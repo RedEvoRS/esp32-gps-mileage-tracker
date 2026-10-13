@@ -1144,8 +1144,13 @@ static bool uploadFile(const char* path) {
     // time. Don't send the local name -- its NVS counter can reset and
     // reuse a name, the server answers a reused id holding different GPX
     // with 409, and a 409 stays queued, retried every 30 s indefinitely.
+
+    // Size and time go in the log so a real upload shows the link speed:
+    // the server's worker timeout (300 s) bounds how slow it can be.
+    uint32_t t0 = millis();
     int code = http.sendRequest("POST", &body, sz);
     http.end();
+    float secs = (millis() - t0) / 1000.0f;
     reportNetworkStack("after HTTP upload");
 
     FS_LOCK();
@@ -1169,12 +1174,15 @@ static bool uploadFile(const char* path) {
     FS_UNLOCK();
 
     if (ok) {
-        Serial.printf("Upload %s -> HTTP 200 (deleted)\n", path);
+        Serial.printf("Upload %s (%u B, %.1f s) -> HTTP 200 (deleted)\n",
+                      path, (unsigned)sz, secs);
     } else if (rejected) {
-        Serial.printf("ERROR: upload %s -> HTTP %d: server rejected the file -- %s\n",
-                      path, code, setAside ? "kept as .bad, not retried" : "rename failed, will retry");
+        Serial.printf("ERROR: upload %s (%u B, %.1f s) -> HTTP %d: server rejected the file -- %s\n",
+                      path, (unsigned)sz, secs, code,
+                      setAside ? "kept as .bad, not retried" : "rename failed, will retry");
     } else {
-        Serial.printf("Upload %s -> HTTP %d (will retry)\n", path, code);
+        Serial.printf("Upload %s (%u B, %.1f s) -> HTTP %d (will retry)\n",
+                      path, (unsigned)sz, secs, code);
     }
     return ok;
 }
