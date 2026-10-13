@@ -59,23 +59,26 @@ firmware hasn't been road-tested.
   private, archived repo, so commit hashes and PR numbers in the audit
   docs point there. This repo is private for now; the owner plans to make
   it public once the server is deployed and the tracker works on the road.
-- **Where status lives:** GitHub issues, not this file. Every open audit
-  finding is an issue. Tracker **#1** covers the October audit (N1–N14)
-  and **#2** the August one (B1–B5, F1–F11). Check `gh issue list` before
+- **Where status lives:** GitHub issues, not this file. Every open
+  finding or check is its own issue, labelled by audit
+  (`audit-2026-08-04`, `audit-2026-10-05`), area and severity. The old
+  trackers **#1** (October, N1–N14) and **#2** (August, B1–B5, F1–F11) are
+  closed, but still record what was fixed. Check `gh issue list` before
   assuming something is open or fixed.
 - **Audits:** `CODE_REVIEW_2026-06-09.md` → `AUDIT_2026-08-04.md` →
   `AUDIT_2026-10-05.md` (findings, fix-status table, bench results) →
   `INDEPENDENT_AUDIT_2026-10-05.md`. The fix-status table in
-  `AUDIT_2026-10-05.md` covers only the first round of fixes; the trackers
-  have the rest.
+  `AUDIT_2026-10-05.md` covers only the first round of fixes; the closed
+  trackers #1 and #2 have the rest.
 - **Fixed:** every August finding except F11 (#6), and October N1–N8 and
   N10–N12. N5 shipped without a commuting category, per the owner.
 - **Still open:** #3 (N9, deep sleep can unmount the FS mid-upload), #4
   (N13: the backup tooling is in `server/backup/`, but it isn't set up on
   the server or restore-tested from a real off-host copy yet), #6 (F11, network stack sizing; needs
-  measurements from a real upload), and the low-severity issues, one per
-  finding: backend #11–#14, firmware #15–#18, installer #19–#23
-  (`gh issue list --label "severity: low"`).
+  measurements from a real upload), the shakedown checks #25 (deep-sleep
+  current), #26 (GPS hot start) and #27 (road test), and the low-severity
+  issues, one per finding: backend #11–#14, firmware #15–#18, installer
+  #19–#23 (`gh issue list --label "severity: low"`).
 - **Firmware:** Stages 1–3 verified on hardware. Stage 4 compiles on ESP32
   core 3.3.11 (XPowersLib 0.3.3, TinyGPSPlus 1.0.3) with the bundled
   `partitions.csv` (2.375 MB LittleFS). Trip files are **GPX 1.0** at ~119 B/point (1.0 allows `<speed>` and
@@ -85,8 +88,8 @@ firmware hasn't been road-tested.
   partition mounts, the M8N ACKs the UBX config, ALDO3 measured as the GPS
   rail, and the charge guard calibrated against the die temperature.
   Details in `AUDIT_2026-10-05.md` → Bench results. Still needs the car or
-  a meter: deep-sleep current, hot-start time, the F11 stack high-water
-  mark, and the road test.
+  a meter: deep-sleep current (#25), hot-start time (#26), the F11 stack
+  high-water mark (#6), and the road test (#27).
 - **Tests (CI runs all of these on every PR):**
   - PII: `python tools/check_pii.py` (add `--commits origin/main..HEAD`
     before pushing) and `python -m unittest discover -s tools`.
@@ -153,15 +156,15 @@ firmware hasn't been road-tested.
 3. **Set up backups** (#4): the installer's Backups step, or
    `DEPLOY_DEBIAN.md` Step 10 by hand. #4 closes once that's done on the
    real server and `restore.sh check` passes from the off-host copy.
-4. **Road test and shakedown.** The checklist is in `AUDIT_2026-10-05.md`
-   and #1: deep-sleep current, hot start after sleep, F10 through engine
-   crank and start-stop, the N1 jitter figure from a parked file, and the
-   F11 stack measurement during a real upload (procedure in
+4. **Road test and shakedown**, one issue per check: deep-sleep current
+   (#25), hot start after sleep (#26), the road test for F10 through
+   engine crank and start-stop and the N1 jitter figure (#27), and the F11
+   stack measurement during a real upload (#6; procedure in
    `firmware/README.md` → Network stack shakedown).
 5. **Remaining code:** N9 (#3), then the low-severity issues (#11–#23).
 
-When a PR fixes an audit issue, say "Fixes #N" and update tracker #1 (or
-#2 for August items). File every new finding as its own issue, however
+When a PR fixes an issue, say "Fixes #N" (one line per issue) so merging
+it closes the issue. File every new finding as its own issue, however
 small, never as an item on a checklist issue.
 
 ## Do Not
