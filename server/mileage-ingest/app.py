@@ -53,7 +53,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from flask import Flask, request, jsonify
+from flask import Flask, abort, request, jsonify
 
 
 # ---------------------------------------------------------------------
@@ -85,9 +85,20 @@ except ZoneInfoNotFoundError as exc:  # pragma: no cover - environment fault
         "reason -- rebuild the image (docker compose build mileage-ingest)."
     ) from exc
 
-# Reject absurdly large bodies early. A dense 1 Hz GPX day is well under
-# a few hundred KB; anything past a couple MB is either a bug or abuse.
+# Reject absurdly large bodies early. The whole body is held in memory and
+# parsed there (~10x its size at peak), so this guards against a bug or a
+# stray client, not the device: the firmware writes ~119 B per second of
+# driving (~430 KB an hour), and its entire trip partition is 2.375 MiB,
+# so no trip it stores can reach the cap. test_upload_limits.py keeps it so.
 MAX_UPLOAD_BYTES = int(os.environ.get("INGEST_MAX_UPLOAD_BYTES", 4 * 1024 * 1024))
+
+# A reply sent before the body is read (bad token, too large) only reaches
+# the device if the rest of the body is read first. The firmware sends the
+# whole file before it reads the reply; gunicorn closes the socket with the
+# body still queued, the kernel resets the connection, and the device sees
+# a send error instead of the status. Read and discard up to this much; a
+# bigger body gets the reset.
+MAX_DISCARD_BYTES = 16 * 1024 * 1024
 
 # Unit conversions, named so the math below reads in plain English.
 METERS_PER_MILE = 1609.344
@@ -129,9 +140,9 @@ DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 
-# Enforce the size cap during request reading (Flask returns 413 itself),
-# rather than only after buffering the whole body in memory. The explicit
-# length check in the route remains as a backstop.
+# Enforce the size cap during request reading (Flask raises 413, answered
+# by payload_too_large()), rather than only after buffering the whole body
+# in memory. The explicit length check in the route remains as a backstop.
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 
 # Configure logging to go to stdout/stderr, which docker captures
@@ -493,6 +504,27 @@ def _atomic_write_json(target, obj):
     _atomic_write_bytes(target, payload)
 
 
+def _discard_body():
+    """Read and drop an unread request body, so an early reply arrives.
+
+    See MAX_DISCARD_BYTES. Call it only before anything has read the body:
+    it reads Content-Length bytes from the raw input, and a server that
+    doesn't bound wsgi.input itself would wait for bytes that never come.
+    """
+    remaining = request.content_length or 0
+    if remaining > MAX_DISCARD_BYTES:
+        return
+    stream = request.environ["wsgi.input"]
+    try:
+        while remaining > 0:
+            chunk = stream.read(min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+    except OSError:
+        pass  # the client went away mid-body; nobody is left to answer
+
+
 # ---------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------
@@ -507,6 +539,19 @@ def health():
     so monitoring tools can poll it freely.
     """
     return jsonify({"status": "ok", "service": "mileage-ingest"}), 200
+
+
+@app.errorhandler(413)
+def payload_too_large(_error):
+    """Answer an oversized upload in JSON, like every other error here.
+
+    MAX_CONTENT_LENGTH makes Flask raise this from the Content-Length
+    header, before upload_trip() reads any of the body, and Flask's own
+    413 page is HTML. Without a Content-Length it's raised partway through
+    the body instead, and there's no length to discard by.
+    """
+    _discard_body()
+    return jsonify({"error": f"payload too large (limit {MAX_UPLOAD_BYTES} bytes)"}), 413
 
 
 @app.route("/upload", methods=["POST"])
@@ -527,8 +572,11 @@ def upload_trip():
     # Step 1: Authentication
     # -----------------------------------------------------------------
     # Simple bearer token: LAN-appropriate security, not internet-grade.
+    # A 401 discards the unread body first, so the device sees the 401
+    # rather than a reset connection (see MAX_DISCARD_BYTES).
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
+        _discard_body()
         return jsonify({"error": "missing or malformed Authorization header"}), 401
 
     presented_token = auth_header[7:]  # strip "Bearer " prefix
@@ -542,16 +590,18 @@ def upload_trip():
         app.logger.warning(
             "Rejected upload with bad token from %s", request.remote_addr
         )
+        _discard_body()
         return jsonify({"error": "unauthorized"}), 401
 
     # -----------------------------------------------------------------
     # Step 2: Read and parse the GPX body
     # -----------------------------------------------------------------
+    # Over MAX_CONTENT_LENGTH, get_data() raises 413 (payload_too_large).
     raw = request.get_data(cache=False)
     if not raw:
         return jsonify({"error": "empty request body"}), 400
     if len(raw) > MAX_UPLOAD_BYTES:
-        return jsonify({"error": "payload too large"}), 413
+        abort(413)
 
     try:
         parsed = parse_gpx(raw)
