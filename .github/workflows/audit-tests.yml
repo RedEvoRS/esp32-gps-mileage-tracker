@@ -106,6 +106,24 @@ jobs:
             echo "INSTALLER=$home/mileage-tracker/install.sh"
             echo "LAN_ADDR=$(ip -4 route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p')"
           } >> "$GITHUB_ENV"
+      - name: Without a terminal, a sudo password stops it, and it says why
+        # Steps have no terminal, so with a password-only sudo rule the
+        # script can't ask. It has to say that, not blame the sudoers file.
+        run: |
+          if [ "$TEST_USER" = "$(id -un)" ]; then
+            echo "Skipped: the test user is the runner itself"
+            exit 0
+          fi
+          echo "$TEST_USER ALL=(ALL) ALL" | sudo tee /etc/sudoers.d/zz-installer-test
+          if sudo -u "$TEST_USER" -H bash "$INSTALLER" < /dev/null > nosudo.log 2>&1; then
+            cat nosudo.log
+            echo "install.sh carried on without sudo"
+            exit 1
+          fi
+          cat nosudo.log
+          grep -q "isn't running in a terminal" nosudo.log
+          echo "$TEST_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/zz-installer-test
+          sudo -u "$TEST_USER" sudo -n true
       - name: Install
         run: |
           sudo -u "$TEST_USER" -H env \
@@ -139,6 +157,22 @@ jobs:
           sudo systemctl restart docker
           sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
             bash "$INSTALLER" --check < /dev/null
+      - name: --check reports a .env with CRLF endings once
+        # Not once per value read from it as well: Compose drops the \r
+        # itself, so the services are fine and only the file is wrong.
+        run: |
+          dir=$(dirname "$INSTALLER")
+          sudo -u "$TEST_USER" sed -i 's/$/\r/' "$dir/.env"
+          if sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+              bash "$INSTALLER" --check < /dev/null > crlf.log 2>&1; then
+            cat crlf.log
+            echo "--check passed with a CRLF .env"
+            exit 1
+          fi
+          cat crlf.log
+          grep -q 'CRLF) line endings in .env' crlf.log
+          test "$(grep -c '  FAIL  ' crlf.log)" = 1
+          sudo -u "$TEST_USER" sed -i 's/\r$//' "$dir/.env"
       - name: --check fails on a broken install
         run: |
           docker stop mileage-viewer

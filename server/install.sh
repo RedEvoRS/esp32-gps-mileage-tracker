@@ -198,10 +198,18 @@ need_sudo() {
     # sudo -n works with NOPASSWD or a password sudo already has; -v
     # only when it doesn't, since -v asks unless every rule is NOPASSWD.
     if ! sudo -n true 2> /dev/null; then
+        # sudo reads the password from the terminal, not stdin, so without
+        # one (ssh <host> 'bash install.sh', no -t) it can't ask at all.
+        if ! { : > /dev/tty; } 2> /dev/null; then
+            die "sudo needs your password, but this isn't running in a terminal, so it can't ask." \
+                "Run it from a login session, or over ssh with -t:" \
+                "ssh -t <user>@<host> bash $SCRIPT_DIR/install.sh"
+        fi
         note "Some steps need root, so sudo asks for your password."
         sudo -v \
-            || die "Your user can't use sudo." \
-                "As root (su -): usermod -aG sudo $ME" \
+            || die "sudo didn't let you in (its reason is just above)." \
+                "A mistyped password: just run this again." \
+                "\"not in the sudoers file\": as root (su -), usermod -aG sudo $ME," \
                 "then log out, log back in, and run this again."
     fi
     SUDO_READY=yes
@@ -228,6 +236,9 @@ env_raw() {
     local file=$1 key=$2 line
     [[ -f $file ]] || return 0
     line=$(grep -E "^[[:space:]]*$key=" "$file" | tail -n 1) || true
+    # Preflight reports CRLF endings once; without this, the \r would also
+    # make every value read from the file look wrong.
+    line=${line%$'\r'}
     printf '%s' "${line#*=}"
 }
 
