@@ -148,7 +148,7 @@ to re-read every track to list them. Trimmed down, one looks like this:
 
 ```json
 {
-  "trip_id": "2026-04-14T13-45-22",
+  "trip_id": "2026-04-14T13-45-22Z",
   "start_time": "2026-04-14T13:45:22+00:00",
   "end_time": "2026-04-14T14:07:41+00:00",
   "distance_miles": 12.417,

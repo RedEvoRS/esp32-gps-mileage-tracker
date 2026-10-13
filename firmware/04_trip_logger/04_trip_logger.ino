@@ -1140,6 +1140,11 @@ static bool uploadFile(const char* path) {
     http.addHeader("Content-Type", "application/gpx+xml");
     http.addHeader("Authorization", String("Bearer ") + AUTH_TOKEN);
     http.addHeader("X-Device-Id", DEVICE_ID);
+    // No X-Trip-Id, by design: the server names the trip by its GPX start
+    // time. Don't send the local name -- its NVS counter can reset and
+    // reuse a name, the server answers a reused id holding different GPX
+    // with 409, and a 409 stays queued, retried every 30 s indefinitely.
+
     // Size and time go in the log so a real upload shows the link speed:
     // the server's worker timeout (300 s) bounds how slow it can be.
     uint32_t t0 = millis();

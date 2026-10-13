@@ -13,13 +13,14 @@ serve a UI, or classify trips. Those responsibilities belong to the
 separate viewer/export service that reads these files independently.
 
 The device uploads the GPX body directly (Content-Type: application/gpx+xml)
-and identifies the trip with two headers:
+and identifies the trip with two optional headers:
 
     X-Device-Id: tbeam-01
     X-Trip-Id:   2026-04-14T13-45-22
 
-If those headers are absent we fall back to the GPX `creator` attribute and
-the trip's first/last timestamps.
+The T-Beam sends only X-Device-Id. Without X-Device-Id we use the GPX
+`creator` attribute; without X-Trip-Id, the trip's start time in UTC
+(2026-04-14T13-45-22Z), which is also the stored file's name.
 
 For each upload we write two files into /data/YYYY-MM/ (bucketed by the
 trip's end time):
@@ -623,12 +624,14 @@ def upload_trip():
 
     trip_id = request.headers.get("X-Trip-Id")
     if not trip_id:
-        # Fall back to the trip's start time, then metadata time.
-        anchor = summary["start_time"] or (
-            parsed["metadata_time"].isoformat() if parsed["metadata_time"] else None
-        )
+        # Fall back to the trip's start time, then metadata time. This is
+        # the T-Beam's path: it sends no X-Trip-Id. Build the id in UTC and
+        # already filename-safe (2026-04-14T14-30-00Z), so the trip_id in
+        # the summary and the export is the file's name, not a variant of
+        # it that _safe_id() rewrote.
+        anchor = _parse_iso(summary["start_time"]) or parsed["metadata_time"]
         if anchor:
-            trip_id = anchor.replace(":", "-")
+            trip_id = anchor.astimezone(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
         else:
             # No timestamps anywhere in the GPX: derive the id from the
             # body content rather than the wall clock, so a retried
