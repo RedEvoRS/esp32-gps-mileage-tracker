@@ -176,7 +176,13 @@ class UploadEndToEnd(unittest.TestCase):
         c = ing.app.test_client()
         r = c.post("/upload", data=body, headers={"Authorization": "Bearer test-token"})
         self.assertEqual(r.status_code, 200, r.get_json())
-        rec = json.loads((Path(_DATA) / r.get_json()["stored_as"]).with_suffix(".json").read_text())
+        stored = Path(_DATA) / r.get_json()["stored_as"]
+        rec = json.loads(stored.with_suffix(".json").read_text())
+        # No X-Trip-Id, like the firmware: the id is the UTC start time,
+        # and the summary, the response and the file name all agree (#11).
+        self.assertEqual(stored.stem, "2026-04-14T14-30-00Z")
+        self.assertEqual(rec["trip_id"], stored.stem)
+        self.assertEqual(r.get_json()["trip_id"], stored.stem)
         self.assertAlmostEqual(rec["distance_miles"] * ing.METERS_PER_MILE, 900, delta=4)
         self.assertEqual(rec["summary_version"], ing.SUMMARY_VERSION)
         self.assertEqual(rec["duration_seconds"], 60)

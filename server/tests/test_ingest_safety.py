@@ -117,6 +117,17 @@ class UploadSafety(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(Path(response.get_json()["stored_as"]).stem, "caf_-trip")
 
+    def test_fallback_trip_id_is_utc_start_time_and_file_name(self):
+        # No X-Trip-Id (the firmware's case), with times given at an offset.
+        headers = {k: v for k, v in HEADERS.items() if k != "X-Trip-Id"}
+        payload = body().replace(b"Z</time>", b"-07:00</time>")
+        response = self.client.post("/upload", data=payload, headers=headers)
+        self.assertEqual(response.status_code, 200)
+        gpx, summary = self.saved_pair(response)
+        self.assertEqual(gpx.stem, "2026-04-14T21-30-00Z")
+        self.assertEqual(json.loads(summary.read_bytes())["trip_id"], gpx.stem)
+        self.assertEqual(response.get_json()["trip_id"], gpx.stem)
+
     def run_workers(self, payloads):
         ctx = multiprocessing.get_context("spawn")
         barrier = ctx.Barrier(len(payloads))

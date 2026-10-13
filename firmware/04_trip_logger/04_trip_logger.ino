@@ -1140,6 +1140,10 @@ static bool uploadFile(const char* path) {
     http.addHeader("Content-Type", "application/gpx+xml");
     http.addHeader("Authorization", String("Bearer ") + AUTH_TOKEN);
     http.addHeader("X-Device-Id", DEVICE_ID);
+    // No X-Trip-Id, by design: the server names the trip by its GPX start
+    // time. Don't send the local name -- its NVS counter can reset and
+    // reuse a name, the server answers a reused id holding different GPX
+    // with 409, and a 409 stays queued, retried every 30 s indefinitely.
     int code = http.sendRequest("POST", &body, sz);
     http.end();
     reportNetworkStack("after HTTP upload");
