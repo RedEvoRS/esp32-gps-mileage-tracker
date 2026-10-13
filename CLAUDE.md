@@ -77,7 +77,7 @@ firmware hasn't been road-tested.
   the server or restore-tested from a real off-host copy yet), #6 (F11, network stack sizing; needs
   measurements from a real upload), the shakedown checks #25 (deep-sleep
   current), #26 (GPS hot start) and #27 (road test), and the low-severity
-  issues, one per finding: backend #10–#14, firmware #15–#18, installer
+  issues, one per finding: backend #11–#14, firmware #15–#18, installer
   #19–#23 (`gh issue list --label "severity: low"`).
 - **Firmware:** Stages 1–3 verified on hardware. Stage 4 compiles on ESP32
   core 3.3.11 (XPowersLib 0.3.3, TinyGPSPlus 1.0.3) with the bundled
@@ -117,6 +117,12 @@ firmware hasn't been road-tested.
   steps only (speed > 2 mph at either end), HDOP > 5 and > 60 m/s jumps
   skipped, GPS gaps bridged by straight line (`summarize()`, tests in
   `server/tests/`)
+- Upload limits: 4 MiB body cap (`INGEST_MAX_UPLOAD_BYTES`); the device's
+  largest possible trip is ~2.4 MB, its whole partition. gunicorn
+  `--timeout 300`, because the timeout includes reading the body and 30 s
+  dropped big trips on slow links. Early 401/413 replies read the body
+  first so the device sees the status, not a reset.
+  `server/tests/test_upload_limits.py` ties these to `partitions.csv`
 - Viewer port: 8091, session login (LAN-only), reads `./data` read-only, owns
   `annotations.db` (SQLite) in the `viewer-db` volume
 - Port binding: `BIND_ADDR` in `.env` sets the host IP both ports publish
@@ -155,7 +161,7 @@ firmware hasn't been road-tested.
    engine crank and start-stop and the N1 jitter figure (#27), and the F11
    stack measurement during a real upload (#6; procedure in
    `firmware/README.md` → Network stack shakedown).
-5. **Remaining code:** N9 (#3), then the low-severity issues (#10–#23).
+5. **Remaining code:** N9 (#3), then the low-severity issues (#11–#23).
 
 When a PR fixes an issue, say "Fixes #N" (one line per issue) so merging
 it closes the issue. File every new finding as its own issue, however
