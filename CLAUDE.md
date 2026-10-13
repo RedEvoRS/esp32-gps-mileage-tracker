@@ -73,8 +73,9 @@ firmware hasn't been road-tested.
 - **Still open:** #3 (N9, deep sleep can unmount the FS mid-upload), #4
   (N13: the backup tooling is in `server/backup/`, but it isn't set up on
   the server or restore-tested from a real off-host copy yet), #6 (F11, network stack sizing; needs
-  measurements from a real upload), and the low-severity lists #5
-  (backend) and #7 (firmware).
+  measurements from a real upload), and the low-severity issues, one per
+  finding: backend #10–#14, firmware #15–#18, installer #19–#23
+  (`gh issue list --label "severity: low"`).
 - **Firmware:** Stages 1–3 verified on hardware. Stage 4 compiles on ESP32
   core 3.3.11 (XPowersLib 0.3.3, TinyGPSPlus 1.0.3) with the bundled
   `partitions.csv` (2.375 MB LittleFS). Trip files are **GPX 1.0** at ~119 B/point (1.0 allows `<speed>` and
@@ -151,10 +152,11 @@ firmware hasn't been road-tested.
    crank and start-stop, the N1 jitter figure from a parked file, and the
    F11 stack measurement during a real upload (procedure in
    `firmware/README.md` → Network stack shakedown).
-5. **Remaining code:** N9 (#3), then the low lists #5 and #7.
+5. **Remaining code:** N9 (#3), then the low-severity issues (#10–#23).
 
 When a PR fixes an audit issue, say "Fixes #N" and update tracker #1 (or
-#2 for August items).
+#2 for August items). File every new finding as its own issue, however
+small, never as an item on a checklist issue.
 
 ## Do Not
 
