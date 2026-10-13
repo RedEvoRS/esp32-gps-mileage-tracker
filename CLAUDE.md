@@ -54,9 +54,11 @@ INDEPENDENT_AUDIT_2026-10-05.md      Review history (see Current Status)
 Code is written and tested on both sides. Nothing is deployed, and the
 firmware hasn't been road-tested.
 
-- **History:** this repo starts from a clean snapshot taken 2026-10-13.
-  Earlier commits, PRs and closed issues stay in a private archive repo,
-  so commit hashes and PR numbers in the audit docs point there.
+- **History and visibility:** this repo starts from a clean snapshot
+  taken 2026-10-13. Earlier commits, PRs and closed issues stay in a
+  private, archived repo, so commit hashes and PR numbers in the audit
+  docs point there. This repo is private for now; the owner plans to make
+  it public once the server is deployed and the tracker works on the road.
 - **Where status lives:** GitHub issues, not this file. Every open audit
   finding is an issue. Tracker **#1** covers the October audit (N1–N14)
   and **#2** the August one (B1–B5, F1–F11). Check `gh issue list` before
@@ -159,12 +161,15 @@ When a PR fixes an audit issue, say "Fixes #N" and update tracker #1 (or
 - Put IRS classification logic in firmware — server-side only
 - Power SX1262 LoRa without antenna (RF damage risk)
 - Commit `secrets.h`, `.env`, or `viewer.env` to version control
-- Commit anything personal. The repo is public, so docs, examples, tests,
+- Commit anything personal. The repo will go public, and that exposes
+  everything from its private period too, so docs, examples, tests,
   commit messages, issues and PRs use placeholders (`<user>`, `<host>`,
   `<username>`, `~\Documents\...`), never a real name, account path,
   email, SSID/MAC, home coordinates, or a photo with EXIF. Commit with the
-  GitHub noreply email. `tools/check_pii.py` enforces this in CI; names
-  come from the `PII_DENYLIST` secret or a gitignored `.pii-denylist`
+  GitHub noreply email. `tools/check_pii.py` enforces this in CI for files
+  and commits (not issue or PR text); names come from the `PII_DENYLIST`
+  secret or a gitignored `.pii-denylist`
+- Change the repo's visibility. The owner decides when it goes public
 - Bring commits over from the private archive repo: no merge, cherry-pick,
   or adding it as a remote. Its history carries a personal email and
   account paths, which is why this repo started from a clean snapshot.
