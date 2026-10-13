@@ -1,0 +1,14 @@
+# Daily backup. Enable with:
+#   sudo systemctl enable --now mileage-backup@<user>.timer
+
+[Unit]
+Description=Daily mileage tracker backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15min
+# Catch up at boot if the box was off at 03:30.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

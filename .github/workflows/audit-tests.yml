@@ -1,0 +1,148 @@
+name: Audit regression tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  pii-scan:
+    # The repo is meant to go public, so files, commit messages and author
+    # emails must carry nothing personal. PII_DENYLIST is a repo secret
+    # (one term per line: real name, personal email, street, SSID, ...).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Test the scanner
+        run: python -m unittest discover -s tools -v
+      - name: Scan files, and on a PR its commits, for personal info
+        env:
+          PII_DENYLIST: ${{ secrets.PII_DENYLIST }}
+          COMMITS: ${{ github.event_name == 'pull_request' && format('{0}..{1}', github.event.pull_request.base.sha, github.event.pull_request.head.sha) || '' }}
+        run: python tools/check_pii.py ${COMMITS:+--commits "$COMMITS"}
+
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install service dependencies
+        run: python -m pip install -r server/mileage-ingest/requirements.txt -r server/mileage-viewer/requirements.txt
+      - name: Install backup test tools
+        # test_backup skips without these; make sure CI never skips it.
+        run: command -v rsync || (sudo apt-get update && sudo apt-get install -y rsync)
+      - name: Run server regression tests
+        run: python -m unittest discover -s server/tests -v
+      - name: Check map parser integration
+        run: node server/tests/test_viewer_map.js
+
+  firmware-host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Check out TinyGPSPlus 1.0.3
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: mikalhart/TinyGPSPlus
+          ref: 81ba32cc9ac63a8e4c20ae624ac48513766c88fc
+          path: .audit-tools/TinyGPSPlus
+          persist-credentials: false
+      - name: Run filesystem and real-parser host tests
+        env:
+          TINYGPS_DIR: ${{ github.workspace }}/.audit-tools/TinyGPSPlus/src
+        run: |
+          test -f "$TINYGPS_DIR/TinyGPS++.cpp"
+          bash firmware/host_test/run.sh
+
+  installer:
+    # Runs server/install.sh for real on a fresh VM: Docker builds, the
+    # test upload, the viewer login and exports, and backups through
+    # systemd. Then reruns it, has it repair a mangled config, restarts
+    # Docker and checks again, and makes sure --check notices a broken
+    # install.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PASSWORD: correct-horse-battery
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Lint
+        run: shellcheck server/install.sh
+      - name: Make a login like a fresh Debian install's
+        # UID 1000 with sudo, not in the docker group yet, and the server
+        # files in ~/mileage-tracker, as DEPLOY_DEBIAN.md Step 2 leaves them.
+        run: |
+          user=$(getent passwd 1000 | cut -d: -f1)
+          if [ -z "$user" ]; then
+            sudo useradd --create-home --uid 1000 --shell /bin/bash tester
+            user=tester
+          fi
+          home=$(getent passwd "$user" | cut -d: -f6)
+          sudo install -d -o "$user" "$home"
+          sudo gpasswd -d "$user" docker || true
+          # sudoers takes the last matching rule; zz- sorts after any existing
+          # rule for this user.
+          echo "$user ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/zz-installer-test
+          sudo -l -U "$user"
+          sudo -u "$user" sudo -n true
+          sudo cp -r server "$home/mileage-tracker"
+          sudo chown -R "$user:" "$home/mileage-tracker"
+          # The "off-host" backup target: same disk here, so the script asks.
+          sudo install -d -o "$user" /srv/offhost
+          {
+            echo "TEST_USER=$user"
+            echo "INSTALLER=$home/mileage-tracker/install.sh"
+            echo "LAN_ADDR=$(ip -4 route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p')"
+          } >> "$GITHUB_ENV"
+      - name: Install
+        run: |
+          sudo -u "$TEST_USER" -H env \
+            INSTALL_BIND_ADDR="$LAN_ADDR" \
+            INSTALL_VIEWER_USER=tester \
+            INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+            INSTALL_WAIT_ONLINE=y \
+            INSTALL_BACKUPS=y \
+            INSTALL_BACKUP_REMOTE=/srv/offhost \
+            INSTALL_SAME_DISK=y \
+            INSTALL_PING_URL= \
+            bash "$INSTALLER" < /dev/null
+          # Backups are private to the backup user (umask 077).
+          test -n "$(sudo ls /srv/offhost/snapshots)"
+          systemctl is-enabled "mileage-backup@$TEST_USER.timer"
+      - name: Run it again; it keeps everything
+        run: |
+          sudo -u "$TEST_USER" -H env INSTALL_KEEP_LOGIN=y INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+            bash "$INSTALLER" < /dev/null
+      - name: Repair a hash that lost its quotes and a .env with CRLF endings
+        run: |
+          dir=$(dirname "$INSTALLER")
+          sudo -u "$TEST_USER" sed -i "s/^VIEWER_PASSWORD_HASH='\(.*\)'\$/VIEWER_PASSWORD_HASH=\1/" "$dir/viewer.env"
+          sudo -u "$TEST_USER" sed -i 's/$/\r/' "$dir/.env"
+          sudo -u "$TEST_USER" -H env INSTALL_KEEP_LOGIN=y INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+            bash "$INSTALLER" < /dev/null
+          sudo grep -q "^VIEWER_PASSWORD_HASH='" "$dir/viewer.env"
+          ! sudo grep -q $'\r' "$dir/.env"
+      - name: Restart Docker, then check
+        run: |
+          sudo systemctl restart docker
+          sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+            bash "$INSTALLER" --check < /dev/null
+      - name: --check fails on a broken install
+        run: |
+          docker stop mileage-viewer
+          if sudo -u "$TEST_USER" -H bash "$INSTALLER" --check < /dev/null; then
+            echo "--check passed with the viewer stopped"
+            exit 1
+          fi

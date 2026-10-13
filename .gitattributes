@@ -1,0 +1,10 @@
+# Server files get copied from a Windows checkout to Linux; scripts and
+# unit files with CRLF line endings fail there.
+*.sh text eol=lf
+*.service text eol=lf
+*.timer text eol=lf
+server/backup/backup.conf.example text eol=lf
+# Env templates become .env files that Compose and the firmware read
+# byte for byte; a CRLF would end every value with a stray \r.
+server/.env.example text eol=lf
+server/viewer.env.example text eol=lf

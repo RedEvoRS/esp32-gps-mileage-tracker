@@ -1,0 +1,37 @@
+# Backup settings for backup.sh and restore.sh. Copy to backup.conf next
+# to this file and edit. backup.conf is gitignored. It's read by bash, so
+# no spaces around '=' and quote anything with spaces in it.
+
+# Where the copy that leaves this box goes. Required. Either an
+# rsync-over-SSH target or a mounted share. The directory has to exist,
+# and an SSH target needs rsync installed on the far end and a key the
+# backup user can log in with unattended (DEPLOY_DEBIAN.md Step 10).
+REMOTE=backup@nas.lan:/volume1/backups/mileage-tracker
+#REMOTE=/mnt/backup-share/mileage-tracker
+
+# Extra ssh options for an SSH REMOTE, e.g. a dedicated key.
+#RSYNC_SSH="ssh -i /home/<user>/.ssh/mileage_backup"
+
+# Local snapshots. Default: ~/mileage-backups of the user the timer runs as.
+#BACKUP_DIR=/home/<user>/mileage-backups
+
+# Retention for local snapshots: the newest KEEP_RECENT, plus the first
+# snapshot of each of the newest KEEP_MONTHLY months. Unchanged files are
+# hard links between snapshots, so keeping lots of them costs little.
+# 84 months covers the IRS's longest common retention period (7 years).
+KEEP_RECENT=14
+KEEP_MONTHLY=84
+
+# yes = prune the off-host copy the same way. Default no: the off-host
+# copy only ever grows, so a mistake or a compromise on this box can't
+# delete history from it.
+REMOTE_PRUNE=no
+
+# Optional URL to GET after each successful backup, for a dead man's
+# switch (Uptime Kuma push monitor, healthchecks.io, ...). If the pings
+# stop arriving, backups have stopped working.
+#PING_URL=https://hc-ping.com/your-uuid
+
+# The directory holding docker-compose.yml. Default: the parent of this
+# backup/ directory, i.e. ~/mileage-tracker.
+#COMPOSE_DIR=/home/<user>/mileage-tracker

@@ -1,0 +1,10 @@
+# Pinned versions for reproducible builds. Pinning ensures that
+# rebuilding the image next year produces the same result as today,
+# which matters for reliability. You can update these periodically
+# by checking for newer stable releases and testing.
+flask==3.0.3
+gunicorn==23.0.0
+# IANA timezone database for zoneinfo. Pinned like everything else, but
+# note this one carries real-world data: refresh it if the US ever
+# changes DST rules, or local timestamps will drift.
+tzdata==2026.3

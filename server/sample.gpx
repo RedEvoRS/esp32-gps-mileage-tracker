@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Sample trip for testing the ingest + viewer services. A short eastbound
+     run: 4 track points ~158 m apart at 15 s intervals, so the derived
+     summary should report roughly 0.30 miles over 45 seconds at ~24 mph.
+     Speed/course ride in Garmin TrackPointExtension v2, in schema order,
+     exactly as the Stage 4 firmware emits them. -->
+<gpx version="1.1" creator="TBeamMileage/1.0"
+     xmlns="http://www.topografix.com/GPX/1/1"
+     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+     xmlns:gpxtpx="http://www.garmin.com/xmlschemas/TrackPointExtension/v2"
+     xsi:schemaLocation="http://www.topografix.com/GPX/1/1
+                         http://www.topografix.com/GPX/1/1/gpx.xsd
+                         http://www.garmin.com/xmlschemas/TrackPointExtension/v2
+                         https://www8.garmin.com/xmlschemas/TrackPointExtensionv2.xsd">
+  <metadata>
+    <name>Sample trip 2026-04-14</name>
+    <time>2026-04-14T14:30:00Z</time>
+  </metadata>
+  <trk>
+    <name>Test drive</name>
+    <type>driving</type>
+    <trkseg>
+      <trkpt lat="37.7749000" lon="-122.4190000">
+        <ele>16.0</ele>
+        <time>2026-04-14T14:30:00Z</time>
+        <sat>10</sat>
+        <hdop>0.9</hdop>
+        <extensions>
+          <gpxtpx:TrackPointExtension>
+            <gpxtpx:speed>10.500</gpxtpx:speed>
+            <gpxtpx:course>90.0</gpxtpx:course>
+          </gpxtpx:TrackPointExtension>
+        </extensions>
+      </trkpt>
+      <trkpt lat="37.7749000" lon="-122.4172000">
+        <ele>16.1</ele>
+        <time>2026-04-14T14:30:15Z</time>
+        <sat>10</sat>
+        <hdop>0.9</hdop>
+        <extensions>
+          <gpxtpx:TrackPointExtension>
+            <gpxtpx:speed>10.600</gpxtpx:speed>
+            <gpxtpx:course>90.0</gpxtpx:course>
+          </gpxtpx:TrackPointExtension>
+        </extensions>
+      </trkpt>
+      <trkpt lat="37.7749000" lon="-122.4154000">
+        <ele>16.2</ele>
+        <time>2026-04-14T14:30:30Z</time>
+        <sat>11</sat>
+        <hdop>0.8</hdop>
+        <extensions>
+          <gpxtpx:TrackPointExtension>
+            <gpxtpx:speed>10.700</gpxtpx:speed>
+            <gpxtpx:course>90.0</gpxtpx:course>
+          </gpxtpx:TrackPointExtension>
+        </extensions>
+      </trkpt>
+      <trkpt lat="37.7749000" lon="-122.4136000">
+        <ele>16.3</ele>
+        <time>2026-04-14T14:30:45Z</time>
+        <sat>11</sat>
+        <hdop>0.8</hdop>
+        <extensions>
+          <gpxtpx:TrackPointExtension>
+            <gpxtpx:speed>10.400</gpxtpx:speed>
+            <gpxtpx:course>90.0</gpxtpx:course>
+          </gpxtpx:TrackPointExtension>
+        </extensions>
+      </trkpt>
+    </trkseg>
+  </trk>
+</gpx>

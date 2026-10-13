@@ -1,0 +1,14 @@
+# Never commit your actual secrets file
+secrets.h
+
+# Arduino IDE build artifacts
+build/
+*.elf
+*.bin
+*.map
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+.DS_Store

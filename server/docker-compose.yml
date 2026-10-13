@@ -1,0 +1,105 @@
+# Mileage Tracker Ingest Service
+#
+# This compose file defines a single service that listens for trip uploads
+# from the T-Beam GPS tracker and writes them as JSON files to a host
+# directory. The service is designed to be minimal, reliable, and easy
+# to reason about.
+#
+# Before first run:
+#   1. Copy .env.example to .env and set INGEST_AUTH_TOKEN to a long random string
+#   2. Ensure the ./data directory exists (or change the volume path below)
+#   3. Run: docker compose up -d --build
+#
+# Both ports listen on every host interface until you set BIND_ADDR in
+# .env to the server's LAN IP (DEPLOY_DEBIAN.md Step 7). Set it: UFW
+# does not filter Docker-published ports, so the bind address is the
+# only thing keeping them off other interfaces.
+
+services:
+  mileage-ingest:
+    build: ./mileage-ingest
+    container_name: mileage-ingest
+    restart: unless-stopped
+
+    # Host port 8090 maps to container port 8090, on BIND_ADDR only.
+    ports:
+      - "${BIND_ADDR:-0.0.0.0}:8090:8090"
+
+    # The ./data directory on the host gets mounted into the container
+    # at /data, which is where the app writes trip files. This means
+    # your trip JSON files persist outside the container and survive
+    # container rebuilds, restarts, and even docker compose down -v.
+    volumes:
+      - ./data:/data
+
+    environment:
+      # The auth token is read from the .env file (never commit .env!)
+      - INGEST_AUTH_TOKEN=${INGEST_AUTH_TOKEN}
+      # Set your timezone so log timestamps match local time
+      - TZ=America/Los_Angeles
+      # Which local month a trip is filed under (data/YYYY-MM/). Must match
+      # DISPLAY_TZ on the viewer, or the folder and the displayed date
+      # disagree at month boundaries. Timestamps in the files stay UTC.
+      - DISPLAY_TZ=America/Los_Angeles
+
+    # Healthcheck lets Docker know when the service is actually ready
+    # to accept requests, not just when the container has started.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # The viewer/export service: a web UI to browse trips, audit each track
+  # on an OpenStreetMap map, tag trip purpose, and export to CSV/XLSX.
+  # It reads the same ./data directory READ-ONLY (the GPX/JSON files are
+  # owned by the ingest service) and keeps its own annotations database
+  # in a separate named volume.
+  mileage-viewer:
+    build: ./mileage-viewer
+    container_name: mileage-viewer
+    restart: unless-stopped
+
+    # Host port 8091 maps to container port 8091, on BIND_ADDR only.
+    ports:
+      - "${BIND_ADDR:-0.0.0.0}:8091:8091"
+
+    volumes:
+      # Same trip data as ingest, but read-only — the viewer never
+      # modifies GPX or summary files.
+      - ./data:/data:ro
+      # Annotations (trip purpose + notes) live here, separate from the
+      # immutable trip data so losing them never risks the trips.
+      - viewer-db:/db
+
+    # Login credentials + session key come from their own env file, passed
+    # through verbatim. Two reasons this is separate from .env:
+    #   1. The viewer has no business holding the ingest auth token.
+    #   2. Single-quoting the hash in viewer.env (as the example shows)
+    #      preserves its '$' separators; unquoted values are interpolated.
+    env_file:
+      - ./viewer.env
+
+    environment:
+      - VIEWER_DB_PATH=/db/annotations.db
+      - TZ=America/Los_Angeles
+      # Timezone all trip times are displayed and exported in. Must match
+      # DISPLAY_TZ on the ingest service (see the note there).
+      - DISPLAY_TZ=America/Los_Angeles
+
+    # Wait for the ingest service so ./data exists, though the viewer
+    # tolerates an empty/missing data dir on its own.
+    depends_on:
+      - mileage-ingest
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8091/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+# Named volume for the viewer's annotations database.
+volumes:
+  viewer-db:

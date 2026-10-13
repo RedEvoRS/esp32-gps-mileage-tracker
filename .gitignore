@@ -1,0 +1,29 @@
+# Secrets — never commit these
+firmware/secrets.h
+server/.env
+server/viewer.env
+server/backup/backup.conf
+
+# Trip data and databases
+server/data/
+*.db
+
+# Build artifacts
+build/
+.audit-venv/
+.audit-tools/
+*.bin
+*.elf
+
+# Editor / OS noise
+.vscode/
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+
+# Per-machine Claude Code settings (personal permissions, local paths)
+.claude/settings.local.json
+
+# Personal terms for tools/check_pii.py; must never be committed
+.pii-denylist
