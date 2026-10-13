@@ -176,7 +176,7 @@ testing remains necessary to verify the flash driver's behavior.
 > rail with a meter and watch the Serial Monitor through a real trip and
 > upload before relying on it in the car.
 
-### Network stack shakedown (issue #16)
+### Network stack shakedown (issue #6)
 
 The network task reserves 12,288 bytes, matching the Stage 4 brief. This is
 a conservative starting point; it has **not** been sized from board measurements.
@@ -191,7 +191,7 @@ an unavailable server, rejected requests, and a dropped WiFi connection.
 Record the firmware commit, core/library versions, file sizes, HTTP outcomes,
 and lowest `Net stack ... minimum free` value. A warning at 1,024 bytes or less
 means the allocation needs review; absence of a warning is not proof that every
-path has been exercised. Keep issue #16 open until these measurements are
+path has been exercised. Keep issue #6 open until these measurements are
 recorded and the final allocation is justified. Host tests check diagnostics
 only and cannot measure ESP32 stack use.
 

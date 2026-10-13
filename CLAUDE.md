@@ -49,27 +49,30 @@ CODE_REVIEW_2026-06-09.md, AUDIT_2026-08-04.md, AUDIT_2026-10-05.md,
 INDEPENDENT_AUDIT_2026-10-05.md      Review history (see Current Status)
 ```
 
-## Current Status (as of 2026-10-06)
+## Current Status (as of 2026-10-13)
 
 Code is written and tested on both sides. Nothing is deployed, and the
 firmware hasn't been road-tested.
 
-- **Where status lives:** GitHub issues, not this file. Every audit finding
-  is an issue. Tracker **#29** covers the October audit (N1–N14) and **#18**
-  the August one (B1–B5, F1–F11). Check `gh issue list` before assuming
-  something is open or fixed.
+- **History:** this repo starts from a clean snapshot taken 2026-10-13.
+  Earlier commits, PRs and closed issues stay in a private archive repo,
+  so commit hashes and PR numbers in the audit docs point there.
+- **Where status lives:** GitHub issues, not this file. Every open audit
+  finding is an issue. Tracker **#1** covers the October audit (N1–N14)
+  and **#2** the August one (B1–B5, F1–F11). Check `gh issue list` before
+  assuming something is open or fixed.
 - **Audits:** `CODE_REVIEW_2026-06-09.md` → `AUDIT_2026-08-04.md` →
   `AUDIT_2026-10-05.md` (findings, fix-status table, bench results) →
-  `INDEPENDENT_AUDIT_2026-10-05.md` (merged in PR #31). The fix-status
-  table in `AUDIT_2026-10-05.md` covers only the first round of fixes;
-  later PRs (#30–#38) are recorded on the issues.
-- **Fixed:** every August finding except F11 (#16), and October N1–N8 and
+  `INDEPENDENT_AUDIT_2026-10-05.md`. The fix-status table in
+  `AUDIT_2026-10-05.md` covers only the first round of fixes; the trackers
+  have the rest.
+- **Fixed:** every August finding except F11 (#6), and October N1–N8 and
   N10–N12. N5 shipped without a commuting category, per the owner.
-- **Still open:** #24 (N9, deep sleep can unmount the FS mid-upload), #27
+- **Still open:** #3 (N9, deep sleep can unmount the FS mid-upload), #4
   (N13: the backup tooling is in `server/backup/`, but it isn't set up on
-  the server or restore-tested from a real off-host copy yet), #16 (F11, network stack sizing; needs
+  the server or restore-tested from a real off-host copy yet), #6 (F11, network stack sizing; needs
   measurements from a real upload), and the low-severity lists #5
-  (backend) and #17 (firmware).
+  (backend) and #7 (firmware).
 - **Firmware:** Stages 1–3 verified on hardware. Stage 4 compiles on ESP32
   core 3.3.11 (XPowersLib 0.3.3, TinyGPSPlus 1.0.3) with the bundled
   `partitions.csv` (2.375 MB LittleFS). Trip files are **GPX 1.0** at ~119 B/point (1.0 allows `<speed>` and
@@ -138,31 +141,31 @@ firmware hasn't been road-tested.
    test, and is safe to re-run. `install.sh --check` re-verifies later.
 2. **Check the viewer by hand** at `http://<host>:8091/`: annotate a
    trip and confirm it persists (the installer doesn't write annotations).
-3. **Set up backups** (#27): the installer's Backups step, or
-   `DEPLOY_DEBIAN.md` Step 10 by hand. #27 closes once that's done on the
+3. **Set up backups** (#4): the installer's Backups step, or
+   `DEPLOY_DEBIAN.md` Step 10 by hand. #4 closes once that's done on the
    real server and `restore.sh check` passes from the off-host copy.
 4. **Road test and shakedown.** The checklist is in `AUDIT_2026-10-05.md`
-   and #29: deep-sleep current, hot start after sleep, F10 through engine
+   and #1: deep-sleep current, hot start after sleep, F10 through engine
    crank and start-stop, the N1 jitter figure from a parked file, and the
    F11 stack measurement during a real upload (procedure in
    `firmware/README.md` → Network stack shakedown).
-5. **Remaining code:** N9 (#24), then the low lists #5 and #17.
+5. **Remaining code:** N9 (#3), then the low lists #5 and #7.
 
-When a PR fixes an audit issue, say "Fixes #N" and update tracker #29 (or
-#18 for August items).
+When a PR fixes an audit issue, say "Fixes #N" and update tracker #1 (or
+#2 for August items).
 
 ## Do Not
 
 - Put IRS classification logic in firmware — server-side only
 - Power SX1262 LoRa without antenna (RF damage risk)
 - Commit `secrets.h`, `.env`, or `viewer.env` to version control
-- Commit anything personal. The repo is going public eventually, so docs,
-  examples, tests and commit messages use placeholders (`<user>`, `<host>`,
+- Commit anything personal. The repo is public, so docs, examples, tests,
+  commit messages, issues and PRs use placeholders (`<user>`, `<host>`,
   `<username>`, `~\Documents\...`), never a real name, account path,
   email, SSID/MAC, home coordinates, or a photo with EXIF. Commit with the
   GitHub noreply email. `tools/check_pii.py` enforces this in CI; names
   come from the `PII_DENYLIST` secret or a gitignored `.pii-denylist`
-- Flip this repo to public. Older commits still carry a personal email and
-  account paths, and GitHub keeps every PR's commits under `refs/pull/*`,
-  which can't be rewritten. Publish a fresh repo with squashed or
-  rewritten history after `check_pii.py --history --commits HEAD` passes
+- Bring commits over from the private archive repo: no merge, cherry-pick,
+  or adding it as a remote. Its history carries a personal email and
+  account paths, which is why this repo started from a clean snapshot.
+  Copy file contents across instead, and run `check_pii.py` before pushing

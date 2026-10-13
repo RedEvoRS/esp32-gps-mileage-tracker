@@ -105,10 +105,10 @@ docker compose version      # expect v2.x
 
 ## Step 2 — Copy the `server/` directory over
 
-From **Windows PowerShell**, in the project folder:
+From **Windows PowerShell**, in your clone of this repo:
 
 ```powershell
-cd "~\Documents\Claude\Projects\GPS Milage Tracker without a Phone (ESP32)"
+cd "~\Documents\esp32-gps-mileage-tracker"
 scp -r server <user>@<host>:~/mileage-tracker
 ```
 
@@ -421,7 +421,7 @@ That's expected. Use the LAN IP for any curl tests from here on.
 On your Windows box:
 
 ```powershell
-cd "~\Documents\Claude\Projects\GPS Milage Tracker without a Phone (ESP32)\firmware"
+cd "~\Documents\esp32-gps-mileage-tracker\firmware"
 copy secrets.h.example 04_trip_logger\secrets.h
 ```
 

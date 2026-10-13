@@ -1,8 +1,12 @@
 # Independent code audit — 2026-10-05
 
+> This audit predates this repository. The commit hashes, branch and PR
+> numbers below belong to the project's earlier private repository, whose
+> history isn't public.
+
 Original audit baseline: `7a9d787f2ae26b3c47dc847efa1fe07d4a1fe3dc`.
 Updated against `main` at `444b2a537f3d479818540cad8f6dbebef8788131`,
-which includes merged [PR #30](https://github.com/RedEvoRS/GPS-Milage-Tracker-without-a-Phone--ESP32-/pull/30).
+which includes merged PR #30.
 This report accompanies proposed fixes on `codex/independent-audit`.
 The pull request is for human review and must remain unmerged unless the
 owner subsequently authorizes a merge.
