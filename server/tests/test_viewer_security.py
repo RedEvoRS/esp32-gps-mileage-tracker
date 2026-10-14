@@ -70,6 +70,7 @@ class ViewerSecurityTests(unittest.TestCase):
     def signed_in(self, csrf=True):
         with self.client.session_transaction() as sess:
             sess["user"] = self.viewer.VIEWER_USERNAME
+            sess["pw_tag"] = self.viewer._password_tag()
             if csrf:
                 sess["csrf"] = "known-token"
 
@@ -105,6 +106,33 @@ class ViewerSecurityTests(unittest.TestCase):
         self.assertEqual(self.client.post("/logout", data={
             "csrf_token": new_token,
         }).status_code, 302)
+
+    def test_new_password_hash_ends_existing_sessions(self):
+        self.client.post("/login", data={
+            "csrf_token": self.login_token(), "username": "driver",
+            "password": "test-password",
+        })
+        self.assertEqual(self.client.get("/").status_code, 200)
+        # Restarting with a new hash is a new module-level value.
+        with patch.object(self.viewer, "VIEWER_PASSWORD_HASH",
+                          generate_password_hash("new-password")):
+            response = self.client.get("/")
+            self.assertEqual(response.status_code, 302)
+            self.assertTrue(response.headers["Location"].startswith("/login"))
+            with self.client.session_transaction() as sess:
+                token = sess["csrf"]
+            self.assertEqual(self.client.post("/trip/2026-10/drive/annotate", data={
+                "csrf_token": token, "category": "business",
+            }).status_code, 401)
+            self.assertEqual(self.client.post("/login", data={
+                "csrf_token": self.login_token(), "username": "driver",
+                "password": "new-password",
+            }).status_code, 302)
+            self.assertEqual(self.client.get("/").status_code, 200)
+        # A session from before sessions carried the tag is logged out too.
+        with self.client.session_transaction() as sess:
+            del sess["pw_tag"]
+        self.assertEqual(self.client.get("/").status_code, 302)
 
     def test_unicode_username_is_a_failed_login(self):
         response = self.client.post("/login", data={

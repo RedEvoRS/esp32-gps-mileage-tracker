@@ -47,6 +47,7 @@ class ViewerRecords(unittest.TestCase):
         self.client = self.viewer.app.test_client()
         with self.client.session_transaction() as session:
             session["user"] = "driver"
+            session["pw_tag"] = self.viewer._password_tag()
             session["csrf"] = "test-csrf"
 
     def trip(self, name, start, miles=1, category="", destination=""):

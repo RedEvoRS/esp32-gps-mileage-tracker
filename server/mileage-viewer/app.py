@@ -28,6 +28,8 @@ Authentication:
     from the environment and be stable: gunicorn runs multiple workers,
     and a per-process random key would mean a session minted by worker A
     is rejected by worker B.
+  - A session is tied to the password hash it logged in under, so setting
+    a new VIEWER_PASSWORD_HASH logs out everyone already logged in.
   - Repeated failed logins lock out the source IP. The counter lives in
     SQLite rather than process memory so all workers share one view of it.
   - This remains a LAN-only tool. The login is defence in depth against
@@ -321,8 +323,28 @@ def _csrf_token():
     return token
 
 
+def _password_tag():
+    """Short HMAC of the password hash, stored in the session at login.
+
+    A session counts only while its tag matches, so a new
+    VIEWER_PASSWORD_HASH logs out every existing session, not just future
+    logins. Keyed with the secret key because the session cookie is signed
+    but readable, and it shouldn't carry anything derived from the hash
+    alone. The signature already stops forgery, so 128 bits is plenty.
+    """
+    return hmac.new(
+        VIEWER_SECRET_KEY.encode("utf-8"),
+        VIEWER_PASSWORD_HASH.encode("utf-8"),
+        "sha256",
+    ).hexdigest()[:32]
+
+
 def _is_logged_in():
-    return bool(VIEWER_USERNAME) and session.get("user") == VIEWER_USERNAME
+    return (
+        bool(VIEWER_USERNAME)
+        and session.get("user") == VIEWER_USERNAME
+        and _safe_equal(session.get("pw_tag", ""), _password_tag())
+    )
 
 
 def _valid_csrf():
@@ -835,6 +857,7 @@ def login():
             _clear_failures(ip)
             session.clear()  # new session id on privilege change
             session["user"] = VIEWER_USERNAME
+            session["pw_tag"] = _password_tag()
             session["csrf"] = secrets.token_urlsafe(32)
             session.permanent = True
             return redirect(_safe_next(request.args.get("next")) or url_for("index"))

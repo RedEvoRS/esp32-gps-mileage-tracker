@@ -249,8 +249,9 @@ everywhere, and it has to be identical across workers — which is why
 it's configured rather than randomly generated at startup.
 
 To change the password later: regenerate the hash, update `viewer.env`,
-then `docker compose up -d mileage-viewer`. Existing sessions survive
-unless you also rotate the secret key.
+then `docker compose up -d mileage-viewer`. That logs out every
+existing session, so anyone still logged in has to sign in again with
+the new password.
 
 ## Timezone
 
