@@ -451,11 +451,11 @@ def _summary_problem(summary):
 
 
 def read_summary(json_path):
-    """Load a trip's summary JSON, or return None if it can't be trusted.
+    """Load a trip's summary JSON: (summary, None), or (None, why not).
 
     Ingest writes summaries atomically, so a bad one means disk damage or
     a hand edit. One bad file must not 500 the trip list and both exports,
-    so it's skipped, and logged so the trip doesn't vanish silently.
+    so callers leave its miles out and report the trip as unreadable.
     """
     try:
         with open(json_path, "r", encoding="utf-8") as fh:
@@ -465,51 +465,54 @@ def read_summary(json_path):
     else:
         problem = _summary_problem(summary)
     if problem:
-        app.logger.warning("Skipping trip summary %s: %s", json_path, problem)
-        return None
+        app.logger.warning("Unreadable trip summary %s: %s", json_path, problem)
+        return None, problem
     return {
         field: summary[field]
         for field in SUMMARY_TEXT_FIELDS + SUMMARY_NUMBER_FIELDS
         if field in summary
-    }
+    }, None
 
 
 def load_trips():
     """Scan DATA_ROOT for *.json summaries and join annotations.
 
-    Returns a list of trip dicts sorted by start_time descending. Each
-    dict carries the summary fields plus: id, ym, trip_key, category,
-    purpose_note, destination, has_gpx.
+    Returns (trips, unreadable). trips is sorted by start_time descending,
+    and each dict carries the summary fields plus: id, ym, trip_key,
+    category, purpose_note, destination, has_gpx. unreadable holds the
+    trips whose summary read_summary() rejected, sorted by trip_key, with
+    the same keys minus the summary fields, plus problem. Their miles are
+    unknown, so they're reported, never counted.
     """
     annotations = get_annotations()
-    trips = []
+    trips, unreadable = [], []
     if not DATA_ROOT.exists():
-        return trips
+        return trips, unreadable
 
     for json_path in DATA_ROOT.glob("*/*.json"):
         ym = json_path.parent.name
         trip_id = json_path.stem
-        summary = read_summary(json_path)
-        if summary is None:
-            continue
-
         trip_key = f"{ym}/{trip_id}"
         ann = annotations.get(trip_key, {})
-        trips.append(
-            {
-                **summary,
-                "id": trip_id,
-                "ym": ym,
-                "trip_key": trip_key,
-                "category": ann.get("category", ""),
-                "purpose_note": ann.get("purpose_note", ""),
-                "destination": ann.get("destination", ""),
-                "has_gpx": (json_path.with_suffix(".gpx")).exists(),
-            }
-        )
+        summary, problem = read_summary(json_path)
+        trip = {
+            **(summary or {}),
+            "id": trip_id,
+            "ym": ym,
+            "trip_key": trip_key,
+            "category": ann.get("category", ""),
+            "purpose_note": ann.get("purpose_note", ""),
+            "destination": ann.get("destination", ""),
+            "has_gpx": (json_path.with_suffix(".gpx")).exists(),
+        }
+        if problem:
+            unreadable.append({**trip, "problem": problem})
+        else:
+            trips.append(trip)
 
     trips.sort(key=lambda t: t.get("start_time") or "", reverse=True)
-    return trips
+    unreadable.sort(key=lambda t: t["trip_key"])
+    return trips, unreadable
 
 
 # ---------------------------------------------------------------------
@@ -579,10 +582,24 @@ def selected_year():
     return int(raw_year) if raw_year else None
 
 
+def _may_start_in(ym, year):
+    """Whether a trip filed under folder ym could have started in year.
+
+    Ingest files each trip under its local END month, and a New Year's
+    Eve drive can end in January. A trip with an unreadable summary has no
+    start time, so its folder is the only clue to its year.
+    """
+    return ym.startswith(f"{year}-") or ym == f"{year + 1}-01"
+
+
 def selected_trips():
-    """Use the trip's local start year, never its storage directory/end date."""
+    """Use the trip's local start year, never its storage directory/end date.
+
+    Returns (trips, unreadable, year, years). Unreadable trips have no
+    start time, so they're the exception: they go by folder.
+    """
     year = selected_year()
-    trips = load_trips()
+    trips, unreadable = load_trips()
     years = set()
     selected = []
     for trip in trips:
@@ -593,7 +610,8 @@ def selected_trips():
             selected.append(trip)
     if year:
         years.add(year)
-    return selected, year, sorted(years, reverse=True)
+        unreadable = [t for t in unreadable if _may_start_in(t["ym"], year)]
+    return selected, unreadable, year, sorted(years, reverse=True)
 
 
 def mileage_totals(trips):
@@ -637,6 +655,9 @@ BASE_CSS = """
   .personal { background: #e7f5ff; color: #1971c2; }
   .other    { background: #fff3bf; color: #e67700; }
   .muted { color: #868e96; }
+  .warn { background: #fff5f5; color: #c92a2a; border: 1px solid #ffc9c9;
+          padding: 10px 14px; border-radius: 6px; margin-bottom: 16px; font-size: 14px; }
+  .warn ul { margin: 6px 0 0; padding-left: 20px; }
   .btn { display: inline-block; background: #1864ab; color: #fff; padding: 8px 14px;
          border-radius: 6px; text-decoration: none; border: none; cursor: pointer; font-size: 14px; }
   .btn.secondary { background: #495057; }
@@ -693,6 +714,19 @@ LIST_HTML = """
   </form>
 </header>
 <div class="wrap">
+  {% if unreadable %}
+  <div class="warn" role="alert">
+    <b>{{ unreadable|length }} trip summary file(s) can't be read.</b>
+    Their miles can't be counted, so the totals below may be short. The
+    exports list these trips as unreadable, without miles. To rebuild a
+    summary from its GPX, see DEPLOY_DEBIAN.md → Troubleshooting.
+    <ul>
+      {% for u in unreadable %}
+      <li><code>{{ u.trip_key }}.json</code>{% if not u.has_gpx %} (no GPX either){% endif %}: {{ u.problem }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
   <div class="toolbar">
     <form method="get">
       <label for="year">Year (trip start in {{ timezone }})</label>
@@ -878,9 +912,9 @@ def logout():
 
 @app.route("/")
 def index():
-    trips, year, years = selected_trips()
+    trips, unreadable, year, years = selected_trips()
     return render_template_string(
-        LIST_HTML, trips=trips, year=year, years=years,
+        LIST_HTML, trips=trips, unreadable=unreadable, year=year, years=years,
         totals=mileage_totals(trips), timezone=DISPLAY_TZ_NAME,
     )
 
@@ -891,12 +925,12 @@ def trip_view(ym, trip_id):
     gpx_path, json_path = _safe_trip_paths(ym, trip_id)
     if not json_path.exists():
         abort(404)
-    summary = read_summary(json_path)
-    if summary is None:
-        # The trip list and exports leave it out too; the log says why.
+    summary, problem = read_summary(json_path)
+    if problem:
         abort(404, description=(
-            "This trip's summary file can't be read, so the trip list and "
-            "exports leave it out. The viewer log says what's wrong with it."
+            f"This trip's summary file can't be read ({problem}), so its "
+            "miles can't be counted. The trip list and exports flag it. To "
+            "rebuild it from the GPX, see DEPLOY_DEBIAN.md → Troubleshooting."
         ))
     ann = get_annotations().get(f"{ym}/{trip_id}", {})
     t = {
@@ -1029,15 +1063,38 @@ def _xlsx_literal_text(row):
             cell.data_type = "s"
 
 
+UNREADABLE_COLUMNS = ("trip_id", "gpx_file", "category", "purpose_note", "destination")
+
+
+def _unreadable_values(t):
+    """Export fields for a trip whose summary can't be read.
+
+    Just what identifies it and what was typed for it. Its miles are
+    unknown, so they stay blank rather than reading as zero.
+    """
+    return {
+        "trip_id": t["id"],
+        "gpx_file": f"{t['id']}.gpx" if t["has_gpx"] else "",
+        "category": t["category"],
+        "purpose_note": t["purpose_note"],
+        "destination": t["destination"],
+    }
+
+
 @app.route("/export.csv")
 def export_csv():
-    trips, year, _ = selected_trips()
+    trips, unreadable, year, _ = selected_trips()
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow([name for name, _ in EXPORT_COLUMNS] + ["row_type"])
     for t in trips:
         t = {**t, **track_endpoints(t)}
         writer.writerow([_csv_safe(fn(t)) for _, fn in EXPORT_COLUMNS] + ["trip"])
+    for t in unreadable:
+        values = _unreadable_values(t)
+        writer.writerow(
+            [_csv_safe(values.get(name, "")) for name, _ in EXPORT_COLUMNS] + ["unreadable"]
+        )
     for category, miles in mileage_totals(trips).items():
         # Keep the CSV rectangular and mark totals explicitly, so consumers
         # can select row_type=trip without double-counting summary rows.
@@ -1054,7 +1111,7 @@ def export_csv():
 
 @app.route("/export.xlsx")
 def export_xlsx():
-    trips, year, _ = selected_trips()
+    trips, unreadable, year, _ = selected_trips()
     wb = Workbook()
     ws = wb.active
     ws.title = "Mileage"
@@ -1068,6 +1125,15 @@ def export_xlsx():
     for category, miles in mileage_totals(trips).items():
         totals.append([year or "All years", DISPLAY_TZ_NAME, category, miles])
         _xlsx_literal_text(totals[totals.max_row])
+    if unreadable:
+        # A sheet of their own: Mileage has no row_type column, so a row
+        # with blank miles there would pass for a real trip.
+        sheet = wb.create_sheet("Unreadable trips")
+        sheet.append(list(UNREADABLE_COLUMNS))
+        for t in unreadable:
+            values = _unreadable_values(t)
+            sheet.append([values[name] for name in UNREADABLE_COLUMNS])
+            _xlsx_literal_text(sheet[sheet.max_row])
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
