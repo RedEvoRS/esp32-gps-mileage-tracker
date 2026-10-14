@@ -505,6 +505,24 @@ def _atomic_write_json(target, obj):
     _atomic_write_bytes(target, payload)
 
 
+def _stored_summary(json_file):
+    """A trip's stored summary as a dict, or None if it's damaged.
+
+    Damaged means it isn't a JSON object with the trip and device IDs as
+    text, so it can't say whose trip this is. Failing to read the file at
+    all (permissions, I/O) isn't damage: that raises, and the upload 500s.
+    """
+    try:
+        summary = json.loads(json_file.read_bytes())
+    except ValueError:  # bad JSON or bad UTF-8
+        return None
+    if not isinstance(summary, dict) or not all(
+        isinstance(summary.get(key), str) for key in ("trip_id", "device_id")
+    ):
+        return None
+    return summary
+
+
 def _discard_body():
     """Read and drop an unread request body, so an early reply arrives.
 
@@ -682,13 +700,21 @@ def upload_trip():
             if gpx_file.exists() and gpx_file.read_bytes() != raw:
                 return jsonify({"error": "trip ID already contains different GPX data"}), 409
             if json_file.exists():
-                existing = json.loads(json_file.read_bytes())
-                if (existing.get("trip_id") != trip_id
-                        or existing.get("device_id") != device_id):
+                existing = _stored_summary(json_file)
+                if existing is None:
+                    # A damaged summary can't say whose trip this is, but a
+                    # stored GPX identical to this upload proves it's the
+                    # same trip, so rebuild the summary from it. With no
+                    # stored GPX, nothing proves it.
+                    if not gpx_file.exists():
+                        return jsonify({"error": "trip ID has a damaged summary and no GPX to match"}), 409
+                    app.logger.warning("Rebuilding the damaged summary of trip %s", safe_id)
+                elif existing["trip_id"] != trip_id or existing["device_id"] != device_id:
                     return jsonify({"error": "trip ID belongs to another trip or device"}), 409
-                # Keep the original receipt metadata on harmless retries.
-                record["_received_at"] = existing.get("_received_at", record["_received_at"])
-                record["_received_from"] = existing.get("_received_from", record["_received_from"])
+                else:
+                    # Keep the original receipt metadata on harmless retries.
+                    record["_received_at"] = existing.get("_received_at", record["_received_at"])
+                    record["_received_from"] = existing.get("_received_from", record["_received_from"])
             # GPX first: failed summary writes can be repaired by a retry.
             # Each write is durable before a 200 lets firmware delete its copy.
             if not gpx_file.exists():

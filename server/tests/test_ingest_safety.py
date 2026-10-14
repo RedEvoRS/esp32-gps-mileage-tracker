@@ -91,6 +91,45 @@ class UploadSafety(unittest.TestCase):
         self.assertEqual(gpx.read_bytes(), body())
         self.assertEqual(json.loads(summary.read_bytes())["num_points"], 2)
 
+    def test_retry_rebuilds_a_damaged_summary_when_the_gpx_matches(self):
+        gpx, summary = self.saved_pair(self.upload())
+        for damage in (b'{"trip_id": "audit-tr', b'\xff\xfe{}', b'[1]', b'{}',
+                       b'{"trip_id": 1, "device_id": "test-device"}'):
+            with self.subTest(damage=damage):
+                summary.write_bytes(damage)
+                # A different GPX under the same ID still can't take it over.
+                self.assertEqual(self.upload(body(3)).status_code, 409)
+                self.assertEqual(summary.read_bytes(), damage)
+                with self.assertLogs(self.ing.app.logger, "WARNING") as logs:
+                    self.assertEqual(self.upload().status_code, 200)
+                self.assertIn("damaged summary", logs.output[0])
+                record = json.loads(summary.read_bytes())
+                self.assertEqual((record["trip_id"], record["device_id"], record["num_points"]),
+                                 ("audit-trip", "test-device", 2))
+                self.assertEqual(gpx.read_bytes(), body())
+
+    def test_damaged_summary_without_its_gpx_is_409_and_kept(self):
+        gpx, summary = self.saved_pair(self.upload())
+        gpx.unlink()
+        summary.write_bytes(b"[1]")
+        response = self.upload()
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("damaged summary", response.get_json()["error"])
+        self.assertEqual(summary.read_bytes(), b"[1]")
+        self.assertFalse(gpx.exists())
+
+    def test_unreadable_summary_file_is_a_500_not_a_rebuild(self):
+        gpx, summary = self.saved_pair(self.upload())
+        before = summary.read_bytes()
+        real_read = Path.read_bytes
+        def read_bytes(path):
+            if path == summary:
+                raise PermissionError("denied")
+            return real_read(path)
+        with mock.patch.object(Path, "read_bytes", read_bytes):
+            self.assertEqual(self.upload().status_code, 500)
+        self.assertEqual(summary.read_bytes(), before)
+
     def test_failed_file_sync_is_not_acknowledged(self):
         with mock.patch.object(self.ing, "_sync_directory"), \
                 mock.patch.object(self.ing.os, "fsync", side_effect=OSError("sync failure")):
