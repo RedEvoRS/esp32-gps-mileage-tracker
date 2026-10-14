@@ -365,6 +365,11 @@ def _csrf_protect():
     requests. /login validates its own token inside the view, where it can
     show a friendly message instead of a bare 400.
     """
+    # No route matched, so no view will run and there is nothing to
+    # protect: let Flask answer 404 (or 405) instead of a misleading 400.
+    # Anonymous callers never get here, so this can't be used to probe.
+    if request.endpoint is None:
+        return None
     if request.method == "POST" and request.endpoint not in PUBLIC_ENDPOINTS:
         if not _valid_csrf():
             abort(400)

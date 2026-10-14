@@ -123,6 +123,21 @@ class ViewerSecurityTests(unittest.TestCase):
         with self.client.session_transaction() as sess:
             self.assertIn("user", sess)
 
+    def test_logged_in_post_to_unknown_path_is_404_not_400(self):
+        self.signed_in()
+        for data in ({}, {"csrf_token": "known-token"}):
+            with self.subTest(data=data):
+                self.assertEqual(self.client.post("/no-such-page", data=data).status_code, 404)
+                # A real page that doesn't take POST is a 405, token or not.
+                self.assertEqual(self.client.post("/", data=data).status_code, 405)
+        # Real POST routes still need the token.
+        self.assertEqual(self.client.post("/trip/2026-10/drive/annotate").status_code, 400)
+        # Anonymous callers can't tell missing paths from real ones.
+        anonymous = self.viewer.app.test_client()
+        for path in ("/no-such-page", "/trip/2026-10/drive/annotate"):
+            with self.subTest(path=path):
+                self.assertEqual(anonymous.post(path).status_code, 401)
+
     def test_concurrent_failures_are_all_counted(self):
         with patch.object(self.viewer, "MAX_FAILS", 1000):
             with ThreadPoolExecutor(max_workers=8) as pool:
