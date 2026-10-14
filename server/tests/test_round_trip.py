@@ -104,6 +104,26 @@ class TripRoundTrip(unittest.TestCase):
             self.assertEqual(summary.read_bytes(), original_summary)
             self.assertEqual(viewer.get_annotations()[key]["purpose_note"], "=1+2")
 
+            # A damaged summary is flagged, and the repair in DEPLOY_DEBIAN.md
+            # (send the stored GPX again, X-Trip-Id = its file name) brings
+            # the trip back with its annotation.
+            summary.write_bytes(original_summary[:40])
+            with self.assertLogs(viewer.app.logger, "WARNING"):
+                self.assertIn(f"{key}.json</code>", client.get("/").get_data(as_text=True))
+            with self.assertLogs(ingest.app.logger, "WARNING"):
+                repaired = uploader.post("/upload", data=gpx.read_bytes(),
+                                         headers=headers | {"X-Trip-Id": gpx.stem})
+            self.assertEqual(repaired.status_code, 200)
+            self.assertEqual(repaired.json["stored_as"], uploaded.json["stored_as"])
+            rebuilt = json.loads(summary.read_bytes())
+            self.assertEqual({k: rebuilt[k] for k in ("trip_id", "device_id", "distance_miles")},
+                             {k: record[k] for k in ("trip_id", "device_id", "distance_miles")})
+            page = client.get("/").get_data(as_text=True)
+            self.assertNotIn("can't be read", page)
+            self.assertIn(f"/trip/{key}", page)
+            self.assertEqual(viewer.get_annotations()[key]["purpose_note"], "=1+2")
+            self.assertEqual(gpx.read_bytes(), raw)
+
 
 if __name__ == "__main__":
     unittest.main()

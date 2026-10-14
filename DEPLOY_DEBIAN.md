@@ -686,14 +686,11 @@ the server (or your browser) can't reach `tile.openstreetmap.org`.
 **The trip list says a trip summary file can't be read** — the `.json` next
 to that trip's GPX is damaged (disk trouble or a hand edit), so the viewer
 can't count its miles, and the exports list it as unreadable. The GPX is the
-record, and ingest rebuilds the summary from it. Ingest won't replace a
-summary it can't read, so move the bad one aside first, then send the GPX
-again:
+record: send it to ingest again, and ingest rebuilds the summary from it.
 
 ```bash
 cd ~/mileage-tracker
 TRIP=2026-10/2026-10-05T16-00-00Z      # the path from the warning, minus .json
-mv data/$TRIP.json data/$TRIP.json.bad
 TOKEN=$(grep INGEST_AUTH_TOKEN .env | cut -d= -f2)
 curl -X POST http://<host>:8090/upload \
   -H "Authorization: Bearer $TOKEN" \
@@ -705,11 +702,18 @@ curl -X POST http://<host>:8090/upload \
 
 `X-Device-Id` is the firmware's `DEVICE_ID`, and `X-Trip-Id` keeps the
 file's name. The reply's `stored_as` should be `$TRIP.gpx`; the trip is then
-back in the list with its annotations, and you can delete the `.bad` file.
-If `mv` is refused, your user isn't UID 1000 (Step 3), so use `sudo mv`. If
-the warning says there's no GPX either, the trip can't be rebuilt from this
-box: copy both files back from a snapshot taken before the damage, in
-`~/mileage-backups/snapshots/<time>/data/` (Step 10).
+back in the list with its annotations. Ingest rebuilds a damaged summary
+only when the GPX it already holds matches the upload byte for byte, since
+that's what proves it's the same trip.
+
+If the warning says there's no GPX either, put the GPX back from a backup
+snapshot first (Step 10), then send it as above. Without it, ingest answers
+409 (`trip ID has a damaged summary and no GPX to match`).
+
+```bash
+ls ~/mileage-backups/snapshots/*/data/$TRIP.gpx      # the snapshots that have it
+cp -p ~/mileage-backups/snapshots/<time>/data/$TRIP.gpx data/$TRIP.gpx
+```
 
 **Port already in use** — `sudo ss -tlnp | grep -E '8090|8091'`, then change
 the host-side port mapping in `docker-compose.yml`.
