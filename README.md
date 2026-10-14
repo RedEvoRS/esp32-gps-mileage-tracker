@@ -1,16 +1,21 @@
 # GPS Mileage Tracker (without a phone)
 
-If you deduct business driving, the IRS wants a log: the date, how far you
-went, where, and why. There are plenty of apps that will keep one for you,
-but they need your phone in the car, usually want a subscription, and keep a
-copy of everywhere you've driven on somebody else's server.
+Deducting business mileage requires a log: the date, distance, destination,
+and business purpose of each trip. Phone apps will keep one, but they depend
+on the phone being in the car with location access, most are subscriptions,
+and the location history ends up on the vendor's servers.
 
-This is the version I wanted instead. It's a small ESP32 board with a GPS
-receiver that sits in the car, powered from a USB port. When the car starts
-moving it starts recording, and when I get home it finds the WiFi and sends
-the trip to a little server on my network. Whenever I get around to it, I
-open a web page, check each trip on a map, type in what it was for, and
-export a spreadsheet at tax time. The location data never leaves the house.
+This project moves the logging onto dedicated hardware. A LilyGO T-Beam
+(ESP32 with a u-blox NEO-M8N) runs from a USB port in the car, detects the
+start and end of each trip from GPS speed, and writes the track as GPX to
+on-board flash. Once it sees the home WiFi network, it uploads whatever
+trips it has stored.
+
+The server side is two small Flask services on the LAN. One accepts the
+uploads and computes trip distance. The other shows each trip on a map,
+records its business purpose, and exports the log as CSV or XLSX. Tracks and
+annotations stay on the local network; the only outside request is for
+OpenStreetMap tiles when the viewer draws a map.
 
 ## Where it's at
 
