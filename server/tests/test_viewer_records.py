@@ -268,15 +268,35 @@ class ViewerRecords(unittest.TestCase):
 
             detail = self.client.get("/trip/2027-01/bad").get_data(as_text=True)
             self.assertIn("(not a JSON object)", detail)
-        # Nothing unreadable: no warning and no extra sheet.
-        (self.month / "bad.json").unlink()
-        (old / "old.json").unlink()
+        # Nothing unreadable: no warning and no extra sheet. (The GPX goes
+        # too: one without a summary is a trip whose summary is missing.)
+        for path in (self.month / "bad.json", self.month / "bad.gpx", old / "old.json"):
+            path.unlink()
         self.assertNotIn("file(s) can't be read", self.client.get("/").get_data(as_text=True))
         workbook = load_workbook(io.BytesIO(self.client.get("/export.xlsx").data))
         try:
             self.assertEqual(workbook.sheetnames, ["Mileage", "Totals"])
         finally:
             workbook.close()
+
+    def test_gpx_without_a_summary_is_reported_as_unreadable(self):
+        self.trip("good", "2026-08-01T12:00:00Z", 2)
+        (self.month / "good.gpx").write_bytes(b"<gpx/>")
+        (self.month / "orphan.gpx").write_bytes(b"<gpx/>")
+        self.viewer.upsert_annotation("2027-01/orphan", "business", "Client visit", "")
+        with self.assertLogs(self.viewer.app.logger, "WARNING"):
+            page = self.client.get("/").get_data(as_text=True)
+            self.assertIn("2027-01/orphan.json</code>: the file is missing", page)
+            self.assertNotIn("good.json</code>", page)
+            rows = self.csv_rows("?year=2026")
+            self.assertEqual([(r["row_type"], r["trip_id"], r["gpx_file"], r["purpose_note"])
+                              for r in rows if r["row_type"] != "total"],
+                             [("trip", "good", "", ""),
+                              ("unreadable", "orphan", "orphan.gpx", "Client visit")])
+            detail = self.client.get("/trip/2027-01/orphan")
+            self.assertEqual(detail.status_code, 404)
+            self.assertIn("(the file is missing)", detail.get_data(as_text=True))
+        self.assertEqual(self.client.get("/trip/2027-01/nothing").status_code, 404)
 
     def test_legacy_database_migration_preserves_rows_and_is_concurrent_safe(self):
         path = self.root / "legacy.db"

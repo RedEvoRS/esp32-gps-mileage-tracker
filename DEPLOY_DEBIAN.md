@@ -684,8 +684,9 @@ the page frame works offline; only OSM *tiles* need internet. Blank tiles =
 the server (or your browser) can't reach `tile.openstreetmap.org`.
 
 **The trip list says a trip summary file can't be read** — the `.json` next
-to that trip's GPX is damaged (disk trouble or a hand edit), so the viewer
-can't count its miles, and the exports list it as unreadable. The GPX is the
+to that trip's GPX is damaged or missing (disk trouble, a hand edit, or a
+summary write that failed after the GPX was saved), so the viewer can't
+count its miles, and the exports list it as unreadable. The GPX is the
 record: send it to ingest again, and ingest rebuilds the summary from it.
 
 ```bash
@@ -702,9 +703,9 @@ curl -X POST http://<host>:8090/upload \
 
 `X-Device-Id` is the firmware's `DEVICE_ID`, and `X-Trip-Id` keeps the
 file's name. The reply's `stored_as` should be `$TRIP.gpx`; the trip is then
-back in the list with its annotations. Ingest rebuilds a damaged summary
-only when the GPX it already holds matches the upload byte for byte, since
-that's what proves it's the same trip.
+back in the list with its annotations. Ingest rebuilds a damaged or missing
+summary only when the GPX it already holds matches the upload byte for byte,
+since that's what proves it's the same trip.
 
 If the warning says there's no GPX either, put the GPX back from a backup
 snapshot first (Step 10), then send it as above. Without it, ingest answers

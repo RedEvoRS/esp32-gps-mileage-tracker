@@ -460,6 +460,8 @@ def read_summary(json_path):
     try:
         with open(json_path, "r", encoding="utf-8") as fh:
             summary = json.load(fh)
+    except FileNotFoundError:
+        problem = "the file is missing"
     except (OSError, ValueError) as exc:  # ValueError: bad JSON or bad UTF-8
         problem = str(exc)
     else:
@@ -475,21 +477,28 @@ def read_summary(json_path):
 
 
 def load_trips():
-    """Scan DATA_ROOT for *.json summaries and join annotations.
+    """Scan DATA_ROOT for trips and join annotations.
 
     Returns (trips, unreadable). trips is sorted by start_time descending,
     and each dict carries the summary fields plus: id, ym, trip_key,
     category, purpose_note, destination, has_gpx. unreadable holds the
-    trips whose summary read_summary() rejected, sorted by trip_key, with
-    the same keys minus the summary fields, plus problem. Their miles are
-    unknown, so they're reported, never counted.
+    trips whose summary read_summary() rejected or couldn't find, sorted
+    by trip_key, with the same keys minus the summary fields, plus
+    problem. Their miles are unknown, so they're reported, never counted.
     """
     annotations = get_annotations()
     trips, unreadable = [], []
     if not DATA_ROOT.exists():
         return trips, unreadable
 
-    for json_path in DATA_ROOT.glob("*/*.json"):
+    # A GPX with no summary next to it is a trip too. Ingest writes the GPX
+    # first, so a failed or lost summary write leaves one behind. (A page
+    # load in the middle of an upload can catch one for a moment, too.)
+    json_paths = [*DATA_ROOT.glob("*/*.json"), *(
+        gpx.with_suffix(".json") for gpx in DATA_ROOT.glob("*/*.gpx")
+        if not gpx.with_suffix(".json").exists()
+    )]
+    for json_path in json_paths:
         ym = json_path.parent.name
         trip_id = json_path.stem
         trip_key = f"{ym}/{trip_id}"
@@ -923,7 +932,7 @@ def index():
 def trip_view(ym, trip_id):
     year = selected_year()
     gpx_path, json_path = _safe_trip_paths(ym, trip_id)
-    if not json_path.exists():
+    if not json_path.exists() and not gpx_path.exists():
         abort(404)
     summary, problem = read_summary(json_path)
     if problem:
