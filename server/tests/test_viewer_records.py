@@ -213,8 +213,70 @@ class ViewerRecords(unittest.TestCase):
             "trip_id": "extra", "distance_miles": 1.5, "bbox": None, "start_latitude": {},
         }), encoding="utf-8")
         self.assertEqual(self.viewer.read_summary(self.month / "extra.json"),
-                         {"trip_id": "extra", "distance_miles": 1.5})
+                         ({"trip_id": "extra", "distance_miles": 1.5}, None))
         self.assertEqual(self.client.get("/export.xlsx").status_code, 200)
+
+    def test_unreadable_summary_is_reported_on_the_list_and_in_exports(self):
+        self.trip("good", "2026-08-01T12:00:00Z", 2, "business")
+        # Filed under January 2027 (its end month), so it may have started
+        # on New Year's Eve 2026. Its annotation outlived the summary.
+        (self.month / "bad.json").write_bytes(b'[1]')
+        (self.month / "bad.gpx").write_bytes(b"<gpx/>")
+        self.viewer.upsert_annotation("2027-01/bad", "business", "=1+2", "Client")
+        old = self.viewer.DATA_ROOT / "2025-06"
+        old.mkdir(exist_ok=True)
+        self.addCleanup(lambda: [p.unlink() for p in old.iterdir()])
+        (old / "old.json").write_bytes(b'{"distance_mi')
+
+        with self.assertLogs(self.viewer.app.logger, "WARNING"):
+            for year, expected in (("", {"2025-06/old", "2027-01/bad"}),
+                                   ("2027", {"2027-01/bad"}), ("2026", {"2027-01/bad"}),
+                                   ("2025", {"2025-06/old"}), ("2028", set())):
+                with self.subTest(year=year):
+                    page = self.client.get("/", query_string={"year": year}).get_data(as_text=True)
+                    shown = {key for key in ("2025-06/old", "2027-01/bad") if f"{key}.json" in page}
+                    self.assertEqual(shown, expected)
+                    self.assertEqual("file(s) can't be read" in page, bool(expected))
+                    rows = self.csv_rows(f"?year={year}")
+                    self.assertEqual({r["trip_id"] for r in rows if r["row_type"] == "unreadable"},
+                                     {key.split("/")[1] for key in expected})
+
+            page = self.client.get("/?year=2026").get_data(as_text=True)
+            self.assertIn("2027-01/bad.json</code>: not a JSON object", page)
+            page = self.client.get("/?year=2025").get_data(as_text=True)
+            self.assertIn("2025-06/old.json</code> (no GPX either): ", page)
+
+            rows = self.csv_rows("?year=2026")
+            bad = next(r for r in rows if r["row_type"] == "unreadable")
+            self.assertEqual((bad["trip_id"], bad["gpx_file"], bad["category"],
+                              bad["purpose_note"], bad["destination"]),
+                             ("bad", "bad.gpx", "business", "'=1+2", "Client"))
+            self.assertEqual((bad["distance_miles"], bad["date"]), ("", ""))
+            totals = {r["category"]: r["distance_miles"] for r in rows if r["row_type"] == "total"}
+            self.assertEqual(totals["all"], "2.0")
+
+            workbook = load_workbook(io.BytesIO(self.client.get("/export.xlsx?year=2026").data))
+            try:
+                self.assertEqual(workbook.sheetnames, ["Mileage", "Totals", "Unreadable trips"])
+                header, row = workbook["Unreadable trips"].iter_rows()
+                self.assertEqual([c.value for c in header], list(self.viewer.UNREADABLE_COLUMNS))
+                self.assertEqual([c.value for c in row], ["bad", "bad.gpx", "business", "=1+2", "Client"])
+                self.assertEqual(row[3].data_type, "s")
+                self.assertEqual(workbook["Mileage"].max_row, 2)
+            finally:
+                workbook.close()
+
+            detail = self.client.get("/trip/2027-01/bad").get_data(as_text=True)
+            self.assertIn("(not a JSON object)", detail)
+        # Nothing unreadable: no warning and no extra sheet.
+        (self.month / "bad.json").unlink()
+        (old / "old.json").unlink()
+        self.assertNotIn("file(s) can't be read", self.client.get("/").get_data(as_text=True))
+        workbook = load_workbook(io.BytesIO(self.client.get("/export.xlsx").data))
+        try:
+            self.assertEqual(workbook.sheetnames, ["Mileage", "Totals"])
+        finally:
+            workbook.close()
 
     def test_legacy_database_migration_preserves_rows_and_is_concurrent_safe(self):
         path = self.root / "legacy.db"

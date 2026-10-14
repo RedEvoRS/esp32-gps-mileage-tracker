@@ -175,7 +175,8 @@ What it does:
 
 Years are based on **trip start in `DISPLAY_TZ`**, including at the New Year
 boundary. A trip crossing midnight belongs entirely to its start year; it
-is not split. The storage folder is not used for filtering. Trips with
+is not split. The storage folder is not used for filtering, except for
+unreadable summaries (below). Trips with
 missing or invalid start dates appear only under All years. Direct exports
 accept `?year=2026`; omit `year` for all years. Empty years export headers
 and zero totals. Totals cover the recorded trips in the selection, not an
@@ -189,6 +190,16 @@ the totals as trips.** XLSX keeps one trip per row on the `Mileage` sheet
 and puts year, display timezone, and totals on a separate `Totals` sheet.
 Totals are summed before rounding to three decimal places, matching stored
 distance precision. Unclassified totals include trips without a category.
+
+A trip whose summary file can't be read (damaged on disk, or edited by
+hand) has no miles the viewer can count. The trip list shows a warning
+naming it and why, the CSV lists it with `row_type=unreadable` and blank
+miles, and the XLSX lists it on an `Unreadable trips` sheet; both keep any
+purpose, note and destination already entered. With no start date to go
+by, it's matched to a year by its storage folder, which is named for the
+trip's local end month: that year, plus the year before for a January
+folder. `DEPLOY_DEBIAN.md` → Troubleshooting says how to rebuild the
+summary from its GPX.
 
 Endpoint coordinates come from the first and last recorded GPX track points,
 so they are also available for existing summaries. They describe the raw
