@@ -70,6 +70,7 @@ class ViewerSecurityTests(unittest.TestCase):
     def signed_in(self, csrf=True):
         with self.client.session_transaction() as sess:
             sess["user"] = self.viewer.VIEWER_USERNAME
+            sess["pw_tag"] = self.viewer._password_tag()
             if csrf:
                 sess["csrf"] = "known-token"
 
@@ -106,6 +107,33 @@ class ViewerSecurityTests(unittest.TestCase):
             "csrf_token": new_token,
         }).status_code, 302)
 
+    def test_new_password_hash_ends_existing_sessions(self):
+        self.client.post("/login", data={
+            "csrf_token": self.login_token(), "username": "driver",
+            "password": "test-password",
+        })
+        self.assertEqual(self.client.get("/").status_code, 200)
+        # Restarting with a new hash is a new module-level value.
+        with patch.object(self.viewer, "VIEWER_PASSWORD_HASH",
+                          generate_password_hash("new-password")):
+            response = self.client.get("/")
+            self.assertEqual(response.status_code, 302)
+            self.assertTrue(response.headers["Location"].startswith("/login"))
+            with self.client.session_transaction() as sess:
+                token = sess["csrf"]
+            self.assertEqual(self.client.post("/trip/2026-10/drive/annotate", data={
+                "csrf_token": token, "category": "business",
+            }).status_code, 401)
+            self.assertEqual(self.client.post("/login", data={
+                "csrf_token": self.login_token(), "username": "driver",
+                "password": "new-password",
+            }).status_code, 302)
+            self.assertEqual(self.client.get("/").status_code, 200)
+        # A session from before sessions carried the tag is logged out too.
+        with self.client.session_transaction() as sess:
+            del sess["pw_tag"]
+        self.assertEqual(self.client.get("/").status_code, 302)
+
     def test_unicode_username_is_a_failed_login(self):
         response = self.client.post("/login", data={
             "csrf_token": self.login_token(), "username": "driv\u00e9r",
@@ -122,6 +150,21 @@ class ViewerSecurityTests(unittest.TestCase):
         }).status_code, 400)
         with self.client.session_transaction() as sess:
             self.assertIn("user", sess)
+
+    def test_logged_in_post_to_unknown_path_is_404_not_400(self):
+        self.signed_in()
+        for data in ({}, {"csrf_token": "known-token"}):
+            with self.subTest(data=data):
+                self.assertEqual(self.client.post("/no-such-page", data=data).status_code, 404)
+                # A real page that doesn't take POST is a 405, token or not.
+                self.assertEqual(self.client.post("/", data=data).status_code, 405)
+        # Real POST routes still need the token.
+        self.assertEqual(self.client.post("/trip/2026-10/drive/annotate").status_code, 400)
+        # Anonymous callers can't tell missing paths from real ones.
+        anonymous = self.viewer.app.test_client()
+        for path in ("/no-such-page", "/trip/2026-10/drive/annotate"):
+            with self.subTest(path=path):
+                self.assertEqual(anonymous.post(path).status_code, 401)
 
     def test_concurrent_failures_are_all_counted(self):
         with patch.object(self.viewer, "MAX_FAILS", 1000):

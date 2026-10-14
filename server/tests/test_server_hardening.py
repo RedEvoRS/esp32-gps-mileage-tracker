@@ -141,7 +141,7 @@ class ViewerAuth(unittest.TestCase):
         self.assertIn("Session expired", r.get_data(as_text=True))
 
     def test_non_ascii_csrf_on_authenticated_post_is_400(self):
-        self.with_session(user="tester", csrf="tok")
+        self.with_session(user="tester", pw_tag=view._password_tag(), csrf="tok")
         r = self.c.post(
             "/trip/2026-04/x/annotate", data={"csrf_token": "tök", "category": "business"}
         )
@@ -187,7 +187,7 @@ class ViewerExport(unittest.TestCase):
     def setUp(self):
         self.c = view.app.test_client()
         with self.c.session_transaction() as s:
-            s.update(user="tester", csrf="tok")
+            s.update(user="tester", pw_tag=view._password_tag(), csrf="tok")
 
     def column(self, rows, name):
         header, *body = rows

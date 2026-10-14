@@ -657,8 +657,8 @@ docker compose exec mileage-viewer python -c \
 ```
 
 **Forgot the viewer password** — regenerate a hash (Step 4b), replace it in
-`viewer.env`, then `docker compose up -d mileage-viewer`. Your annotations are
-untouched.
+`viewer.env`, then `docker compose up -d mileage-viewer`. Every browser that
+was logged in has to sign in again; your annotations are untouched.
 
 **Containers missing after a reboot, log says `cannot assign requested
 address`** — Docker started before the network brought up the `BIND_ADDR` IP,
