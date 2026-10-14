@@ -191,8 +191,8 @@ and puts year, display timezone, and totals on a separate `Totals` sheet.
 Totals are summed before rounding to three decimal places, matching stored
 distance precision. Unclassified totals include trips without a category.
 
-A trip whose summary file can't be read (damaged on disk, or edited by
-hand) has no miles the viewer can count. The trip list shows a warning
+A trip whose summary file can't be read (damaged on disk, edited by hand,
+or missing next to its GPX) has no miles the viewer can count. The trip list shows a warning
 naming it and why, the CSV lists it with `row_type=unreadable` and blank
 miles, and the XLSX lists it on an `Unreadable trips` sheet; both keep any
 purpose, note and destination already entered. With no start date to go
