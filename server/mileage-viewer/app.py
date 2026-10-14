@@ -397,6 +397,61 @@ def _safe_trip_paths(ym, trip_id):
     return gpx, json_path
 
 
+# The summary fields the pages and exports read. read_summary() keeps only
+# these, so a new column that reads another summary field must add it here.
+SUMMARY_TEXT_FIELDS = ("trip_id", "device_id", "gpx_file", "start_time", "end_time")
+SUMMARY_NUMBER_FIELDS = (
+    "distance_miles", "duration_seconds", "avg_speed_mph", "max_speed_mph", "num_points",
+)
+
+
+def _is_number(value):
+    """A finite int or float. Python counts bool as an int; this doesn't."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an int too big to be a float
+        return False
+
+
+def _summary_problem(summary):
+    """Why a parsed summary can't be used, or None if it can."""
+    if not isinstance(summary, dict):
+        return "not a JSON object"
+    for field in SUMMARY_TEXT_FIELDS:
+        if summary.get(field) is not None and not isinstance(summary[field], str):
+            return f"{field} is not text"
+    for field in SUMMARY_NUMBER_FIELDS:
+        if summary.get(field) is not None and not _is_number(summary[field]):
+            return f"{field} is not a finite number"
+    return None
+
+
+def read_summary(json_path):
+    """Load a trip's summary JSON, or return None if it can't be trusted.
+
+    Ingest writes summaries atomically, so a bad one means disk damage or
+    a hand edit. One bad file must not 500 the trip list and both exports,
+    so it's skipped, and logged so the trip doesn't vanish silently.
+    """
+    try:
+        with open(json_path, "r", encoding="utf-8") as fh:
+            summary = json.load(fh)
+    except (OSError, ValueError) as exc:  # ValueError: bad JSON or bad UTF-8
+        problem = str(exc)
+    else:
+        problem = _summary_problem(summary)
+    if problem:
+        app.logger.warning("Skipping trip summary %s: %s", json_path, problem)
+        return None
+    return {
+        field: summary[field]
+        for field in SUMMARY_TEXT_FIELDS + SUMMARY_NUMBER_FIELDS
+        if field in summary
+    }
+
+
 def load_trips():
     """Scan DATA_ROOT for *.json summaries and join annotations.
 
@@ -412,10 +467,8 @@ def load_trips():
     for json_path in DATA_ROOT.glob("*/*.json"):
         ym = json_path.parent.name
         trip_id = json_path.stem
-        try:
-            with open(json_path, "r", encoding="utf-8") as fh:
-                summary = json.load(fh)
-        except (OSError, json.JSONDecodeError):
+        summary = read_summary(json_path)
+        if summary is None:
             continue
 
         trip_key = f"{ym}/{trip_id}"
@@ -815,8 +868,13 @@ def trip_view(ym, trip_id):
     gpx_path, json_path = _safe_trip_paths(ym, trip_id)
     if not json_path.exists():
         abort(404)
-    with open(json_path, "r", encoding="utf-8") as fh:
-        summary = json.load(fh)
+    summary = read_summary(json_path)
+    if summary is None:
+        # The trip list and exports leave it out too; the log says why.
+        abort(404, description=(
+            "This trip's summary file can't be read, so the trip list and "
+            "exports leave it out. The viewer log says what's wrong with it."
+        ))
     ann = get_annotations().get(f"{ym}/{trip_id}", {})
     t = {
         **summary,

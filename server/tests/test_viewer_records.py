@@ -177,6 +177,44 @@ class ViewerRecords(unittest.TestCase):
                 (self.month / "a.gpx").write_bytes(raw)
                 self.assertEqual(self.csv_rows()[0]["start_latitude"], "")
 
+    def test_damaged_summary_is_skipped_everywhere_not_a_500(self):
+        self.trip("good", "2026-08-01T12:00:00Z", 2, "business")
+        damaged = {
+            "truncated": b'{"trip_id": "truncated", "distance_mi',
+            "not_utf8": b'\xff\xfe{"distance_miles": 1}',
+            "not_object": b'[1, 2]',
+            "text_number": b'{"distance_miles": "abc"}',
+            "number_time": b'{"start_time": 12345}',
+            "object_text": b'{"device_id": {"a": 1}}',
+            "nan_number": b'{"distance_miles": NaN}',
+            "huge_number": b'{"distance_miles": 1' + b'0' * 400 + b'}',
+            "bool_number": b'{"distance_miles": true}',
+        }
+        for name, raw in damaged.items():
+            with self.subTest(name=name), self.assertLogs(self.viewer.app.logger, "WARNING") as logs:
+                path = self.month / f"{name}.json"
+                path.write_bytes(raw)
+                try:
+                    detail = self.client.get(f"/trip/2027-01/{name}")
+                    self.assertEqual(detail.status_code, 404)
+                    self.assertIn("summary file", detail.get_data(as_text=True))
+                    self.assertEqual(self.client.get("/").status_code, 200)
+                    rows = self.csv_rows()
+                    self.assertEqual([r["trip_id"] for r in rows if r["row_type"] == "trip"], ["good"])
+                    self.assertIn({"category": "all", "distance_miles": "2.0"},
+                                  [{k: r[k] for k in ("category", "distance_miles")} for r in rows])
+                    self.assertEqual(self.client.get("/export.xlsx").status_code, 200)
+                finally:
+                    path.unlink()
+                self.assertIn(f"{name}.json", logs.output[0])
+        # Fields the viewer doesn't use are dropped, not type-checked.
+        (self.month / "extra.json").write_text(json.dumps({
+            "trip_id": "extra", "distance_miles": 1.5, "bbox": None, "start_latitude": {},
+        }), encoding="utf-8")
+        self.assertEqual(self.viewer.read_summary(self.month / "extra.json"),
+                         {"trip_id": "extra", "distance_miles": 1.5})
+        self.assertEqual(self.client.get("/export.xlsx").status_code, 200)
+
     def test_legacy_database_migration_preserves_rows_and_is_concurrent_safe(self):
         path = self.root / "legacy.db"
         with closing(sqlite3.connect(path)) as conn, conn:
