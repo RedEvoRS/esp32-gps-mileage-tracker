@@ -5,31 +5,41 @@ with NEO-M8N GPS module. The firmware is organized into progressive
 stages that let you verify each hardware subsystem before building
 the full mileage tracker.
 
+This is the board half of the project. The [top-level README](../README.md)
+gives the whole setup in order (server first, then the board, then the
+car); this file has the firmware details it points to.
+
 ## Hardware
 
 - **Board:** LilyGO TTGO T-Beam V1.2 (ESP32 + SX1262 LoRa + NEO-M8N GPS)
 - **PMU:** AXP2101 (NOT AXP192 — older code examples need updating)
 - **GPS:** u-blox NEO-M8N (GPS/GLONASS/BeiDou, IPEX antenna)
 - **LoRa:** SX1262 at 915MHz (unused in this project)
-- **Battery:** 18650 cell in onboard holder (recommended for clean shutdown)
+- **Battery:** 18650 cell in the onboard holder. Needed in practice: it
+  runs the board for the upload after the car turns off (see Stage 4 →
+  Normal operation)
 - **USB:** Micro-USB via CH9102F serial converter
 
 ## Development Environment Setup
 
-### 1. Install the CH9102 USB-Serial Driver (Windows)
+### 1. Install the CH9102 USB-Serial Driver
 
-Download from Adafruit's guide:
+**Windows** needs a driver. Download it from Adafruit's guide:
 https://learn.adafruit.com/how-to-install-drivers-for-wch-usb-to-serial-chips-ch9102f-ch9102/windows-driver-installation
 
 After installing, plug in the T-Beam and check Device Manager for
 "Ports (COM & LPT)" → "USB-Enhanced-SERIAL CH9102 (COMx)".
-
 Note the COM number — you'll need it in the Arduino IDE.
+
+**macOS and Linux** normally have the driver built in: the board shows up
+as a new serial port when you plug it in. On Linux, if the upload fails
+with "permission denied", add yourself to the `dialout` group
+(`sudo usermod -aG dialout $USER`), then log out and back in.
 
 ### 2. Install Arduino IDE
 
-Download from https://www.arduino.cc/en/software
-Install the Windows version. Say yes to USB drivers during install.
+Download from https://www.arduino.cc/en/software and install the version
+for your OS. On Windows, say yes to the USB drivers during install.
 
 ### 3. Add ESP32 Board Support
 
@@ -39,22 +49,36 @@ Install the Windows version. Say yes to USB drivers during install.
    https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 4. Click OK
 5. Tools → Board → Boards Manager
-6. Search "esp32" and install "esp32 by Espressif Systems" (~300MB)
+6. Search "esp32", find "esp32 by Espressif Systems", pick version
+   **3.3.11** in its version list, and install (~300MB)
+
+The trip logger is tested on core 3.3.11. It relies on 3.x behaviour, so
+don't use a 2.x core. A newer 3.x will probably work but hasn't been
+tested. The Boards Manager installs the newest version unless you pick one.
 
 ### 4. Configure Board Settings
 
 - Tools → Board → esp32 → ESP32 Dev Module
-- Tools → Port → (your COM port from step 1)
+- Tools → Port → (the board's port from step 1)
 - Tools → Upload Speed → 921600
 - Tools → Flash Size → 4MB (32Mb)
-- Tools → Partition Scheme → Default 4MB with spiffs
+- Tools → Partition Scheme → Default 4MB with spiffs. Stages 1-3 use
+  this; Stage 4 brings its own `partitions.csv` and ignores the menu.
+- Tools → Erase All Flash Before Sketch Upload → **Disabled** (the
+  default). Enabled, it wipes any trips waiting on the board, and the
+  trip storage has to be set up again (Stage 4 → First flash on a new
+  board).
 
 ### 5. Install Required Libraries
 
-Open Sketch → Include Library → Manage Libraries and install:
+Open Sketch → Include Library → Manage Libraries and install these,
+picking the version from each one's version list:
 
-1. **XPowersLib** by lewisxhe — for the AXP2101 power manager
-2. **TinyGPSPlus** by Mikal Hart — for NMEA GPS parsing
+1. **XPowersLib** by lewisxhe, version **0.3.3** — for the AXP2101 power manager
+2. **TinyGPSPlus** by Mikal Hart, version **1.0.3** — for NMEA GPS parsing
+
+Those are the versions the trip logger is tested with. The Library Manager
+installs the newest unless you pick one.
 
 ## Firmware Stages
 
@@ -101,39 +125,75 @@ logging to LittleFS, and WiFi upload to your home server.
 
 Before flashing:
 
-1. Copy `secrets.h.example` to `04_trip_logger/secrets.h` (the sketch
-   folder; the build won't find it anywhere else) and fill in your WiFi
-   credentials, `SERVER_HOST`/`SERVER_PORT`, and `AUTH_TOKEN` (the
-   token must match `INGEST_AUTH_TOKEN` in the server's `.env`).
-2. Partitions are handled for you: the sketch folder includes a
+1. **Create `secrets.h`.** Copy `firmware/secrets.h.example` to
+   `04_trip_logger/secrets.h`, next to the `.ino` (the build won't find
+   it anywhere else), and fill it in. The top-level README has a table of
+   the settings under [Flash the board](../README.md#3-flash-the-board).
+   The ones that catch people out:
+   - The WiFi has to be 2.4 GHz (the ESP32 has no 5 GHz radio), and
+     **hidden networks won't work**: the board only uploads when it sees
+     your network's name in a scan. `WIFI_SSID` must match exactly,
+     capitals included.
+   - It's C source, so a `"` or `\` in the WiFi password is written `\"`
+     or `\\`.
+   - `AUTH_TOKEN` must match `INGEST_AUTH_TOKEN` in the server's `.env`
+     exactly.
+   - **These settings are built into the firmware.** If the server's
+     address, the token, or your WiFi name or password changes, the board
+     can't upload until you edit `secrets.h` and flash again. Nothing on
+     the board shows it: trips just stop appearing in the viewer and wait
+     on the board.
+2. **Partitions are handled for you.** The sketch folder includes a
    `partitions.csv` (no OTA: 1.5 MB app, 2.375 MB of trip storage), and
    the ESP32 core uses it in place of whatever Tools -> Partition Scheme
    says. At ~118 bytes per second of driving that's roughly 5-6 hours
-   between uploads. Normal firmware never formats the trip partition
-   automatically: a mount error halts logging and preserves queued data.
-   The battery's charge-temperature guard keeps running while halted.
-   A fresh device or a changed partition layout needs the explicit
-   first-time provisioning below.
+   between uploads. **Once it's full, the board stops recording**: it
+   ends the trip in progress and won't start another until it uploads.
+3. **On a new board, do the first flash below** before anything else.
 
-#### Storage provisioning and mount-error recovery
+#### First flash on a new board
 
-An existing device with this partition layout needs no formatting. If the
-Serial Monitor reports `LittleFS mount failed`, preserve the flash before
-troubleshooting; a mount error does not establish that the stored trips
-are unrecoverable. Recheck the partition layout and try the previously
-working firmware before considering a destructive reset.
+A board that hasn't run this firmware has nothing usable in its trip
+partition, and the firmware never formats the partition on its own. That's
+deliberate: on a board in use, a mount error mustn't be able to wipe trips
+that are waiting to upload. So the first time Stage 4 runs, the Serial
+Monitor shows
 
-For a **new, empty device**, or only after all existing trips have been
-uploaded or independently backed up, provision the partition once:
+```
+ERROR: LittleFS mount failed. Storage preserved; halting. See firmware README for first-time provisioning/recovery.
+```
 
-1. In `mountTripStorage()`, temporarily change `LittleFS.begin(false)` to
-   `LittleFS.begin(true)` and flash the sketch with the included partition
-   layout. This permits formatting on mount failure and **erases stored
-   trips** if formatting is needed.
-2. Let the device reach `Setup complete. Logging trips.`
-3. Restore `LittleFS.begin(false)` and flash again with the same partition
-   layout before using it in the car. Do not retain or commit the temporary
-   formatting-enabled build.
+and it stops there. (The battery's charge-temperature guard keeps running
+while it's halted.) Set the partition up once:
+
+1. In `04_trip_logger.ino`, find `mountTripStorage()` and change
+   `LittleFS.begin(false)` to `LittleFS.begin(true)`. That lets it format
+   the partition when it can't mount it.
+2. Flash, and watch the Serial Monitor until it says
+   `Setup complete. Logging trips.`
+3. Change it back to `LittleFS.begin(false)` and flash again. **Don't skip
+   this.** The `true` build formats the partition, erasing any trips
+   waiting on it, whenever a mount fails, so it must never go in the car.
+   Don't commit it either.
+
+After that, the trip storage survives reflashing. You only do this again
+if you change the partition layout or erase the whole flash, and only once
+every trip on the board has been uploaded.
+
+#### If the trip storage won't mount later
+
+On a board that's been working, `LittleFS mount failed` doesn't mean the
+trips are gone, so don't reach for the first-flash steps. Check that you
+flashed with this sketch's `partitions.csv`, and try the firmware that last
+worked. Before anything that could erase the partition, copy it to a file
+with esptool (it comes with the ESP32 core, or `pip install esptool`):
+
+```
+esptool --port <port> read-flash 0x190000 0x260000 trips-backup.bin
+```
+
+The offset and size come from the `spiffs` line in `partitions.csv`. Older
+esptool versions spell the command `read_flash`.
 
 #### Normal operation
 
@@ -151,8 +211,9 @@ How it behaves once flashed:
   fix are buffered and back-dated once UTC arrives. A trip that ends
   before the clock was ever set (by GPS or NTP) keeps its points with no
   times rather than guessed ones; the viewer lists it without a date.
-- **Upload:** while parked on your home WiFi, finished trips are POSTed
-  to the ingest server as GPX and deleted locally on success. GPS
+- **Upload:** every 30 s, if finished trips are waiting, the board scans
+  for your home WiFi. When it finds it, it POSTs each trip to the ingest
+  server as GPX and deletes it locally once the server accepts it. GPS
   parsing runs on core 1; networking runs on core 0 and never blocks
   it.
 - **Power loss:** when the car turns off (USB power off for 10 s), the
@@ -160,11 +221,28 @@ How it behaves once flashed:
   board stays awake on battery for 10 minutes, so a trip that ends at
   home uploads right away, then deep-sleeps until the car turns on. An
   upload still running at 10 minutes gets up to 6 more to finish; one
-  cut off then stays queued and is sent next time.
+  cut off then stays queued and is sent next time. Without the 18650,
+  the board loses power with the car, so it can only upload while the
+  car is on. On a USB port that stays powered with the car off, it never
+  sees the car turn off and never sleeps.
+- **Buttons:** a long press of PWR finalizes any trip and puts the board
+  into deep sleep; a short press, or USB power coming back, wakes it.
+- **Storage full:** below 64 KB free it won't start a trip, and below
+  24 KB it ends the one in progress. An upload frees the space.
+- **No display:** the firmware doesn't use a screen or a status LED. The
+  Serial Monitor shows what it's doing; once it's in the car, trips
+  appearing in the viewer are how you know it works.
 
 Watch the Serial Monitor (115200) for state transitions:
 `Trip started` → (drive) → `Trip finalized`, then
 `Upload ... -> HTTP 200 (deleted)` when you get home.
+
+If an upload fails, the `Upload` line shows why. `HTTP 401` means
+`AUTH_TOKEN` doesn't match the server's token. A negative number (like
+`HTTP -1`) means the board joined the WiFi but couldn't reach the server:
+check `SERVER_HOST` and that the server is up. If no `Upload` line ever
+appears, the board isn't finding or joining your WiFi; the firmware
+doesn't log that case yet.
 
 Boot repair also examines `.gpx.fix` files left by interrupted repairs.
 It reclaims a temporary copy only when its bytes match the original or its
@@ -184,6 +262,9 @@ testing remains necessary to verify the flash driver's behavior.
 > upload before relying on it in the car.
 
 ### Network stack shakedown (issue #6)
+
+This section is for validating the firmware on hardware. You don't need it
+to build or use the tracker.
 
 The network task reserves 12,288 bytes, matching the Stage 4 brief. This is
 a conservative starting point; it has **not** been sized from board measurements.
@@ -233,5 +314,6 @@ only and cannot measure ESP32 stack use.
   Charge-only cables will power the board but won't appear in
   Device Manager. Test with your phone if unsure.
 
-- Use a **protected 18650 cell** for the battery. It provides a
-  power buffer for clean shutdown when the car turns off.
+- Use a **protected 18650 cell** for the battery. It keeps the board
+  running for 10 minutes after the car turns off, which is when trips
+  upload at home, then lets it sleep until the car starts again.
