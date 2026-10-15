@@ -45,6 +45,7 @@ server/
 
 tools/check_pii.py                  Personal-info scan (CI runs it; see Do Not)
 .github/workflows/audit-tests.yml   CI: PII scan + server tests + firmware host tests
+.github/dependabot.yml              Dependabot: monthly pip, Docker and Actions bumps
 CODE_REVIEW_2026-06-09.md, AUDIT_2026-08-04.md, AUDIT_2026-10-05.md,
 INDEPENDENT_AUDIT_2026-10-05.md      Review history (see Current Status)
 ```

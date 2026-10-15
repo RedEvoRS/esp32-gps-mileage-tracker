@@ -1,0 +1,56 @@
+# Dependabot version updates. Security updates are switched on in the
+# repo settings; this file covers the routine bumps.
+#
+# Monthly, with a week's cooldown so a release has time to be pulled or
+# patched before it lands here. Every PR runs the full CI, installer
+# included. The firmware's Arduino libraries (XPowersLib, TinyGPSPlus)
+# aren't a Dependabot ecosystem; they're tracked by hand in
+# firmware/README.md.
+version: 2
+updates:
+  # Both services pin flask, gunicorn and tzdata, and those must stay in
+  # step, so one grouped PR updates both requirements files together.
+  - package-ecosystem: pip
+    directories:
+      - /server/mileage-ingest
+      - /server/mileage-viewer
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      server-python:
+        patterns: ["*"]
+    commit-message:
+      prefix: "Server"
+
+  # The python:3.12-slim base images. A new Python minor here should also
+  # move python-version in .github/workflows/audit-tests.yml, so CI tests
+  # what the containers run.
+  - package-ecosystem: docker
+    directories:
+      - /server/mileage-ingest
+      - /server/mileage-viewer
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      server-images:
+        patterns: ["*"]
+    commit-message:
+      prefix: "Server"
+
+  # Actions are pinned by commit SHA; Dependabot moves the SHA and the
+  # version comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "CI"
