@@ -13,6 +13,9 @@ jobs:
     # The repo is meant to go public, so files, commit messages and author
     # emails must carry nothing personal. PII_DENYLIST is a repo secret
     # (one term per line: real name, personal email, street, SSID, ...).
+    # Skipped on runs Dependabot starts: its PRs only bump versions, and
+    # it can't read the secret anyway. Every push to main still scans.
+    if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
