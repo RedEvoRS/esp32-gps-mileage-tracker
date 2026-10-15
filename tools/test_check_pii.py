@@ -57,6 +57,7 @@ class Emails(unittest.TestCase):
     def test_noreply_example_and_lan_addresses_pass(self):
         for text in [
             "Co-Authored-By: Claude <noreply@anthropic.com>",
+            "Signed-off-by: dependabot[bot] <support@github.com>",
             "123+someone@users.noreply.github.com",
             "REMOTE=backup@nas.lan:/volume1/backups",
             "someone@example.com",
@@ -70,6 +71,8 @@ class Emails(unittest.TestCase):
         self.assertTrue(check_pii.email_allowed("noreply@github.com"))
         self.assertTrue(check_pii.email_allowed("123+someone@users.noreply.github.com"))
         self.assertFalse(check_pii.email_allowed("alice" + "@" + "gmail.com"))
+        # Only GitHub's support address, not any github.com one.
+        self.assertFalse(check_pii.email_allowed("alice" + "@" + "github.com"))
 
 
 class Macs(unittest.TestCase):
