@@ -1,9 +1,9 @@
 # Pinned versions for reproducible builds. Keep these in step with the
 # ingest service where they overlap.
-flask==3.0.3
-gunicorn==23.0.0
+flask==3.1.3
+gunicorn==26.2.0
 openpyxl==3.1.5
 # IANA timezone database for zoneinfo. Pinned like everything else, but
 # note this one carries real-world data: refresh it if the US ever
 # changes DST rules, or local timestamps will drift.
-tzdata==2026.3
+tzdata==2026.5
