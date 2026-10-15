@@ -211,6 +211,7 @@ static size_t gPendHead = 0, gPendCount = 0;
 enum TripState { IDLE, ARMING, ACTIVE, COOLDOWN, FINALIZING };
 static TripState gState = IDLE;
 static uint32_t  gArmT0 = 0, gCoolT0 = 0, gTripT0 = 0;
+static uint32_t  gLastMoveMs = 0;       // the active trip's last moving fix
 static uint32_t  gFsCheckT0 = 0;        // last free-space check during a trip
 static uint32_t  gFullWarnT0 = 0;       // last "storage full" log line
 static bool      gFullWarned = false;
@@ -414,14 +415,20 @@ static void pushPending(const Fix& fx) {
 
 // Write all buffered fixes to the open trip file, back-dating each from
 // the now-known UTC and its monotonic stamp. Called once, the first time
-// UTC becomes available during an active trip.
+// UTC becomes available during an active trip -- or when a trip that never
+// got UTC is closed. Those points get no time at all: until a source has
+// synchronized it, the system clock reads 1970 or a date carried over deep
+// sleep, and a made-up date can file the miles under the wrong day or year.
 static void flushPending(FileWriter& w) {
+    // Read the flag before the clock: core 0 sets the clock from NTP first,
+    // then the flag.
+    bool trusted = gClockSet.load();
     uint64_t utcNow = nowEpochMs();
     uint32_t monoNow = millis();
     for (size_t i = 0; i < gPendCount; ++i) {
         Fix p = gPend[(gPendHead + i) % 90];
-        p.hasUtc = true;
-        p.utcMs  = utcNow - (uint64_t)(monoNow - p.monoMs);
+        p.hasUtc = trusted;
+        p.utcMs  = trusted ? utcNow - (uint64_t)(monoNow - p.monoMs) : 0;
         appendTrkpt(w, p);
     }
     gPendCount = gPendHead = 0;
@@ -476,6 +483,7 @@ static bool beginTrip(const Fix& fx) {
     gNeedNewSeg = false;
     gTripWriteFailed = false;
     gTripT0 = gArmCount ? gArmBuf[gArmHead].monoMs : fx.monoMs;
+    gLastMoveMs = fx.monoMs;
 
     FS_LOCK();
     makeTripPath(gTripPath, sizeof(gTripPath));
@@ -570,13 +578,17 @@ static bool repairIfNeeded(const char* path);
 static void endTrip(bool discardIfMicro) {
     if (gTripPath[0] == 0) { gState = IDLE; return; }
 
-    bool micro = (millis() - gTripT0 < MIN_TRIP_MS) ||
+    // Duration runs to the last moving fix: the 3 min parked cooldown (or
+    // the wait before a fix-loss finalize) that ends every trip would
+    // otherwise pass MIN_TRIP_MS on its own. A stop mid-trip still counts.
+    uint32_t tripMs = gLastMoveMs - gTripT0;
+    bool micro = (tripMs < MIN_TRIP_MS) ||
                  (gTripMeters < MIN_TRIP_METERS);
 
     FS_LOCK();
     if (discardIfMicro && micro) {
         Serial.printf("Discarding micro-trip (%.0f m, %lu ms)\n",
-                      gTripMeters, (unsigned long)(millis() - gTripT0));
+                      gTripMeters, (unsigned long)tripMs);
         LittleFS.remove(gTripPath);
     } else {
         bool ok = false;
@@ -587,7 +599,8 @@ static void endTrip(bool discardIfMicro) {
             if (f && f.size() > 0) {
                 FileWriter w(f);
                 // Flush any still-buffered (never-got-UTC) points before
-                // closing, so a trip that never got UTC isn't lost.
+                // closing, so a trip that never got UTC isn't lost. They're
+                // written without times unless the clock is now trusted.
                 if (gPendCount > 0) flushPending(w);
                 w.put(GPX_EPILOGUE);
                 ok = w.commit();
@@ -624,10 +637,12 @@ static void tripFsmOnFix(const Fix& fx) {
     // Distance + max speed accumulate whenever we're recording. The
     // speed gate stops GPS jitter from adding phantom meters while
     // stationary (3 min parked in COOLDOWN scatters tens of meters);
-    // erring low is the IRS-safe direction.
-    if ((gState == ACTIVE || gState == COOLDOWN) && gHaveLastFix &&
-        fx.speedMps > END_MPS) {
-        gTripMeters += haversineM(gLastFix.lat, gLastFix.lon, fx.lat, fx.lon);
+    // erring low is the IRS-safe direction. The same gate marks the last
+    // moving fix, where endTrip() measures the trip's duration to.
+    if ((gState == ACTIVE || gState == COOLDOWN) && fx.speedMps > END_MPS) {
+        if (gHaveLastFix)
+            gTripMeters += haversineM(gLastFix.lat, gLastFix.lon, fx.lat, fx.lon);
+        gLastMoveMs = now;
     }
     if (fx.speedMps > gMaxSpeedMps) gMaxSpeedMps = fx.speedMps;
 
@@ -1448,6 +1463,10 @@ void setup() {
     // capacity, much less stress on a cell that lives in a hot car (the
     // charge temperature guard, below, covers charging when it's too hot).
     PMU.setChargeTargetVoltage(XPOWERS_AXP2101_CHG_VOL_4V1);
+    // No charging until the temperature guard's first check. The PMU keeps
+    // the charger on across ESP32 resets, and storage setup (mount, fsck)
+    // can halt or crash before that check runs.
+    PMU.disableCellbatteryCharge();
     // Enable the measurements the battery/VBUS predicates and the charge
     // temperature guard rely on.
     PMU.enableTemperatureMeasure();
@@ -1471,7 +1490,10 @@ void setup() {
 
     // --- Storage + boot-time repair ---
     if (!mountTripStorage()) {
-        while (1) delay(1000);
+        // Halted, but maybe still on USB in a hot car: keep guarding the
+        // charger (off since the PMU setup). Delay first, so the temperature
+        // ADC has converted before the first reading.
+        while (1) { delay(1000); serviceChargeTemp(); }
     }
     if (!LittleFS.exists(TRIP_DIR)) LittleFS.mkdir(TRIP_DIR);
     prefs.begin("mileage", false);
@@ -1480,9 +1502,10 @@ void setup() {
     // After the fsck so the receiver has had time to boot.
     configureGps();
 
-    // First charge-temperature check now, not 30 s in: a car that starts
-    // hot must not charge in the meantime. (The temperature ADC was enabled
-    // well over a conversion time ago, with the PMU.)
+    // First charge-temperature check now, not 30 s in: charging has been off
+    // since the PMU setup, and this turns it back on if it's safe. (The
+    // temperature ADC was enabled well over a conversion time ago, with the
+    // PMU.)
     serviceChargeTemp();
 
     // --- Networking task on core 0; GPS/FSM stay on core 1 (loop) ---

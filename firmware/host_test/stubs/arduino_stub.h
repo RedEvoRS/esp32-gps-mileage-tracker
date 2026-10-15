@@ -22,7 +22,10 @@ using std::isnan;
 // ---- time / misc ------------------------------------------------------
 extern uint32_t g_millis;
 inline uint32_t millis() { return g_millis; }
-inline void delay(uint32_t) {}
+// delay() takes no time unless a test sets g_delayHook. A test escapes one
+// of setup()'s halt loops by throwing from the hook.
+inline void (*g_delayHook)(uint32_t ms) = nullptr;
+inline void delay(uint32_t ms) { if (g_delayHook) g_delayHook(ms); }
 inline double radians(double d) { return d * M_PI / 180.0; }
 using std::min;
 #define IRAM_ATTR
@@ -144,6 +147,7 @@ struct FakeDisk {
         if (openDirectories) mutationsWithDirectoryOpen++;
     }
     bool failMount = false;
+    void (*onMount)() = nullptr;   // runs at each mount attempt
     bool formatRequested = false;
     bool mounted = true;
     size_t used() const { size_t u = 0; for (auto& kv : files) u += kv.second.size(); return u; }
@@ -222,6 +226,7 @@ public:
 
 struct LittleFSStub {
     bool begin(bool formatOnFail = false) {
+        if (g_disk.onMount) g_disk.onMount();
         g_disk.formatRequested = formatOnFail;
         if (!g_disk.failMount) return true;
         if (!formatOnFail) return false;

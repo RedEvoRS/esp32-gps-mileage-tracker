@@ -111,6 +111,7 @@ Before flashing:
    says. At ~118 bytes per second of driving that's roughly 5-6 hours
    between uploads. Normal firmware never formats the trip partition
    automatically: a mount error halts logging and preserves queued data.
+   The battery's charge-temperature guard keeps running while halted.
    A fresh device or a changed partition layout needs the explicit
    first-time provisioning below.
 
@@ -140,14 +141,16 @@ How it behaves once flashed:
 
 - **Trip detection:** logging starts after you sustain >5 mph for
   10 s and ends after you're below 2 mph for 3 minutes (stop-and-go
-  traffic won't split a drive). Trips shorter than ~30 s or 0.1 mi are
-  discarded as noise.
+  traffic won't split a drive). Trips shorter than ~30 s (not counting
+  the 3 minutes parked at the end) or 0.1 mi are discarded as noise.
 - **Crash-safe logging:** each GPS point is written to a `.gpx` file
   and the file is closed immediately, so pulling USB power loses at
   most one point. On boot, any file left unclosed by a hard power cut
   is repaired automatically.
 - **Time:** comes from the GPS (UTC). Points captured before the first
-  fix are buffered and back-dated once UTC arrives.
+  fix are buffered and back-dated once UTC arrives. A trip that ends
+  before the clock was ever set (by GPS or NTP) keeps its points with no
+  times rather than guessed ones; the viewer lists it without a date.
 - **Upload:** while parked on your home WiFi, finished trips are POSTed
   to the ingest server as GPX and deleted locally on success. GPS
   parsing runs on core 1; networking runs on core 0 and never blocks

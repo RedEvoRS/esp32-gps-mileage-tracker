@@ -23,7 +23,8 @@ The T-Beam sends only X-Device-Id. Without X-Device-Id we use the GPX
 (2026-04-14T13-45-22Z), which is also the stored file's name.
 
 For each upload we write two files into /data/YYYY-MM/ (bucketed by the
-trip's end time):
+trip's end time, or its first upload for an undated trip). Undated retries
+reuse their original directory even if the month has changed:
 
     <id>.gpx    the raw upload, byte-for-byte
     <id>.json   { trip_id, device_id, start_time, end_time, recorded_until,
@@ -46,6 +47,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
@@ -523,6 +525,30 @@ def _stored_summary(json_file):
     return summary
 
 
+def _stored_trip_directories(safe_id):
+    """Find either half of a stored pair; caller must hold _upload_lock.
+
+    Undated trips have no stable timestamp to choose a month. Look for
+    their ID before using the receipt month, including GPX-only failed
+    writes and summary-only records whose GPX can be restored by a retry.
+    Check known filenames in each month instead of reading every trip.
+    """
+    matches = []
+    for directory in DATA_ROOT.iterdir():
+        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}", directory.name):
+            continue
+        for suffix in (".gpx", ".json"):
+            try:
+                # stat() propagates permission/I/O errors: an unreadable
+                # original must not be mistaken for a missing record.
+                (directory / f"{safe_id}{suffix}").stat()
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            matches.append(directory)
+            break
+    return matches
+
+
 def _discard_body():
     """Read and drop an unread request body, so an early reply arrives.
 
@@ -664,9 +690,9 @@ def upload_trip():
     # -----------------------------------------------------------------
     # Step 4: Determine target directory (bucket by end time)
     # -----------------------------------------------------------------
-    end_dt = summary.pop("_end_dt") or parsed["metadata_time"] or datetime.now(
-        timezone.utc
-    )
+    end_dt = summary.pop("_end_dt") or parsed["metadata_time"]
+    untimed = end_dt is None
+    end_dt = end_dt or datetime.now(timezone.utc)
     # Bucket by LOCAL month, matching how the viewer displays the trip.
     # Bucketing in UTC while displaying local would file a Dec 31 evening
     # drive under 2027-01/ with a 2026-12-31 date on screen -- the folder
@@ -676,16 +702,13 @@ def upload_trip():
     year_month = end_dt.astimezone(DISPLAY_TZ).strftime("%Y-%m")
     target_dir = DATA_ROOT / year_month
 
-    gpx_file = target_dir / f"{safe_id}.gpx"
-    json_file = target_dir / f"{safe_id}.json"
-
     # -----------------------------------------------------------------
     # Step 5: Assemble the summary record and write both files
     # -----------------------------------------------------------------
     record = {
         "trip_id": trip_id,
         "device_id": device_id,
-        "gpx_file": gpx_file.name,
+        "gpx_file": f"{safe_id}.gpx",
         "_received_at": datetime.now(timezone.utc).isoformat(),
         "_received_from": request.remote_addr,
     }
@@ -693,6 +716,16 @@ def upload_trip():
 
     try:
         with _upload_lock():
+            if untimed:
+                # Lookup and creation share the lock so workers handling
+                # opposite sides of midnight cannot create two records.
+                existing_dirs = _stored_trip_directories(safe_id)
+                if len(existing_dirs) > 1:
+                    return jsonify({"error": "undated trip ID exists in multiple month directories"}), 409
+                if existing_dirs:
+                    target_dir = existing_dirs[0]
+            gpx_file = target_dir / f"{safe_id}.gpx"
+            json_file = target_dir / f"{safe_id}.json"
             target_dir.mkdir(parents=True, exist_ok=True)
             _sync_directory(DATA_ROOT)
             # An ID can be retried, but must never replace another trip's
