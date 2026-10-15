@@ -868,6 +868,33 @@ int main(int argc, char** argv) {
         g_epochBaseMs = clock0;
     }
 
+    printf("T35 the parked cooldown doesn't count toward the 30 s minimum (#58)\n");
+    {
+        resetWorld();
+        drive(15, 20); drive(0, 181);                // 19 s moving, ~285 m
+        CHECK(gState == IDLE && tripFiles().empty() && logHas("Discarding micro-trip"),
+              "20 s drive, then the cooldown: discarded");
+
+        resetWorld();
+        drive(15, 31); drive(0, 181);                // 30 s, first to last moving fix
+        CHECK(tripFiles().size() == 1, "30 s drive: kept");
+
+        resetWorld();                                // 11 s, a 60 s stop, 12 s more
+        drive(15, 12); drive(0, 60); drive(15, 12); drive(0, 181);
+        CHECK(tripFiles().size() == 1, "a stop mid-trip still counts toward the 30 s");
+
+        resetWorld();
+        drive(15, 20); drive(0, 5);
+        endTrip(false);                              // car off: a real short drive
+        CHECK(tripFiles().size() == 1, "power-loss finalize keeps a short drive");
+
+        resetWorld();                                // GPS lost right after a short drive
+        drive(15, 20);
+        loopFor(FIX_LOSS_END_MS + 1000);
+        CHECK(logHas("No GPS fix for 5 min") && tripFiles().empty(),
+              "nor does the wait before a fix-loss finalize");
+    }
+
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
     return g_fail ? 1 : 0;
 }

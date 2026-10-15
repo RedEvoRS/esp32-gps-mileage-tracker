@@ -141,8 +141,8 @@ How it behaves once flashed:
 
 - **Trip detection:** logging starts after you sustain >5 mph for
   10 s and ends after you're below 2 mph for 3 minutes (stop-and-go
-  traffic won't split a drive). Trips shorter than ~30 s or 0.1 mi are
-  discarded as noise.
+  traffic won't split a drive). Trips shorter than ~30 s (not counting
+  the 3 minutes parked at the end) or 0.1 mi are discarded as noise.
 - **Crash-safe logging:** each GPS point is written to a `.gpx` file
   and the file is closed immediately, so pulling USB power loses at
   most one point. On boot, any file left unclosed by a hard power cut
