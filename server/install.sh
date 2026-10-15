@@ -4,8 +4,8 @@
 #
 #   bash install.sh           set everything up, or finish a setup that
 #                             stopped partway
-#   bash install.sh --check   check an existing install; changes nothing
-#                             except a test upload it deletes again
+#   bash install.sh --check   leave configuration unchanged; upload and
+#                             remove a test trip, optionally test login
 #
 # Run it as your normal login user, not root; it asks for sudo when it
 # needs it. It works on the directory it's in, normally ~/mileage-tracker
@@ -1444,13 +1444,18 @@ summary() {
     printf '    #define SERVER_HOST   "%s"\n' "${host:-<this server>}"
     printf '    #define SERVER_PORT   8090\n'
     printf '    #define AUTH_TOKEN    "%s"\n\n' "$(env_raw .env INGEST_AUTH_TOKEN)"
+    printf 'These are built into the firmware. If this address or the token ever\n'
+    printf 'changes, the board stops uploading until you update secrets.h and\n'
+    printf 'flash it again.\n\n'
     printf 'Next:\n'
     if [[ $RELOGIN == yes ]]; then
         printf '  - Log out and back in, so docker works without sudo.\n'
     fi
     printf '  - Reboot (sudo reboot), then check it all came back:\n'
     printf '      bash %s/install.sh --check\n' "$SCRIPT_DIR"
-    printf '  - Flash the firmware and take it for a drive (firmware/README.md).\n'
+    printf '  - Flash the board, check it works and put it in the car: README.md at\n'
+    printf '    the top of the repo, "Setting it up", steps 3 to 5. A new board needs\n'
+    printf '    a one-time storage setup on its first flash (firmware/README.md).\n'
 }
 
 main() {

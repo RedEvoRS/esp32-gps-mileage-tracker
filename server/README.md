@@ -1,10 +1,31 @@
-# Mileage Tracker Ingest Service
+# Mileage Tracker Server
 
-A minimal HTTP service that receives trip uploads from a T-Beam GPS
-mileage tracker and stores them as JSON files on disk, organized by
-year-month.
+This folder is the server half of the GPS mileage tracker. The board in
+the car uploads each finished trip here over your home WiFi, and you
+review, tag and export the trips in a web page. The
+[top-level README](../README.md) explains how the pieces fit together and
+the order to set them up in.
 
-## What This Service Does
+It runs as two Docker containers, both defined in `docker-compose.yml`:
+
+| Service | Port | What it does |
+|---|---|---|
+| `mileage-ingest` | 8090 | Accepts trip uploads from the board (bearer token) and stores each one as GPX plus a JSON summary |
+| `mileage-viewer` | 8091 | A web page, behind a login, to list trips, check them on a map, tag their purpose, and export CSV/XLSX |
+
+**To set it up, run `bash install.sh`** on the server, from this folder
+once it's copied over (normally `~/mileage-tracker`). It does everything
+below and checks each step. `DEPLOY_DEBIAN.md` at the top of the repo
+walks through the same steps by hand. This file is the reference for how
+the services behave.
+
+`install.sh --check` leaves configuration unchanged but uploads and removes
+a temporary test trip and can test the viewer login. Automatic backups
+currently require the server login's numeric user ID to be **1000**
+(`id -u`); the installer skips backups for other IDs. See
+[the deployment prerequisites](../DEPLOY_DEBIAN.md).
+
+## What the Ingest Service Does
 
 When your T-Beam completes a trip and detects it's on your home WiFi,
 it POSTs the trip as a **GPX** file to this service. The service verifies
@@ -42,65 +63,95 @@ by the `mileage-viewer` service, which reads these files independently.
 
 ## Directory Layout
 
-    mileage-tracker/
-    ├── docker-compose.yml     # Compose definition
-    ├── .env.example           # Template for secrets
-    ├── .env                   # Your real config (created by you, never committed)
-    ├── data/                  # Trip files live here (created on first run)
+    mileage-tracker/           # this folder, copied to the server
+    ├── docker-compose.yml     # Compose definition for both services
+    ├── .env.example           # Template for .env
+    ├── .env                   # Upload token and BIND_ADDR (created by you or install.sh, never committed)
+    ├── viewer.env.example     # Template for viewer.env
+    ├── viewer.env             # The viewer login (created by you or install.sh, never committed)
+    ├── install.sh             # First-time install with checks; --check later
+    ├── sample.gpx             # A short test trip for checking uploads
+    ├── data/                  # Trip files (create it before the first start, see below)
     │   └── 2026-04/
+    │       ├── 2026-04-14T13-45-22.gpx
     │       └── 2026-04-14T13-45-22.json
     ├── backup/                # Scheduled backup + restore scripts, systemd timer
-    ├── install.sh             # First-time install with checks; --check later
-    └── mileage-ingest/
-        ├── Dockerfile         # Container definition
-        ├── requirements.txt   # Python dependencies
-        └── app.py             # The Flask application
+    ├── tests/                 # The server test suite (not needed to run it)
+    ├── mileage-ingest/
+    │   ├── Dockerfile         # Container definition
+    │   ├── requirements.txt   # Python dependencies
+    │   └── app.py             # The upload service (Flask)
+    └── mileage-viewer/
+        ├── Dockerfile
+        ├── requirements.txt
+        ├── app.py             # The web UI (Flask)
+        └── static/            # Leaflet and its GPX plugin, bundled
 
 ## First-Time Setup
 
 The easy way is `bash install.sh` from this directory. It sets up both
 services, the viewer login and backups, checks each step, and tests an
 upload end to end (`DEPLOY_DEBIAN.md` → The quick way). The steps below
-set up the ingest service by hand.
+set up both services by hand, in the order Compose needs them, all run
+from this folder. Docker has to be installed first (`DEPLOY_DEBIAN.md`
+Step 1).
 
-1. Copy the example environment file to `.env` so you can fill in
+1. Create the `data/` folder yourself, owned by UID 1000, the user both
+   containers run as. If Docker creates it on first start, root owns it
+   and every upload fails with a 500:
+
+       mkdir -p data
+       id -u                       # if this isn't 1000:
+       sudo chown 1000:1000 data
+
+2. Copy the example environment file to `.env` so you can fill in
    the real auth token:
 
        cp .env.example .env
 
-2. Generate a strong random auth token and put it in `.env`:
+3. Generate a strong random auth token and put it in `.env`:
 
        openssl rand -hex 32
 
    Copy the output and set `INGEST_AUTH_TOKEN` in `.env` to that value.
-   You'll use the same token in the T-Beam firmware later.
+   You'll use the same token in the T-Beam firmware later. This token is
+   separate from your SSH login and the viewer's username/password.
 
-3. Build and start the service:
+4. Create `viewer.env` and set the viewer login, as described under
+   [Viewer Login](#viewer-login) below. Compose won't build or start
+   anything, either service, until `viewer.env` exists.
+
+5. Build and start both services:
 
        docker compose up -d --build
 
-4. Verify the service is responding:
+6. Verify the service is responding:
 
        curl http://localhost:8090/health
 
    You should see `{"service":"mileage-ingest","status":"ok"}`.
 
-5. Test an authenticated upload with the sample trip. A ready-made
-   `sample.gpx` lives one directory up (in `server/`):
+7. Test an authenticated upload with the sample trip, `sample.gpx`, which
+   is in this folder:
 
-       TOKEN=$(grep INGEST_AUTH_TOKEN .env | cut -d= -f2)
+       TOKEN=$(grep '^INGEST_AUTH_TOKEN=' .env | cut -d= -f2-)
        curl -X POST http://localhost:8090/upload \
          -H "Authorization: Bearer $TOKEN" \
          -H "Content-Type: application/gpx+xml" \
          -H "X-Device-Id: tbeam-01" \
          -H "X-Trip-Id: 2026-04-14T13-45-22" \
-         --data-binary @../sample.gpx
+         --data-binary @sample.gpx
 
    You should see a JSON success response with a `distance_miles` value,
    and find two files at `./data/2026-04/2026-04-14T13-45-22.gpx` and
-   `.../2026-04-14T13-45-22.json`.
+   `.../2026-04-14T13-45-22.json`. Delete both afterwards so the test
+   trip doesn't end up in your mileage log.
 
-6. Bind both ports to the server's LAN IP by setting `BIND_ADDR` in
+   The `^INGEST_AUTH_TOKEN=` match above reads only the setting, not
+   comments that mention its name. It assumes the unquoted hexadecimal
+   token generated in step 3.
+
+8. Bind both ports to the server's LAN IP by setting `BIND_ADDR` in
    `.env`, then run `docker compose up -d` again. UFW rules don't
    restrict Docker-published ports, so this is the setting that keeps
    them off other interfaces. After this, `localhost` no longer answers;
@@ -112,7 +163,14 @@ Check the logs when you want to see what's happening:
 
     docker compose logs -f mileage-ingest
 
-Restart the service after config changes:
+After changing `.env` or `viewer.env`, recreate the containers so they
+pick up the new values (Compose only recreates the ones that changed):
+
+    docker compose up -d
+
+`docker compose restart` is not enough for that: it restarts a container
+with the settings it was created with, so a new token or login wouldn't
+take effect. Use it only when nothing in the config changed:
 
     docker compose restart mileage-ingest
 
@@ -308,10 +366,8 @@ If you ever do put a TLS reverse proxy in front, set
 
 Both containers run as a non-root user. The viewer mounts the trip data
 read-only, so even a full compromise of the viewer cannot alter the GPX
-files or their derived summaries.
-
-Both containers run as a non-root user. The data directory is mounted
-from the host, so trip files persist across container rebuilds; viewer
+files or their derived summaries. The data directory is mounted from the
+host, so trip files persist across container rebuilds; viewer
 annotations persist in the `viewer-db` volume.
 
 ## Backup
@@ -329,6 +385,11 @@ then reads the copy there back to verify it. `backup/restore.sh check`
 is the restore test: it pulls the newest off-host snapshot and checks
 every file and the database without touching anything live.
 `backup/restore.sh restore` puts a snapshot back.
+
+The timer runs as the server login, while ingest writes private trip files
+as UID 1000. Use a UID 1000 login with this setup; giving `data/` to UID
+1000 lets ingest write but does not make the files readable by another
+account's backup timer.
 
 Setup, the restore test and the restore procedure are in
 `DEPLOY_DEBIAN.md` Step 10.
