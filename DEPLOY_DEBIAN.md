@@ -351,7 +351,8 @@ confirm you're bounced back to the login page.
 **Clean up the test trip** so it doesn't pollute your real mileage log:
 
 ```bash
-rm -rf ~/mileage-tracker/data/2026-04
+rm ~/mileage-tracker/data/2026-04/2026-04-14T13-45-22.{gpx,json}
+rmdir ~/mileage-tracker/data/2026-04   # only goes if nothing else is in it
 ```
 
 (The annotation row stays in the viewer DB but is harmless — it has no

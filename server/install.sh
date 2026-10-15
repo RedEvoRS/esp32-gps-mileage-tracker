@@ -31,9 +31,9 @@ set -Eeuo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # Both images run as a user called app, which gets UID 1000.
 CONTAINER_UID=1000
-# Trip and device ID of the test upload. Nothing real uses it, so the
-# test can be uploaded and deleted on a live system.
-TEST_ID=install-check
+# Trip and device IDs of the test upload start with this. Each run adds
+# a random suffix, so nothing real or another run's test shares its path.
+TEST_PREFIX=install-check
 # The REMOTE line backup.conf.example ships with, i.e. "not set up yet".
 EXAMPLE_REMOTE=backup@nas.lan:/volume1/backups/mileage-tracker
 
@@ -60,7 +60,9 @@ VIEWER_PASSWORD=
 RELOGIN=no
 SUDO_READY=no
 SUDO_KEEPALIVE=
-TEST_TRIP=          # data/<ym>/install-check, while the test trip exists
+TEST_ID=            # install-check-<random>, set by upload_test_trip
+TEST_TRIP=          # data/<ym>/<TEST_ID>, while this run's test trip may exist
+TEST_NEW_DIR=       # data/<ym>, if this run's upload is what created it
 TMP_FILES=()
 WARNINGS=()
 FAILURES=0
@@ -878,8 +880,20 @@ remove_test_trip() {
     [[ -n $trip ]] || return 0
     TEST_TRIP=
     "${DATA_SUDO[@]}" rm -f -- "$trip.gpx" "$trip.json"
-    # Only goes if the test trip was all that month held.
-    "${DATA_SUDO[@]}" rmdir -- "${trip%/*}" 2> /dev/null || true
+    # Only a month folder the test upload made, and only if it's empty:
+    # another run's upload may be filing into one that already existed.
+    if [[ ${trip%/*} == "$TEST_NEW_DIR" ]]; then
+        "${DATA_SUDO[@]}" rmdir -- "$TEST_NEW_DIR" 2> /dev/null || true
+    fi
+}
+
+# data_exists PATH...: whether any of them exists in data/.
+data_exists() {
+    local path
+    for path; do
+        if "${DATA_SUDO[@]}" test -e "$path"; then return 0; fi
+    done
+    return 1
 }
 
 csrf_from() {
@@ -899,10 +913,60 @@ http_fetch() {
     printf '%s' "${code:-000}"
 }
 
+# The real thing: upload sample.gpx with the token from .env. The header
+# comes from a pipe so the token stays out of the process list.
+# sample.gpx ends on 2026-04-14, so it's filed under data/2026-04/.
+#
+# Cleanup deletes the test trip, so it may only ever be this run's: the
+# ID is new each run, and its path has to be free beforehand. Then
+# whatever turns up there came from this upload.
+upload_test_trip() {
+    local trip token response code body status miles stored
+    TEST_ID=$TEST_PREFIX-$(openssl rand -hex 6)
+    trip=data/2026-04/$TEST_ID
+    if data_exists "$trip.gpx" "$trip.json"; then
+        problem "$trip already exists, so the test upload can't use it" \
+            "Nothing was uploaded or deleted. Run the check again for a new test ID."
+        return 1
+    fi
+    if ! data_exists "${trip%/*}"; then TEST_NEW_DIR=${trip%/*}; fi
+    token=$(env_raw .env INGEST_AUTH_TOKEN)
+    TEST_TRIP=$trip
+    response=$(curl -s -m 30 -w '\n%{http_code}' -X POST \
+        -H @<(printf 'Authorization: Bearer %s\n' "$token") \
+        -H 'Content-Type: application/gpx+xml' \
+        -H "X-Device-Id: $TEST_ID" -H "X-Trip-Id: $TEST_ID" \
+        --data-binary @sample.gpx "$INGEST_URL/upload") || response=$'\n000'
+    code=${response##*$'\n'}
+    body=${response%$'\n'*}
+    status=$(jq -r '.status // empty' <<< "$body" 2> /dev/null) || status=
+    miles=$(jq -r '.distance_miles // empty' <<< "$body" 2> /dev/null) || miles=
+    stored=$(jq -r '.stored_as // empty' <<< "$body" 2> /dev/null) || stored=
+    if [[ $code == 200 && $status == accepted && $stored == */"$TEST_ID.gpx" ]]; then
+        TEST_TRIP=data/${stored%.gpx}
+        ok "Uploaded sample.gpx with the token; it was filed as $stored"
+    else
+        # A refusal (4xx) stored nothing, so there's nothing of ours to
+        # delete. After a timeout or a 5xx some of it may have been
+        # written; the path was free before, so cleanup can remove that.
+        if [[ $code == 4?? ]]; then TEST_TRIP=; fi
+        problem "The test upload failed: HTTP $code ${body}" \
+            "401: the running service has a different token from .env; recreate it: docker compose up -d" \
+            "500: data/ probably isn't writable by UID $CONTAINER_UID (DEPLOY_DEBIAN.md Step 3)."
+        return 1
+    fi
+    if awk -v m="$miles" 'BEGIN { exit !(m >= 0.25 && m <= 0.35) }'; then
+        ok "It came to $miles miles, as it should (sample.gpx is about 0.30)"
+    else
+        problem "sample.gpx came to ${miles:-no} miles instead of about 0.30" \
+            "The upload works, but the distance calculation is off."
+    fi
+}
+
 verify_end_to_end() {
     section "End-to-end checks"
     if (( ${#DATA_SUDO[@]} )); then need_sudo; fi
-    local url body code token
+    local url body code
     for url in "$INGEST_URL/health" "$VIEWER_URL/health"; do
         body=$(curl -sS -m 10 "$url" 2>&1) || true
         if [[ $(jq -r '.status // empty' <<< "$body" 2> /dev/null) == ok ]]; then
@@ -930,37 +994,7 @@ verify_end_to_end() {
         problem "An upload with the wrong token got HTTP $code instead of 401"
     fi
 
-    # The real thing, with the token from .env. The header comes from a
-    # pipe so the token stays out of the process list. sample.gpx ends on
-    # 2026-04-14, so it's filed under data/2026-04/.
-    token=$(env_raw .env INGEST_AUTH_TOKEN)
-    TEST_TRIP=data/2026-04/$TEST_ID
-    local response status miles stored
-    response=$(curl -s -m 30 -w '\n%{http_code}' -X POST \
-        -H @<(printf 'Authorization: Bearer %s\n' "$token") \
-        -H 'Content-Type: application/gpx+xml' \
-        -H "X-Device-Id: $TEST_ID" -H "X-Trip-Id: $TEST_ID" \
-        --data-binary @sample.gpx "$INGEST_URL/upload") || response=$'\n000'
-    code=${response##*$'\n'}
-    body=${response%$'\n'*}
-    status=$(jq -r '.status // empty' <<< "$body" 2> /dev/null) || status=
-    miles=$(jq -r '.distance_miles // empty' <<< "$body" 2> /dev/null) || miles=
-    stored=$(jq -r '.stored_as // empty' <<< "$body" 2> /dev/null) || stored=
-    if [[ $code == 200 && $status == accepted && $stored == */"$TEST_ID.gpx" ]]; then
-        TEST_TRIP=data/${stored%.gpx}
-        ok "Uploaded sample.gpx with the token; it was filed as $stored"
-    else
-        problem "The test upload failed: HTTP $code ${body}" \
-            "401: the running service has a different token from .env; recreate it: docker compose up -d" \
-            "500: data/ probably isn't writable by UID $CONTAINER_UID (DEPLOY_DEBIAN.md Step 3)."
-        return 1
-    fi
-    if awk -v m="$miles" 'BEGIN { exit !(m >= 0.25 && m <= 0.35) }'; then
-        ok "It came to $miles miles, as it should (sample.gpx is about 0.30)"
-    else
-        problem "sample.gpx came to ${miles:-no} miles instead of about 0.30" \
-            "The upload works, but the distance calculation is off."
-    fi
+    upload_test_trip || return 1
     if "${DATA_SUDO[@]}" cmp -s sample.gpx "$TEST_TRIP.gpx"; then
         ok "The GPX on disk matches the upload byte for byte"
     else
