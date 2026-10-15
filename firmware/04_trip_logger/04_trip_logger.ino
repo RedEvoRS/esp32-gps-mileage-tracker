@@ -1448,6 +1448,10 @@ void setup() {
     // capacity, much less stress on a cell that lives in a hot car (the
     // charge temperature guard, below, covers charging when it's too hot).
     PMU.setChargeTargetVoltage(XPOWERS_AXP2101_CHG_VOL_4V1);
+    // No charging until the temperature guard's first check. The PMU keeps
+    // the charger on across ESP32 resets, and storage setup (mount, fsck)
+    // can halt or crash before that check runs.
+    PMU.disableCellbatteryCharge();
     // Enable the measurements the battery/VBUS predicates and the charge
     // temperature guard rely on.
     PMU.enableTemperatureMeasure();
@@ -1471,7 +1475,10 @@ void setup() {
 
     // --- Storage + boot-time repair ---
     if (!mountTripStorage()) {
-        while (1) delay(1000);
+        // Halted, but maybe still on USB in a hot car: keep guarding the
+        // charger (off since the PMU setup). Delay first, so the temperature
+        // ADC has converted before the first reading.
+        while (1) { delay(1000); serviceChargeTemp(); }
     }
     if (!LittleFS.exists(TRIP_DIR)) LittleFS.mkdir(TRIP_DIR);
     prefs.begin("mileage", false);
@@ -1480,9 +1487,10 @@ void setup() {
     // After the fsck so the receiver has had time to boot.
     configureGps();
 
-    // First charge-temperature check now, not 30 s in: a car that starts
-    // hot must not charge in the meantime. (The temperature ADC was enabled
-    // well over a conversion time ago, with the PMU.)
+    // First charge-temperature check now, not 30 s in: charging has been off
+    // since the PMU setup, and this turns it back on if it's safe. (The
+    // temperature ADC was enabled well over a conversion time ago, with the
+    // PMU.)
     serviceChargeTemp();
 
     // --- Networking task on core 0; GPS/FSM stay on core 1 (loop) ---

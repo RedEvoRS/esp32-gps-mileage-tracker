@@ -111,6 +111,7 @@ Before flashing:
    says. At ~118 bytes per second of driving that's roughly 5-6 hours
    between uploads. Normal firmware never formats the trip partition
    automatically: a mount error halts logging and preserves queued data.
+   The battery's charge-temperature guard keeps running while halted.
    A fresh device or a changed partition layout needs the explicit
    first-time provisioning below.
 

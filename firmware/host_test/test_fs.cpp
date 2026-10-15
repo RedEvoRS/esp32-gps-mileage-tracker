@@ -42,6 +42,7 @@ static void resetWorld() {
     gChargePaused = false; gChargeApplied = false; gChargeCheckT0 = 0;
     gNetBusy = false; gNetHold = false; gNetAbort = false;
     gIdleSince = g_millis; g_deepSleeps = 0; g_lockDepth = 0;
+    g_delayHook = nullptr;
 }
 
 // Run loop() every 100 ms for `ms`, stopping at deep sleep (the stub returns
@@ -105,6 +106,11 @@ static bool wellFormedShape(const std::string& d) {
     if (d.size() < 22 || d.compare(d.size() - 22, 22, "</trkseg></trk></gpx>\n") != 0) return false;
     return count(d, "<trkpt ") == count(d, "</trkpt>");
 }
+// setup()'s halt loops never return: a delay() hook throws this to stop one.
+struct Halted {};
+static int  g_haltSecs = 0;
+static bool g_chargeAtMount = false, g_chargeWhileHot = false, g_chargeWhenCool = false;
+
 static void dump(const char* test) {
     int i = 0;
     for (auto& f : tripFiles()) {
@@ -762,6 +768,43 @@ int main(int argc, char** argv) {
         CHECK(!logHas("after network cycle") && !gNetBusy, "held: no cycle starts");
         gNetHold = false; netCycle();
         CHECK(logHas("after network cycle") && !gNetBusy, "released: cycle runs and clears busy");
+    }
+
+    printf("T33 storage that won't mount: the charge guard keeps running (#55)\n");
+    {
+        resetWorld();
+        g_disk.files["/trips/t000033.gpx"] = "irreplaceable trip";
+        g_disk.failMount = true;
+        PMU.chargeEnabled = true;                    // left on by the last boot
+        PMU.dieC = 60;                               // parked in the sun
+        g_disk.onMount = [] { g_chargeAtMount = PMU.chargeEnabled; };
+        g_haltSecs = 0;
+        g_delayHook = [](uint32_t ms) {
+            g_millis += ms;
+            if (!logHas("LittleFS mount failed")) return;   // setup()'s start-up delay
+            ++g_haltSecs;
+            if (g_haltSecs == 60)  { g_chargeWhileHot = PMU.chargeEnabled; PMU.dieC = 35; }   // AC on
+            if (g_haltSecs == 120) { g_chargeWhenCool = PMU.chargeEnabled; PMU.dieC = 60; }  // parked again
+            if (g_haltSecs == 180) throw Halted{};
+        };
+        try { setup(); } catch (const Halted&) {}
+        g_delayHook = nullptr;
+        CHECK(g_haltSecs == 180, "setup() halts on the mount error");
+        CHECK(!g_chargeAtMount, "charging off before storage is touched");
+        CHECK(!g_chargeWhileHot, "hot: charging stays off while halted");
+        CHECK(g_chargeWhenCool, "cooled: the halted guard turns charging back on");
+        CHECK(!PMU.chargeEnabled && logCount("too hot") == 2, "hot again: paused again");
+        CHECK(!g_disk.formatRequested && g_disk.files["/trips/t000033.gpx"] == "irreplaceable trip",
+              "queued trip neither formatted nor erased");
+
+        resetWorld();                                // normal boot, cool car
+        PMU.chargeEnabled = true;
+        PMU.dieC = 35;
+        g_chargeAtMount = true;
+        g_disk.onMount = [] { g_chargeAtMount = PMU.chargeEnabled; };
+        setup();
+        CHECK(!g_chargeAtMount, "normal boot: charging off while storage starts");
+        CHECK(PMU.chargeEnabled && logHas("Setup complete"), "then the first check turns it on");
     }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
