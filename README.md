@@ -347,8 +347,10 @@ laptop and watch the Serial Monitor.
   2.4 GHz WiFi has to reach that spot. A phone on the same network,
   standing where the car parks, is a quick test.
 - **The power button.** The board starts by itself when the car's USB
-  port comes on. A short press of **PWR** wakes it from sleep, and a long
-  press puts it to sleep. Unplugged from USB, on your desk say, it runs
+  port comes on. A short press of **PWR** wakes it from sleep, and holding
+  it for a couple of seconds puts it to sleep. Keep holding for 6 seconds
+  and the power chip switches the board off completely; a short press
+  turns it back on. Unplugged from USB, on your desk say, it runs
   on the battery for 10 minutes and then sleeps until USB power comes
   back. It hasn't died.
 

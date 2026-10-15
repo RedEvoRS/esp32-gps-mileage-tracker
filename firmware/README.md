@@ -309,6 +309,8 @@ How it behaves once flashed:
   sees the car turn off and never sleeps.
 - **Buttons:** a long press of PWR finalizes any trip and puts the board
   into deep sleep; a short press, or USB power coming back, wakes it.
+  Holding PWR for 6 seconds is the power chip's own power-off (LilyGO's
+  default), which cuts power completely; a short press turns it back on.
 - **Charging:** the firmware pauses charging at high or low temperatures
   reported by the AXP2101 power-management chip. Its temperature is an
   indirect estimate, not a measurement of the battery cell or a guarantee
