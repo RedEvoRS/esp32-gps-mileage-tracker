@@ -92,6 +92,15 @@ static constexpr uint32_t FIX_LOSS_END_MS = 300UL * 1000;   // 5 min
 // VBUS insert (car back on) wakes us.
 static constexpr uint32_t IDLE_BATT_SLEEP_MS = 10UL * 60 * 1000;
 
+// Sleep never unmounts storage under an upload (issue #3). When the idle
+// timer runs out mid-upload, the file gets up to NET_DRAIN_MS to finish:
+// the server's 300 s worker timeout bounds one upload, plus time to scan
+// and connect. After that, or at once for a critical battery or a held
+// power key, the upload is cut off and the network task gets NET_ABORT_MS
+// to close the file and switch WiFi off. A cut-off trip stays queued.
+static constexpr uint32_t NET_DRAIN_MS = 6UL * 60 * 1000;
+static constexpr uint32_t NET_ABORT_MS = 15UL * 1000;
+
 // How often the networking task wakes to look for pending uploads.
 static constexpr uint32_t NET_TICK_MS     = 30000;
 // Restore the brief's conservative allocation until measured on hardware.
@@ -137,6 +146,14 @@ volatile bool     gVbusLost   = false;
 volatile bool     gPmuIrqFlag = false;
 // Shared by core 0 (SNTP) and core 1 (GPS/fix construction).
 std::atomic<bool> gClockSet{false};  // a source has synchronized UTC this boot
+// Sleep/upload handshake (issue #3). Core 0 raises gNetBusy before it reads
+// gNetHold; core 1 sets gNetHold before it reads gNetBusy. With seq_cst
+// atomics at least one side sees the other, so once core 1 reads gNetBusy
+// false the network task can't start a new cycle. gNetAbort cuts off an
+// upload in progress (LockedFileStream ends the body).
+std::atomic<bool> gNetBusy{false};   // a network cycle is running
+std::atomic<bool> gNetHold{false};   // don't start a cycle or another file
+std::atomic<bool> gNetAbort{false};  // stop the current upload now
 // GPS correction cadence belongs only to core 1; SNTP never suppresses it.
 bool              gGpsClockSet = false;
 uint32_t          gLastGpsSyncMs = 0;
@@ -890,12 +907,28 @@ static void setupPmuIrq() {
                   XPOWERS_AXP2101_WARNING_LEVEL2_IRQ);
 }
 
+// Stop the network task before storage is unmounted (issue #3). It starts
+// no new work once gNetHold is set; an upload still running is cut off and
+// given NET_ABORT_MS to close its file and switch WiFi off. The trip stays
+// queued: only an HTTP 200 deletes it.
+static void stopNetworkTask() {
+    gNetHold.store(true);
+    if (!gNetBusy.load()) return;
+    gNetAbort.store(true);
+    Serial.println("Stopping the upload in progress -- the trip stays queued.");
+    uint32_t t0 = millis();
+    while (gNetBusy.load() && millis() - t0 < NET_ABORT_MS) vTaskDelay(pdMS_TO_TICKS(20));
+    if (gNetBusy.load()) Serial.println("Network task still busy -- sleeping anyway.");
+}
+
 static void deepSleepForVbus() {
     Serial.println("Entering deep sleep (battery critical / idle).");
     if (gTripPath[0]) endTrip(/*discardIfMicro=*/false);
+    stopNetworkTask();
+    // Keep the lock: this boot ends in deep sleep, so even a network task
+    // that never stopped can't reach the filesystem once it's unmounted.
     FS_LOCK();
     LittleFS.end();
-    FS_UNLOCK();
     // GPS main supply off. The receiver keeps its clock and satellite data
     // on the backup supply (enabled in setup), so the next fix is a hot
     // start.
@@ -1049,7 +1082,7 @@ static bool connectWifi() {
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 #endif
     uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+    while (WiFi.status() != WL_CONNECTED && !gNetAbort.load() && millis() - t0 < 15000) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     return WiFi.status() == WL_CONNECTED;
@@ -1065,7 +1098,7 @@ static void trySntp() {
     esp_sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
     uint32_t start = millis();
-    while (!gClockSet.load() && millis() - start < 5000) {
+    while (!gClockSet.load() && !gNetAbort.load() && millis() - start < 5000) {
         if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
             gClockSet.store(true);
             Serial.println("System clock set from NTP.");
@@ -1105,11 +1138,14 @@ static bool isComplete(const char* path) {
 // reads ~1.4 KB per chunk, so each lock hold is now milliseconds and
 // the GPS task interleaves freely. The file being uploaded is always
 // finalized and never the active trip, so per-chunk locking is safe.
+// available() returns -1 once gNetAbort is set: HTTPClient then stops
+// sending and fails the request, so a cut-off upload ends within a chunk.
 class LockedFileStream : public Stream {
     File& _f;
 public:
     explicit LockedFileStream(File& f) : _f(f) {}
     int available() override {
+        if (gNetAbort.load()) return -1;
         FS_LOCK(); int n = _f.available(); FS_UNLOCK(); return n;
     }
     int read() override {
@@ -1207,7 +1243,8 @@ static void uploadPending() {
     }
     FS_UNLOCK();
 
-    for (int i = 0; i < count; ++i) {
+    // A sleep request (gNetHold) lets the current file finish, then stops.
+    for (int i = 0; i < count && !gNetHold.load(); ++i) {
         if (isComplete(pending[i].c_str())) {
             uploadFile(pending[i].c_str());
         }
@@ -1234,18 +1271,27 @@ static bool hasPending() {
     return found;
 }
 
+// One pass of the network task. gNetBusy covers everything that touches
+// WiFi or the filesystem, and is raised before gNetHold is read (see the
+// handshake note at the globals).
+static void netCycle() {
+    gNetBusy.store(true);
+    if (!gNetHold.load() && hasPending()) {
+        if (homeApInRange() && connectWifi()) {
+            trySntp();
+            uploadPending();
+        }
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        reportNetworkStack("after network cycle");
+    }
+    gNetBusy.store(false);
+}
+
 static void networkTask(void*) {
     reportNetworkStack("task start");
     for (;;) {
-        if (hasPending()) {
-            if (homeApInRange() && connectWifi()) {
-                trySntp();
-                uploadPending();
-            }
-            WiFi.disconnect(true);
-            WiFi.mode(WIFI_OFF);
-            reportNetworkStack("after network cycle");
-        }
+        netCycle();
         vTaskDelay(pdMS_TO_TICKS(NET_TICK_MS));
     }
 }
@@ -1499,7 +1545,15 @@ void loop() {
     // VBUS insert wakes us when the car turns back on.
     if (!gVbusLost || gState != IDLE) {
         gIdleSince = millis();
+        gNetHold.store(false);
     } else if (millis() - gIdleSince >= IDLE_BATT_SLEEP_MS) {
-        deepSleepForVbus();
+        // Not under a running upload (issue #3): the network task finishes
+        // its current file and stops, and we sleep once it's idle. Logging
+        // carries on while it finishes, and power or a trip coming back
+        // cancels the wait. A file still going after NET_DRAIN_MS is cut off.
+        if (!gNetHold.exchange(true) && gNetBusy.load())
+            Serial.println("Idle on battery -- letting the upload finish before sleeping.");
+        if (!gNetBusy.load() || millis() - gIdleSince >= IDLE_BATT_SLEEP_MS + NET_DRAIN_MS)
+            deepSleepForVbus();
     }
 }

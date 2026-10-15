@@ -371,14 +371,19 @@ extern WiFiStub WiFi;
 struct WiFiClient {};
 // HTTP: the response code is set by the test; each request's body is read
 // through the sketch's stream exactly as HTTPClient would, and recorded.
+// g_httpHook, if set, runs once the request starts, standing in for the
+// other core acting mid-upload. As in the real client, a stream that ends
+// early (available() < 0) fails the request with SEND_PAYLOAD_FAILED.
 inline int g_httpCode = 200;
 inline int g_httpRequests = 0;
 inline std::string g_httpLastBody;
+inline void (*g_httpHook)() = nullptr;
 struct HTTPClient {
     void begin(WiFiClient&, const String&) {} void addHeader(const char*, const String&) {}
     int sendRequest(const char*, Stream* s, size_t size) {
         g_httpRequests++;
         g_httpLastBody.clear();
+        if (g_httpHook) g_httpHook();
         char buf[1436];
         while (g_httpLastBody.size() < size && s->available() > 0) {
             size_t want = std::min(sizeof buf, size - g_httpLastBody.size());
@@ -386,10 +391,13 @@ struct HTTPClient {
             if (n == 0) break;
             g_httpLastBody.append(buf, n);
         }
+        if (g_httpLastBody.size() != size) return -3;   // HTTPC_ERROR_SEND_PAYLOAD_FAILED
         return g_httpCode;
     }
     void end() {}
 };
 #define ESP_EXT1_WAKEUP_ALL_LOW 0
 inline void esp_sleep_enable_ext1_wakeup(uint64_t, int) {}
-inline void esp_deep_sleep_start() { fprintf(stderr, "deep sleep called\n"); }
+// Returns, unlike the real call, so tests can count it and look around.
+inline int g_deepSleeps = 0;
+inline void esp_deep_sleep_start() { g_deepSleeps++; }

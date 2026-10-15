@@ -152,8 +152,12 @@ How it behaves once flashed:
   to the ingest server as GPX and deleted locally on success. GPS
   parsing runs on core 1; networking runs on core 0 and never blocks
   it.
-- **Power loss:** when the car turns off (USB power removed), the
-  current trip is finalized cleanly and kept for the next upload.
+- **Power loss:** when the car turns off (USB power off for 10 s), the
+  current trip is finalized cleanly and kept for the next upload. The
+  board stays awake on battery for 10 minutes, so a trip that ends at
+  home uploads right away, then deep-sleeps until the car turns on. An
+  upload still running at 10 minutes gets up to 6 more to finish; one
+  cut off then stays queued and is sent next time.
 
 Watch the Serial Monitor (115200) for state transitions:
 `Trip started` → (drive) → `Trip finalized`, then
