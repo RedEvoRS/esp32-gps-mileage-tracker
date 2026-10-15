@@ -7,6 +7,10 @@ Deploys both services from `server/`:
 | `mileage-ingest` | 8090 | Bearer token | Accepts GPX uploads from the T-Beam |
 | `mileage-viewer` | 8091 | Session login | Trip list, map audit, annotate, CSV/XLSX export |
 
+This is the server half of the project. The top-level `README.md` gives
+the whole setup in order (server, then the board, then the car); come
+back to it after Step 8.
+
 Assumes: Debian 12/13, a non-root user with sudo, SSH reachable.
 Placeholders: `<user>` = your Debian login, `<host>` = server IP or hostname.
 
@@ -43,9 +47,10 @@ you'd rather do it by hand, or to understand a step it stopped on.
 
 ## Step 0 — Confirm SSH works
 
-From your Windows box (PowerShell):
+From the computer you'll run the setup from (PowerShell on Windows,
+Terminal on macOS or Linux):
 
-```powershell
+```bash
 ssh <user>@<host>
 ```
 
@@ -105,12 +110,17 @@ docker compose version      # expect v2.x
 
 ## Step 2 — Copy the `server/` directory over
 
-From **Windows PowerShell**, in your clone of this repo:
+From the computer with your copy of this repo (cloned, or downloaded as a
+ZIP and unzipped), in the repo's top folder:
 
-```powershell
-cd "~\Documents\esp32-gps-mileage-tracker"
+```bash
+cd <your copy of the repo>
 scp -r server <user>@<host>:~/mileage-tracker
 ```
+
+`scp` comes with Windows 10 and later, macOS and Linux, and works the same
+in each. Use this for the first copy only: if `~/mileage-tracker` already
+exists, `scp -r` puts the new copy inside it as `server/`.
 
 Then back on the server, sanity-check the tree:
 
@@ -127,7 +137,7 @@ works with no internet except OSM map tiles).
 > **Watch for:** `scp -r` on Windows can silently skip dotfiles in some
 > OpenSSH builds. Confirm `.env.example` made it: `ls -a ~/mileage-tracker`.
 > If missing, copy it explicitly:
-> `scp server\.env.example <user>@<host>:~/mileage-tracker/`
+> `scp server/.env.example <user>@<host>:~/mileage-tracker/`
 
 ---
 
@@ -184,9 +194,15 @@ chmod 600 .env
 **Save this token somewhere you can get at it** — the same value goes into
 `firmware/secrets.h` in Step 8.
 
-Optional: `docker-compose.yml` hardcodes `TZ=America/Los_Angeles` for both
-services. Edit it now if you're in a different zone — trip timestamps and log
-lines follow it.
+**Not in Pacific time?** Trip times are shown and exported in
+`America/Los_Angeles` until you change `DISPLAY_TZ` in `docker-compose.yml`.
+Edit it now, on **both** services, to your zone's name: `America/Chicago`
+or `Europe/London`, say. Never use a fixed offset like `-06:00`; it's an
+hour wrong for half the year wherever clocks change for daylight saving.
+Ingest also uses `DISPLAY_TZ` to pick the month folder a trip is filed
+in, which is why the two have to match. `TZ`, also set on both, only
+changes the times on log lines; change it too if you want those in local
+time.
 
 ---
 
@@ -369,8 +385,9 @@ the traffic can replay them. The login is defence in depth against other
 devices on your network, not a substitute for TLS.
 
 **Give the server a static IP or DHCP reservation first.** The T-Beam
-hardcodes the upload host, so a lease change would silently break uploads.
-The bind address below depends on it too.
+has the upload address compiled in, so a lease change silently breaks
+uploads until you reflash it with the new address (Step 8). The bind
+address below depends on it too.
 
 **Restrict the ports with the bind address, not UFW.** Docker publishes
 ports through its own iptables rules, which forward the traffic before UFW
@@ -419,24 +436,33 @@ That's expected. Use the LAN IP for any curl tests from here on.
 
 ## Step 8 — Point the firmware at it
 
-On your Windows box:
+On the computer with your copy of the repo, create the firmware's
+settings file from the example:
 
-```powershell
-cd "~\Documents\esp32-gps-mileage-tracker\firmware"
-copy secrets.h.example 04_trip_logger\secrets.h
+```bash
+cd <your copy of the repo>/firmware
+cp secrets.h.example 04_trip_logger/secrets.h
 ```
 
-It has to sit in the sketch folder, `04_trip_logger\`, next to the
-`.ino`; that's the only place the build looks for it. Fill in WiFi
-SSID/password, the server host/IP, port `8090`, and the
-`INGEST_AUTH_TOKEN` from Step 4 — it must match byte-for-byte.
-`install.sh` prints the server lines ready to paste.
+(In Windows `cmd`, use `copy secrets.h.example 04_trip_logger\secrets.h`;
+PowerShell accepts `cp`.) It has to sit in the sketch folder,
+`04_trip_logger/`, next to the `.ino`; that's the only place the build
+looks for it. Fill in WiFi SSID/password, the server host/IP, port
+`8090`, and the `INGEST_AUTH_TOKEN` from Step 4a — it must match
+byte-for-byte. `install.sh` prints the server lines ready to paste. The
+WiFi has to be 2.4 GHz, and hidden networks won't work.
+
+> **These settings are compiled into the firmware.** If the server's IP or
+> the token changes later, or your WiFi name or password does, the board
+> stops uploading until you update `secrets.h` and flash it again.
 
 `secrets.h` is gitignored. Keep it that way.
 
-Then compile and flash `firmware/04_trip_logger`. It compiles on ESP32 core
-3.3.11 with XPowersLib 0.3.3 and TinyGPSPlus 1.0.3, and uses the
-`partitions.csv` in its folder automatically.
+Then flash `firmware/04_trip_logger`, check it works and put it in the car.
+The top-level README covers all three under "Setting it up", steps 3 to 5:
+the Arduino IDE setup (ESP32 core 3.3.11, XPowersLib 0.3.3, TinyGPSPlus
+1.0.3), the rest of the WiFi requirements, and the **one-time storage setup
+a new board needs on its first flash**.
 
 ---
 
@@ -633,7 +659,19 @@ then `docker compose restart mileage-ingest`.
 
 **Upload returns 401** — token mismatch. Verify what the container actually
 sees: `docker compose exec mileage-ingest env | grep INGEST`. A trailing space
-or quotes in `.env` will break it.
+or quotes in `.env` will break it. If the server's token looks right, the
+board has a different one: `AUTH_TOKEN` in `secrets.h` must match it byte
+for byte, and the board only picks up a change when you flash it again
+(Step 8). Regenerating the token after flashing causes exactly this.
+
+**Trips stop arriving from the board, but the server checks out** — the
+board can't reach it. The usual cause is something that changed since it
+was flashed: the server's IP (check the DHCP reservation), the token in
+`.env`, or the WiFi name or password. The board has all of these compiled
+in, so update `secrets.h` and reflash (Step 8). The top-level README's
+"Check it works" section says how to read the board's Serial Monitor
+output. Trips recorded meanwhile wait on the board, but once its storage
+fills (about 5 to 6 hours of driving) it stops recording.
 
 **Compose says `INGEST_AUTH_TOKEN` is unset** — `.env` must sit next to
 `docker-compose.yml` in `~/mileage-tracker/`, not inside `mileage-ingest/`.
