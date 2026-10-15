@@ -49,7 +49,7 @@ CODE_REVIEW_2026-06-09.md, AUDIT_2026-08-04.md, AUDIT_2026-10-05.md,
 INDEPENDENT_AUDIT_2026-10-05.md      Review history (see Current Status)
 ```
 
-## Current Status (as of 2026-10-13)
+## Current Status (as of 2026-10-15)
 
 Code is written and tested on both sides. Nothing is deployed, and the
 firmware hasn't been road-tested.
@@ -70,9 +70,9 @@ firmware hasn't been road-tested.
   `INDEPENDENT_AUDIT_2026-10-05.md`. The fix-status table in
   `AUDIT_2026-10-05.md` covers only the first round of fixes; the closed
   trackers #1 and #2 have the rest.
-- **Fixed:** every August finding except F11 (#6), and October N1–N8 and
-  N10–N12. N5 shipped without a commuting category, per the owner.
-- **Still open:** #3 (N9, deep sleep can unmount the FS mid-upload), #4
+- **Fixed:** every August finding except F11 (#6), and October N1–N12.
+  N5 shipped without a commuting category, per the owner.
+- **Still open:** #4
   (N13: the backup tooling is in `server/backup/`, but it isn't set up on
   the server or restore-tested from a real off-host copy yet), #6 (F11, network stack sizing; needs
   measurements from a real upload), the shakedown checks #25 (deep-sleep
@@ -162,7 +162,7 @@ firmware hasn't been road-tested.
    engine crank and start-stop and the N1 jitter figure (#27), and the F11
    stack measurement during a real upload (#6; procedure in
    `firmware/README.md` → Network stack shakedown).
-5. **Remaining code:** N9 (#3), then the low-severity issues (#16–#23).
+5. **Remaining code:** the low-severity issues (#16–#23).
 
 When a PR fixes an issue, say "Fixes #N" (one line per issue) so merging
 it closes the issue. File every new finding as its own issue, however

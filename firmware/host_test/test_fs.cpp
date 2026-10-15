@@ -38,8 +38,17 @@ static void resetWorld() {
     gClockSet = true;
     PMU = XPowersAXP2101(); gPmuIrqFlag = false;
     gVbusLost = false; gVbusOffPending = false;
-    g_httpCode = 200; g_httpRequests = 0; g_httpLastBody.clear();
+    g_httpCode = 200; g_httpRequests = 0; g_httpLastBody.clear(); g_httpHook = nullptr;
     gChargePaused = false; gChargeApplied = false; gChargeCheckT0 = 0;
+    gNetBusy = false; gNetHold = false; gNetAbort = false;
+    gIdleSince = g_millis; g_deepSleeps = 0; g_lockDepth = 0;
+}
+
+// Run loop() every 100 ms for `ms`, stopping at deep sleep (the stub returns
+// from it, but the real board never runs loop() again).
+static void loopFor(uint32_t ms) {
+    uint32_t end = g_millis + ms;
+    while ((int32_t)(g_millis - end) < 0 && !g_deepSleeps) { g_millis += 100; loop(); }
 }
 
 // Advance the clock a second at a time with the die at `c`, servicing the
@@ -677,6 +686,82 @@ int main(int argc, char** argv) {
         fsckAllTrips();
         CHECK(g_disk.files[path] == partial && g_disk.removeCount == 0,
               "unreadable original is not classified as garbage");
+    }
+
+    // Issue #3. gNetBusy = true stands in for core 0 mid-upload; these
+    // check the handshake, not real multicore timing.
+    printf("T30 idle sleep lets a running upload finish, then sleeps (#3)\n");
+    {
+        resetWorld();
+        drive(15, 40); drive(0, 5);
+        vbus(false); drive(0, 11);                   // car off: trip finalized
+        CHECK(gVbusLost && gState == IDLE && hasPending(), "trip queued, on battery");
+        gIdleSince = g_millis;                       // as loop() last saw the trip
+        gNetBusy = true;                             // uploading it
+        loopFor(IDLE_BATT_SLEEP_MS + 1000);
+        CHECK(g_deepSleeps == 0 && gNetHold, "10 min: no sleep yet, network task told to stop");
+        CHECK(logHas("letting the upload finish"), "logged");
+        loopFor(60000);
+        CHECK(g_deepSleeps == 0, "keeps waiting while the upload runs");
+        gNetBusy = false;                            // its file is done
+        loopFor(1000);
+        CHECK(g_deepSleeps == 1 && !gNetAbort, "sleeps once it's idle, nothing cut off");
+        CHECK(!g_disk.mounted && g_lockDepth == 1, "storage unmounted, lock kept into sleep");
+
+        resetWorld();
+        gVbusLost = true; gNetBusy = true;
+        loopFor(IDLE_BATT_SLEEP_MS + 1000);
+        CHECK(g_deepSleeps == 0 && gNetHold, "waiting on the upload");
+        vbus(true); loopFor(1000);
+        CHECK(!gVbusLost && !gNetHold && g_deepSleeps == 0, "car back on: wait cancelled, uploads resume");
+    }
+
+    printf("T31 an upload that won't finish is cut off, and storage stays locked (#3)\n");
+    {
+        resetWorld();
+        gVbusLost = true; gNetBusy = true;           // and it never finishes
+        loopFor(IDLE_BATT_SLEEP_MS + NET_DRAIN_MS - 1000);
+        CHECK(g_deepSleeps == 0 && !gNetAbort, "waits out the drain limit");
+        loopFor(2000 + NET_ABORT_MS);
+        CHECK(g_deepSleeps == 1 && gNetAbort, "then cuts the upload off and sleeps");
+        CHECK(logHas("sleeping anyway") && g_lockDepth == 1, "a stuck task still can't reach storage");
+
+        resetWorld();                                // critical battery / power key
+        drive(15, 40); drive(0, 5);
+        gNetBusy = true;
+        uint32_t t0 = g_millis;
+        deepSleepForVbus();                          // as pollPmu() calls it
+        CHECK(gNetAbort && g_millis - t0 <= NET_ABORT_MS + 100, "upload cut off without waiting for it");
+        auto v = tripFiles();
+        CHECK(v.size() == 1 && wellFormedShape(g_disk.files[v[0]]), "trip finalized first");
+        CHECK(g_deepSleeps == 1 && g_lockDepth == 1, "asleep with storage locked");
+    }
+
+    printf("T32 network task: stops between files, ends a cut-off body, starts nothing when held (#3)\n");
+    {
+        resetWorld();
+        drive(15, 40); drive(0, 200);
+        drive(15, 40); drive(0, 200);
+        CHECK(tripFiles().size() == 2, "two trips queued");
+        g_httpHook = [] { gNetHold = true; };        // sleep asked for mid-upload
+        uploadPending();
+        CHECK(g_httpRequests == 1 && tripFiles().size() == 1, "current file finished, next not started");
+
+        auto left = tripFiles();
+        std::string content = left.empty() ? "" : g_disk.files[left[0]];
+        gNetHold = false; g_httpRequests = 0;
+        g_httpHook = [] { gNetHold = true; gNetAbort = true; };   // cut off at once
+        uploadPending();
+        CHECK(g_httpRequests == 1 && g_httpLastBody.empty(), "body stops at the abort");
+        CHECK(!left.empty() && g_disk.files[left[0]] == content && logHas("will retry"),
+              "trip kept for next time");
+
+        g_httpHook = nullptr; gNetAbort = false;
+        Serial.log.clear();
+        gNetHold = true; netCycle();
+        CHECK(!logHas("after network cycle") && !gNetBusy, "held: no cycle starts");
+        gNetHold = false; netCycle();
+        CHECK(logHas("after network cycle") && !gNetBusy, "released: cycle runs and clears busy");
     }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
