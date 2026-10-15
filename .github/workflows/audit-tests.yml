@@ -160,6 +160,36 @@ jobs:
           sudo systemctl restart docker
           sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
             bash "$INSTALLER" --check < /dev/null
+      - name: Two --checks at once delete only their own test trips
+        # Each run uploads under its own test ID and deletes only that
+        # (#43). A trip under the old fixed ID, in the same month folder,
+        # has to come through byte for byte.
+        run: |
+          dir=$(dirname "$INSTALLER")
+          token=$(sudo sed -n 's/^INGEST_AUTH_TOKEN=//p' "$dir/.env" | tail -n 1)
+          sed 's/Test drive/Not the test drive/' "$dir/sample.gpx" > other.gpx
+          curl -fsS -H @<(printf 'Authorization: Bearer %s\n' "$token") \
+            -H 'Content-Type: application/gpx+xml' \
+            -H 'X-Device-Id: install-check' -H 'X-Trip-Id: install-check' \
+            --data-binary @other.gpx "http://$LAN_ADDR:8090/upload"
+          echo
+          old="$dir/data/2026-04/install-check"
+          before=$(sudo sha256sum "$old.gpx" "$old.json")
+          pids=()
+          for n in 1 2; do
+            sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+              bash "$INSTALLER" --check < /dev/null > "check$n.log" 2>&1 &
+            pids+=($!)
+          done
+          failed=0
+          for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+          cat check1.log check2.log
+          test "$failed" = 0
+          grep -q 'Deleted the test trip' check1.log
+          grep -q 'Deleted the test trip' check2.log
+          test "$(sudo sha256sum "$old.gpx" "$old.json")" = "$before"
+          test -z "$(sudo find "$dir/data" -name 'install-check-*')"
+          sudo rm "$old.gpx" "$old.json"
       - name: --check reports a .env with CRLF endings once
         # Not once per value read from it as well: Compose drops the \r
         # itself, so the services are fine and only the file is wrong.
