@@ -183,7 +183,8 @@ cd firmware/04_trip_logger
 cp ../secrets.h.example secrets.h
 ```
 
-Then edit it:
+(PowerShell accepts `cp`; in Windows `cmd`, use
+`copy ..\secrets.h.example secrets.h`.) Then edit it:
 
 | Setting | What goes in it |
 |---|---|
