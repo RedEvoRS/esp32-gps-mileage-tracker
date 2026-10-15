@@ -70,9 +70,11 @@ MAC_ARRAY = re.compile(r"(?i)0x[0-9a-f]{2}(?:\s*,\s*0x[0-9a-f]{2}){5}")
 
 
 def email_allowed(addr):
-    """noreply, example and LAN-only addresses (ssh targets like backup@nas.lan)."""
+    """noreply, example and LAN-only addresses (ssh targets like backup@nas.lan),
+    plus GitHub's support address, which Dependabot signs its commits with."""
     local, _, domain = addr.lower().rpartition("@")
     return (local in ("noreply", "git")
+            or addr.lower() == "support@github.com"
             or domain.endswith("users.noreply.github.com")
             or domain in ("example.com", "example.org", "example.net")
             or domain.rsplit(".", 1)[-1] in ("lan", "local", "test", "invalid", "example"))
