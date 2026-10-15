@@ -8,10 +8,10 @@
 //   1. A trip state machine that auto-detects start (>5 mph for 10 s)
 //      and end (<2 mph for 3 min), with hysteresis so stop-and-go
 //      traffic doesn't split one drive into many.
-//   2. Crash-safe GPX logging to LittleFS -- one trkpt line appended
-//      per fix, file.close() after every write, so a yanked USB cable
-//      loses at most the single in-flight point. A boot-time "fsck"
-//      repairs any file left unclosed by a hard power cut.
+//   2. GPX logging to LittleFS -- one trkpt line appended per timed fix,
+//      file.close() after every write to limit power-cut data loss.
+//      Untimed points are buffered in RAM. Boot-time "fsck" attempts
+//      repair; a maximum loss bound still needs hardware validation.
 //   3. A FreeRTOS networking task pinned to core 0 that, when parked on
 //      home WiFi, uploads finished .gpx files to the ingest server and
 //      deletes them locally on success. GPS parsing stays on core 1 and

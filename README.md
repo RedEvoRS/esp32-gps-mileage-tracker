@@ -61,9 +61,11 @@ The board decides on its own when a trip starts and stops. Going faster than
 which is long enough that a red light doesn't chop one drive into six.
 Anything shorter than 30 seconds or about a tenth of a mile gets thrown away.
 
-Each GPS point is written to flash and the file is closed right after, so if
-the power gets yanked you lose one point at most. A file left half-written by
-a power cut gets repaired on the next boot.
+Once the clock is set, each GPS point is written to flash and the file is
+closed right after to limit data loss if power is cut. Points waiting for
+the clock are buffered in memory and can be lost on a reset. On the next
+boot the firmware attempts to repair incomplete files. Hardware power-cut
+testing is still needed; there is no verified one-point loss limit.
 
 The board runs off the car's USB port, with an 18650 battery as backup. When
 you turn the car off and the port goes dead, the board closes out the trip
@@ -73,7 +75,7 @@ until the car starts again. Trips recorded away from home wait on the board
 until it's next in range.
 
 The server adds up distance point to point, with a few corrections. Wobble
-while you're parked doesn't count (both ends of a step have to be over
+while you're parked doesn't count (at least one end of a step must be over
 2 mph), bad fixes and physically impossible jumps get skipped, and a gap in
 coverage like a tunnel or a parking garage gets filled with a straight line.
 A straight line is the shortest way between two points, so if the number is
@@ -106,8 +108,11 @@ antenna attached either. Running the SX1262 without a load can damage it.
 And around it:
 
 - **A server**: a Debian 12/13 or Ubuntu machine on your home network
-  that stays on, with a login that can use sudo. Everything runs in
-  Docker, which the installer sets up.
+  that stays on, with SSH access and a login that can use sudo (run
+  administrative commands). Everything runs in Docker, which the installer
+  sets up. For automatic backups, that account currently needs numeric
+  user ID **1000**; run `id -u` on the server to check. The installer skips
+  backups for other IDs. See [backup setup](DEPLOY_DEBIAN.md#step-10--backups).
 - **Home WiFi on 2.4 GHz that reaches where you park.** The ESP32 has no
   5 GHz radio. A network that uses one name for both bands is fine.
   **Hidden networks won't work**: the board only uploads when it sees
@@ -125,7 +130,17 @@ those before you can flash.
 ### 1. Get the code
 
 Clone this repository, or on GitHub use **Code → Download ZIP** and unzip
-it. The commands below run from the top folder of that copy.
+it. On your computer, open PowerShell (Windows) or Terminal (macOS/Linux)
+and change to the top folder of that copy:
+
+```bash
+cd "<path to your copy of the repo>"
+```
+
+Replace text in angle brackets, including the brackets, with your own
+values. Keep the quotes around directory paths, especially if they contain
+spaces. Commands below say when to switch between this computer and the
+server.
 
 ### 2. Set up the server
 
@@ -133,12 +148,19 @@ Before you start, give the server a fixed address on your network: a DHCP
 reservation in your router, or a static IP. The board is flashed with this
 address, so if it ever changes, uploads stop until you reflash.
 
-Copy the `server/` folder over and run the installer as yourself, not
-root:
+**On your computer**, in the repo's top folder, copy `server/` over and
+connect to the server. `<user>` is your Linux login on the server;
+`<server>` is its IP address or hostname:
 
 ```bash
 scp -r server <user>@<server>:~/mileage-tracker
 ssh <user>@<server>
+```
+
+**In that SSH session on the server**, run the installer as your normal
+login, not root:
+
+```bash
 bash ~/mileage-tracker/install.sh
 ```
 
@@ -157,12 +179,33 @@ them for the next step. The token is also in `~/mileage-tracker/.env` on
 the server, as `INGEST_AUTH_TOKEN`.
 
 `bash ~/mileage-tracker/install.sh --check` reruns the checks later
-without changing anything, which is handy after a reboot.
+without changing the configuration. It uploads and removes a temporary
+test trip and can test the viewer login, so it is not a read-only check.
+
+There are three separate credentials to keep straight:
+
+| Credential | Where you use it |
+|---|---|
+| Server SSH login | To connect to and administer the Linux server |
+| Viewer username and password | To sign in to the trips web page |
+| Upload token | In the board's `AUTH_TOKEN` and the server's `INGEST_AUTH_TOKEN`; it is not either login password |
+
+When the installer finishes and you have saved its firmware settings,
+leave the SSH session to return to your computer:
+
+```bash
+exit
+```
 
 If you'd rather do it by hand, [DEPLOY_DEBIAN.md](DEPLOY_DEBIAN.md) goes
 through the same steps one at a time.
 
 ### 3. Flash the board
+
+**Back on your computer**, connect the T-Beam with the data-capable USB
+cable. A *sketch* is an Arduino program (`.ino`); *uploading* or *flashing*
+compiles it and installs it on the board. The *Serial Monitor* is the
+Arduino IDE's window for the board's diagnostic messages over USB.
 
 **Set up the Arduino IDE.** [firmware/README.md](firmware/README.md)
 covers the USB driver, ESP32 board support and the two libraries. Use the
@@ -173,6 +216,8 @@ Library Manager install the newest version unless you pick one.
 If the board is new to you, work through stages 1 to 3 first. Each one gets
 a single piece of hardware working before the next stage depends on it, and
 it's a lot easier to debug that way.
+Each stage replaces the previous program; they do not stay installed
+together. Finish with Stage 4, which is the only stage that records trips.
 
 **Fill in `secrets.h`.** Stage 4, the trip logger, reads your settings
 from `secrets.h`, which has to sit next to `04_trip_logger.ino`; the build
@@ -190,7 +235,7 @@ cp ../secrets.h.example secrets.h
 |---|---|
 | `WIFI_SSID` | Your home network's name, exactly as it appears, capitals included. It has to be 2.4 GHz, and not hidden. |
 | `WIFI_PASSWORD` | Its password. If the password has a `"` or `\` in it, write them as `\"` and `\\`. |
-| `SERVER_HOST` | The server's address, from the installer's output. |
+| `SERVER_HOST` | Only the server's IP address or hostname, from the installer's output. Do not include `http://`, a port, or `/upload`. |
 | `SERVER_PORT` | `8090`. |
 | `AUTH_TOKEN` | The token from the installer's output. It has to match `INGEST_AUTH_TOKEN` in the server's `.env` exactly, or every upload is refused. |
 | `DEVICE_ID` | A name for this board. The default, `tbeam-01`, is fine. |
@@ -209,7 +254,9 @@ router; the comments in `secrets.h` explain it. `secrets.h` is in
 
 **Flash it.** Open `firmware/04_trip_logger/04_trip_logger.ino` in the
 Arduino IDE. Pick **ESP32 Dev Module**, Flash Size **4MB**, and the
-board's port, then Upload. The sketch folder has its own `partitions.csv`,
+board's port. Keep **Erase All Flash Before Sketch Upload → Disabled**,
+then click **Upload** (the right-arrow button) and wait for it to finish.
+The sketch folder has its own `partitions.csv`,
 which overrides the Partition Scheme menu and sets aside 2.375 MB for
 trips.
 
@@ -219,22 +266,30 @@ gets home and uploads, so any driving after that isn't logged. Keep it in
 mind on a long trip away from home, or if uploads have been failing for a
 while.
 
-**First flash on a new board.** The first time Stage 4 runs on a board,
-the Serial Monitor shows `ERROR: LittleFS mount failed. Storage preserved;
-halting.` and nothing gets logged. That's expected: the trip storage
-hasn't been set up yet, and the firmware never formats it on its own, so
+**First flash on a new, empty board.** If the Serial Monitor shows
+`ERROR: LittleFS mount failed. Storage preserved; halting.`, nothing gets
+logged. On a new board this usually means the trip storage hasn't been
+set up yet. The firmware never formats it on its own, so
 a glitch can't wipe trips that are waiting to upload. Set it up once by
 following [First flash on a new board](firmware/README.md#first-flash-on-a-new-board)
-in the firmware README: one temporary edit and two flashes. You won't need
-to do it again on that board unless the partition layout changes.
+in the firmware README: one temporary edit and two flashes. A normal
+reflash with the same partition layout and erasing disabled preserves it.
+**If the board has already recorded trips, do not format it:** follow
+[storage recovery](firmware/README.md#if-the-trip-storage-wont-mount-later).
 
 ### 4. Check it works
 
 The board has no screen and the firmware doesn't use any status light, so
-the Serial Monitor (115200 baud) is the only way to see what it's doing.
+open **Tools → Serial Monitor** in Arduino IDE and set its baud rate
+(communication speed) to **115200**. The board's charging/GPS lights do
+not confirm that a trip was saved or uploaded. If you missed the startup
+messages, briefly press **RST** with the monitor open to restart the
+program. Do this before the test drive, not during a trip.
 
 1. After flashing you should see `Setup complete. Logging trips.` If it
-   says `LittleFS mount failed`, do the first-flash setup above.
+   says `LittleFS mount failed`, use the first-flash setup only for a new,
+   empty board. For a board that has recorded trips, use
+   [storage recovery](firmware/README.md#if-the-trip-storage-wont-mount-later).
 2. Take it for a drive of a few minutes, powered from a laptop with the
    Serial Monitor open. (Anything under 30 seconds or a tenth of a mile is
    thrown away as noise.) GPS doesn't work indoors, and the first fix
@@ -246,15 +301,27 @@ the Serial Monitor (115200 baud) is the only way to see what it's doing.
 4. Open the viewer at `http://<server>:8091/` and log in. The trip should
    be on the list.
 
-If the upload doesn't go through:
+If the trip does not appear, first confirm both `Trip started` and
+`Trip finalized`. A trip still in progress cannot upload; a short trip
+discarded as noise has nothing to upload. Then look for the upload result:
 
 - `HTTP 401`: the token in `secrets.h` doesn't match the server's.
-- A negative number, like `HTTP -1`: the board joined your WiFi but
-  couldn't reach the server. Check `SERVER_HOST` and that the server is
-  running.
-- No `Upload` line at all: the board isn't finding or joining your WiFi.
-  Check the name and password, and that the network is 2.4 GHz and not
-  hidden. The firmware doesn't print anything for this case yet.
+- A negative number, like `HTTP -1`: a connection or transfer failed.
+  This can include a dropped connection or timeout after reaching the
+  server. Check WiFi signal, `SERVER_HOST`, `SERVER_PORT` and server logs.
+- `HTTP 400` or `HTTP 413`: the server rejected the file as invalid or
+  too large. Look for `kept as .bad, not retried`. That file remains on
+  the board for inspection and uses storage, but no longer uploads
+  automatically. Preserve it and investigate the server logs; changing
+  WiFi settings will not make it retry. If the rename fails, the log says
+  `rename failed, will retry` instead.
+- `HTTP 409` or a `5xx` status: the trip stays queued for retry. Check
+  server logs for a conflicting trip identity (409) or a server error.
+- No upload result after a saved trip: WiFi is one possible cause. Check
+  the name and password, and that the network is 2.4 GHz and not hidden;
+  the firmware doesn't print scan/join failures yet. Also check earlier
+  serial messages for storage errors, incomplete files or files set aside
+  as `.bad`, which are not eligible for normal upload.
 
 Once it's in the car, the viewer is the only sign the board is working.
 Look at it every so often after you've driven. If trips stop showing up,
@@ -268,9 +335,12 @@ laptop and watch the Serial Monitor.
   port that stays on for a few minutes is fine. On a port that's always
   on, the board never knows the car is off: it doesn't sleep, and it draws
   on the car's battery the whole time it's parked.
-- **Battery.** Fit the 18650. It charges from USB while you drive, except
-  when the board is too hot or too cold to charge it safely (a car that's
-  been sitting in the sun, say). Logging carries on either way.
+- **Battery.** Fit the 18650, following the holder's polarity markings.
+  It charges from USB while you drive. The firmware pauses charging when
+  the power-management chip reports a high or low temperature. This is an
+  indirect estimate, not a measurement of the cell's temperature or a
+  guarantee of safe charging in a hot car. Logging carries on while
+  charging is paused.
 - **Antenna.** The GPS antenna needs a view of the sky. The dashboard or
   the rear shelf works; the glovebox, under a seat or the trunk doesn't.
 - **WiFi range.** The board uploads from wherever you park, so your
@@ -281,6 +351,17 @@ laptop and watch the Serial Monitor.
   press puts it to sleep. Unplugged from USB, on your desk say, it runs
   on the battery for 10 minutes and then sleeps until USB power comes
   back. It hasn't died.
+
+**Check the installed power setup.** With the battery fitted and Stage 4
+running from the intended car USB port, take another short drive and park
+within home WiFi range. Turn the ignition off and confirm the port loses
+power after any normal delay. Leave the board connected to the car, not
+the laptop: laptop USB power would mask this test. Confirm that the new
+trip reaches the viewer during the battery-powered upload window. On the
+next start, take another short drive and confirm a second trip appears
+after parking. This checks the installed recording/upload path across
+shutdown and restart; it does not measure deep-sleep current, which still
+needs a meter.
 
 ## The data
 

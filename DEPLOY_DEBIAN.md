@@ -13,6 +13,14 @@ back to it after Step 8.
 
 Assumes: Debian 12/13, a non-root user with sudo, SSH reachable.
 Placeholders: `<user>` = your Debian login, `<host>` = server IP or hostname.
+Replace the angle-bracket placeholders before running commands. The server
+SSH login is separate from the viewer login you create below and from the
+upload token the board uses.
+
+For the supplied automatic backups, the server login currently needs
+numeric user ID **1000** (`id -u`). The installer skips backups for other
+IDs; changing ownership of `data/` alone does not give that login access
+to the private trip files. See Steps 3 and 10 before choosing the account.
 
 ## The quick way: `install.sh`
 
@@ -33,8 +41,9 @@ prints the lines for the firmware's `secrets.h` (Step 8).
 If something fails, it says what and stops. Fix that and run it again:
 anything already set up is checked and kept, never redone.
 
-To check an install later, after a reboot say, without changing
-anything:
+To check an install later, after a reboot say, without changing its
+configuration (the check uploads and removes a temporary test trip and
+can test the viewer login):
 
 ```bash
 bash ~/mileage-tracker/install.sh --check
@@ -66,6 +75,8 @@ If `id -u` is **not** 1000, see the note in Step 3.
 ---
 
 ## Step 1 — Update the box and install Docker Engine
+
+Run this section **on the server**, in the SSH session from Step 0.
 
 Debian's repos ship an old/renamed Docker. Use Docker's official repo so you
 get `docker compose` (v2 plugin), not the deprecated `docker-compose`.
@@ -110,11 +121,12 @@ docker compose version      # expect v2.x
 
 ## Step 2 — Copy the `server/` directory over
 
-From the computer with your copy of this repo (cloned, or downloaded as a
-ZIP and unzipped), in the repo's top folder:
+Run the copy **on your computer**, where you cloned or unzipped the repo.
+If you are still in the SSH session from Step 1, type `exit` first to
+return to your computer's terminal. Then:
 
 ```bash
-cd <your copy of the repo>
+cd "<path to your copy of the repo>"
 scp -r server <user>@<host>:~/mileage-tracker
 ```
 
@@ -122,10 +134,18 @@ scp -r server <user>@<host>:~/mileage-tracker
 in each. Use this for the first copy only: if `~/mileage-tracker` already
 exists, `scp -r` puts the new copy inside it as `server/`.
 
-Then back on the server, sanity-check the tree:
+Reconnect from your computer:
+
+```bash
+ssh <user>@<host>
+```
+
+**On the server**, sanity-check the tree. Stay in this SSH session for
+Steps 3–7:
 
 ```bash
 cd ~/mileage-tracker
+ls -a
 ls -R | head -30
 ```
 
@@ -138,6 +158,8 @@ works with no internet except OSM map tiles).
 > OpenSSH builds. Confirm `.env.example` made it: `ls -a ~/mileage-tracker`.
 > If missing, copy it explicitly:
 > `scp server/.env.example <user>@<host>:~/mileage-tracker/`
+> Run that copy from your computer in a separate local terminal, not from
+> the server's SSH session.
 
 ---
 
@@ -159,6 +181,11 @@ If your `id -u` from Step 0 was **not** 1000:
 ```bash
 sudo chown -R 1000:1000 ~/mileage-tracker/data
 ```
+
+This lets the containers write trips, but your non-1000 login still cannot
+read their private files for the backup timer. The supplied automatic
+backup setup requires a UID 1000 login; do not assume this ownership fix
+also enables backups.
 
 The viewer's annotations DB lives in a named Docker volume (`viewer-db`), not
 here — nothing to prepare for it.
@@ -192,7 +219,8 @@ chmod 600 .env
 ```
 
 **Save this token somewhere you can get at it** — the same value goes into
-`firmware/secrets.h` in Step 8.
+`firmware/04_trip_logger/secrets.h` in Step 8. It is an upload credential,
+not the password used for SSH or for the viewer web page.
 
 **Not in Pacific time?** Trip times are shown and exported in
 `America/Los_Angeles` until you change `DISPLAY_TZ` in `docker-compose.yml`.
@@ -305,7 +333,7 @@ Expect `401`.
 
 ```bash
 cd ~/mileage-tracker
-TOKEN=$(grep INGEST_AUTH_TOKEN .env | cut -d= -f2)
+TOKEN=$(grep '^INGEST_AUTH_TOKEN=' .env | cut -d= -f2-)
 curl -X POST http://localhost:8090/upload \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/gpx+xml" \
@@ -346,7 +374,7 @@ docker compose exec mileage-viewer env | grep VIEWER_PASSWORD_HASH
 The value must still contain its `$` separators. If they're gone, re-quote it
 in `viewer.env` and `docker compose up -d mileage-viewer`.
 
-**Viewer, from your Windows browser:**
+**Viewer, from a browser on your computer:**
 
 ```
 http://<host>:8091/
@@ -436,11 +464,11 @@ That's expected. Use the LAN IP for any curl tests from here on.
 
 ## Step 8 — Point the firmware at it
 
-On the computer with your copy of the repo, create the firmware's
-settings file from the example:
+**On your computer**, create the firmware's settings file from the
+example. If you are still in the server's SSH session, type `exit` first:
 
 ```bash
-cd <your copy of the repo>/firmware
+cd "<path to your copy of the repo>/firmware"
 cp secrets.h.example 04_trip_logger/secrets.h
 ```
 
@@ -449,8 +477,9 @@ PowerShell accepts `cp`.) It has to sit in the sketch folder,
 `04_trip_logger/`, next to the `.ino`; that's the only place the build
 looks for it. Fill in WiFi SSID/password, the server host/IP, port
 `8090`, and the `INGEST_AUTH_TOKEN` from Step 4a — it must match
-byte-for-byte. `install.sh` prints the server lines ready to paste. The
-WiFi has to be 2.4 GHz, and hidden networks won't work.
+byte-for-byte. Put only the IP address or hostname in `SERVER_HOST`, with
+no `http://`, port or `/upload`. `install.sh` prints the server lines ready
+to paste. The WiFi has to be 2.4 GHz, and hidden networks won't work.
 
 > **These settings are compiled into the firmware.** If the server's IP or
 > the token changes later, or your WiFi name or password does, the board
@@ -462,11 +491,16 @@ Then flash `firmware/04_trip_logger`, check it works and put it in the car.
 The top-level README covers all three under "Setting it up", steps 3 to 5:
 the Arduino IDE setup (ESP32 core 3.3.11, XPowersLib 0.3.3, TinyGPSPlus
 1.0.3), the rest of the WiFi requirements, and the **one-time storage setup
-a new board needs on its first flash**.
+a new, empty board may need on its first flash**. For a board that has
+already recorded trips, use the firmware guide's storage recovery steps
+instead of formatting after a mount error.
 
 ---
 
 ## Step 9 — Set it to survive reboots
+
+Return to the server from your computer with `ssh <user>@<host>`.
+Run Steps 9 and 10 **on the server**.
 
 `restart: unless-stopped` is already in the compose file, and Docker's systemd
 unit is enabled by default on Debian. Verify:
@@ -490,9 +524,10 @@ a reboot" in Troubleshooting.
 
 ## Step 10 — Backups
 
-Two things need backing up, and neither can be regenerated:
+Two things need backing up:
 
 - **Trip files** in `~/mileage-tracker/data`, the raw GPX and its summary.
+  The GPX cannot be regenerated; a summary can be rebuilt from its GPX.
 - **The annotations database** (business/personal, purpose, destination)
   in the `viewer-db` Docker volume. It's easy to forget, and it's the
   record the IRS cares about. It can't be rebuilt from the trips.
@@ -731,7 +766,7 @@ record: send it to ingest again, and ingest rebuilds the summary from it.
 ```bash
 cd ~/mileage-tracker
 TRIP=2026-10/2026-10-05T16-00-00Z      # the path from the warning, minus .json
-TOKEN=$(grep INGEST_AUTH_TOKEN .env | cut -d= -f2)
+TOKEN=$(grep '^INGEST_AUTH_TOKEN=' .env | cut -d= -f2-)
 curl -X POST http://<host>:8090/upload \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/gpx+xml" \

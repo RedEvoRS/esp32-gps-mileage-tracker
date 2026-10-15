@@ -19,6 +19,12 @@ below and checks each step. `DEPLOY_DEBIAN.md` at the top of the repo
 walks through the same steps by hand. This file is the reference for how
 the services behave.
 
+`install.sh --check` leaves configuration unchanged but uploads and removes
+a temporary test trip and can test the viewer login. Automatic backups
+currently require the server login's numeric user ID to be **1000**
+(`id -u`); the installer skips backups for other IDs. See
+[the deployment prerequisites](../DEPLOY_DEBIAN.md).
+
 ## What the Ingest Service Does
 
 When your T-Beam completes a trip and detects it's on your home WiFi,
@@ -108,7 +114,8 @@ Step 1).
        openssl rand -hex 32
 
    Copy the output and set `INGEST_AUTH_TOKEN` in `.env` to that value.
-   You'll use the same token in the T-Beam firmware later.
+   You'll use the same token in the T-Beam firmware later. This token is
+   separate from your SSH login and the viewer's username/password.
 
 4. Create `viewer.env` and set the viewer login, as described under
    [Viewer Login](#viewer-login) below. Compose won't build or start
@@ -127,7 +134,7 @@ Step 1).
 7. Test an authenticated upload with the sample trip, `sample.gpx`, which
    is in this folder:
 
-       TOKEN=$(grep INGEST_AUTH_TOKEN .env | cut -d= -f2)
+       TOKEN=$(grep '^INGEST_AUTH_TOKEN=' .env | cut -d= -f2-)
        curl -X POST http://localhost:8090/upload \
          -H "Authorization: Bearer $TOKEN" \
          -H "Content-Type: application/gpx+xml" \
@@ -139,6 +146,10 @@ Step 1).
    and find two files at `./data/2026-04/2026-04-14T13-45-22.gpx` and
    `.../2026-04-14T13-45-22.json`. Delete both afterwards so the test
    trip doesn't end up in your mileage log.
+
+   The `^INGEST_AUTH_TOKEN=` match above reads only the setting, not
+   comments that mention its name. It assumes the unquoted hexadecimal
+   token generated in step 3.
 
 8. Bind both ports to the server's LAN IP by setting `BIND_ADDR` in
    `.env`, then run `docker compose up -d` again. UFW rules don't
@@ -374,6 +385,11 @@ then reads the copy there back to verify it. `backup/restore.sh check`
 is the restore test: it pulls the newest off-host snapshot and checks
 every file and the database without touching anything live.
 `backup/restore.sh restore` puts a snapshot back.
+
+The timer runs as the server login, while ingest writes private trip files
+as UID 1000. Use a UID 1000 login with this setup; giving `data/` to UID
+1000 lets ingest write but does not make the files readable by another
+account's backup timer.
 
 Setup, the restore test and the restore procedure are in
 `DEPLOY_DEBIAN.md` Step 10.

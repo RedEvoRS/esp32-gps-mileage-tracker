@@ -20,6 +20,26 @@ car); this file has the firmware details it points to.
   Normal operation)
 - **USB:** Micro-USB via CH9102F serial converter
 
+### Identify the controls and connectors
+
+Use the markings on the board; do not substitute a pinout from a T-Beam
+Supreme or an older AXP192 board. LilyGO's
+[T-Beam hardware guide](https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/docs/en/t_beam/t_beam_hw.md#button-description)
+and [V1.2 schematic](https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/schematic/LilyGo_TBeam_V1.2.pdf)
+identify these controls:
+
+| Marking / connection | What it is for |
+|---|---|
+| **PWR** | Button connected to the power-management chip; Stage 4 uses it for sleep/wake |
+| **IO38** | User button on GPIO 38; unused by this firmware, not an ESP32 BOOT button |
+| **RST** | Restarts the ESP32 program; useful for seeing startup messages again |
+| **GPS antenna** | Small IPEX/u.FL connection for the GPS antenna; needed to receive satellites |
+| **LoRa antenna** | Separate radio antenna connection; not the GPS antenna |
+| **Micro-USB** | Power and the computer's serial connection for flashing and diagnostics |
+
+The board has charging and GPS indicator lights, but none reports that
+this firmware has saved or uploaded a trip.
+
 ## Development Environment Setup
 
 ### 1. Install the CH9102 USB-Serial Driver
@@ -31,10 +51,15 @@ After installing, plug in the T-Beam and check Device Manager for
 "Ports (COM & LPT)" → "USB-Enhanced-SERIAL CH9102 (COMx)".
 Note the COM number — you'll need it in the Arduino IDE.
 
-**macOS and Linux** normally have the driver built in: the board shows up
-as a new serial port when you plug it in. On Linux, if the upload fails
-with "permission denied", add yourself to the `dialout` group
-(`sudo usermod -aG dialout $USER`), then log out and back in.
+**macOS:** first check whether a new serial port appears when you plug in
+the board. If none appears with a known data cable, install the
+[WCH macOS driver linked by LilyGO](https://www.wch-ic.com/downloads/CH34XSER_MAC_ZIP.html)
+and follow its installation instructions.
+
+**Linux** normally has the driver built in. If the port appears but the
+upload fails with "permission denied", Debian/Ubuntu users can join the
+`dialout` group (`sudo usermod -aG dialout $USER`), then log out and back
+in. Other distributions may use a different serial-port access group.
 
 ### 2. Install Arduino IDE
 
@@ -44,7 +69,7 @@ for your OS. On Windows, say yes to the USB drivers during install.
 ### 3. Add ESP32 Board Support
 
 1. Open Arduino IDE
-2. File → Preferences
+2. File → Preferences (Arduino IDE → Settings on macOS)
 3. In "Additional boards manager URLs" paste:
    https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 4. Click OK
@@ -80,6 +105,50 @@ picking the version from each one's version list:
 Those are the versions the trip logger is tested with. The Library Manager
 installs the newest unless you pick one.
 
+### 6. Upload a sketch and read its messages
+
+A *sketch* is an Arduino program, stored in an `.ino` file inside a folder
+with the same name. *Firmware* is the program installed on the board.
+*Uploading* or *flashing* compiles the sketch and writes that firmware to
+the board's flash memory. A *partition* is a reserved area of that memory;
+Stage 4 stores trips in its LittleFS filesystem partition.
+
+1. Connect the board with a data-capable USB cable and open the stage's
+   `.ino` file with **File → Open**. Keep it in its supplied folder.
+2. Select **ESP32 Dev Module** and the board's **Tools → Port** entry.
+3. Click **Upload**, the right-arrow button (or **Sketch → Upload**).
+   The checkmark button only compiles; it does not install the program.
+   Wait for the upload to finish before disconnecting anything.
+4. Open **Tools → Serial Monitor** and select **115200 baud**, the speed
+   used by the board's diagnostic messages. Garbled text usually means
+   the monitor is set to a different speed.
+5. If the startup messages have already scrolled past or you opened the
+   monitor too late, briefly press **RST** to restart the sketch. With
+   Stage 4, do this before a test trip, not during recording.
+
+Each upload replaces the previous stage's program. Stages 1–3 are hardware
+checks; they do not record trips. **Leave Stage 4 installed for use in the
+car.** When updating Stage 4 later, keep its `partitions.csv` and leave
+**Erase All Flash Before Sketch Upload → Disabled** to preserve trips.
+
+#### If uploading fails
+
+The T-Beam V1.2 has **PWR, IO38 and RST**, not a GPIO 0 BOOT button.
+Holding IO38 while pressing RST does not select the ESP32 bootloader.
+
+1. Close Serial Monitor and any other program using the port. Reconnect
+   the USB cable, select the port again, and retry Upload.
+2. If there is no port, check the data cable and
+   [USB driver](#1-install-the-ch9102-usb-serial-driver). If there is a
+   port but transfers fail, try **Tools → Upload Speed →
+   115200** and a direct USB connection instead of a hub.
+3. If it still stops at `Connecting...`, keep the exact upload error and
+   check the board's automatic reset/boot wiring against the V1.2
+   schematic above and
+   [Espressif's boot-mode troubleshooting](https://docs.espressif.com/projects/esptool/en/latest/esp32/advanced-topics/boot-mode-selection.html).
+   Manual bootloader entry uses GPIO 0, not IO38 or PWR; do not follow a
+   generic "hold BOOT" sequence or guess which pads to connect.
+
 ## Firmware Stages
 
 Work through these in order. Each stage builds on the previous one
@@ -92,8 +161,7 @@ and verifies a specific hardware subsystem before moving on.
 Open `01_hello_world.ino`, upload it, then open Serial Monitor at
 115200 baud. You should see "T-Beam is alive!" and heartbeat messages.
 
-If upload fails with "Connecting...": hold BOOT button, tap RST
-button, release BOOT. This forces the ESP32 into bootloader mode.
+If uploading fails, follow [If uploading fails](#if-uploading-fails).
 
 ### Stage 2: Power Manager (`02_pmu_test/`)
 
@@ -125,9 +193,10 @@ logging to LittleFS, and WiFi upload to your home server.
 
 Before flashing:
 
-1. **Create `secrets.h`.** Copy `firmware/secrets.h.example` to
-   `04_trip_logger/secrets.h`, next to the `.ino` (the build won't find
-   it anywhere else), and fill it in. The top-level README has a table of
+1. **Create `secrets.h`.** From the repo's top folder, copy
+   `firmware/secrets.h.example` to `firmware/04_trip_logger/secrets.h`,
+   next to the `.ino` (the build won't find it anywhere else), and fill
+   it in. The top-level README has a table of
    the settings under [Flash the board](../README.md#3-flash-the-board).
    The ones that catch people out:
    - The WiFi has to be 2.4 GHz (the ESP32 has no 5 GHz radio), and
@@ -137,7 +206,9 @@ Before flashing:
    - It's C source, so a `"` or `\` in the WiFi password is written `\"`
      or `\\`.
    - `AUTH_TOKEN` must match `INGEST_AUTH_TOKEN` in the server's `.env`
-     exactly.
+     exactly. This is the upload token, not the viewer or SSH password.
+   - `SERVER_HOST` contains only an IP address or hostname. The firmware
+     supplies `http://`, the port and `/upload` itself.
    - **These settings are built into the firmware.** If the server's
      address, the token, or your WiFi name or password changes, the board
      can't upload until you edit `secrets.h` and flash again. Nothing on
@@ -153,10 +224,10 @@ Before flashing:
 
 #### First flash on a new board
 
-A board that hasn't run this firmware has nothing usable in its trip
-partition, and the firmware never formats the partition on its own. That's
-deliberate: on a board in use, a mount error mustn't be able to wipe trips
-that are waiting to upload. So the first time Stage 4 runs, the Serial
+On a new, empty board the trip partition may not be formatted yet. The
+firmware never formats it on its own. That's deliberate: on a board in
+use, a mount error mustn't be able to wipe trips
+that are waiting to upload. If the first run cannot mount it, the Serial
 Monitor shows
 
 ```
@@ -164,7 +235,10 @@ ERROR: LittleFS mount failed. Storage preserved; halting. See firmware README fo
 ```
 
 and it stops there. (The battery's charge-temperature guard keeps running
-while it's halted.) Set the partition up once:
+while it's halted.) **Use these steps only for a new, empty board.** If it
+has recorded trips, follow [storage recovery](#if-the-trip-storage-wont-mount-later)
+instead. If it already reaches `Setup complete. Logging trips.`, no
+formatting is needed. Otherwise set the partition up once:
 
 1. In `04_trip_logger.ino`, find `mountTripStorage()` and change
    `LittleFS.begin(false)` to `LittleFS.begin(true)`. That lets it format
@@ -178,7 +252,7 @@ while it's halted.) Set the partition up once:
 
 After that, the trip storage survives reflashing. You only do this again
 if you change the partition layout or erase the whole flash, and only once
-every trip on the board has been uploaded.
+every trip on the board has been uploaded or independently backed up.
 
 #### If the trip storage won't mount later
 
@@ -192,8 +266,13 @@ with esptool (it comes with the ESP32 core, or `pip install esptool`):
 esptool --port <port> read-flash 0x190000 0x260000 trips-backup.bin
 ```
 
-The offset and size come from the `spiffs` line in `partitions.csv`. Older
-esptool versions spell the command `read_flash`.
+Close Serial Monitor before running esptool. Replace `<port>` with the
+board's port, such as `COM5` or `/dev/ttyACM0`. The offset and size above
+come from this project's `spiffs` line in `partitions.csv`; if a different
+layout was previously installed, use that layout's offset and size instead.
+Keep the backup outside the repo. Older esptool versions spell the command
+`read_flash`. A backup image preserves the bytes but does not prove they
+are recoverable; keep it before attempting repairs or formatting.
 
 #### Normal operation
 
@@ -203,14 +282,17 @@ How it behaves once flashed:
   10 s and ends after you're below 2 mph for 3 minutes (stop-and-go
   traffic won't split a drive). Trips shorter than ~30 s (not counting
   the 3 minutes parked at the end) or 0.1 mi are discarded as noise.
-- **Crash-safe logging:** each GPS point is written to a `.gpx` file
-  and the file is closed immediately, so pulling USB power loses at
-  most one point. On boot, any file left unclosed by a hard power cut
-  is repaired automatically.
+- **Power-cut recovery:** once the clock is set, each GPS point is written
+  to a `.gpx` file and the file is closed immediately to limit data loss.
+  Points waiting for the clock are still in memory and can be lost on a
+  reset. On boot the firmware attempts to repair incomplete files, keeping
+  ambiguous or damaged files for inspection. Hardware power-cut testing
+  is still needed; there is no verified one-point loss limit.
 - **Time:** comes from the GPS (UTC). Points captured before the first
   fix are buffered and back-dated once UTC arrives. A trip that ends
-  before the clock was ever set (by GPS or NTP) keeps its points with no
-  times rather than guessed ones; the viewer lists it without a date.
+  before the clock was ever set (by GPS or NTP) writes the points still
+  in its 90-point buffer without times rather than guessing them; earlier
+  points may already have been dropped. The viewer lists it without a date.
 - **Upload:** every 30 s, if finished trips are waiting, the board scans
   for your home WiFi. When it finds it, it POSTs each trip to the ingest
   server as GPX and deletes it locally once the server accepts it. GPS
@@ -227,6 +309,10 @@ How it behaves once flashed:
   sees the car turn off and never sleeps.
 - **Buttons:** a long press of PWR finalizes any trip and puts the board
   into deep sleep; a short press, or USB power coming back, wakes it.
+- **Charging:** the firmware pauses charging at high or low temperatures
+  reported by the AXP2101 power-management chip. Its temperature is an
+  indirect estimate, not a measurement of the battery cell or a guarantee
+  of safe charging in a hot car. Logging continues while charging is paused.
 - **Storage full:** below 64 KB free it won't start a trip, and below
   24 KB it ends the one in progress. An upload frees the space.
 - **No display:** the firmware doesn't use a screen or a status LED. The
@@ -237,12 +323,16 @@ Watch the Serial Monitor (115200) for state transitions:
 `Trip started` → (drive) → `Trip finalized`, then
 `Upload ... -> HTTP 200 (deleted)` when you get home.
 
-If an upload fails, the `Upload` line shows why. `HTTP 401` means
-`AUTH_TOKEN` doesn't match the server's token. A negative number (like
-`HTTP -1`) means the board joined the WiFi but couldn't reach the server:
-check `SERVER_HOST` and that the server is up. If no `Upload` line ever
-appears, the board isn't finding or joining your WiFi; the firmware
-doesn't log that case yet.
+If a trip does not appear, first confirm `Trip started` and `Trip finalized`:
+an active or discarded trip cannot upload. `HTTP 401` means the upload
+token does not match. A negative result means a connection or transfer
+failure, including timeouts after reaching the server. `HTTP 400/413`
+normally sets the file aside as `.bad` without further retries, while
+`409` and `5xx` leave it queued. No upload result can mean WiFi trouble,
+but also an incomplete file or one set aside during repair. The firmware
+does not log WiFi scan/join failures yet. See the
+[upload troubleshooting steps](../README.md#4-check-it-works) for what to
+check and preserve in each case.
 
 Boot repair also examines `.gpx.fix` files left by interrupted repairs.
 It reclaims a temporary copy only when its bytes match the original or its
@@ -299,7 +389,9 @@ only and cannot measure ESP32 stack use.
 | LoRa MOSI       | 27       | SX1262 (unused in this project)|
 | LoRa SCK        | 5        | SX1262 (unused in this project)|
 | LoRa CS         | 18       | SX1262 (unused in this project)|
-| BOOT Button     | 0        | Hold during upload if needed   |
+| User button (IO38) | 38    | Unused; not a BOOT button      |
+| PWR button      | —        | Connected to the AXP2101 PMU  |
+| RST button      | —        | Resets the ESP32              |
 
 ## Important Notes
 

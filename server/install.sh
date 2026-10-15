@@ -4,8 +4,8 @@
 #
 #   bash install.sh           set everything up, or finish a setup that
 #                             stopped partway
-#   bash install.sh --check   check an existing install; changes nothing
-#                             except a test upload it deletes again
+#   bash install.sh --check   leave configuration unchanged; upload and
+#                             remove a test trip, optionally test login
 #
 # Run it as your normal login user, not root; it asks for sudo when it
 # needs it. It works on the directory it's in, normally ~/mileage-tracker

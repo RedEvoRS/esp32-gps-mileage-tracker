@@ -15,7 +15,8 @@
 //   2. Tools → Port → (your COM port, e.g., COM5)
 //   3. Tools → Upload Speed → 921600
 //   4. Click the Upload arrow button
-//   5. If "Connecting..." hangs: hold BOOT button, tap RST button, release BOOT
+//   5. If "Connecting..." hangs, see firmware/README.md, "If uploading fails".
+//      T-Beam V1.2 has PWR, IO38 and RST; IO38 is NOT a GPIO 0 BOOT button.
 // =================================================================
 
 void setup() {
