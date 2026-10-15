@@ -148,7 +148,9 @@ How it behaves once flashed:
   most one point. On boot, any file left unclosed by a hard power cut
   is repaired automatically.
 - **Time:** comes from the GPS (UTC). Points captured before the first
-  fix are buffered and back-dated once UTC arrives.
+  fix are buffered and back-dated once UTC arrives. A trip that ends
+  before the clock was ever set (by GPS or NTP) keeps its points with no
+  times rather than guessed ones; the viewer lists it without a date.
 - **Upload:** while parked on your home WiFi, finished trips are POSTed
   to the ingest server as GPX and deleted locally on success. GPS
   parsing runs on core 1; networking runs on core 0 and never blocks

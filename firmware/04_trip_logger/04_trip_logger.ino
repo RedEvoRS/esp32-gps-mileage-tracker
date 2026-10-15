@@ -414,14 +414,20 @@ static void pushPending(const Fix& fx) {
 
 // Write all buffered fixes to the open trip file, back-dating each from
 // the now-known UTC and its monotonic stamp. Called once, the first time
-// UTC becomes available during an active trip.
+// UTC becomes available during an active trip -- or when a trip that never
+// got UTC is closed. Those points get no time at all: until a source has
+// synchronized it, the system clock reads 1970 or a date carried over deep
+// sleep, and a made-up date can file the miles under the wrong day or year.
 static void flushPending(FileWriter& w) {
+    // Read the flag before the clock: core 0 sets the clock from NTP first,
+    // then the flag.
+    bool trusted = gClockSet.load();
     uint64_t utcNow = nowEpochMs();
     uint32_t monoNow = millis();
     for (size_t i = 0; i < gPendCount; ++i) {
         Fix p = gPend[(gPendHead + i) % 90];
-        p.hasUtc = true;
-        p.utcMs  = utcNow - (uint64_t)(monoNow - p.monoMs);
+        p.hasUtc = trusted;
+        p.utcMs  = trusted ? utcNow - (uint64_t)(monoNow - p.monoMs) : 0;
         appendTrkpt(w, p);
     }
     gPendCount = gPendHead = 0;
@@ -587,7 +593,8 @@ static void endTrip(bool discardIfMicro) {
             if (f && f.size() > 0) {
                 FileWriter w(f);
                 // Flush any still-buffered (never-got-UTC) points before
-                // closing, so a trip that never got UTC isn't lost.
+                // closing, so a trip that never got UTC isn't lost. They're
+                // written without times unless the clock is now trusted.
                 if (gPendCount > 0) flushPending(w);
                 w.put(GPX_EPILOGUE);
                 ok = w.commit();

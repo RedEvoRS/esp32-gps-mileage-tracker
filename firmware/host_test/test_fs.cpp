@@ -68,14 +68,15 @@ static int logCount(const char* frag) {
     return n;
 }
 
-// One fix per second at `mps`, heading north.
+// One fix per second at `mps`, heading north. Like buildFix(), a fix has
+// UTC only once gClockSet says the clock is synchronized.
 static void drive(float mps, int seconds) {
     for (int i = 0; i < seconds; ++i) {
         g_millis += 1000; g_epochMs += 1000;
         gLat += mps / 111320.0;
         Fix fx{};
         fx.lat = gLat; fx.lon = gLon; fx.speedMps = mps; fx.hdop = 0.9f;
-        fx.monoMs = g_millis; fx.hasUtc = true; fx.utcMs = g_epochMs;
+        fx.monoMs = g_millis; fx.hasUtc = gClockSet; fx.utcMs = fx.hasUtc ? g_epochMs : 0;
         tripFsmOnFix(fx);
         pollPmu();          // as loop() does after each fix
         confirmVbusOff();
@@ -97,6 +98,13 @@ static std::vector<std::string> tripFiles() {
 static int count(const std::string& s, const std::string& tok) {
     int n = 0; for (size_t p = s.find(tok); p != std::string::npos; p = s.find(tok, p + 1)) n++; return n;
 }
+static std::vector<std::string> times(const std::string& d) {
+    std::vector<std::string> v;
+    for (size_t p = d.find("<time>"); p != std::string::npos; p = d.find("<time>", p + 1))
+        v.push_back(d.substr(p + 6, d.find("</time>", p) - p - 6));
+    return v;
+}
+static std::string iso(uint64_t ms) { char b[24]; isoFromEpochMs(ms, b, sizeof b); return b; }
 static bool logHas(const char* frag) {
     for (auto& l : Serial.log) if (l.find(frag) != std::string::npos) return true; return false;
 }
@@ -805,6 +813,59 @@ int main(int argc, char** argv) {
         setup();
         CHECK(!g_chargeAtMount, "normal boot: charging off while storage starts");
         CHECK(PMU.chargeEnabled && logHas("Setup complete"), "then the first check turns it on");
+    }
+
+    printf("T34 a trip closed before UTC is trusted gets no made-up times (#57)\n");
+    {
+        const uint64_t clock0 = g_epochBaseMs;
+        // A fresh clock reads 1970. One carried over deep sleep reads a
+        // plausible date, drifted. Neither was synchronized this boot.
+        for (uint64_t base : {uint64_t(0), g_epochMs - g_millis - 90000}) {
+            resetWorld();
+            gClockSet = false;
+            g_epochBaseMs = base;
+            drive(15, 40);
+            endTrip(false);                          // car off, still no UTC
+            auto v = tripFiles();
+            std::string d = v.size() == 1 ? g_disk.files[v[0]] : "";
+            CHECK(v.size() == 1 && isComplete(v[0].c_str()), "trip kept, complete");
+            CHECK(count(d, "<trkpt ") == 40, "every point kept");
+            CHECK(times(d).empty(), base ? "carried-over date not written as UTC"
+                                         : "1970 not written as UTC");
+            dump("T34");
+        }
+
+        // UTC from the GPS mid-trip: the buffered points are back-dated.
+        resetWorld();
+        gClockSet = false;
+        g_epochBaseMs = 0;
+        uint64_t first = g_epochMs + 1000;           // the trip's first fix
+        drive(15, 20);
+        g_epochBaseMs = g_epochMs - g_millis;        // GPS sets the clock...
+        gClockSet = true;                            // ...and says so
+        drive(15, 20);
+        endTrip(false);
+        auto v = tripFiles();
+        auto t = v.size() == 1 ? times(g_disk.files[v[0]]) : std::vector<std::string>();
+        bool exact = t.size() == 40;
+        for (size_t i = 0; exact && i < t.size(); ++i) exact = t[i] == iso(first + i * 1000);
+        CHECK(exact, "GPS UTC mid-trip: every point timed, the buffered ones back-dated exactly");
+
+        // NTP syncs the clock (core 0), and the trip ends before another fix.
+        resetWorld();
+        gClockSet = false;
+        g_epochBaseMs = 0;
+        first = g_epochMs + 1000;
+        drive(15, 20);
+        g_epochBaseMs = g_epochMs - g_millis;
+        gClockSet = true;
+        endTrip(false);
+        v = tripFiles();
+        t = v.size() == 1 ? times(g_disk.files[v[0]]) : std::vector<std::string>();
+        exact = t.size() == 20;
+        for (size_t i = 0; exact && i < t.size(); ++i) exact = t[i] == iso(first + i * 1000);
+        CHECK(exact, "NTP before the trip closes: buffered points back-dated exactly");
+        g_epochBaseMs = clock0;
     }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
