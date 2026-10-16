@@ -5,10 +5,11 @@
 A DIY GPS mileage tracker for IRS tax deduction logging. Plug-and-forget
 USB device for a car. Logs trips automatically; user annotates purpose later.
 
-**Hardware:** LilyGO **T-Beam Supreme** (ESP32-S3 + u-blox MAX-M10S GPS +
-SX1262 LoRa + AXP2101 PMU + microSD + SH1106 OLED + PCF8563 RTC) at
-915 MHz. 18650 battery. Trips are stored on the microSD card. Enclosure is
-a PETG print of a published Supreme case.
+**Hardware:** LilyGO **T-Beam Supreme** with the u-blox **MAX-M10S GPS
+version (not L76K)** (ESP32-S3 + SX1262 LoRa + AXP2101 PMU + microSD +
+SH1106 OLED + PCF8563 RTC) at 915 MHz. 18650 battery. The selected trip
+storage card is a **SanDisk 32 GB Max Endurance microSD**. Enclosure is a
+PETG print of a published Supreme case.
 
 **Old hardware, frozen branch:** the project started on the LilyGO TTGO
 T-Beam V1.2 (ESP32 + NEO-M8N). It's retired: its 2.375 MB trip partition
