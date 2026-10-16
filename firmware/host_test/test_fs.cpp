@@ -547,7 +547,8 @@ int main(int argc, char** argv) {
             g_partition.bytes[dirtyAt] = 0xFE;
             const auto before = g_partition.bytes;
             CHECK(!mountTripStorage() && g_disk.formatAttempts == 0 &&
-                  g_partition.bytes == before, "even one programmed bit prevents formatting");
+                  g_partition.bytes == before && logHas("contains non-erased data"),
+                  "even one programmed bit prevents formatting and explains the halt");
         }
 
         resetWorld();
@@ -563,8 +564,9 @@ int main(int argc, char** argv) {
             g_disk.failMount = true;
             g_partition.bytes.assign(8192, 0xFF);
             g_partition.failReadAt = failAt;
-            CHECK(!mountTripStorage() && g_disk.formatAttempts == 0,
-                  "a raw read error at any point prevents formatting");
+            CHECK(!mountTripStorage() && g_disk.formatAttempts == 0 &&
+                  logHas(("read failed at offset " + std::to_string(failAt)).c_str()),
+                  "a raw read error at any point prevents formatting and reports its offset");
         }
         for (bool missing : {false, true}) {
             resetWorld();
@@ -572,7 +574,8 @@ int main(int argc, char** argv) {
             g_partition.missing = missing;
             g_partition.partition.size = 0;
             CHECK(!mountTripStorage() && g_disk.formatAttempts == 0 &&
-                  g_partition.readOffsets.empty(), "missing or zero-sized partition cannot authorize formatting");
+                  g_partition.readOffsets.empty() && logHas("check the flashed partitions.csv"),
+                  "missing or zero-sized partition cannot authorize formatting and explains the halt");
         }
         for (bool failFormat : {false, true}) {
             resetWorld();

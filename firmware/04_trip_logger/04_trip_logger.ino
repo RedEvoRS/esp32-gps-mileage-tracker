@@ -1510,14 +1510,24 @@ static bool tripPartitionIsErased() {
     // or a sample of the partition: even its last byte could hold trip data.
     const esp_partition_t* partition = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, TRIP_PARTITION_LABEL);
-    if (!partition || !partition->size) return false;
+    if (!partition || !partition->size) {
+        Serial.println("LittleFS partition missing or empty; check the flashed partitions.csv.");
+        return false;
+    }
 
     uint8_t buf[1024];
     for (size_t offset = 0; offset < partition->size;) {
         size_t n = std::min(sizeof buf, (size_t)partition->size - offset);
-        if (esp_partition_read(partition, offset, buf, n) != ESP_OK) return false;
+        if (esp_partition_read(partition, offset, buf, n) != ESP_OK) {
+            Serial.printf("LittleFS partition read failed at offset %u; storage preserved.\n",
+                          (unsigned)offset);
+            return false;
+        }
         for (size_t i = 0; i < n; ++i) {
-            if (buf[i] != 0xFF) return false;
+            if (buf[i] != 0xFF) {
+                Serial.println("LittleFS partition contains non-erased data; storage preserved.");
+                return false;
+            }
         }
         offset += n;
         delay(1);  // yield during the full-partition scan on a new board

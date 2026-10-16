@@ -273,6 +273,32 @@ Keep the backup outside the repo. Older esptool versions spell the command
 `read_flash`. A backup image preserves the bytes but does not prove they
 are recoverable; keep it before attempting repairs or formatting.
 
+If the log says the partition is missing or empty, check the flashed
+`partitions.csv` first. A partition read error needs investigation and a
+backup, not an erase attempt. `contains non-erased data` can mean queued
+trips, a damaged filesystem, or factory firmware data on a new board.
+
+For a board that has never logged trips, or when you have independently
+backed up the stored data and deliberately decided to reset trip storage,
+you can erase **only the trip partition** once. This deletes everything
+in that region. First finish the backup above and confirm the board is
+running this sketch's bundled partition layout. If a previous layout put
+trip data elsewhere, preserve that region too before changing layouts.
+Do not use this step to recover trips you still need from the device.
+
+With Serial Monitor closed, run:
+
+```
+esptool --port <port> erase-region 0x190000 0x260000
+```
+
+Older esptool versions spell it `erase_region`. The address and size are
+for this project's bundled `spiffs` partition only. Reset the board (or
+power-cycle it) after a successful erase; the unchanged firmware verifies
+the erased partition, provisions it, and reaches `Setup complete. Logging
+trips.` No second flash or format-on-mount-failure build is needed. If it
+still halts, investigate the reported error rather than repeating erases.
+
 #### Normal operation
 
 How it behaves once flashed:
