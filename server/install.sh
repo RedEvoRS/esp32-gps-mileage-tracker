@@ -1305,7 +1305,18 @@ check_wait_online() {
 
 # --- Backups -----------------------------------------------------------
 
+# Where the backup units go, and where their template expects the files.
+UNIT_DIR=/etc/systemd/system
+DEFAULT_DIR=/home/$ME/mileage-tracker
+
 backup_unit() { printf 'mileage-backup@%s' "$ME"; }
+
+# The drop-in that points the service at an install outside DEFAULT_DIR.
+backup_dropin() { printf '%s/%s.service.d/install-path.conf' "$UNIT_DIR" "$(backup_unit)"; }
+
+dropin_text() {
+    printf '[Service]\nExecStart=\nExecStart=/bin/bash "%s/backup/backup.sh"\n' "${SCRIPT_DIR//%/%%}"
+}
 
 backups_configured() {
     local remote
@@ -1318,6 +1329,16 @@ timer_ok() {
     unit=$(backup_unit)
     [[ $(systemctl is-enabled "$unit.timer" 2> /dev/null) == enabled \
         && $(systemctl is-active "$unit.timer" 2> /dev/null) == active ]]
+}
+
+# Whether the service, as systemd has it loaded, runs this copy's
+# backup.sh. After the install moves, the timer stays on but runs the old
+# path (#46).
+timer_current() {
+    local exec
+    exec=$(systemctl show -p ExecStart --value "$(backup_unit).service" 2> /dev/null) || return 1
+    # e.g. { path=/bin/bash ; argv[]=/bin/bash /home/<user>/... ; ... }
+    [[ $exec == *[=\ ]"$SCRIPT_DIR/backup/backup.sh ;"* ]]
 }
 
 local_target_ok() {
@@ -1430,18 +1451,18 @@ restore_test() {
 install_backup_timer() {
     local unit dropin
     unit=$(backup_unit)
-    dropin=/etc/systemd/system/$unit.service.d
-    sudo install -m 644 backup/mileage-backup@.service backup/mileage-backup@.timer /etc/systemd/system/
+    dropin=$(backup_dropin)
+    sudo install -m 644 backup/mileage-backup@.service backup/mileage-backup@.timer "$UNIT_DIR/"
     # The unit runs /home/<user>/mileage-tracker/backup/backup.sh. If the
     # files are somewhere else, a drop-in points it at them.
-    if [[ $SCRIPT_DIR != "/home/$ME/mileage-tracker" ]]; then
-        sudo install -d -m 755 "$dropin"
-        printf '[Service]\nExecStart=\nExecStart=/bin/bash "%s/backup/backup.sh"\n' "${SCRIPT_DIR//%/%%}" \
-            | sudo tee "$dropin/install-path.conf" > /dev/null
-        sudo chmod 644 "$dropin/install-path.conf"
+    if [[ $SCRIPT_DIR != "$DEFAULT_DIR" ]]; then
+        sudo install -d -m 755 "${dropin%/*}"
+        dropin_text | sudo tee "$dropin" > /dev/null
+        sudo chmod 644 "$dropin"
         note "Pointed $unit.service at $SCRIPT_DIR"
-    elif [[ -e $dropin/install-path.conf ]]; then
-        sudo rm -f "$dropin/install-path.conf"
+    elif [[ -e $dropin ]]; then
+        sudo rm -f "$dropin"
+        note "Pointed $unit.service back at $DEFAULT_DIR"
     fi
     sudo systemctl daemon-reload
     sudo systemctl enable --now --quiet "$unit.timer"
@@ -1457,11 +1478,14 @@ install_backup_timer() {
 verify_backups() {
     local unit backup_dir last age next
     unit=$(backup_unit)
-    if timer_ok; then
+    if ! timer_ok; then
+        problem "The daily backup timer isn't running" "sudo systemctl enable --now $unit.timer"
+    elif ! timer_current; then
+        problem "The daily backup timer is on, but doesn't back up $SCRIPT_DIR" \
+            "It runs backup.sh from somewhere else. Run install.sh from here again to fix it."
+    else
         next=$(systemctl show -p NextElapseUSecRealtime --value "$unit.timer" 2> /dev/null) || next=
         ok "The daily backup timer is on${next:+ (next run: $next)}"
-    else
-        problem "The daily backup timer isn't running" "sudo systemctl enable --now $unit.timer"
     fi
     if systemctl is-failed --quiet "$unit.service" 2> /dev/null; then
         problem "The last backup failed" "To see why: journalctl -u $unit.service -n 30"
@@ -1506,7 +1530,11 @@ setup_backups() {
         install_backup_timer
     else
         ok "backup.conf sends backups to $(conf_get REMOTE)"
-        if [[ $MODE == install ]] && ! timer_ok; then
+        if [[ $MODE == install ]] && ! { timer_ok && timer_current; }; then
+            if timer_ok; then
+                note "The backup timer is on, but it runs backup.sh from somewhere else." \
+                    "Setting it up again from $SCRIPT_DIR."
+            fi
             first_backup
             install_backup_timer
         elif [[ $MODE == check ]]; then
