@@ -73,7 +73,9 @@ by the `mileage-viewer` service, which reads these files independently.
 ## Directory Layout
 
     mileage-tracker/           # this folder, copied to the server
-    ├── docker-compose.yml     # Compose definition for both services
+    ├── docker-compose.yml     # Both builds use this server directory as context
+    ├── .dockerignore          # Runtime allowlist; excludes secrets, tests and data
+    ├── common/diagnostics/    # Shared validators and catalog.json (required)
     ├── .env.example           # Template for .env
     ├── .env                   # Upload token and BIND_ADDR (created by you or install.sh, never committed)
     ├── viewer.env.example     # Template for viewer.env
@@ -81,6 +83,7 @@ by the `mileage-viewer` service, which reads these files independently.
     ├── install.sh             # First-time install with checks; --check later
     ├── sample.gpx             # A short test trip for checking uploads
     ├── data/                  # Trip files (create it before the first start, see below)
+    │   ├── diagnostics/events.db # Ingest-owned SQLite, created on first contact
     │   └── 2026-04/
     │       ├── 2026-04-14T13-45-22.gpx
     │       └── 2026-04-14T13-45-22.json
@@ -89,7 +92,8 @@ by the `mileage-viewer` service, which reads these files independently.
     ├── mileage-ingest/
     │   ├── Dockerfile         # Container definition
     │   ├── requirements.txt   # Python dependencies
-    │   └── app.py             # The upload service (Flask)
+    │   ├── app.py             # GPX uploads + device-event endpoint (Flask)
+    │   └── diag_store.py      # Diagnostics transactions and ordered health
     └── mileage-viewer/
         ├── Dockerfile
         ├── requirements.txt
@@ -415,3 +419,39 @@ account's backup timer.
 
 Setup, the restore test and the restore procedure are in
 `DEPLOY_DEBIAN.md` Step 10.
+
+## Device diagnostics
+
+Ingest also accepts protocol-v1 diagnostics at `POST /v1/device-events`. The
+same bearer token authenticates it; `X-Device-Id` is required and must be a
+non-personal lowercase label of 1-32 letters/digits, `_` or `-`, starting with
+a letter/digit. Bodies are capped at 32 KiB even for chunked requests. This
+synthetic empty-event heartbeat returns `{"accepted":[]}` after committing:
+
+```sh
+curl -X POST 'http://<host>:8090/v1/device-events' \
+  -H 'Authorization: Bearer <token>' \
+  -H 'X-Device-Id: tracker-1' \
+  -H 'Content-Type: application/json' \
+  --data '{"schema_version":1,"checkin":{"boot_id":"00000000000000000000000000000001","status_sequence":1,"uptime_ms":1500,"active":[]},"events":[]}'
+```
+
+Devices must durably increase `status_sequence` for each new snapshot across
+boots; reuse it only for identical retries. Event retries are acknowledged
+again; conflicting event IDs or equal revisions with changed snapshots return
+409 and commit nothing. Validation errors return 400, oversized bodies 413,
+authentication failures 401, and storage/commit failures 5xx without an ack.
+See [DIAGNOSTICS.md](../DIAGNOSTICS.md) for the full protocol and ordering rules.
+
+`data/diagnostics/events.db` belongs to ingest, alongside trip data. Valid
+`X-Device-Id` headers on successful GPX uploads refresh contact, even before
+firmware sends diagnostics. Missing/invalid headers create no diagnostic device;
+GPX creator is never used to guess one. Diagnostics failures do not fail GPX.
+The viewer health page is planned in #119; consistent SQLite backups remain
+#129 (`backup.sh` currently rsyncs the live data directory).
+
+Build both images from this directory with `docker compose build`. Both service
+Dockerfiles use this directory as their context and include `common/`, including
+`catalog.json`. Copy the whole `server/` tree and its `.dockerignore` when
+installing; the allowlist keeps `.env`, `viewer.env`, data and backups out of
+both build contexts. Ingest refuses to start without a valid catalog.

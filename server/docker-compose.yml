@@ -26,7 +26,9 @@
 
 services:
   mileage-ingest:
-    build: ./mileage-ingest
+    build:
+      context: .
+      dockerfile: mileage-ingest/Dockerfile
     container_name: mileage-ingest
     restart: unless-stopped
 
@@ -68,7 +70,9 @@ services:
   # owned by the ingest service) and keeps its own annotations database
   # in a separate named volume.
   mileage-viewer:
-    build: ./mileage-viewer
+    build:
+      context: .
+      dockerfile: mileage-viewer/Dockerfile
     container_name: mileage-viewer
     restart: unless-stopped
 

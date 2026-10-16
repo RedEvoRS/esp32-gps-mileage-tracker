@@ -151,14 +151,19 @@ ls -R | head -30
 ```
 
 You should see `docker-compose.yml`, `.env.example`, `viewer.env.example`,
-`sample.gpx`, `backup/`, `mileage-ingest/`, and `mileage-viewer/` (with `static/` holding
+`sample.gpx`, `.dockerignore`, `common/diagnostics/` (including `catalog.json`),
+`backup/`, `mileage-ingest/` (including `diag_store.py`), and `mileage-viewer/`
+(with `static/` holding
 `leaflet.js`, `leaflet.css`, `gpx.js` — those are vendored, so the viewer
 works with no internet except OSM map tiles).
 
 > **Watch for:** `scp -r` on Windows can silently skip dotfiles in some
-> OpenSSH builds. Confirm `.env.example` made it: `ls -a ~/mileage-tracker`.
+> OpenSSH builds. Confirm `.env.example` and `.dockerignore` made it:
+> `ls -a ~/mileage-tracker`. Both Docker builds use the whole server directory
+> as context; `.dockerignore` allows only runtime files and excludes secrets/data.
 > If missing, copy it explicitly:
 > `scp server/.env.example <user>@<host>:~/mileage-tracker/`
+> `scp server/.dockerignore <user>@<host>:~/mileage-tracker/`
 > Run that copy from your computer in a separate local terminal, not from
 > the server's SSH session.
 

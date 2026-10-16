@@ -379,8 +379,9 @@ preflight() {
     esac
 
     local f missing=()
-    for f in docker-compose.yml .env.example viewer.env.example sample.gpx \
-        mileage-ingest/{Dockerfile,app.py,requirements.txt} \
+    for f in docker-compose.yml .dockerignore .env.example viewer.env.example sample.gpx \
+        common/__init__.py common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json} \
+        mileage-ingest/{Dockerfile,app.py,diag_store.py,requirements.txt} \
         mileage-viewer/{Dockerfile,app.py,requirements.txt} \
         mileage-viewer/static/{leaflet.js,leaflet.css,gpx.js} \
         backup/{backup.sh,restore.sh,lib.sh,backup.conf.example} \
