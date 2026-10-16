@@ -243,6 +243,15 @@ What it does:
   immutable trip files.
 - **Export** — "Export CSV" / "Export XLSX" use the selected year and
   include annotations, recorded start/end latitude and longitude, and totals.
+- **Device health** — open `/device-health` from the navigation after login.
+  See last contact, snapshot age, firmware, storage, pending/dropped counts,
+  counters and active / unknown / clear conditions with catalog recovery advice.
+  History shows 50 events per page, with code/severity filters and device clock
+  confidence separately from server receipt time, all in `DISPLAY_TZ`.
+  Severity comes from the current catalog, including for older stored events.
+  The diagnostics DB is opened read-only with a two-second lock timeout.
+  Before it exists the page says "No diagnostics yet"; read/schema/lock errors
+  say "Diagnostics unavailable" (503) and log a warning. Neither means healthy.
 
 Years are based on **trip start in `DISPLAY_TZ`**, including at the New Year
 boundary. A trip crossing midnight belongs entirely to its start year; it
@@ -447,7 +456,7 @@ See [DIAGNOSTICS.md](../DIAGNOSTICS.md) for the full protocol and ordering rules
 `X-Device-Id` headers on successful GPX uploads refresh contact, even before
 firmware sends diagnostics. Missing/invalid headers create no diagnostic device;
 GPX creator is never used to guess one. Diagnostics failures do not fail GPX.
-The viewer health page is planned in #119; consistent SQLite backups remain
+The viewer's `/device-health` page shipped in #119; consistent SQLite backups remain
 #129 (`backup.sh` currently rsyncs the live data directory).
 
 Build both images from this directory with `docker compose build`. Both service
