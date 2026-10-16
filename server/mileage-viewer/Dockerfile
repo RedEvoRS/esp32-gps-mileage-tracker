@@ -4,11 +4,13 @@ RUN useradd --create-home --shell /bin/bash app
 
 WORKDIR /app
 
-COPY requirements.txt /app/
+COPY mileage-viewer/requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py /app/
-COPY static/ /app/static/
+COPY mileage-viewer/app.py /app/
+COPY mileage-viewer/static/ /app/static/
+COPY common/ /app/common/
+ENV PYTHONPATH=/app
 
 # /data is the read-only mount of the ingest data; /db holds the
 # annotations SQLite database (its own writable volume).

@@ -2,9 +2,10 @@
 
 This is the reference for issues #117 through #130. It describes the complete
 planned framework, including features that are not implemented yet. **#117 adds
-only the shared catalog, protocol validation, generated C++ header, tests and
-this document.** It does not change trip logging, provide an HTTP endpoint, or
-send notifications. Existing firmware and server behavior remains described in
+the shared catalog, protocol validation, generated C++ header, tests and this
+document; #118 adds the ingest endpoint, storage and GPX contact refresh.**
+Firmware diagnostics, the health page and notifications follow in later issues.
+Existing firmware and server behavior remains described in
 [README.md](README.md) and [DEPLOY_DEBIAN.md](DEPLOY_DEBIAN.md).
 
 The tracker normally runs unattended in a car. A serial console cannot explain
@@ -119,9 +120,10 @@ CI checks exact header bytes, and tests verify JSON/header version agreement.
 
 ## Protocol v1 (#117 contract, #118 and #125 integration)
 
-The planned endpoint is `POST /v1/device-events` on ingest port 8090. It uses
-the existing bearer token and an `X-Device-Id` header. Firmware will define
-`DEVICE_ID` in `secrets.h`; the public example is a non-personal identifier such
+The endpoint is `POST /v1/device-events` on ingest port 8090. It uses
+the existing bearer token and an `X-Device-Id` header. Firmware already defines
+`DEVICE_ID` in `secrets.h` and sends it on GPX uploads; diagnostics uploads follow
+in #125. The public example is a non-personal identifier such
 as `tracker-1`. Header identity is validated separately and is not repeated in
 every record. It is a label, not authentication or a secret. In practice there
 is one tracker, but retaining the label prevents future data collisions.
@@ -216,7 +218,7 @@ A minimal valid example (synthetic identifiers, unset device clock):
   schema validity alone does not guarantee it fits. Request whitespace does
   not count toward an individual canonical event's frame size.
 
-The validator accepts future unknown codes in 1000-7999, even when their
+The validator accepts future unknown device codes in 1000-6999, even when their
 `catalog_version` is newer. Unknown codes must have **empty context** until the
 server knows their schema. The server retains them and displays `Unknown E####`
 without inventing severity or enabling notifications. This deliberately trades
@@ -397,15 +399,44 @@ an accepted GPX upload into an error. Successful GPX uploads independently
 refresh device contact time when their device identity is supplied/validated.
 Legacy uploads with no identity must not be assigned to a guessed device.
 
-**Packaging work reserved for #118:** both Docker builds currently need their
-own application and the new shared package. Change their build contexts/COPY
-instructions (and corresponding Compose build configuration) to include
-`server/common/`, add a strict `.dockerignore` to the wider `server/` context
-(excluding secrets, data and development artifacts), ensure the parent of
-`common/` is on the Python import path,
-and copy `catalog.json` as package data. A deployment that imports the Python
-files but omits the JSON must fail clearly, not silently start with an empty
-catalog. #117 intentionally changes no Dockerfiles, Compose or Flask apps.
+The database path is derived from `INGEST_DATA_ROOT` (default `/data`), so it
+lives inside the existing data mount. Initialization is lazy: the first event
+batch or validated GPX contact creates it; a broken diagnostics database must
+not prevent GPX service startup. The catalog is loaded and validated at ingest
+startup; missing/invalid `catalog.json` fails startup clearly. Each connection
+uses a 5000 ms busy timeout. Schema creation/versioning shares the same
+`BEGIN IMMEDIATE` writer lock as updates, safe across Gunicorn workers.
+
+Schema version 1 (all receipt timestamps are UTC ISO 8601 with `+00:00`):
+
+- `schema_version`: singleton row `(singleton=1, version=1)`. Unsupported versions
+  fail closed; migrations belong to the change that introduces a new version.
+- `devices`: primary key `device_id`, `last_contact_at`, nullable `status_sequence`,
+  `snapshot_json` (complete canonical latest check-in), `snapshot_received_at`.
+  GPX-only contact creates a device with no snapshot. A retry can refresh contact
+  without making the snapshot fresh. Conflicting batches refresh nothing.
+- `boots`: primary key `(device_id, boot_id)`, `first_received_at`, `last_received_at`.
+  Both event boots and check-in boots are recorded; receipt order is not boot order.
+- `events`: primary key `(device_id, boot_id, sequence)`, `code`, nullable derived
+  `severity`, nullable device `utc_ms`, server `received_at`, `canonical_json`
+  (the complete event). Unknown codes have NULL severity. Event retries preserve
+  the original receipt. History/code indexes support #119 filtering/pagination.
+- `device_conditions`: primary key `(device_id, code)`, `state` (`active`, `clear`,
+  `unknown`), nullable `episode_id`. A newer snapshot makes all previously known
+  but omitted conditions unknown, even within one boot. Observed inactive codes
+  become clear; active codes retain their supplied episode. Codes never seen in
+  this table are unknown too. Historical events never change these states.
+
+Canonical content sorts object keys and uses compact ASCII JSON. Array order
+remains significant, so firmware must preserve list order when retrying the
+same revision. Optional-field omission differs from an explicitly supplied
+field; revisions can be reused only for identical decoded check-ins.
+
+Both Docker builds use `server/` as context, copy their application plus
+`common/` (including `catalog.json`) to `/app`, and set `PYTHONPATH=/app`.
+`server/.dockerignore` defaults to denying everything and explicitly allows
+only the required runtime files. Secrets, data and development artifacts stay
+outside the build context. The viewer can import the shared package for #119.
 
 The #119 Device health page shows last server contact, current active/clear/
 unknown conditions, firmware, storage backend and pending/dropped counters.
@@ -477,8 +508,12 @@ silently suppress it. Document that distinction in deployment settings.
 ## Backups and acceptance (#129/#130)
 
 Use SQLite's backup API (or a coordinated service pause) to take consistent
-copies of events.db and the monitor's own SQLite state. Do not blindly copy a
-live database file and assume it is consistent. Preserve restrictive file
+copies of events.db and the monitor's own SQLite state. `backup.sh` currently
+rsyncs `/data`, which now includes `/data/diagnostics/events.db`; that live-file
+copy is not a guaranteed consistent SQLite snapshot. Implementing and testing
+the consistent snapshot is **#129's job**, still required before relying on
+diagnostics backups. Do not blindly copy a live database file and assume it is
+consistent. Preserve restrictive file
 permissions and include schema/catalog versions in restore validation. Restored
 monitor state can replay notifications; restored diagnostics state can lower
 server high-water revisions. #129 must test those cases and document recovery

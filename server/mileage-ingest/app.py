@@ -3,11 +3,11 @@ Mileage Tracker Ingest Service
 
 A minimal HTTP service that receives trip uploads from the T-Beam GPS
 mileage tracker and persists them as GPX files on disk, alongside a
-derived JSON summary.
+derived JSON summary. It also receives bounded diagnostic event batches and
+ordered health check-ins in an independent SQLite database (DIAGNOSTICS.md).
 
-Design philosophy: do one thing and do it reliably. This service accepts
-a GPX upload, stores the raw GPX unchanged (it is the immutable source of
-truth), and computes a small JSON summary so other tools can list and
+This service accepts a GPX upload, stores the raw GPX unchanged (it is the
+immutable source of truth), and computes a small JSON summary so other tools can list and
 total trips without re-parsing every track. It does not generate reports,
 serve a UI, or classify trips. Those responsibilities belong to the
 separate viewer/export service that reads these files independently.
@@ -57,6 +57,17 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import Flask, abort, request, jsonify
+from werkzeug.exceptions import ClientDisconnected
+
+# Support both the source tree and the container's flat /app layout, including
+# direct app.py execution and importlib-based service tests.
+for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resolve().parent):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
+
+from common.diagnostics import CatalogError, ProtocolError, load_catalog, parse_request, validate_device_id
+from common.diagnostics.protocol import MAX_REQUEST_BYTES
+from diag_store import ConflictError, DiagnosticsStore
 
 
 # ---------------------------------------------------------------------
@@ -68,6 +79,12 @@ from flask import Flask, abort, request, jsonify
 
 AUTH_TOKEN = os.environ.get("INGEST_AUTH_TOKEN")
 DATA_ROOT = Path(os.environ.get("INGEST_DATA_ROOT", "/data"))
+try:
+    DIAGNOSTICS_CATALOG = load_catalog()
+except CatalogError as exc:
+    raise RuntimeError("Cannot start ingest: missing or invalid diagnostics catalog.json") from exc
+DIAGNOSTICS_STORE = DiagnosticsStore(DATA_ROOT, DIAGNOSTICS_CATALOG)
+MAX_DIAGNOSTICS_DISCARD_BYTES = 4 * MAX_REQUEST_BYTES
 
 # Timestamps inside the stored files stay UTC -- that's what the GPX
 # carries and it's the unambiguous form. This zone controls one thing:
@@ -595,9 +612,101 @@ def _discard_body():
         pass  # the client went away mid-body; nobody is left to answer
 
 
+def _authenticate(discard):
+    """Shared constant-time bearer check; callers select their bounded drain."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        discard()
+        return jsonify({"error": "missing or malformed Authorization header"}), 401
+
+    presented_token = auth_header[7:]  # strip "Bearer " prefix
+    # Constant-time comparison; on a LAN the timing channel is mostly
+    # theoretical, but compare_digest costs nothing to use. Compare bytes:
+    # on str, compare_digest raises TypeError for any non-ASCII character,
+    # so "Bearer café" would be a 500 instead of a 401.
+    if not hmac.compare_digest(
+        presented_token.encode("utf-8"), AUTH_TOKEN.encode("utf-8")
+    ):
+        app.logger.warning(
+            "Rejected upload with bad token from %s", request.remote_addr
+        )
+        discard()
+        return jsonify({"error": "unauthorized"}), 401
+
+
+def _discard_diagnostics_body(consumed=0):
+    """Drain raw/dechunked WSGI input within a per-request byte budget.
+
+    Avoid Flask's GPX length cap and missing-length safe fallback here. Gunicorn
+    supplies a framed, dechunked wsgi.input, including for chunked requests.
+    A lengthless input is read only up to the bounded budget, never unbounded.
+    """
+    length = request.content_length
+    if length is not None and length > MAX_DIAGNOSTICS_DISCARD_BYTES:
+        return
+    remaining = MAX_DIAGNOSTICS_DISCARD_BYTES - consumed
+    if length is not None:
+        remaining = min(remaining, max(0, length - consumed))
+    try:
+        while remaining > 0:
+            chunk = request.environ["wsgi.input"].read(min(remaining, 8192))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+    except (OSError, ClientDisconnected):
+        pass
+
+
 # ---------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------
+
+
+@app.route("/v1/device-events", methods=["POST"])
+def device_events():
+    auth_error = _authenticate(_discard_diagnostics_body)
+    if auth_error is not None:
+        return auth_error
+    try:
+        device_id = validate_device_id(request.headers.get("X-Device-Id"))
+    except ProtocolError as exc:
+        _discard_diagnostics_body()
+        return jsonify(error=str(exc)), 400
+
+    length = request.content_length
+    if length is not None and length > MAX_REQUEST_BYTES:
+        _discard_diagnostics_body()
+        return jsonify(error="payload too large (limit 32768 bytes)"), 413
+    chunks, consumed = [], 0
+    try:
+        while length is None or consumed < length:
+            size = min(8192, MAX_REQUEST_BYTES + 1 - consumed)
+            if length is not None:
+                size = min(size, length - consumed)
+            chunk = request.environ["wsgi.input"].read(size)
+            if not chunk:
+                if length is not None and consumed < length:
+                    return jsonify(error="incomplete request body"), 400
+                break
+            consumed += len(chunk)
+            if consumed > MAX_REQUEST_BYTES:
+                _discard_diagnostics_body(consumed)
+                return jsonify(error="payload too large (limit 32768 bytes)"), 413
+            chunks.append(chunk)
+    except (OSError, ClientDisconnected):
+        return jsonify(error="cannot read request body"), 400
+    try:
+        body = parse_request(b"".join(chunks), catalog=DIAGNOSTICS_CATALOG)
+    except ProtocolError as exc:
+        return jsonify(error=str(exc)), 400
+    try:
+        accepted = DIAGNOSTICS_STORE.accept(device_id, body)
+    except ConflictError as exc:
+        return jsonify(error=str(exc)), 409
+    except Exception:
+        app.logger.exception("Failed to commit device diagnostics")
+        return jsonify(error="server error storing diagnostics"), 500
+    return jsonify(accepted=accepted), 200
 
 
 @app.route("/health", methods=["GET"])
@@ -644,24 +753,9 @@ def upload_trip():
     # Simple bearer token: LAN-appropriate security, not internet-grade.
     # A 401 discards the unread body first, so the device sees the 401
     # rather than a reset connection (see MAX_DISCARD_BYTES).
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        _discard_body()
-        return jsonify({"error": "missing or malformed Authorization header"}), 401
-
-    presented_token = auth_header[7:]  # strip "Bearer " prefix
-    # Constant-time comparison; on a LAN the timing channel is mostly
-    # theoretical, but compare_digest costs nothing to use. Compare bytes:
-    # on str, compare_digest raises TypeError for any non-ASCII character,
-    # so "Bearer café" would be a 500 instead of a 401.
-    if not hmac.compare_digest(
-        presented_token.encode("utf-8"), AUTH_TOKEN.encode("utf-8")
-    ):
-        app.logger.warning(
-            "Rejected upload with bad token from %s", request.remote_addr
-        )
-        _discard_body()
-        return jsonify({"error": "unauthorized"}), 401
+    auth_error = _authenticate(_discard_body)
+    if auth_error is not None:
+        return auth_error
 
     # -----------------------------------------------------------------
     # Step 2: Read and parse the GPX body
@@ -786,6 +880,18 @@ def upload_trip():
     # -----------------------------------------------------------------
     # Step 6: Success
     # -----------------------------------------------------------------
+    # Only the validated header identifies diagnostics contact; GPX creator
+    # and the summary's legacy fallback are never used to guess a device.
+    try:
+        contact_device = validate_device_id(request.headers.get("X-Device-Id"))
+    except ProtocolError:
+        contact_device = None
+    if contact_device is not None:
+        try:
+            DIAGNOSTICS_STORE.refresh_contact(contact_device)
+        except Exception:
+            app.logger.exception("Could not refresh diagnostics contact after GPX upload")
+
     app.logger.info(
         "Accepted trip %s (%.2f mi, %d pts) from %s",
         trip_id,
@@ -815,7 +921,7 @@ def index():
     information minimization.
     """
     return (
-        jsonify({"service": "mileage-ingest", "endpoints": ["/health", "/upload"]}),
+        jsonify({"service": "mileage-ingest", "endpoints": ["/health", "/upload", "/v1/device-events"]}),
         200,
     )
 

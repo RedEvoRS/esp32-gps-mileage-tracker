@@ -4,10 +4,12 @@ RUN useradd --create-home --shell /bin/bash app
 
 WORKDIR /app
 
-COPY requirements.txt /app/
+COPY mileage-ingest/requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py /app/
+COPY mileage-ingest/app.py mileage-ingest/diag_store.py /app/
+COPY common/ /app/common/
+ENV PYTHONPATH=/app
 
 RUN mkdir -p /data && chown -R app:app /data /app
 

@@ -1,0 +1,31 @@
+# Default deny: only reviewed runtime files enter either build context.
+# This excludes .env, viewer.env, data/, backup/, backups/, tests/,
+# __pycache__/, bytecode, editor files and future unlisted files.
+# Re-deny contents after opening each directory: Docker otherwise includes
+# unlisted descendants through the directory exception.
+**
+!mileage-ingest/
+mileage-ingest/**
+!mileage-ingest/Dockerfile
+!mileage-ingest/requirements.txt
+!mileage-ingest/app.py
+!mileage-ingest/diag_store.py
+!mileage-viewer/
+mileage-viewer/**
+!mileage-viewer/Dockerfile
+!mileage-viewer/requirements.txt
+!mileage-viewer/app.py
+!mileage-viewer/static/
+mileage-viewer/static/**
+!mileage-viewer/static/leaflet.js
+!mileage-viewer/static/leaflet.css
+!mileage-viewer/static/gpx.js
+!common/
+common/**
+!common/__init__.py
+!common/diagnostics/
+common/diagnostics/**
+!common/diagnostics/__init__.py
+!common/diagnostics/catalog.py
+!common/diagnostics/protocol.py
+!common/diagnostics/catalog.json

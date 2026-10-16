@@ -33,11 +33,12 @@ firmware/
 
 server/
   common/diagnostics/    Shared catalog and protocol validators (stdlib only)
-  docker-compose.yml     Compose definition (ports 8090 + 8091)
+  docker-compose.yml     Compose definition (ports 8090 + 8091; server/ build contexts)
+  .dockerignore          Default-deny runtime allowlist; excludes secrets and data
   .env.example           Copy to .env, set INGEST_AUTH_TOKEN and BIND_ADDR
   viewer.env.example     Copy to viewer.env, set the viewer login
   install.sh             First-time install with checks; --check re-verifies
-  mileage-ingest/        Flask ingest service (app.py, Dockerfile)
+  mileage-ingest/        Flask ingest (app.py), diagnostics SQLite (diag_store.py), Dockerfile
   mileage-viewer/        Flask viewer/export service (app.py, static/)
   backup/                backup.sh + restore.sh, systemd timer, backup.conf.example
   tests/                 Server tests (unittest) + map-parser check (node)
@@ -136,6 +137,15 @@ firmware hasn't been road-tested.
   links. Early 401/413 replies read and discard up to 4x the cap first, so
   the device sees the status, not a reset.
   `server/tests/test_upload_limits.py` ties these to `partitions.csv`
+- Diagnostics: `POST /v1/device-events` on ingest, same bearer auth plus validated
+  `X-Device-Id`, 32 KiB streaming cap (also without Content-Length), protocol v1
+  from `common.diagnostics`, catalog cached at startup. Ingest owns
+  `/data/diagnostics/events.db` under `INGEST_DATA_ROOT`: SQLite DELETE journal,
+  synchronous=FULL, 5 s busy timeout, schema version 1. One transaction dedupes
+  events and applies the device-wide `status_sequence` high-water rule; ack only
+  after commit. GPX successes refresh contact only for a valid device header;
+  diagnostics failure never changes their response. See `DIAGNOSTICS.md` for
+  schema/unknown-condition semantics. Consistent DB backups remain #129.
 - Viewer port: 8091, session login (LAN-only), reads `./data` read-only, owns
   `annotations.db` (SQLite) in the `viewer-db` volume
 - Port binding: `BIND_ADDR` in `.env` sets the host IP both ports publish
