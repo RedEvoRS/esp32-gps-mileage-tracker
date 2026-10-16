@@ -1,0 +1,397 @@
+"""Optional, stdlib-only diagnostics policy and durable ntfy delivery worker.
+
+Ingest owns events.db. This process only opens it in mode=ro, never immutable.
+All mutable policy, queue, retry and rate-limit state belongs to monitor.db.
+"""
+
+import json
+import logging
+import math
+import os
+import signal
+import sqlite3
+import threading
+import time
+import urllib.parse
+import urllib.request
+from contextlib import closing
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+from common.diagnostics import load_catalog, validate_device_id, validate_request
+
+
+LOG = logging.getLogger("mileage-monitor")
+SEVERITIES = ("info", "warning", "error", "critical")
+SNAPSHOT_MAX_AGE_SECONDS = 86400
+TICK_SECONDS = 60
+MAX_BODY_BYTES = 3500  # Leave room below ntfy's default 4096-byte message limit.
+
+
+@dataclass(frozen=True)
+class Config:
+    enabled: bool = False
+    notify: bool = False
+    url: str = ""
+    token: str = ""
+    min_severity: str = "error"
+    hold_seconds: float = 300
+    repeat_seconds: float = 86400
+    max_per_hour: int = 6
+    stale_seconds: float = 7 * 86400
+
+    @classmethod
+    def from_env(cls, env=None):
+        env = os.environ if env is None else env
+
+        def boolean(name):
+            value = env.get(name, "false").lower()
+            if value not in ("true", "false"):
+                raise ValueError(name + " must be true or false")
+            return value == "true"
+
+        enabled = boolean("MONITOR_ENABLED")
+        if not enabled:
+            return cls()  # Inactive profile can carry unfilled example settings.
+        notify = boolean("NOTIFY_ENABLED")
+
+        def number(name, default, lower, upper, *, integer=False):
+            try:
+                raw = env.get(name, str(default))
+                value = int(raw) if integer else float(raw)
+                if not math.isfinite(value) or not lower <= value <= upper:
+                    raise ValueError
+            except (ValueError, TypeError, OverflowError):
+                raise ValueError(name + " is outside its supported numeric range") from None
+            return value
+
+        severity = env.get("NOTIFY_MIN_SEVERITY", "error")
+        if severity not in SEVERITIES:
+            raise ValueError("NOTIFY_MIN_SEVERITY must be info, warning, error or critical")
+        hold = number("NOTIFY_HOLD_SECONDS", 300, 0, 604800)
+        repeat = number("NOTIFY_REPEAT_HOURS", 24, 1 / 3600, 8760) * 3600
+        maximum = number("NOTIFY_MAX_PER_HOUR", 6, 1, 1000, integer=True)
+        stale = number("MONITOR_STALE_DAYS", 7, 1 / 86400, 36500) * 86400
+        url, token = env.get("NTFY_URL", ""), env.get("NTFY_TOKEN", "")
+        if notify:
+            try:
+                parsed = urllib.parse.urlsplit(url)
+                valid = (parsed.scheme in ("http", "https") and parsed.hostname
+                         and parsed.port != 0 and parsed.username is None
+                         and parsed.password is None and not parsed.query and not parsed.fragment
+                         and parsed.path.strip("/") and not any(c.isspace() for c in url))
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValueError("NTFY_URL must be an http(s) topic URL without credentials, query or fragment")
+            if not token or any(not 33 <= ord(c) <= 126 for c in token):
+                raise ValueError("NTFY_TOKEN must be a nonempty access token without whitespace")
+        return cls(enabled, notify, url, token, severity, hold, repeat, maximum, stale)
+
+
+def receipt(value):
+    """Only timezone-aware server receipt timestamps are policy inputs."""
+    stamp = datetime.fromisoformat(value)
+    if stamp.utcoffset() is None or stamp.utcoffset().total_seconds() != 0:
+        raise ValueError("invalid diagnostics receipt timestamp")
+    return stamp.timestamp()
+
+
+def read_devices(path, catalog):
+    path = Path(path)
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return None
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro",
+                                 uri=True, timeout=2)) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("BEGIN")
+        versions = db.execute("SELECT singleton, version FROM schema_version").fetchall()
+        if [tuple(row) for row in versions] != [(1, 1)]:
+            raise ValueError("unsupported diagnostics database schema version")
+        devices = []
+        for row in db.execute("SELECT device_id,last_contact_at,status_sequence,snapshot_json,"
+                              "snapshot_received_at FROM devices ORDER BY device_id"):
+            device = dict(row)
+            validate_device_id(device["device_id"])
+            device["contact"] = receipt(device["last_contact_at"])
+            snapshot = json.loads(device["snapshot_json"]) if device["snapshot_json"] else None
+            if snapshot is not None:
+                validate_request({"schema_version": 1, "checkin": snapshot, "events": []}, catalog=catalog)
+                if snapshot["status_sequence"] != device["status_sequence"]:
+                    raise ValueError("invalid diagnostics snapshot revision")
+                device["snapshot_at"] = receipt(device["snapshot_received_at"])
+            device["snapshot"] = snapshot
+            devices.append(device)
+        return devices
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Never forward the bearer token through a redirect.
+        return None
+
+
+class NtfySender:
+    def __init__(self, config):
+        self.config = config
+        self.opener = urllib.request.build_opener(NoRedirect())
+
+    def __call__(self, body):
+        request = urllib.request.Request(
+            self.config.url, body.encode("utf-8"), method="POST",
+            headers={"Authorization": "Bearer " + self.config.token,
+                     "Content-Type": "text/plain; charset=utf-8"})
+        with self.opener.open(request, timeout=10) as response:
+            if not 200 <= response.status < 300:
+                raise OSError("ntfy rejected delivery")
+            response.read(1024)
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS schema_version (singleton INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS episodes (
+    device TEXT NOT NULL, code INTEGER NOT NULL, episode TEXT NOT NULL,
+    state TEXT NOT NULL, eligible_since REAL, revision INTEGER NOT NULL,
+    contact REAL, alerted_at REAL, last_sent_at REAL, resolved_at REAL,
+    PRIMARY KEY (device, code, episode)
+);
+CREATE TABLE IF NOT EXISTS work (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device TEXT NOT NULL, code INTEGER NOT NULL, episode TEXT NOT NULL,
+    kind TEXT NOT NULL, queued_at REAL NOT NULL, overflow INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (device, code, episode, kind)
+);
+CREATE TABLE IF NOT EXISTS outbox (singleton INTEGER PRIMARY KEY, ids_json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS deliveries (sent_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS retry (
+    singleton INTEGER PRIMARY KEY, attempts INTEGER NOT NULL, next_attempt REAL NOT NULL
+);
+"""
+
+
+class Monitor:
+    def __init__(self, config, events_path="/data/diagnostics/events.db",
+                 state_path="/state/monitor.db", *, clock=time.time, sender=None, catalog=None):
+        self.config = config
+        self.catalog = load_catalog() if catalog is None else catalog
+        self.codes = {row["code"]: row for row in self.catalog["codes"]}
+        self.events_path, self.state_path = Path(events_path), Path(state_path)
+        if self.events_path.resolve() == self.state_path.resolve():
+            raise ValueError("monitor state must be separate from diagnostics")
+        self.clock = clock
+        self.sender = NtfySender(config) if sender is None else sender
+        if config.enabled:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            with closing(self._connect()) as db:
+                # Check an existing version before changing any state.
+                if db.execute("SELECT name FROM sqlite_master WHERE name='schema_version'").fetchone():
+                    if db.execute("SELECT singleton,version FROM schema_version").fetchall() != [(1, 1)]:
+                        raise ValueError("unsupported monitor state schema version")
+                db.executescript(SCHEMA)
+                with db:
+                    db.execute("INSERT OR IGNORE INTO schema_version VALUES (1,1)")
+                    db.execute("INSERT OR IGNORE INTO retry VALUES (1,0,0)")
+
+    def _connect(self):
+        db = sqlite3.connect(self.state_path, timeout=2)
+        try:
+            db.execute("PRAGMA journal_mode=DELETE")
+            db.execute("PRAGMA synchronous=FULL")
+        except Exception:
+            db.close()
+            raise
+        return db
+
+    def eligible(self, code):
+        definition = self.codes.get(code)
+        return bool(definition and definition["notify"] and
+                    (code == 7001 or SEVERITIES.index(definition["severity"]) >=
+                     SEVERITIES.index(self.config.min_severity)))
+
+    def _reconcile(self, db, devices, now):
+        # Reset eligibility on unknown/stale input, but preserve sent history.
+        previous = {tuple(row[:3]): row[3] for row in db.execute(
+            "SELECT device,code,episode,eligible_since FROM episodes WHERE state='active'")}
+        db.execute("UPDATE episodes SET state='unknown', eligible_since=NULL WHERE state!='clear'")
+        for device in devices:
+            name, contact = device["device_id"], device["contact"]
+            # A contact is recovery only when it is genuinely newer than the
+            # contact on which this silence episode was based (not a clock jump).
+            db.execute("UPDATE episodes SET state='clear', eligible_since=NULL "
+                       "WHERE device=? AND code=7001 AND contact<?", (name, contact))
+            if now - contact >= self.config.stale_seconds:
+                episode = "silence:" + device["last_contact_at"]
+                self._active(db, name, 7001, episode, 0, contact, now, previous)
+            snapshot = device["snapshot"]
+            if snapshot is None or not 0 <= now - device["snapshot_at"] <= SNAPSHOT_MAX_AGE_SECONDS:
+                continue
+            revision = snapshot["status_sequence"]
+            active = {item["code"]: item["episode_id"] for item in snapshot["active"]}
+            for code in set(snapshot.get("observed", [])) - set(active):
+                db.execute("UPDATE episodes SET state='clear', eligible_since=NULL "
+                           "WHERE device=? AND code=? AND revision<?", (name, code, revision))
+            for code, episode in active.items():
+                if self.eligible(code):
+                    self._active(db, name, code, episode, revision, None, now, previous)
+
+    @staticmethod
+    def _active(db, device, code, episode, revision, contact, now, previous):
+        since = previous.get((device, code, episode))
+        db.execute("INSERT INTO episodes(device,code,episode,state,eligible_since,revision,contact) "
+                   "VALUES (?,?,?,'active',?,?,?) ON CONFLICT(device,code,episode) DO UPDATE SET "
+                   "state='active', eligible_since=excluded.eligible_since, "
+                   "revision=MAX(episodes.revision,excluded.revision) WHERE episodes.state!='clear'",
+                   (device, code, episode, since if since is not None else now, revision, contact))
+
+    def _queue(self, db, now):
+        desired = set()
+        for row in db.execute("SELECT device,code,episode,state,eligible_since,alerted_at,"
+                              "last_sent_at,resolved_at FROM episodes"):
+            device, code, episode, state, since, alerted, last_sent, resolved = row
+            if state == "clear" and alerted is not None and resolved is None:
+                desired.add((device, code, episode, "resolution"))
+            elif state == "active" and self.eligible(code):
+                hold = 0 if code == 7001 or self.codes[code]["severity"] == "critical" else self.config.hold_seconds
+                if now - since >= hold:
+                    if alerted is None:
+                        desired.add((device, code, episode, "alert"))
+                    elif now - last_sent >= self.config.repeat_seconds:
+                        desired.add((device, code, episode, "reminder"))
+        if not self.config.notify:
+            desired.clear()
+        for row in db.execute("SELECT id,device,code,episode,kind FROM work").fetchall():
+            if tuple(row[1:]) not in desired:
+                db.execute("DELETE FROM work WHERE id=?", (row[0],))
+        for key in sorted(desired):
+            db.execute("INSERT OR IGNORE INTO work(device,code,episode,kind,queued_at) VALUES (?,?,?,?,?)",
+                       (*key, now))
+
+    def _message(self, row, now):
+        _, device, code, episode, kind, *_ = row
+        definition = self.codes[code]
+        title = definition["title"]
+        if code == 7001 and kind != "resolution":
+            contact = receipt(episode.removeprefix("silence:"))
+            title = f"No contact for {max(0, int((now - contact) // 86400))} days"
+        label = {"alert": "Alert", "reminder": "Reminder", "resolution": "Resolved"}[kind]
+        return f"{label} E{code}: {title}\nDevice: {device}\nRecovery: {definition['recovery']}"
+
+    def _prepare(self, db, now, remaining):
+        work = db.execute("SELECT * FROM work ORDER BY id").fetchall()
+        if not work:
+            db.execute("DELETE FROM outbox")
+            return None
+        if remaining <= 0:
+            db.execute("UPDATE work SET overflow=1")
+            return None
+        pending = db.execute("SELECT ids_json FROM outbox WHERE singleton=1").fetchone()
+        if pending:
+            ids = set(json.loads(pending[0]))
+            chosen = [row for row in work if row[0] in ids]
+            if chosen:
+                body = "\n\n".join(self._message(row, now) for row in chosen)
+                if len(chosen) > 1 or any(row[6] for row in chosen):
+                    body = "Diagnostics digest\n\n" + body
+                return chosen, body
+            db.execute("DELETE FROM outbox")
+        # Reserve the last available slot for a digest if a burst would exceed
+        # the rolling-hour budget. Queued overflow stays coalesced next hour.
+        overflow = len(work) > remaining or any(row[6] for row in work)
+        if len(work) > remaining:
+            db.execute("UPDATE work SET overflow=1")
+        digest = overflow and (remaining == 1 or any(row[6] for row in work))
+        chosen, parts = [], []
+        body = "Diagnostics digest\n\n" if digest else ""
+        for row in work:
+            part = self._message(row, now)
+            candidate = body + "\n\n".join(parts + [part])
+            if len(candidate.encode("utf-8")) > MAX_BODY_BYTES:
+                break
+            chosen.append(row)
+            parts.append(part)
+            if not digest:
+                break
+        body += "\n\n".join(parts)
+        db.execute("INSERT OR REPLACE INTO outbox VALUES (1,?)",
+                   (json.dumps([row[0] for row in chosen]),))
+        return chosen, body
+
+    def tick(self):
+        if not self.config.enabled:
+            return True
+        try:
+            devices = read_devices(self.events_path, self.catalog)
+        except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+            # Exceptions may contain a path or endpoint. Do not log their text.
+            LOG.warning("Diagnostics unavailable (%s); retry next tick", type(exc).__name__)
+            return False
+        if devices is None:
+            LOG.info("No diagnostics database yet; nothing to monitor")
+            return True
+        now = self.clock()
+        with closing(self._connect()) as db:
+            with db:
+                self._reconcile(db, devices, now)
+                self._queue(db, now)
+                db.execute("DELETE FROM deliveries WHERE sent_at<=?", (now - 3600,))
+            while self.config.notify:
+                attempts, next_attempt = db.execute("SELECT attempts,next_attempt FROM retry WHERE singleton=1").fetchone()
+                if now < next_attempt:
+                    break
+                count = db.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0]
+                with db:
+                    prepared = self._prepare(db, now, self.config.max_per_hour - count)
+                if prepared is None:
+                    break
+                rows, body = prepared  # Intent is committed before any HTTP POST.
+                try:
+                    self.sender(body)
+                except Exception as exc:
+                    attempts += 1
+                    delay = min(3600, 60 * 2 ** min(attempts - 1, 6))
+                    with db:
+                        db.execute("UPDATE retry SET attempts=?,next_attempt=? WHERE singleton=1",
+                                   (attempts, now + delay))
+                    LOG.warning("ntfy delivery failed (%s); retry in %s seconds", type(exc).__name__, delay)
+                    break
+                with db:
+                    for row in rows:
+                        key = (row[1], row[2], row[3])
+                        if row[4] == "resolution":
+                            db.execute("UPDATE episodes SET resolved_at=? WHERE device=? AND code=? AND episode=?",
+                                       (now, *key))
+                        else:
+                            db.execute("UPDATE episodes SET alerted_at=COALESCE(alerted_at,?),last_sent_at=? "
+                                       "WHERE device=? AND code=? AND episode=?", (now, now, *key))
+                        db.execute("DELETE FROM work WHERE id=?", (row[0],))
+                    db.execute("INSERT INTO deliveries VALUES (?)", (now,))
+                    db.execute("DELETE FROM outbox")
+                    db.execute("UPDATE retry SET attempts=0,next_attempt=0 WHERE singleton=1")
+                LOG.info("ntfy delivered %s condition update(s)", len(rows))
+        return True
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    config = Config.from_env()
+    monitor = Monitor(config)
+    if config.enabled:
+        LOG.info("Monitor enabled; delivery %s", "enabled" if config.notify else "disabled")
+    else:
+        LOG.info("Monitor disabled; idling (no database reads or notifications)")
+    stop = threading.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: stop.set())
+    while not stop.is_set():
+        try:
+            monitor.tick()
+        except (sqlite3.Error, OSError, ValueError) as exc:
+            LOG.error("Monitor state unavailable (%s); retry next tick", type(exc).__name__)
+        stop.wait(TICK_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
