@@ -46,6 +46,8 @@ jobs:
         run: command -v rsync || (sudo apt-get update && sudo apt-get install -y rsync)
       - name: Run server regression tests
         run: python -m unittest discover -s server/tests -v
+      - name: Check generated diagnostics catalog
+        run: python tools/generate_error_catalog.py --check
       - name: Check map parser integration
         run: node server/tests/test_viewer_map.js
 

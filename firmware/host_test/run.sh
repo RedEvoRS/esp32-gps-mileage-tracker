@@ -29,6 +29,10 @@ flags=(-std=gnu++20 -O1 -w)
 incs=(-I"$here/stubs" -I"$here/../04_trip_logger" -I"$build/include")
 status=0
 
+echo "== test_diag_catalog"
+"${cxx[@]}" -std=c++14 -Wall -Wextra -pedantic "$here/test_diag_catalog.cpp" -o "$build/test_diag_catalog.exe"
+"$build/test_diag_catalog.exe" || status=1
+
 echo "== test_fs"
 "${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_fs.cpp" -o "$build/test_fs.exe"
 "$build/test_fs.exe" "$build/out" || status=1
