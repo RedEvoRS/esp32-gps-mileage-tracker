@@ -290,9 +290,11 @@ How it behaves once flashed:
   is still needed; there is no verified one-point loss limit.
 - **Time:** comes from the GPS (UTC). Points captured before the first
   fix are buffered and back-dated once UTC arrives. A trip that ends
-  before the clock was ever set (by GPS or NTP) writes the points still
-  in its 90-point buffer without times rather than guessing them; earlier
-  points may already have been dropped. The viewer lists it without a date.
+  before the clock was ever set (by GPS or NTP) keeps every point without
+  times rather than guessing them. Once its 90-point buffer fills, older
+  points are written to flash without times; the latest 90 stay buffered
+  for back-dating if UTC arrives later. Already-written untimed points stay
+  untimed. The viewer lists a wholly untimed trip without a date.
 - **Upload:** the board checks for finished trips every 30 s and scans
   for your home WiFi when a retry is due. Failed scans, connections, or
   uploads double the retry wait (60 s, 120 s, 240 s, then at most 5 min).
@@ -302,7 +304,7 @@ How it behaves once flashed:
   have parked at home: the board tries within 30 s, then about 1, 3 and
   7 minutes later, all before it sleeps. Each failed try prints why and
   when the next one is, e.g.
-  `Network: home WiFi not found -- next try in 60 s.` When connected, it
+  `Network: home WiFi not found "<ssid>" -- next try in 60 s.` When connected, it
   POSTs each trip to the ingest server as GPX and deletes it locally once
   the server accepts it. GPS
   parsing runs on core 1; networking runs on core 0 and never blocks
@@ -341,9 +343,13 @@ failure, including timeouts after reaching the server. `HTTP 400/413`
 normally sets the file aside as `.bad` without further retries, while
 `409` and `5xx` leave it queued. No upload result can mean WiFi trouble,
 but also an incomplete file or one set aside during repair. A failed WiFi
-scan or join prints `Network: home WiFi not found` or
-`Network: couldn't join home WiFi`, with the time until the next try
-(up to 5 minutes); press **RST** to try again at once. See the
+scan or join prints `Network: home WiFi not found "<ssid>"` or
+`Network: couldn't join home WiFi "<ssid>" (status N)`, with the time until
+the next try (up to 5 minutes). Check the SSID and 2.4 GHz coverage after
+a scan miss. Join status `4` (`WL_CONNECT_FAILED`) can indicate a wrong
+password; `1` is `WL_NO_SSID_AVAIL` and `6` is `WL_DISCONNECTED`. These are
+connection states, not a definitive diagnosis. Press **RST** to try again
+at once. See the
 [upload troubleshooting steps](../README.md#4-check-it-works) for what to
 check and preserve in each case.
 

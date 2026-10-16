@@ -376,6 +376,7 @@ struct WiFiStub {
     std::vector<std::string> scanSsids;
     int scanError = 0, scans = 0, scanDeletes = 0, joins = 0, disconnects = 0;
     int connectionStatus = 0, currentMode = WIFI_OFF, readsAfterDelete = 0;
+    int disconnectStatus = -1;  // optionally change status when the radio is shut down
     uint32_t scanDurationMs = 0;
     bool scanResultsAvailable = false;
     int scanNetworks(bool, bool, bool, int) {
@@ -394,7 +395,10 @@ struct WiFiStub {
     void mode(int m) { currentMode = m; } void setAutoReconnect(bool) {}
     void begin(const char*, const char*, int = 0, const uint8_t* = nullptr, bool = false) { joins++; }
     int status() { return connectionStatus; }
-    void disconnect(bool) { disconnects++; }
+    void disconnect(bool) {
+        disconnects++;
+        if (disconnectStatus >= 0) connectionStatus = disconnectStatus;
+    }
 };
 extern WiFiStub WiFi;
 // A real restart never returns. Unwind setup() so a test can inspect what

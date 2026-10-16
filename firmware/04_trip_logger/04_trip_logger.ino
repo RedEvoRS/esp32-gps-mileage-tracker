@@ -10,7 +10,8 @@
 //      traffic doesn't split one drive into many.
 //   2. GPX logging to LittleFS -- one trkpt line appended per timed fix,
 //      file.close() after every write to limit power-cut data loss.
-//      Untimed points are buffered in RAM. Boot-time "fsck" attempts
+//      The latest 90 untimed points are buffered in RAM; older ones spill
+//      to flash without times. Boot-time "fsck" attempts
 //      repair; a maximum loss bound still needs hardware validation.
 //   3. A FreeRTOS networking task pinned to core 0 that, when parked on
 //      home WiFi, uploads finished .gpx files to the ingest server and
@@ -209,8 +210,10 @@ struct FileWriter {
 };
 
 // Ring buffer of fixes captured before UTC was available. One fix per
-// 1 Hz epoch (see loop()), so this covers ~90 s -- a cold start.
-static Fix    gPend[90];
+// 1 Hz epoch (see loop()), so this covers ~90 s -- a cold start. Once
+// full, spill the oldest fix to flash without a time before adding more.
+static constexpr size_t PENDING_CAPACITY = 90;
+static Fix    gPend[PENDING_CAPACITY];
 static size_t gPendHead = 0, gPendCount = 0;
 
 // -----------------------------------------------------------------
@@ -413,12 +416,9 @@ static void appendTrkpt(FileWriter& w, const Fix& fx) {
 // Pending ring buffer (pre-UTC fixes)
 // =================================================================
 static void pushPending(const Fix& fx) {
-    gPend[(gPendHead + gPendCount) % 90] = fx;
-    if (gPendCount < 90) {
-        gPendCount++;
-    } else {
-        gPendHead = (gPendHead + 1) % 90;   // overwrite oldest
-    }
+    // Callers make room first; an active trip must never overwrite fixes.
+    gPend[(gPendHead + gPendCount) % PENDING_CAPACITY] = fx;
+    gPendCount++;
 }
 
 // Write all buffered fixes to the open trip file, back-dating each from
@@ -434,7 +434,7 @@ static void flushPending(FileWriter& w) {
     uint64_t utcNow = nowEpochMs();
     uint32_t monoNow = millis();
     for (size_t i = 0; i < gPendCount; ++i) {
-        Fix p = gPend[(gPendHead + i) % 90];
+        Fix p = gPend[(gPendHead + i) % PENDING_CAPACITY];
         p.hasUtc = trusted;
         p.utcMs  = trusted ? utcNow - (uint64_t)(monoNow - p.monoMs) : 0;
         appendTrkpt(w, p);
@@ -547,12 +547,14 @@ static bool beginTrip(const Fix& fx) {
 }
 
 // Append a point to the active trip, buffering instead if UTC isn't
-// available yet. Once UTC arrives mid-trip, flush the buffer first.
+// available yet. If the buffer is full, commit its oldest point untimed
+// before accepting this one. Once UTC arrives, back-date the buffered tail;
+// points already committed without times stay untimed.
 // Returns false if the write didn't reach flash; the caller must end the
 // trip, since a partial line may now sit at the tail of the file.
 static bool writeOrBufferTrkpt(const Fix& fx) {
     if (gTripPath[0] == 0) return true;
-    if (!fx.hasUtc) {
+    if (!fx.hasUtc && gPendCount < PENDING_CAPACITY) {
         pushPending(fx);
         return true;
     }
@@ -564,13 +566,22 @@ static bool writeOrBufferTrkpt(const Fix& fx) {
     // points into a file with no <gpx> header.
     if (f && f.size() > 0) {
         FileWriter w(f);
-        if (gPendCount > 0) flushPending(w);
-        appendTrkpt(w, fx);
+        if (!fx.hasUtc) {
+            appendTrkpt(w, gPend[gPendHead]);
+        } else {
+            if (gPendCount > 0) flushPending(w);
+            appendTrkpt(w, fx);
+        }
         ok = w.commit();
     }
     if (f) f.close();   // close() as well as the commit's fsync
     FS_UNLOCK();
 
+    if (ok && !fx.hasUtc) {
+        gPendHead = (gPendHead + 1) % PENDING_CAPACITY;
+        gPendCount--;
+        pushPending(fx);
+    }
     if (!ok) {
         Serial.printf("ERROR: write to %s failed -- ending trip.\n", gTripPath);
         gTripWriteFailed = true;
@@ -1145,9 +1156,9 @@ static void trySntp() {
     esp_sntp_stop();
 }
 
-static bool isComplete(const char* path) {
-    FS_LOCK();
-    File f = LittleFS.open(path, FILE_READ);
+// Caller holds the FS mutex. Accept an already-open directory entry too,
+// so queue selection can skip incomplete files without a recursive lock.
+static bool isCompleteFile(File& f) {
     bool ok = false;
     if (f) {
         size_t sz = f.size();
@@ -1159,8 +1170,15 @@ static bool isComplete(const char* path) {
             tail[n] = 0;
             ok = strstr(tail, "</gpx>") != nullptr;
         }
-        f.close();
     }
+    return ok;
+}
+
+static bool isComplete(const char* path) {
+    FS_LOCK();
+    File f = LittleFS.open(path, FILE_READ);
+    bool ok = isCompleteFile(f);
+    if (f) f.close();
     FS_UNLOCK();
     return ok;
 }
@@ -1269,20 +1287,22 @@ static bool uploadPending() {
     File dir = LittleFS.open(TRIP_DIR);
     if (dir && dir.isDirectory()) {
         File e = dir.openNextFile();
-        while (e && count < 16) {
+        while (e && count < 16 && !gNetHold.load() && !gNetAbort.load()) {
             String name = tripEntryPath(e);
             if (name.endsWith(".gpx") &&
-                (gTripPath[0] == 0 || name != String(gTripPath))) {
+                (gTripPath[0] == 0 || name != String(gTripPath)) &&
+                isCompleteFile(e)) {
                 pending[count++] = name;
             }
             e = dir.openNextFile();
         }
     }
+    if (dir) dir.close();  // finish enumeration before uploads mutate the directory
     FS_UNLOCK();
 
     // A sleep request (gNetHold) lets the current file finish, then stops.
     bool uploaded = false;
-    for (int i = 0; i < count && !gNetHold.load(); ++i) {
+    for (int i = 0; i < count && !gNetHold.load() && !gNetAbort.load(); ++i) {
         if (isComplete(pending[i].c_str())) {
             if (uploadFile(pending[i].c_str())) uploaded = true;
         }
@@ -1324,10 +1344,13 @@ static void netCycle() {
         } else if (gNetRetryMs == 0 || millis() - gNetLastAttemptMs >= gNetRetryMs) {
             bool uploaded = false;
             const char* miss = nullptr;
-            if (!homeApInRange()) {
+            int joinStatus = -1;
+            bool homeFound = homeApInRange();
+            if (!homeFound) {
                 miss = "home WiFi not found";
             } else if (!connectWifi()) {
                 miss = "couldn't join home WiFi";
+                joinStatus = (int)WiFi.status();  // capture before disconnect
             } else {
                 trySntp();
                 uploaded = uploadPending();
@@ -1340,8 +1363,18 @@ static void netCycle() {
             gNetRetryMs = uploaded ? NET_TICK_MS :
                 min((gNetRetryMs ? gNetRetryMs : NET_TICK_MS) * 2, NET_RETRY_MAX_MS);
             gNetLastAttemptMs = millis();  // wait after the attempt finishes
-            if (miss) Serial.printf("Network: %s -- next try in %lu s.\n",
-                                    miss, (unsigned long)(gNetRetryMs / 1000));
+            if (miss) {
+                if (joinStatus >= 0) {
+                    Serial.printf("Network: %s \"%s\" (status %d) -- next try in %lu s.\n",
+                                  miss, WIFI_SSID, joinStatus, (unsigned long)(gNetRetryMs / 1000));
+                } else if (!homeFound) {
+                    Serial.printf("Network: %s \"%s\" -- next try in %lu s.\n",
+                                  miss, WIFI_SSID, (unsigned long)(gNetRetryMs / 1000));
+                } else {
+                    Serial.printf("Network: %s -- next try in %lu s.\n",
+                                  miss, (unsigned long)(gNetRetryMs / 1000));
+                }
+            }
             reportNetworkStack("after network cycle");
         }
     }

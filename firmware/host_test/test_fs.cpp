@@ -937,8 +937,8 @@ int main(int argc, char** argv) {
             CHECK(WiFi.scans == before + 1, "no scan before retry is due");
             ++g_millis;
         }
-        CHECK(logHas("Network: home WiFi not found -- next try in 60 s.") &&
-              logHas("Network: home WiFi not found -- next try in 300 s."),
+        CHECK(logHas("Network: home WiFi not found \"" WIFI_SSID "\" -- next try in 60 s.") &&
+              logHas("Network: home WiFi not found \"" WIFI_SSID "\" -- next try in 300 s."),
               "each miss logs why and when the next try is");
         int scans = WiFi.scans;
         gNetHold = true; netCycle();
@@ -950,7 +950,8 @@ int main(int argc, char** argv) {
         CHECK(WiFi.joins == 1 && g_millis - joinStart == 17000 && gNetRetryMs == NET_RETRY_MAX_MS,
               "seeing the AP but failing to join keeps the backoff");
         CHECK(gNetLastAttemptMs == g_millis, "join timeout does not consume the next retry wait");
-        CHECK(logHas("Network: couldn't join home WiFi -- next try in 300 s."), "join failure logged");
+        CHECK(logHas("Network: couldn't join home WiFi \"" WIFI_SSID "\" (status 0) -- next try in 300 s."),
+              "join failure logged with SSID and status");
 
         WiFi.connectionStatus = WL_CONNECTED;
         g_httpCode = 503;
@@ -1066,6 +1067,131 @@ int main(int argc, char** argv) {
                 CHECK(gNetRetryMs == NET_RETRY_MAX_MS, "misses after parking back off again");
             }
         }
+    }
+
+    printf("T41 incomplete files cannot fill the upload batch (#56)\n");
+    {
+        for (bool fullPaths : {false, true}) {
+            resetWorld();
+            g_disk.fullPathNames = fullPaths;
+            drive(15, 40); endTrip(false);
+            const std::string complete = g_disk.files.begin()->second;
+            const std::string incomplete = complete.substr(0, complete.find(GPX_EPILOGUE));
+            g_disk.files.clear();
+            for (int i = 0; i < 36; ++i) {
+                char path[40]; snprintf(path, sizeof(path), "/trips/t%06d.gpx", i);
+                g_disk.files[path] = i < 16 ? incomplete : complete;
+            }
+            g_disk.capacity = g_disk.used();
+            fsckAllTrips();
+            CHECK(tripFiles().size() == 36 && g_disk.used() == g_disk.capacity,
+                  "full flash cannot repair the 16 incomplete originals");
+            CHECK(uploadPending() && g_httpRequests == 16,
+                  "first batch reaches and uploads 16 complete files after the incomplete prefix");
+            CHECK(g_disk.used() < g_disk.capacity && tripFiles().size() == 20,
+                  "successful uploads free flash for later recovery");
+            CHECK(uploadPending() && g_httpRequests == 20 && tripFiles().size() == 16,
+                  "second batch uploads the remaining complete trips");
+            CHECK(!uploadPending() && g_httpRequests == 20, "incomplete files are never sent");
+            bool preserved = tripFiles().size() == 16;
+            for (auto& kv : g_disk.files) preserved &= kv.second == incomplete;
+            CHECK(preserved, "all incomplete originals kept byte for byte across repeated cycles");
+            CHECK(g_lockDepth == 0, "filesystem lock released after queue walks and uploads");
+            CHECK(g_disk.mutationsWithDirectoryOpen == 0, "uploads mutate only after directory handles close");
+        }
+    }
+
+    printf("T42 long trips keep every fix without trusted UTC (#60)\n");
+    {
+        for (int seconds : {90, 91, 300, 1200}) {
+            resetWorld();
+            gClockSet = false;
+            const double startLat = gLat;
+            drive(15, seconds);
+            CHECK(gPendCount == 90 && count(g_disk.files[gTripPath], "<trkpt ") == seconds - 90,
+                  "only the latest 90 fixes stay buffered; older fixes reach flash");
+            endTrip(false);
+            const std::string& d = g_disk.files.begin()->second;
+            CHECK(wellFormedShape(d) && count(d, "<trkpt ") == seconds && times(d).empty(),
+                  "every point retained with no invented timestamps");
+            double lat = startLat;
+            size_t pos = 0;
+            bool ordered = true;
+            for (int i = 0; i < seconds; ++i) {
+                lat += 15.0 / 111320.0;
+                char point[80]; snprintf(point, sizeof(point), "<trkpt lat=\"%.6f\"", lat);
+                size_t next = d.find(point, pos);
+                if (next == std::string::npos) { ordered = false; break; }
+                pos = next + strlen(point);
+            }
+            CHECK(ordered, "fixes remain in order across repeated ring wrap");
+            dump(("T42_" + std::to_string(seconds)).c_str());
+        }
+
+        resetWorld();
+        gClockSet = false;
+        drive(15, 300);
+        const uint64_t firstTimed = g_epochMs - 89000;
+        g_epochBaseMs = g_epochMs - g_millis;
+        gClockSet = true;
+        drive(15, 30); endTrip(false);
+        const std::string& d = g_disk.files.begin()->second;
+        const auto ts = times(d);
+        bool exact = ts.size() == 120;
+        for (size_t i = 0; exact && i < ts.size(); ++i) exact = ts[i] == iso(firstTimed + i * 1000);
+        CHECK(wellFormedShape(d) && count(d, "<trkpt ") == 330 && exact,
+              "late UTC back-dates the 90 buffered fixes and times new ones exactly");
+        CHECK(count(d.substr(0, d.find("<time>")), "<trkpt ") == 211,
+              "the first 210 points stay untimed and precede the timed tail");
+        dump("T42_late_utc");
+
+        resetWorld();
+        gClockSet = false;
+        drive(15, 100); drive(0, 200);
+        CHECK(gState == IDLE && tripFiles().size() == 1 &&
+              count(g_disk.files.begin()->second, "<trkpt ") == 281,
+              "untimed spills also preserve cooldown fixes until normal finalize");
+
+        for (bool failOpen : {false, true}) {
+            resetWorld();
+            gClockSet = false;
+            drive(15, 100);
+            if (failOpen) g_disk.failNextOpens = 1;
+            else g_disk.failFlushes = 2;  // both commit() and close() fail
+            drive(15, 1);
+            CHECK(gState == IDLE && !gTripPath[0] && logHas("write to /trips/t000001.gpx failed"),
+                  "an untimed spill reports storage failure and ends the trip");
+            CHECK(tripFiles().size() == 1 && wellFormedShape(g_disk.files.begin()->second) &&
+                  count(g_disk.files.begin()->second, "<trkpt ") == 10,
+                  "repair preserves the previously committed untimed prefix");
+        }
+    }
+
+    printf("T43 WiFi failures identify the SSID and pre-disconnect status (#77)\n");
+    {
+        resetWorld();
+        netCycle();
+        CHECK(logCount("Network: ") == 0 && WiFi.scans == 0, "empty queue is quiet");
+        drive(15, 40); endTrip(false);
+        netCycle();
+        CHECK(logCount("Network: ") == 1 &&
+              logHas("home WiFi not found \"" WIFI_SSID "\" -- next try in 60 s."),
+              "AP miss identifies the configured SSID and next retry in one line");
+        netCycle();
+        CHECK(logCount("Network: ") == 1, "backoff does not repeat the diagnostic");
+        WiFi.scanSsids = {WIFI_SSID};
+        for (int status : {1, 4, 6}) {  // NO_SSID_AVAIL, CONNECT_FAILED, DISCONNECTED
+            WiFi.disconnectStatus = 6;
+            WiFi.connectionStatus = status;
+            g_millis = gNetLastAttemptMs + gNetRetryMs;
+            int before = logCount("Network: ");
+            netCycle();
+            const std::string expected = "couldn't join home WiFi \"" WIFI_SSID "\" (status " +
+                                         std::to_string(status) + ")";
+            CHECK(logCount("Network: ") == before + 1 && logHas(expected.c_str()),
+                  "one join failure line includes the status captured before disconnect");
+        }
+        CHECK(!logHas(WIFI_PASSWORD) && !logHas(AUTH_TOKEN), "diagnostics never print credentials");
     }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);

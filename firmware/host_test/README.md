@@ -15,7 +15,9 @@ There are two suites:
   report success, as they do on ESP32 core 3.x, and only `flush()`/`close()`
   commit them to the simulated flash. Tests can inject a failed open, a flash
   write error, or a full filesystem. The trip state machine is driven
-  directly with synthetic fixes. Network-cycle tests simulate AP scans,
+  directly with synthetic fixes. Regressions cover incomplete files ahead
+  of complete uploads, long trips without UTC, and late UTC after untimed
+  writes. Network-cycle tests simulate AP scans,
   connection failures, and HTTP responses to check retry backoff, recovery,
   the reset when a trip ends, scan cleanup, sleep holds, and clock
   wraparound. Boot tests inject mutex

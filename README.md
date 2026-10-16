@@ -318,8 +318,11 @@ discarded as noise has nothing to upload. Then look for the upload result:
 - `HTTP 409` or a `5xx` status: the trip stays queued for retry. Check
   server logs for a conflicting trip identity (409) or a server error.
 - `Network: home WiFi not found` or `Network: couldn't join home WiFi`:
-  check the name and password, and that the network is 2.4 GHz and not
-  hidden. After repeated failures the board waits up to 5 minutes between
+  the message names the configured SSID; a join failure also reports
+  `status N` (`4` can indicate a wrong password). Check the name and
+  password, and that the network is 2.4 GHz and not hidden. See the
+  [firmware status notes](firmware/README.md#normal-operation) for details.
+  After repeated failures the board waits up to 5 minutes between
   tries; the message says how long. Press **RST** to try again at once.
 - No upload result and no `Network:` line after a saved trip: check
   earlier serial messages for storage errors, incomplete files or files
