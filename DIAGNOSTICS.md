@@ -47,6 +47,10 @@ numeric measurements and fixed enumerated values in context.
 - **#128:** PCF8563 clock integration on the Supreme and time-confidence tests.
 - **#129:** consistent diagnostics database and monitor-state backups/restores.
 - **#130:** induced-fault, power-cut, backlog and display shakedown on hardware.
+- **#134:** Prometheus `/metrics` for the owner's external Grafana (not bundled).
+- **#135:** shipped GELF export to the owner's external Graylog (not bundled).
+- **#136:** optional push to an external Loki (not bundled).
+- **#137:** installer questions choosing these outputs.
 
 Host tests prove catalog consistency and policy behavior. They do not prove bus
 wiring, power rails, charging safety, FAT power-cut recovery or road behavior.
@@ -613,6 +617,57 @@ default silence is exactly seven days with an inclusive threshold. Firmware
 heartbeat integration remains #125, and consistent state backups remain #129.
 Installer test uploads omit `X-Device-Id` so a routine `--check` does not enroll
 an ever-watched synthetic device; their unique `X-Trip-Id` still owns cleanup.
+
+### Graylog export (#135, shipped)
+
+Owner decision (2026-10-16): Graylog runs on a separate server the owner
+manages; this repo never bundles it and only sends to it. Setup steps and
+starter Event Definitions are in
+[DEPLOY_DEBIAN.md Step 11d](DEPLOY_DEBIAN.md#11d--optional-send-diagnostics-to-your-own-graylog).
+The code is `server/mileage-monitor/gelf.py`, called from each monitor tick
+after the ntfy step; any Graylog failure is caught there and never affects ntfy.
+
+**Why facts, not ntfy decisions.** ntfy's decisions are phone policy: the
+hold, the hourly cap and digests, dropping a not-yet-sent alert when its fault
+clears. Graylog has its own alerting (Event Definitions, grace periods), so
+forwarding pre-throttled decisions would apply that policy twice, and with
+ntfy off it would forward nothing. GELF therefore carries two kinds of facts,
+independent of `NOTIFY_ENABLED` and `NOTIFY_*` settings (only
+`MONITOR_STALE_DAYS` and the 24-hour snapshot freshness apply):
+
+- `event`: every row in `events.db`, in rowid order, each forwarded once. The
+  cursor is the last delivered rowid (`gelf_cursor`). The ingest never deletes
+  events, so rowids only grow; if the table's highest rowid is ever below the
+  cursor (events.db replaced by a restore), the cursor resets to 0 and history
+  is resent, so Graylog may see duplicates but never silently misses events.
+  A damaged stored row is skipped with a type-only warning and the cursor
+  moves past it.
+- `condition`: the state of each (device, code) as the monitor sees it:
+  `active` or `clear` from a fresh (≤ 24 h), valid snapshot, `unknown` when a
+  previously known condition has no current evidence, and E7001 `active` or
+  `clear` from server last-contact age. `gelf_conditions` holds the last state
+  delivered per (device, code); a message goes out only when it changes. A new
+  episode while the state stays active is not a change: every deep-sleep wake
+  has a new `boot_id`, and a persistent fault must not produce one message per
+  wake. On first enable, every device's current states go out once as a baseline.
+
+Level: catalog severity (critical 2, error 3, warning 4, info 6; unknown code
+5) for active conditions and raise/repeat/notice events; 6 for clear/unknown
+states and clear events. Only catalog fields, validated identifiers, bounded
+device-clock fields and catalog context (re-checked: short tokens, integers,
+booleans as `"true"`/`"false"`) are sent; the source is the fixed
+`mileage-tracker`; the reserved `_id` is never used.
+
+Transport: GELF HTTP (one message per POST, success on 2xx; Graylog answers
+202), redirects never followed, optional single extra header; or GELF TCP,
+null-terminated frames on one connection per batch, optional TLS with
+verification on by default and an optional CA file. TCP cannot confirm
+receipt, so any TCP failure resends the whole batch. Delivery is at least once.
+Each tick sends at most 200 messages, conditions first; progress is committed
+for the messages delivered before a failure. Failures back off from 60 seconds,
+doubling to an hour, in `gelf_retry`, separate from ntfy's `retry`. The GELF
+tables are additive to monitor schema v1 (`CREATE TABLE IF NOT EXISTS`), so an
+existing `monitor.db` gains them at startup without a migration.
 
 ## Backups and acceptance (#129/#130)
 

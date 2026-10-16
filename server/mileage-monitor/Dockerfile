@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 RUN useradd --create-home --shell /bin/bash app
 WORKDIR /app
-COPY mileage-monitor/monitor.py /app/monitor.py
+COPY mileage-monitor/monitor.py mileage-monitor/gelf.py /app/
 COPY common/ /app/common/
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
