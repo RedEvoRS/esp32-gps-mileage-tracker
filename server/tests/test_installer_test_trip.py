@@ -1,4 +1,5 @@
-"""install.sh's test upload must only ever delete its own test trip (#43).
+"""install.sh's test upload must only ever delete its own test trip (#43),
+and must not report it deleted while it's still on disk (#44).
 
 Sources the real install.sh functions (everything but the final `main`)
 into bash, with curl replaced by a fake ingest service that can write
@@ -38,9 +39,24 @@ HARNESS = textwrap.dedent("""\
         if [[ $FAKE_CODE == 000 ]]; then return 28; fi
         printf '%s\\n%s' "$FAKE_BODY" "$FAKE_CODE"
     }
+    # rm that can't delete trip files, like a data/ folder we can't write.
+    if [[ -n ${FAKE_RM_FAIL:-} ]]; then
+        rm() {
+            if [[ $* == *.gpx* ]]; then
+                echo "rm: cannot remove '$3': Permission denied" >&2
+                return 1
+            fi
+            command rm "$@"
+        }
+    fi
     cd "$WORK"
     if upload_test_trip; then result=0; else result=1; fi
     printf 'RESULT=%s\\nTEST_ID=%s\\n' "$result" "$TEST_ID"
+    # The end-to-end check runs under `|| true`, so errexit is off here.
+    if [[ -n ${REMOVE:-} ]]; then
+        { if remove_test_trip; then removed=yes; else removed=no; fi; } || true
+        printf 'REMOVED=%s\\nLEFT=%s\\n' "$removed" "$TEST_TRIP"
+    fi
     cleanup
     """)
 
@@ -78,16 +94,18 @@ class InstallerTestTrip(unittest.TestCase):
             self.assertEqual((self.month / (name + ext)).read_text(),
                              f"{content}{ext}")
 
-    def run_check(self, code, body="", write=None, content="", hex_=HEX):
+    def run_check(self, code, body="", write=None, content="", hex_=HEX,
+                  rm_fails=False, remove=False, status=0):
         env = dict(os.environ, INSTALL=str(INSTALL), WORK=str(self.work),
                    FAKE_HEX=hex_ or "", FAKE_CODE=code, FAKE_BODY=body,
                    FAKE_WRITE=str(write.relative_to(self.work)) if write else "",
-                   FAKE_CONTENT=content)
+                   FAKE_CONTENT=content, FAKE_RM_FAIL="1" if rm_fails else "",
+                   REMOVE="1" if remove else "")
         proc = subprocess.run(["bash", "-c", HARNESS], env=env, text=True,
                               capture_output=True, timeout=60)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, status, proc.stdout + proc.stderr)
         out = dict(line.split("=", 1) for line in proc.stdout.splitlines()
-                   if line.startswith(("RESULT=", "TEST_ID=")))
+                   if line.startswith(("RESULT=", "TEST_ID=", "REMOVED=", "LEFT=")))
         log = self.work / "curl.log"
         out["uploads"] = len(log.read_text().splitlines()) if log.exists() else 0
         out["output"] = proc.stdout
@@ -137,6 +155,27 @@ class InstallerTestTrip(unittest.TestCase):
         self.assertFalse(self.own.with_suffix(".gpx").exists())
         self.assertFalse(self.own.with_suffix(".json").exists())
         self.assert_trip_intact("2026-04-14T14-30-00Z", "real trip")
+
+    def test_successful_removal_is_reported(self):
+        out = self.run_check("200", self.accepted(), write=self.own,
+                             content=SAMPLE.read_text(), remove=True)
+        self.assertEqual(out["REMOVED"], "yes", out["output"])
+        self.assertEqual(out["LEFT"], "")
+        self.assertFalse(self.own.with_suffix(".gpx").exists())
+
+    def test_failed_removal_is_not_reported_as_deleted(self):
+        out = self.run_check("200", self.accepted(), write=self.own,
+                             content=SAMPLE.read_text(), rm_fails=True,
+                             remove=True, status=1)
+        self.assertEqual(out["RESULT"], "0", out["output"])
+        # Still tracked, so the EXIT cleanup tries again, and when that
+        # fails too it says so, says how to fix it, and exits non-zero.
+        self.assertEqual(out["REMOVED"], "no", out["output"])
+        self.assertEqual(out["LEFT"], "data/2026-04/" + self.ID)
+        self.assertIn("Permission denied", out["output"])
+        self.assertIn("The test trip is still on disk", out["output"])
+        self.assertRegex(out["output"], rf"rm -f \S*/data/2026-04/{self.ID}\.gpx ")
+        self.assertTrue(self.own.with_suffix(".gpx").exists())
 
     def test_each_run_gets_its_own_id(self):
         ids = {self.run_check("401", "{}", hex_=None)["TEST_ID"]

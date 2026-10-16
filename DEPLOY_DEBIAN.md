@@ -627,6 +627,13 @@ Restore test passed
 The counts should match what the viewer shows. It changes nothing on the
 live system. Do this again before each filing.
 
+On a new install the first snapshot is empty (`0 annotations`, `0 trip
+GPX files`): the installer deletes its test trip before it gets to
+backups. That proves the SSH key, rsync and checksums, but not that real
+trips and annotations come back. After the first real drives, annotate
+one in the viewer and run `install.sh --check` (or the nightly backup,
+then `restore.sh check`), and check the counts are no longer zero.
+
 ### 10e — Schedule it
 
 ```bash

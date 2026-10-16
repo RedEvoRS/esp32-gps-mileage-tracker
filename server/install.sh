@@ -58,6 +58,7 @@ DATA_SUDO=()        # sudo, if trip files (UID 1000) aren't ours to touch
 BIND_ADDR=
 VIEWER_PASSWORD=
 RELOGIN=no
+FIRST_BACKUP=no     # yes once this run has made the first backup
 SUDO_READY=no
 SUDO_KEEPALIVE=
 TEST_ID=            # install-check-<random>, set by upload_test_trip
@@ -120,9 +121,17 @@ on_error() {
 }
 
 cleanup() {
-    if [[ -n $TEST_TRIP ]]; then remove_test_trip || true; fi
+    # A last try at deleting the test trip. If it's still there, say so and
+    # exit non-zero, whatever the run reported before.
+    local left=no
+    if [[ -n $TEST_TRIP ]] && ! remove_test_trip; then
+        printf '\n  %sFAIL%s  The test trip is still on disk\n' "$RED" "$PLAIN"
+        test_trip_left
+        left=yes
+    fi
     if [[ -n $SUDO_KEEPALIVE ]]; then kill "$SUDO_KEEPALIVE" 2> /dev/null || true; fi
     if (( ${#TMP_FILES[@]} )); then rm -f "${TMP_FILES[@]}"; fi
+    if [[ $left == yes ]]; then exit 1; fi
 }
 
 # Print a command's output indented, so it reads as part of a step.
@@ -289,8 +298,11 @@ is_host_addr() {
 }
 
 # The address this machine uses to reach the internet, usually its LAN IP.
+# Empty, not an error, on a LAN-only host with no default route: it's only
+# ever a suggestion (#47).
 default_addr() {
-    ip -4 route get 1.1.1.1 2> /dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p;T;q'
+    { ip -4 route get 1.1.1.1 2> /dev/null || true; } \
+        | sed -n 's/.* src \([0-9.]*\).*/\1/p;T;q'
 }
 
 # IANA timezone names this machine knows, one per line. Empty if it has
@@ -624,6 +636,7 @@ setup_bind_addr() {
     local addrs suggested answer
     addrs=$(host_addrs | awk '{ printf "%s%s (%s)", sep, $1, $2; sep = ", " }')
     suggested=$(default_addr)
+    if ! is_host_addr "$suggested"; then suggested=; fi
     note "The T-Beam uploads to this server's LAN address, and both ports are" \
         "published on that address only. UFW can't do this for Docker's ports." \
         "This server has: ${addrs:-no LAN address found}"
@@ -633,7 +646,11 @@ setup_bind_addr() {
         if [[ -n ${INSTALL_BIND_ADDR+set} ]]; then
             die "INSTALL_BIND_ADDR=$answer isn't an address of this server."
         fi
-        note "$answer isn't one of this server's addresses."
+        if [[ -z $answer ]]; then
+            note "Type one of the addresses above, or \"all\"."
+        else
+            note "$answer isn't one of this server's addresses."
+        fi
     done
     if [[ $answer == all ]]; then
         BIND_ADDR=
@@ -975,16 +992,29 @@ verify_services() {
 
 # --- End to end --------------------------------------------------------
 
+# Fails, leaving TEST_TRIP set, while either file is still there. It goes
+# by what's on disk rather than rm's status: the end-to-end check runs
+# with errexit off, and a failed rm mustn't pass for a deleted trip (#44).
 remove_test_trip() {
     local trip=$TEST_TRIP
     [[ -n $trip ]] || return 0
+    "${DATA_SUDO[@]}" rm -f -- "$trip.gpx" "$trip.json" 2>&1 | indent || true
+    if data_exists "$trip.gpx" "$trip.json"; then return 1; fi
     TEST_TRIP=
-    "${DATA_SUDO[@]}" rm -f -- "$trip.gpx" "$trip.json"
     # Only a month folder the test upload made, and only if it's empty:
     # another run's upload may be filing into one that already existed.
     if [[ ${trip%/*} == "$TEST_NEW_DIR" ]]; then
         "${DATA_SUDO[@]}" rmdir -- "$TEST_NEW_DIR" 2> /dev/null || true
     fi
+}
+
+# What to do about a test trip that couldn't be deleted.
+test_trip_left() {
+    local sudo=
+    if (( ${#DATA_SUDO[@]} )); then sudo='sudo '; fi
+    note "$SCRIPT_DIR/$TEST_TRIP.gpx (and .json) counts in the viewer's totals" \
+        "and exports until it's gone. Fix what stopped it (output above), then:" \
+        "${sudo}rm -f $SCRIPT_DIR/$TEST_TRIP.gpx $SCRIPT_DIR/$TEST_TRIP.json"
 }
 
 # data_exists PATH...: whether any of them exists in data/.
@@ -1127,8 +1157,12 @@ verify_end_to_end() {
         warn "Skipped the login test" "Log in at $VIEWER_URL/ from a browser to check it."
     fi
 
-    remove_test_trip
-    ok "Deleted the test trip"
+    if remove_test_trip; then
+        ok "Deleted the test trip"
+    else
+        problem "Couldn't delete the test trip"
+        test_trip_left
+    fi
     verify_binding
 }
 
@@ -1414,6 +1448,7 @@ first_backup() {
             "Fix backup/backup.conf or the destination, then run this again."
     fi
     ok "Backed up, and checked the copy at $(conf_get REMOTE)"
+    FIRST_BACKUP=yes
     restore_test
 }
 
@@ -1556,6 +1591,15 @@ summary() {
     printf '  - Flash the board, check it works and put it in the car: README.md at\n'
     printf '    the top of the repo, "Setting it up", steps 3 to 5. A new board needs\n'
     printf '    a one-time storage setup on its first flash (firmware/README.md).\n'
+    if [[ $FIRST_BACKUP == yes ]]; then
+        # The test trip is gone before the backup step, so that first
+        # restore test had no trips or annotations to bring back (#23).
+        printf '  - After the first real drives, annotate one in the viewer and run\n'
+        printf '      bash %s/install.sh --check\n' "$SCRIPT_DIR"
+        printf '    The backup tested above was empty, so it proved the plumbing but\n'
+        printf '    not that trips and annotations come back. --check tests the newest\n'
+        printf '    backup, which by then holds them.\n'
+    fi
 }
 
 main() {
