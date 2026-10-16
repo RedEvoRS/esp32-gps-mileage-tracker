@@ -6,6 +6,9 @@
 #                   summary.
 #   mileage-viewer  (port 8091) the web UI: trip list, map, purpose tags,
 #                   CSV/XLSX export. It reads ./data read-only.
+# Optional profiles:
+#   mileage-monitor (port 8093) provides /metrics when enabled; no third-party deps.
+#   ntfy            (port 8092) self-hosted phone notifications.
 #
 # install.sh sets all of this up and checks it. By hand, before first run
 # (README.md in this folder and DEPLOY_DEBIAN.md have the details):
@@ -19,7 +22,7 @@
 # After editing .env or viewer.env, run docker compose up -d again;
 # docker compose restart keeps the old values.
 #
-# Both ports listen on every host interface until you set BIND_ADDR in
+# Published ports listen on every host interface until you set BIND_ADDR in
 # .env to the server's LAN IP (DEPLOY_DEBIAN.md Step 7). Set it: UFW
 # does not filter Docker-published ports, so the bind address is the
 # only thing keeping them off other interfaces.
@@ -115,7 +118,8 @@ services:
       retries: 3
       start_period: 10s
 
-  # Opt in with --profile monitor. No port, no ingest/viewer credentials.
+  # Opt in with --profile monitor. Port 8093 serves only optional, token-protected
+  # Prometheus metrics; the service has no ingest or viewer credentials.
   mileage-monitor:
     profiles: ["monitor"]
     build:
@@ -129,6 +133,8 @@ services:
     # without creating another private env file or needing newer env_file syntax.
     env_file:
       - ${MONITOR_ENV_FILE:-./monitor.env.example}
+    ports:
+      - "${BIND_ADDR:-0.0.0.0}:8093:8093"
     depends_on:
       - mileage-ingest
 

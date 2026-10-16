@@ -1,4 +1,4 @@
-"""Optional, stdlib-only diagnostics policy, durable ntfy delivery and GELF export.
+"""Optional, stdlib-only diagnostics policy, ntfy alerts and external exports.
 
 Ingest owns events.db. This process only opens it in mode=ro, never immutable.
 All mutable policy, queue, retry and rate-limit state belongs to monitor.db.
@@ -18,7 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +33,7 @@ for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resol
 from common.diagnostics import CatalogError, load_catalog, validate_device_id, validate_request  # noqa: E402
 
 import gelf  # noqa: E402
+import prometheus  # noqa: E402
 
 
 LOG = logging.getLogger("mileage-monitor")
@@ -54,6 +55,7 @@ class Config:
     max_per_hour: int = 6
     stale_seconds: float = 7 * 86400
     graylog: gelf.GelfConfig = gelf.GelfConfig()
+    metrics: prometheus.MetricsConfig = field(default_factory=prometheus.MetricsConfig)
 
     @classmethod
     def from_env(cls, env=None):
@@ -65,8 +67,11 @@ class Config:
                 raise ValueError(name + " must be true or false")
             return value == "true"
 
+        metrics = prometheus.MetricsConfig.from_env(env)
         enabled = boolean("MONITOR_ENABLED")
         if not enabled:
+            if metrics.enabled:
+                raise ValueError("METRICS_ENABLED requires MONITOR_ENABLED=true")
             return cls()  # Inactive profile can carry unfilled example settings.
         notify = boolean("NOTIFY_ENABLED")
 
@@ -111,8 +116,10 @@ class Config:
                 raise ValueError("NTFY_URL must be an http(s) topic URL without credentials, query or fragment")
             if not token or token == "<token>" or any(not 33 <= ord(c) <= 126 for c in token):
                 raise ValueError("NTFY_TOKEN must be a nonempty access token without whitespace")
-        return cls(enabled, notify, url, token, severity, hold, repeat, maximum, stale,
-                   gelf.GelfConfig.from_env(env))
+        return cls(enabled=enabled, notify=notify, url=url, token=token,
+                   min_severity=severity, hold_seconds=hold, repeat_seconds=repeat,
+                   max_per_hour=maximum, stale_seconds=stale,
+                   graylog=gelf.GelfConfig.from_env(env), metrics=metrics)
 
 
 def receipt(value):
@@ -125,6 +132,7 @@ def receipt(value):
 
 def read_devices(path, catalog):
     path = Path(path)
+    catalog_codes = {row["code"] for row in catalog["codes"]}
     try:
         path.stat()
     except FileNotFoundError:
@@ -142,15 +150,19 @@ def read_devices(path, catalog):
             device = dict(row)
             device["contact"] = None
             device["snapshot"] = None
+            device["conditions"] = {}
+            device["device_id_valid"] = False
             try:
                 validate_device_id(device["device_id"])
+                device["device_id_valid"] = True
                 device["contact"] = receipt(device["last_contact_at"])
+                if device["snapshot_received_at"] is not None:
+                    device["snapshot_at"] = receipt(device["snapshot_received_at"])
                 if device["snapshot_json"] is not None:
                     snapshot = json.loads(device["snapshot_json"])
                     validate_request({"schema_version": 1, "checkin": snapshot, "events": []}, catalog=catalog)
                     if snapshot["status_sequence"] != device["status_sequence"]:
                         raise ValueError("invalid diagnostics snapshot revision")
-                    device["snapshot_at"] = receipt(device["snapshot_received_at"])
                     device["snapshot"] = snapshot
             except (ValueError, TypeError, OverflowError, RecursionError, OSError) as exc:
                 # A stored snapshot can predate the current catalog or be
@@ -158,6 +170,13 @@ def read_devices(path, catalog):
                 # usable for silence. Never carry stored text into a log.
                 device["snapshot_error"] = type(exc).__name__
             devices.append(device)
+        by_device = {device["device_id"]: device for device in devices}
+        for device_id, code, state in db.execute(
+                "SELECT device_id,code,state FROM device_conditions ORDER BY device_id,code"):
+            device = by_device.get(device_id)
+            if (device is not None and type(code) is int and code in catalog_codes
+                    and state in ("active", "clear", "unknown")):
+                device["conditions"][code] = state
         return devices
 
 
@@ -231,6 +250,8 @@ class Monitor:
         self.sender = NtfySender(config) if sender is None else sender
         self.gelf_sender = (gelf.transport(config.graylog) if gelf_sender is None and config.graylog.enabled
                             else gelf_sender)
+        self.metrics_snapshot = (prometheus.MetricsSnapshot(self.codes, config.stale_seconds)
+                                 if config.metrics.enabled else None)
         if config.enabled:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             with closing(self._connect()) as db, db:
@@ -259,6 +280,24 @@ class Monitor:
             db.close()
             raise
         return db
+
+    def start_metrics(self):
+        if self.metrics_snapshot is None:
+            return None
+        return prometheus.start_server(self.metrics_snapshot, self.config.metrics.token)
+
+    def _publish_metrics(self, devices, now, db=None):
+        if self.metrics_snapshot is None:
+            return
+        episodes = ()
+        if db is not None:
+            try:
+                episodes = db.execute("SELECT device,code,state,alerted_at,resolved_at FROM episodes").fetchall()
+            except sqlite3.Error:
+                self.metrics_snapshot.record_read_error()
+                LOG.warning("Monitor state unavailable (database read error); retaining previous metrics")
+                return
+        self.metrics_snapshot.publish(devices, episodes, now)
 
     def eligible(self, code):
         definition = self.codes.get(code)
@@ -400,18 +439,32 @@ class Monitor:
         return chosen, body
 
     def tick(self):
-        if not self.config.enabled:
+        try:
+            return self._tick()
+        except sqlite3.Error:
+            if self.metrics_snapshot is not None:
+                self.metrics_snapshot.record_read_error()
+            raise
+
+    def _tick(self):
+        if not self.config.enabled and self.metrics_snapshot is None:
             return True
         try:
             devices = read_devices(self.events_path, self.catalog)
         except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
             # Exceptions may contain a path or endpoint. Do not log their text.
+            if self.metrics_snapshot is not None:
+                self.metrics_snapshot.record_read_error()
             LOG.warning("Diagnostics unavailable (%s); retry next tick", type(exc).__name__)
             return False
+        now = self.clock()
         if devices is None:
             LOG.info("No diagnostics database yet; nothing to monitor")
+            self._publish_metrics([], now)
             return True
-        now = self.clock()
+        if not self.config.enabled:
+            self._publish_metrics(devices, now)
+            return True
         with closing(self._connect()) as db:
             with db:
                 self._warn_snapshots(db, devices)
@@ -456,6 +509,7 @@ class Monitor:
                 self._forward_gelf(db, devices, now)
             except Exception as exc:  # Graylog problems must never affect ntfy or trips.
                 LOG.warning("Graylog export unavailable (%s); retry next tick", type(exc).__name__)
+            self._publish_metrics(devices, now, db)
         return True
 
     def _forward_gelf(self, db, devices, now):
@@ -527,11 +581,18 @@ class Monitor:
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    config = Config.from_env()
+    try:
+        config = Config.from_env()
+    except ValueError as exc:
+        LOG.error("Invalid monitor configuration: %s", exc)
+        raise SystemExit(2) from None
     monitor = Monitor(config)
+    metrics_server = monitor.start_metrics()
     if config.enabled:
-        LOG.info("Monitor enabled; ntfy %s, Graylog %s", "enabled" if config.notify else "disabled",
-                 "enabled" if config.graylog.enabled else "disabled")
+        LOG.info("Monitor enabled; ntfy %s, Graylog %s, Prometheus %s",
+                 "enabled" if config.notify else "disabled",
+                 "enabled" if config.graylog.enabled else "disabled",
+                 "enabled" if config.metrics.enabled else "disabled")
         if config.graylog.enabled and not config.graylog.tls_verify:
             LOG.warning("Graylog TLS certificate verification is off (GRAYLOG_GELF_TLS_VERIFY=false)")
     else:
@@ -545,6 +606,9 @@ def main():
         except (sqlite3.Error, OSError, ValueError) as exc:
             LOG.error("Monitor state unavailable (%s); retry next tick", type(exc).__name__)
         stop.wait(TICK_SECONDS)
+    if metrics_server is not None:
+        metrics_server.shutdown()
+        metrics_server.server_close()
 
 
 if __name__ == "__main__":

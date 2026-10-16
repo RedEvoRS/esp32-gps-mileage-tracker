@@ -34,7 +34,7 @@ firmware/
 
 server/
   common/diagnostics/    Shared catalog and protocol validators (stdlib only)
-  docker-compose.yml     Default ports 8090 + 8091; optional monitor/ntfy profiles (8092)
+  docker-compose.yml     Default ports 8090 + 8091; optional ntfy 8092 and monitor 8093
   .dockerignore          Default-deny runtime allowlist; excludes secrets and data
   .env.example           Copy to .env, set INGEST_AUTH_TOKEN and BIND_ADDR
   viewer.env.example     Copy to viewer.env, set the viewer login
@@ -42,7 +42,7 @@ server/
   install.sh             First-time install with checks; --check re-verifies
   mileage-ingest/        Flask ingest (app.py), diagnostics SQLite (diag_store.py), Dockerfile
   mileage-viewer/        Flask trip viewer/export + Device health (app.py, static/)
-  mileage-monitor/       Stdlib monitor.py, gelf.py (Graylog export), Dockerfile; own monitor-state volume
+  mileage-monitor/       Stdlib monitor.py, gelf.py (Graylog), prometheus.py (metrics); own state volume
   ntfy/server.yml        Optional self-hosted ntfy; deny-all access, ntfy-state volume
   backup/                backup.sh + restore.sh, systemd timer, backup.conf.example
   tests/                 Server tests (unittest) + map-parser check (node)
@@ -157,7 +157,7 @@ firmware hasn't been road-tested.
   code/severity filters. Severity/text come from the current startup catalog,
   never stored severity. Missing DB means no diagnostics yet; read/schema/lock
   errors mean unavailable (503 + warning log). No diagnostics writes or recovery.
-- Optional monitor (#120/#121): `monitor` Compose profile, no port, stdlib only,
+- Optional monitor (#120/#121): `monitor` Compose profile, stdlib only,
   catalog loaded at startup. `events.db` schema v1 is read with `mode=ro` and
   a 2 s busy timeout; missing means no work, unreadable logs unavailable and
   suspends sends until a successful read. Own `/state/monitor.db` schema v1 in
@@ -186,7 +186,13 @@ firmware hasn't been road-tested.
   repeat. Independent of NOTIFY_*; own retry/backoff; failures never affect
   ntfy. Tables `gelf_cursor`, `gelf_conditions`, `gelf_retry` are additive to
   monitor schema v1. Setup and Event Definitions: DEPLOY_DEBIAN Step 11d.
-- Port binding: `BIND_ADDR` in `.env` sets the host IP both ports publish
+- Optional Prometheus metrics (#134, `prometheus.py`): `METRICS_ENABLED=true`
+  plus a separate token of at least 32 printable ASCII characters in
+  `monitor.env`. `/metrics` publishes on `BIND_ADDR` port 8093 with bearer auth.
+  The HTTP thread serves the latest published snapshot and never queries SQLite.
+  Importable scrape config, Tracker health dashboard and alert examples are in
+  `server/grafana/`; setup is DEPLOY_DEBIAN Step 11e.
+- Port binding: `BIND_ADDR` in `.env` sets the host IP published ports bind
   on (unset = all interfaces). UFW does not filter Docker-published ports,
   so the bind address is the LAN-only control (`DEPLOY_DEBIAN.md` Step 7)
 - Viewer auth: `viewer.env` (separate from `.env` — keeps the ingest token out

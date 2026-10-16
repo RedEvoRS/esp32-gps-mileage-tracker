@@ -443,8 +443,9 @@ class DiagnosticsPackaging(unittest.TestCase):
         for expected in ('profiles: ["monitor"]', "./data:/data:ro", "monitor-state:/state",
                          "${MONITOR_ENV_FILE:-./monitor.env.example}"):
             self.assertIn(expected, section)
-        for forbidden in ("ports:", "INGEST_AUTH_TOKEN", "viewer.env", "VIEWER_", "./.env"):
+        for forbidden in ("INGEST_AUTH_TOKEN", "viewer.env", "VIEWER_", "./.env"):
             self.assertNotIn(forbidden, section)
+        self.assertIn('"${BIND_ADDR:-0.0.0.0}:8093:8093"', section)
         ntfy = compose.split("  ntfy:\n", 1)[1]
         for expected in ('profiles: ["ntfy"]', '${BIND_ADDR:-0.0.0.0}:8092:80',
                          "ntfy-state:/var/lib/ntfy", "./ntfy/server.yml:/etc/ntfy/server.yml:ro"):

@@ -13,7 +13,7 @@ defined in `docker-compose.yml`:
 |---|---|---|
 | `mileage-ingest` | 8090 | Accepts trip uploads from the board (bearer token) and stores each one as GPX plus a JSON summary |
 | `mileage-viewer` | 8091 | A web page, behind a login, to list trips, check them on a map, tag their purpose, and export CSV/XLSX |
-| `mileage-monitor` | none | Optional `monitor` profile: current-fault and seven-day no-contact alerts |
+| `mileage-monitor` | 8093 | Optional `monitor` profile: authenticated Prometheus metrics; current-fault and seven-day no-contact alerts |
 | `ntfy` | 8092 | Optional `ntfy` profile: self-hosted phone notifications, authenticated topic access |
 
 **To set it up, run `bash install.sh`** on the server, from this folder
@@ -84,7 +84,7 @@ by the `mileage-viewer` service, which reads these files independently.
     ├── viewer.env.example     # Template for viewer.env
     ├── viewer.env             # The viewer login (created by you or install.sh, never committed)
     ├── monitor.env.example    # Disabled defaults; template for private monitor.env
-    ├── mileage-monitor/       # monitor.py + Dockerfile; Python stdlib only
+    ├── mileage-monitor/       # monitor.py, gelf.py, prometheus.py + Dockerfile; Python stdlib only
     ├── ntfy/server.yml        # Optional ntfy deny-all config; no credentials
     ├── install.sh             # First-time install with checks; --check later
     ├── sample.gpx             # A short test trip for checking uploads
@@ -157,6 +157,14 @@ Graylog's own Event Definitions do the alerting. GELF HTTP is preferred (each
 message confirmed); GELF TCP with optional TLS also works. Graylog outages back
 off independently and never affect ntfy. Setup: DEPLOY_DEBIAN.md Step 11d.
 
+Prometheus metrics are another optional monitor output on port 8093
+(`METRICS_ENABLED=false` by default). The endpoint requires a separate bearer
+token and publishes only on `BIND_ADDR`; keep it LAN-only because that token is
+the only access protection. A Prometheus server on another host scrapes it over
+the LAN or VPN, then Grafana reads that Prometheus data source. The monitor does
+not install Prometheus or Grafana. Dashboard, scrape and alert examples are in
+`grafana/`; setup is in DEPLOY_DEBIAN.md Step 11e.
+
 Consistent DB backups/restores, including monitor state, remain #129. The
 existing trip backup does not include either optional named volume. Full
 policy and schema details are in [DIAGNOSTICS.md](../DIAGNOSTICS.md).
@@ -225,7 +233,7 @@ Step 1).
    comments that mention its name. It assumes the unquoted hexadecimal
    token generated in step 3.
 
-8. Bind both ports to the server's LAN IP by setting `BIND_ADDR` in
+8. Bind the two default ports to the server's LAN IP by setting `BIND_ADDR` in
    `.env`, then run `docker compose up -d` again. UFW rules don't
    restrict Docker-published ports, so this is the setting that keeps
    them off other interfaces. After this, `localhost` no longer answers;

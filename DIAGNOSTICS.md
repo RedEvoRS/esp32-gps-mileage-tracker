@@ -482,7 +482,8 @@ and a viewer warning log, with no healthy empty state substituted.
 
 ## Optional monitor and notifications (#120/#121, shipped)
 
-The stdlib-only `mileage-monitor` service has no published port. Every 60 seconds
+The stdlib-only `mileage-monitor` service optionally publishes metrics on port
+8093; the endpoint is disabled unless configured. Every 60 seconds
 it reads `/data:ro` and stores its own delivery/deduplication state in a separate
 writable volume. It watches **every device that has ever checked in**; there is
 no `MONITOR_DEVICE_IDS` watchlist. Removing an obsolete device requires a future
@@ -617,6 +618,28 @@ default silence is exactly seven days with an inclusive threshold. Firmware
 heartbeat integration remains #125, and consistent state backups remain #129.
 Installer test uploads omit `X-Device-Id` so a routine `--check` does not enroll
 an ever-watched synthetic device; their unique `X-Trip-Id` still owns cleanup.
+
+### Prometheus metrics (#134)
+
+The monitor can expose `/metrics` for a Prometheus server that you run
+separately. The `monitor` Compose profile publishes host port 8093 on
+`BIND_ADDR`; the HTTP listener starts only when `METRICS_ENABLED=true` and
+requires its own `METRICS_TOKEN` (at least 32 printable ASCII characters).
+Keep this port on a trusted LAN or VPN: bearer-token authentication is its
+only protection and traffic is plain HTTP. Do not reuse the ingest token or
+viewer secrets. Setup, scrape configuration, network path and Grafana starter
+files are in [DEPLOY_DEBIAN.md Step 11e](DEPLOY_DEBIAN.md#11e--optional-prometheus-metrics-for-external-grafana).
+
+The endpoint serves a published in-memory snapshot. The HTTP thread does not
+open SQLite or block the monitor tick. Each scrape reports server contact and
+snapshot ages, current catalog condition states (active/clear/unknown), the
+latest pending/dropped counts and catalog check-in counters, alert episode
+counts (active/sent/resolved), database read errors, last successful read time
+and the configured silence threshold. Labels are limited to validated device
+IDs, current catalog code/symbol/severity, and fixed state/decision values;
+there is no event text, coordinates, SSIDs or credentials. Counter-like alert
+values are gauges derived from monitor state, so restoring monitor-state can
+reduce them.
 
 ### Graylog export (#135, shipped)
 
