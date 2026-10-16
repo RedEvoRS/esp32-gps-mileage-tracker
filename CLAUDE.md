@@ -5,19 +5,35 @@
 A DIY GPS mileage tracker for IRS tax deduction logging. Plug-and-forget
 USB device for a car. Logs trips automatically; user annotates purpose later.
 
-**Hardware:** LilyGO TTGO T-Beam V1.2 (ESP32 + NEO-M8N GPS + SX1262 LoRa +
-AXP2101 PMU) at 915 MHz. 18650 battery. Enclosure 3D-printed and in use.
+**Hardware:** LilyGO **T-Beam Supreme** (ESP32-S3 + u-blox MAX-M10S GPS +
+SX1262 LoRa + AXP2101 PMU + microSD + SH1106 OLED + PCF8563 RTC) at
+915 MHz. 18650 battery. Trips are stored on the microSD card. Enclosure is
+a PETG print of a published Supreme case.
+
+**Old hardware, frozen branch:** the project started on the LilyGO TTGO
+T-Beam V1.2 (ESP32 + NEO-M8N). It's retired: its 2.375 MB trip partition
+held only ~6 h of driving between uploads. Its last firmware is on the
+`tbeam-v1.2` branch, which is frozen and won't be updated: no fixes, no
+backports. Never commit to it or base work on it; all work targets the
+Supreme on `main`.
+
+**Port in progress:** until the Supreme port lands (label `supreme-port`),
+the firmware on `main` is still the V1.2 code. Don't assume a Supreme pin,
+rail or peripheral works until its port issue is closed and it's verified
+on the bench.
 
 ## Architecture
 
 Two-component system:
-- **Firmware** (Arduino/C++) — runs on T-Beam, logs trips to LittleFS, uploads
+- **Firmware** (Arduino/C++) — runs on the T-Beam, logs trips, uploads
   over home WiFi
 - **Server** (Flask + Gunicorn, Docker, Debian Linux) — two default services. Ingest
   accepts authenticated GPX uploads and writes `/data/YYYY-MM/<trip>.gpx`
   plus a derived `<trip>.json` summary; the viewer lists, maps, annotates
   and exports them. Optional stdlib monitor and self-hosted ntfy services
-  deliver device fault/silence notifications
+  deliver device fault/silence notifications. Deploy with
+  `server/install.sh` (runbook: `DEPLOY_DEBIAN.md`); `install.sh --check`
+  re-verifies an install
 
 ## Project Layout
 
@@ -28,7 +44,7 @@ firmware/
   03_gps_test/           Stage 3: TinyGPSPlus NMEA parsing
   04_trip_logger/        Stage 4: the trip logger, plus its partitions.csv
   host_test/             Host-side tests for Stage 4 (run.sh, stubs/)
-  STAGE4_TECHNICAL_BRIEF.md  Stage 4 design brief
+  STAGE4_TECHNICAL_BRIEF.md  Stage 4 design brief (written for the V1.2)
   secrets.h.example      Copy to secrets.h and fill in WiFi + server creds
   README.md              Full setup guide + pin reference
 
@@ -43,6 +59,7 @@ server/
   mileage-ingest/        Flask ingest (app.py), diagnostics SQLite (diag_store.py), Dockerfile
   mileage-viewer/        Flask trip viewer/export + Device health (app.py, static/)
   mileage-monitor/       Stdlib monitor.py, gelf.py, prometheus.py, loki.py; own state volume
+  grafana/               Importable Prometheus scrape config, dashboard, alert examples
   ntfy/server.yml        Optional self-hosted ntfy; deny-all access, ntfy-state volume
   backup/                backup.sh + restore.sh, systemd timer, backup.conf.example
   tests/                 Server tests (unittest) + map-parser check (node)
@@ -55,78 +72,88 @@ DIAGNOSTICS.md                     Framework reference and issue delivery map
 .github/workflows/audit-tests.yml   CI: PII scan + server tests + firmware host tests
 .github/dependabot.yml              Dependabot: monthly pip, Docker and Actions bumps
 CODE_REVIEW_2026-06-09.md, AUDIT_2026-08-04.md, AUDIT_2026-10-05.md,
-INDEPENDENT_AUDIT_2026-10-05.md      Review history (see Current Status)
+INDEPENDENT_AUDIT_2026-10-05.md      Review history (see Where Status Lives)
 ```
 
-## Current Status (as of 2026-10-15)
+## Where Status Lives
 
-Code is written and tested on both sides. Nothing is deployed, and the
-firmware hasn't been road-tested.
+GitHub issues are the only record of what's open, fixed or next. This file
+names no issue numbers on purpose, because they go stale; keep it that way.
 
+- **Before assuming anything is open or fixed**, check `gh issue list`.
+  Filter by label: area (`area: firmware`, `area: backend`,
+  `area: installer`), severity (`severity: high|medium|low`), project
+  (`supreme-port`, `diagnostics`) or audit (`audit-2026-08-04`,
+  `audit-2026-10-05`). Hands-on hardware checks are issues titled
+  `Shakedown: ...`; they need the board, a meter or the car, so they can't
+  be done from this PC alone.
+- **Picking what's next:** look at the open issues, favouring whatever
+  blocks deploying the server or road-testing the tracker, then severity.
+- **Closed issues** record what was fixed and why. The audit docs
+  (`CODE_REVIEW_2026-06-09.md` → `AUDIT_2026-08-04.md` →
+  `AUDIT_2026-10-05.md` → `INDEPENDENT_AUDIT_2026-10-05.md`) record the
+  findings and V1.2 bench results as they were at the time.
 - **History and visibility:** this repo starts from a clean snapshot
   taken 2026-10-13. Earlier commits, PRs and closed issues stay in a
   private, archived repo, so commit hashes and PR numbers in the audit
   docs point there. This repo is private for now; the owner plans to make
   it public once the server is deployed and the tracker works on the road.
-- **Where status lives:** GitHub issues, not this file. Every open
-  finding or check is its own issue, labelled by audit
-  (`audit-2026-08-04`, `audit-2026-10-05`), area and severity. The old
-  trackers **#1** (October, N1–N14) and **#2** (August, B1–B5, F1–F11) are
-  closed, but still record what was fixed. Check `gh issue list` before
-  assuming something is open or fixed.
-- **Audits:** `CODE_REVIEW_2026-06-09.md` → `AUDIT_2026-08-04.md` →
-  `AUDIT_2026-10-05.md` (findings, fix-status table, bench results) →
-  `INDEPENDENT_AUDIT_2026-10-05.md`. The fix-status table in
-  `AUDIT_2026-10-05.md` covers only the first round of fixes; the closed
-  trackers #1 and #2 have the rest.
-- **Fixed:** every August finding except F11 (#6), and October N1–N12.
-  N5 shipped without a commuting category, per the owner. The August
-  low-severity firmware issues #16–#18 (WiFi retry backoff, trip-path
-  helper, mutex check) and installer #19 and #23 are fixed too.
-  Firmware #56, #60 and #77 fix upload queue starvation, retention of long
-  untimed trips, and WiFi failure diagnostics.
-  Firmware #76 provisions fully erased trip storage on first boot without
-  enabling format-on-mount-failure.
-- **Still open:** #4
-  (N13: the backup tooling is in `server/backup/`, but it isn't set up on
-  the server or restore-tested from a real off-host copy yet), #6 (F11, network stack sizing; needs
-  measurements from a real upload), the shakedown checks #25 (deep-sleep
-  current), #26 (GPS hot start) and #27 (road test), and
-  the low-severity issues, one per finding:
-  installer #20 and #21 (`gh issue list --label "severity: low"`).
-- **Firmware:** Stages 1–3 verified on hardware. Stage 4 compiles on ESP32
-  core 3.3.11 (XPowersLib 0.3.3, TinyGPSPlus 1.0.3) with the bundled
-  `partitions.csv` (2.375 MB LittleFS). Trip files are **GPX 1.0** at ~119 B/point (1.0 allows `<speed>` and
-  `<hdop>` directly on `<trkpt>`). The M8N is configured over UBX at boot
-  for RMC+GGA only, 1 Hz, automotive dynamic model.
-- **Bench test (2026-10-05, board on USB):** current build flashed, the
-  partition mounts, the M8N ACKs the UBX config, ALDO3 measured as the GPS
-  rail, and the charge guard calibrated against the die temperature.
-  Details in `AUDIT_2026-10-05.md` → Bench results. Still needs the car or
-  a meter: deep-sleep current (#25), hot-start time (#26), the F11 stack
-  high-water mark (#6), and the road test (#27).
-- **Tests (CI runs all of these on every PR):**
-  - PII: `python tools/check_pii.py` (add `--commits origin/main..HEAD`
-    before pushing) and `python -m unittest discover -s tools`.
-  - Server: `python -m unittest discover -s server/tests` and
-    `node server/tests/test_viewer_map.js`. Needs the service requirements
-    installed. Monitor needs no additional dependencies and uses fake time,
-    real SQLite, and local fake HTTP receivers for ntfy, GELF and Loki.
-    `test_backup` needs bash and rsync, so it skips on Windows; run it in
-    WSL (`wsl -d Ubuntu -- python3 -m unittest server/tests/test_backup.py`).
-  - Firmware: `bash firmware/host_test/run.sh` (`test_fs`, and `test_gps`
-    against the real TinyGPSPlus). No host compiler on this PC: set
-    `CXX="<venv python> -m ziglang c++"`.
-- **Server deployment: pending.** Runbook is `DEPLOY_DEBIAN.md`.
+- **Conventions:** when a PR fixes an issue, say "Fixes #N" (one line per
+  issue) so merging it closes the issue. File every new finding as its own
+  issue, however small, never as an item on a checklist issue.
+
+## Tests
+
+CI runs all of these on every PR:
+- PII: `python tools/check_pii.py` (add `--commits origin/main..HEAD`
+  before pushing) and `python -m unittest discover -s tools`.
+- Server: `python -m unittest discover -s server/tests` and
+  `node server/tests/test_viewer_map.js`. Needs the service requirements
+  installed. Monitor needs no additional dependencies and uses fake time,
+  real SQLite, and local fake HTTP receivers for ntfy, GELF and Loki.
+  `test_backup` needs bash and rsync, so it skips on Windows; run it in
+  WSL (`wsl -d Ubuntu -- python3 -m unittest server/tests/test_backup.py`).
+- Firmware: `bash firmware/host_test/run.sh` (`test_fs`, and `test_gps`
+  against the real TinyGPSPlus). No host compiler on this PC: set
+  `CXX="<venv python> -m ziglang c++"`.
 
 ## Key Technical Details
 
-- GPS power: AXP2101 **ALDO3** rail at 3.3V (measured 2026-10-05: ALDO3 off
-  silences the GPS, ALDO4 off doesn't; ALDO3 is on at power-up). VBACKUP
-  (button-battery charge) is enabled for GPS hot starts. ALDO2 = LoRa + OLED
-  header, on at power-up — leave it alone
+### Supreme (target hardware)
+
+Taken from LilyGO's source (LilyGo-LoRa-Series `examples/Factory/`); confirm
+each on the bench before relying on it.
+- **Rails differ from the V1.2:** ALDO3 = LoRa, ALDO4 = GPS. Never run V1.2
+  rail code on the Supreme
+- microSD: FAT32, powered from BLDO1, SPI on GPIO 35/36/37, CS GPIO 47
+- PMU interrupt is GPIO 40, which isn't an RTC GPIO on the ESP32-S3, so it
+  can't wake the chip from deep sleep via ext1
+- The MAX-M10S drops UBX CFG-MSG and CFG-NAV5; configure it with
+  UBX-CFG-VALSET
+- Before first power, attach the LoRa antenna; before first flash, back up
+  the factory flash
+
+### V1.2 (what the firmware on `main` still targets until the port lands)
+
+- GPS power: AXP2101 **ALDO3** rail at 3.3V (measured 2026-10-05). VBACKUP
+  enabled for GPS hot starts. ALDO2 = LoRa + OLED header — leave it alone
 - GPS UART: GPIO 34 (RX from GPS), GPIO 12 (TX to GPS), 9600 baud
 - I2C (PMU): GPIO 21 (SDA), GPIO 22 (SCL)
+- Builds on ESP32 core 3.3.11 (XPowersLib 0.3.3, TinyGPSPlus 1.0.3) with
+  the bundled `partitions.csv` (2.375 MB LittleFS). The M8N is configured
+  over UBX at boot for RMC+GGA only, 1 Hz, automotive dynamic model
+- LittleFS: use `file.close()` not `file.flush()` for durability
+
+### Firmware (both boards)
+
+- Trip files are **GPX 1.0** at ~119 B/point (1.0 allows `<speed>` and
+  `<hdop>` directly on `<trkpt>`)
+- Trip detection: start >5 mph for 10s; end <2 mph for 3 min
+- FreeRTOS: networking on core 0, GPS on core 1
+- Five-state FSM for trip lifecycle
+
+### Server
+
 - Ingest port: 8090, bearer token auth, GPX body in → raw `.gpx` + derived
   `.json` summary out (atomic writes); distance = haversine over moving
   steps only (speed > 2 mph at either end), HDOP > 5 and > 60 m/s jumps
@@ -134,13 +161,13 @@ firmware hasn't been road-tested.
   `server/tests/`)
 - Upload limits: 16 MiB body cap (`INGEST_MAX_UPLOAD_BYTES`, ~39 h of
   nonstop driving). It protects the server's memory: the ingest parses the
-  whole body at once, peaking at ~9x its size. The V1.2's largest possible
-  trip is ~2.4 MB, its whole partition; on the Supreme the firmware has
-  to split trips under the cap (#110). gunicorn `--timeout 300`, because
-  the timeout includes reading the body and 30 s dropped big trips on slow
-  links. Early 401/413 replies read and discard up to 4x the cap first, so
-  the device sees the status, not a reset.
-  `server/tests/test_upload_limits.py` ties these to `partitions.csv`
+  whole body at once, peaking at ~9x its size. The Supreme's SD card has
+  no such limit, so its firmware splits runaway trips at 8 MiB, half the
+  cap. gunicorn `--timeout 300`, because the timeout includes reading the
+  body and 30 s dropped big trips on slow links. Early 401/413 replies
+  read and discard up to 4x the cap first, so the device sees the status,
+  not a reset. `server/tests/test_upload_limits.py` ties these to
+  `partitions.csv`
 - Diagnostics: `POST /v1/device-events` on ingest, same bearer auth plus validated
   `X-Device-Id`, 32 KiB streaming cap (also without Content-Length), protocol v1
   from `common.diagnostics`, catalog cached at startup. Ingest owns
@@ -149,7 +176,7 @@ firmware hasn't been road-tested.
   events and applies the device-wide `status_sequence` high-water rule; ack only
   after commit. GPX successes refresh contact only for a valid device header;
   diagnostics failure never changes their response. See `DIAGNOSTICS.md` for
-  schema/unknown-condition semantics. Consistent DB backups remain #129.
+  schema/unknown-condition semantics.
 - Viewer port: 8091, session login (LAN-only), reads `./data` read-only, owns
   `annotations.db` (SQLite) in the `viewer-db` volume. `/device-health` reads
   diagnostics schema v1 via `mode=ro` with a 2 s busy timeout, shows contact and
@@ -157,7 +184,7 @@ firmware hasn't been road-tested.
   code/severity filters. Severity/text come from the current startup catalog,
   never stored severity. Missing DB means no diagnostics yet; read/schema/lock
   errors mean unavailable (503 + warning log). No diagnostics writes or recovery.
-- Optional monitor (#120/#121): `monitor` Compose profile, stdlib only,
+- Optional monitor: `monitor` Compose profile, stdlib only,
   catalog loaded at startup. `events.db` schema v1 is read with `mode=ro` and
   a 2 s busy timeout; missing means no work, unreadable logs unavailable and
   suspends sends until a successful read. Own `/state/monitor.db` schema v1 in
@@ -170,14 +197,14 @@ firmware hasn't been road-tested.
   recorded alert success are required. Delivery is at least once; persistent
   global retry doubles from 60 s to 3600 s, HTTP timeout 10 s, no redirects.
   E7001 uses server last-contact age >= seven days, bypasses fault severity/hold,
-  resolves on newer contact; firmware heartbeat is #125. State backups are #129.
-  Separate `monitor.env` (selected by `MONITOR_ENV_FILE` in `.env`) holds only
+  resolves on newer contact. Separate `monitor.env` (selected by
+  `MONITOR_ENV_FILE` in `.env`) holds only
   monitor settings/token, defaults to disabled `monitor.env.example` for normal
   install/--check. Disabled monitor idles without DB reads. Optional `ntfy`
   profile uses port 8092 with `BIND_ADDR`, deny-all auth and `ntfy-state` cache/auth
   volume. Self-hosted only; iOS instant push requires ntfy.sh wake-up relay
   (no message text), Android does not. Manual enablement: DEPLOY_DEBIAN Step 11.
-- Optional Graylog export (#135, `gelf.py`): `GRAYLOG_ENABLED` plus exactly one
+- Optional Graylog export (`gelf.py`): `GRAYLOG_ENABLED` plus exactly one
   of `GRAYLOG_GELF_URL` (GELF HTTP, preferred) or `GRAYLOG_GELF_TCP` (optional
   TLS) in `monitor.env`. Graylog runs on the owner's own server; never bundle it.
   Sends facts, not ntfy decisions: every events.db row once (rowid cursor,
@@ -186,7 +213,7 @@ firmware hasn't been road-tested.
   repeat. Independent of NOTIFY_*; own retry/backoff; failures never affect
   ntfy. Tables `gelf_cursor`, `gelf_conditions`, `gelf_retry` are additive to
   monitor schema v1. Setup and Event Definitions: DEPLOY_DEBIAN Step 11d.
-- Optional Prometheus metrics (#134, `prometheus.py`): `METRICS_ENABLED=true`
+- Optional Prometheus metrics (`prometheus.py`): `METRICS_ENABLED=true`
   plus a separate token of at least 32 printable ASCII characters in
   `monitor.env`. `/metrics` publishes on `BIND_ADDR` port 8093 with bearer auth.
   The HTTP thread serves the latest published snapshot with a 10-second request
@@ -194,7 +221,7 @@ firmware hasn't been road-tested.
   `condition_state`; `alert_decisions` reports ntfy delivery state and works
   only as delivery history. Importable scrape config, Tracker health dashboard
   and alert examples are in `server/grafana/`; setup is DEPLOY_DEBIAN Step 11e.
-- Optional Loki push (#136, `loki.py`): a nonempty `LOKI_PUSH_URL` enables
+- Optional Loki push (`loki.py`): a nonempty `LOKI_PUSH_URL` enables
   JSON event lines, per-device/code condition changes (active/clear/unknown,
   including E7001 silence and recovery) independent of ntfy, and successful
   ntfy alert/reminder/resolution decisions. Fixed labels are `job`, validated
@@ -220,37 +247,12 @@ firmware hasn't been road-tested.
   start without it. `tzdata` pinned in both requirements; services
   fail-fast if the zone db is missing. Distinct from `TZ`, which only
   affects log lines.
-- Trip detection: start >5 mph for 10s; end <2 mph for 3 min
-- LittleFS: use `file.close()` not `file.flush()` for durability
-- FreeRTOS: networking on core 0, GPS on core 1
-- Five-state FSM for trip lifecycle
-
-## What To Do Next
-
-1. **Deploy on Debian** with `server/install.sh`: copy `server/` over,
-   then `bash ~/mileage-tracker/install.sh`. It does `DEPLOY_DEBIAN.md`
-   Steps 1 and 3–10 with checks, including the `sample.gpx` end-to-end
-   test, and is safe to re-run. `install.sh --check` re-verifies later.
-2. **Check the viewer by hand** at `http://<host>:8091/`: annotate a
-   trip and confirm it persists (the installer doesn't write annotations).
-3. **Set up backups** (#4): the installer's Backups step, or
-   `DEPLOY_DEBIAN.md` Step 10 by hand. #4 closes once that's done on the
-   real server and `restore.sh check` passes from the off-host copy.
-4. **Road test and shakedown**, one issue per check: deep-sleep current
-   (#25), hot start after sleep (#26), the road test for F10 through
-   engine crank and start-stop and the N1 jitter figure (#27), and the F11
-   stack measurement during a real upload (#6; procedure in
-   `firmware/README.md` → Network stack shakedown).
-5. **Remaining code:** the low-severity installer issues #20 and #21.
-
-When a PR fixes an issue, say "Fixes #N" (one line per issue) so merging
-it closes the issue. File every new finding as its own issue, however
-small, never as an item on a checklist issue.
 
 ## Do Not
 
 - Put IRS classification logic in firmware — server-side only
 - Power SX1262 LoRa without antenna (RF damage risk)
+- Commit to the frozen `tbeam-v1.2` branch, or port fixes back to it
 - Commit `secrets.h`, `.env`, `viewer.env`, or `monitor.env` to version control
 - Commit anything personal. The repo will go public, and that exposes
   everything from its private period too, so docs, examples, tests,
