@@ -220,44 +220,43 @@ Before flashing:
    says. At ~118 bytes per second of driving that's roughly 5-6 hours
    between uploads. **Once it's full, the board stops recording**: it
    ends the trip in progress and won't start another until it uploads.
-3. **On a new board, do the first flash below** before anything else.
+3. **On a new board, check the first-flash output below.** Storage is
+   provisioned automatically only when the whole partition is erased.
 
 #### First flash on a new board
 
-On a new, empty board the trip partition may not be formatted yet. The
-firmware never formats it on its own. That's deliberate: on a board in
-use, a mount error mustn't be able to wipe trips
-that are waiting to upload. If the first run cannot mount it, the Serial
-Monitor shows
+Flash the sketch normally, with its bundled `partitions.csv`, and watch
+the Serial Monitor. If the trip partition mounts, startup proceeds as
+usual. If it doesn't mount, the firmware reads **every byte** of the
+`spiffs` data partition. Only when every read succeeds and every byte is
+erased (`0xFF`) does it format the partition once and mount it again. It
+prints
 
 ```
-ERROR: LittleFS mount failed. Storage preserved; halting. See firmware README for first-time provisioning/recovery.
+LittleFS partition is fully erased; provisioning trip storage.
+...
+Setup complete. Logging trips.
 ```
 
-and it stops there. (The battery's charge-temperature guard keeps running
-while it's halted.) **Use these steps only for a new, empty board.** If it
-has recorded trips, follow [storage recovery](#if-the-trip-storage-wont-mount-later)
-instead. If it already reaches `Setup complete. Logging trips.`, no
-formatting is needed. Otherwise set the partition up once:
-
-1. In `04_trip_logger.ino`, find `mountTripStorage()` and change
-   `LittleFS.begin(false)` to `LittleFS.begin(true)`. That lets it format
-   the partition when it can't mount it.
-2. Flash, and watch the Serial Monitor until it says
-   `Setup complete. Logging trips.`
-3. Change it back to `LittleFS.begin(false)` and flash again. **Don't skip
-   this.** The `true` build formats the partition, erasing any trips
-   waiting on it, whenever a mount fails, so it must never go in the car.
-   Don't commit it either.
+No sketch edits or second flash are needed. A board sold as new may still
+contain factory test data, so "new" alone is not enough to allow formatting.
+Any non-erased byte, failed read, or missing partition leaves storage
+untouched and halts startup with `LittleFS mount failed. Storage preserved`.
+A format or subsequent mount failure also halts, with
+`LittleFS provisioning failed`. The battery's charge-temperature guard
+keeps running while halted. Follow [storage recovery](#if-the-trip-storage-wont-mount-later)
+if startup halts; do not enable format-on-mount-failure.
+An interrupted format may leave non-erased bytes, so the next boot can
+also halt for recovery instead of trying another format.
 
 After that, the trip storage survives reflashing. You only do this again
-if you change the partition layout or erase the whole flash, and only once
-every trip on the board has been uploaded or independently backed up.
+if the partition is fully erased again. Before changing the partition
+layout or erasing flash, upload or independently back up every trip.
 
 #### If the trip storage won't mount later
 
 On a board that's been working, `LittleFS mount failed` doesn't mean the
-trips are gone, so don't reach for the first-flash steps. Check that you
+trips are gone. Keep format-on-mount-failure disabled. Check that you
 flashed with this sketch's `partitions.csv`, and try the firmware that last
 worked. Before anything that could erase the partition, copy it to a file
 with esptool (it comes with the ESP32 core, or `pip install esptool`):

@@ -29,6 +29,7 @@ static double gLat = 37.0, gLon = -122.0;
 
 static void resetWorld() {
     g_disk = FakeDisk();
+    g_partition = PartitionStub();
     LittleFS.dirs.clear();
     LittleFS.mkdir(TRIP_DIR);
     prefs.kv.clear();
@@ -505,10 +506,84 @@ int main(int argc, char** argv) {
         g_disk.failMount = true;
         CHECK(!mountTripStorage(), "mount error stops initialization");
         CHECK(!g_disk.formatRequested, "format-on-failure is disabled");
+        CHECK(g_disk.formatAttempts == 0, "non-erased partition is never formatted");
         CHECK(g_disk.files["/trips/t000023.gpx"] == "irreplaceable trip", "queued bytes preserved");
         g_disk.failMount = false;
         CHECK(mountTripStorage(), "a later successful mount recovers normally");
         CHECK(g_disk.files["/trips/t000023.gpx"] == "irreplaceable trip", "successful mount also preserves data");
+    }
+
+    printf("T23a only a fully erased partition can be provisioned (#76)\n");
+    {
+        resetWorld();
+        g_disk.files["/trips/queued.gpx"] = "queued trip";
+        CHECK(mountTripStorage(), "existing filesystem mounts normally");
+        CHECK(g_partition.finds == 0 && g_disk.formatAttempts == 0,
+              "successful mount skips the raw scan and format");
+
+        resetWorld();
+        g_disk.failMount = true;
+        g_partition.partition.size = 0x260000;
+        g_partition.bytes.assign(g_partition.partition.size, 0xFF);
+        setup();
+        CHECK(logHas("Setup complete") && g_taskCreates == 1,
+              "first flash on fully erased storage completes setup and starts worker");
+        CHECK(g_disk.formatAttempts == 1 && g_disk.mountAttempts == 2 && !g_disk.formatRequested,
+              "provisions once then remounts with format-on-failure disabled");
+        CHECK(g_partition.readBytes == g_partition.partition.size && !g_partition.wrongLookup &&
+              g_disk.partitionLabel == "spiffs", "reads every byte of the same labelled data partition");
+        g_disk.files["/trips/queued.gpx"] = "queued trip";
+        CHECK(mountTripStorage() && g_disk.formatAttempts == 1 &&
+              g_disk.files["/trips/queued.gpx"] == "queued trip",
+              "next mount preserves trips without provisioning again");
+
+        // Exercise the first byte, both sides of a read boundary, and the
+        // last byte of a short final chunk. Sampling must never suffice.
+        for (size_t dirtyAt : {0U, 1023U, 1024U, 2500U}) {
+            resetWorld();
+            g_disk.failMount = true;
+            g_partition.partition.size = 2501;
+            g_partition.bytes.assign(2501, 0xFF);
+            g_partition.bytes[dirtyAt] = 0xFE;
+            const auto before = g_partition.bytes;
+            CHECK(!mountTripStorage() && g_disk.formatAttempts == 0 &&
+                  g_partition.bytes == before, "even one programmed bit prevents formatting");
+        }
+
+        resetWorld();
+        g_disk.failMount = true;
+        g_partition.partition.size = 2501;
+        g_partition.bytes.assign(2501, 0xFF);
+        CHECK(mountTripStorage() && g_partition.readBytes == 2501 &&
+              g_partition.readOffsets == std::vector<size_t>({0, 1024, 2048}),
+              "erased short final chunk is read in full and provisions safely");
+
+        for (size_t failAt : {0U, 1024U, 2048U}) {
+            resetWorld();
+            g_disk.failMount = true;
+            g_partition.bytes.assign(8192, 0xFF);
+            g_partition.failReadAt = failAt;
+            CHECK(!mountTripStorage() && g_disk.formatAttempts == 0,
+                  "a raw read error at any point prevents formatting");
+        }
+        for (bool missing : {false, true}) {
+            resetWorld();
+            g_disk.failMount = true;
+            g_partition.missing = missing;
+            g_partition.partition.size = 0;
+            CHECK(!mountTripStorage() && g_disk.formatAttempts == 0 &&
+                  g_partition.readOffsets.empty(), "missing or zero-sized partition cannot authorize formatting");
+        }
+        for (bool failFormat : {false, true}) {
+            resetWorld();
+            g_disk.failMount = true;
+            g_partition.bytes.assign(8192, 0xFF);
+            g_disk.failFormat = failFormat;
+            g_disk.failRemount = !failFormat;
+            CHECK(!mountTripStorage() && g_disk.formatAttempts == 1 &&
+                  !g_disk.formatRequested && logHas("provisioning failed"),
+                  "format or remount failure halts without an unconditional format retry");
+        }
     }
 
     printf("T24 boot repair snapshots the directory before mutating it\n");

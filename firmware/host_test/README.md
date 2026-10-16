@@ -22,6 +22,10 @@ There are two suites:
   the reset when a trip ends, scan cleanup, sleep holds, and clock
   wraparound. Boot tests inject mutex
   allocation failure and check that storage and workers never start.
+  Provisioning tests read a separate raw partition model: an entirely
+  erased partition completes first-boot setup, while a programmed bit
+  anywhere, read errors, or missing storage prevents formatting. Format
+  and remount failures halt; a normal mount preserves queued trips.
   Trip-directory walks are checked with both basename and full-path names.
 - **`test_gps`**: the GPS input path, built against the **real** TinyGPSPlus.
   It feeds the sketch's `loop()` the NMEA a NEO-M8N sends at its defaults,
