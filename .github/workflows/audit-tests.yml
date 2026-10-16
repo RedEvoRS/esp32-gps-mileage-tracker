@@ -163,7 +163,8 @@ jobs:
           echo "$TEST_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/zz-installer-test
           cat rerun.log
           test "$status" = 0
-          grep -q "Nothing needs root this time" rerun.log
+          grep -q "Nothing needs root so far" rerun.log
+          ! grep -q "Root is needed" rerun.log
       - name: Repair a hash that lost its quotes and a .env with CRLF endings
         run: |
           dir=$(dirname "$INSTALLER")

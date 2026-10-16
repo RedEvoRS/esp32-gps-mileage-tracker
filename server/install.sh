@@ -8,8 +8,10 @@
 #                             remove a test trip, optionally test login
 #
 # Run it as your normal login user, not root. If any step will need root,
-# it asks for sudo once, at the start; if none will, it doesn't ask at
-# all. It works on the directory it's in, normally ~/mileage-tracker
+# it asks for sudo once, before the long steps: at the start, or for
+# optional steps (backups, waiting for the network) as soon as you say
+# yes to them. If none will, it doesn't ask at all. It works on the
+# directory it's in, normally ~/mileage-tracker
 # (your copy of server/). It's safe to run again: anything already set up
 # is checked and kept, so after fixing a problem, just run it again.
 #
@@ -61,6 +63,8 @@ VIEWER_PASSWORD=
 RELOGIN=no
 FIRST_BACKUP=no     # yes once this run has made the first backup
 SUDO_READY=no
+WANT_WAIT_ONLINE=   # yes/no once asked; see ask_root_options
+WANT_BACKUPS=       # likewise
 SUDO_KEEPALIVE=
 TEST_ID=            # install-check-<random>, set by upload_test_trip
 TEST_TRIP=          # data/<ym>/<TEST_ID>, while this run's test trip may exist
@@ -430,16 +434,18 @@ preflight() {
 
 # Work out what this run will need root for before anything runs. If
 # anything, ask for sudo now, so the password prompt doesn't come halfway
-# through a long image build; if nothing, don't ask at all (#22). Each
-# step still calls need_sudo itself, in case this misses something.
+# through a long image build; if nothing, don't ask (#22). The optional
+# steps that need root are asked about in ask_root_options, once the
+# answers they depend on are in. Each step still calls need_sudo itself,
+# in case this misses something.
 plan_sudo() {
-    local reasons=() missing unit
+    local reasons=() missing
     if [[ $MODE == install ]]; then
         missing=$(missing_packages)
         if [[ -n $missing ]]; then reasons+=("install packages: $missing"); fi
         if ! command -v docker > /dev/null; then
             reasons+=("install Docker")
-        elif [[ -d /run/systemd/system ]] \
+        elif have_systemd \
             && [[ $(systemctl is-active docker 2> /dev/null) != active \
                 || $(systemctl is-enabled docker 2> /dev/null) != enabled ]]; then
             reasons+=("start Docker, and have it start at boot")
@@ -456,32 +462,48 @@ plan_sudo() {
     if (( ${#DATA_SUDO[@]} )); then
         reasons+=("check and delete the test trip, whose files belong to UID $CONTAINER_UID")
     fi
-    if [[ $MODE == install && -d /run/systemd/system && -n $(env_raw .env BIND_ADDR) \
-        && ${INSTALL_WAIT_ONLINE:-y} != [Nn]* ]]; then
-        unit=$(wait_online_unit)
-        if [[ -n $unit ]] && ! wait_online_enabled "$unit"; then
-            reasons+=("make Docker wait for the network at boot, if you say yes to that")
-        fi
-    fi
-    if [[ $MODE == install && $(id -u) == "$CONTAINER_UID" ]]; then
-        if backups_configured; then
-            if ! { timer_ok && timer_current; }; then
-                reasons+=("set up the daily backup timer")
-            fi
-        elif [[ ${INSTALL_BACKUPS:-y} != [Nn]* ]]; then
-            reasons+=("set up the daily backup timer, if you set up backups")
-        fi
+    # Backups already set up, but the timer is off or runs another copy:
+    # setup_backups puts it right without asking.
+    if [[ $MODE == install && $(id -u) == "$CONTAINER_UID" ]] \
+        && backups_configured && ! { timer_ok && timer_current; }; then
+        reasons+=("set up the daily backup timer")
     fi
 
     if (( ${#reasons[@]} == 0 )); then
-        ok "Nothing needs root this time, so no sudo"
+        ok "Nothing needs root so far, so no sudo"
         return 0
     fi
+    sudo_for "${reasons[@]}"
+}
+
+# sudo_for REASON...: list why, then make sure sudo works.
+sudo_for() {
     local reason
     note "Root is needed to:"
-    for reason in "${reasons[@]}"; do note "  - $reason"; done
+    for reason; do note "  - $reason"; done
     need_sudo "Asking once now, not partway through"
     ok "sudo works"
+}
+
+# The optional steps that need root, asked about after Configuration
+# (which chooses BIND_ADDR) and before the image build. A yes gets its
+# sudo prompt here rather than after the build; a no means no prompt.
+ask_root_options() {
+    local reasons=() unit
+    if [[ -n $BIND_ADDR ]] && have_systemd; then
+        unit=$(wait_online_unit)
+        if [[ -n $unit ]] && ! wait_online_enabled "$unit"; then
+            ask_wait_online "$unit"
+            if [[ $WANT_WAIT_ONLINE == yes ]]; then
+                reasons+=("make Docker wait for the network at boot ($unit)")
+            fi
+        fi
+    fi
+    if [[ $(id -u) == "$CONTAINER_UID" ]] && ! backups_configured; then
+        ask_backups
+        if [[ $WANT_BACKUPS == yes ]]; then reasons+=("set up the daily backup timer"); fi
+    fi
+    if (( ${#reasons[@]} )) && [[ $SUDO_READY == no ]]; then sudo_for "${reasons[@]}"; fi
 }
 
 # --- Packages and Docker -----------------------------------------------
@@ -494,6 +516,7 @@ apt_get() {
 WANTED_PACKAGES=(ca-certificates curl gnupg jq openssl openssh-client rsync iproute2)
 
 have_apt() { command -v apt-get > /dev/null && command -v dpkg-query > /dev/null; }
+have_systemd() { [[ -d /run/systemd/system ]]; }
 
 # The WANTED_PACKAGES that aren't installed, space-separated. Empty
 # without apt, where install_packages only checks for the commands.
@@ -1413,6 +1436,16 @@ wait_online_enabled() {
     return 1
 }
 
+ask_wait_online() {
+    note "With BIND_ADDR set, Docker can only publish the ports once $BIND_ADDR is up." \
+        "If Docker starts first at boot, the containers stay down until you start them."
+    if confirm WAIT_ONLINE "Make Docker wait for the network at boot ($1)?" y; then
+        WANT_WAIT_ONLINE=yes
+    else
+        WANT_WAIT_ONLINE=no
+    fi
+}
+
 check_wait_online() {
     local unit
     unit=$(wait_online_unit)
@@ -1431,9 +1464,8 @@ check_wait_online() {
             "sudo systemctl enable $unit"
         return 0
     fi
-    note "With BIND_ADDR set, Docker can only publish the ports once $BIND_ADDR is up." \
-        "If Docker starts first at boot, the containers stay down until you start them."
-    if confirm WAIT_ONLINE "Make Docker wait for the network at boot ($unit)?" y; then
+    if [[ -z $WANT_WAIT_ONLINE ]]; then ask_wait_online "$unit"; fi
+    if [[ $WANT_WAIT_ONLINE == yes ]]; then
         need_sudo
         sudo systemctl enable --quiet "$unit"
         ok "Docker waits for the network at boot ($unit)"
@@ -1648,6 +1680,17 @@ verify_backups() {
     fi
 }
 
+ask_backups() {
+    note "If this disk dies, the trip files and the annotations can't be rebuilt, and the" \
+        "annotations (business or personal, and why) are the record the IRS asks for." \
+        "Backups copy both to another machine or a mounted share every night."
+    if confirm BACKUPS "Set up backups?" y; then
+        WANT_BACKUPS=yes
+    else
+        WANT_BACKUPS=no
+    fi
+}
+
 setup_backups() {
     section "Backups"
     if [[ $(id -u) != "$CONTAINER_UID" ]]; then
@@ -1660,10 +1703,8 @@ setup_backups() {
             warn "Backups aren't set up" "Run install.sh to set them up, or see DEPLOY_DEBIAN.md Step 10."
             return 0
         fi
-        note "If this disk dies, the trip files and the annotations can't be rebuilt, and the" \
-            "annotations (business or personal, and why) are the record the IRS asks for." \
-            "Backups copy both to another machine or a mounted share every night."
-        if ! confirm BACKUPS "Set up backups now?" y; then
+        if [[ -z $WANT_BACKUPS ]]; then ask_backups; fi
+        if [[ $WANT_BACKUPS != yes ]]; then
             warn "Backups aren't set up" "Run this script again to set them up, or see DEPLOY_DEBIAN.md Step 10."
             return 0
         fi
@@ -1754,6 +1795,7 @@ main() {
     setup_docker
     configure
     if [[ $MODE == install ]]; then
+        ask_root_options
         build_images
         setup_viewer_login
         start_services
