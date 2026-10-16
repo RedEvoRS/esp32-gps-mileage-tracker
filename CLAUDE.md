@@ -199,7 +199,7 @@ firmware hasn't been road-tested.
   including E7001 silence and recovery) independent of ntfy, and successful
   ntfy alert/reminder/resolution decisions. Fixed labels are `job`, validated
   `device_id` and catalog severity. The independent event cursor resets on a
-  lower restored events.db rowid; timestamps remain ordered per stream. Network
+  lower restored events.db rowid; real timestamps (Loki 2.4+), backlog first. Network
   failures, 408, 429 and 5xx retry; other HTTP 4xx rejections skip the batch and
   advance its cursors. The condition table and cursor are additive to monitor
   schema v1. Setup and LogQL examples: DEPLOY_DEBIAN Step 11f.

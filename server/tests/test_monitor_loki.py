@@ -124,18 +124,16 @@ class LokiLineTests(unittest.TestCase):
         self.assertIsNone(loki.condition_log(self.codes, "tracker-1", 4003, "raise", 1))
         self.assertIsNone(loki.condition_log(self.codes, "tracker-1", 9999, "active", 1))
 
-    def test_each_stream_is_sorted_and_timestamps_advance_past_previous(self):
+    def test_each_stream_is_sorted_and_keeps_real_timestamps(self):
         items = [(("tracker-1", "critical"), 300, '{"line":"late"}'),
                  (("tracker-1", "critical"), 100, '{"line":"early"}'),
                  (("tracker-1", "critical"), 300, '{"line":"tie"}')]
-        payload, watermark = loki.push_payload(items, {})
-        stream = json.loads(payload)["streams"][0]
-        self.assertEqual([int(value[0]) for value in stream["values"]], [100, 300, 301])
+        stream = json.loads(loki.push_payload(items))["streams"][0]
+        self.assertEqual(stream["stream"], {"job": "mileage-tracker", "device_id": "tracker-1",
+                                            "severity": "critical"})
+        self.assertEqual([int(value[0]) for value in stream["values"]], [100, 300, 300])
         self.assertEqual([json.loads(value[1])["line"] for value in stream["values"]],
                          ["early", "late", "tie"])
-        payload, watermark = loki.push_payload(items[:2], watermark)
-        self.assertEqual([int(value[0]) for value in json.loads(payload)["streams"][0]["values"]],
-                         [302, 303])
 
 
 class LokiPolicyTests(unittest.TestCase):
@@ -236,6 +234,17 @@ class LokiPolicyTests(unittest.TestCase):
         self.worker = self.make_monitor()
         self.assertEqual(self.tick(60), [])
 
+    def test_event_backlog_drains_before_condition_lines(self):
+        with mock.patch.object(loki, "MAX_PER_TICK", 2):
+            self.post(active=(4003,), observed=[4003],
+                      events=[(1000, "notice", {}) for _ in range(3)])
+            first = self.tick()
+            self.assertEqual([entry[1]["kind"] for entry in first], ["event", "event"])
+            second = self.tick(60)
+            kinds = [entry[1]["kind"] for entry in second]
+            self.assertEqual(kinds.count("event"), 1)
+            self.assertIn("condition_change", kinds)
+
     def test_condition_changes_are_independent_of_ntfy_and_deduplicated_across_wakes(self):
         self.post(active=(4003,), observed=[4003])
         first = self.tick()
@@ -320,7 +329,7 @@ class LokiPolicyTests(unittest.TestCase):
         state = self.root / "legacy.db"
         monitor.Monitor(monitor.Config(enabled=True), self.store.path, state, catalog=self.catalog)
         with closing(sqlite3.connect(state)) as db, db:
-            for table in ("loki_cursor", "loki_retry", "loki_decisions", "loki_conditions", "loki_streams"):
+            for table in ("loki_cursor", "loki_retry", "loki_decisions", "loki_conditions"):
                 db.execute("DROP TABLE " + table)
         monitor.Monitor(monitor.Config(enabled=True, loki=HTTP), self.store.path, state,
                         catalog=self.catalog, loki_sender=self.capture_loki)

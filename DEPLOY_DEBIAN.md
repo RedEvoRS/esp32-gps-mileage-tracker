@@ -1063,10 +1063,13 @@ off, diagnostic events and condition changes still flow to Loki.
 
 Each line is JSON. Loki stream labels are only `job=mileage-tracker`, validated
 `device_id`, and current-catalog `severity`; context and other fields stay in
-the line. To satisfy Loki's per-stream timestamp ordering, each push sorts its
-lines and stores the last timestamp per label set. If source timestamps tie or
-move backward, Loki's entry timestamp advances by one nanosecond; the original
-server receipt time remains in the JSON. Delivery uses a ten-second timeout,
+the line. Each entry carries its real timestamp (server receipt time for
+events, the monitor tick for condition changes and decisions). This needs Loki
+2.4 or newer, which accepts out-of-order writes within about an hour of a
+stream's newest entry. While an event backlog drains, for example on first
+enable, the monitor sends only events, oldest first, and holds condition and
+decision lines until it catches up. Loki still rejects anything older than its
+`reject_old_samples_max_age` (one week by default); that history is skipped. Delivery uses a ten-second timeout,
 does not follow redirects, and retries independently from one minute to one
 hour. An ambiguous response can cause a duplicate, but does not lose a cursor.
 Restoring `events.db` below the Loki rowid resets only the Loki event cursor;

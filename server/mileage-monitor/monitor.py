@@ -604,20 +604,7 @@ class Monitor:
             return
         event_cursor, decision_cursor = db.execute(
             "SELECT event_rowid,decision_id FROM loki_cursor WHERE singleton=1").fetchone()
-        known_conditions = {(device, code): (state, episode) for device, code, state, episode in
-                            db.execute("SELECT device,code,state,episode FROM loki_conditions")}
-        changes = gelf.desired_conditions(devices, known_conditions, now, self.config.stale_seconds,
-                                          SNAPSHOT_MAX_AGE_SECONDS)
-        condition_items = []
-        for key, value in sorted(changes.items())[:loki_module.MAX_PER_TICK]:
-            state, episode, _ = value
-            item = loki_module.condition_log(self.codes, key[0], key[1], state, now)
-            if item is None:
-                LOG.warning("Skipping a damaged monitor condition for Loki")
-            condition_items.append((key, value, item))
-
-        highest, rows = gelf.read_events(
-            self.events_path, event_cursor, max(0, loki_module.MAX_PER_TICK - len(condition_items)))
+        highest, rows = gelf.read_events(self.events_path, event_cursor, loki_module.MAX_PER_TICK)
         if highest < event_cursor:
             # A restored events.db can be shorter than this sink's cursor.
             # Start its history over without changing GELF progress.
@@ -625,6 +612,22 @@ class Monitor:
                 db.execute("UPDATE loki_cursor SET event_rowid=0 WHERE singleton=1")
             LOG.warning("Diagnostics events restarted below the Loki cursor; resending from the start")
             return
+
+        # While an event backlog drains, send only events so each stream stays
+        # in ascending time order; a newer condition or decision line first
+        # would push older backlog outside Loki's out-of-order window.
+        backlog = len(rows) >= loki_module.MAX_PER_TICK
+        condition_items = []
+        if not backlog:
+            known_conditions = {(device, code): (state, episode) for device, code, state, episode in
+                                db.execute("SELECT device,code,state,episode FROM loki_conditions")}
+            changes = gelf.desired_conditions(devices, known_conditions, now, self.config.stale_seconds,
+                                              SNAPSHOT_MAX_AGE_SECONDS)
+            for key, value in sorted(changes.items())[:loki_module.MAX_PER_TICK - len(rows)]:
+                item = loki_module.condition_log(self.codes, key[0], key[1], value[0], now)
+                if item is None:
+                    LOG.warning("Skipping a damaged monitor condition for Loki")
+                condition_items.append((key, value, item))
 
         selected_events = []
         push_items = [item for _, _, item in condition_items if item is not None]
@@ -648,14 +651,10 @@ class Monitor:
         if not condition_items and not rows and not decisions:
             return
 
-        updated_timestamps = {}
         rejection_status = None
         if push_items:
-            previous_timestamps = {(device, severity): timestamp for device, severity, timestamp in
-                                   db.execute("SELECT device,severity,timestamp_ns FROM loki_streams")}
-            payload, updated_timestamps = loki_module.push_payload(push_items, previous_timestamps)
             try:
-                self.loki_sender(payload)
+                self.loki_sender(loki_module.push_payload(push_items))
             except loki_module.PermanentRejection as exc:
                 rejection_status = exc.status_code
             except Exception as exc:
@@ -676,11 +675,6 @@ class Monitor:
                 db.execute("INSERT INTO loki_conditions VALUES (?,?,?,?) ON CONFLICT(device,code) "
                            "DO UPDATE SET state=excluded.state, episode=excluded.episode",
                            (device, code, state, episode))
-            if rejection_status is None:
-                for (device, severity), timestamp in updated_timestamps.items():
-                    db.execute("INSERT INTO loki_streams VALUES (?,?,?) ON CONFLICT(device,severity) "
-                               "DO UPDATE SET timestamp_ns=excluded.timestamp_ns",
-                               (device, severity, timestamp))
             db.execute("DELETE FROM loki_decisions WHERE id<=?", (next_decision,))
             db.execute("UPDATE loki_retry SET attempts=0,next_attempt=0 WHERE singleton=1")
         if rejection_status is not None:

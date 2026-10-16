@@ -717,13 +717,13 @@ streams have exactly three labels: fixed `job=mileage-tracker`, validated
 line to keep label cardinality low.
 
 `loki_cursor` keeps event rowid and delivered-decision progress independently
-from GELF. The condition state, retry state and per-stream timestamp watermark
-are also stored in additive tables in monitor schema v1. The first enable has
-no age filter: each tick sends up to 200 total condition changes, events and
-delivered decisions. Lines are sorted by timestamp within each label set; if
-an event timestamp ties or predates one already sent for that stream, its Loki
-entry timestamp is advanced by one nanosecond. The original server receipt time
-remains in the JSON line.
+from GELF. The condition and retry state are also stored in additive tables
+in monitor schema v1. The first enable has no age filter: each tick sends up to
+200 total condition changes, events and delivered decisions. Entries keep their
+real timestamps, sorted within each label set (Loki 2.4+ accepts out-of-order
+writes inside its window). While a full 200-event batch is still draining, only
+events are sent, so the backlog stays oldest-first; condition changes and
+decisions follow once it catches up. History Loki rejects as too old is skipped.
 
 The monitor uses one HTTP push with a ten-second timeout and never follows
 redirects. Network failures, HTTP 408, HTTP 429 and 5xx responses back off

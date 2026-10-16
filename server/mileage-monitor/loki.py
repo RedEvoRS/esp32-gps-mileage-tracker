@@ -47,10 +47,6 @@ CREATE TABLE IF NOT EXISTS loki_conditions (
     device TEXT NOT NULL, code INTEGER NOT NULL, state TEXT NOT NULL, episode TEXT,
     PRIMARY KEY (device, code)
 );
-CREATE TABLE IF NOT EXISTS loki_streams (
-    device TEXT NOT NULL, severity TEXT NOT NULL, timestamp_ns INTEGER NOT NULL,
-    PRIMARY KEY (device,severity)
-);
 """
 SEED = ("INSERT OR IGNORE INTO loki_cursor VALUES (1,0,0)",
         "INSERT OR IGNORE INTO loki_retry VALUES (1,0,0)")
@@ -254,28 +250,21 @@ def decision_log(codes, row):
         return None
 
 
-def push_payload(items, previous_timestamps):
-    """Build Loki streams with strictly ascending timestamps in each stream.
+def push_payload(items):
+    """Build Loki streams, each sorted by its real timestamp.
 
-    Loki rejects older entries in an already-open stream. Row order is the
-    durable cursor order, but restored clocks or an event batch can carry tied
-    timestamps, so sort each push and advance by one nanosecond beyond the
-    last timestamp already accepted for that label set.
+    Loki 2.4+ accepts out-of-order writes within its window, so timestamps are
+    never moved to force ordering; a line outside the window is rejected (4xx)
+    and the caller skips it. Sorting keeps a backlog push in ascending order,
+    which Loki accepts as long as each entry is within the window.
     """
     grouped = defaultdict(list)
     for labels, timestamp, line in items:
         grouped[labels].append((timestamp, line))
-    streams, updated = [], {}
+    streams = []
     for (device, severity), entries in sorted(grouped.items()):
         entries.sort(key=lambda item: item[0])
-        previous = previous_timestamps.get((device, severity), -1)
-        values = []
-        for timestamp, line in entries:
-            previous = max(timestamp, previous + 1)
-            values.append([str(previous), line])
-        updated[(device, severity)] = previous
         streams.append({"stream": {"job": SOURCE, "device_id": device, "severity": severity},
-                        "values": values})
-    payload = json.dumps({"streams": streams}, separators=(",", ":"), ensure_ascii=True,
-                         allow_nan=False).encode("utf-8")
-    return payload, updated
+                        "values": [[str(timestamp), line] for timestamp, line in entries]})
+    return json.dumps({"streams": streams}, separators=(",", ":"), ensure_ascii=True,
+                      allow_nan=False).encode("utf-8")
