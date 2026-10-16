@@ -337,13 +337,61 @@ class MonitorTests(unittest.TestCase):
         self.tick()
         self.assertEqual(len(self.messages), 1)
 
-    def test_new_episode_gets_a_new_alert_without_reboot_recovery(self):
-        self.snapshot(active=(4003,))
+    def test_open_fault_spans_hourly_wakes_until_clear_and_resolution(self):
+        self.snapshot(active=(4002,))
         self.tick()
-        self.snapshot(active=(4003,), boot=OTHER_BOOT)
+        self.tick(300)
+        for hour in range(1, 49):
+            self.now += 3600
+            boot = f"{hour + 1:032x}"
+            self.snapshot(active=(4002,), boot=boot)
+            self.tick()
+            if hour in (12, 36):
+                self.worker = self.make_monitor()  # Sent state survives restart.
+        self.assertEqual(sum("Alert E4002" in text for text in self.messages), 1)
+        self.assertEqual(sum("Reminder E4002" in text for text in self.messages), 2)
+        self.assertEqual(len(self.messages), 3)
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM episodes WHERE code=4002", state=True), [(1,)])
+        self.snapshot(active=(), observed=[4002], boot=boot)
+        self.tick()
+        self.assertIn("Resolved E4002", self.messages[-1])
+        self.assertEqual(len(self.messages), 4)
+        self.snapshot(active=(4002,), boot=f"{50:032x}")
+        self.tick()
+        self.tick(299)
+        self.assertEqual(len(self.messages), 4)
+        self.tick(1)
+        self.assertIn("Alert E4002", self.messages[-1])
+        self.assertEqual(len(self.messages), 5)
+
+    def test_open_fault_returns_from_unknown_with_reminder_without_new_hold(self):
+        self.snapshot(active=(4002,))
+        self.tick()
+        self.tick(300)
+        self.snapshot(active=(), boot=OTHER_BOOT)
+        self.tick(86400)
+        self.worker = self.make_monitor()
+        self.snapshot(active=(4002,), boot=OTHER_BOOT)
         self.tick()
         self.assertEqual(len(self.messages), 2)
-        self.assertTrue(all("Alert E4003" in text for text in self.messages))
+        self.assertIn("Reminder E4002", self.messages[-1])
+        self.tick()
+        self.assertEqual(len(self.messages), 2)
+
+    def test_return_before_deferred_resolution_continues_open_alert(self):
+        self.worker = self.make_monitor(max_per_hour=1)
+        self.snapshot(active=(4003,))
+        self.tick()
+        self.snapshot(active=(), observed=[4003])
+        self.tick()  # Resolution waits for a delivery slot.
+        self.snapshot(active=(4003,), boot=OTHER_BOOT)
+        self.tick(3600)
+        self.assertEqual(len(self.messages), 1)
+        self.assertEqual(self.sql("SELECT * FROM work", state=True), [])
+        self.snapshot(active=(4003,), boot=OTHER_BOOT)
+        self.tick(82800)
+        self.assertIn("Reminder E4003", self.messages[-1])
+        self.assertEqual(len(self.messages), 2)
 
     def test_backoff_is_persistent_bounded_and_eventually_delivers(self):
         self.snapshot(active=(4003,))
@@ -365,7 +413,7 @@ class MonitorTests(unittest.TestCase):
         self.tick(1)
         self.assertEqual(len(self.messages), 1)
         self.assertEqual(self.sql("SELECT attempts,next_attempt FROM retry", state=True), [(0, 0)])
-        self.snapshot(active=(4003,), episode=2)
+        self.snapshot(active=(4003,), device="tracker-2")
         self.worker.sender = fail
         for delay in (60, 120, 240, 480, 960, 1920, 3600, 3600):
             with self.assertLogs("mileage-monitor", "WARNING"):

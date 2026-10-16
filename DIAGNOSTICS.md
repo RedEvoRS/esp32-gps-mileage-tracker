@@ -514,10 +514,15 @@ GPX-only contact does not make an old health snapshot fresh.
 
 Alert only for catalog-eligible current faults in a fresh snapshot. Hold a new
 fault for 300 seconds by default; critical faults bypass that hold, while
-deduplication and rate limits still apply. Deduplicate by device/code/episode,
-with daily reminders for unresolved eligible faults. Above the hourly cap,
+deduplication and rate limits still apply. Keep one **open alert per device/code**
+from its first successful send until an explicit clear and successful resolution.
+Firmware creates a new `boot_id` on every boot, including each deep-sleep wake,
+so a new device episode of the same code continues that open alert. Even after
+unknown status, send only reminders on `NOTIFY_REPEAT_HOURS` measured from the
+last successful alert/reminder, without a new hold. After resolution, a later
+raise starts a new alert subject to hold. Above the hourly cap,
 coalesce into a digest and persist pending work; avoid a later replay storm.
-Send a resolution only if the corresponding episode was actually alerted and
+Send a resolution only if the corresponding device/code was actually alerted and
 an ordered snapshot explicitly observes it clear. A reboot, stale snapshot,
 missing code or delayed clear event alone is not recovery.
 
@@ -556,9 +561,12 @@ Only accepted snapshots and contact receipt times drive policy; journal events
 and their stored severity are never queried.
 
 `monitor-state:/state/monitor.db` has its own version-1 schema, DELETE journal
-and synchronous=FULL. `episodes` retains device/code/episode identity, current
+and synchronous=FULL. `episodes` retains the original device/code/episode anchor, current
 evidence, eligibility start, observed revision, silence contact anchor, first
-alert, last successful alert/reminder and resolution delivery. `work` coalesces
+alert, last successful alert/reminder and resolution delivery. A unique partial
+index permits only one unresolved sent fault per device/code; later device
+episodes update that open row. Silence (7001) keeps its contact-based identity.
+`work` coalesces
 one pending action per episode/kind; `outbox` commits the selected delivery
 intent before posting; `deliveries` holds the rolling-hour successful POST
 window; `retry` persists global retry attempts and the next attempt time.
@@ -567,9 +575,10 @@ version fails startup. Run one monitor replica per volume.
 
 Hold starts at the monitor's first eligible observation, survives restarts,
 and restarts after observed unknown/stale/ineligible evidence. Critical faults
-and server silence bypass hold. Unknown or superseded episodes retain sent
-history; neither a new boot nor a new episode emits an invented resolution.
-An explicit newer clear can resolve previously alerted episodes of that code.
+and server silence bypass hold. Unknown status retains open sent alerts;
+neither a new boot nor a new episode emits a new alert or an invented resolution.
+An explicit newer clear can resolve the open alert for that code. If the fault
+returns before a deferred resolution is delivered, the same alert stays open.
 Silence identity is stable from the last contact receipt and resolves only
 when that receipt advances, not when a server clock adjustment changes age.
 

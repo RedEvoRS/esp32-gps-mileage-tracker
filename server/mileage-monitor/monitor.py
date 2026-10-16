@@ -175,6 +175,8 @@ CREATE TABLE IF NOT EXISTS episodes (
     contact REAL, alerted_at REAL, last_sent_at REAL, resolved_at REAL,
     PRIMARY KEY (device, code, episode)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS open_fault ON episodes(device, code)
+    WHERE code != 7001 AND alerted_at IS NOT NULL AND resolved_at IS NULL;
 CREATE TABLE IF NOT EXISTS work (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     device TEXT NOT NULL, code INTEGER NOT NULL, episode TEXT NOT NULL,
@@ -266,11 +268,22 @@ class Monitor:
 
     @staticmethod
     def _active(db, device, code, episode, revision, contact, now, previous):
+        # Firmware creates a new boot/episode on every deep-sleep wake. Once
+        # sent, a fault stays anchored to its original monitor row until an
+        # explicit clear AND successful resolution close it. This also cancels
+        # a deferred resolution if the fault returns before it is delivered.
+        if code != 7001:
+            opened = db.execute("SELECT episode FROM episodes WHERE device=? AND code=? "
+                                "AND alerted_at IS NOT NULL AND resolved_at IS NULL",
+                                (device, code)).fetchone()
+            if opened:
+                episode = opened[0]
         since = previous.get((device, code, episode))
         db.execute("INSERT INTO episodes(device,code,episode,state,eligible_since,revision,contact) "
                    "VALUES (?,?,?,'active',?,?,?) ON CONFLICT(device,code,episode) DO UPDATE SET "
                    "state='active', eligible_since=excluded.eligible_since, "
-                   "revision=MAX(episodes.revision,excluded.revision) WHERE episodes.state!='clear'",
+                   "revision=MAX(episodes.revision,excluded.revision) WHERE episodes.state!='clear' "
+                   "OR (episodes.alerted_at IS NOT NULL AND episodes.resolved_at IS NULL)",
                    (device, code, episode, since if since is not None else now, revision, contact))
 
     def _queue(self, db, now, clear_codes):
@@ -283,11 +296,10 @@ class Monitor:
                 desired.add((device, code, episode, "resolution"))
             elif state == "active" and self.eligible(code):
                 hold = 0 if code == 7001 or self.codes[code]["severity"] == "critical" else self.config.hold_seconds
-                if now - since >= hold:
-                    if alerted is None:
-                        desired.add((device, code, episode, "alert"))
-                    elif now - last_sent >= self.config.repeat_seconds:
-                        desired.add((device, code, episode, "reminder"))
+                if alerted is None and now - since >= hold:
+                    desired.add((device, code, episode, "alert"))
+                elif alerted is not None and now - last_sent >= self.config.repeat_seconds:
+                    desired.add((device, code, episode, "reminder"))
         if not self.config.notify:
             desired.clear()
         for row in db.execute("SELECT id,device,code,episode,kind FROM work").fetchall():
