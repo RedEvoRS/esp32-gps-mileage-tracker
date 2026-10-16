@@ -97,19 +97,27 @@ except ZoneInfoNotFoundError as exc:  # pragma: no cover - environment fault
     ) from exc
 
 # Reject absurdly large bodies early. The whole body is held in memory and
-# parsed there (~10x its size at peak), so this guards against a bug or a
-# stray client, not the device: the firmware writes ~119 B per second of
-# driving (~430 KB an hour), and its entire trip partition is 2.375 MiB,
-# so no trip it stores can reach the cap. test_upload_limits.py keeps it so.
-MAX_UPLOAD_BYTES = int(os.environ.get("INGEST_MAX_UPLOAD_BYTES", 4 * 1024 * 1024))
+# parsed there, peaking at ~9x its size (a 9.2 MiB trip peaks at ~86 MiB),
+# so the cap protects the server's memory. Without one, a trip that never
+# ended (a parked car whose USB port stays on, GPS drift keeping the trip
+# open) could get the worker killed for memory; the device sees that as a
+# dropped connection, keeps the file, and resends it on every visit home.
+# The cap turns it into one 413, and the device sets the file aside.
+# 16 MiB is ~39 hours of nonstop driving at ~119 B per second, far past any
+# real trip; the firmware has to keep its trips under it, and
+# test_upload_limits.py checks that it does.
+MAX_UPLOAD_BYTES = int(os.environ.get("INGEST_MAX_UPLOAD_BYTES", 16 * 1024 * 1024))
 
 # A reply sent before the body is read (bad token, too large) only reaches
 # the device if the rest of the body is read first. The firmware sends the
 # whole file before it reads the reply; gunicorn closes the socket with the
 # body still queued, the kernel resets the connection, and the device sees
 # a send error instead of the status. Read and discard up to this much; a
-# bigger body gets the reset.
-MAX_DISCARD_BYTES = 16 * 1024 * 1024
+# bigger body gets the reset. It must stay well above the cap: if it
+# didn't, an over-cap upload would get the reset, not the 413, and the
+# device would keep retrying it instead of setting it aside. Discarding
+# reads 64 KB at a time, so this costs time, not memory.
+MAX_DISCARD_BYTES = 4 * MAX_UPLOAD_BYTES
 
 # Unit conversions, named so the math below reads in plain English.
 METERS_PER_MILE = 1609.344

@@ -1,5 +1,5 @@
 """The ingest size cap, what an early-rejected upload gets back, and the
-limits a device trip has to fit through (#10, #29, #30).
+limits a device trip has to fit through (#10, #29, #30, #114).
 
     python -m unittest server/tests/test_upload_limits.py
 """
@@ -105,6 +105,38 @@ class EarlyReplies(unittest.TestCase):
         response, read = self.post(payload)
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(read, len(payload))
+
+
+class DefaultCap(unittest.TestCase):
+    """The real default cap, not the small one EarlyReplies uses (#114)."""
+
+    def test_default_cap_is_16_mib(self):
+        # ~39 h of nonstop driving. Sized for the server's memory, not the
+        # V1.2's partition: an upload peaks at ~9x its size while parsing.
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(load_ingest(root).MAX_UPLOAD_BYTES, 16 * 1024 * 1024)
+
+    def test_discard_limit_stays_above_the_cap(self):
+        # At or under the cap, every over-cap upload would be past the
+        # discard limit too, and get a reset the device retries forever.
+        for override in (None, str(64 * 1024 * 1024)):
+            env = {} if override is None else {"INGEST_MAX_UPLOAD_BYTES": override}
+            with self.subTest(cap=override or "default"),                     tempfile.TemporaryDirectory() as root:
+                ing = load_ingest(root, **env)
+                self.assertGreater(ing.MAX_DISCARD_BYTES, ing.MAX_UPLOAD_BYTES)
+
+    def test_just_over_the_default_cap_gets_a_413_after_the_body(self):
+        with tempfile.TemporaryDirectory() as root:
+            ing = load_ingest(root)
+            payload = b"x" * (ing.MAX_UPLOAD_BYTES + 1)
+            stream = io.BytesIO(payload)
+            response = ing.app.test_client().post(
+                "/upload", input_stream=stream, content_length=len(payload),
+                headers={"Authorization": f"Bearer {TOKEN}"})
+            self.assertEqual(response.status_code, 413)
+            self.assertTrue(response.is_json, response.content_type)
+            self.assertEqual(stream.tell(), len(payload))
+            self.assertEqual(list(Path(root).glob("*/*")), [])
 
 
 class DeviceTripsFit(unittest.TestCase):
