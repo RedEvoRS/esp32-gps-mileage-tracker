@@ -562,7 +562,8 @@ alert, last successful alert/reminder and resolution delivery. `work` coalesces
 one pending action per episode/kind; `outbox` commits the selected delivery
 intent before posting; `deliveries` holds the rolling-hour successful POST
 window; `retry` persists global retry attempts and the next attempt time.
-An unsupported state version fails startup. Run one monitor replica per volume.
+Initialization and versioning share one transaction; an unsupported state
+version fails startup. Run one monitor replica per volume.
 
 Hold starts at the monitor's first eligible observation, survives restarts,
 and restarts after observed unknown/stale/ineligible evidence. Critical faults

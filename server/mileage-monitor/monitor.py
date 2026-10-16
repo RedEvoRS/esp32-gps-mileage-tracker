@@ -205,15 +205,18 @@ class Monitor:
         self.sender = NtfySender(config) if sender is None else sender
         if config.enabled:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
-            with closing(self._connect()) as db:
-                # Check an existing version before changing any state.
+            with closing(self._connect()) as db, db:
+                # Initialize/version in one transaction: interrupted first use
+                # must not leave a partial schema that cannot restart.
+                db.execute("BEGIN IMMEDIATE")
                 if db.execute("SELECT name FROM sqlite_master WHERE name='schema_version'").fetchone():
                     if db.execute("SELECT singleton,version FROM schema_version").fetchall() != [(1, 1)]:
                         raise ValueError("unsupported monitor state schema version")
-                db.executescript(SCHEMA)
-                with db:
-                    db.execute("INSERT OR IGNORE INTO schema_version VALUES (1,1)")
-                    db.execute("INSERT OR IGNORE INTO retry VALUES (1,0,0)")
+                for statement in SCHEMA.split(";"):
+                    if statement.strip():
+                        db.execute(statement)
+                db.execute("INSERT OR IGNORE INTO schema_version VALUES (1,1)")
+                db.execute("INSERT OR IGNORE INTO retry VALUES (1,0,0)")
 
     def _connect(self):
         db = sqlite3.connect(self.state_path, timeout=2)

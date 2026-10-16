@@ -9,6 +9,7 @@ import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -58,7 +59,7 @@ class ViewerSecurityTests(unittest.TestCase):
 
     def setUp(self):
         self.client = self.viewer.app.test_client()
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute("DELETE FROM login_attempts")
             conn.execute("DELETE FROM annotations")
 
@@ -170,7 +171,7 @@ class ViewerSecurityTests(unittest.TestCase):
         with patch.object(self.viewer, "MAX_FAILS", 1000):
             with ThreadPoolExecutor(max_workers=8) as pool:
                 list(pool.map(self.viewer._record_failure, ["test-ip"] * 40))
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             fails = conn.execute(
                 "SELECT fails FROM login_attempts WHERE ip = 'test-ip'"
             ).fetchone()[0]
@@ -181,7 +182,7 @@ class ViewerSecurityTests(unittest.TestCase):
         # password verification. Later failures must preserve the new lock.
         for _ in range(self.viewer.MAX_FAILS + 1):
             self.viewer._record_failure("test-ip")
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             locked_until = conn.execute(
                 "SELECT locked_until FROM login_attempts WHERE ip = 'test-ip'"
             ).fetchone()[0]

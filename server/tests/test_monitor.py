@@ -494,6 +494,16 @@ class MonitorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported monitor"):
             self.make_monitor()
 
+    def test_failed_first_state_initialization_rolls_back_and_can_restart(self):
+        state = self.root / "interrupted.db"
+        with mock.patch.object(monitor, "SCHEMA", monitor.SCHEMA + "INVALID SQL;"):
+            with self.assertRaises(sqlite3.OperationalError):
+                monitor.Monitor(monitor.Config(enabled=True), self.store.path, state)
+        with closing(sqlite3.connect(state)) as db:
+            self.assertEqual(db.execute("SELECT name FROM sqlite_master").fetchall(), [])
+        worker = monitor.Monitor(monitor.Config(enabled=True), self.store.path, state)
+        self.assertTrue(worker.tick())
+
 
 class NtfyHTTPTests(unittest.TestCase):
     def test_redirect_cannot_forward_credentials(self):
