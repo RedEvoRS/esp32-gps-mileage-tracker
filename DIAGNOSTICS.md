@@ -300,8 +300,8 @@ Use flat rolling SD segments, for example `/diag/seg-00000001.open`, sealed as
 `boot_id` inside each record, **not in directory names**: deep sleep creates
 many boots per day, and per-boot directories would leave thousands of FAT
 directories. A segment can contain records from several boots. Segments roll at
-about 64 KiB without splitting a frame; SD diagnostics have an 8 MiB total
-quota, including acknowledgment and recovery metadata. #122 must define safe
+about 64 KiB without splitting a frame; SD diagnostics have a 16 MiB total
+quota (owner's choice, 2026-10-16), including acknowledgment and recovery metadata. #122 must define safe
 counter-exhaustion handling (no unchecked wrap into an existing filename).
 
 Keep acknowledgments in separate checksummed metadata using generation slots
@@ -346,7 +346,21 @@ Being parked away from WiFi can legitimately trigger the optional silence alert.
 ## Display policy and Supreme hardware (#123/#127/#128/#130)
 
 DisplayModel is pure C++ policy; the SH1106 adapter alone touches hardware.
-While parked, briefly show boot, trip and upload status. While moving **or when
+**The screen design is provisional** (owner, 2026-10-16): it will get more
+thought once the board is in the car. For now there are two modes, chosen by
+a firmware build toggle, `DISPLAY_DEBUG` in the sketch (on for the first
+builds):
+
+- **Debug on:** a status page for bench and shakedown work: FSM state,
+  satellites in view and used, fix/HDOP, storage backend and free space,
+  pending trips/events, WiFi/upload result, battery. It is the only mode that
+  may stay lit, so it is for development, not everyday driving.
+- **Debug off:** minimal: the number of satellites in view, plus the error
+  policy below. Whether that count stays lit or blanks is part of the future
+  screen design; OLEDs burn in, so a static always-on display needs a
+  dim/shift/timeout rule before it ships.
+
+The error policy applies in both modes. While parked, briefly show boot, trip and upload status. While moving **or when
 motion is unknown**, suppress routine messages. Show each new ERROR/CRITICAL
 episode once at low brightness for about 10 seconds, then blank. No flashing or
 scrolling. Repeats do not keep it lit. Remind about unresolved conditions at the
@@ -410,7 +424,15 @@ no `MONITOR_DEVICE_IDS` watchlist. Removing an obsolete device requires an
 explicit administrative retirement policy in #121, rather than an implicit
 watchlist omission. The intended installation has a single tracker.
 
-Notifications use ntfy only and are off by default. Planned settings:
+Notifications use [ntfy](https://ntfy.sh), **self-hosted** on the same
+server: it is free, open-source software with no account or subscription, and
+#120 adds it as an optional Compose service. Phones subscribe with the free
+ntfy app (Android: Play Store or F-Droid; iOS: App Store). Gotcha: on iOS,
+instant push from a self-hosted server needs its `upstream-base-url` set to
+`https://ntfy.sh`, which relays only a wake-up poke (no message text) through
+the public instance, still free; Android needs no relay. ntfy allows anonymous
+access by default, so #120 sets `auth-default-access: deny-all` and uses a token.
+Notifications are off by default. Planned settings:
 
 ```dotenv
 MONITOR_ENABLED=false
