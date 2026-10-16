@@ -176,6 +176,7 @@ struct Fix {
     double   lat, lon;
     float    speedMps, hdop;
     bool     hasUtc;
+    bool     newSegment = false;  // travels with this fix through both buffers
     uint64_t utcMs;
     uint32_t monoMs;
 };
@@ -245,7 +246,6 @@ static void armBufPush(const Fix& fx) {
 static float     gMaxSpeedMps = 0;
 static char      gTripPath[48] = {0};   // active file, "" when none
 static bool      gTripWriteFailed = false;  // a write to gTripPath didn't land
-static bool      gNeedNewSeg = false;
 static bool      gHaveLastFix = false;
 static Fix       gLastFix;
 static uint32_t  gLastFixMonoMs = 0;
@@ -404,12 +404,11 @@ static void appendTrkpt(FileWriter& w, const Fix& fx) {
     int n = snprintf(line, sizeof(line),
         "%s<trkpt lat=\"%.6f\" lon=\"%.6f\">%s"
         "<speed>%.2f</speed><hdop>%.1f</hdop></trkpt>\n",
-        gNeedNewSeg ? "</trkseg><trkseg>\n" : "",
+        fx.newSegment ? "</trkseg><trkseg>\n" : "",
         fx.lat, fx.lon, timeEl, fx.speedMps, fx.hdop);
     if (n <= 0 || n >= (int)sizeof(line)) { w.ok = false; return; }
 
     w.put(line, n);
-    gNeedNewSeg = false;
 }
 
 // =================================================================
@@ -488,7 +487,6 @@ static bool tripStorageLow(uint32_t now) {
 static bool beginTrip(const Fix& fx) {
     gTripMeters = 0;
     gMaxSpeedMps = 0;
-    gNeedNewSeg = false;
     gTripWriteFailed = false;
     gTripT0 = gArmCount ? gArmBuf[gArmHead].monoMs : fx.monoMs;
     gLastMoveMs = fx.monoMs;
@@ -1311,21 +1309,25 @@ static bool uploadPending() {
 }
 
 static bool hasPending() {
+    // Preserved incomplete files need recovery, not radio work. Scan past
+    // them so a complete trip later in directory order is still found.
     bool found = false;
     FS_LOCK();
     File dir = LittleFS.open(TRIP_DIR);
     if (dir && dir.isDirectory()) {
         File e = dir.openNextFile();
-        while (e) {
+        while (e && !gNetHold.load() && !gNetAbort.load()) {
             String name = tripEntryPath(e);
             if (name.endsWith(".gpx") &&
-                (gTripPath[0] == 0 || name != String(gTripPath))) {
+                (gTripPath[0] == 0 || name != String(gTripPath)) &&
+                isCompleteFile(e)) {
                 found = true;
                 break;
             }
             e = dir.openNextFile();
         }
     }
+    if (dir) dir.close();
     FS_UNLOCK();
     return found;
 }
@@ -1622,7 +1624,7 @@ void loop() {
             // gArmT0 would otherwise start a trip on the very next fix).
             if (gHaveLastFix && (fx.monoMs - gLastFixMonoMs) > SEG_GAP_MS) {
                 if (gState == ACTIVE || gState == COOLDOWN) {
-                    gNeedNewSeg = true;
+                    fx.newSegment = true;
                 } else if (gState == ARMING) {
                     gState = IDLE;
                     armBufReset();

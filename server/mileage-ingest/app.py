@@ -29,7 +29,7 @@ reuse their original directory even if the month has changed:
     <id>.gpx    the raw upload, byte-for-byte
     <id>.json   { trip_id, device_id, start_time, end_time, recorded_until,
                   duration_seconds, distance_miles, max_speed_mph,
-                  avg_speed_mph, num_points, bbox{...}, gpx_file,
+                  avg_speed_mph, timing_status, timed_from, num_points, bbox{...}, gpx_file,
                   summary_version, _received_at, _received_from }
 
 Distance is the haversine sum over consecutive fixes, with three rules
@@ -115,9 +115,9 @@ MAX_DISCARD_BYTES = 16 * 1024 * 1024
 METERS_PER_MILE = 1609.344
 MPS_TO_MPH = 2.2369362920544
 
-# Distance model. Bump SUMMARY_VERSION whenever these rules change, so
+# Distance and timing model. Bump SUMMARY_VERSION whenever these rules change, so
 # summaries written under the old rules can be found and recomputed.
-SUMMARY_VERSION = 2
+SUMMARY_VERSION = 3
 # Below this speed at both ends of a step, the vehicle is parked or stopped
 # at a light and the step is GPS scatter. 2 mph matches the firmware's
 # END_MPS, the speed at which it decides a drive is winding down.
@@ -365,13 +365,16 @@ def summarize(parsed):
     firmware's 3-minute stationary cooldown doesn't stretch every trip;
     the final timestamp in the file is kept as recorded_until. Max speed
     prefers the device-reported speed, else distance/time. Average speed
-    is total distance over start..end.
+    is total distance over start..end only when every point is timed.
+    Partly timed trips retain distance and observed timestamps, but expose
+    no full-trip bounds, duration or average speed.
     """
     all_points = [p for seg in parsed["segments"] for p in seg]
     num_points = len(all_points)
 
     times = [p["time"] for p in all_points if p["time"] is not None]
     start_time = min(times) if times else None
+    timing_status = "complete" if len(times) == num_points else "partial" if times else "untimed"
     recorded_until = max(times) if times else None
     moving_times = [
         p["time"]
@@ -382,7 +385,8 @@ def summarize(parsed):
     ]
     end_time = max(moving_times) if moving_times else recorded_until
     duration_seconds = (
-        (end_time - start_time).total_seconds() if start_time and end_time else None
+        (end_time - start_time).total_seconds()
+        if timing_status == "complete" and start_time and end_time else None
     )
 
     distance_m = 0.0
@@ -412,7 +416,7 @@ def summarize(parsed):
     if duration_seconds and duration_seconds > 0:
         avg_speed_mph = (distance_m / duration_seconds) * MPS_TO_MPH
     else:
-        avg_speed_mph = 0.0
+        avg_speed_mph = 0.0 if timing_status == "complete" else None
 
     bbox = None
     if lats:
@@ -424,8 +428,12 @@ def summarize(parsed):
         }
 
     return {
-        "start_time": start_time.isoformat() if start_time else None,
-        "end_time": end_time.isoformat() if end_time else None,
+        # Partial timing cannot establish full-trip bounds. Keep observed
+        # times separately and preserve the old identity/bucketing anchors.
+        "timing_status": timing_status,
+        "timed_from": start_time.isoformat() if start_time else None,
+        "start_time": start_time.isoformat() if timing_status == "complete" and start_time else None,
+        "end_time": end_time.isoformat() if timing_status == "complete" and end_time else None,
         "recorded_until": recorded_until.isoformat() if recorded_until else None,
         "duration_seconds": (
             round(duration_seconds) if duration_seconds is not None else None
@@ -433,10 +441,11 @@ def summarize(parsed):
         "summary_version": SUMMARY_VERSION,
         "distance_miles": round(distance_miles, 3),
         "max_speed_mph": round(max_speed_mps * MPS_TO_MPH, 1),
-        "avg_speed_mph": round(avg_speed_mph, 1),
+        "avg_speed_mph": round(avg_speed_mph, 1) if avg_speed_mph is not None else None,
         "num_points": num_points,
         "bbox": bbox,
         "_end_dt": end_time,  # internal: used for path bucketing, stripped before write
+        "_identity_dt": start_time,  # internal: keep existing mixed-timing trip IDs stable
     }
 
 
@@ -668,6 +677,7 @@ def upload_trip():
         return jsonify({"error": "invalid GPX: no track points"}), 400
 
     summary = summarize(parsed)
+    identity_dt = summary.pop("_identity_dt")
 
     # -----------------------------------------------------------------
     # Step 3: Identify the trip
@@ -676,16 +686,16 @@ def upload_trip():
 
     trip_id = request.headers.get("X-Trip-Id")
     if not trip_id:
-        # Fall back to the trip's start time, then metadata time. This is
+        # Fall back to the earliest recorded point time, then metadata time. This is
         # the T-Beam's path: it sends no X-Trip-Id. Build the id in UTC and
         # already filename-safe (2026-04-14T14-30-00Z), so the trip_id in
         # the summary and the export is the file's name, not a variant of
         # it that _safe_id() rewrote.
-        anchor = _parse_iso(summary["start_time"]) or parsed["metadata_time"]
+        anchor = identity_dt or parsed["metadata_time"]
         if anchor:
             trip_id = anchor.astimezone(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
         else:
-            # No timestamps anywhere in the GPX: derive the id from the
+            # No usable point or metadata timestamps: derive the id from the
             # body content rather than the wall clock, so a retried
             # upload of the same file is idempotent instead of creating
             # a duplicate under a new received-at name.

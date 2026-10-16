@@ -429,7 +429,10 @@ def _safe_trip_paths(ym, trip_id):
 
 # The summary fields the pages and exports read. read_summary() keeps only
 # these, so a new column that reads another summary field must add it here.
-SUMMARY_TEXT_FIELDS = ("trip_id", "device_id", "gpx_file", "start_time", "end_time")
+SUMMARY_TEXT_FIELDS = (
+    "trip_id", "device_id", "gpx_file", "start_time", "end_time",
+    "timing_status", "timed_from", "recorded_until",
+)
 SUMMARY_NUMBER_FIELDS = (
     "distance_miles", "duration_seconds", "avg_speed_mph", "max_speed_mph", "num_points",
 )
@@ -455,6 +458,8 @@ def _summary_problem(summary):
     for field in SUMMARY_NUMBER_FIELDS:
         if summary.get(field) is not None and not _is_number(summary[field]):
             return f"{field} is not a finite number"
+    if summary.get("timing_status") not in (None, "complete", "partial", "untimed"):
+        return "timing_status is not recognized"
     return None
 
 
@@ -570,6 +575,10 @@ def fmt_duration(seconds):
     return f"{m}m {s}s"
 
 
+def fmt_speed(value):
+    return "—" if value is None else f"{value:.1f}"
+
+
 def _parse(iso):
     if not iso:
         return None
@@ -644,7 +653,7 @@ def mileage_totals(trips):
 
 
 app.jinja_env.globals.update(
-    fmt_date=fmt_date, fmt_duration=fmt_duration, csrf_token=_csrf_token
+    fmt_date=fmt_date, fmt_duration=fmt_duration, fmt_speed=fmt_speed, csrf_token=_csrf_token
 )
 
 
@@ -768,10 +777,10 @@ LIST_HTML = """
         <th>Purpose</th><th>Destination</th><th>Note</th><th></th></tr>
     {% for t in trips %}
     <tr>
-      <td>{{ fmt_date(t.start_time) }}</td>
+      <td>{{ fmt_date(t.start_time) }}{% if t.get('timing_status') == 'partial' %}<br><span class="muted">Partial timing</span>{% endif %}</td>
       <td>{{ "%.2f"|format(t.distance_miles or 0) }} mi</td>
       <td>{{ fmt_duration(t.duration_seconds) }}</td>
-      <td>{{ "%.1f"|format(t.avg_speed_mph or 0) }}</td>
+      <td>{{ fmt_speed(t.get('avg_speed_mph')) }}</td>
       <td>{% if t.category %}<span class="tag {{ t.category }}">{{ t.category }}</span>
           {% else %}<span class="muted">—</span>{% endif %}</td>
       <td>{{ t.destination or "" }}</td><td>{{ t.purpose_note or "" }}</td>
@@ -797,10 +806,15 @@ TRIP_HTML = """
 </header>
 <div class="wrap">
   <h2>{{ fmt_date(t.start_time) }}</h2>
+  {% if t.get('timing_status') == 'partial' %}
+  <p class="muted">Partial timing: some points have no timestamp. Full-trip dates,
+    duration and average speed are unknown. Recorded timestamps run from
+    {{ fmt_date(t.timed_from) }} to {{ fmt_date(t.recorded_until) }}. Recorded distance is retained.</p>
+  {% endif %}
   <div class="stats">
     <div class="stat"><b>{{ "%.2f"|format(t.distance_miles or 0) }}</b><span>miles</span></div>
     <div class="stat"><b>{{ fmt_duration(t.duration_seconds) }}</b><span>duration</span></div>
-    <div class="stat"><b>{{ "%.1f"|format(t.avg_speed_mph or 0) }}</b><span>avg mph</span></div>
+    <div class="stat"><b>{{ fmt_speed(t.get('avg_speed_mph')) }}</b><span>avg mph</span></div>
     <div class="stat"><b>{{ "%.1f"|format(t.max_speed_mph or 0) }}</b><span>max mph</span></div>
     <div class="stat"><b>{{ t.num_points or 0 }}</b><span>points</span></div>
   </div>
@@ -994,19 +1008,23 @@ EXPORT_COLUMNS = [
     ("trip_id", lambda t: t.get("trip_id", t.get("id"))),
     ("device_id", lambda t: t.get("device_id", "")),
     ("distance_miles", lambda t: t.get("distance_miles") or 0),
-    ("duration_minutes", lambda t: round((t.get("duration_seconds") or 0) / 60, 1)),
+    ("duration_minutes", lambda t: round(t["duration_seconds"] / 60, 1)
+     if t.get("duration_seconds") is not None else ""),
     ("category", lambda t: t.get("category", "")),
     ("purpose_note", lambda t: t.get("purpose_note", "")),
     ("start_time", lambda t: fmt_local_iso(t.get("start_time"))),
     ("end_time", lambda t: fmt_local_iso(t.get("end_time"))),
     ("max_speed_mph", lambda t: t.get("max_speed_mph") or 0),
-    ("avg_speed_mph", lambda t: t.get("avg_speed_mph") or 0),
+    ("avg_speed_mph", lambda t: t.get("avg_speed_mph") if t.get("avg_speed_mph") is not None else ""),
     ("gpx_file", lambda t: t.get("gpx_file", "")),
     ("destination", lambda t: t.get("destination", "")),
     ("start_latitude", lambda t: t.get("start_latitude", "")),
     ("start_longitude", lambda t: t.get("start_longitude", "")),
     ("end_latitude", lambda t: t.get("end_latitude", "")),
     ("end_longitude", lambda t: t.get("end_longitude", "")),
+    ("timing_status", lambda t: t.get("timing_status") or "unknown"),
+    ("timed_from", lambda t: fmt_local_iso(t.get("timed_from"))),
+    ("recorded_until", lambda t: fmt_local_iso(t.get("recorded_until"))),
 ]
 
 

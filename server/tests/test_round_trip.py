@@ -6,7 +6,7 @@ import io
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import unittest
@@ -28,6 +28,89 @@ def load_service(name):
 
 
 class TripRoundTrip(unittest.TestCase):
+    def test_partial_timing_keeps_identity_annotations_and_unknown_export_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {
+                "INGEST_DATA_ROOT": str(root / "data"),
+                "INGEST_AUTH_TOKEN": "round-trip-test-token",
+                "VIEWER_DB_PATH": str(root / "annotations.db"),
+                "VIEWER_USERNAME": "test-driver",
+                "VIEWER_PASSWORD_HASH": generate_password_hash("test-password"),
+                "VIEWER_SECRET_KEY": "round-trip-session-key-" * 3,
+                "DISPLAY_TZ": "America/Los_Angeles",
+            }):
+                ingest = load_service("mileage-ingest")
+                viewer = load_service("mileage-viewer")
+            start = datetime(2026, 4, 14, 14, 30, tzinfo=timezone.utc)
+            points = []
+            for i in range(330):
+                time = f"<time>{(start + timedelta(seconds=i)).isoformat()}</time>" if i >= 210 else ""
+                points.append(f'<trkpt lat="{37 + i * 15 / 111320:.6f}" lon="-122">'
+                              f'{time}<speed>15</speed><hdop>0.9</hdop></trkpt>')
+            raw = ("<gpx><trk><trkseg>" + "".join(points) + "</trkseg></trk></gpx>").encode()
+            headers = {"Authorization": "Bearer round-trip-test-token", "X-Device-Id": "test-device"}
+            uploader = ingest.app.test_client()
+            uploaded = uploader.post("/upload", data=raw, headers=headers)
+            self.assertEqual(uploaded.status_code, 200)
+            path = Path(uploaded.json["stored_as"])
+            # Identity and bucketing use the same observed anchors as v2,
+            # even though the full-trip start is now explicitly unknown.
+            self.assertEqual(path.as_posix(), "2026-04/2026-04-14T14-33-30Z.gpx")
+            key = path.with_suffix("").as_posix()
+            gpx = root / "data" / path
+            json_path = gpx.with_suffix(".json")
+            record = json.loads(json_path.read_bytes())
+            self.assertEqual(record["timing_status"], "partial")
+            self.assertEqual(record["num_points"], 330)
+            self.assertGreater(record["distance_miles"], 3)
+            for field in ("start_time", "end_time", "duration_seconds", "avg_speed_mph"):
+                self.assertIsNone(record[field], field)
+
+            viewer.upsert_annotation(key, "business", "Test visit", "Test destination")
+            # An existing v2 summary upgrades in place on retry.
+            old = record | {"summary_version": 2, "start_time": record["timed_from"],
+                            "end_time": record["recorded_until"], "duration_seconds": 119,
+                            "avg_speed_mph": 92.5}
+            for field in ("timing_status", "timed_from"):
+                old.pop(field)
+            json_path.write_text(json.dumps(old))
+            with patch.object(ingest, "datetime", wraps=datetime) as clock:
+                clock.now.return_value = datetime(2027, 1, 1, tzinfo=timezone.utc)
+                retried = uploader.post("/upload", data=raw, headers=headers)
+            self.assertEqual(retried.status_code, 200)
+            self.assertEqual(retried.json["stored_as"], uploaded.json["stored_as"])
+            self.assertEqual(json.loads(json_path.read_bytes()), record)
+            self.assertEqual(gpx.read_bytes(), raw)
+            self.assertEqual(len(list((root / "data").glob("*/*.json"))), 1)
+            self.assertEqual(viewer.get_annotations()[key]["purpose_note"], "Test visit")
+
+            client = viewer.app.test_client()
+            with client.session_transaction() as session:
+                session["user"] = "test-driver"
+                session["pw_tag"] = viewer._password_tag()
+            self.assertIn("Partial timing", client.get("/").get_data(as_text=True))
+            detail = client.get(f"/trip/{key}").get_data(as_text=True)
+            self.assertIn("duration and average speed are unknown", detail)
+            self.assertIn("<b>—</b><span>avg mph</span>", detail)
+            self.assertNotIn(f"/trip/{key}", client.get("/?year=2026").get_data(as_text=True))
+            rows = list(csv.DictReader(io.StringIO(client.get("/export.csv").data.decode())))
+            row = next(row for row in rows if row["row_type"] == "trip")
+            self.assertEqual(row["timing_status"], "partial")
+            self.assertTrue(row["timed_from"].endswith("-07:00"))
+            for field in ("start_time", "end_time", "duration_minutes", "avg_speed_mph"):
+                self.assertEqual(row[field], "", field)
+            self.assertEqual(float(row["distance_miles"]), record["distance_miles"])
+            workbook = load_workbook(io.BytesIO(client.get("/export.xlsx").data))
+            try:
+                cells = dict(zip((c.value for c in workbook.active[1]), workbook.active[2]))
+                self.assertEqual(cells["timing_status"].value, "partial")
+                for field in ("start_time", "end_time", "duration_minutes", "avg_speed_mph"):
+                    self.assertIsNone(cells[field].value, field)
+                self.assertEqual(cells["distance_miles"].value, record["distance_miles"])
+            finally:
+                workbook.close()
+
     def test_untimed_month_boundary_retry_keeps_annotations_and_single_exported_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

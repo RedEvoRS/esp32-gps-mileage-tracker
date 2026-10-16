@@ -103,7 +103,7 @@ static void resetWorld() {
     gRmcTimeGP.begin(gps, "GPRMC", 1);
     gRmcDateGP.begin(gps, "GPRMC", 9);
     GPSSerial.rx.clear(); GPSSerial.rxPos = 0; GPSSerial.tx.clear();
-    gState = IDLE; gTripPath[0] = 0; gTripWriteFailed = false; gNeedNewSeg = false;
+    gState = IDLE; gTripPath[0] = 0; gTripWriteFailed = false;
     gPendCount = gPendHead = 0; armBufReset(); gHaveLastFix = false;
     gClockSet = false; gVbusLost = false;
     gGpsClockSet = false; gLastGpsSyncMs = 0;
@@ -323,6 +323,19 @@ int main(int argc, char** argv) {
         CHECK(gGpsClockSet && gClockSet && nowEpochMs() == 1776177000101ULL,
               "GPS source wins without waiting for an NTP timeout");
         CHECK(g_sntpStopCalls == 2 && g_sntpPolls == 1, "network task stops its SNTP attempt after GPS success");
+    }
+
+    printf("G12 the first fix after a GPS gap starts its own segment (#99)\n");
+    {
+        resetWorld(); run(15, 30);
+        gT += (SEG_GAP_MS / 1000) + 1;
+        run(15, 10); endTrip(false);
+        const std::string& d = g_disk.files.begin()->second;
+        size_t split = d.find("</trkseg><trkseg>");
+        CHECK(trkpts(d).size() == 40 && split != std::string::npos &&
+              d.find("</trkseg><trkseg>", split + 1) == std::string::npos &&
+              trkpts(d.substr(0, split)).size() == 30,
+              "real NMEA/loop path marks only the first post-gap fix");
     }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);

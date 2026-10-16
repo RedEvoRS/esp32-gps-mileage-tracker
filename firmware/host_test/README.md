@@ -17,8 +17,11 @@ There are two suites:
   write error, or a full filesystem. The trip state machine is driven
   directly with synthetic fixes. Regressions cover incomplete files ahead
   of complete uploads, long trips without UTC, and late UTC after untimed
-  writes. Network-cycle tests simulate AP scans,
-  connection failures, and HTTP responses to check retry backoff, recovery,
+  writes. Network-cycle tests simulate AP scans, connection failures, and
+  HTTP responses, including incomplete-only queues that keep the radio off.
+  Buffered
+  segment tests cover multiple gaps, ring wrap, and late UTC; a real-parser
+  regression also exercises the gap detection in `loop()`. Tests check retry backoff, recovery,
   the reset when a trip ends, scan cleanup, sleep holds, and clock
   wraparound. Boot tests inject mutex
   allocation failure and check that storage and workers never start.
