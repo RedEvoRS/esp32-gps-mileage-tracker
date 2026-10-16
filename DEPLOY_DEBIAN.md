@@ -807,7 +807,8 @@ Booleans are `true`/`false`; severity is `info`, `warning`, `error` or `critical
 Hold accepts 0–604800 seconds, repeat 1 second–8760 hours, cap an integer
 1–1000, and silence 1 second–36500 days. Fractional hours/days are allowed.
 Delivery requires an HTTP(S) topic URL without embedded credentials, query or
-fragment, plus a token. `MONITOR_ENABLED=false` idles without DB reads.
+fragment, ending in a 1–64 character topic (letters, digits, `_` or `-`), plus
+a token. `MONITOR_ENABLED=false` idles without DB reads.
 
 Silence **E7001 DEVICE_SILENT** reads "No contact for N days", bypasses the
 device-fault severity threshold and hold, and shares reminders and the cap.

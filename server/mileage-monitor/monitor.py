@@ -5,13 +5,16 @@ All mutable policy, queue, retry and rate-limit state belongs to monitor.db.
 """
 
 import json
+import ipaddress
 import logging
 import math
 import os
+import re
 import signal
 import sqlite3
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import closing
@@ -19,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from common.diagnostics import load_catalog, validate_device_id, validate_request
+from common.diagnostics import CatalogError, load_catalog, validate_device_id, validate_request
 
 
 LOG = logging.getLogger("mileage-monitor")
@@ -77,15 +80,25 @@ class Config:
         if notify:
             try:
                 parsed = urllib.parse.urlsplit(url)
+                host = parsed.hostname or ""
+                try:
+                    ipaddress.ip_address(host)
+                    valid_host = True
+                except ValueError:
+                    valid_host = bool(host and len(host) <= 253 and all(
+                        re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", label)
+                        for label in host.rstrip(".").split(".")))
                 valid = (parsed.scheme in ("http", "https") and parsed.hostname
+                         and valid_host
                          and parsed.port != 0 and parsed.username is None
                          and parsed.password is None and not parsed.query and not parsed.fragment
-                         and parsed.path.strip("/") and not any(c.isspace() for c in url))
+                         and re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", parsed.path.rsplit("/", 1)[-1])
+                         and not any(c.isspace() for c in url))
             except ValueError:
                 valid = False
             if not valid:
                 raise ValueError("NTFY_URL must be an http(s) topic URL without credentials, query or fragment")
-            if not token or any(not 33 <= ord(c) <= 126 for c in token):
+            if not token or token == "<token>" or any(not 33 <= ord(c) <= 126 for c in token):
                 raise ValueError("NTFY_TOKEN must be a nonempty access token without whitespace")
         return cls(enabled, notify, url, token, severity, hold, repeat, maximum, stale)
 
@@ -144,10 +157,14 @@ class NtfySender:
             self.config.url, body.encode("utf-8"), method="POST",
             headers={"Authorization": "Bearer " + self.config.token,
                      "Content-Type": "text/plain; charset=utf-8"})
-        with self.opener.open(request, timeout=10) as response:
-            if not 200 <= response.status < 300:
-                raise OSError("ntfy rejected delivery")
-            response.read(1024)
+        try:
+            with self.opener.open(request, timeout=10) as response:
+                if not 200 <= response.status < 300:
+                    raise OSError("ntfy rejected delivery")
+                response.read(1024)
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            raise
 
 
 SCHEMA = """
@@ -176,7 +193,10 @@ class Monitor:
     def __init__(self, config, events_path="/data/diagnostics/events.db",
                  state_path="/state/monitor.db", *, clock=time.time, sender=None, catalog=None):
         self.config = config
-        self.catalog = load_catalog() if catalog is None else catalog
+        try:
+            self.catalog = load_catalog() if catalog is None else catalog
+        except CatalogError as exc:
+            raise ValueError("Cannot start monitor: missing or invalid diagnostics catalog.json") from exc
         self.codes = {row["code"]: row for row in self.catalog["codes"]}
         self.events_path, self.state_path = Path(events_path), Path(state_path)
         if self.events_path.resolve() == self.state_path.resolve():
@@ -216,8 +236,10 @@ class Monitor:
         previous = {tuple(row[:3]): row[3] for row in db.execute(
             "SELECT device,code,episode,eligible_since FROM episodes WHERE state='active'")}
         db.execute("UPDATE episodes SET state='unknown', eligible_since=NULL WHERE state!='clear'")
+        clear_codes = set()
         for device in devices:
             name, contact = device["device_id"], device["contact"]
+            clear_codes.add((name, 7001))  # Per-episode contact comparison below.
             # A contact is recovery only when it is genuinely newer than the
             # contact on which this silence episode was based (not a clock jump).
             db.execute("UPDATE episodes SET state='clear', eligible_since=NULL "
@@ -231,11 +253,13 @@ class Monitor:
             revision = snapshot["status_sequence"]
             active = {item["code"]: item["episode_id"] for item in snapshot["active"]}
             for code in set(snapshot.get("observed", [])) - set(active):
+                clear_codes.add((name, code))
                 db.execute("UPDATE episodes SET state='clear', eligible_since=NULL "
                            "WHERE device=? AND code=? AND revision<?", (name, code, revision))
             for code, episode in active.items():
                 if self.eligible(code):
                     self._active(db, name, code, episode, revision, None, now, previous)
+        return clear_codes
 
     @staticmethod
     def _active(db, device, code, episode, revision, contact, now, previous):
@@ -246,12 +270,13 @@ class Monitor:
                    "revision=MAX(episodes.revision,excluded.revision) WHERE episodes.state!='clear'",
                    (device, code, episode, since if since is not None else now, revision, contact))
 
-    def _queue(self, db, now):
+    def _queue(self, db, now, clear_codes):
         desired = set()
         for row in db.execute("SELECT device,code,episode,state,eligible_since,alerted_at,"
                               "last_sent_at,resolved_at FROM episodes"):
             device, code, episode, state, since, alerted, last_sent, resolved = row
-            if state == "clear" and alerted is not None and resolved is None:
+            if (state == "clear" and (device, code) in clear_codes
+                    and alerted is not None and resolved is None):
                 desired.add((device, code, episode, "resolution"))
             elif state == "active" and self.eligible(code):
                 hold = 0 if code == 7001 or self.codes[code]["severity"] == "critical" else self.config.hold_seconds
@@ -297,8 +322,8 @@ class Monitor:
                     body = "Diagnostics digest\n\n" + body
                 return chosen, body
             db.execute("DELETE FROM outbox")
-        # Reserve the last available slot for a digest if a burst would exceed
-        # the rolling-hour budget. Queued overflow stays coalesced next hour.
+        # Coalesce a burst that cannot fit in the rolling-hour budget. Marked
+        # overflow stays coalesced when a slot opens in a later hour.
         overflow = len(work) > remaining or any(row[6] for row in work)
         if len(work) > remaining:
             db.execute("UPDATE work SET overflow=1")
@@ -334,8 +359,8 @@ class Monitor:
         now = self.clock()
         with closing(self._connect()) as db:
             with db:
-                self._reconcile(db, devices, now)
-                self._queue(db, now)
+                clear_codes = self._reconcile(db, devices, now)
+                self._queue(db, now, clear_codes)
                 db.execute("DELETE FROM deliveries WHERE sent_at<=?", (now - 3600,))
             while self.config.notify:
                 attempts, next_attempt = db.execute("SELECT attempts,next_attempt FROM retry WHERE singleton=1").fetchone()

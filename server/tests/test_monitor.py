@@ -40,14 +40,25 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(config.notify)
         self.assertEqual(config.stale_seconds, 7 * 86400)
 
+    def test_valid_delivery_config_and_nondefault_numbers(self):
+        for url in ("https://notify.example.com/topic", "http://localhost:8092/topic",
+                    "http://[::1]:8092/topic", "https://notify.example.com/prefix/topic"):
+            config = monitor.Config.from_env({"MONITOR_ENABLED": "true", "NOTIFY_ENABLED": "true",
+                "NTFY_URL": url, "NTFY_TOKEN": "test-token", "NOTIFY_HOLD_SECONDS": "0",
+                "NOTIFY_REPEAT_HOURS": "0.5", "NOTIFY_MAX_PER_HOUR": "1", "MONITOR_STALE_DAYS": "1.5"})
+            self.assertTrue(config.notify)
+            self.assertEqual(config.repeat_seconds, 1800)
+            self.assertEqual(config.stale_seconds, 129600)
+
     def test_bad_config_fails_without_echoing_values(self):
         baseline = {"MONITOR_ENABLED": "true", "NOTIFY_ENABLED": "true",
                     "NTFY_URL": "http://localhost/topic", "NTFY_TOKEN": "test-token"}
         cases = {"MONITOR_ENABLED": ["yes"], "NOTIFY_ENABLED": ["1"],
                  "NTFY_URL": ["", "ftp://host/topic", "https://host", "https://u:p@host/t",
                               "http://host/t?secret=value", "http://host/t#frag", "http://host:bad/t",
-                              "http://host:0/t", "http://host/\nt"],
-                 "NTFY_TOKEN": ["", "contains space", "bad\r\nheader", "\u00e9"],
+                              "http://host:0/t", "http://host/\nt", "http://<host>/topic",
+                              "http://host\\invalid/topic", "http://host/<topic>", "http://host/topic/"],
+                 "NTFY_TOKEN": ["", "<token>", "contains space", "bad\r\nheader", "\u00e9"],
                  "NOTIFY_MIN_SEVERITY": ["unknown"], "NOTIFY_HOLD_SECONDS": ["-1", "nan", "inf", "bad"],
                  "NOTIFY_REPEAT_HOURS": ["0", "-1"], "NOTIFY_MAX_PER_HOUR": ["0", "1.5", "1001"],
                  "MONITOR_STALE_DAYS": ["0", "-1", "nan", "36501"]}
@@ -60,6 +71,13 @@ class ConfigTests(unittest.TestCase):
         with mock.patch.object(monitor, "load_catalog", side_effect=ValueError("missing catalog")):
             with self.assertRaisesRegex(ValueError, "missing catalog"):
                 monitor.Monitor(monitor.Config())
+
+    def test_missing_catalog_file_is_a_clear_startup_error(self):
+        from common.diagnostics import catalog
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(catalog, "CATALOG_PATH", Path(root) / "absent.json"):
+                with self.assertRaisesRegex(ValueError, "missing or invalid diagnostics catalog.json"):
+                    monitor.Monitor(monitor.Config())
 
 
 class MonitorTests(unittest.TestCase):
@@ -268,6 +286,57 @@ class MonitorTests(unittest.TestCase):
         self.tick()
         self.assertEqual(len(self.messages), 2)
 
+    def test_deferred_resolution_requires_current_fresh_clear_evidence(self):
+        self.worker = self.make_monitor(max_per_hour=1)
+        self.snapshot(active=(4003,))
+        self.tick()
+        self.snapshot(active=(), observed=[4003])
+        self.tick()
+        self.assertEqual(len(self.messages), 1)  # cap defers resolution
+        self.snapshot(active=(), boot=OTHER_BOOT)
+        self.tick(3600)
+        self.assertEqual(len(self.messages), 1)  # unknown cannot deliver it
+        self.snapshot(active=(), observed=[4003], boot=OTHER_BOOT, at=self.now - 86401)
+        self.tick()
+        self.assertEqual(len(self.messages), 1)  # neither can stale clear evidence
+        self.snapshot(active=(), observed=[4003], boot=OTHER_BOOT)
+        self.tick()
+        self.assertIn("Resolved E4003", self.messages[-1])
+
+    def test_rate_cap_applies_to_resolution_and_survives_restart(self):
+        self.worker = self.make_monitor(max_per_hour=1)
+        self.snapshot(active=(4003,))
+        self.tick()
+        self.snapshot(active=(), observed=[4003])
+        self.tick(3599)
+        self.assertEqual(len(self.messages), 1)
+        self.worker = self.make_monitor(max_per_hour=1)
+        self.tick(1)
+        self.assertEqual(len(self.messages), 2)
+        self.assertIn("Diagnostics digest", self.messages[-1])
+        self.assertIn("Resolved", self.messages[-1])
+
+    def test_snapshot_rollback_cannot_resolve_alerted_episode(self):
+        self.snapshot(active=(4003,))
+        self.tick()
+        self.snapshot(active=(), observed=[4003])
+        snapshot = json.loads(self.sql("SELECT snapshot_json FROM devices")[0][0])
+        snapshot["status_sequence"] = 1
+        self.sql("UPDATE devices SET status_sequence=1,snapshot_json=?", (json.dumps(snapshot),))
+        self.tick()
+        self.assertEqual(len(self.messages), 1)
+
+    def test_locked_db_reports_unavailable_and_retries(self):
+        self.snapshot(active=(4003,))
+        with closing(sqlite3.connect(self.store.path)) as writer:
+            writer.execute("BEGIN EXCLUSIVE")
+            with self.assertLogs("mileage-monitor", "WARNING"):
+                self.assertFalse(self.tick())
+            writer.rollback()
+        self.assertEqual(self.messages, [])
+        self.tick()
+        self.assertEqual(len(self.messages), 1)
+
     def test_new_episode_gets_a_new_alert_without_reboot_recovery(self):
         self.snapshot(active=(4003,))
         self.tick()
@@ -417,6 +486,34 @@ class MonitorTests(unittest.TestCase):
 
 
 class NtfyHTTPTests(unittest.TestCase):
+    def test_redirect_cannot_forward_credentials(self):
+        received = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                received.append(self.path)
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(307)
+                self.send_header("Location", "/redirect-target")
+                self.end_headers()
+
+            def log_message(self, *_):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            sender = monitor.NtfySender(monitor.Config(
+                url=f"http://127.0.0.1:{server.server_port}/topic", token="test-token"))
+            with self.assertRaises(monitor.urllib.error.HTTPError):
+                sender("test message")
+            self.assertEqual(received, ["/topic"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
     def test_real_http_failure_backoff_then_delivery_and_token(self):
         received = []
         status = [503]

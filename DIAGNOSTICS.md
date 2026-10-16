@@ -579,7 +579,9 @@ as individual delayed alerts. Digests are split at 3500 UTF-8 bytes, below
 ntfy's default message limit; remaining entries stay queued. Recheck pending
 fault alerts/reminders against current fresh eligibility before retrying:
 withdraw them if they became unknown, stale, ineligible or clear. Never send a
-resolution for an alert with no recorded successful delivery. Retry failures
+resolution for an alert with no recorded successful delivery; a deferred fault
+resolution also requires the latest fresh snapshot to explicitly observe it
+clear. Retry failures
 globally after 60 seconds, doubling to at most 3600 seconds, so an ntfy outage
 does not cause one retry storm per condition. Posts have a ten-second timeout
 and do not follow redirects with the token. At-least-once duplicates after an
