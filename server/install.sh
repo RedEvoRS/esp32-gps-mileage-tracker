@@ -22,10 +22,11 @@
 #   Start           build, viewer login, start, wait for healthy (Step 5)
 #   End to end      upload sample.gpx, find it in the viewer and the
 #                   exports, then delete it again (Steps 6, 7)
-#   Notifications   optional ntfy, metrics, Graylog and Loki outputs, each
-#                   tested; the answers go to monitor.env (Step 11)
 #   Reboots         Docker comes back with the network (Step 9)
 #   Backups         off-host copy, restore test, daily timer (Step 10)
+#   Notifications   optional ntfy, metrics, Graylog and Loki outputs, last,
+#                   so an unreachable destination can't hold up the backups
+#                   above; the answers go to monitor.env (Step 11)
 # and finally the settings for the firmware's secrets.h (Step 8).
 #
 # Any question can be answered ahead of time with an INSTALL_<NAME>
@@ -1753,8 +1754,16 @@ setup_backups() {
 # The outputs, in the order they're offered. Each is switched on in
 # monitor.env, which MONITOR_ENV_FILE in .env points at; the monitor reads
 # that file when it starts (monitor.py Config.from_env). The only thing this
-# section writes to .env is that pointer. Answers are collected first, and
-# changes to containers or files only happen once they're all in.
+# section writes to .env is that pointer.
+#
+# The order of work: before the first question, monitor.env and the pointer
+# are created if they're missing, with every output off (ensure_monitor_file).
+# Then the questions. The one exception to "questions first" is the bundled
+# ntfy: it's started as soon as its user question is answered, because the
+# phone user is looked up in the running container. Nothing else changes until
+# every answer is in: then the phone user and token are made (prepare_ntfy),
+# monitor.env is written (write_monitor_settings), and containers are started
+# or stopped (apply_outputs).
 OUTPUT_NAMES=(ntfy metrics graylog loki)
 MONITOR_FILE=       # absolute path of monitor.env, from find_monitor_file
 MONITOR_CONFIGURED=no
@@ -1775,6 +1784,26 @@ PY_NTFY_HEALTH='import json, urllib.request
 with urllib.request.urlopen("http://ntfy:80/v1/health", timeout=10) as response:
     healthy = json.load(response).get("healthy") is True
 raise SystemExit(0 if healthy else 1)'
+
+# deny-all check: an anonymous read of the topic's cache, which changes
+# nothing. It must be refused (401 or 403). No credentials are sent, and a
+# redirect isn't followed.
+PY_NTFY_ANONYMOUS='import os, sys, urllib.error, urllib.request
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args):
+        return None
+opener = urllib.request.build_opener(NoRedirect())
+request = urllib.request.Request(os.environ["NTFY_URL"] + "/json?poll=1")
+try:
+    with opener.open(request, timeout=10) as response:
+        print("HTTP", response.status, "(anonymous read allowed)")
+        raise SystemExit(1)
+except urllib.error.HTTPError as exc:
+    print("HTTP", exc.code)
+    raise SystemExit(0 if exc.code in (401, 403) else 1)
+except OSError as exc:
+    print("no answer (" + type(exc).__name__ + ")")
+    raise SystemExit(1)'
 
 # A TCP connect to the host and port of NTFY_URL, GRAYLOG_GELF_URL,
 # GRAYLOG_GELF_TCP or LOKI_PUSH_URL, named as argv[1].
@@ -1853,13 +1882,20 @@ except OSError as exc:
     raise SystemExit(1)
 print("accepted")'
 
-# The value of KEY in monitor.env, without the single quotes that keep
-# Compose from reading its $ signs. Empty if unset.
+# The value of KEY in monitor.env, as the monitor will see it, for defaults,
+# kept secrets and mode decisions. One matching pair of quotes is removed
+# (Compose strips either kind, and a hand-written file may use double quotes).
+# A template placeholder such as <host> or <token>, which the example ships
+# with, counts as unset, and so does any value containing < or >: valid
+# answers never contain them (valid_secret and the URL and token checks
+# refuse them), so nothing real is lost. Empty if unset.
 mon_value() {
     local raw
     raw=$(env_raw "$1" "$2")
-    raw=${raw#\'}
-    raw=${raw%\'}
+    if (( ${#raw} >= 2 )) && { [[ $raw == \'*\' ]] || [[ $raw == \"*\" ]]; }; then
+        raw=${raw:1:${#raw}-2}
+    fi
+    if [[ $raw == *[\<\>]* ]]; then raw=; fi
     printf '%s' "$raw"
 }
 
@@ -2022,7 +2058,8 @@ valid_graylog_target() {
 # Free-form secrets go into monitor.env in single quotes, which Compose reads
 # literally (the viewer's hash works the same way). So they can't hold quotes,
 # backslashes, spaces or control characters.
-valid_secret() { [[ -n $1 && $1 =~ ^[!-~]+$ && $1 != *\'* && $1 != *\\* ]]; }
+# < and > are refused too: mon_value reads them as a template placeholder.
+valid_secret() { [[ -n $1 && $1 =~ ^[!-~]+$ && $1 != *\'* && $1 != *\\* && $1 != *[\<\>]* ]]; }
 valid_basic_user() { valid_secret "$1" && [[ $1 != *:* ]]; }
 valid_tenant() {
     [[ -z $1 || $1 == - ]] && return 0
@@ -2116,9 +2153,9 @@ ask_ntfy() {
     if [[ $NTFY_MODE_NEW == bundled ]]; then
         ask_bundled_ntfy "$current_url"
     else
-        ask_checked NTFY_URL_NEW NTFY_URL "Topic URL of the existing ntfy (https://<host>/<topic>)" \
+        ask_checked NTFY_URL_NEW NTFY_URL "Topic URL of the existing ntfy (its address, then the topic name)" \
             "$current_url" valid_ntfy_url \
-            "Use http(s)://host/<topic>, with a topic of letters, digits, _ or -, and no username, ? or #."
+            "Use http or https, the server's address, then the topic: letters, digits, _ or -, with no username, ? or #."
         keep=
         if [[ $current_url != http://ntfy:80/* ]]; then keep=$(mon_value "$MONITOR_FILE" NTFY_TOKEN); fi
         ask_secret_keep NTFY_TOKEN_NEW NTFY_TOKEN "Access token for that topic" "$keep" valid_ntfy_token \
@@ -2156,7 +2193,7 @@ ask_graylog() {
     current_tcp=$(mon_value "$MONITOR_FILE" GRAYLOG_GELF_TCP)
     note "Graylog runs on a server you control. Give the URL of a GELF HTTP input (preferred:" \
         "Graylog confirms each message), or host:port of a GELF TCP input."
-    ask_checked GRAYLOG_VALUE GRAYLOG_TARGET "GELF HTTP URL (http://<host>:12201/gelf) or TCP host:port" \
+    ask_checked GRAYLOG_VALUE GRAYLOG_TARGET "GELF HTTP URL (its address, ending in /gelf) or TCP host:port" \
         "${current_url:-$current_tcp}" valid_graylog_target \
         "Use http(s)://host:port/path, or host:port for TCP."
     case $GRAYLOG_VALUE in
@@ -2179,7 +2216,7 @@ ask_loki() {
         cur_auth=basic
     fi
     note "Loki is a log store you run; its push URL ends in /loki/api/v1/push."
-    ask_checked LOKI_URL_NEW LOKI_URL "Loki push URL (https://<host>/loki/api/v1/push)" "$cur_url" valid_loki_url \
+    ask_checked LOKI_URL_NEW LOKI_URL "Loki push URL (its address, ending in /loki/api/v1/push)" "$cur_url" valid_loki_url \
         "Use http(s)://host[:port]/loki/api/v1/push, with no username, ? or #."
     ask_checked LOKI_AUTH_NEW LOKI_AUTH "Loki login: none, bearer or basic" "$cur_auth" valid_loki_auth \
         "Answer none, bearer or basic."
@@ -2400,10 +2437,17 @@ write_monitor_settings() {
     fi
 }
 
-# Start or stop the containers to match monitor.env. Only the monitor and the
-# bundled ntfy are touched; the ingest and viewer are never restarted here.
+# Make the containers match monitor.env. Works from the file, not from this
+# run's answers, so it serves new answers and kept outputs alike. The bundled
+# ntfy is started if it's on. The monitor is brought up with --build, which
+# recreates it only when its image or settings changed (a re-run after new
+# server code therefore picks the code up). Nothing is sent by this function,
+# and the ingest and viewer are never restarted here.
 apply_outputs() {
-    if (( ${#CHOSEN[@]} )); then
+    if output_on ntfy && ntfy_bundled; then
+        start_bundled_ntfy
+    fi
+    if [[ -n $(outputs_on) ]]; then
         if [[ $(service_state mileage-monitor monitor) != running ]]; then
             check_port_free mileage-monitor 8093 monitor
         fi
@@ -2562,10 +2606,20 @@ check_outputs() {
             else
                 problem "The bundled ntfy isn't running" "Start it with: docker compose --profile ntfy up -d ntfy"
             fi
+            if grep -Eq '^auth-default-access:[[:space:]]*"?deny-all"?' "$SCRIPT_DIR/ntfy/server.yml" 2> /dev/null; then
+                ok "ntfy/server.yml sets auth-default-access to deny-all"
+            else
+                problem "ntfy/server.yml doesn't set auth-default-access to deny-all" \
+                    "Without it, ntfy may let anyone read the topics. Restore that setting, then: docker compose --profile ntfy up -d ntfy"
+            fi
             if [[ $monitor_ok == yes ]]; then
                 monitor_check "The bundled ntfy's health check passes from the monitor" \
                     "The bundled ntfy's health check fails from the monitor" \
                     "Its log: docker compose --profile ntfy logs ntfy" "$PY_NTFY_HEALTH"
+                monitor_check "The bundled ntfy refuses anonymous reads (deny-all)" \
+                    "The bundled ntfy answers anonymous reads, so anyone who can reach port 8092 can read the alerts" \
+                    "Check ntfy/server.yml has auth-default-access: \"deny-all\", then: docker compose --profile ntfy up -d ntfy" \
+                    "$PY_NTFY_ANONYMOUS"
             fi
         elif [[ $monitor_ok == yes ]]; then
             reach_check NTFY_URL "ntfy server"
@@ -2673,6 +2727,21 @@ send_tests() {
     if output_on metrics; then show_scrape_config; fi
 }
 
+# The bundled ntfy's HTTP server can take a moment after its container starts.
+# Wait (up to a minute) for its health check before the checks that need it;
+# if it still doesn't answer, check_outputs reports that.
+wait_for_bundled_ntfy() {
+    local deadline=$((SECONDS + 60))
+    if ! { output_on ntfy && ntfy_bundled; }; then return 0; fi
+    until compose --profile monitor exec -T mileage-monitor python -c "$PY_NTFY_HEALTH" \
+        < /dev/null > /dev/null 2>&1; do
+        if (( SECONDS >= deadline )); then return 0; fi
+        sleep 2
+    done
+}
+
+# Check mode only checks. Install mode asks, applies and checks; a kept set of
+# outputs is applied without any question and without any test being sent.
 setup_outputs() {
     section "Notifications"
     if [[ $MODE == check ]]; then
@@ -2686,6 +2755,9 @@ setup_outputs() {
         note "Notification outputs now: $(outputs_text "$current")"
         if confirm KEEP_OUTPUTS "Keep them as they are?" y; then
             ok "Kept the notification outputs"
+            apply_outputs
+            if [[ -n $(outputs_on) ]]; then wait_monitor_start; fi
+            wait_for_bundled_ntfy
             check_outputs
             return 0
         fi
@@ -2708,6 +2780,7 @@ setup_outputs() {
     apply_outputs
     if (( ${#CHOSEN[@]} )); then
         wait_monitor_start
+        wait_for_bundled_ntfy
         check_outputs
         send_tests
     else
@@ -2796,9 +2869,9 @@ main() {
     if verify_services; then
         verify_end_to_end || true
     fi
-    setup_outputs
     verify_reboots
     setup_backups
+    setup_outputs
     summary
 }
 

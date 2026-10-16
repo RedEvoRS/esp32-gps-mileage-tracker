@@ -57,7 +57,11 @@ HARNESS = textwrap.dedent("""\
                 if [[ " ${FAKE_RUNNING-} " == *" ${!#} "* ]]; then printf 'cid-%s\\n' "${!#}"; fi
                 return 0 ;;
             *" logs "*)
-                if [[ -n ${FAKE_LOGS+set} ]]; then printf '%s\\n' "$FAKE_LOGS"; else startup_line; fi
+                if [[ -n ${FAKE_LOGS+set} && ( ! -f $WORK/upped || -n ${FAKE_LOGS_ALWAYS-} ) ]]; then
+                    printf '%s\\n' "$FAKE_LOGS"
+                else
+                    startup_line
+                fi
                 return 0 ;;
             *"exec -T ntfy sh -c"*) cat > "$WORK/stdin.log"; return 0 ;;
             *"exec -T ntfy ntfy user list"*) printf '%s\\n' "${FAKE_USERS-}"; return 0 ;;
@@ -65,7 +69,7 @@ HARNESS = textwrap.dedent("""\
                 printf 'Created token %s for user\\n' "$FAKE_NTFY_TOKEN"; return 0 ;;
             *"exec -T ntfy ntfy access"*) return 0 ;;
             *"up -d ntfy"*) return 0 ;;
-            *"up -d --build"*) return "${FAKE_UP_RC:-0}" ;;
+            *"up -d --build"*) touch "$WORK/upped"; return "${FAKE_UP_RC:-0}" ;;
             *" stop "*) return 0 ;;
             *"exec -T mileage-monitor python -c"*) python_fake "$script"; return ;;
         esac
@@ -86,6 +90,8 @@ HARNESS = textwrap.dedent("""\
     # The Python run inside the monitor container, told apart by its text.
     python_fake() {
         case $1 in
+            *"poll=1"*)
+                printf '%s\n' "${FAKE_ANON_OUT:-HTTP 401}"; return "${FAKE_ANON_RC:-0}" ;;
             *"socket.create_connection"*)
                 if (( ${FAKE_REACH_RC:-0} )); then printf 'OSError\\n'; fi
                 return "${FAKE_REACH_RC:-0}" ;;
@@ -149,15 +155,17 @@ class InstallerOutputs(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
         (self.work / "grafana").mkdir()
         # Unix line endings, as preflight converts a Windows checkout to.
+        (self.work / "ntfy").mkdir()
         for source, target in (("monitor.env.example", "monitor.env.example"),
-                               ("grafana/prometheus-scrape.yml", "grafana/prometheus-scrape.yml")):
+                               ("grafana/prometheus-scrape.yml", "grafana/prometheus-scrape.yml"),
+                               ("ntfy/server.yml", "ntfy/server.yml")):
             text = (SERVER / source).read_text(encoding="utf-8")
             (self.work / target).write_text(text.replace("\r\n", "\n"), encoding="utf-8")
         self.env_file = self.work / ".env"
         self.env_file.write_text("INGEST_AUTH_TOKEN=" + "a" * 64 + "\nBIND_ADDR=\nDISPLAY_TZ=UTC\n")
         os.chmod(self.env_file, 0o600)
 
-    def run_step(self, answers="", mode="install", **fakes):
+    def run_step(self, answers="", mode="install", drop=(), **fakes):
         env = {key: value for key, value in os.environ.items() if not key.startswith(PRESET_PREFIX)}
         # Answers the tests don't care about, so no question waits for input.
         env.update({"INSTALL": str(INSTALL), "WORK": str(self.work), "FAKE_MODE": mode,
@@ -165,6 +173,8 @@ class InstallerOutputs(unittest.TestCase):
                     "INSTALL_STALE_DAYS": "7", "INSTALL_NOTIFY_MIN_SEVERITY": "error",
                     "INSTALL_LOKI_TENANT_ID": ""})
         env.update(fakes)
+        for key in drop:
+            env.pop(key, None)
         return subprocess.run(["bash", "-c", HARNESS], input=answers, env=env, cwd=self.work,
                               capture_output=True, text=True, timeout=60)
 
@@ -291,15 +301,62 @@ class InstallerOutputs(unittest.TestCase):
         self.assertIn("Skipped the ntfy test", result.stdout)
         self.assert_no_secret(result, NTFY_TOKEN, PHONE_PASSWORD)
 
-    def test_keep_yes_changes_nothing(self):
+    def test_keep_yes_applies_without_asking_or_sending(self):
         self.run_step(INSTALL_OUTPUTS="metrics", INSTALL_STALE_DAYS="7")
         before = {name: self.text(name) for name in ("monitor.env", ".env")}
         (self.work / "compose.log").unlink()
         result = self.run_step(INSTALL_KEEP_OUTPUTS="y")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Notification outputs now: metrics", result.stdout)
+        self.assertNotIn("Outputs to turn on", result.stdout)
+        self.assertNotIn("silence alert", result.stdout)
         self.assertEqual({name: self.text(name) for name in before}, before)
-        self.assertNotIn("up -d", self.compose_log())
+        self.assertIn("up -d --build --no-deps mileage-monitor", self.compose_log())
+        self.assertNotIn("up -d ntfy", self.compose_log())
+        self.assertIn("Metrics answer with the token (200)", result.stdout)
+        self.assertEqual(self.sent(), [])
+
+    def test_keep_yes_starts_the_bundled_ntfy_too(self):
+        setup = self.run_step(INSTALL_OUTPUTS="ntfy", INSTALL_NTFY_MODE="bundled", INSTALL_NTFY_TOPIC="mileage-tracker",
+                              INSTALL_NTFY_USER="mileage", INSTALL_NTFY_PASSWORD=PHONE_PASSWORD,
+                              INSTALL_NTFY_READY="n", FAKE_USERS="")
+        self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+        (self.work / "compose.log").unlink()
+        result = self.run_step(INSTALL_KEEP_OUTPUTS="y", FAKE_USERS="")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        log = self.compose_log()
+        self.assertIn("up -d ntfy", log)
+        self.assertIn("up -d --build --no-deps mileage-monitor", log)
+        self.assertNotIn("user add", log)
+        self.assertEqual(self.sent(), [])
+
+    def test_keep_yes_recreates_the_monitor_after_a_hand_edit(self):
+        # The monitor is running with the settings from before the owner added
+        # Graylog by hand. Keeping the outputs must apply that, not report it.
+        self.run_step(INSTALL_OUTPUTS="metrics", INSTALL_STALE_DAYS="7")
+        with (self.work / "monitor.env").open("a", encoding="utf-8") as handle:
+            handle.write("GRAYLOG_ENABLED=true\nGRAYLOG_GELF_URL=https://graylog.invalid/gelf\n")
+        (self.work / "upped").unlink(missing_ok=True)
+        (self.work / "compose.log").unlink()
+        result = self.run_step(
+            INSTALL_KEEP_OUTPUTS="y",
+            FAKE_LOGS="mileage-monitor  | 2026-10-16 INFO Monitor enabled; ntfy disabled, Graylog disabled, "
+                      "Prometheus enabled, Loki disabled")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("other settings than monitor.env", result.stdout)
+        self.assertIn("The monitor is running with the settings in monitor.env", result.stdout)
+        self.assertIn("up -d --build --no-deps mileage-monitor", self.compose_log())
+        self.assertEqual(self.sent(), [])
+
+    def test_keep_yes_with_outputs_none_stops_a_running_monitor_and_starts_nothing(self):
+        self.run_step(INSTALL_OUTPUTS="none")
+        (self.work / "compose.log").unlink()
+        result = self.run_step(INSTALL_KEEP_OUTPUTS="y")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Notification outputs: off", result.stdout)
+        log = self.compose_log()
+        self.assertNotIn("up -d", log)
+        self.assertIn("stop mileage-monitor", log)
         self.assertEqual(self.sent(), [])
 
     def test_keep_no_with_empty_secrets_keeps_the_existing_ones(self):
@@ -386,7 +443,7 @@ class InstallerOutputs(unittest.TestCase):
 
     def test_monitor_refusing_its_settings_stops_with_the_log_line(self):
         result = self.run_step(
-            INSTALL_OUTPUTS="metrics", INSTALL_STALE_DAYS="7",
+            INSTALL_OUTPUTS="metrics", INSTALL_STALE_DAYS="7", FAKE_LOGS_ALWAYS="1",
             FAKE_LOGS="mileage-monitor | ERROR Invalid monitor configuration: NTFY_URL must be a topic URL")
         self.assertEqual(result.returncode, 1)
         self.assertIn("The monitor refused the settings in monitor.env", result.stdout)
@@ -503,6 +560,86 @@ class InstallerOutputs(unittest.TestCase):
         self.assertIn("The monitor can't connect to the Graylog input", result.stdout)
         self.assertIn("FAILURES=1", result.stdout)
         self.assertEqual(self.sent(), ["gelf-test"])
+
+
+    def test_a_fresh_install_offers_bundled_and_shows_no_placeholder(self):
+        # The example's <host>, <topic> and <token> values must not become
+        # defaults. Every answer comes from stdin, in prompt order: mode, topic,
+        # user, password, password again, severity, phone ready, arrived.
+        answers = "\n\n\n" + f"{PHONE_PASSWORD}\n{PHONE_PASSWORD}\n" + "\n\n\n"
+        result = self.run_step(
+            answers=answers, INSTALL_OUTPUTS="ntfy", FAKE_USERS="",
+            drop=("INSTALL_NTFY_MODE", "INSTALL_NTFY_TOPIC", "INSTALL_NTFY_USER", "INSTALL_NTFY_PASSWORD",
+                  "INSTALL_NOTIFY_MIN_SEVERITY", "INSTALL_NTFY_READY", "INSTALL_NTFY_ARRIVED",
+                  "INSTALL_NTFY_URL", "INSTALL_NTFY_TOKEN"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("[bundled]", result.stdout)
+        self.assertNotIn("[existing]", result.stdout)
+        self.assertNotIn("<host>", result.stdout)
+        self.assertNotIn("<token>", result.stdout)
+        self.assertNotIn("<topic>", result.stdout)
+        self.assertNotIn("Enter keeps the current one", result.stdout)
+        self.assertEqual(self.setting("NTFY_URL"), "http://ntfy:80/mileage-tracker")
+
+    def test_the_graylog_question_offers_no_placeholder(self):
+        result = self.run_step(answers="\n", drop=("INSTALL_GRAYLOG_TARGET",), INSTALL_OUTPUTS="graylog")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("GELF HTTP URL", result.stdout)
+        self.assertNotIn("<host>", result.stdout)
+        self.assertNotIn("[http", result.stdout)
+
+    def test_bundled_ntfy_must_refuse_anonymous_reads(self):
+        setup = self.run_step(INSTALL_OUTPUTS="ntfy", INSTALL_NTFY_MODE="bundled",
+                              INSTALL_NTFY_TOPIC="mileage-tracker", INSTALL_NTFY_USER="mileage",
+                              INSTALL_NTFY_PASSWORD=PHONE_PASSWORD, INSTALL_NTFY_READY="n", FAKE_USERS="")
+        self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+        passed = self.run_step(mode="check")
+        self.assertEqual(passed.returncode, 0, passed.stdout + passed.stderr)
+        self.assertIn("The bundled ntfy refuses anonymous reads (deny-all)", passed.stdout)
+        self.assertIn("FAILURES=0", passed.stdout)
+
+        leaked = self.run_step(mode="check", FAKE_ANON_RC="1", FAKE_ANON_OUT="HTTP 200 (anonymous read allowed)")
+        self.assertIn("The bundled ntfy answers anonymous reads", leaked.stdout)
+        self.assertIn("HTTP 200 (anonymous read allowed)", leaked.stdout)
+        self.assertIn("FAILURES=1", leaked.stdout)
+
+        config = self.work / "ntfy" / "server.yml"
+        config.write_text(config.read_text(encoding="utf-8").replace('"deny-all"', '"allow-all"'), encoding="utf-8")
+        open_config = self.run_step(mode="check")
+        self.assertIn("ntfy/server.yml doesn't set auth-default-access to deny-all", open_config.stdout)
+        self.assertIn("FAILURES=1", open_config.stdout)
+        self.assertEqual(self.sent(), [])
+
+    def test_monitor_env_values_lose_one_matching_pair_of_quotes(self):
+        (self.work / "monitor.env").write_text(textwrap.dedent("""\
+            MONITOR_ENABLED="true"
+            NOTIFY_ENABLED='true'
+            NTFY_URL="http://ntfy:80/x"
+            NTFY_TOKEN=plain
+            A="it's"
+            B='"quoted"'
+            C="mismatched'
+            D=<host>
+            E="<token>"
+            F=""
+            """), encoding="utf-8")
+        snippet = textwrap.dedent("""\
+            source <(sed '$d' "$INSTALL")
+            SCRIPT_DIR=$WORK
+            cd "$WORK"
+            MONITOR_FILE=$WORK/monitor.env
+            for key in MONITOR_ENABLED NOTIFY_ENABLED NTFY_URL NTFY_TOKEN A B C D E F; do
+                printf '%s=[%s]\\n' "$key" "$(mon_value "$MONITOR_FILE" "$key")"
+            done
+            output_on ntfy && echo ntfy-on
+            """)
+        env = {**os.environ, "INSTALL": str(INSTALL), "WORK": str(self.work)}
+        result = subprocess.run(["bash", "-c", snippet], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            "MONITOR_ENABLED=[true]", "NOTIFY_ENABLED=[true]", "NTFY_URL=[http://ntfy:80/x]",
+            "NTFY_TOKEN=[plain]", "A=[it's]", 'B=["quoted"]', "C=[\"mismatched']",
+            "D=[]", "E=[]", "F=[]", "ntfy-on"])
 
 
 if __name__ == "__main__":
