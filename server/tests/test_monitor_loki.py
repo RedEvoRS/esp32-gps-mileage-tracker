@@ -12,10 +12,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
-from test_monitor import BOOT, monitor, store_module
+from test_monitor import BOOT, OTHER_BOOT, monitor, store_module
 from common.diagnostics import load_catalog
 
-loki = monitor.loki
+loki = monitor.loki_module
 PUSH_URL = "http://127.0.0.1:3100/loki/api/v1/push"
 HTTP = loki.LokiConfig(enabled=True, url=PUSH_URL, bearer_token="loki-test-token", tenant="test-tenant")
 
@@ -109,6 +109,21 @@ class LokiLineTests(unittest.TestCase):
         self.assertEqual(body["decision"], "resolution")
         self.assertIsNone(loki.decision_log(self.codes, (1, 1, "tracker-1", 9999, "alert")))
 
+    def test_condition_change_line_uses_current_catalog_state(self):
+        labels, stamp, line = loki.condition_log(
+            self.codes, "tracker-1", 4003, "active", 1800000000.25)
+        body = json.loads(line)
+        self.assertEqual(labels, ("tracker-1", "critical"))
+        self.assertEqual(stamp, 1800000000250000000)
+        self.assertEqual((body["kind"], body["device_id"], body["code"], body["state"]),
+                         ("condition_change", "tracker-1", 4003, "active"))
+        self.assertEqual(body["title"], self.codes[4003]["title"])
+        unknown = json.loads(loki.condition_log(
+            self.codes, "tracker-1", 4003, "unknown", 1800000000.25)[2])
+        self.assertEqual(unknown["state"], "unknown")
+        self.assertIsNone(loki.condition_log(self.codes, "tracker-1", 4003, "raise", 1))
+        self.assertIsNone(loki.condition_log(self.codes, "tracker-1", 9999, "active", 1))
+
     def test_each_stream_is_sorted_and_timestamps_advance_past_previous(self):
         items = [(("tracker-1", "critical"), 300, '{"line":"late"}'),
                  (("tracker-1", "critical"), 100, '{"line":"early"}'),
@@ -155,6 +170,20 @@ class LokiPolicyTests(unittest.TestCase):
         self.graylog.extend(json.loads(payload.decode("ascii")) for payload in payloads)
         return len(payloads)
 
+    def serve_loki(self, statuses, response_body=b""):
+        handler = type("Handler", (LokiReceiver,), {
+            "status": 204, "statuses": list(statuses), "received": [],
+            "response_body": response_body})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}/loki/api/v1/push"
+        sender = loki.transport(loki.LokiConfig(enabled=True, url=url, bearer_token="loki-test-token"))
+        return handler, sender, url
+
     def sql(self, sql, parameters=(), *, state=False):
         with closing(sqlite3.connect(self.state if state else self.store.path)) as db:
             with db:
@@ -193,31 +222,90 @@ class LokiPolicyTests(unittest.TestCase):
         self.post(events=[(4005, "raise", {"backend": "sd", "free_bytes": 0}),
                           (1000, "notice", {})])
         entries = self.tick()
-        self.assertEqual(len(entries), 2)
+        events = [entry for entry in entries if entry[1].get("kind") == "event"]
+        conditions = [entry for entry in entries if entry[1].get("kind") == "condition_change"]
+        self.assertEqual(len(events), 2)
+        self.assertTrue(conditions)
         self.assertEqual({entry[0]["job"] for entry in entries}, {"mileage-tracker"})
         self.assertEqual({frozenset(entry[0]) for entry in entries},
                          {frozenset(("job", "device_id", "severity"))})
-        self.assertEqual({entry[1]["kind"] for entry in entries}, {"event"})
+        self.assertEqual({entry[1]["kind"] for entry in events}, {"event"})
         self.assertEqual(self.sql("SELECT event_rowid FROM loki_cursor", state=True), [(2,)])
         self.assertEqual(self.sql("SELECT event_rowid FROM gelf_cursor", state=True), [(0,)])
         self.assertEqual(self.tick(60), [])
         self.worker = self.make_monitor()
         self.assertEqual(self.tick(60), [])
 
+    def test_condition_changes_are_independent_of_ntfy_and_deduplicated_across_wakes(self):
+        self.post(active=(4003,), observed=[4003])
+        first = self.tick()
+        active = [entry[1] for entry in first
+                  if entry[1].get("kind") == "condition_change" and entry[1].get("code") == 4003]
+        self.assertEqual([entry["state"] for entry in active], ["active"])
+        self.assertFalse(self.ntfy)
+
+        self.assertEqual(self.tick(60), [])
+        self.post(active=(4003,), observed=[4003], boot=OTHER_BOOT)
+        repeated = self.tick(60)
+        self.assertFalse([entry for _, entry, _ in repeated
+                          if entry.get("kind") == "condition_change" and entry.get("code") == 4003])
+
+        self.post(active=(), observed=[4003])
+        cleared = self.tick(60)
+        changes = [entry[1] for entry in cleared
+                   if entry[1].get("kind") == "condition_change" and entry[1].get("code") == 4003]
+        self.assertEqual([entry["state"] for entry in changes], ["clear"])
+        self.assertFalse(self.ntfy)
+        self.assertEqual(self.sql("SELECT state FROM loki_conditions WHERE device='tracker-1' AND code=4003",
+                                  state=True), [("clear",)])
+
+    def test_stale_snapshot_emits_unknown_condition_change(self):
+        self.post(active=(4003,), observed=[4003])
+        self.tick()
+        stale_at = datetime.fromtimestamp(
+            self.now - monitor.SNAPSHOT_MAX_AGE_SECONDS - 1, timezone.utc).isoformat()
+        self.sql("UPDATE devices SET snapshot_received_at=?", (stale_at,))
+        unknown = self.tick(60)
+        changes = [entry[1] for entry in unknown
+                   if entry[1].get("kind") == "condition_change" and entry[1].get("code") == 4003]
+        self.assertEqual([entry["state"] for entry in changes], ["unknown"])
+        self.assertFalse(self.ntfy)
+
+    def test_silence_and_recovery_condition_changes_are_forwarded_once(self):
+        self.post(observed=[])
+        silent_at = datetime.fromtimestamp(
+            self.now - self.worker.config.stale_seconds - 1, timezone.utc).isoformat()
+        self.sql("UPDATE devices SET last_contact_at=?", (silent_at,))
+        active = self.tick()
+        silence = [entry[1] for entry in active
+                   if entry[1].get("kind") == "condition_change" and entry[1].get("code") == 7001]
+        self.assertEqual([entry["state"] for entry in silence], ["active"])
+        self.assertFalse(self.ntfy)
+
+        self.post(observed=[])
+        recovered = self.tick(60)
+        recovery = [entry[1] for entry in recovered
+                    if entry[1].get("kind") == "condition_change" and entry[1].get("code") == 7001]
+        self.assertEqual([entry["state"] for entry in recovery], ["clear"])
+        self.assertFalse(self.ntfy)
+
     def test_successful_alert_and_resolution_are_pushed_as_decisions(self):
         self.worker = self.make_monitor(notify=True)
         self.post(active=(4003,), observed=[4003])
         alert = self.tick()
-        self.assertEqual([entry[1]["decision"] for entry in alert], ["alert"])
+        decisions = [entry[1] for entry in alert if entry[1].get("kind") == "alert_decision"]
+        self.assertEqual([entry["decision"] for entry in decisions], ["alert"])
         self.post(active=(), observed=[4003])
         resolution = self.tick(60)
-        self.assertEqual([entry[1]["decision"] for entry in resolution], ["resolution"])
+        decisions = [entry[1] for entry in resolution if entry[1].get("kind") == "alert_decision"]
+        self.assertEqual([entry["decision"] for entry in decisions], ["resolution"])
         self.assertEqual(self.sql("SELECT COUNT(*) FROM loki_decisions", state=True), [(0,)])
         self.assertEqual(self.sql("SELECT decision_id FROM loki_cursor", state=True), [(2,)])
 
     def test_restored_events_db_resets_only_loki_cursor_and_resends(self):
         self.post(events=[(1000, "notice", {})] * 3)
-        self.assertEqual(len(self.tick()), 3)
+        first = self.tick()
+        self.assertEqual(sum(entry[1].get("kind") == "event" for entry in first), 3)
         self.sql("UPDATE gelf_cursor SET event_rowid=77", state=True)
         self.sql("DELETE FROM events WHERE sequence>1")
         with self.assertLogs("mileage-monitor", "WARNING") as logs:
@@ -225,19 +313,73 @@ class LokiPolicyTests(unittest.TestCase):
         self.assertIn("Loki cursor", logs.output[0])
         self.assertEqual(self.sql("SELECT event_rowid FROM loki_cursor", state=True), [(0,)])
         self.assertEqual(self.sql("SELECT event_rowid FROM gelf_cursor", state=True), [(77,)])
-        self.assertEqual(len(self.tick(60)), 1)
+        resent = self.tick(60)
+        self.assertEqual(sum(entry[1].get("kind") == "event" for entry in resent), 1)
 
     def test_existing_monitor_state_adds_loki_tables_to_schema_v1(self):
         state = self.root / "legacy.db"
         monitor.Monitor(monitor.Config(enabled=True), self.store.path, state, catalog=self.catalog)
         with closing(sqlite3.connect(state)) as db, db:
-            for table in ("loki_cursor", "loki_retry", "loki_decisions", "loki_streams"):
+            for table in ("loki_cursor", "loki_retry", "loki_decisions", "loki_conditions", "loki_streams"):
                 db.execute("DROP TABLE " + table)
         monitor.Monitor(monitor.Config(enabled=True, loki=HTTP), self.store.path, state,
                         catalog=self.catalog, loki_sender=self.capture_loki)
         with closing(sqlite3.connect(state)) as db:
             self.assertEqual(db.execute("SELECT event_rowid,decision_id FROM loki_cursor").fetchall(), [(0, 0)])
             self.assertEqual(db.execute("SELECT attempts,next_attempt FROM loki_retry").fetchall(), [(0, 0.0)])
+            self.assertIsNotNone(db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='loki_conditions'").fetchone())
+
+    def test_permanent_400_skips_batch_and_later_rows_still_deliver(self):
+        handler, sender, url = self.serve_loki([400, 204], b"private rejection details")
+        self.worker = self.make_monitor(loki_sender=sender)
+        self.post(events=[(1000, "notice", {})])
+        with self.assertLogs("mileage-monitor", "WARNING") as logs:
+            self.assertTrue(self.worker.tick())
+        text = "\n".join(logs.output)
+        self.assertIn("400", text)
+        self.assertNotIn(url, text)
+        self.assertNotIn("private rejection details", text)
+        self.assertEqual(self.sql("SELECT event_rowid,decision_id FROM loki_cursor", state=True), [(1, 0)])
+        self.assertEqual(self.sql("SELECT attempts,next_attempt FROM loki_retry", state=True), [(0, 0.0)])
+
+        self.post(events=[(1000, "notice", {})])
+        self.tick(60)
+        self.assertEqual(len(handler.received), 2)
+        streams = json.loads(handler.received[1][1])["streams"]
+        lines = [json.loads(line) for stream in streams for _, line in stream["values"]]
+        self.assertEqual([line["sequence"] for line in lines if line.get("kind") == "event"], [2])
+        self.assertEqual(self.sql("SELECT event_rowid FROM loki_cursor", state=True), [(2,)])
+
+    def assert_transient_status_retries(self, status):
+        handler, sender, _ = self.serve_loki([status, 204])
+        self.worker = self.make_monitor(loki_sender=sender)
+        self.post(events=[(1000, "notice", {})])
+        with self.assertLogs("mileage-monitor", "WARNING"):
+            self.assertTrue(self.worker.tick())
+        self.assertEqual(len(handler.received), 1)
+        self.assertEqual(self.sql("SELECT event_rowid FROM loki_cursor", state=True), [(0,)])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM loki_conditions", state=True), [(0,)])
+        self.assertEqual(self.sql("SELECT attempts,next_attempt FROM loki_retry", state=True),
+                         [(1, self.now + 60)])
+
+        self.assertEqual(self.tick(59), [])
+        self.assertEqual(len(handler.received), 1)
+        self.assertEqual(self.sql("SELECT event_rowid FROM loki_cursor", state=True), [(0,)])
+        self.assertEqual(self.tick(1), [])
+        self.assertEqual(len(handler.received), 2)
+        self.assertEqual(self.sql("SELECT event_rowid FROM loki_cursor", state=True), [(1,)])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM loki_conditions", state=True), [(1,)])
+        self.assertEqual(self.sql("SELECT attempts,next_attempt FROM loki_retry", state=True), [(0, 0.0)])
+
+    def test_http_500_backs_off_without_advancing_cursors(self):
+        self.assert_transient_status_retries(500)
+
+    def test_http_408_backs_off_without_advancing_cursors(self):
+        self.assert_transient_status_retries(408)
+
+    def test_http_429_backs_off_without_advancing_cursors(self):
+        self.assert_transient_status_retries(429)
 
     def test_loki_failure_does_not_prevent_ntfy_or_gelf_and_retries(self):
         self.worker = self.make_monitor(notify=True, graylog=True,
@@ -268,7 +410,7 @@ class LokiPolicyTests(unittest.TestCase):
         self.worker = self.make_monitor()
         entries = self.tick(1)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(len(entries), 1)
+        self.assertEqual(sum(entry[1].get("kind") == "event" for entry in entries), 1)
         self.assertEqual(self.sql("SELECT attempts,next_attempt FROM loki_retry", state=True), [(0, 0.0)])
 
     def test_events_db_is_never_written(self):
@@ -280,16 +422,23 @@ class LokiPolicyTests(unittest.TestCase):
 
 class LokiReceiver(BaseHTTPRequestHandler):
     status = 204
+    statuses = []
+    response_body = b""
     received = []
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         type(self).received.append((dict(self.headers), body, self.path))
-        self.send_response(self.status)
-        if self.status == 302:
+        statuses = type(self).statuses
+        status = statuses.pop(0) if statuses else type(self).status
+        self.send_response(status)
+        if status == 302:
             self.send_header("Location", "http://127.0.0.1:1/elsewhere")
-        self.send_header("Content-Length", "0")
+        response_body = type(self).response_body
+        self.send_header("Content-Length", str(len(response_body)))
         self.end_headers()
+        if response_body:
+            self.wfile.write(response_body)
 
     def log_message(self, *_):
         pass
@@ -319,11 +468,19 @@ class LokiTransportTests(unittest.TestCase):
         self.assertEqual(headers["Content-Type"], "application/json")
 
     def test_http_error_and_redirect_are_failures_without_following(self):
-        for status in (500, 302):
+        for status in (500, 302, 408, 429):
             handler, url = self.serve(status)
             with self.subTest(status=status), self.assertRaises(urllib.error.HTTPError):
                 loki.transport(loki.LokiConfig(enabled=True, url=url))(b'{"streams":[]}')
             self.assertEqual(len(handler.received), 1)
+
+    def test_http_400_raises_status_only_permanent_rejection(self):
+        handler, url = self.serve(400)
+        with self.assertRaises(loki.PermanentRejection) as caught:
+            loki.transport(loki.LokiConfig(enabled=True, url=url))(b'{"streams":[]}')
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertEqual(str(caught.exception), "400")
+        self.assertEqual(len(handler.received), 1)
 
 
 if __name__ == "__main__":

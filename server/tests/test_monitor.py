@@ -127,13 +127,25 @@ class PrometheusEndpointTests(unittest.TestCase):
         self.assertIn('decision="active"} 1', body)
         self.assertIn('decision="sent"} 2', body)
         self.assertIn('decision="resolved"} 1', body)
+        self.assertIn("# HELP mileage_tracker_alert_decisions ntfy delivery state:", body)
         self.assertIn("mileage_tracker_monitor_stale_after_seconds 604800", body)
         for forbidden in ("ssid", "<ssid>", "free_text", "<context>", "coordinates", "<coordinates>"):
             self.assertNotIn(forbidden, body)
 
+    def test_fault_alert_uses_current_condition_state_not_ntfy_delivery(self):
+        rules = (SERVER / "grafana/alert-rules.yml").read_text(encoding="utf-8")
+        marker = "      - alert: TrackerActiveErrorOrCriticalFault\n"
+        self.assertIn(marker, rules)
+        fault_rule = rules.split(marker, 1)[1].split("      - alert:", 1)[0]
+        self.assertIn(
+            'expr: mileage_tracker_condition_state{state="active",severity=~"error|critical"} == 1',
+            fault_rule)
+        self.assertNotIn("mileage_tracker_alert_decisions", fault_rule)
+
     def test_http_requires_bearer_token_and_serves_prometheus_text(self):
         token = "m" * 32
         server = monitor.prometheus.make_server(self.snapshot, token, "127.0.0.1", 0)
+        self.assertEqual(server.RequestHandlerClass.timeout, 10)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(thread.join, 5)

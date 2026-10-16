@@ -189,15 +189,20 @@ firmware hasn't been road-tested.
 - Optional Prometheus metrics (#134, `prometheus.py`): `METRICS_ENABLED=true`
   plus a separate token of at least 32 printable ASCII characters in
   `monitor.env`. `/metrics` publishes on `BIND_ADDR` port 8093 with bearer auth.
-  The HTTP thread serves the latest published snapshot and never queries SQLite.
-  Importable scrape config, Tracker health dashboard and alert examples are in
-  `server/grafana/`; setup is DEPLOY_DEBIAN Step 11e.
+  The HTTP thread serves the latest published snapshot with a 10-second request
+  timeout and never queries SQLite. The Grafana fault rule reads current
+  `condition_state`; `alert_decisions` reports ntfy delivery state and works
+  only as delivery history. Importable scrape config, Tracker health dashboard
+  and alert examples are in `server/grafana/`; setup is DEPLOY_DEBIAN Step 11e.
 - Optional Loki push (#136, `loki.py`): a nonempty `LOKI_PUSH_URL` enables
-  JSON event lines and successful alert/reminder/resolution decisions. Labels
-  stay fixed (`job`, validated `device_id`, catalog severity); the independent
-  cursor resets on a lower restored events.db rowid, timestamps remain ordered
-  per stream, and retries never affect ntfy or GELF. Tables are additive to
-  monitor schema v1. Setup and LogQL examples: DEPLOY_DEBIAN Step 11f.
+  JSON event lines, per-device/code condition changes (active/clear/unknown,
+  including E7001 silence and recovery) independent of ntfy, and successful
+  ntfy alert/reminder/resolution decisions. Fixed labels are `job`, validated
+  `device_id` and catalog severity. The independent event cursor resets on a
+  lower restored events.db rowid; timestamps remain ordered per stream. Network
+  failures, 408, 429 and 5xx retry; other HTTP 4xx rejections skip the batch and
+  advance its cursors. The condition table and cursor are additive to monitor
+  schema v1. Setup and LogQL examples: DEPLOY_DEBIAN Step 11f.
 - Port binding: `BIND_ADDR` in `.env` sets the host IP published ports bind
   on (unset = all interfaces). UFW does not filter Docker-published ports,
   so the bind address is the LAN-only control (`DEPLOY_DEBIAN.md` Step 7)

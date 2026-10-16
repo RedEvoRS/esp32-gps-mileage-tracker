@@ -810,7 +810,7 @@ Once started, their restart policies also bring them back on reboot.
 | `MONITOR_STALE_DAYS` | `7` | No-contact threshold, using server receipt time including identified GPX uploads |
 | `METRICS_ENABLED` | `false` | Start token-protected Prometheus `/metrics` on port 8093 |
 | `METRICS_TOKEN` | unset | Separate 32+ character bearer token, required when metrics are enabled |
-| `LOKI_PUSH_URL` | blank | Enable event and delivered-decision pushes to an external Loki |
+| `LOKI_PUSH_URL` | blank | Enable event and condition-change pushes plus ntfy-delivered decisions to external Loki |
 | `LOKI_BASIC_AUTH_*`, `LOKI_BEARER_TOKEN` | blank | Choose basic or bearer auth for Loki, never both |
 | `LOKI_TENANT_ID` | blank | Optional value for Loki's `X-Scope-OrgID` header |
 
@@ -999,10 +999,12 @@ unset METRICS_TEST_TOKEN
 An authenticated request returns Prometheus text; missing or incorrect tokens
 return 401. Import [`grafana/tracker-health.json`](server/grafana/tracker-health.json)
 in Grafana and select the Prometheus data source. The starter alert expressions
-are in [`grafana/alert-rules.yml`](server/grafana/alert-rules.yml); they cover
-active error/critical alerts and contact age at the configured
-`MONITOR_STALE_DAYS` threshold. The HTTP thread serves the monitor's latest
-published snapshot and does not query SQLite during scrapes.
+are in [`grafana/alert-rules.yml`](server/grafana/alert-rules.yml); the
+error/critical rule reads `mileage_tracker_condition_state` and works with
+`NOTIFY_ENABLED=false`. `mileage_tracker_alert_decisions` is ntfy delivery
+state, so it can remain zero when ntfy is off. The no-contact rule uses the
+configured `MONITOR_STALE_DAYS` threshold. The HTTP thread serves the monitor's
+latest published snapshot and does not query SQLite during scrapes.
 
 To stop exposing metrics, set `METRICS_ENABLED=false` and reapply the monitor
 profile. Keep the separate token private; it is not the ingest token.
@@ -1044,11 +1046,20 @@ docker compose logs --tail 30 mileage-monitor
 
 The startup line should say `Loki enabled`; once it has new records, the log
 reports how many lines Loki accepted. On first enable, the separate persisted
-cursor starts at rowid zero and the monitor sends stored event history in
-batches of at most 200 per tick. It also pushes each alert, reminder or
-resolution that ntfy successfully accepted while Loki was enabled. If ntfy is
-disabled, no notification decisions are produced, but diagnostic events still
-flow to Loki.
+event cursor starts at rowid zero, so stored history is sent in batches of at
+most 200 lines per tick without an age filter. Loki may reject history older
+than its configured retention window. A permanent HTTP 4xx rejection other
+than 408 or 429 skips the entire rejected batch and advances its cursors; that
+history is not retried, and later batches continue. Network failures, 408, 429
+and 5xx responses back off and retry without advancing the cursors.
+
+Loki also receives one `condition_change` line when a device/code condition
+changes to active, clear or unknown, including E7001 silence and recovery.
+This state-change export is independent of `NOTIFY_ENABLED` and is deduplicated
+across repeated check-ins and deep-sleep wakes. Successful ntfy alerts,
+reminders and resolutions remain separate `alert_decision` lines; those lines
+exist only for notifications ntfy accepted while Loki was enabled. With ntfy
+off, diagnostic events and condition changes still flow to Loki.
 
 Each line is JSON. Loki stream labels are only `job=mileage-tracker`, validated
 `device_id`, and current-catalog `severity`; context and other fields stay in
@@ -1063,9 +1074,11 @@ GELF's cursor and progress are unchanged.
 
 Import [`grafana/loki-panel.json`](server/grafana/loki-panel.json) after adding
 your external Loki data source. [`grafana/loki-alerts.md`](server/grafana/loki-alerts.md)
-contains LogQL examples for new alert and resolution decisions. They alert on
-decision lines in a short time window; use the Prometheus rule from Step 11e
-when you need the monitor's current active condition or no-contact state.
+uses condition-change lines for its primary error/critical alert, so it works
+with ntfy off. Those LogQL rules detect transitions in a recent time window;
+the Prometheus rule from Step 11e reads the current active condition state and
+the configured no-contact state. Delivered-decision LogQL examples are
+separate and apply only when ntfy is enabled.
 
 To pause the sink, blank `LOKI_PUSH_URL` and reapply the monitor profile. Its
 cursor and pending decisions stay in `monitor-state`; when re-enabled, it

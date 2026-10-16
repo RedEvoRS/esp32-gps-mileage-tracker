@@ -30,7 +30,7 @@
         "wrapLogMessage": true
       },
       "targets": [{"expr": "{job=\"mileage-tracker\"} | json", "refId": "A"}],
-      "title": "Tracker events and alert decisions",
+      "title": "Tracker events, condition changes and ntfy decisions",
       "type": "logs"
     }
   ],

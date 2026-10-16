@@ -206,7 +206,7 @@ class MetricsSnapshot:
                                               ("severity", definition["severity"]),
                                               ("decision", decision)), str(counts[decision])))
         family("mileage_tracker_alert_decisions",
-               "Monitor alert episodes active, sent at least once, or resolved by an explicit clear.",
+               "ntfy delivery state: episodes active after delivery, sent at least once, or resolved after delivery.",
                "gauge", alert_samples)
         family("mileage_tracker_db_read_errors_total", "Monitor diagnostics or state database read failures.",
                "counter", [f"mileage_tracker_db_read_errors_total {read_errors}"])
@@ -221,6 +221,8 @@ class MetricsSnapshot:
 
 def make_server(snapshot, token, host="0.0.0.0", port=PORT):
     class Handler(BaseHTTPRequestHandler):
+        timeout = 10
+
         def do_GET(self):
             if self.path != "/metrics":
                 self.send_error(404)

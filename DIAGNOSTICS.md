@@ -702,31 +702,39 @@ but not both. `LOKI_TENANT_ID` sets `X-Scope-OrgID`. Credentials are not
 accepted in the URL. Setup and sample LogQL are in
 [DEPLOY_DEBIAN.md Step 11f](DEPLOY_DEBIAN.md#11f--optional-push-to-external-loki).
 
-Each new `events.db` row becomes one JSON log line; each successful ntfy
-alert, reminder or resolution becomes one `alert_decision` line. A decision
-line records only the catalog title/symbol/severity, code, validated device ID
-and decision. Event lines use the current catalog fields and only context
-fields allowed for that event's code; they never carry free text, coordinates,
-SSIDs or credentials. Loki streams have exactly three labels: fixed
-`job=mileage-tracker`, validated `device_id`, and current catalog `severity`.
-All other fields stay in the JSON line to keep label cardinality low.
+Each new `events.db` row becomes one JSON log line. A `condition_change` line
+is sent when a device/code condition changes to active, clear or unknown,
+including E7001 silence and recovery. `loki_conditions` stores the last state
+per device/code, so persistent faults do not repeat on deep-sleep wakes. These
+condition changes are independent of `NOTIFY_ENABLED`. Each successful ntfy
+alert, reminder or resolution remains a separate `alert_decision` line; it
+records only the catalog title/symbol/severity, code, validated device ID and
+decision, and exists only when ntfy accepted the notification. Event lines use
+the current catalog fields and only context fields allowed for that event's
+code; they never carry free text, coordinates, SSIDs or credentials. Loki
+streams have exactly three labels: fixed `job=mileage-tracker`, validated
+`device_id`, and current catalog `severity`. All other fields stay in the JSON
+line to keep label cardinality low.
 
 `loki_cursor` keeps event rowid and delivered-decision progress independently
-from GELF. The outbox, retry state and per-stream timestamp watermark are also
-stored in additive tables in monitor schema v1. Each tick reads up to 200 new
-events and 200 decisions. Lines are sorted by timestamp within each label set;
-if an event timestamp ties or predates one already sent for that stream, its
-Loki entry timestamp is advanced by one nanosecond. The original server receipt
-time remains in the JSON line. This avoids Loki rejecting out-of-order writes.
+from GELF. The condition state, retry state and per-stream timestamp watermark
+are also stored in additive tables in monitor schema v1. The first enable has
+no age filter: each tick sends up to 200 total condition changes, events and
+delivered decisions. Lines are sorted by timestamp within each label set; if
+an event timestamp ties or predates one already sent for that stream, its Loki
+entry timestamp is advanced by one nanosecond. The original server receipt time
+remains in the JSON line.
 
 The monitor uses one HTTP push with a ten-second timeout and never follows
-redirects. Failed pushes back off from 60 seconds to one hour. A successful
-HTTP response advances both Loki cursors; an ambiguous response can be retried
-and duplicated. If `events.db` is restored with a lower rowid than Loki's
-cursor, only the Loki event cursor resets and that history is sent again.
-Loki runs after ntfy and GELF; its failures are caught separately and do not
-change either sink's progress or trip uploads. Decision lines exist only for
-actions that ntfy successfully accepted while Loki was enabled.
+redirects. Network failures, HTTP 408, HTTP 429 and 5xx responses back off
+from 60 seconds to one hour without advancing the batch. A permanent HTTP 4xx
+other than 408 or 429 logs only the status code, skips the rejected batch and
+advances its cursors; that history is not retried, and later rows continue.
+Successful pushes advance the batch; an ambiguous response can be retried and
+duplicated. If `events.db` is restored with a lower rowid than Loki's cursor,
+only the Loki event cursor resets and that history is sent again. Loki runs
+after ntfy and GELF; its failures are caught separately and do not change
+either sink's progress or trip uploads.
 
 ## Backups and acceptance (#129/#130)
 

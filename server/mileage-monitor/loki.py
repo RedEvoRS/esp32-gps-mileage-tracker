@@ -21,6 +21,16 @@ MAX_PER_TICK = 200
 SEVERITIES = ("info", "warning", "error", "critical", "unknown")
 DECISIONS = ("alert", "reminder", "resolution")
 SOURCE = "mileage-tracker"
+CONDITION_STATES = ("active", "clear", "unknown")
+
+
+class PermanentRejection(Exception):
+    """A permanent HTTP 4xx rejection of one Loki batch."""
+
+    def __init__(self, status_code):
+        self.status_code = status_code
+        super().__init__(status_code)
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS loki_cursor (
@@ -32,6 +42,10 @@ CREATE TABLE IF NOT EXISTS loki_retry (
 CREATE TABLE IF NOT EXISTS loki_decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at REAL NOT NULL,
     device TEXT NOT NULL, code INTEGER NOT NULL, decision TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS loki_conditions (
+    device TEXT NOT NULL, code INTEGER NOT NULL, state TEXT NOT NULL, episode TEXT,
+    PRIMARY KEY (device, code)
 );
 CREATE TABLE IF NOT EXISTS loki_streams (
     device TEXT NOT NULL, severity TEXT NOT NULL, timestamp_ns INTEGER NOT NULL,
@@ -130,7 +144,11 @@ class HttpTransport:
                 if not 200 <= response.status < 300:
                     raise OSError("Loki rejected the push")
                 response.read(1024)
-        except urllib.error.HTTPError:
+        except urllib.error.HTTPError as exc:
+            status_code = exc.code
+            exc.close()
+            if 400 <= status_code < 500 and status_code not in (408, 429):
+                raise PermanentRejection(status_code) from None
             raise
 
 
@@ -193,6 +211,25 @@ def event_log(catalog, row):
                   }
         line = json.dumps(fields, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
         return (device, severity), timestamp, line
+    except (KeyError, ValueError, TypeError, OverflowError, RecursionError):
+        return None
+
+
+def condition_log(codes, device, code, state, now):
+    """Return a bounded current-condition state-change line."""
+    try:
+        validate_device_id(device)
+        if type(code) is not int or state not in CONDITION_STATES:
+            return None
+        definition = codes.get(code)
+        if definition is None or definition.get("severity") not in SEVERITIES:
+            return None
+        timestamp = _seconds_timestamp_ns(now)
+        fields = {"kind": "condition_change", "device_id": device, "code": code,
+                  "symbol": definition["symbol"], "severity": definition["severity"],
+                  "title": definition["title"], "state": state}
+        line = json.dumps(fields, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+        return (device, definition["severity"]), timestamp, line
     except (KeyError, ValueError, TypeError, OverflowError, RecursionError):
         return None
 

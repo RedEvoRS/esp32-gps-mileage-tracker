@@ -33,10 +33,9 @@ for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resol
 from common.diagnostics import CatalogError, load_catalog, validate_device_id, validate_request  # noqa: E402
 
 import gelf  # noqa: E402
-import loki  # noqa: E402
+import loki as loki_module  # noqa: E402
 import prometheus  # noqa: E402
 
-loki_export = loki
 
 
 LOG = logging.getLogger("mileage-monitor")
@@ -59,7 +58,7 @@ class Config:
     stale_seconds: float = 7 * 86400
     graylog: gelf.GelfConfig = gelf.GelfConfig()
     metrics: prometheus.MetricsConfig = field(default_factory=prometheus.MetricsConfig)
-    loki: loki_export.LokiConfig = field(default_factory=loki_export.LokiConfig)
+    loki: loki_module.LokiConfig = field(default_factory=loki_module.LokiConfig)
 
     @classmethod
     def from_env(cls, env=None):
@@ -72,7 +71,7 @@ class Config:
             return value == "true"
 
         metrics = prometheus.MetricsConfig.from_env(env)
-        loki_config = loki.LokiConfig.from_env(env)
+        loki_config = loki_module.LokiConfig.from_env(env)
         enabled = boolean("MONITOR_ENABLED")
         if not enabled:
             if metrics.enabled:
@@ -257,7 +256,7 @@ class Monitor:
         self.sender = NtfySender(config) if sender is None else sender
         self.gelf_sender = (gelf.transport(config.graylog) if gelf_sender is None and config.graylog.enabled
                             else gelf_sender)
-        self.loki_sender = (loki.transport(config.loki) if loki_sender is None and config.loki.enabled
+        self.loki_sender = (loki_module.transport(config.loki) if loki_sender is None and config.loki.enabled
                             else loki_sender)
         self.metrics_snapshot = (prometheus.MetricsSnapshot(self.codes, config.stale_seconds)
                                  if config.metrics.enabled else None)
@@ -272,12 +271,12 @@ class Monitor:
                         raise ValueError("unsupported monitor state schema version")
                 # Export tables are additive to schema v1 (CREATE IF NOT EXISTS),
                 # so an existing monitor.db gains them without a migration.
-                for statement in (SCHEMA + gelf.SCHEMA + loki.SCHEMA).split(";"):
+                for statement in (SCHEMA + gelf.SCHEMA + loki_module.SCHEMA).split(";"):
                     if statement.strip():
                         db.execute(statement)
                 db.execute("INSERT OR IGNORE INTO schema_version VALUES (1,1)")
                 db.execute("INSERT OR IGNORE INTO retry VALUES (1,0,0)")
-                for statement in gelf.SEED + loki.SEED:
+                for statement in gelf.SEED + loki_module.SEED:
                     db.execute(statement)
 
     def _connect(self):
@@ -456,7 +455,7 @@ class Monitor:
             raise
 
     def _tick(self):
-        if not self.config.enabled and self.metrics_snapshot is None:
+        if not self.config.enabled:
             return True
         try:
             devices = read_devices(self.events_path, self.catalog)
@@ -470,9 +469,6 @@ class Monitor:
         if devices is None:
             LOG.info("No diagnostics database yet; nothing to monitor")
             self._publish_metrics([], now)
-            return True
-        if not self.config.enabled:
-            self._publish_metrics(devices, now)
             return True
         with closing(self._connect()) as db:
             with db:
@@ -524,7 +520,7 @@ class Monitor:
                     self.metrics_snapshot.record_read_error()
                 LOG.warning("Graylog export unavailable (%s); retry next tick", type(exc).__name__)
             try:
-                self._forward_loki(db, now)
+                self._forward_loki(db, devices, now)
             except Exception as exc:  # Loki outages never affect ntfy or Graylog.
                 if isinstance(exc, sqlite3.Error) and self.metrics_snapshot is not None:
                     self.metrics_snapshot.record_read_error()
@@ -598,8 +594,8 @@ class Monitor:
             LOG.warning("Graylog delivery failed (%s) after %s message(s); retry in %s seconds",
                         error, delivered, delay)
 
-    def _forward_loki(self, db, now):
-        """Push new event and delivered-alert lines using an independent cursor."""
+    def _forward_loki(self, db, devices, now):
+        """Push condition changes, new events and delivered-alert lines."""
         if not self.config.loki.enabled:
             return
         attempts, next_attempt = db.execute(
@@ -608,7 +604,20 @@ class Monitor:
             return
         event_cursor, decision_cursor = db.execute(
             "SELECT event_rowid,decision_id FROM loki_cursor WHERE singleton=1").fetchone()
-        highest, rows = gelf.read_events(self.events_path, event_cursor, loki.MAX_PER_TICK)
+        known_conditions = {(device, code): (state, episode) for device, code, state, episode in
+                            db.execute("SELECT device,code,state,episode FROM loki_conditions")}
+        changes = gelf.desired_conditions(devices, known_conditions, now, self.config.stale_seconds,
+                                          SNAPSHOT_MAX_AGE_SECONDS)
+        condition_items = []
+        for key, value in sorted(changes.items())[:loki_module.MAX_PER_TICK]:
+            state, episode, _ = value
+            item = loki_module.condition_log(self.codes, key[0], key[1], state, now)
+            if item is None:
+                LOG.warning("Skipping a damaged monitor condition for Loki")
+            condition_items.append((key, value, item))
+
+        highest, rows = gelf.read_events(
+            self.events_path, event_cursor, max(0, loki_module.MAX_PER_TICK - len(condition_items)))
         if highest < event_cursor:
             # A restored events.db can be shorter than this sink's cursor.
             # Start its history over without changing GELF progress.
@@ -618,33 +627,37 @@ class Monitor:
             return
 
         selected_events = []
-        push_items = []
+        push_items = [item for _, _, item in condition_items if item is not None]
         for row in rows:
             selected_events.append(row[0])
-            item = loki.event_log(self.catalog, row)
+            item = loki_module.event_log(self.catalog, row)
             if item is None:
                 LOG.warning("Skipping a damaged diagnostics event for Loki")
             else:
                 push_items.append(item)
+        decision_limit = max(0, loki_module.MAX_PER_TICK - len(condition_items) - len(rows))
         decisions = db.execute(
             "SELECT id,occurred_at,device,code,decision FROM loki_decisions "
-            "WHERE id>? ORDER BY id LIMIT ?", (decision_cursor, loki.MAX_PER_TICK)).fetchall()
+            "WHERE id>? ORDER BY id LIMIT ?", (decision_cursor, decision_limit)).fetchall()
         for row in decisions:
-            item = loki.decision_log(self.codes, row)
+            item = loki_module.decision_log(self.codes, row)
             if item is None:
                 LOG.warning("Skipping a damaged monitor decision for Loki")
             else:
                 push_items.append(item)
-        if not rows and not decisions:
+        if not condition_items and not rows and not decisions:
             return
 
         updated_timestamps = {}
+        rejection_status = None
         if push_items:
             previous_timestamps = {(device, severity): timestamp for device, severity, timestamp in
                                    db.execute("SELECT device,severity,timestamp_ns FROM loki_streams")}
-            payload, updated_timestamps = loki.push_payload(push_items, previous_timestamps)
+            payload, updated_timestamps = loki_module.push_payload(push_items, previous_timestamps)
             try:
                 self.loki_sender(payload)
+            except loki_module.PermanentRejection as exc:
+                rejection_status = exc.status_code
             except Exception as exc:
                 attempts += 1
                 delay = min(3600, 60 * 2 ** min(attempts - 1, 6))
@@ -659,13 +672,21 @@ class Monitor:
         with db:
             db.execute("UPDATE loki_cursor SET event_rowid=?,decision_id=? WHERE singleton=1",
                        (next_event, next_decision))
-            for (device, severity), timestamp in updated_timestamps.items():
-                db.execute("INSERT INTO loki_streams VALUES (?,?,?) ON CONFLICT(device,severity) "
-                           "DO UPDATE SET timestamp_ns=excluded.timestamp_ns",
-                           (device, severity, timestamp))
+            for (device, code), (state, episode, _), _ in condition_items:
+                db.execute("INSERT INTO loki_conditions VALUES (?,?,?,?) ON CONFLICT(device,code) "
+                           "DO UPDATE SET state=excluded.state, episode=excluded.episode",
+                           (device, code, state, episode))
+            if rejection_status is None:
+                for (device, severity), timestamp in updated_timestamps.items():
+                    db.execute("INSERT INTO loki_streams VALUES (?,?,?) ON CONFLICT(device,severity) "
+                               "DO UPDATE SET timestamp_ns=excluded.timestamp_ns",
+                               (device, severity, timestamp))
             db.execute("DELETE FROM loki_decisions WHERE id<=?", (next_decision,))
             db.execute("UPDATE loki_retry SET attempts=0,next_attempt=0 WHERE singleton=1")
-        if push_items:
+        if rejection_status is not None:
+            LOG.warning("Loki permanently rejected a batch with HTTP status %s; skipping it",
+                        rejection_status)
+        elif push_items:
             LOG.info("Loki accepted %s log line(s)", len(push_items))
 
 

@@ -6,13 +6,13 @@ groups:
     interval: 1m
     rules:
       - alert: TrackerActiveErrorOrCriticalFault
-        expr: mileage_tracker_alert_decisions{decision="active",severity=~"error|critical"} > 0
+        expr: mileage_tracker_condition_state{state="active",severity=~"error|critical"} == 1
         for: 1m
         labels:
           severity: critical
         annotations:
           summary: "Tracker {{ $labels.device_id }} has an active E{{ $labels.code }} condition"
-          description: "The monitor has sent an alert for this current catalog condition."
+          description: "The current diagnostics condition is active; this does not depend on ntfy delivery."
       - alert: TrackerNoContact
         expr: mileage_tracker_last_contact_age_seconds >= scalar(mileage_tracker_monitor_stale_after_seconds)
         for: 1m

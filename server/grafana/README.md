@@ -11,6 +11,7 @@ elsewhere. The Compose project does not install either service.
 - `alert-rules.yml` contains Prometheus alert-rule examples and the same
   PromQL expressions can be used in Grafana-managed rules.
 - Import `loki-panel.json` in Grafana after adding your Loki data source.
-  `loki-alerts.md` has LogQL examples for new alert and resolution decisions.
+  `loki-alerts.md` uses ntfy-independent condition changes for the primary
+  fault alert and includes a separate ntfy-delivered decision example.
 
 The metrics names and labels are documented in [DIAGNOSTICS.md](../../DIAGNOSTICS.md).

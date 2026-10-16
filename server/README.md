@@ -167,13 +167,17 @@ not install Prometheus or Grafana. Dashboard, scrape and alert examples are in
 `grafana/`; setup is in DEPLOY_DEBIAN.md Step 11e.
 
 If you also run Loki, a nonempty `LOKI_PUSH_URL` can send new diagnostic
-events and successful monitor alert/reminder/resolution decisions. Loki is
-external and is not bundled in Compose. Its HTTP push has an independent
-cursor, retry state and timestamp order per stream; a failed Loki push does
-not stop ntfy or Graylog. JSON lines use only current catalog fields and
-bounded context, with `job`, validated `device_id` and catalog `severity` as
-the only labels. Importable panel and LogQL alert examples are in `grafana/`;
-see DEPLOY_DEBIAN.md Step 11f.
+events, condition changes and successful monitor alert/reminder/resolution
+decisions. Condition changes are independent of ntfy and deduplicated across
+deep-sleep wakes; delivered-decision lines exist only when ntfy accepted an
+alert. Loki is external and is not bundled in Compose. Its HTTP push has an
+independent cursor, retry state and timestamp order per stream; a failed Loki
+push does not stop ntfy or Graylog. Permanent HTTP 4xx rejections (except 408
+and 429) skip the batch and advance its cursors, so rejected history is not
+retried. JSON lines use only current catalog fields and bounded context, with
+`job`, validated `device_id` and catalog `severity` as the only labels.
+Importable panel and LogQL alert examples are in `grafana/`; see
+DEPLOY_DEBIAN.md Step 11f.
 
 Consistent DB backups/restores, including monitor state, remain #129. The
 existing trip backup does not include either optional named volume. Full

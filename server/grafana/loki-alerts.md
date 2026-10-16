@@ -1,11 +1,54 @@
 # Loki alert examples
 
-Use these LogQL expressions in Grafana's alert-rule editor with the external
-Loki data source. They detect decision lines delivered in the selected window;
-they are event alerts, not a durable current-condition view. Use the Prometheus
-`TrackerActiveErrorOrCriticalFault` rule for current monitor alert state.
+The primary fault rule uses `condition_change` lines. They are sent on active
+condition changes independently of ntfy delivery, so this rule works with
+`NOTIFY_ENABLED=false`. These LogQL rules detect transitions in the selected
+time window. For durable current condition state, use the Prometheus
+`TrackerActiveErrorOrCriticalFault` rule, which reads
+`mileage_tracker_condition_state`. `mileage_tracker_alert_decisions` and
+`alert_decision` lines describe ntfy delivery state.
 
-**A new active error or critical alert decision in the last five minutes:**
+**An error or critical condition became active in the last five minutes:**
+
+```logql
+sum by (device_id, code) (
+  count_over_time(
+    {job="mileage-tracker", severity=~"error|critical"}
+      | json
+      | kind="condition_change"
+      | state="active" [5m]
+  )
+) > 0
+```
+
+**A condition cleared in the last five minutes:**
+
+```logql
+sum by (device_id, code) (
+  count_over_time(
+    {job="mileage-tracker"}
+      | json
+      | kind="condition_change"
+      | state="clear" [5m]
+  )
+) > 0
+```
+
+**E7001 no-contact silence began in the last five minutes:**
+
+```logql
+sum by (device_id) (
+  count_over_time(
+    {job="mileage-tracker"}
+      | json
+      | kind="condition_change"
+      | code="7001"
+      | state="active" [5m]
+  )
+) > 0
+```
+
+**An alert decision ntfy accepted in the last five minutes (only when ntfy is enabled):**
 
 ```logql
 sum by (device_id, code) (
@@ -18,18 +61,5 @@ sum by (device_id, code) (
 ) > 0
 ```
 
-**A fault resolution decision in the last five minutes:**
-
-```logql
-sum by (device_id, code) (
-  count_over_time(
-    {job="mileage-tracker"}
-      | json
-      | kind="alert_decision"
-      | decision="resolution" [5m]
-  )
-) > 0
-```
-
-For both rules, choose an evaluation interval shorter than the range window and
-set Grafana's contact point and notification policy in your own installation.
+Choose an evaluation interval shorter than the range window and set Grafana's
+contact point and notification policy in your own installation.
