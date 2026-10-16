@@ -77,12 +77,14 @@ firmware hasn't been road-tested.
   helper, mutex check) and installer #19 and #23 are fixed too.
   Firmware #56, #60 and #77 fix upload queue starvation, retention of long
   untimed trips, and WiFi failure diagnostics.
+  Firmware #76 provisions fully erased trip storage on first boot without
+  enabling format-on-mount-failure.
 - **Still open:** #4
   (N13: the backup tooling is in `server/backup/`, but it isn't set up on
   the server or restore-tested from a real off-host copy yet), #6 (F11, network stack sizing; needs
   measurements from a real upload), the shakedown checks #25 (deep-sleep
   current), #26 (GPS hot start) and #27 (road test), and
-  the low-severity issues, one per finding: firmware #76 and
+  the low-severity issues, one per finding:
   installer #20–#22 (`gh issue list --label "severity: low"`).
 - **Firmware:** Stages 1–3 verified on hardware. Stage 4 compiles on ESP32
   core 3.3.11 (XPowersLib 0.3.3, TinyGPSPlus 1.0.3) with the bundled
@@ -168,8 +170,7 @@ firmware hasn't been road-tested.
    engine crank and start-stop and the N1 jitter figure (#27), and the F11
    stack measurement during a real upload (#6; procedure in
    `firmware/README.md` → Network stack shakedown).
-5. **Remaining code:** the low-severity issues: firmware #76 and
-   installer #20–#22.
+5. **Remaining code:** the low-severity installer issues #20–#22.
 
 When a PR fixes an issue, say "Fixes #N" (one line per issue) so merging
 it closes the issue. File every new finding as its own issue, however

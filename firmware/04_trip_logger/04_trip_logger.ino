@@ -54,6 +54,7 @@
 #include <esp_sleep.h>
 #include <vector>
 #include <esp_sntp.h>
+#include <esp_partition.h>
 #include <atomic>
 
 #include "secrets.h"
@@ -1502,11 +1503,50 @@ static bool buildFix(Fix& fx) {
 // =================================================================
 // setup / loop
 // =================================================================
+static constexpr const char* TRIP_PARTITION_LABEL = "spiffs";
+
+static bool tripPartitionIsErased() {
+    // Use the same data partition label as LittleFS, never a fixed address
+    // or a sample of the partition: even its last byte could hold trip data.
+    const esp_partition_t* partition = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, TRIP_PARTITION_LABEL);
+    if (!partition || !partition->size) {
+        Serial.println("LittleFS partition missing or empty; check the flashed partitions.csv.");
+        return false;
+    }
+
+    uint8_t buf[1024];
+    for (size_t offset = 0; offset < partition->size;) {
+        size_t n = std::min(sizeof buf, (size_t)partition->size - offset);
+        if (esp_partition_read(partition, offset, buf, n) != ESP_OK) {
+            Serial.printf("LittleFS partition read failed at offset %u; storage preserved.\n",
+                          (unsigned)offset);
+            return false;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            if (buf[i] != 0xFF) {
+                Serial.println("LittleFS partition contains non-erased data; storage preserved.");
+                return false;
+            }
+        }
+        offset += n;
+        delay(1);  // yield during the full-partition scan on a new board
+    }
+    return true;
+}
+
 static bool mountTripStorage() {
-    // A mount error is not proof that the partition is empty. Formatting
-    // here would erase every queued trip after a recoverable mount error.
-    // Provision a new device explicitly; see the firmware README.
-    if (LittleFS.begin(false)) return true;
+    // Mount failures alone never authorize erasure. Only a successful read
+    // of EVERY byte as 0xFF proves that provisioning cannot lose queued data.
+    if (LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL)) return true;
+    if (tripPartitionIsErased()) {
+        Serial.println("LittleFS partition is fully erased; provisioning trip storage.");
+        if (LittleFS.format() &&
+            LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL)) return true;
+        Serial.println("ERROR: LittleFS provisioning failed; halting. "
+                       "See firmware README for storage recovery.");
+        return false;
+    }
     Serial.println("ERROR: LittleFS mount failed. Storage preserved; halting. "
                    "See firmware README for first-time provisioning/recovery.");
     return false;

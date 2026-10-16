@@ -151,6 +151,10 @@ struct FakeDisk {
     int mountAttempts = 0;
     void (*onMount)() = nullptr;   // runs at each mount attempt
     bool formatRequested = false;
+    int formatAttempts = 0;
+    bool failFormat = false;
+    bool failRemount = false;
+    std::string partitionLabel;
     bool mounted = true;
     size_t used() const { size_t u = 0; for (auto& kv : files) u += kv.second.size(); return u; }
 };
@@ -228,13 +232,23 @@ public:
 };
 
 struct LittleFSStub {
-    bool begin(bool formatOnFail = false) {
+    bool begin(bool formatOnFail = false, const char* = "/littlefs", uint8_t = 10,
+               const char* partitionLabel = "spiffs") {
         g_disk.mountAttempts++;
+        g_disk.partitionLabel = partitionLabel;
         if (g_disk.onMount) g_disk.onMount();
-        g_disk.formatRequested = formatOnFail;
+        g_disk.formatRequested |= formatOnFail;
         if (!g_disk.failMount) return true;
         if (!formatOnFail) return false;
         g_disk.files.clear();
+        return true;
+    }
+    bool format() {
+        g_disk.formatAttempts++;
+        if (g_disk.failFormat) return false;
+        g_disk.files.clear();
+        dirs.clear();
+        g_disk.failMount = g_disk.failRemount;
         return true;
     }
     void end() { g_disk.mounted = false; }
