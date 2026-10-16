@@ -546,8 +546,8 @@ silently suppress it.
 
 ### Shipped service and state policy
 
-Use [DEPLOY_DEBIAN.md Step 11](DEPLOY_DEBIAN.md#step-11--optional-device-notifications)
-for manual enablement. `monitor` and `ntfy` are independent Compose profiles;
+`install.sh` asks which outputs to turn on (its Notifications step). For manual enablement, use
+[DEPLOY_DEBIAN.md Step 11](DEPLOY_DEBIAN.md#step-11--optional-device-notifications). `monitor` and `ntfy` are independent Compose profiles;
 an existing self-hosted ntfy can replace the bundled one. Profile gating avoids
 an idle container on a normal install. If explicitly started while disabled,
 the monitor logs that it is idling, loads the required catalog, and does no

@@ -34,12 +34,17 @@ bash ~/mileage-tracker/install.sh
 ```
 
 It works through Steps 1 and 3 to 10 below, checking each one, and asks
-for only four things: the LAN address to publish the ports on, the
-timezone trips are shown in, a username and password for the viewer, and
-where backups should go. It
-uploads `sample.gpx`, logs in to the viewer, finds the trip in the list,
-on its map and in both exports, then deletes it again. At the end it
-prints the lines for the firmware's `secrets.h` (Step 8).
+for the few things only you can answer: the LAN address to publish the
+ports on, the timezone trips are shown in, a username and password for the
+viewer, where backups should go, and which optional alert and dashboard
+outputs to turn on (none by default; [Step 11](#step-11--optional-device-notifications)
+explains each one). It uploads `sample.gpx`, logs in to the viewer, finds
+the trip in the list, on its map and in both exports, then deletes it
+again. At the end it prints the lines for the firmware's `secrets.h` (Step 8).
+
+Every question can also be answered in advance with an `INSTALL_` variable
+(for example `INSTALL_DISPLAY_TZ=America/Chicago`), which is how an
+unattended run works. The names are listed where each question is explained.
 
 If something fails, it says what and stops. Fix that and run it again:
 anything already set up is checked and kept, never redone.
@@ -717,11 +722,73 @@ can write to `data/` again.
 
 ## Step 11 — Optional device notifications
 
-Skip this step to keep notifications off. The installer adds no prompts for it.
-Two optional services provide alerts: a monitor checks health every minute;
-**ntfy** delivers notifications from your own server. No subscription or cloud
-account is required. Its local user is a login on your server. If you already
-host ntfy, skip 11a and use that server's topic URL and token.
+Skip this step to keep notifications off, which is the default. The tracker
+logs trips the same way either way; these outputs only tell you about faults
+in the tracker and let you see its health.
+
+### What the installer asks
+
+`install.sh` asks in its **Notifications** step, after the services are
+running. You can pick none, or any of these. Each one runs on a server you
+control, with no subscription or cloud account:
+
+- **ntfy** sends phone notifications when a tracker reports a fault, or goes
+  silent (no upload for the number of days you choose). Choose *bundled* to
+  run ntfy in a container here (11a), or *existing* to send to an ntfy server
+  you already run.
+- **metrics** opens a token-protected Prometheus page on port 8093, for Grafana
+  dashboards and alert rules (11e).
+- **graylog** sends each diagnostics event to a Graylog you already run (11d).
+- **loki** pushes the same events to a Loki you already run (11f).
+
+The installer sends one test through each output that needs a destination,
+then asks whether it arrived. If it doesn't, it tells you what to check.
+
+Your answers go to `monitor.env`, in the server directory. That file is
+gitignored and mode 600, and it holds the tokens and passwords. `.env` gets
+one line, pointing at `monitor.env`, and nothing else. Only the monitor is
+started or restarted (and the bundled ntfy, when you choose it), so trips and
+the viewer keep running through the change. Nothing is ever deleted: the ntfy
+users and the monitor's delivery state live in named volumes.
+
+Running `install.sh` again shows the outputs that are on and asks whether to
+keep them. Answers come back as defaults, and a secret you already set is
+never wiped: press Enter at its question and it's kept. Turning an output off
+keeps its URL and secrets in `monitor.env` so turning it back on needs no
+re-entry, except Loki's URL and login: those are commented out when it's off,
+and you type them again when it's turned back on.
+
+`install.sh --check` verifies what is on. The monitor must be running with
+the settings in `monitor.env`, each destination must be reachable from the
+monitor, and metrics must refuse a request without the token. Outputs that
+are off are reported as "off", never as problems, so a check with nothing
+turned on passes.
+
+For an unattended install, every question has an environment variable. Set
+`INSTALL_OUTPUTS` to `none` or a list such as `ntfy,metrics`, and
+`INSTALL_KEEP_OUTPUTS=y` to keep what's on during a re-run (or `n` to change
+it). The rest:
+
+- `INSTALL_STALE_DAYS`: days without an upload before a silence alert (default 7)
+- `INSTALL_NOTIFY_MIN_SEVERITY`: lowest severity to send, `info`, `warning`, `error` or `critical` (default `error`)
+- ntfy: `INSTALL_NTFY_MODE` (`bundled` or `existing`), `INSTALL_NTFY_TOPIC`, `INSTALL_NTFY_USER`, `INSTALL_NTFY_PASSWORD` (the phone login), `INSTALL_NTFY_URL` and `INSTALL_NTFY_TOKEN` (existing server), `INSTALL_NTFY_READY` (`y` once the phone is set up, `n` to skip the test) and `INSTALL_NTFY_ARRIVED` (`y` or `n`)
+- graylog: `INSTALL_GRAYLOG_TARGET` (a GELF HTTP URL, or `host:port` for TCP) and `INSTALL_GRAYLOG_ARRIVED` (`y` or `n`)
+- loki: `INSTALL_LOKI_URL`, `INSTALL_LOKI_AUTH` (`none`, `bearer` or `basic`), `INSTALL_LOKI_BEARER_TOKEN`, `INSTALL_LOKI_BASIC_AUTH_USER`, `INSTALL_LOKI_BASIC_AUTH_PASSWORD` and `INSTALL_LOKI_TENANT_ID`
+
+A preset that isn't usable stops the install with a message, as the other
+questions do. Metrics has no question of its own: its token is generated and
+kept in `monitor.env`, never printed.
+
+**Phone alerts only reach the phone where it can reach this server.** The
+bundled ntfy is published on your LAN address, port 8092, like the other
+ports. So the phone gets alerts on home WiFi or over a VPN into your network.
+Away from that, alerts wait in ntfy's cache (72 hours by default). Opening it
+to the internet is your decision and isn't part of this setup. Metrics on
+port 8093 is LAN-only for the same reason: Prometheus has to be able to reach
+it.
+
+The sections below are the same steps by hand, for when you'd rather not use
+the installer or want to see what it does.
 
 Run these commands **on the Debian server**, in `~/mileage-tracker` (the copied
 `server/` directory). Replace angle-bracket placeholders before running commands.

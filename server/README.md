@@ -109,8 +109,8 @@ by the `mileage-viewer` service, which reads these files independently.
 
 ## Optional diagnostics notifications
 
-Follow [DEPLOY_DEBIAN.md Step 11](../DEPLOY_DEBIAN.md#step-11--optional-device-notifications)
-to enable them manually. No subscriptions or cloud accounts are required.
+`install.sh` asks which of them to turn on, in its Notifications step. To enable them by hand, follow
+[DEPLOY_DEBIAN.md Step 11](../DEPLOY_DEBIAN.md#step-11--optional-device-notifications). No subscriptions or cloud accounts are required.
 The `monitor` and `ntfy` Compose profiles are off by default, keeping ordinary
 installation and `install.sh --check` unchanged. Copy `monitor.env.example` to
 private `monitor.env` (mode 600), select it with `MONITOR_ENV_FILE=./monitor.env`
