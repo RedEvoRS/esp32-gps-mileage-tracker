@@ -270,16 +270,17 @@ gets home and uploads, so any driving after that isn't logged. Keep it in
 mind on a long trip away from home, or if uploads have been failing for a
 while.
 
-**First flash on a new, empty board.** If the Serial Monitor shows
-`ERROR: LittleFS mount failed. Storage preserved; halting.`, nothing gets
-logged. On a new board this usually means the trip storage hasn't been
-set up yet. The firmware never formats it on its own, so
-a glitch can't wipe trips that are waiting to upload. Set it up once by
-following [First flash on a new board](firmware/README.md#first-flash-on-a-new-board)
-in the firmware README: one temporary edit and two flashes. A normal
-reflash with the same partition layout and erasing disabled preserves it.
-**If the board has already recorded trips, do not format it:** follow
-[storage recovery](firmware/README.md#if-the-trip-storage-wont-mount-later).
+**First flash on a new, empty V1.2 board.** With the bundled partition
+layout and erase-all disabled, Stage 4 checks every byte of the trip
+partition and formats it only if the whole partition is erased. No sketch
+edit or second flash is needed. A board sold as new may still contain
+factory test data. If the Serial Monitor shows
+`ERROR: LittleFS mount failed. Storage preserved; halting.`, the firmware
+has left storage untouched; follow [storage recovery](firmware/README.md#if-the-trip-storage-wont-mount-later)
+instead of trying to format it. See [First flash on a new board](firmware/README.md#first-flash-on-a-new-board)
+for the startup messages and recovery details. A normal reflash with the
+same partition layout and erase-all disabled preserves existing trips.
+**If the board has already recorded trips, do not format it.**
 
 ### 4. Check it works (legacy V1.2 only)
 

@@ -162,12 +162,14 @@ each on the bench before relying on it.
   `server/tests/`)
 - Upload limits: 16 MiB body cap (`INGEST_MAX_UPLOAD_BYTES`, ~39 h of
   nonstop driving). It protects the server's memory: the ingest parses the
-  whole body at once, peaking at ~9x its size. The Supreme's SD card has
-  no such limit, so its firmware splits runaway trips at 8 MiB, half the
-  cap. gunicorn `--timeout 300`, because the timeout includes reading the
-  body and 30 s dropped big trips on slow links. Early 401/413 replies
-  read and discard up to 4x the cap first, so the device sees the status,
-  not a reset. `server/tests/test_upload_limits.py` ties these to
+  whole body at once, peaking at ~9x its size. Issue #110 proposes an 8 MiB
+  trip split for the Supreme firmware, half the server cap; this is not
+  implemented yet, and `main` still has the V1.2 logger. Do not assume
+  runaway trips are split until the port and issue #110 are complete.
+  gunicorn `--timeout 300`, because the timeout includes reading the body
+  and 30 s dropped big trips on slow links. Early 401/413 replies read and
+  discard up to 4x the cap first, so the device sees the status, not a reset.
+  `server/tests/test_upload_limits.py` ties the current upload limit to
   `partitions.csv`
 - Diagnostics: `POST /v1/device-events` on ingest, same bearer auth plus validated
   `X-Device-Id`, 32 KiB streaming cap (also without Content-Length), protocol v1
