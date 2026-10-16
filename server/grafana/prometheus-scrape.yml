@@ -1,0 +1,10 @@
+# Merge this job into the Prometheus server's scrape_configs. Store the same
+# METRICS_TOKEN used by mileage-monitor in this private file, not in this YAML.
+scrape_configs:
+  - job_name: mileage-tracker
+    scrape_interval: 60s
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets: ["<host>:8093"]
+    bearer_token_file: /etc/prometheus/secrets/mileage-tracker-token

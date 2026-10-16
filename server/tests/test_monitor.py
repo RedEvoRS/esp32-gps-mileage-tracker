@@ -8,6 +8,8 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from contextlib import closing
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -78,6 +80,105 @@ class ConfigTests(unittest.TestCase):
             with mock.patch.object(catalog, "CATALOG_PATH", Path(root) / "absent.json"):
                 with self.assertRaisesRegex(ValueError, "missing or invalid diagnostics catalog.json"):
                     monitor.Monitor(monitor.Config())
+
+
+class PrometheusConfigTests(unittest.TestCase):
+    def test_off_by_default_and_requires_monitor_and_long_token(self):
+        self.assertFalse(monitor.Config.from_env({}).metrics.enabled)
+        for env in ({"MONITOR_ENABLED": "true", "METRICS_ENABLED": "true"},
+                    {"MONITOR_ENABLED": "true", "METRICS_ENABLED": "true", "METRICS_TOKEN": "short"},
+                    {"METRICS_ENABLED": "true", "METRICS_TOKEN": "x" * 32}):
+            with self.subTest(env=env), self.assertRaisesRegex(ValueError, "METRICS"):
+                monitor.Config.from_env(env)
+        config = monitor.Config.from_env({"MONITOR_ENABLED": "true", "METRICS_ENABLED": "true",
+                                          "METRICS_TOKEN": "x" * 32})
+        self.assertTrue(config.metrics.enabled)
+        self.assertEqual(config.metrics.token, "x" * 32)
+
+    def test_label_escaping(self):
+        self.assertEqual(monitor.prometheus.escape_label('quote " slash \\ line\nbreak'),
+                         'quote \\" slash \\\\ line\\nbreak')
+
+
+class PrometheusEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self.codes = {row["code"]: row for row in load_catalog()["codes"]}
+        self.snapshot = monitor.prometheus.MetricsSnapshot(self.codes, 7 * 86400)
+        self.snapshot.publish([{
+            "device_id": "tracker-1", "contact": 100.0, "snapshot_at": 200.0,
+            "snapshot": {"active": [{"code": 4003}], "observed": [4003, 4001],
+                         "pending_events": 2, "dropped_events": 1, "counters": {"5001": 4},
+                         "ssid": "<ssid>", "free_text": "<context>",
+                         "coordinates": "<coordinates>"},
+        }], [("tracker-1", 4003, "active", 250.0, None),
+             ("tracker-1", 4002, "unknown", 220.0, None),
+             ("tracker-1", 4003, "clear", 100.0, 150.0)], 290.0)
+
+    def test_exposition_labels_ages_counters_and_alert_decisions(self):
+        body = self.snapshot.render(300.0)
+        self.assertIn("# TYPE mileage_tracker_condition_state gauge", body)
+        self.assertIn('device_id="tracker-1",code="4003",symbol="NO_RECORDING_STORAGE",severity="critical",state="active"} 1', body)
+        self.assertIn('device_id="tracker-1",code="4001",symbol="SD_UNAVAILABLE",severity="warning",state="clear"} 1', body)
+        self.assertIn('device_id="tracker-1"} 200', body)
+        self.assertIn("mileage_tracker_snapshot_age_seconds{device_id=\"tracker-1\"} 100", body)
+        self.assertIn("mileage_tracker_pending_events{device_id=\"tracker-1\"} 2", body)
+        self.assertIn("mileage_tracker_dropped_events{device_id=\"tracker-1\"} 1", body)
+        self.assertIn('code="5001",symbol="HOME_AP_ABSENT"', body)
+        self.assertIn('decision="active"} 1', body)
+        self.assertIn('decision="sent"} 2', body)
+        self.assertIn('decision="resolved"} 1', body)
+        self.assertIn("# HELP mileage_tracker_alert_decisions ntfy delivery state:", body)
+        self.assertIn("mileage_tracker_monitor_stale_after_seconds 604800", body)
+        for forbidden in ("ssid", "<ssid>", "free_text", "<context>", "coordinates", "<coordinates>"):
+            self.assertNotIn(forbidden, body)
+
+    def test_fault_alert_uses_current_condition_state_not_ntfy_delivery(self):
+        rules = (SERVER / "grafana/alert-rules.yml").read_text(encoding="utf-8")
+        marker = "      - alert: TrackerActiveErrorOrCriticalFault\n"
+        self.assertIn(marker, rules)
+        fault_rule = rules.split(marker, 1)[1].split("      - alert:", 1)[0]
+        self.assertIn(
+            'expr: mileage_tracker_condition_state{state="active",severity=~"error|critical"} == 1',
+            fault_rule)
+        self.assertNotIn("mileage_tracker_alert_decisions", fault_rule)
+
+    def test_http_requires_bearer_token_and_serves_prometheus_text(self):
+        token = "m" * 32
+        server = monitor.prometheus.make_server(self.snapshot, token, "127.0.0.1", 0)
+        self.assertEqual(server.RequestHandlerClass.timeout, 10)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}/metrics"
+        for headers in ({}, {"Authorization": "Bearer " + "w" * 32}):
+            with self.subTest(headers=headers), self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=2)
+            self.assertEqual(caught.exception.code, 401)
+        request = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+        with urllib.request.urlopen(request, timeout=2) as response:
+            self.assertEqual(response.status, 200)
+            self.assertTrue(response.headers["Content-Type"].startswith("text/plain; version=0.0.4"))
+            self.assertIn(b"mileage_tracker_last_contact_age_seconds", response.read())
+
+    def test_read_errors_are_counted_and_keep_last_successful_read(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = monitor.Config(enabled=True,
+                                    metrics=monitor.prometheus.MetricsConfig(True, "m" * 32))
+            worker = monitor.Monitor(config, Path(root) / "missing-events.db", Path(root) / "monitor.db",
+                                     clock=lambda: 300.0, catalog=load_catalog())
+            self.assertTrue(worker.tick())
+            with mock.patch.object(monitor, "read_devices", side_effect=sqlite3.OperationalError):
+                with self.assertLogs("mileage-monitor", "WARNING"):
+                    self.assertFalse(worker.tick())
+            body = worker.metrics_snapshot.render(400.0)
+            self.assertIn("mileage_tracker_db_read_errors_total 1", body)
+            self.assertIn("mileage_tracker_last_successful_read_timestamp_seconds 300", body)
+
+    def test_compose_publishes_metrics_only_on_bind_addr(self):
+        compose = (SERVER / "docker-compose.yml").read_text(encoding="utf-8")
+        self.assertRegex(compose, r'"\$\{BIND_ADDR:-0\.0\.0\.0\}:8093:8093"')
 
 
 class MonitorTests(unittest.TestCase):

@@ -482,7 +482,8 @@ and a viewer warning log, with no healthy empty state substituted.
 
 ## Optional monitor and notifications (#120/#121, shipped)
 
-The stdlib-only `mileage-monitor` service has no published port. Every 60 seconds
+The stdlib-only `mileage-monitor` service optionally publishes metrics on port
+8093; the endpoint is disabled unless configured. Every 60 seconds
 it reads `/data:ro` and stores its own delivery/deduplication state in a separate
 writable volume. It watches **every device that has ever checked in**; there is
 no `MONITOR_DEVICE_IDS` watchlist. Removing an obsolete device requires a future
@@ -618,6 +619,28 @@ heartbeat integration remains #125, and consistent state backups remain #129.
 Installer test uploads omit `X-Device-Id` so a routine `--check` does not enroll
 an ever-watched synthetic device; their unique `X-Trip-Id` still owns cleanup.
 
+### Prometheus metrics (#134)
+
+The monitor can expose `/metrics` for a Prometheus server that you run
+separately. The `monitor` Compose profile publishes host port 8093 on
+`BIND_ADDR`; the HTTP listener starts only when `METRICS_ENABLED=true` and
+requires its own `METRICS_TOKEN` (at least 32 printable ASCII characters).
+Keep this port on a trusted LAN or VPN: bearer-token authentication is its
+only protection and traffic is plain HTTP. Do not reuse the ingest token or
+viewer secrets. Setup, scrape configuration, network path and Grafana starter
+files are in [DEPLOY_DEBIAN.md Step 11e](DEPLOY_DEBIAN.md#11e--optional-prometheus-metrics-for-external-grafana).
+
+The endpoint serves a published in-memory snapshot. The HTTP thread does not
+open SQLite or block the monitor tick. Each scrape reports server contact and
+snapshot ages, current catalog condition states (active/clear/unknown), the
+latest pending/dropped counts and catalog check-in counters, alert episode
+counts (active/sent/resolved), database read errors, last successful read time
+and the configured silence threshold. Labels are limited to validated device
+IDs, current catalog code/symbol/severity, and fixed state/decision values;
+there is no event text, coordinates, SSIDs or credentials. Counter-like alert
+values are gauges derived from monitor state, so restoring monitor-state can
+reduce them.
+
 ### Graylog export (#135, shipped)
 
 Owner decision (2026-10-16): Graylog runs on a separate server the owner
@@ -668,6 +691,50 @@ for the messages delivered before a failure. Failures back off from 60 seconds,
 doubling to an hour, in `gelf_retry`, separate from ntfy's `retry`. The GELF
 tables are additive to monitor schema v1 (`CREATE TABLE IF NOT EXISTS`), so an
 existing `monitor.db` gains them at startup without a migration.
+
+### Loki push (#136)
+
+The monitor can push to an external Loki endpoint; Compose does not install
+Loki. Set `LOKI_PUSH_URL` to its `/loki/api/v1/push` endpoint in `monitor.env`
+to enable the sink. Optional basic auth (`LOKI_BASIC_AUTH_USER` and
+`LOKI_BASIC_AUTH_PASSWORD`) or bearer auth (`LOKI_BEARER_TOKEN`) is supported,
+but not both. `LOKI_TENANT_ID` sets `X-Scope-OrgID`. Credentials are not
+accepted in the URL. Setup and sample LogQL are in
+[DEPLOY_DEBIAN.md Step 11f](DEPLOY_DEBIAN.md#11f--optional-push-to-external-loki).
+
+Each new `events.db` row becomes one JSON log line. A `condition_change` line
+is sent when a device/code condition changes to active, clear or unknown,
+including E7001 silence and recovery. `loki_conditions` stores the last state
+per device/code, so persistent faults do not repeat on deep-sleep wakes. These
+condition changes are independent of `NOTIFY_ENABLED`. Each successful ntfy
+alert, reminder or resolution remains a separate `alert_decision` line; it
+records only the catalog title/symbol/severity, code, validated device ID and
+decision, and exists only when ntfy accepted the notification. Event lines use
+the current catalog fields and only context fields allowed for that event's
+code; they never carry free text, coordinates, SSIDs or credentials. Loki
+streams have exactly three labels: fixed `job=mileage-tracker`, validated
+`device_id`, and current catalog `severity`. All other fields stay in the JSON
+line to keep label cardinality low.
+
+`loki_cursor` keeps event rowid and delivered-decision progress independently
+from GELF. The condition and retry state are also stored in additive tables
+in monitor schema v1. The first enable has no age filter: each tick sends up to
+200 total condition changes, events and delivered decisions. Entries keep their
+real timestamps, sorted within each label set (Loki 2.4+ accepts out-of-order
+writes inside its window). While a full 200-event batch is still draining, only
+events are sent, so the backlog stays oldest-first; condition changes and
+decisions follow once it catches up. History Loki rejects as too old is skipped.
+
+The monitor uses one HTTP push with a ten-second timeout and never follows
+redirects. Network failures, HTTP 408, HTTP 429 and 5xx responses back off
+from 60 seconds to one hour without advancing the batch. A permanent HTTP 4xx
+other than 408 or 429 logs only the status code, skips the rejected batch and
+advances its cursors; that history is not retried, and later rows continue.
+Successful pushes advance the batch; an ambiguous response can be retried and
+duplicated. If `events.db` is restored with a lower rowid than Loki's cursor,
+only the Loki event cursor resets and that history is sent again. Loki runs
+after ntfy and GELF; its failures are caught separately and do not change
+either sink's progress or trip uploads.
 
 ## Backups and acceptance (#129/#130)
 

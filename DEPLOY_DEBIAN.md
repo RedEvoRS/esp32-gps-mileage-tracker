@@ -6,6 +6,8 @@ Deploys both services from `server/`:
 |---|---|---|---|
 | `mileage-ingest` | 8090 | Bearer token | Accepts GPX uploads from the T-Beam |
 | `mileage-viewer` | 8091 | Session login | Trip list, map audit, annotate, CSV/XLSX export |
+| `ntfy` | 8092 | Topic token | Optional self-hosted phone notifications |
+| `mileage-monitor` | 8093 | Bearer token when enabled | Optional Prometheus `/metrics` endpoint in the `monitor` profile |
 
 This is the server half of the project. The top-level `README.md` gives
 the whole setup in order (server, then the board, then the car); come
@@ -429,11 +431,11 @@ address below depends on it too.
 
 **Restrict the ports with the bind address, not UFW.** Docker publishes
 ports through its own iptables rules, which forward the traffic before UFW
-ever sees it. A `ufw allow from 192.168.1.0/24 ...` rule for 8090/8091 has
-no effect, and neither does a `ufw deny`: the ports stay open on every
+ever sees it. A `ufw allow from 192.168.1.0/24 ...` rule for ports 8090, 8091,
+8092 or 8093 has no effect, and neither does a `ufw deny`: the ports stay open on every
 interface the box has (a VPN, a second NIC). UFW still governs
 services running directly on the host, such as SSH; it just has no say
-over these two ports.
+over Docker-published ports.
 
 What works is telling Docker which address to listen on. Set `BIND_ADDR`
 in `.env` to the server's LAN IP:
@@ -456,7 +458,8 @@ docker compose ps
 ```
 
 The `PORTS` column should read `192.168.1.10:8090->8090/tcp` and
-`192.168.1.10:8091->8091/tcp`. If it still says `0.0.0.0`, Compose didn't
+`192.168.1.10:8091->8091/tcp`. When the monitor profile is running, port 8093
+should also be bound to the LAN IP. If a published port says `0.0.0.0`, Compose didn't
 pick up `BIND_ADDR`; check the spelling and that `.env` is next to
 `docker-compose.yml`.
 
@@ -465,6 +468,7 @@ Confirm the mappings and health from the server:
 ```bash
 docker compose port mileage-ingest 8090   # expect 192.168.1.10:8090
 docker compose port mileage-viewer 8091   # expect 192.168.1.10:8091
+docker compose port mileage-monitor 8093 # when the monitor profile is started
 curl http://192.168.1.10:8090/health    # expect {"service":"mileage-ingest","status":"ok"}
 ```
 
@@ -785,11 +789,13 @@ docker compose --profile monitor up -d --build mileage-monitor
 docker compose logs --tail 30 mileage-monitor
 ```
 
-Look for `Monitor enabled; ntfy enabled, Graylog disabled`. Bad enabled settings fail startup
+Look for `Monitor enabled; ntfy enabled, Graylog disabled, Prometheus disabled, Loki disabled`. Bad enabled settings fail startup
 with a message naming the setting. A missing diagnostics DB means no device
 has checked in yet; an unreadable DB logs unavailable and retries next minute.
-The monitor publishes no port, mounts `/data` read-only, and persists policy
-and delivery state in `monitor-state`. The `monitor` and `ntfy` profiles keep
+The monitor mounts `/data` read-only and persists policy and delivery state in
+`monitor-state`. Port 8093 is published on `BIND_ADDR` for the optional
+token-protected metrics endpoint; the listener stays off unless enabled. The
+`monitor` and `ntfy` profiles keep
 both optional services out of ordinary installs and `install.sh --check`.
 Once started, their restart policies also bring them back on reboot.
 
@@ -802,6 +808,11 @@ Once started, their restart policies also bring them back on reboot.
 | `NOTIFY_REPEAT_HOURS` | `24` | Minimum time after successful delivery before a reminder |
 | `NOTIFY_MAX_PER_HOUR` | `6` | Rolling-hour successful POST cap, including digests and resolutions |
 | `MONITOR_STALE_DAYS` | `7` | No-contact threshold, using server receipt time including identified GPX uploads |
+| `METRICS_ENABLED` | `false` | Start token-protected Prometheus `/metrics` on port 8093 |
+| `METRICS_TOKEN` | unset | Separate 32+ character bearer token, required when metrics are enabled |
+| `LOKI_PUSH_URL` | blank | Enable event and condition-change pushes plus ntfy-delivered decisions to external Loki |
+| `LOKI_BASIC_AUTH_*`, `LOKI_BEARER_TOKEN` | blank | Choose basic or bearer auth for Loki, never both |
+| `LOKI_TENANT_ID` | blank | Optional value for Loki's `X-Scope-OrgID` header |
 
 Booleans are `true`/`false`; severity is `info`, `warning`, `error` or `critical`.
 Hold accepts 0–604800 seconds, repeat 1 second–8760 hours, cap an integer
@@ -934,6 +945,148 @@ dashboard or use ntfy's daily reminder instead.
 To stop sending, set `GRAYLOG_ENABLED=false` and apply. The monitor remembers
 how far it got in `monitor-state`; turning it back on resumes from there.
 
+### 11e — Optional: Prometheus metrics for external Grafana
+
+This endpoint is for a Prometheus server you already run elsewhere. This
+project does not install Prometheus or Grafana. Prometheus must be able to
+connect to the tracker server's `BIND_ADDR` IP on TCP port 8093, directly on
+the LAN or over a VPN route. Docker-published ports bypass UFW, so `BIND_ADDR`
+is the important boundary. The bearer token is the only protection on this
+plain-HTTP port; keep it LAN-only and never forward it from the internet.
+
+Copy the monitor template if you have not already done so, and generate a
+separate token. Do not reuse the ingest token or viewer credentials:
+
+```bash
+cd ~/mileage-tracker
+install -m 600 monitor.env.example monitor.env
+openssl rand -hex 32
+nano monitor.env
+```
+
+Set `MONITOR_ENABLED=true`, `METRICS_ENABLED=true` and put the random output in
+`METRICS_TOKEN` in the private `monitor.env`. Keep the token out of shell
+history, screenshots and Git. In the existing `.env`, select that file with
+`MONITOR_ENV_FILE=./monitor.env`. Apply the settings:
+
+```bash
+docker compose --profile monitor up -d --build mileage-monitor
+docker compose logs --tail 30 mileage-monitor
+```
+
+The log should say that Prometheus is enabled. If its token is missing or
+shorter than 32 printable ASCII characters, the monitor refuses to start and
+names `METRICS_TOKEN` in the error. The profile publishes port 8093 on the
+`BIND_ADDR` host IP; when metrics are disabled, no HTTP listener accepts
+scrapes.
+
+On the Prometheus host, store the same token in the private file referenced by
+[`grafana/prometheus-scrape.yml`](server/grafana/prometheus-scrape.yml), then
+merge that file's job into Prometheus `scrape_configs`. Replace `<host>` with
+the tracker server's LAN IP or a VPN-reachable host name. Do not put the token
+directly in the scrape YAML. Prometheus reads the token file and sends it as a
+bearer credential on each scrape.
+
+Test the path from the Prometheus host (or another host on the same LAN/VPN):
+
+```bash
+read -rs -p 'metrics token: ' METRICS_TEST_TOKEN; echo
+curl -i -H "Authorization: Bearer $METRICS_TEST_TOKEN" \
+  'http://<host>:8093/metrics'
+unset METRICS_TEST_TOKEN
+```
+
+An authenticated request returns Prometheus text; missing or incorrect tokens
+return 401. Import [`grafana/tracker-health.json`](server/grafana/tracker-health.json)
+in Grafana and select the Prometheus data source. The starter alert expressions
+are in [`grafana/alert-rules.yml`](server/grafana/alert-rules.yml); the
+error/critical rule reads `mileage_tracker_condition_state` and works with
+`NOTIFY_ENABLED=false`. `mileage_tracker_alert_decisions` is ntfy delivery
+state, so it can remain zero when ntfy is off. The no-contact rule uses the
+configured `MONITOR_STALE_DAYS` threshold. The HTTP thread serves the monitor's
+latest published snapshot and does not query SQLite during scrapes.
+
+To stop exposing metrics, set `METRICS_ENABLED=false` and reapply the monitor
+profile. Keep the separate token private; it is not the ingest token.
+
+### 11f — Optional: push to external Loki
+
+Skip this unless you run Loki elsewhere. Nothing in this Compose project
+installs Loki or Grafana. The monitor container must be able to reach the Loki
+host and port over the server's outbound LAN or VPN route. Use the Loki host's
+LAN address or a reachable DNS name: `localhost` inside the monitor container
+means the container itself. Permit that outbound path in the relevant host and
+network firewalls. Use HTTPS when the path leaves a trusted network; the
+request contains diagnostic facts, not credentials in its JSON body.
+
+Set `LOKI_PUSH_URL` to the full HTTP(S) `/loki/api/v1/push` endpoint in the
+private `monitor.env`. Configure either bearer auth or basic auth, never both.
+Add the tenant ID only if your Loki requires `X-Scope-OrgID`:
+
+```dotenv
+MONITOR_ENABLED=true
+LOKI_PUSH_URL=https://<host>/loki/api/v1/push
+LOKI_BEARER_TOKEN=<token>
+# Or use these two lines instead of LOKI_BEARER_TOKEN:
+# LOKI_BASIC_AUTH_USER=<user>
+# LOKI_BASIC_AUTH_PASSWORD=<password>
+# Optional multi-tenant header:
+# LOKI_TENANT_ID=<tenant>
+```
+
+If Loki has no authentication, leave all three auth settings blank. Do not put
+credentials in the URL or commit them. In `.env`, select the private file with
+`MONITOR_ENV_FILE=./monitor.env`, then recreate the monitor:
+
+```bash
+cd ~/mileage-tracker
+docker compose --profile monitor up -d --build mileage-monitor
+docker compose logs --tail 30 mileage-monitor
+```
+
+The startup line should say `Loki enabled`; once it has new records, the log
+reports how many lines Loki accepted. On first enable, the separate persisted
+event cursor starts at rowid zero, so stored history is sent in batches of at
+most 200 lines per tick without an age filter. Loki may reject history older
+than its configured retention window. A permanent HTTP 4xx rejection other
+than 408 or 429 skips the entire rejected batch and advances its cursors; that
+history is not retried, and later batches continue. Network failures, 408, 429
+and 5xx responses back off and retry without advancing the cursors.
+
+Loki also receives one `condition_change` line when a device/code condition
+changes to active, clear or unknown, including E7001 silence and recovery.
+This state-change export is independent of `NOTIFY_ENABLED` and is deduplicated
+across repeated check-ins and deep-sleep wakes. Successful ntfy alerts,
+reminders and resolutions remain separate `alert_decision` lines; those lines
+exist only for notifications ntfy accepted while Loki was enabled. With ntfy
+off, diagnostic events and condition changes still flow to Loki.
+
+Each line is JSON. Loki stream labels are only `job=mileage-tracker`, validated
+`device_id`, and current-catalog `severity`; context and other fields stay in
+the line. Each entry carries its real timestamp (server receipt time for
+events, the monitor tick for condition changes and decisions). This needs Loki
+2.4 or newer, which accepts out-of-order writes within about an hour of a
+stream's newest entry. While an event backlog drains, for example on first
+enable, the monitor sends only events, oldest first, and holds condition and
+decision lines until it catches up. Loki still rejects anything older than its
+`reject_old_samples_max_age` (one week by default); that history is skipped. Delivery uses a ten-second timeout,
+does not follow redirects, and retries independently from one minute to one
+hour. An ambiguous response can cause a duplicate, but does not lose a cursor.
+Restoring `events.db` below the Loki rowid resets only the Loki event cursor;
+GELF's cursor and progress are unchanged.
+
+Import [`grafana/loki-panel.json`](server/grafana/loki-panel.json) after adding
+your external Loki data source. [`grafana/loki-alerts.md`](server/grafana/loki-alerts.md)
+uses condition-change lines for its primary error/critical alert, so it works
+with ntfy off. Those LogQL rules detect transitions in a recent time window;
+the Prometheus rule from Step 11e reads the current active condition state and
+the configured no-contact state. Delivered-decision LogQL examples are
+separate and apply only when ntfy is enabled.
+
+To pause the sink, blank `LOKI_PUSH_URL` and reapply the monitor profile. Its
+cursor and pending decisions stay in `monitor-state`; when re-enabled, it
+resumes from those cursors.
+
 ## Troubleshooting
 
 **Container is `unhealthy` or restarting**
@@ -1045,7 +1198,7 @@ ls ~/mileage-backups/snapshots/*/data/$TRIP.gpx      # the snapshots that have i
 cp -p ~/mileage-backups/snapshots/<time>/data/$TRIP.gpx data/$TRIP.gpx
 ```
 
-**Port already in use** — `sudo ss -tlnp | grep -E '8090|8091'`, then change
+**Port already in use** — `sudo ss -tlnp | grep -E '8090|8091|8092|8093'`, then change
 the host-side port mapping in `docker-compose.yml`.
 
 **Rebuild after code changes:**

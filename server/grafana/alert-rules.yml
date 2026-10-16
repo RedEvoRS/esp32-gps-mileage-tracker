@@ -1,0 +1,23 @@
+# Prometheus alert-rule examples for the external Grafana installation.
+# Import these rules into Prometheus, or use the expressions in Grafana's
+# alert-rule editor and select its Prometheus data source.
+groups:
+  - name: mileage-tracker
+    interval: 1m
+    rules:
+      - alert: TrackerActiveErrorOrCriticalFault
+        expr: mileage_tracker_condition_state{state="active",severity=~"error|critical"} == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Tracker {{ $labels.device_id }} has an active E{{ $labels.code }} condition"
+          description: "The current diagnostics condition is active; this does not depend on ntfy delivery."
+      - alert: TrackerNoContact
+        expr: mileage_tracker_last_contact_age_seconds >= scalar(mileage_tracker_monitor_stale_after_seconds)
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tracker {{ $labels.device_id }} has not contacted the server"
+          description: "The age is at least the monitor's configured MONITOR_STALE_DAYS threshold."
