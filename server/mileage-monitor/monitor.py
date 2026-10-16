@@ -128,15 +128,23 @@ def read_devices(path, catalog):
         for row in db.execute("SELECT device_id,last_contact_at,status_sequence,snapshot_json,"
                               "snapshot_received_at FROM devices ORDER BY device_id"):
             device = dict(row)
-            validate_device_id(device["device_id"])
-            device["contact"] = receipt(device["last_contact_at"])
-            snapshot = json.loads(device["snapshot_json"]) if device["snapshot_json"] else None
-            if snapshot is not None:
-                validate_request({"schema_version": 1, "checkin": snapshot, "events": []}, catalog=catalog)
-                if snapshot["status_sequence"] != device["status_sequence"]:
-                    raise ValueError("invalid diagnostics snapshot revision")
-                device["snapshot_at"] = receipt(device["snapshot_received_at"])
-            device["snapshot"] = snapshot
+            device["contact"] = None
+            device["snapshot"] = None
+            try:
+                validate_device_id(device["device_id"])
+                device["contact"] = receipt(device["last_contact_at"])
+                if device["snapshot_json"] is not None:
+                    snapshot = json.loads(device["snapshot_json"])
+                    validate_request({"schema_version": 1, "checkin": snapshot, "events": []}, catalog=catalog)
+                    if snapshot["status_sequence"] != device["status_sequence"]:
+                        raise ValueError("invalid diagnostics snapshot revision")
+                    device["snapshot_at"] = receipt(device["snapshot_received_at"])
+                    device["snapshot"] = snapshot
+            except (ValueError, TypeError, OverflowError, RecursionError, OSError) as exc:
+                # A stored snapshot can predate the current catalog or be
+                # damaged. Its faults are unknown, but valid contact remains
+                # usable for silence. Never carry stored text into a log.
+                device["snapshot_error"] = type(exc).__name__
             devices.append(device)
         return devices
 
@@ -188,6 +196,9 @@ CREATE TABLE IF NOT EXISTS deliveries (sent_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS retry (
     singleton INTEGER PRIMARY KEY, attempts INTEGER NOT NULL, next_attempt REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS snapshot_warnings (
+    device TEXT NOT NULL, revision TEXT NOT NULL, PRIMARY KEY (device, revision)
+);
 """
 
 
@@ -236,6 +247,14 @@ class Monitor:
                     (code == 7001 or SEVERITIES.index(definition["severity"]) >=
                      SEVERITIES.index(self.config.min_severity)))
 
+    @staticmethod
+    def _warn_snapshots(db, devices):
+        for device in devices:
+            error = device.get("snapshot_error")
+            if error and db.execute("INSERT OR IGNORE INTO snapshot_warnings VALUES (?,?)",
+                                    (str(device["device_id"]), str(device["status_sequence"]))).rowcount:
+                LOG.warning("Device snapshot unavailable (%s); conditions unknown", error)
+
     def _reconcile(self, db, devices, now):
         # Reset eligibility on unknown/stale input, but preserve sent history.
         previous = {tuple(row[:3]): row[3] for row in db.execute(
@@ -244,6 +263,8 @@ class Monitor:
         clear_codes = set()
         for device in devices:
             name, contact = device["device_id"], device["contact"]
+            if contact is None:  # Damaged identity/contact cannot drive any policy.
+                continue
             clear_codes.add((name, 7001))  # Per-episode contact comparison below.
             # A contact is recovery only when it is genuinely newer than the
             # contact on which this silence episode was based (not a clock jump).
@@ -374,6 +395,7 @@ class Monitor:
         now = self.clock()
         with closing(self._connect()) as db:
             with db:
+                self._warn_snapshots(db, devices)
                 clear_codes = self._reconcile(db, devices, now)
                 self._queue(db, now, clear_codes)
                 db.execute("DELETE FROM deliveries WHERE sent_at<=?", (now - 3600,))

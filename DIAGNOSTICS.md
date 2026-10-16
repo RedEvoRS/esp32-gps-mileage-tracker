@@ -557,6 +557,13 @@ timeout and a consistent read transaction, closing every connection. No
 initialization, migration or recovery is attempted there. An absent DB means
 nothing to do. A read/schema/lock/hot-journal failure logs unavailable and
 suspends all sends, including pending retries, until a successful read.
+Snapshot parse/validation failures are isolated per device, including snapshots
+that no longer satisfy the current catalog. That device's fault conditions
+become unknown: they cannot trigger fault alerts, reminders or resolutions.
+Silence detection still uses its valid last-contact receipt, and other devices
+continue normally. A damaged identity/contact receipt also isolates that row;
+without a valid contact, its silence cannot be evaluated. Log only the error
+type once per device/revision, retaining that warning record across restarts.
 Only accepted snapshots and contact receipt times drive policy; journal events
 and their stored severity are never queried.
 
@@ -570,6 +577,7 @@ episodes update that open row. Silence (7001) keeps its contact-based identity.
 one pending action per episode/kind; `outbox` commits the selected delivery
 intent before posting; `deliveries` holds the rolling-hour successful POST
 window; `retry` persists global retry attempts and the next attempt time.
+`snapshot_warnings` deduplicates unavailable-snapshot warnings by device/revision.
 Initialization and versioning share one transaction; an unsupported state
 version fails startup. Run one monitor replica per volume.
 

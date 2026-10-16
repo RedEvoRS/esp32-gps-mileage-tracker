@@ -167,6 +167,80 @@ class MonitorTests(unittest.TestCase):
         self.tick(86400)
         self.assertEqual(len(self.messages), 1)  # stale snapshot cannot remind
 
+    def test_catalog_invalid_snapshot_preserves_silence_and_other_devices(self):
+        self.snapshot(active=(4002,), device="tracker-old", at=self.now - 7 * 86400)
+        self.snapshot(active=(4003,), device="tracker-good")
+        self.catalog = copy.deepcopy(self.catalog)
+        next(row for row in self.catalog["codes"] if row["code"] == 4002)["journal"] = "per_occurrence"
+        self.worker = self.make_monitor()
+        with self.assertLogs("mileage-monitor", "WARNING") as logs:
+            self.assertTrue(self.tick())
+        self.assertEqual(logs.output, [
+            "WARNING:mileage-monitor:Device snapshot unavailable (ProtocolError); conditions unknown"])
+        self.assertEqual(len(self.messages), 2)
+        self.assertTrue(any("Alert E7001" in text and "tracker-old" in text for text in self.messages))
+        self.assertTrue(any("Alert E4003" in text and "tracker-good" in text for text in self.messages))
+        self.assertFalse(any("E4002" in text for text in self.messages))
+        self.worker = self.make_monitor()
+        with self.assertNoLogs("mileage-monitor", "WARNING"):
+            self.assertTrue(self.tick(60))
+        # A valid replacement resumes normal fault policy and contact recovery.
+        self.snapshot(active=(4003,), device="tracker-old", boot=OTHER_BOOT)
+        self.tick()
+        self.assertTrue(any("Alert E4003" in text and "tracker-old" in text for text in self.messages))
+        self.assertTrue(any("Resolved E7001" in text for text in self.messages))
+
+    def test_corrupt_snapshot_is_unknown_and_warns_once_per_device_revision(self):
+        self.snapshot(active=(4003,), device="tracker-bad")
+        self.tick()
+        self.snapshot(active=(), observed=[4003], device="tracker-bad", at=self.now - 7 * 86400)
+        self.sql("UPDATE devices SET snapshot_json=? WHERE device_id=?",
+                 ("{private stored text", "tracker-bad"))
+        self.snapshot(active=(4003,), device="tracker-good")
+        with self.assertLogs("mileage-monitor", "WARNING") as logs:
+            self.assertTrue(self.tick())
+        self.assertEqual(logs.output, [
+            "WARNING:mileage-monitor:Device snapshot unavailable (JSONDecodeError); conditions unknown"])
+        self.assertEqual(self.sql("SELECT state FROM episodes WHERE device='tracker-bad' AND code=4003",
+                                  state=True), [("unknown",)])
+        self.assertEqual(len(self.messages), 3)  # Original alert, silence and other device's fault.
+        self.assertFalse(any("Resolved E4003" in text for text in self.messages))
+        self.worker = self.make_monitor()
+        with self.assertNoLogs("mileage-monitor", "WARNING"):
+            self.assertTrue(self.tick(60))
+        self.sql("UPDATE devices SET status_sequence=status_sequence+1 WHERE device_id='tracker-bad'")
+        with self.assertLogs("mileage-monitor", "WARNING") as logs:
+            self.assertTrue(self.tick())
+        self.assertEqual(len(logs.output), 1)
+        # Each device logs once, even if both share the same bad revision.
+        self.snapshot(active=(), device="tracker-second")
+        self.sql("UPDATE devices SET snapshot_json=?,status_sequence="
+                 "(SELECT status_sequence FROM devices WHERE device_id='tracker-bad') "
+                 "WHERE device_id='tracker-second'", ("{private stored text",))
+        with self.assertLogs("mileage-monitor", "WARNING") as logs:
+            self.assertTrue(self.tick())
+        self.assertEqual(len(logs.output), 1)
+        # New contact resolves silence even while its health snapshot stays bad.
+        stamp = datetime.fromtimestamp(self.now, timezone.utc).isoformat()
+        self.sql("UPDATE devices SET last_contact_at=?", (stamp,))
+        with self.assertNoLogs("mileage-monitor", "WARNING"):
+            self.assertTrue(self.tick())
+        self.assertIn("Resolved E7001", self.messages[-1])
+        self.assertFalse(any("Resolved E4003" in text for text in self.messages))
+
+    def test_malformed_snapshot_fields_and_receipts_are_isolated(self):
+        for value, column in (("null", "snapshot_json"), ("[]", "snapshot_json"),
+                              ("[" * 1100, "snapshot_json"), ("not a receipt", "snapshot_received_at"),
+                              ("not a receipt", "last_contact_at")):
+            with self.subTest(column=column, value=value[:20]):
+                self.snapshot(active=(4003,), device="tracker-bad")
+                self.snapshot(active=(4003,), device="tracker-good")
+                self.sql(f"UPDATE devices SET {column}=? WHERE device_id='tracker-bad'", (value,))
+                with self.assertLogs("mileage-monitor", "WARNING"):
+                    self.assertTrue(self.tick())
+                self.assertEqual(len(self.messages), 1)
+                self.assertTrue(all("tracker-good" in text for text in self.messages))
+
     def test_history_alone_never_alerts(self):
         self.snapshot(active=(), observed=[4003])
         event = {"code": 4003, "transition": "raise"}
