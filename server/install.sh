@@ -22,6 +22,8 @@
 #   Start           build, viewer login, start, wait for healthy (Step 5)
 #   End to end      upload sample.gpx, find it in the viewer and the
 #                   exports, then delete it again (Steps 6, 7)
+#   Notifications   optional ntfy, metrics, Graylog and Loki outputs, each
+#                   tested; the answers go to monitor.env (Step 11)
 #   Reboots         Docker comes back with the network (Step 9)
 #   Backups         off-host copy, restore test, daily timer (Step 10)
 # and finally the settings for the firmware's secrets.h (Step 8).
@@ -245,6 +247,16 @@ compose() { "${DOCKER[@]}" compose "$@"; }
 
 container_state() {
     "${DOCKER[@]}" inspect -f '{{.State.Status}}' "$1" 2> /dev/null || echo missing
+}
+
+# The state of a Compose service's container, or missing. Services with no
+# container_name (ntfy, mileage-monitor) are called <project>-<service>-1,
+# so they're looked up by service. Needs the service's profile.
+service_state() {
+    local id
+    id=$({ compose --profile "$2" ps -a -q "$1" < /dev/null 2> /dev/null || true; } | sed -n '1p')
+    if [[ -z $id ]]; then printf missing; return 0; fi
+    "${DOCKER[@]}" inspect -f '{{.State.Status}}' "$id" 2> /dev/null || printf missing
 }
 
 # --- Config files ------------------------------------------------------
@@ -991,9 +1003,14 @@ setup_viewer_login() {
 }
 
 # Fail early if something else already listens where a port has to go.
+# With a profile, $svc is a Compose service (see service_state).
 check_port_free() {
-    local svc=$1 port=$2 taken
-    if [[ $(container_state "$svc") == running ]]; then return 0; fi
+    local svc=$1 port=$2 profile=${3-} taken
+    if [[ -n $profile ]]; then
+        if [[ $(service_state "$svc" "$profile") == running ]]; then return 0; fi
+    elif [[ $(container_state "$svc") == running ]]; then
+        return 0
+    fi
     taken=$(ss -Hltn "sport = :$port" 2> /dev/null | awk -v want="$BIND_ADDR" '{
         addr = $4
         sub(/:[0-9]+$/, "", addr)
@@ -1731,6 +1748,973 @@ setup_backups() {
     verify_backups
 }
 
+# --- Notifications -----------------------------------------------------
+
+# The outputs, in the order they're offered. Each is switched on in
+# monitor.env, which MONITOR_ENV_FILE in .env points at; the monitor reads
+# that file when it starts (monitor.py Config.from_env). The only thing this
+# section writes to .env is that pointer. Answers are collected first, and
+# changes to containers or files only happen once they're all in.
+OUTPUT_NAMES=(ntfy metrics graylog loki)
+MONITOR_FILE=       # absolute path of monitor.env, from find_monitor_file
+MONITOR_CONFIGURED=no
+CHOSEN=()           # the outputs answered for this run, in OUTPUT_NAMES order
+BAD_WORD=           # the word parse_outputs rejected
+URL_PATH=           # the path of the URL valid_http_url last checked
+NEW_TOKEN=          # the token ntfy_new_token made
+NTFY_MODE_NEW='' NTFY_TOPIC_NEW='' NTFY_USER_NEW='' NTFY_PW_NEW=''
+NTFY_USER_EXISTS=no
+NTFY_URL_NEW='' NTFY_TOKEN_NEW='' NTFY_TOKEN_OUT='' NTFY_SEVERITY_NEW=''
+STALE_DAYS_NEW='' GRAYLOG_KIND='' GRAYLOG_VALUE=''
+LOKI_URL_NEW='' LOKI_AUTH_NEW='' LOKI_USER_NEW='' LOKI_PW_NEW='' LOKI_TOKEN_NEW='' LOKI_TENANT_NEW=''
+
+# These run inside the monitor container, which has the network path and
+# settings the monitor itself uses. Secrets come from the container's own
+# environment, so they never appear in a command line or in this output.
+PY_NTFY_HEALTH='import json, urllib.request
+with urllib.request.urlopen("http://ntfy:80/v1/health", timeout=10) as response:
+    healthy = json.load(response).get("healthy") is True
+raise SystemExit(0 if healthy else 1)'
+
+# A TCP connect to the host and port of NTFY_URL, GRAYLOG_GELF_URL,
+# GRAYLOG_GELF_TCP or LOKI_PUSH_URL, named as argv[1].
+PY_REACH='import os, socket, sys, urllib.parse
+name = sys.argv[1]
+if name == "GRAYLOG_GELF_TCP":
+    host, _, port = os.environ[name].rpartition(":")
+    host, port = host.strip("[]"), int(port)
+else:
+    parts = urllib.parse.urlsplit(os.environ[name])
+    host = parts.hostname
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+socket.create_connection((host, port), timeout=10).close()
+print("reachable")'
+
+# One test notification, posted the way the monitor posts alerts (bearer
+# token, no redirects). Retries while ntfy is still starting.
+PY_NTFY_TEST='import os, sys, time, urllib.error, urllib.request
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args):
+        return None
+opener = urllib.request.build_opener(NoRedirect())
+request = urllib.request.Request(
+    os.environ["NTFY_URL"], b"Mileage tracker test notification", method="POST",
+    headers={"Authorization": "Bearer " + os.environ["NTFY_TOKEN"],
+             "Title": "Mileage tracker test", "Content-Type": "text/plain; charset=utf-8"})
+reason = "none"
+for attempt in range(10):
+    try:
+        with opener.open(request, timeout=10) as response:
+            print("HTTP", response.status)
+            raise SystemExit(0 if 200 <= response.status < 300 else 1)
+    except urllib.error.HTTPError as exc:
+        print("HTTP", exc.code)
+        raise SystemExit(1)
+    except OSError as exc:
+        reason = type(exc).__name__
+        time.sleep(2)
+print("no answer from ntfy (" + reason + ")")
+raise SystemExit(1)'
+
+# One GELF message through the monitor's own transport (HTTP, or TCP with
+# the NUL frame and optional TLS, as configured).
+PY_GRAYLOG_TEST='import json, os, time
+import gelf
+config = gelf.GelfConfig.from_env(os.environ)
+message = {"version": "1.1", "host": gelf.SOURCE, "timestamp": round(time.time(), 3),
+           "short_message": "Mileage tracker install test", "level": gelf.CLEAR_LEVEL,
+           "_kind": "install_test"}
+try:
+    gelf.transport(config)([json.dumps(message, separators=(",", ":")).encode("ascii")])
+except gelf.DeliveryError as exc:
+    print("failed:", type(exc.cause).__name__, getattr(exc.cause, "code", ""))
+    raise SystemExit(1)
+print("accepted")'
+
+# One line through the monitor's own Loki transport.
+PY_LOKI_TEST='import json, os, time, urllib.error
+import loki
+config = loki.LokiConfig.from_env(os.environ)
+line = json.dumps({"kind": "install_test", "message": "Mileage tracker install test"},
+                  separators=(",", ":"))
+payload = json.dumps({"streams": [{"stream": {"job": "mileage-tracker"},
+                                   "values": [[str(time.time_ns()), line]]}]},
+                     separators=(",", ":")).encode("utf-8")
+try:
+    loki.transport(config)(payload)
+except loki.PermanentRejection as exc:
+    print("rejected: HTTP", exc.status_code)
+    raise SystemExit(1)
+except urllib.error.HTTPError as exc:
+    print("rejected: HTTP", exc.code)
+    raise SystemExit(1)
+except OSError as exc:
+    print("failed:", type(exc).__name__)
+    raise SystemExit(1)
+print("accepted")'
+
+# The value of KEY in monitor.env, without the single quotes that keep
+# Compose from reading its $ signs. Empty if unset.
+mon_value() {
+    local raw
+    raw=$(env_raw "$1" "$2")
+    raw=${raw#\'}
+    raw=${raw%\'}
+    printf '%s' "$raw"
+}
+
+# Whether monitor.env sets KEY to true.
+mon_flag() {
+    local value
+    value=$(mon_value "$MONITOR_FILE" "$1")
+    [[ ${value,,} == true ]]
+}
+
+# Whether monitor.env turns this output on, counting the way the monitor
+# does: only while MONITOR_ENABLED=true, and Loki only with a push URL.
+output_on() {
+    [[ -n $MONITOR_FILE && -f $MONITOR_FILE ]] || return 1
+    mon_flag MONITOR_ENABLED || return 1
+    case $1 in
+        ntfy) mon_flag NOTIFY_ENABLED ;;
+        metrics) mon_flag METRICS_ENABLED ;;
+        graylog) mon_flag GRAYLOG_ENABLED ;;
+        loki) [[ -n $(mon_value "$MONITOR_FILE" LOKI_PUSH_URL) ]] ;;
+    esac
+}
+
+# The outputs monitor.env turns on, one per line.
+outputs_on() {
+    local name
+    for name in "${OUTPUT_NAMES[@]}"; do
+        if output_on "$name"; then printf '%s\n' "$name"; fi
+    done
+}
+
+# Whether an output was answered for in this run.
+chosen_output() { [[ " ${CHOSEN[*]-} " == *" $1 "* ]]; }
+
+# Whether the ntfy in monitor.env is the bundled container.
+ntfy_bundled() { [[ $(mon_value "$MONITOR_FILE" NTFY_URL) == http://ntfy:80/* ]]; }
+
+# Set MONITOR_FILE from MONITOR_ENV_FILE in .env, which Compose reads
+# relative to this directory. Returns 0 if that file exists.
+find_monitor_file() {
+    local pointer
+    pointer=$(env_raw .env MONITOR_ENV_FILE)
+    MONITOR_FILE=
+    if [[ -z $pointer ]]; then return 1; fi
+    if [[ $pointer == /* ]]; then MONITOR_FILE=$pointer; else MONITOR_FILE=$SCRIPT_DIR/${pointer#./}; fi
+    [[ -f $MONITOR_FILE ]]
+}
+
+# Make sure .env points at a monitor.env, creating it from the example (all
+# outputs off) if there's none. Sets MONITOR_CONFIGURED to yes when the
+# pointer or a monitor.env the owner made already exists. The example itself
+# is tracked in Git, so it's never the file secrets go into.
+ensure_monitor_file() {
+    local pointer
+    pointer=$(env_raw .env MONITOR_ENV_FILE)
+    MONITOR_CONFIGURED=no
+    if [[ -n $pointer ]] && find_monitor_file && [[ $MONITOR_FILE != "$SCRIPT_DIR/monitor.env.example" ]]; then
+        MONITOR_CONFIGURED=yes
+    else
+        if [[ -f monitor.env ]]; then
+            # A monitor.env made by hand (DEPLOY_DEBIAN.md Step 11b) is used,
+            # not overwritten.
+            note "Using the monitor.env already here"
+            MONITOR_CONFIGURED=yes
+        else
+            install -m 600 monitor.env.example monitor.env
+            note "Created monitor.env from monitor.env.example, with every output off"
+        fi
+        if [[ $pointer != ./monitor.env ]]; then env_set .env MONITOR_ENV_FILE ./monitor.env; fi
+        find_monitor_file
+    fi
+    if [[ $(stat -c %a "$MONITOR_FILE") != 600 ]]; then chmod 600 "$MONITOR_FILE"; fi
+}
+
+# "ntfy, metrics" for a list of outputs given as comma-separated words.
+outputs_text() { local list=$1; printf '%s' "${list:-none}" | sed 's/,/, /g'; }
+
+# The answers to "Outputs to turn on". Accepts commas or spaces, any case,
+# and "none" only on its own. Sets CHOSEN and returns 1 with BAD_WORD set on
+# a word it doesn't know.
+parse_outputs() {
+    local word name
+    local -a words=()
+    local -A seen=()
+    CHOSEN=()
+    read -r -a words <<< "$(printf '%s' "$1" | tr 'A-Z,' 'a-z ')" || true
+    for word in "${words[@]}"; do
+        case $word in
+            none | ntfy | metrics | graylog | loki) seen[$word]=1 ;;
+            *) BAD_WORD=$word; return 1 ;;
+        esac
+    done
+    if [[ -n ${seen[none]-} ]]; then
+        if (( ${#seen[@]} > 1 )); then BAD_WORD=none; return 1; fi
+        return 0
+    fi
+    for name in "${OUTPUT_NAMES[@]}"; do
+        if [[ -n ${seen[$name]-} ]]; then CHOSEN+=("$name"); fi
+    done
+    return 0
+}
+
+ask_outputs() {
+    local answer
+    while :; do
+        ask answer OUTPUTS "Outputs to turn on (ntfy, metrics, graylog, loki; comma-separated, or none)" "$1"
+        if parse_outputs "$answer"; then return 0; fi
+        if [[ -n ${INSTALL_OUTPUTS+set} ]]; then
+            die "INSTALL_OUTPUTS=$answer isn't a list of outputs." \
+                "Use any of ntfy, metrics, graylog, loki (comma-separated), or none on its own."
+        fi
+        note "\"$BAD_WORD\" isn't one of those. Use ntfy, metrics, graylog, loki (comma-separated), or none on its own."
+    done
+}
+
+# Checks for answers. Each takes one value and returns 0 if it's usable.
+valid_topic() { [[ $1 =~ ^[A-Za-z0-9_-]{1,64}$ ]]; }
+valid_ntfy_user() { [[ $1 =~ ^[A-Za-z0-9_-]{1,64}$ ]]; }
+valid_ntfy_mode() { case $1 in bundled | existing) ;; *) return 1 ;; esac; }
+valid_ntfy_token() { [[ $1 =~ ^[A-Za-z0-9._~+/=-]{8,}$ ]]; }
+valid_severity() { case $1 in info | warning | error | critical) ;; *) return 1 ;; esac; }
+valid_loki_auth() { case $1 in none | bearer | basic) ;; *) return 1 ;; esac; }
+valid_days() { [[ $1 =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v d="$1" 'BEGIN { exit !(d > 0 && d <= 36500) }'; }
+
+# An http or https URL with a host, optional port and optional path. Only
+# characters Compose won't expand, and no credentials, query or fragment.
+# Sets URL_PATH.
+valid_http_url() {
+    local port
+    URL_PATH=
+    [[ $1 =~ ^https?://(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:([0-9]{1,5}))?(/[A-Za-z0-9._~%/+-]*)?$ ]] || return 1
+    port=${BASH_REMATCH[3]}
+    if [[ -n $port ]] && (( 10#$port < 1 || 10#$port > 65535 )); then return 1; fi
+    URL_PATH=${BASH_REMATCH[4]}
+}
+
+valid_ntfy_url() {
+    valid_http_url "$1" || return 1
+    [[ ${URL_PATH##*/} =~ ^[A-Za-z0-9_-]{1,64}$ ]]
+}
+
+valid_loki_url() {
+    valid_http_url "$1" || return 1
+    [[ ${URL_PATH%/} == */loki/api/v1/push ]]
+}
+
+# A GELF HTTP URL, or host:port of a GELF TCP input.
+valid_graylog_target() {
+    local port
+    case $1 in
+        http://* | https://*) valid_http_url "$1" ;;
+        *)
+            [[ $1 =~ ^([A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\]):([0-9]{1,5})$ ]] || return 1
+            port=${BASH_REMATCH[2]}
+            (( 10#$port >= 1 && 10#$port <= 65535 ))
+            ;;
+    esac
+}
+
+# Free-form secrets go into monitor.env in single quotes, which Compose reads
+# literally (the viewer's hash works the same way). So they can't hold quotes,
+# backslashes, spaces or control characters.
+valid_secret() { [[ -n $1 && $1 =~ ^[!-~]+$ && $1 != *\'* && $1 != *\\* ]]; }
+valid_basic_user() { valid_secret "$1" && [[ $1 != *:* ]]; }
+valid_tenant() {
+    [[ -z $1 || $1 == - ]] && return 0
+    valid_secret "$1" && (( ${#1} <= 128 ))
+}
+
+# What the monitor accepts as METRICS_TOKEN: 32 or more printable characters,
+# not a template placeholder.
+valid_metrics_token() { [[ ${#1} -ge 32 && $1 =~ ^[!-~]+$ && $1 != *[\<\>]* ]]; }
+
+# ask_checked VAR NAME "Question" DEFAULT CHECK "Hint"
+# Asks until CHECK accepts the answer. A preset CHECK rejects is an error,
+# as with the other steps.
+ask_checked() {
+    local __var=$1 __name=$2 __question=$3 __default=${4-} __check=$5 __hint=$6 __val preset="INSTALL_$2"
+    while :; do
+        ask __val "$__name" "$__question" "$__default"
+        if "$__check" "$__val"; then printf -v "$__var" '%s' "$__val"; return 0; fi
+        if [[ -n ${!preset+set} ]]; then die "$preset=$__val isn't usable. $__hint"; fi
+        note "$__hint"
+    done
+}
+
+# ask_secret_keep VAR NAME "Question" CURRENT CHECK "Hint"
+# A secret: Enter keeps CURRENT. Asked again until CHECK accepts it. The
+# value is never printed.
+ask_secret_keep() {
+    local __var=$1 __name=$2 __question=$3 __current=$4 __check=$5 __hint=$6 __got label preset="INSTALL_$2"
+    label=$__question
+    if [[ -n $__current ]]; then label="$__question (Enter keeps the current one)"; fi
+    while :; do
+        ask_secret __got "$__name" "$label"
+        if [[ -z $__got ]]; then __got=$__current; fi
+        if [[ -n $__got ]] && "$__check" "$__got"; then printf -v "$__var" '%s' "$__got"; return 0; fi
+        if [[ -n ${!preset+set} ]]; then die "$preset isn't usable. $__hint"; fi
+        note "$__hint"
+    done
+}
+
+# ask_new_secret VAR NAME "Question" MINIMUM [optional]
+# A password asked twice. With "optional", an empty first answer leaves VAR
+# empty, meaning keep what's there. A preset skips the second question.
+ask_new_secret() {
+    local __var=$1 __name=$2 __question=$3 __min=$4 __optional=${5-} __first __again preset="INSTALL_$2"
+    while :; do
+        ask_secret __first "$__name" "$__question"
+        if [[ -z $__first && -n $__optional ]]; then printf -v "$__var" '%s' ''; return 0; fi
+        if (( ${#__first} < __min )); then
+            if [[ -n ${!preset+set} ]]; then die "$preset is shorter than $__min characters."; fi
+            note "That's too short; use at least $__min characters."
+            continue
+        fi
+        if [[ -n ${!preset+set} ]]; then printf -v "$__var" '%s' "$__first"; return 0; fi
+        ask_secret __again "$__name" "Same again"
+        if [[ $__first == "$__again" ]]; then printf -v "$__var" '%s' "$__first"; return 0; fi
+        note "Those didn't match. Try again."
+    done
+}
+
+explain_outputs() {
+    note "Optional alerts and dashboards. All are off unless you pick them, and each runs" \
+        "on a server you control, with no cloud account or subscription:" \
+        "  ntfy     phone notifications when a tracker reports a fault or goes silent" \
+        "           (for days without an upload). Bundled runs ntfy here; or use one you run." \
+        "  metrics  a token-protected Prometheus page on port 8093, for Grafana" \
+        "  graylog  the diagnostics events, sent to a Graylog you already run" \
+        "  loki     the same events, pushed to a Loki you already run" \
+        "Pick none to leave them all off. Run install.sh again later to change it."
+}
+
+ask_stale_days() {
+    local current
+    current=$(mon_value "$MONITOR_FILE" MONITOR_STALE_DAYS)
+    note "How long a tracker can go without uploading before it counts as silent. Trips" \
+        "upload when you park somewhere with WiFi, so a car parked for weeks is normal."
+    ask_checked STALE_DAYS_NEW STALE_DAYS "Days without an upload before a silence alert" "${current:-7}" \
+        valid_days "Use a number of days above 0 and up to 36500 (decimals are fine)."
+}
+
+# ntfy: a bundled server here, or an existing one.
+ask_ntfy() {
+    local current_url default_mode current_sev keep
+    current_url=$(mon_value "$MONITOR_FILE" NTFY_URL)
+    default_mode=bundled
+    if [[ -n $current_url && $current_url != http://ntfy:80/* ]]; then default_mode=existing; fi
+    note "ntfy delivers the phone alerts. Bundled runs ntfy in a container here, with its own" \
+        "login for the phone and nothing open to anonymous users. Existing sends to an ntfy" \
+        "server you already run, given by its topic URL and an access token for that topic."
+    ask_checked NTFY_MODE_NEW NTFY_MODE "ntfy: bundled or existing" "$default_mode" valid_ntfy_mode \
+        "Answer bundled or existing."
+    if [[ $NTFY_MODE_NEW == bundled ]]; then
+        ask_bundled_ntfy "$current_url"
+    else
+        ask_checked NTFY_URL_NEW NTFY_URL "Topic URL of the existing ntfy (https://<host>/<topic>)" \
+            "$current_url" valid_ntfy_url \
+            "Use http(s)://host/<topic>, with a topic of letters, digits, _ or -, and no username, ? or #."
+        keep=
+        if [[ $current_url != http://ntfy:80/* ]]; then keep=$(mon_value "$MONITOR_FILE" NTFY_TOKEN); fi
+        ask_secret_keep NTFY_TOKEN_NEW NTFY_TOKEN "Access token for that topic" "$keep" valid_ntfy_token \
+            "A token starts with tk_ and has no spaces."
+    fi
+    current_sev=$(mon_value "$MONITOR_FILE" NOTIFY_MIN_SEVERITY)
+    ask_checked NTFY_SEVERITY_NEW NOTIFY_MIN_SEVERITY \
+        "Lowest severity to send (info, warning, error, critical)" "${current_sev:-error}" valid_severity \
+        "Answer info, warning, error or critical."
+}
+
+ask_bundled_ntfy() {
+    local current_url=$1 topic_default=mileage-tracker
+    if [[ $current_url == http://ntfy:80/* ]]; then topic_default=${current_url##*/}; fi
+    ask_checked NTFY_TOPIC_NEW NTFY_TOPIC "Topic name (letters, digits, _ or -)" "$topic_default" valid_topic \
+        "Use 1 to 64 letters, digits, _ or -."
+    ask_checked NTFY_USER_NEW NTFY_USER "Username for the phone app" mileage valid_ntfy_user \
+        "Use 1 to 64 letters, digits, _ or -."
+    start_bundled_ntfy
+    if ntfy_user_exists "$NTFY_USER_NEW"; then
+        NTFY_USER_EXISTS=yes
+        note "$NTFY_USER_NEW already exists in the bundled ntfy. Its password stays as it is" \
+            "unless you type a new one."
+        ask_new_secret NTFY_PW_NEW NTFY_PASSWORD "New password for $NTFY_USER_NEW (Enter keeps it)" 8 optional
+    else
+        NTFY_USER_EXISTS=no
+        note "The phone app logs in with this username and password. ntfy keeps only a hash."
+        ask_new_secret NTFY_PW_NEW NTFY_PASSWORD "Password for $NTFY_USER_NEW (at least 8 characters)" 8
+    fi
+}
+
+ask_graylog() {
+    local current_url current_tcp
+    current_url=$(mon_value "$MONITOR_FILE" GRAYLOG_GELF_URL)
+    current_tcp=$(mon_value "$MONITOR_FILE" GRAYLOG_GELF_TCP)
+    note "Graylog runs on a server you control. Give the URL of a GELF HTTP input (preferred:" \
+        "Graylog confirms each message), or host:port of a GELF TCP input."
+    ask_checked GRAYLOG_VALUE GRAYLOG_TARGET "GELF HTTP URL (http://<host>:12201/gelf) or TCP host:port" \
+        "${current_url:-$current_tcp}" valid_graylog_target \
+        "Use http(s)://host:port/path, or host:port for TCP."
+    case $GRAYLOG_VALUE in
+        http://* | https://*) GRAYLOG_KIND=url ;;
+        *) GRAYLOG_KIND=tcp ;;
+    esac
+}
+
+ask_loki() {
+    local cur_url cur_user cur_pw cur_token cur_tenant cur_auth keep ukeep pkeep
+    cur_url=$(mon_value "$MONITOR_FILE" LOKI_PUSH_URL)
+    cur_user=$(mon_value "$MONITOR_FILE" LOKI_BASIC_AUTH_USER)
+    cur_pw=$(mon_value "$MONITOR_FILE" LOKI_BASIC_AUTH_PASSWORD)
+    cur_token=$(mon_value "$MONITOR_FILE" LOKI_BEARER_TOKEN)
+    cur_tenant=$(mon_value "$MONITOR_FILE" LOKI_TENANT_ID)
+    cur_auth=none
+    if [[ -n $cur_token ]]; then
+        cur_auth=bearer
+    elif [[ -n $cur_user || -n $cur_pw ]]; then
+        cur_auth=basic
+    fi
+    note "Loki is a log store you run; its push URL ends in /loki/api/v1/push."
+    ask_checked LOKI_URL_NEW LOKI_URL "Loki push URL (https://<host>/loki/api/v1/push)" "$cur_url" valid_loki_url \
+        "Use http(s)://host[:port]/loki/api/v1/push, with no username, ? or #."
+    ask_checked LOKI_AUTH_NEW LOKI_AUTH "Loki login: none, bearer or basic" "$cur_auth" valid_loki_auth \
+        "Answer none, bearer or basic."
+    case $LOKI_AUTH_NEW in
+        bearer)
+            keep=
+            if [[ $cur_auth == bearer ]]; then keep=$cur_token; fi
+            ask_secret_keep LOKI_TOKEN_NEW LOKI_BEARER_TOKEN "Loki bearer token" "$keep" valid_secret \
+                "Use a token with no spaces, quotes or backslashes."
+            ;;
+        basic)
+            ukeep=
+            pkeep=
+            if [[ $cur_auth == basic ]]; then ukeep=$cur_user; pkeep=$cur_pw; fi
+            ask_checked LOKI_USER_NEW LOKI_BASIC_AUTH_USER "Loki username" "$ukeep" valid_basic_user \
+                "Use a username with no colon, spaces, quotes or backslashes."
+            ask_secret_keep LOKI_PW_NEW LOKI_BASIC_AUTH_PASSWORD "Loki password" "$pkeep" valid_secret \
+                "Use a password with no spaces, quotes or backslashes."
+            ;;
+    esac
+    ask_checked LOKI_TENANT_NEW LOKI_TENANT_ID \
+        "Loki tenant ID for X-Scope-OrgID (Enter keeps the current one; - clears it; Enter if none)" \
+        "$cur_tenant" valid_tenant "Use up to 128 characters without spaces, quotes or backslashes."
+    if [[ $LOKI_TENANT_NEW == - ]]; then LOKI_TENANT_NEW=; fi
+}
+
+# Bundled ntfy: start the profile (its port is checked first). Its auth DB
+# and users live in the ntfy-state volume, which nothing here removes.
+start_bundled_ntfy() {
+    local output
+    check_port_free ntfy 8092 ntfy
+    if ! output=$(compose --profile ntfy up -d ntfy < /dev/null 2>&1); then
+        printf '%s\n' "$output" | indent
+        die "docker compose couldn't start the bundled ntfy (output above)." \
+            "Its log: docker compose --profile ntfy logs ntfy"
+    fi
+}
+
+# Whether the bundled ntfy already has this user (ntfy user list).
+ntfy_user_exists() {
+    local listing
+    listing=$(compose --profile ntfy exec -T ntfy ntfy user list < /dev/null 2> /dev/null) || return 1
+    grep -Eq "(^|[^A-Za-z0-9_-])user[[:space:]]+$1([^A-Za-z0-9_-]|\$)" <<< "$listing"
+}
+
+# ntfy user add/change-pass USER PASSWORD. The password goes in on stdin,
+# is exported as NTFY_PASSWORD inside the container, and never appears on a
+# command line, in a file or in this output.
+# The script run in the container: read the password, export it for ntfy,
+# then run ntfy user with the subcommand and username it's given.
+# shellcheck disable=SC2016
+NTFY_PASSWORD_SCRIPT='IFS= read -r NTFY_PASSWORD; export NTFY_PASSWORD; exec ntfy user "$1" "$2"'
+
+ntfy_set_password() {
+    local output
+    if ! output=$(printf '%s\n' "$3" | compose --profile ntfy exec -T ntfy sh -c \
+        "$NTFY_PASSWORD_SCRIPT" sh "$1" "$2" 2>&1); then
+        printf '%s\n' "$output" | indent
+        die "ntfy couldn't set the password for $2 (output above)." \
+            "Its log: docker compose --profile ntfy logs ntfy"
+    fi
+}
+
+ntfy_grant() {
+    local output
+    if ! output=$(compose --profile ntfy exec -T ntfy ntfy access "$1" "$2" rw < /dev/null 2>&1); then
+        printf '%s\n' "$output" | indent
+        die "ntfy couldn't give $1 read-write access to $2 (output above)."
+    fi
+}
+
+# Makes a token for USER and sets NEW_TOKEN. The token is never printed.
+ntfy_new_token() {
+    local output token
+    NEW_TOKEN=
+    if ! output=$(compose --profile ntfy exec -T ntfy ntfy token add "$1" < /dev/null 2>&1); then
+        printf '%s\n' "$output" | indent
+        die "ntfy couldn't make an access token for $1 (output above)."
+    fi
+    token=$(grep -Eo 'tk_[A-Za-z0-9]+' <<< "$output" | sed -n '1p') || true
+    if [[ -z $token ]]; then
+        die "ntfy didn't print an access token for $1." \
+            "Check what exists with: docker compose --profile ntfy exec ntfy ntfy token list"
+    fi
+    NEW_TOKEN=$token
+}
+
+# Create or update the bundled phone user, give it the topic, and make the
+# token the monitor will use. Only runs once every answer is in.
+prepare_ntfy() {
+    local current
+    if [[ $NTFY_MODE_NEW != bundled ]]; then
+        NTFY_TOKEN_OUT=$NTFY_TOKEN_NEW
+        return 0
+    fi
+    NTFY_URL_NEW=http://ntfy:80/$NTFY_TOPIC_NEW
+    if [[ $NTFY_USER_EXISTS == no ]]; then
+        ntfy_set_password add "$NTFY_USER_NEW" "$NTFY_PW_NEW"
+        ok "Created the phone user $NTFY_USER_NEW"
+    elif [[ -n $NTFY_PW_NEW ]]; then
+        ntfy_set_password change-pass "$NTFY_USER_NEW" "$NTFY_PW_NEW"
+        ok "Changed the password of $NTFY_USER_NEW"
+    fi
+    ntfy_grant "$NTFY_USER_NEW" "$NTFY_TOPIC_NEW"
+    ok "$NTFY_USER_NEW can read and post to $NTFY_TOPIC_NEW"
+    current=$(mon_value "$MONITOR_FILE" NTFY_TOKEN)
+    if [[ $NTFY_USER_EXISTS == yes && -n $current ]] && ntfy_bundled; then
+        NTFY_TOKEN_OUT=$current
+        ok "Kept the access token already in monitor.env"
+    else
+        ntfy_new_token "$NTFY_USER_NEW"
+        NTFY_TOKEN_OUT=$NEW_TOKEN
+        ok "Made an access token for $NTFY_USER_NEW (saved in monitor.env, not printed)"
+    fi
+}
+
+# Comment out KEY in an env file and keep its value, so it no longer applies.
+# Empty lines are left alone.
+env_comment() {
+    local file=$1 key=$2 tmp
+    tmp=$(mktemp "$file.XXXXXX")
+    KEY=$key awk '
+        $0 ~ "^[[:space:]]*" ENVIRON["KEY"] "=" {
+            if (substr($0, index($0, "=") + 1) ~ /^[[:space:]]*$/) { print; next }
+            print "#" $0
+            next
+        }
+        { print }' "$file" > "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$file"
+}
+
+# Write the answers into monitor.env. Turning an output off flips its switch
+# and keeps its URL and secrets in the file, with two exceptions: Loki's
+# settings are commented out, because the monitor refuses Loki credentials
+# without a push URL, and a value that conflicts with the chosen Graylog
+# transport is commented out too.
+write_monitor_settings() {
+    local f=$MONITOR_FILE
+    if (( ${#CHOSEN[@]} )); then
+        env_set "$f" MONITOR_ENABLED true
+        env_set "$f" MONITOR_STALE_DAYS "$STALE_DAYS_NEW"
+    else
+        env_set "$f" MONITOR_ENABLED false
+    fi
+
+    if chosen_output ntfy; then
+        env_set "$f" NOTIFY_ENABLED true
+        env_set "$f" NOTIFY_MIN_SEVERITY "$NTFY_SEVERITY_NEW"
+        env_set "$f" NTFY_URL "$NTFY_URL_NEW"
+        env_set "$f" NTFY_TOKEN "$NTFY_TOKEN_OUT"
+    else
+        env_set "$f" NOTIFY_ENABLED false
+    fi
+
+    if chosen_output metrics; then
+        env_set "$f" METRICS_ENABLED true
+        if ! valid_metrics_token "$(mon_value "$f" METRICS_TOKEN)"; then
+            env_set "$f" METRICS_TOKEN "$(random_hex)"
+            note "Made the metrics token (saved in monitor.env, not printed)"
+        fi
+    else
+        env_set "$f" METRICS_ENABLED false
+    fi
+
+    if chosen_output graylog; then
+        env_set "$f" GRAYLOG_ENABLED true
+        if [[ $GRAYLOG_KIND == url ]]; then
+            env_set "$f" GRAYLOG_GELF_URL "$GRAYLOG_VALUE"
+            env_set "$f" GRAYLOG_GELF_TCP ""
+            if [[ $(mon_value "$f" GRAYLOG_GELF_TLS) == true ]]; then
+                env_comment "$f" GRAYLOG_GELF_TLS
+                warn "GRAYLOG_GELF_TLS=true was commented out" \
+                    "It only applies to TCP, and an https:// URL already uses TLS."
+            fi
+        else
+            env_set "$f" GRAYLOG_GELF_TCP "$GRAYLOG_VALUE"
+            env_set "$f" GRAYLOG_GELF_URL ""
+            if [[ -n $(mon_value "$f" GRAYLOG_GELF_HEADER) ]]; then
+                env_comment "$f" GRAYLOG_GELF_HEADER
+                warn "GRAYLOG_GELF_HEADER was commented out" \
+                    "It only applies to the HTTP URL. To keep it, use an http(s) URL (DEPLOY_DEBIAN.md Step 11d)."
+            fi
+        fi
+    else
+        env_set "$f" GRAYLOG_ENABLED false
+    fi
+
+    if chosen_output loki; then
+        env_set "$f" LOKI_PUSH_URL "$LOKI_URL_NEW"
+        case $LOKI_AUTH_NEW in
+            bearer)
+                env_set "$f" LOKI_BEARER_TOKEN "'$LOKI_TOKEN_NEW'"
+                env_set "$f" LOKI_BASIC_AUTH_USER ""
+                env_set "$f" LOKI_BASIC_AUTH_PASSWORD ""
+                ;;
+            basic)
+                env_set "$f" LOKI_BASIC_AUTH_USER "'$LOKI_USER_NEW'"
+                env_set "$f" LOKI_BASIC_AUTH_PASSWORD "'$LOKI_PW_NEW'"
+                env_set "$f" LOKI_BEARER_TOKEN ""
+                ;;
+            none)
+                env_set "$f" LOKI_BEARER_TOKEN ""
+                env_set "$f" LOKI_BASIC_AUTH_USER ""
+                env_set "$f" LOKI_BASIC_AUTH_PASSWORD ""
+                ;;
+        esac
+        if [[ -n $LOKI_TENANT_NEW ]]; then
+            env_set "$f" LOKI_TENANT_ID "'$LOKI_TENANT_NEW'"
+        else
+            env_set "$f" LOKI_TENANT_ID ""
+        fi
+    else
+        local key
+        for key in LOKI_PUSH_URL LOKI_BASIC_AUTH_USER LOKI_BASIC_AUTH_PASSWORD LOKI_BEARER_TOKEN LOKI_TENANT_ID; do
+            env_comment "$f" "$key"
+        done
+    fi
+}
+
+# Start or stop the containers to match monitor.env. Only the monitor and the
+# bundled ntfy are touched; the ingest and viewer are never restarted here.
+apply_outputs() {
+    if (( ${#CHOSEN[@]} )); then
+        if [[ $(service_state mileage-monitor monitor) != running ]]; then
+            check_port_free mileage-monitor 8093 monitor
+        fi
+        note "Starting the monitor with these settings (its image is rebuilt if the code changed)"
+        if ! compose --profile monitor up -d --build --no-deps mileage-monitor < /dev/null 2>&1 | indent; then
+            die "docker compose couldn't start the monitor (output above)." \
+                "Its settings are in $MONITOR_FILE"
+        fi
+    elif [[ $(service_state mileage-monitor monitor) == running ]]; then
+        if ! compose --profile monitor stop mileage-monitor < /dev/null 2>&1 | indent; then
+            die "docker compose couldn't stop the monitor (output above)."
+        fi
+        ok "Stopped the monitor, since no output is on"
+    fi
+    if [[ $(service_state ntfy ntfy) == running ]] && ! { output_on ntfy && ntfy_bundled; }; then
+        if ! compose --profile ntfy stop ntfy < /dev/null 2>&1 | indent; then
+            die "docker compose couldn't stop the bundled ntfy (output above)."
+        fi
+        ok "Stopped the bundled ntfy, since phone alerts don't use it now"
+    fi
+}
+
+# What monitor.py logs when it starts, from monitor.env.
+expected_startup() {
+    printf 'Monitor enabled; ntfy %s, Graylog %s, Prometheus %s, Loki %s' \
+        "$(onoff_word ntfy)" "$(onoff_word graylog)" "$(onoff_word metrics)" "$(onoff_word loki)"
+}
+
+onoff_word() {
+    if output_on "$1"; then printf enabled; else printf disabled; fi
+}
+
+# The monitor's last startup line (or refusal) in its log, if any.
+monitor_startup_line() {
+    { compose --profile monitor logs --no-color mileage-monitor < /dev/null 2>&1 || true; } \
+        | grep -E 'Monitor (enabled|disabled)|Invalid monitor configuration' | sed -n '$p' || true
+}
+
+# After the monitor is started: wait until it's running with these settings,
+# or report the refusal or crash it gave.
+wait_monitor_start() {
+    local deadline=$((SECONDS + 90)) state line expected
+    expected=$(expected_startup)
+    while :; do
+        line=$(monitor_startup_line)
+        if [[ $line == *"Invalid monitor configuration"* ]]; then
+            problem "The monitor refused the settings in monitor.env" "${line##*| }" \
+                "Fix the setting it names in $MONITOR_FILE, then run install.sh again."
+            return 1
+        fi
+        state=$(service_state mileage-monitor monitor)
+        if [[ $state == running && $line == *"$expected"* ]]; then
+            ok "The monitor is running with these settings"
+            return 0
+        fi
+        if [[ $state == exited || $state == dead || $state == restarting ]] || (( SECONDS >= deadline )); then
+            compose --profile monitor logs --no-color --tail 25 mileage-monitor < /dev/null 2>&1 | indent || true
+            problem "The monitor didn't come up (state: $state)" \
+                "Its last log lines are above. Fix the cause, then run install.sh again."
+            return 1
+        fi
+        sleep 2
+    done
+}
+
+# Run a check script in the monitor container. Prints ok, or a problem with
+# the last line of its output.
+monitor_check() {  # OK PROBLEM HINT SCRIPT [ARGUMENT]
+    local output
+    if output=$(compose --profile monitor exec -T mileage-monitor python -c "$4" "${5-}" < /dev/null 2>&1); then
+        ok "$1"
+    else
+        problem "$2" "${output##*$'\n'}" "$3"
+    fi
+}
+
+# Whether the monitor can connect to the host and port named by ENV_NAME.
+reach_check() {  # ENV_NAME LABEL
+    monitor_check "The monitor can connect to the $2" "The monitor can't connect to the $2" \
+        "Check the address in $MONITOR_FILE, and that the server is up and reachable from this server." \
+        "$PY_REACH" "$1"
+}
+
+# Metrics, from the host: refused without the token, served with it.
+check_metrics() {
+    local url token file code
+    url="http://${BIND_ADDR:-127.0.0.1}:8093/metrics"
+    token=$(mon_value "$MONITOR_FILE" METRICS_TOKEN)
+    if ! valid_metrics_token "$token"; then
+        problem "METRICS_TOKEN in monitor.env is missing or too short" \
+            "Metrics need a token of at least 32 printable characters. Run install.sh with metrics on to make one."
+        return 0
+    fi
+    code=$(http_status "$url")
+    if [[ $code != 401 ]]; then
+        if [[ $code == 000 ]]; then
+            problem "Nothing answers on port 8093 (metrics)" \
+                "Check the monitor's log: docker compose --profile monitor logs mileage-monitor"
+        else
+            problem "Metrics answered $code without a token, not 401" \
+                "Anyone who can reach port 8093 could read them. Check: docker compose --profile monitor logs mileage-monitor"
+        fi
+        return 0
+    fi
+    ok "Metrics refuse a request without the token (401)"
+    file=$(mktemp)
+    TMP_FILES+=("$file")
+    code=$(http_fetch "$file" -H @<(printf 'Authorization: Bearer %s\n' "$token") "$url")
+    if [[ $code == 200 ]] && grep -q 'mileage_tracker_' "$file"; then
+        ok "Metrics answer with the token (200) and report mileage_tracker_ series"
+    else
+        problem "Metrics didn't answer with the token (HTTP $code)" \
+            "The token in $MONITOR_FILE should match the one the monitor loaded. Restart it: docker compose --profile monitor up -d mileage-monitor"
+    fi
+}
+
+# Read-only checks of what monitor.env turns on, in both modes. Nothing is
+# sent to a phone, Graylog or Loki from here.
+check_outputs() {
+    local list monitor_ok=no pointer
+    if ! find_monitor_file; then
+        pointer=$(env_raw .env MONITOR_ENV_FILE)
+        if [[ -n $pointer ]]; then
+            warn "MONITOR_ENV_FILE in .env points at $pointer, which doesn't exist" \
+                "Create that file, or set MONITOR_ENV_FILE=./monitor.env, then run install.sh."
+        else
+            ok "Notification outputs: off"
+        fi
+        return 0
+    fi
+    list=$(outputs_on | paste -sd, -)
+    if [[ -z $list ]]; then
+        ok "Notification outputs: off"
+        return 0
+    fi
+    ok "Notification outputs on: ${list//,/, }"
+    if [[ $(stat -c %a "$MONITOR_FILE") != 600 ]]; then
+        warn "monitor.env can be read by other users on this machine" "chmod 600 $MONITOR_FILE"
+    fi
+
+    if [[ $(service_state mileage-monitor monitor) != running ]]; then
+        problem "The monitor isn't running" \
+            "Start it with: docker compose --profile monitor up -d mileage-monitor"
+    elif [[ $(monitor_startup_line) == *"$(expected_startup)"* ]]; then
+        ok "The monitor is running with the settings in monitor.env"
+        monitor_ok=yes
+    else
+        problem "The monitor is running with other settings than monitor.env" \
+            "Apply them: docker compose --profile monitor up -d mileage-monitor"
+    fi
+
+    if output_on ntfy; then
+        if ntfy_bundled; then
+            if [[ $(service_state ntfy ntfy) == running ]]; then
+                ok "The bundled ntfy is running"
+            else
+                problem "The bundled ntfy isn't running" "Start it with: docker compose --profile ntfy up -d ntfy"
+            fi
+            if [[ $monitor_ok == yes ]]; then
+                monitor_check "The bundled ntfy's health check passes from the monitor" \
+                    "The bundled ntfy's health check fails from the monitor" \
+                    "Its log: docker compose --profile ntfy logs ntfy" "$PY_NTFY_HEALTH"
+            fi
+        elif [[ $monitor_ok == yes ]]; then
+            reach_check NTFY_URL "ntfy server"
+        fi
+    fi
+    if output_on graylog && [[ $monitor_ok == yes ]]; then
+        if [[ -n $(mon_value "$MONITOR_FILE" GRAYLOG_GELF_URL) ]]; then
+            reach_check GRAYLOG_GELF_URL "Graylog input"
+        else
+            reach_check GRAYLOG_GELF_TCP "Graylog input"
+        fi
+    fi
+    if output_on loki && [[ $monitor_ok == yes ]]; then
+        reach_check LOKI_PUSH_URL "Loki server"
+    fi
+    if output_on metrics; then
+        check_metrics
+    fi
+}
+
+# Print the Prometheus job with <host> filled in, and say where its token is.
+show_scrape_config() {
+    local addr=${BIND_ADDR:-$(default_addr)}
+    note "For Prometheus, add this job to its scrape_configs (the source is grafana/prometheus-scrape.yml):"
+    if [[ -f grafana/prometheus-scrape.yml ]]; then
+        sed -e '/^#/d' -e "s|<host>|${addr:-<this server>}|" grafana/prometheus-scrape.yml | indent
+    fi
+    note "The token it needs is in $MONITOR_FILE. Copy only its value into the token file on" \
+        "the Prometheus host (bearer_token_file), not into the YAML. To see it:" \
+        "grep '^METRICS_TOKEN=' $MONITOR_FILE"
+}
+
+# Send one test through each output that needs a real destination. These
+# are the only steps here that send anything out.
+test_ntfy() {
+    local topic result status=0 last addr
+    topic=$(mon_value "$MONITOR_FILE" NTFY_URL)
+    topic=${topic##*/}
+    addr=${BIND_ADDR:-$(default_addr)}
+    if ntfy_bundled; then
+        note "Phone setup (one time):" \
+            "1. Install the free ntfy app (Android: Play Store or F-Droid; iOS: App Store)." \
+            "2. Add the server http://${addr:-<this server>}:8092, then log in as $NTFY_USER_NEW with its password." \
+            "3. Subscribe to the topic $topic." \
+            "The phone only gets alerts on home WiFi or over a VPN into this network. Away from it," \
+            "they wait in ntfy's cache for up to 72 hours. Instant push on iOS is an extra step:" \
+            "DEPLOY_DEBIAN.md Step 11a."
+    else
+        note "On the phone, subscribe to $topic on that ntfy server, with an account that can read it."
+    fi
+    if ! confirm NTFY_READY "Is the phone set up? y sends a test notification now (n skips it)" y; then
+        warn "Skipped the ntfy test" "Send one later with DEPLOY_DEBIAN.md Step 11c."
+        return 0
+    fi
+    result=$(compose --profile monitor exec -T mileage-monitor python -c "$PY_NTFY_TEST" < /dev/null 2>&1) || status=$?
+    last=${result##*$'\n'}
+    if (( status == 0 )); then
+        ok "ntfy accepted the test notification ($last)"
+        if confirm NTFY_ARRIVED "Did it arrive on the phone?" y; then
+            ok "The test notification reached the phone"
+        else
+            warn "The test notification didn't reach the phone" \
+                "Likely causes: the phone isn't on home WiFi or the VPN, it isn't subscribed to $topic," \
+                "or the app is logged in with the wrong username or password. Test again with DEPLOY_DEBIAN.md Step 11c."
+        fi
+    else
+        problem "ntfy didn't accept the test notification ($last)" \
+            "A 401 or 403 means the token or its access to $topic is wrong: docker compose --profile ntfy exec ntfy ntfy access" \
+            "Anything else: docker compose --profile ntfy logs ntfy"
+    fi
+}
+
+test_graylog() {
+    local result status=0
+    result=$(compose --profile monitor exec -T mileage-monitor python -c "$PY_GRAYLOG_TEST" < /dev/null 2>&1) || status=$?
+    if (( status == 0 )); then
+        ok "Graylog's input took the test message"
+        if confirm GRAYLOG_ARRIVED "Does it show up in Graylog (search source:mileage-tracker)?" y; then
+            ok "The test message shows up in Graylog"
+        else
+            warn "The test message didn't show up in Graylog" \
+                "Check the input is running, that the search covers the time now, and that it's the right Graylog."
+        fi
+    else
+        problem "Graylog didn't take the test message (${result##*$'\n'})" \
+            "Check the address in $MONITOR_FILE and that the input is running."
+    fi
+}
+
+test_loki() {
+    local result status=0
+    result=$(compose --profile monitor exec -T mileage-monitor python -c "$PY_LOKI_TEST" < /dev/null 2>&1) || status=$?
+    if (( status == 0 )); then
+        ok "Loki accepted a test line (search {job=\"mileage-tracker\"} in Grafana)"
+    else
+        problem "Loki didn't accept the test line (${result##*$'\n'})" \
+            "Check LOKI_PUSH_URL and the login in $MONITOR_FILE, and that Loki is up."
+    fi
+}
+
+send_tests() {
+    if output_on ntfy; then test_ntfy; fi
+    if output_on graylog; then test_graylog; fi
+    if output_on loki; then test_loki; fi
+    if output_on metrics; then show_scrape_config; fi
+}
+
+setup_outputs() {
+    section "Notifications"
+    if [[ $MODE == check ]]; then
+        check_outputs
+        return 0
+    fi
+    ensure_monitor_file
+    local default=none current
+    if [[ $MONITOR_CONFIGURED == yes ]]; then
+        current=$(outputs_on | paste -sd, -)
+        note "Notification outputs now: $(outputs_text "$current")"
+        if confirm KEEP_OUTPUTS "Keep them as they are?" y; then
+            ok "Kept the notification outputs"
+            check_outputs
+            return 0
+        fi
+        default=${current:-none}
+    else
+        explain_outputs
+    fi
+    ask_outputs "$default"
+
+    if (( ${#CHOSEN[@]} )); then
+        ask_stale_days
+        if chosen_output ntfy; then ask_ntfy; fi
+        if chosen_output graylog; then ask_graylog; fi
+        if chosen_output loki; then ask_loki; fi
+    fi
+
+    # Every answer is in. Now make the changes.
+    if chosen_output ntfy; then prepare_ntfy; fi
+    write_monitor_settings
+    apply_outputs
+    if (( ${#CHOSEN[@]} )); then
+        wait_monitor_start
+        check_outputs
+        send_tests
+    else
+        ok "Notification outputs: off"
+    fi
+}
+
 # --- Summary -----------------------------------------------------------
 
 summary() {
@@ -1812,6 +2796,7 @@ main() {
     if verify_services; then
         verify_end_to_end || true
     fi
+    setup_outputs
     verify_reboots
     setup_backups
     summary
