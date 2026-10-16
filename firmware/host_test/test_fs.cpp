@@ -41,6 +41,8 @@ static void resetWorld() {
     g_httpCode = 200; g_httpRequests = 0; g_httpLastBody.clear(); g_httpHook = nullptr;
     gChargePaused = false; gChargeApplied = false; gChargeCheckT0 = 0;
     gNetBusy = false; gNetHold = false; gNetAbort = false;
+    gNetLastAttemptMs = 0; gNetRetryMs = 0; WiFi = WiFiStub();
+    g_failMutexCreate = false; g_taskCreates = 0; g_restarts = 0;
     gIdleSince = g_millis; g_deepSleeps = 0; g_lockDepth = 0;
     g_delayHook = nullptr;
 }
@@ -893,6 +895,136 @@ int main(int argc, char** argv) {
         loopFor(FIX_LOSS_END_MS + 1000);
         CHECK(logHas("No GPS fix for 5 min") && tripFiles().empty(),
               "nor does the wait before a fix-loss finalize");
+    }
+
+    printf("T36 WiFi scan results are freed on every exit (#16)\n");
+    {
+        resetWorld();
+        for (int error : {0, -1, -2}) {
+            WiFi.scanError = error;
+            CHECK(!homeApInRange(), "empty or failed scan is a miss");
+            CHECK(WiFi.scanDeletes == WiFi.scans && !WiFi.scanResultsAvailable,
+                  "empty/failed results released");
+        }
+        WiFi.scanError = 0;
+        WiFi.scanSsids = {"other-network"};
+        CHECK(!homeApInRange(), "unrelated AP is a miss");
+        CHECK(WiFi.scanDeletes == WiFi.scans, "unmatched results released");
+        WiFi.scanSsids = {"other-network", WIFI_SSID};
+        CHECK(homeApInRange(), "home AP found after an unrelated result");
+        CHECK(WiFi.scanDeletes == WiFi.scans, "matched results released");
+        WiFi.scanSsids = {WIFI_SSID, "other-network"};
+        CHECK(homeApInRange() && !WiFi.scanResultsAvailable, "early match also releases results");
+        CHECK(WiFi.readsAfterDelete == 0, "scan data read only before release");
+    }
+
+    printf("T37 failed network attempts back off, recover, and survive millis wrap (#16)\n");
+    {
+        resetWorld();
+        drive(15, 40); endTrip(false);
+        const std::string complete = g_disk.files.begin()->second;
+        WiFi.scanDurationMs = 2000;
+        for (uint32_t wait : {60000U, 120000U, 240000U, 300000U, 300000U}) {
+            int before = WiFi.scans;
+            netCycle();
+            CHECK(WiFi.scans == before + 1 && gNetRetryMs == wait,
+                  "AP miss doubles the wait up to five minutes");
+            CHECK(gNetLastAttemptMs == g_millis && !gNetBusy &&
+                  WiFi.currentMode == WIFI_OFF && WiFi.scanDeletes == WiFi.scans,
+                  "wait begins after the attempt; radio and busy flag cleared");
+            g_millis = gNetLastAttemptMs + wait - 1;
+            netCycle();
+            CHECK(WiFi.scans == before + 1, "no scan before retry is due");
+            ++g_millis;
+        }
+        int scans = WiFi.scans;
+        gNetHold = true; netCycle();
+        CHECK(WiFi.scans == scans && !gNetBusy, "sleep hold suppresses even an overdue retry");
+        gNetHold = false;
+        WiFi.scanSsids = {WIFI_SSID};
+        uint32_t joinStart = g_millis;
+        netCycle();
+        CHECK(WiFi.joins == 1 && g_millis - joinStart == 17000 && gNetRetryMs == NET_RETRY_MAX_MS,
+              "seeing the AP but failing to join keeps the backoff");
+        CHECK(gNetLastAttemptMs == g_millis, "join timeout does not consume the next retry wait");
+
+        WiFi.connectionStatus = WL_CONNECTED;
+        g_httpCode = 503;
+        g_millis = gNetLastAttemptMs + gNetRetryMs;
+        netCycle();
+        CHECK(g_httpRequests == 1 && gNetRetryMs == NET_RETRY_MAX_MS && hasPending(),
+              "server failure stays queued and keeps the backoff");
+        g_disk.files["/trips/t999999.gpx"] = complete;
+        g_httpHook = [] { g_httpCode = g_httpRequests == 2 ? 200 : 503; };
+        g_millis = gNetLastAttemptMs + gNetRetryMs;
+        netCycle();
+        CHECK(g_httpRequests == 3 && tripFiles().size() == 1 && gNetRetryMs == NET_TICK_MS,
+              "one successful upload resets the wait even if a later file fails");
+        g_httpHook = nullptr;
+        scans = WiFi.scans;
+        g_millis = gNetLastAttemptMs + NET_TICK_MS - 1; netCycle();
+        CHECK(WiFi.scans == scans, "success still waits the normal 30 s before another attempt");
+        ++g_millis; netCycle();
+        CHECK(g_httpRequests == 4 && gNetRetryMs == 60000, "a new failure grows from the reset wait");
+
+        g_disk.files.clear();
+        scans = WiFi.scans;
+        netCycle();
+        CHECK(gNetRetryMs == 0 && WiFi.scans == scans, "empty queue clears backoff without a scan");
+        g_disk.files["/trips/t999999.gpx"] = complete;
+        g_httpCode = 200;
+        netCycle();
+        CHECK(g_httpRequests == 5 && !hasPending(), "new queued trip can upload immediately");
+
+        resetWorld();
+        g_disk.files["/trips/t999999.gpx"] = complete;
+        g_millis = UINT32_MAX - 1000;
+        netCycle();
+        g_millis = gNetLastAttemptMs + gNetRetryMs - 1; netCycle();
+        CHECK(WiFi.scans == 1, "wrapped clock: no early retry");
+        ++g_millis; netCycle();
+        CHECK(WiFi.scans == 2 && gNetRetryMs == 120000, "wrapped clock: retry when due");
+    }
+
+    printf("T38 every trip walk accepts basenames and full paths (#17)\n");
+    {
+        for (bool fullPaths : {false, true}) {
+            resetWorld();
+            g_disk.fullPathNames = fullPaths;
+            drive(15, 40); endTrip(false);
+            const std::string complete = g_disk.files.begin()->second;
+            g_disk.files.clear();
+            g_disk.files["/trips/t000038.gpx.fix"] = complete;  // orphan boot repair
+            fsckAllTrips();
+            CHECK(g_disk.files.count("/trips/t000038.gpx") == 1 &&
+                  !g_disk.files.count("/trips/t000038.gpx.fix"), "fsck resolves the actual trip path");
+            strcpy(gTripPath, "/trips/t000038.gpx");
+            CHECK(!hasPending(), "active trip excluded from pending lookup");
+            CHECK(!uploadPending() && g_httpRequests == 0, "active trip excluded from uploads");
+            gTripPath[0] = 0;
+            CHECK(hasPending(), "finished trip found by pending lookup");
+            CHECK(uploadPending() && g_httpRequests == 1 && g_httpLastBody == complete,
+                  "upload reads the actual path and exact trip bytes");
+            CHECK(tripFiles().empty() && !hasPending(), "accepted trip deleted from the actual path");
+        }
+    }
+
+    printf("T39 failed mutex allocation restarts before storage or task startup (#18)\n");
+    {
+        resetWorld();
+        g_disk.files["/trips/t000039.gpx"] = "irreplaceable trip";
+        g_failMutexCreate = true;
+        try { setup(); } catch (const Restarted&) {}
+        CHECK(g_restarts == 1 && !gFsMutex && logHas("LittleFS mutex allocation failed"),
+              "specific boot error and restart on allocation failure");
+        CHECK(g_disk.mountAttempts == 0 && g_lockDepth == 0 && g_taskCreates == 0 && prefs.kv.empty(),
+              "no storage access, lock acquisition, or worker startup");
+        CHECK(g_disk.files["/trips/t000039.gpx"] == "irreplaceable trip" && !logHas("Setup complete"),
+              "queued trip preserved and setup does not continue");
+        resetWorld();
+        setup();
+        CHECK(gFsMutex && g_restarts == 0 && g_disk.mountAttempts == 1 && g_taskCreates == 1,
+              "successful allocation still mounts storage and starts the network task");
     }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);

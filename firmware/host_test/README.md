@@ -15,7 +15,11 @@ There are two suites:
   report success, as they do on ESP32 core 3.x, and only `flush()`/`close()`
   commit them to the simulated flash. Tests can inject a failed open, a flash
   write error, or a full filesystem. The trip state machine is driven
-  directly with synthetic fixes.
+  directly with synthetic fixes. Network-cycle tests simulate AP scans,
+  connection failures, and HTTP responses to check retry backoff, recovery,
+  scan cleanup, sleep holds, and clock wraparound. Boot tests inject mutex
+  allocation failure and check that storage and workers never start.
+  Trip-directory walks are checked with both basename and full-path names.
 - **`test_gps`**: the GPS input path, built against the **real** TinyGPSPlus.
   It feeds the sketch's `loop()` the NMEA a NEO-M8N sends at its defaults,
   one sentence per call as the UART delivers it, and checks there's exactly
@@ -29,7 +33,8 @@ There are two suites:
   library in the Arduino IDE's default folder, or wherever `TINYGPS_DIR`
   points, and is skipped if the library isn't found.
 
-PMU and WiFi are compile-only stand-ins in both suites.
+PMU, WiFi, and HTTP inputs are simulated; the host suites do not exercise
+the real drivers, radio, allocator, or reset mechanism.
 
 Trip files the tests leave behind are written to `build/out/`. To check that
 they're valid, upload them to the ingest service the same way the curl test in

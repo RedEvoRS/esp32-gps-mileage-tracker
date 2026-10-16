@@ -293,9 +293,14 @@ How it behaves once flashed:
   before the clock was ever set (by GPS or NTP) writes the points still
   in its 90-point buffer without times rather than guessing them; earlier
   points may already have been dropped. The viewer lists it without a date.
-- **Upload:** every 30 s, if finished trips are waiting, the board scans
-  for your home WiFi. When it finds it, it POSTs each trip to the ingest
-  server as GPX and deletes it locally once the server accepts it. GPS
+- **Upload:** the board checks for finished trips every 30 s and scans
+  for your home WiFi when a retry is due. Failed scans, connections, or
+  uploads double the retry wait (60 s, 120 s, 240 s, then at most 5 min).
+  The wait starts after the attempt finishes; the next 30 s check runs it
+  once due. A successful upload resets the wait to 30 s, and an empty
+  queue clears it so the next trip can try promptly. When connected, it
+  POSTs each trip to the ingest server as GPX and deletes it locally once
+  the server accepts it. GPS
   parsing runs on core 1; networking runs on core 0 and never blocks
   it.
 - **Power loss:** when the car turns off (USB power off for 10 s), the
