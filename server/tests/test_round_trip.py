@@ -93,21 +93,29 @@ class TripRoundTrip(unittest.TestCase):
             detail = client.get(f"/trip/{key}").get_data(as_text=True)
             self.assertIn("duration and average speed are unknown", detail)
             self.assertIn("<b>—</b><span>avg mph</span>", detail)
-            self.assertNotIn(f"/trip/{key}", client.get("/?year=2026").get_data(as_text=True))
-            rows = list(csv.DictReader(io.StringIO(client.get("/export.csv").data.decode())))
+            year_page = client.get("/?year=2026").get_data(as_text=True)
+            self.assertIn(f"/trip/{key}", year_page)
+            self.assertIn("Timed from", year_page)
+            rows = list(csv.DictReader(io.StringIO(client.get("/export.csv?year=2026").data.decode())))
             row = next(row for row in rows if row["row_type"] == "trip")
             self.assertEqual(row["timing_status"], "partial")
+            self.assertEqual(row["year_basis"], "first_recorded_time")
+            self.assertTrue(row["date"].startswith("Timed from "))
             self.assertTrue(row["timed_from"].endswith("-07:00"))
             for field in ("start_time", "end_time", "duration_minutes", "avg_speed_mph"):
                 self.assertEqual(row[field], "", field)
             self.assertEqual(float(row["distance_miles"]), record["distance_miles"])
-            workbook = load_workbook(io.BytesIO(client.get("/export.xlsx").data))
+            total = next(row for row in rows if row["row_type"] == "total" and row["category"] == "all")
+            self.assertEqual(float(total["distance_miles"]), record["distance_miles"])
+            workbook = load_workbook(io.BytesIO(client.get("/export.xlsx?year=2026").data))
             try:
                 cells = dict(zip((c.value for c in workbook.active[1]), workbook.active[2]))
                 self.assertEqual(cells["timing_status"].value, "partial")
                 for field in ("start_time", "end_time", "duration_minutes", "avg_speed_mph"):
                     self.assertIsNone(cells[field].value, field)
                 self.assertEqual(cells["distance_miles"].value, record["distance_miles"])
+                totals = {r[2]: r[3] for r in workbook["Totals"].iter_rows(min_row=2, values_only=True)}
+                self.assertEqual(totals["all"], record["distance_miles"])
             finally:
                 workbook.close()
 

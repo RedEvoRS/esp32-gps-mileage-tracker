@@ -1341,7 +1341,13 @@ static void netCycle() {
         // A trip just ended, so the car may be parked at home: try now,
         // whatever the backoff reached while driving or parked elsewhere.
         if (gNetRetryNow.exchange(false)) gNetRetryMs = 0;
-        if (!hasPending()) {
+        bool pending = hasPending();
+        // A scan interrupted by sleep/abort has not proved the queue empty.
+        if (gNetHold.load() || gNetAbort.load()) {
+            gNetBusy.store(false);
+            return;
+        }
+        if (!pending) {
             gNetRetryMs = 0;
         } else if (gNetRetryMs == 0 || millis() - gNetLastAttemptMs >= gNetRetryMs) {
             bool uploaded = false;

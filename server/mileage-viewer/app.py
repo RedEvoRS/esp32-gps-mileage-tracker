@@ -492,7 +492,7 @@ def read_summary(json_path):
 def load_trips():
     """Scan DATA_ROOT for trips and join annotations.
 
-    Returns (trips, unreadable). trips is sorted by start_time descending,
+    Returns (trips, unreadable). trips is sorted by its date anchor descending,
     and each dict carries the summary fields plus: id, ym, trip_key,
     category, purpose_note, destination, has_gpx. unreadable holds the
     trips whose summary read_summary() rejected or couldn't find, sorted
@@ -532,7 +532,7 @@ def load_trips():
         else:
             trips.append(trip)
 
-    trips.sort(key=lambda t: t.get("start_time") or "", reverse=True)
+    trips.sort(key=lambda t: _trip_date_anchor(t) or "", reverse=True)
     unreadable.sort(key=lambda t: t["trip_key"])
     return trips, unreadable
 
@@ -551,6 +551,29 @@ def fmt_date(iso):
     """
     dt = _to_local(_parse(iso))
     return dt.strftime("%Y-%m-%d %H:%M %Z") if dt else "—"
+
+
+def _trip_date_anchor(trip):
+    """Year/sort anchor; a partial trip's observed date is not its start."""
+    if _parse(trip.get("start_time")):
+        return trip["start_time"]
+    if trip.get("timing_status") == "partial":
+        return trip.get("timed_from")
+    return None
+
+
+def fmt_trip_date(trip):
+    if not _parse(trip.get("start_time")) and trip.get("timing_status") == "partial":
+        return "Timed from " + fmt_date(trip.get("timed_from"))
+    return fmt_date(trip.get("start_time"))
+
+
+def year_basis(trip):
+    if _parse(trip.get("start_time")):
+        return "trip_start"
+    if trip.get("timing_status") == "partial" and _parse(trip.get("timed_from")):
+        return "first_recorded_time"
+    return "unknown"
 
 
 def fmt_local_iso(iso):
@@ -619,7 +642,7 @@ def _may_start_in(ym, year):
 
 
 def selected_trips():
-    """Use the trip's local start year, never its storage directory/end date.
+    """Use local start year, or first recorded time for partly timed trips.
 
     Returns (trips, unreadable, year, years). Unreadable trips have no
     start time, so they're the exception: they go by folder.
@@ -629,7 +652,7 @@ def selected_trips():
     years = set()
     selected = []
     for trip in trips:
-        local = _to_local(_parse(trip.get("start_time")))
+        local = _to_local(_parse(_trip_date_anchor(trip)))
         if local:
             years.add(local.year)
         if year is None or (local and local.year == year):
@@ -653,7 +676,8 @@ def mileage_totals(trips):
 
 
 app.jinja_env.globals.update(
-    fmt_date=fmt_date, fmt_duration=fmt_duration, fmt_speed=fmt_speed, csrf_token=_csrf_token
+    fmt_date=fmt_date, fmt_trip_date=fmt_trip_date, fmt_duration=fmt_duration,
+    fmt_speed=fmt_speed, csrf_token=_csrf_token
 )
 
 
@@ -755,7 +779,7 @@ LIST_HTML = """
   {% endif %}
   <div class="toolbar">
     <form method="get">
-      <label for="year">Year (trip start in {{ timezone }})</label>
+      <label for="year">Year (trip start or first recorded time in {{ timezone }})</label>
       <select name="year" id="year">
         <option value="">All years</option>
         {% for y in years %}<option value="{{ y }}" {% if year == y %}selected{% endif %}>{{ y }}</option>{% endfor %}
@@ -771,13 +795,14 @@ LIST_HTML = """
     <div class="stat"><b>{{ "%.3f"|format(miles) }}</b><span>{{ category }} miles</span></div>
     {% endif %}{% endfor %}
   </div>
-  <p class="muted">Totals cover recorded trips in this selection. Trips without a start date appear only under All years.</p>
+  <p class="muted">Totals cover recorded trips in this selection. Partly timed trips use their first recorded timestamp
+    for year selection; their actual start can be in an earlier year. Trips with no usable date appear only under All years.</p>
   <table>
     <tr><th>Date</th><th>Distance</th><th>Duration</th><th>Avg mph</th>
         <th>Purpose</th><th>Destination</th><th>Note</th><th></th></tr>
     {% for t in trips %}
     <tr>
-      <td>{{ fmt_date(t.start_time) }}{% if t.get('timing_status') == 'partial' %}<br><span class="muted">Partial timing</span>{% endif %}</td>
+      <td>{{ fmt_trip_date(t) }}{% if t.get('timing_status') == 'partial' %}<br><span class="muted">Partial timing</span>{% endif %}</td>
       <td>{{ "%.2f"|format(t.distance_miles or 0) }} mi</td>
       <td>{{ fmt_duration(t.duration_seconds) }}</td>
       <td>{{ fmt_speed(t.get('avg_speed_mph')) }}</td>
@@ -805,11 +830,12 @@ TRIP_HTML = """
   </form>
 </header>
 <div class="wrap">
-  <h2>{{ fmt_date(t.start_time) }}</h2>
+  <h2>{{ fmt_trip_date(t) }}</h2>
   {% if t.get('timing_status') == 'partial' %}
   <p class="muted">Partial timing: some points have no timestamp. Full-trip dates,
     duration and average speed are unknown. Recorded timestamps run from
-    {{ fmt_date(t.timed_from) }} to {{ fmt_date(t.recorded_until) }}. Recorded distance is retained.</p>
+    {{ fmt_date(t.timed_from) }} to {{ fmt_date(t.recorded_until) }}. Recorded distance is retained.
+    Year selection uses the first recorded timestamp; the actual start can be in an earlier year.</p>
   {% endif %}
   <div class="stats">
     <div class="stat"><b>{{ "%.2f"|format(t.distance_miles or 0) }}</b><span>miles</span></div>
@@ -1004,7 +1030,7 @@ def annotate(ym, trip_id):
 # ---------------------------------------------------------------------
 
 EXPORT_COLUMNS = [
-    ("date", lambda t: fmt_date(t.get("start_time"))),
+    ("date", fmt_trip_date),
     ("trip_id", lambda t: t.get("trip_id", t.get("id"))),
     ("device_id", lambda t: t.get("device_id", "")),
     ("distance_miles", lambda t: t.get("distance_miles") or 0),
@@ -1025,6 +1051,7 @@ EXPORT_COLUMNS = [
     ("timing_status", lambda t: t.get("timing_status") or "unknown"),
     ("timed_from", lambda t: fmt_local_iso(t.get("timed_from"))),
     ("recorded_until", lambda t: fmt_local_iso(t.get("recorded_until"))),
+    ("year_basis", year_basis),
 ]
 
 

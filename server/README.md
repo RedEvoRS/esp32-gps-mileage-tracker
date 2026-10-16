@@ -243,13 +243,16 @@ What it does:
 Years are based on **trip start in `DISPLAY_TZ`**, including at the New Year
 boundary. A trip crossing midnight belongs entirely to its start year; it
 is not split. The storage folder is not used for filtering, except for
-unreadable summaries (below). Trips with
-missing or invalid start dates appear only under All years. The viewer
-labels partly timed trips with **Partial timing** and leaves
+unreadable summaries (below). The viewer labels partly timed trips with
+**Partial timing** and leaves
 unknown duration and average speed blank. CSV/XLSX include `timing_status`,
 `timed_from`, and `recorded_until`; older summaries without a status export
-`unknown`. Partly timed trips appear only under All years because their
-full-trip start is unknown. Direct exports
+`unknown`. For partly timed trips, year selection and sorting
+use `timed_from`, the first recorded timestamp in `DISPLAY_TZ`, so their miles
+remain in year totals and exports. The date is labeled **Timed from** and
+`year_basis` exports `first_recorded_time`. Their actual start may be in an
+earlier year, which the viewer states explicitly. Wholly undated trips appear
+only under All years. Direct exports
 accept `?year=2026`; omit `year` for all years. Empty years export headers
 and zero totals. Totals cover the recorded trips in the selection, not an
 odometer measurement of all vehicle use or a determination of deductibility.

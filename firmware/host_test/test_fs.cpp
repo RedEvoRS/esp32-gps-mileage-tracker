@@ -1278,6 +1278,37 @@ int main(int argc, char** argv) {
         }
     }
 
+    printf("T46 interruption during queue lookup preserves retry backoff\n");
+    {
+        for (bool abort : {false, true}) {
+            resetWorld(); drive(15, 40); endTrip(false);
+            const std::string complete = g_disk.files.begin()->second;
+            g_disk.files.clear();
+            g_disk.files["/trips/t000000.gpx"] = complete.substr(0, complete.find(GPX_EPILOGUE));
+            g_disk.files["/trips/t999999.gpx"] = complete;
+            const auto originals = g_disk.files;
+            gNetRetryNow = false;
+            gNetRetryMs = NET_RETRY_MAX_MS; gNetLastAttemptMs = g_millis;
+            if (abort) g_disk.onRead = [] { g_disk.onRead = nullptr; gNetAbort = true; };
+            else g_disk.onRead = [] { g_disk.onRead = nullptr; gNetHold = true; };
+            netCycle();
+            CHECK(gNetRetryMs == NET_RETRY_MAX_MS && !gNetBusy &&
+                  WiFi.scans == 0 && g_httpRequests == 0,
+                  "hold/abort arriving inside the filesystem read leaves the retry delay intact");
+            CHECK(g_disk.files == originals && g_lockDepth == 0 && g_disk.openDirectories == 0,
+                  "interrupted lookup preserves all files and releases every handle and lock");
+            gNetHold = false; gNetAbort = false;
+            netCycle();
+            CHECK(WiFi.scans == 0, "releasing the interruption does not start an early retry");
+            WiFi.scanSsids = {WIFI_SSID}; WiFi.connectionStatus = WL_CONNECTED;
+            g_millis = gNetLastAttemptMs + gNetRetryMs;
+            netCycle();
+            CHECK(g_httpRequests == 1 && !g_disk.files.count("/trips/t999999.gpx") &&
+                  g_disk.files.count("/trips/t000000.gpx"),
+                  "the due retry still uploads complete work and preserves the incomplete original");
+        }
+    }
+
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
     return g_fail ? 1 : 0;
 }
