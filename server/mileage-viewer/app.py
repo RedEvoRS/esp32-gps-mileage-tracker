@@ -10,6 +10,7 @@ provides a small web UI to:
   - annotate each trip with a purpose (business / personal / other) and
     a free-text note and destination
   - select a local calendar year and export trips and totals to CSV or XLSX
+  - inspect device health and diagnostic history at /device-health
 
 Design notes:
   - The GPX/JSON files are the immutable source of truth and are mounted
@@ -44,6 +45,7 @@ import os
 import re
 import secrets
 import sqlite3
+import sys
 import json
 import math
 from xml.parsers import expat
@@ -65,6 +67,21 @@ from flask import (
 )
 from openpyxl import Workbook
 from werkzeug.security import check_password_hash
+
+# Support source-tree importlib tests and the container's flat /app layout.
+for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resolve().parent):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
+
+from common.diagnostics import CatalogError, load_catalog
+
+try:
+    DIAGNOSTICS_CATALOG = load_catalog()
+except CatalogError as exc:
+    raise RuntimeError("Cannot start viewer: missing or invalid diagnostics catalog.json") from exc
+DIAGNOSTICS_CODES = {row["code"]: row for row in DIAGNOSTICS_CATALOG["codes"]}
+DIAGNOSTICS_SEVERITIES = ("info", "warning", "error", "critical")
+DIAGNOSTICS_PAGE_SIZE = 50
 
 
 # ---------------------------------------------------------------------
@@ -538,6 +555,129 @@ def load_trips():
 
 
 # ---------------------------------------------------------------------
+# Read-only diagnostics (ingest owns schema creation and all writes)
+# ---------------------------------------------------------------------
+
+
+def diagnostics_filters():
+    # Bound integers before conversion (including Python's huge-int limit and
+    # SQLite's signed offset limit). Reject duplicate/unknown parameters too.
+    if set(request.args) - {"page", "code", "severity"} or any(
+        len(request.args.getlist(key)) != 1 for key in request.args
+    ):
+        abort(400)
+    page = request.args.get("page", "1")
+    code = request.args.get("code", "")
+    severity = request.args.get("severity", "")
+    if not re.fullmatch(r"[1-9][0-9]{0,6}", page):
+        abort(400)
+    if code and not re.fullmatch(r"[1-7][0-9]{3}", code):
+        abort(400)
+    if severity and severity not in DIAGNOSTICS_SEVERITIES:
+        abort(400)
+    return int(page), int(code) if code else None, severity
+
+
+def diagnostics_definition(code):
+    return DIAGNOSTICS_CODES.get(code, {
+        "code": code, "title": f"Unknown E{code}", "severity": None,
+        "oled": [], "explanation": "This code is absent from the current server catalog.",
+        "recovery": "Update the server catalog to learn its meaning.",
+    })
+
+
+def diagnostics_age(iso, now):
+    stamp = _parse(iso)
+    if stamp is None:
+        raise ValueError("invalid diagnostics receipt timestamp")
+    seconds = int((now - stamp).total_seconds())
+    if seconds < 0:
+        return "in the future (check server clock)"
+    if seconds < 60:
+        return f"{seconds} seconds ago"
+    if seconds < 3600:
+        return f"{seconds // 60} minutes ago"
+    if seconds < 86400:
+        return f"{seconds // 3600} hours ago"
+    return f"{seconds // 86400} days ago"
+
+
+def read_diagnostics(page, code, severity):
+    """One consistent read, never initialize, migrate or recover this DB.
+
+    mode=ro deliberately preserves SQLite locking and hot-journal checks;
+    immutable=1 would skip those checks and could show inconsistent health.
+    Closing is explicit: sqlite3's context manager does not close handles.
+    """
+    path = DATA_ROOT / "diagnostics" / "events.db"
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return {"state": "absent"}
+    now = datetime.now(timezone.utc)
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro",
+                                 uri=True, timeout=2)) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("BEGIN")
+        versions = db.execute("SELECT singleton, version FROM schema_version").fetchall()
+        if [tuple(row) for row in versions] != [(1, 1)]:
+            raise ValueError("unsupported diagnostics database schema version")
+        devices = []
+        for row in db.execute("SELECT * FROM devices ORDER BY device_id"):
+            device = dict(row)
+            device["contact_age"] = diagnostics_age(row["last_contact_at"], now)
+            snapshot = json.loads(row["snapshot_json"]) if row["snapshot_json"] is not None else None
+            if snapshot is not None and not isinstance(snapshot, dict):
+                raise ValueError("invalid diagnostics snapshot")
+            if snapshot is not None and not isinstance(snapshot.get("counters", {}), dict):
+                raise ValueError("invalid diagnostics counters")
+            device["snapshot"] = snapshot
+            device["snapshot_age"] = diagnostics_age(row["snapshot_received_at"], now) if snapshot is not None else None
+            conditions = {r["code"]: dict(r) for r in db.execute(
+                "SELECT code, state, episode_id FROM device_conditions WHERE device_id=? ORDER BY code",
+                (row["device_id"],))}
+            # Never-observed continuing conditions are unknown, not clear.
+            # 7xxx codes are raised by the server monitor, not device conditions.
+            for number, definition in DIAGNOSTICS_CODES.items():
+                if definition["journal"] == "transitions" and number < 7000:
+                    conditions.setdefault(number, {"code": number, "state": "unknown", "episode_id": None})
+            groups = {state: [] for state in ("active", "unknown", "clear")}
+            for number, condition in sorted(conditions.items()):
+                groups[condition["state"]].append({**diagnostics_definition(number), **condition})
+            device["groups"] = groups
+            devices.append(device)
+
+        clauses, params = [], []
+        if code is not None:
+            clauses.append("code=?")
+            params.append(code)
+        if severity:
+            codes = [n for n, definition in DIAGNOSTICS_CODES.items() if definition["severity"] == severity]
+            clauses.append("code IN (" + ",".join("?" for _ in codes) + ")" if codes else "0")
+            params.extend(codes)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        rows = db.execute(
+            "SELECT device_id, boot_id, sequence, code, received_at, canonical_json FROM events" + where +
+            " ORDER BY received_at DESC, device_id DESC, boot_id DESC, sequence DESC LIMIT ? OFFSET ?",
+            (*params, DIAGNOSTICS_PAGE_SIZE + 1, (page - 1) * DIAGNOSTICS_PAGE_SIZE)).fetchall()
+        events = []
+        for row in rows[:DIAGNOSTICS_PAGE_SIZE]:
+            event = json.loads(row["canonical_json"])
+            if not isinstance(event, dict) or not isinstance(event.get("context", {}), dict):
+                raise ValueError("invalid diagnostics event")
+            diagnostics_age(row["received_at"], now)
+            device_time = None
+            if event.get("utc_ms") is not None and event.get("time_source") != "unknown":
+                # Avoid floating-point rounding at the protocol's year-9999 bound.
+                stamp = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=event["utc_ms"])
+                device_time = fmt_date(stamp.isoformat())
+            events.append({**event, **dict(row), "definition": diagnostics_definition(row["code"]),
+                           "device_time": device_time})
+        return {"state": "normal", "devices": devices, "events": events,
+                "has_next": len(rows) > DIAGNOSTICS_PAGE_SIZE}
+
+
+# ---------------------------------------------------------------------
 # Display helpers (exposed to templates)
 # ---------------------------------------------------------------------
 
@@ -758,6 +898,7 @@ LIST_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Mileage Trips</title>
 <style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index') }}">🚗 Mileage Tracker</a>
+  <a href="{{ url_for('device_health') }}">Device health</a>
   <form class="logout" method="post" action="{{ url_for('logout') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <button type="submit">Log out</button>
@@ -824,6 +965,7 @@ TRIP_HTML = """
 <link rel="stylesheet" href="{{ url_for('static', filename='leaflet.css') }}">
 <style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index', year=year or '') }}">← {{ year or 'All' }} trips</a>
+  <a href="{{ url_for('device_health') }}">Device health</a>
   <form class="logout" method="post" action="{{ url_for('logout') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
     <button type="submit">Log out</button>
@@ -902,6 +1044,101 @@ TRIP_HTML = """
 
 
 # ---------------------------------------------------------------------
+# Device health uses the same autoescaped inline templates as the trip pages.
+# No stored value is markup, including JSON strings from a damaged/edited DB.
+# ---------------------------------------------------------------------
+
+DEVICE_HEALTH_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><title>Device health</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>""" + BASE_CSS + """
+  .health-table { overflow-x: auto; }
+  .health-table td { vertical-align: top; overflow-wrap: anywhere; }
+  .oled { white-space: pre-wrap; }
+  .condition { border-bottom: 1px solid #e0e0e0; padding: 8px 0; }
+</style></head><body>
+<header><a href="{{ url_for('index') }}">← Trips</a><span>Device health</span>
+  <form class="logout" method="post" action="{{ url_for('logout') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button type="submit">Log out</button>
+  </form>
+</header><main class="wrap"><h1>Device health</h1>
+{% if state == 'absent' %}
+  <p>No diagnostics yet. No device diagnostics or identified trip contact has arrived.</p>
+{% elif state == 'unavailable' %}
+  <p class="warn" role="alert">Diagnostics unavailable. The diagnostics database could not be read.
+    Current device health is unknown. Try again later; check the viewer logs if this persists.</p>
+{% else %}
+  <p class="muted">Times shown in {{ timezone }}. Contact can be recent while a snapshot is stale.
+    Unknown means the condition has not been observed in the latest snapshot; it does not prove recovery.</p>
+  {% for d in devices %}
+  <section><h2>{{ d.device_id }}</h2>
+    <p>Last server contact: {{ fmt_date(d.last_contact_at) }} ({{ d.contact_age }})</p>
+    {% if d.snapshot is not none %}
+    <p>Snapshot received: {{ fmt_date(d.snapshot_received_at) }} ({{ d.snapshot_age }}).
+      Snapshot age measures staleness; contact does not refresh it.</p>
+    <dl>
+    {% for key, label in [('firmware_version', 'Firmware'), ('storage_backend', 'Storage backend'),
+        ('pending_events', 'Pending events'), ('dropped_events', 'Dropped events'),
+        ('boot_counter', 'Boot counter'), ('uptime_ms', 'Uptime (ms)')] %}
+      <dt>{{ label }}</dt><dd>{{ d.snapshot.get(key, 'Not reported') }}</dd>
+    {% endfor %}
+      <dt>Status revision</dt><dd>{{ d.status_sequence }}</dd>
+      <dt>Counters (boot-local)</dt><dd>
+      {% for key, value in d.snapshot.get('counters', {}).items() %}
+        <div>E{{ key }} = {{ value }}</div>
+      {% else %}Not reported{% endfor %}</dd>
+    </dl>
+    {% else %}<p>No health snapshot received. Contact alone does not establish device health.</p>{% endif %}
+    {% for state_name, conditions in d.groups.items() %}
+    {# Unknown is usually most of the catalog; keep it folded away. #}
+    {% if state_name == 'unknown' %}<details><summary>{% endif %}
+    <h3 style="display:inline">{{ state_name|capitalize }} conditions ({{ conditions|length }})</h3>
+    {% if state_name == 'unknown' %}</summary>{% endif %}
+    {% for c in conditions %}
+      <div class="condition"><b>E{{ c.code }} · {{ c.title }}</b>
+        {% if c.severity %}<span class="tag">{{ c.severity }}</span>{% endif %}
+        {% if c.episode_id %}<div>Episode: {{ c.episode_id }}</div>{% endif %}
+        {% if c.oled %}<div>OLED: <span class="oled">{{ c.oled|join('\n') }}</span></div>{% endif %}
+        <p>{{ c.explanation }} Recovery: {{ c.recovery }}</p>
+      </div>
+    {% else %}<p class="muted">None recorded.</p>{% endfor %}
+    {% if state_name == 'unknown' %}</details>{% endif %}
+    {% endfor %}
+  </section>
+  {% else %}<p>No devices recorded yet.</p>{% endfor %}
+  <h2>Event history</h2>
+  <form method="get" class="toolbar">
+    <div><label for="code">Code (digits, e.g. 4005)</label>
+      <input type="text" name="code" id="code" value="{{ code or '' }}" maxlength="4"></div>
+    <div><label for="severity">Severity (current catalog)</label><select name="severity" id="severity">
+      <option value="">All severities</option>
+      {% for level in severities %}<option value="{{ level }}" {% if severity == level %}selected{% endif %}>{{ level }}</option>{% endfor %}
+    </select></div><button class="btn" type="submit">Filter</button>
+  </form>
+  <div class="health-table"><table>
+    <thead><tr><th>Device / code</th><th>Event identity</th><th>Context</th><th>Device time</th><th>Server receipt</th></tr></thead>
+    <tbody>{% for e in events %}<tr class="diagnostic-event">
+      <td>{{ e.device_id }}<br>E{{ e.code }} · {{ e.definition.title }}
+        {% if e.definition.severity %}<br>{{ e.definition.severity }}{% endif %}</td>
+      <td>{{ e.transition }}<br>Episode: {{ e.episode_id or '—' }}
+        <br>Boot: {{ e.boot_id[:8] }}…<br>Sequence: {{ e.sequence }}</td>
+      <td>{% for key, value in e.get('context', {}).items() %}<div>{{ key }} = {{ value }}</div>{% else %}—{% endfor %}</td>
+      <td>{% if e.device_time %}{{ e.device_time }}<br>Source: {{ e.time_source }}
+        <br>Sync age: {% if e.sync_age_ms is not none %}{{ e.sync_age_ms }} ms{% else %}unknown{% endif %}
+        {% else %}Device clock unknown{% endif %}</td>
+      <td>{{ fmt_date(e.received_at) }}</td>
+    </tr>{% else %}<tr><td colspan="5">No events in this selection.</td></tr>{% endfor %}</tbody>
+  </table></div>
+  <p>Page {{ page }}</p><nav aria-label="Event history pages">
+    {% if page > 1 %}<a class="btn" href="{{ url_for('device_health', page=page-1, code=code or '', severity=severity) }}">Newer</a>{% endif %}
+    {% if has_next %}<a class="btn" href="{{ url_for('device_health', page=page+1, code=code or '', severity=severity) }}">Older</a>{% endif %}
+  </nav>
+{% endif %}</main></body></html>
+"""
+
+
+# ---------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------
 
@@ -909,6 +1146,22 @@ TRIP_HTML = """
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "service": "mileage-viewer"}), 200
+
+
+@app.route("/device-health")
+def device_health():
+    page, code, severity = diagnostics_filters()
+    try:
+        data = read_diagnostics(page, code, severity)
+    except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, OverflowError) as exc:
+        # Do not log stored JSON or device identifiers (even a damaged DB may
+        # contain private text). Keep enough detail to diagnose schema/I/O faults.
+        app.logger.warning("Diagnostics unavailable (%s)", type(exc).__name__)
+        data = {"state": "unavailable"}
+    return render_template_string(
+        DEVICE_HEALTH_HTML, **data, page=page, code=code, severity=severity,
+        severities=DIAGNOSTICS_SEVERITIES, timezone=DISPLAY_TZ_NAME,
+    ), 503 if data["state"] == "unavailable" else 200
 
 
 @app.route("/login", methods=["GET", "POST"])

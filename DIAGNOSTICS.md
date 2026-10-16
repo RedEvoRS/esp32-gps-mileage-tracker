@@ -3,8 +3,9 @@
 This is the reference for issues #117 through #130. It describes the complete
 planned framework, including features that are not implemented yet. **#117 adds
 the shared catalog, protocol validation, generated C++ header, tests and this
-document; #118 adds the ingest endpoint, storage and GPX contact refresh.**
-Firmware diagnostics, the health page and notifications follow in later issues.
+document; #118 adds the ingest endpoint, storage and GPX contact refresh;
+#119 adds the viewer's Device health page.**
+Firmware diagnostics and notifications follow in later issues.
 Existing firmware and server behavior remains described in
 [README.md](README.md) and [DEPLOY_DEBIAN.md](DEPLOY_DEBIAN.md).
 
@@ -30,7 +31,8 @@ numeric measurements and fixed enumerated values in context.
   drift check, and this reference.
 - **#118:** authenticated ingest endpoint, SQLite storage, GPX contact updates,
   snapshot ordering, and packaging the shared Python code into both services.
-- **#119:** Device health page with current faults and paginated history.
+- **#119:** shipped Device health at `/device-health`, with current conditions
+  and paginated history behind the viewer login.
 - **#120:** independent monitor service and optional ntfy fault notifications.
 - **#121:** server-side device-silence detection and firmware heartbeat policy.
 - **#122:** host-testable EventLog, bounded queues, segmented persistence and
@@ -436,15 +438,42 @@ Both Docker builds use `server/` as context, copy their application plus
 `common/` (including `catalog.json`) to `/app`, and set `PYTHONPATH=/app`.
 `server/.dockerignore` defaults to denying everything and explicitly allows
 only the required runtime files. Secrets, data and development artifacts stay
-outside the build context. The viewer can import the shared package for #119.
+outside the build context. Both services load the catalog once at startup and
+fail fast if it is missing or invalid.
 
-The #119 Device health page shows last server contact, current active/clear/
-unknown conditions, firmware, storage backend and pending/dropped counters.
-History is paginated with code/severity filters. Show device UTC and confidence
-separately from server receipt time; format both in `DISPLAY_TZ`. Older boots
-and status revisions cannot clear current health. Before the diagnostics DB
-exists, the page should explain that no device diagnostics have arrived rather
-than failing. Render all values as text with escaping, including unknown codes.
+### Device health page (#119, shipped)
+
+Open `/device-health` from the viewer navigation after logging in. It shows
+each device's last server contact and age, latest snapshot receipt and age,
+firmware, storage backend, pending/dropped events, boot-local counters, uptime
+and status revision. Contact alone does not establish health or refresh a
+snapshot's age. No fixed freshness threshold is imposed here; silence policy
+belongs to #121.
+
+Conditions are grouped active / unknown / clear from `device_conditions`.
+Never-observed catalog conditions with `journal=transitions` also appear as
+unknown (server-raised 7xxx codes excluded), folded into a collapsed section
+because it is usually most of the catalog. Each known code has its current
+catalog severity, title, OLED text,
+explanation and recovery. Unknown codes show `Unknown E####` without severity.
+Older events and boots never alter current conditions in the viewer.
+
+History spans all devices, newest server receipt first, with stable identity
+tie-breakers and 50 events per page (offset pagination). Code and severity
+filters can be combined. Severity display and filtering use the **current
+catalog by code**, never the stored `events.severity`, including stored NULL
+or obsolete values. Query parameters are strictly validated; invalid or
+duplicate parameters return 400. Event rows show transition, episode, shortened
+boot ID, sequence, context key/value text, device time/source/sync age (or
+device clock unknown), and server receipt. All timestamps use `DISPLAY_TZ`;
+all stored text is autoescaped.
+
+The viewer checks schema version 1 and reads a consistent transaction through
+a `file:...?mode=ro` connection with a two-second busy timeout. It never creates,
+migrates, writes or recovers the diagnostics DB. An absent file gives a normal
+"No diagnostics yet" page. Open/read errors, unsupported schemas, lock timeout
+and hot journals requiring recovery give **Diagnostics unavailable**, HTTP 503,
+and a viewer warning log, with no healthy empty state substituted.
 
 ## Optional monitor and notifications (#120/#121)
 

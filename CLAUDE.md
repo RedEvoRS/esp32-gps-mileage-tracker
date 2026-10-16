@@ -39,7 +39,7 @@ server/
   viewer.env.example     Copy to viewer.env, set the viewer login
   install.sh             First-time install with checks; --check re-verifies
   mileage-ingest/        Flask ingest (app.py), diagnostics SQLite (diag_store.py), Dockerfile
-  mileage-viewer/        Flask viewer/export service (app.py, static/)
+  mileage-viewer/        Flask trip viewer/export + Device health (app.py, static/)
   backup/                backup.sh + restore.sh, systemd timer, backup.conf.example
   tests/                 Server tests (unittest) + map-parser check (node)
   sample.gpx             Test upload for the end-to-end check
@@ -147,7 +147,12 @@ firmware hasn't been road-tested.
   diagnostics failure never changes their response. See `DIAGNOSTICS.md` for
   schema/unknown-condition semantics. Consistent DB backups remain #129.
 - Viewer port: 8091, session login (LAN-only), reads `./data` read-only, owns
-  `annotations.db` (SQLite) in the `viewer-db` volume
+  `annotations.db` (SQLite) in the `viewer-db` volume. `/device-health` reads
+  diagnostics schema v1 via `mode=ro` with a 2 s busy timeout, shows contact and
+  snapshot ages, active/unknown/clear conditions and 50-event history pages with
+  code/severity filters. Severity/text come from the current startup catalog,
+  never stored severity. Missing DB means no diagnostics yet; read/schema/lock
+  errors mean unavailable (503 + warning log). No diagnostics writes or recovery.
 - Port binding: `BIND_ADDR` in `.env` sets the host IP both ports publish
   on (unset = all interfaces). UFW does not filter Docker-published ports,
   so the bind address is the LAN-only control (`DEPLOY_DEBIAN.md` Step 7)
