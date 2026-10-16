@@ -20,7 +20,7 @@ INSTALL = SERVER / "install.sh"
 
 HARNESS = textwrap.dedent("""\
     source <(sed '$d' "$INSTALL")
-    MODE=install
+    MODE=$FAKE_MODE
     ip() {
         case "$*" in
             *"addr show"*)
@@ -36,7 +36,8 @@ HARNESS = textwrap.dedent("""\
     }
     cd "$WORK"
     setup_bind_addr
-    printf 'DONE\\n'
+    printf 'DONE\\nFAILURES=%s\\n' "$FAILURES"
+    if (( FAILURES == 0 )); then MODE=check summary; fi
     """)
 
 
@@ -48,9 +49,9 @@ class InstallerBindAddr(unittest.TestCase):
         self.env = self.work / ".env"
         self.env.write_text("INGEST_AUTH_TOKEN=x\nBIND_ADDR=\n")
 
-    def run_step(self, answers="", route="", **preset):
+    def run_step(self, answers="", route="", mode="install", **preset):
         env = {**os.environ, "INSTALL": str(INSTALL), "WORK": str(self.work),
-               "FAKE_ROUTE": route}
+               "FAKE_ROUTE": route, "FAKE_MODE": mode}
         env.pop("INSTALL_BIND_ADDR", None)
         env.update(preset)
         return subprocess.run(["bash", "-c", HARNESS], input=answers, env=env,
@@ -94,6 +95,40 @@ class InstallerBindAddr(unittest.TestCase):
         self.assertIn("INSTALL_BIND_ADDR=10.0.0.99 isn't an address of this server",
                       proc.stdout)
         self.assertEqual(self.bind_addr(), "")
+
+    def test_repaired_address_does_not_stay_in_summary(self):
+        self.env.write_text("BIND_ADDR=10.0.0.99\n")
+        proc = self.run_step(answers="192.168.1.10\n")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("10.0.0.99 in .env isn't an address", proc.stdout)
+        self.assertEqual(self.bind_addr(), "192.168.1.10")
+        self.assertNotIn("Worth a look:", proc.stdout)
+
+    def test_all_interfaces_still_appears_in_summary(self):
+        self.env.write_text("BIND_ADDR=10.0.0.99\n")
+        proc = self.run_step(answers="all\n")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.bind_addr(), "")
+        summary = proc.stdout.split("== Summary ==", 1)[1]
+        self.assertIn("Worth a look:", summary)
+        self.assertIn("open on every interface", summary)
+        self.assertNotIn("10.0.0.99", summary)
+
+    def test_check_mode_keeps_invalid_address_and_reports_failure(self):
+        self.env.write_text("BIND_ADDR=10.0.0.99\n")
+        proc = self.run_step(mode="check")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("FAILURES=1", proc.stdout)
+        self.assertIn("FAIL  BIND_ADDR=10.0.0.99", proc.stdout)
+        self.assertEqual(self.bind_addr(), "10.0.0.99")
+
+    def test_check_mode_keeps_warning_for_unset_address(self):
+        proc = self.run_step(mode="check")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.bind_addr(), "")
+        summary = proc.stdout.split("== Summary ==", 1)[1]
+        self.assertIn("Worth a look:", summary)
+        self.assertIn("open on every interface", summary)
 
 
 if __name__ == "__main__":

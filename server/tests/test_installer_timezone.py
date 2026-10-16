@@ -33,6 +33,7 @@ HARNESS = textwrap.dedent("""\
     cd "$WORK"
     setup_display_tz
     printf 'FAILURES=%s\\n' "$FAILURES"
+    if (( FAILURES == 0 )); then MODE=check summary; fi
     """)
 
 
@@ -108,6 +109,7 @@ class InstallerTimezone(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("DISPLAY_TZ=Mars/Base in .env isn't a timezone name", result.stdout)
         self.assertEqual(self.zone_in_env(), "Europe/London")
+        self.assertNotIn("Worth a look:", result.stdout)
 
     def test_check_mode_reports_and_changes_nothing(self):
         for value in ("", "Mars/Base"):

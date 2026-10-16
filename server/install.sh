@@ -550,11 +550,15 @@ setup_docker() {
     fi
 
     if [[ $fresh == yes ]]; then
+        if ! "${DOCKER[@]}" pull hello-world > /dev/null; then
+            die "Docker couldn't download hello-world (output above)." \
+                "It needs to reach Docker Hub; check this server's internet access and DNS."
+        fi
         if "${DOCKER[@]}" run --rm hello-world > /dev/null; then
             ok "Docker can download and run a container (hello-world)"
         else
             die "Docker couldn't run hello-world (output above)." \
-                "It needs to reach Docker Hub; check this server's internet access and DNS."
+                "The image downloaded successfully; check Docker's error above for the cause."
         fi
     fi
 }
@@ -631,7 +635,7 @@ setup_bind_addr() {
     fi
 
     if [[ -n $BIND_ADDR ]]; then
-        warn "BIND_ADDR=$BIND_ADDR in .env isn't an address this server has; choose again"
+        note "BIND_ADDR=$BIND_ADDR in .env isn't an address this server has; choose again"
     fi
     local addrs suggested answer
     addrs=$(host_addrs | awk '{ printf "%s%s (%s)", sep, $1, $2; sep = ", " }')
@@ -688,7 +692,7 @@ setup_display_tz() {
     fi
 
     if [[ -n $zone ]]; then
-        warn "DISPLAY_TZ=$zone in .env isn't a timezone name; choose again"
+        note "DISPLAY_TZ=$zone in .env isn't a timezone name; choose again"
     fi
     # A server clock on UTC says nothing about where the car is, so only
     # a real local zone is offered as the default.
