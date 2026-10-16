@@ -149,6 +149,14 @@ only a free wake-up poke, not message text. Android needs no relay.
 [ntfy documents the settings](https://docs.ntfy.sh/config/).
 An existing self-hosted ntfy can be selected with `NTFY_URL` instead.
 
+Optionally, the monitor also sends diagnostics as GELF to a Graylog you run
+elsewhere (`GRAYLOG_*` in `monitor.env`, off by default; nothing here installs
+Graylog). It forwards every diagnostic event once and each change in a
+device/code condition's state (active/clear/unknown, plus E7001 silence), and
+Graylog's own Event Definitions do the alerting. GELF HTTP is preferred (each
+message confirmed); GELF TCP with optional TLS also works. Graylog outages back
+off independently and never affect ntfy. Setup: DEPLOY_DEBIAN.md Step 11d.
+
 Consistent DB backups/restores, including monitor state, remain #129. The
 existing trip backup does not include either optional named volume. Full
 policy and schema details are in [DIAGNOSTICS.md](../DIAGNOSTICS.md).

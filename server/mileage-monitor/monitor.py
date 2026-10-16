@@ -1,4 +1,4 @@
-"""Optional, stdlib-only diagnostics policy and durable ntfy delivery worker.
+"""Optional, stdlib-only diagnostics policy, durable ntfy delivery and GELF export.
 
 Ingest owns events.db. This process only opens it in mode=ro, never immutable.
 All mutable policy, queue, retry and rate-limit state belongs to monitor.db.
@@ -22,7 +22,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from common.diagnostics import CatalogError, load_catalog, validate_device_id, validate_request
+import sys
+
+# Support the source tree (tests load this file directly) and the container's
+# flat /app layout, as the ingest and viewer do.
+for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resolve().parent):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
+
+from common.diagnostics import CatalogError, load_catalog, validate_device_id, validate_request  # noqa: E402
+
+import gelf  # noqa: E402
 
 
 LOG = logging.getLogger("mileage-monitor")
@@ -43,6 +53,7 @@ class Config:
     repeat_seconds: float = 86400
     max_per_hour: int = 6
     stale_seconds: float = 7 * 86400
+    graylog: gelf.GelfConfig = gelf.GelfConfig()
 
     @classmethod
     def from_env(cls, env=None):
@@ -100,7 +111,8 @@ class Config:
                 raise ValueError("NTFY_URL must be an http(s) topic URL without credentials, query or fragment")
             if not token or token == "<token>" or any(not 33 <= ord(c) <= 126 for c in token):
                 raise ValueError("NTFY_TOKEN must be a nonempty access token without whitespace")
-        return cls(enabled, notify, url, token, severity, hold, repeat, maximum, stale)
+        return cls(enabled, notify, url, token, severity, hold, repeat, maximum, stale,
+                   gelf.GelfConfig.from_env(env))
 
 
 def receipt(value):
@@ -204,7 +216,8 @@ CREATE TABLE IF NOT EXISTS snapshot_warnings (
 
 class Monitor:
     def __init__(self, config, events_path="/data/diagnostics/events.db",
-                 state_path="/state/monitor.db", *, clock=time.time, sender=None, catalog=None):
+                 state_path="/state/monitor.db", *, clock=time.time, sender=None, catalog=None,
+                 gelf_sender=None):
         self.config = config
         try:
             self.catalog = load_catalog() if catalog is None else catalog
@@ -216,6 +229,8 @@ class Monitor:
             raise ValueError("monitor state must be separate from diagnostics")
         self.clock = clock
         self.sender = NtfySender(config) if sender is None else sender
+        self.gelf_sender = (gelf.transport(config.graylog) if gelf_sender is None and config.graylog.enabled
+                            else gelf_sender)
         if config.enabled:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             with closing(self._connect()) as db, db:
@@ -225,11 +240,15 @@ class Monitor:
                 if db.execute("SELECT name FROM sqlite_master WHERE name='schema_version'").fetchone():
                     if db.execute("SELECT singleton,version FROM schema_version").fetchall() != [(1, 1)]:
                         raise ValueError("unsupported monitor state schema version")
-                for statement in SCHEMA.split(";"):
+                # GELF tables are additive to schema v1 (CREATE IF NOT EXISTS),
+                # so an existing monitor.db gains them without a migration.
+                for statement in (SCHEMA + gelf.SCHEMA).split(";"):
                     if statement.strip():
                         db.execute(statement)
                 db.execute("INSERT OR IGNORE INTO schema_version VALUES (1,1)")
                 db.execute("INSERT OR IGNORE INTO retry VALUES (1,0,0)")
+                for statement in gelf.SEED:
+                    db.execute(statement)
 
     def _connect(self):
         db = sqlite3.connect(self.state_path, timeout=2)
@@ -433,7 +452,77 @@ class Monitor:
                     db.execute("DELETE FROM outbox")
                     db.execute("UPDATE retry SET attempts=0,next_attempt=0 WHERE singleton=1")
                 LOG.info("ntfy delivered %s condition update(s)", len(rows))
+            try:
+                self._forward_gelf(db, devices, now)
+            except Exception as exc:  # Graylog problems must never affect ntfy or trips.
+                LOG.warning("Graylog export unavailable (%s); retry next tick", type(exc).__name__)
         return True
+
+    def _forward_gelf(self, db, devices, now):
+        """Forward condition changes, then new events, to Graylog (at least once)."""
+        if not self.config.graylog.enabled:
+            return
+        attempts, next_attempt = db.execute(
+            "SELECT attempts,next_attempt FROM gelf_retry WHERE singleton=1").fetchone()
+        if now < next_attempt:
+            return
+        known = {(device, code): (state, episode) for device, code, state, episode in
+                 db.execute("SELECT device,code,state,episode FROM gelf_conditions")}
+        changes = gelf.desired_conditions(devices, known, now, self.config.stale_seconds,
+                                          SNAPSHOT_MAX_AGE_SECONDS)
+        # Items are (kind, key, payload); payload None marks a damaged event
+        # that is skipped but still advances the cursor once reached.
+        items = [("condition", (key, value), gelf.condition_message(
+                    self.codes, key[0], key[1], value[0], value[1], now, value[2]))
+                 for key, value in sorted(changes.items())][:gelf.MAX_PER_TICK]
+        cursor = db.execute("SELECT event_rowid FROM gelf_cursor WHERE singleton=1").fetchone()[0]
+        highest, rows = gelf.read_events(self.events_path, cursor, max(0, gelf.MAX_PER_TICK - len(items)))
+        if highest < cursor:
+            # events.db was replaced (e.g. restored from a backup): start over.
+            # Graylog may see duplicates; it never silently misses events.
+            LOG.warning("Diagnostics events restarted below the Graylog cursor; resending from the start")
+            with db:
+                db.execute("UPDATE gelf_cursor SET event_rowid=0 WHERE singleton=1")
+            return
+        for row in rows:
+            payload = gelf.event_message(self.codes, row)
+            if payload is None:
+                LOG.warning("Skipping a damaged diagnostics event for Graylog")
+            items.append(("event", row[0], payload))
+        payloads = [payload for _, _, payload in items if payload is not None]
+        if not items:
+            return
+        error = None
+        try:
+            delivered = self.gelf_sender(payloads) if payloads else 0
+        except gelf.DeliveryError as exc:
+            delivered, error = exc.delivered, exc
+        with db:
+            sent = 0
+            for kind, key, payload in items:
+                if payload is not None:
+                    if sent == delivered:
+                        break
+                    sent += 1
+                if kind == "condition":
+                    (device, code), (state, episode, _) = key
+                    db.execute("INSERT INTO gelf_conditions VALUES (?,?,?,?) ON CONFLICT(device,code) "
+                               "DO UPDATE SET state=excluded.state, episode=excluded.episode",
+                               (device, code, state, episode))
+                else:
+                    db.execute("UPDATE gelf_cursor SET event_rowid=? WHERE singleton=1", (key,))
+            if error is None:
+                db.execute("UPDATE gelf_retry SET attempts=0,next_attempt=0 WHERE singleton=1")
+            else:
+                attempts += 1
+                delay = min(3600, 60 * 2 ** min(attempts - 1, 6))
+                db.execute("UPDATE gelf_retry SET attempts=?,next_attempt=? WHERE singleton=1",
+                           (attempts, now + delay))
+        if error is None:
+            LOG.info("Graylog accepted %s message(s)", delivered)
+        else:
+            LOG.warning("Graylog delivery failed (%s) after %s message(s); retry in %s seconds",
+                        error, delivered, delay)
 
 
 def main():
@@ -441,7 +530,10 @@ def main():
     config = Config.from_env()
     monitor = Monitor(config)
     if config.enabled:
-        LOG.info("Monitor enabled; delivery %s", "enabled" if config.notify else "disabled")
+        LOG.info("Monitor enabled; ntfy %s, Graylog %s", "enabled" if config.notify else "disabled",
+                 "enabled" if config.graylog.enabled else "disabled")
+        if config.graylog.enabled and not config.graylog.tls_verify:
+            LOG.warning("Graylog TLS certificate verification is off (GRAYLOG_GELF_TLS_VERIFY=false)")
     else:
         LOG.info("Monitor disabled; idling (no database reads or notifications)")
     stop = threading.Event()

@@ -384,7 +384,7 @@ preflight() {
         mileage-ingest/{Dockerfile,app.py,diag_store.py,requirements.txt} \
         mileage-viewer/{Dockerfile,app.py,requirements.txt} \
         mileage-viewer/static/{leaflet.js,leaflet.css,gpx.js} \
-        mileage-monitor/{Dockerfile,monitor.py} ntfy/server.yml \
+        mileage-monitor/{Dockerfile,monitor.py,gelf.py} ntfy/server.yml \
         backup/{backup.sh,restore.sh,lib.sh,backup.conf.example} \
         backup/mileage-backup@.{service,timer}; do
         if [[ ! -e $f ]]; then missing+=("$f"); fi

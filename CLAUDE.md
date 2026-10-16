@@ -42,7 +42,7 @@ server/
   install.sh             First-time install with checks; --check re-verifies
   mileage-ingest/        Flask ingest (app.py), diagnostics SQLite (diag_store.py), Dockerfile
   mileage-viewer/        Flask trip viewer/export + Device health (app.py, static/)
-  mileage-monitor/       Stdlib monitor.py + Dockerfile; own monitor-state volume
+  mileage-monitor/       Stdlib monitor.py, gelf.py (Graylog export), Dockerfile; own monitor-state volume
   ntfy/server.yml        Optional self-hosted ntfy; deny-all access, ntfy-state volume
   backup/                backup.sh + restore.sh, systemd timer, backup.conf.example
   tests/                 Server tests (unittest) + map-parser check (node)
@@ -177,6 +177,15 @@ firmware hasn't been road-tested.
   profile uses port 8092 with `BIND_ADDR`, deny-all auth and `ntfy-state` cache/auth
   volume. Self-hosted only; iOS instant push requires ntfy.sh wake-up relay
   (no message text), Android does not. Manual enablement: DEPLOY_DEBIAN Step 11.
+- Optional Graylog export (#135, `gelf.py`): `GRAYLOG_ENABLED` plus exactly one
+  of `GRAYLOG_GELF_URL` (GELF HTTP, preferred) or `GRAYLOG_GELF_TCP` (optional
+  TLS) in `monitor.env`. Graylog runs on the owner's own server; never bundle it.
+  Sends facts, not ntfy decisions: every events.db row once (rowid cursor,
+  reset if events.db is restored lower), and per-(device, code) condition state
+  changes (active/clear/unknown, E7001 silence), so deep-sleep wakes don't
+  repeat. Independent of NOTIFY_*; own retry/backoff; failures never affect
+  ntfy. Tables `gelf_cursor`, `gelf_conditions`, `gelf_retry` are additive to
+  monitor schema v1. Setup and Event Definitions: DEPLOY_DEBIAN Step 11d.
 - Port binding: `BIND_ADDR` in `.env` sets the host IP both ports publish
   on (unset = all interfaces). UFW does not filter Docker-published ports,
   so the bind address is the LAN-only control (`DEPLOY_DEBIAN.md` Step 7)

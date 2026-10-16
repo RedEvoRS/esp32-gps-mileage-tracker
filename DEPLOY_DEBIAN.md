@@ -785,7 +785,7 @@ docker compose --profile monitor up -d --build mileage-monitor
 docker compose logs --tail 30 mileage-monitor
 ```
 
-Look for `Monitor enabled; delivery enabled`. Bad enabled settings fail startup
+Look for `Monitor enabled; ntfy enabled, Graylog disabled`. Bad enabled settings fail startup
 with a message naming the setting. A missing diagnostics DB means no device
 has checked in yet; an unreadable DB logs unavailable and retries next minute.
 The monitor publishes no port, mounts `/data` read-only, and persists policy
@@ -855,6 +855,84 @@ Keep the named volumes: deleting monitor state loses deduplication and can
 replay alerts; deleting ntfy state loses users, tokens and cached messages.
 Consistent SQLite backup/restore remains #129; the existing trip backup does
 not cover these named volumes.
+
+### 11d — Optional: send diagnostics to your own Graylog
+
+Skip this unless you run [Graylog](https://graylog.org/) somewhere else on
+your network. Nothing here installs Graylog; the monitor only sends to it.
+It works with or without ntfy: Graylog gets the facts and does its own alerting.
+
+**What it sends**, as [GELF](https://go2docs.graylog.org/current/getting_in_log_data/gelf.html)
+messages with source `mileage-tracker`. Field names below are as Graylog shows
+and searches them; on the wire GELF prefixes each with `_` (`kind` is `_kind`),
+and Graylog removes it:
+
+- `kind:event`: every diagnostic event the tracker uploaded, each once, at the
+  time the server received it. On first enable, the whole stored history is
+  sent, up to 200 messages a minute.
+- `kind:condition`: a change in a fault's state on a device: `state` is
+  `active`, `clear` or `unknown` (no fresh health report, so its state isn't
+  known). State is per device and code, so a fault that persists across the
+  tracker's deep-sleep wakes is one `active` message, not one per wake.
+  E7001 `active` means no contact for `MONITOR_STALE_DAYS`
+  (`days_without_contact` says how long); it turns `clear` on the next contact.
+  On first enable, each device's current states are sent once as a baseline.
+
+Every message carries `device_id`, `code` (e.g. 4005), `symbol`,
+`severity` and `title` from the server's catalog. `level` follows severity
+(critical 2, error 3, warning 4, info 6; a code the server doesn't know yet is
+5). `clear` and `unknown` states, and `clear` events, are always level 6, so
+"level ≤ 3" finds only active errors and critical faults. Events also carry
+`transition`, `episode_id`, `boot_id`, `sequence`, the device clock
+(`device_utc_ms`, `time_source`) and catalog context as `ctx_<name>`. No
+location, WiFi names, free text or credentials are ever sent.
+
+**1. Create an input in Graylog** (*System → Inputs*): **GELF HTTP** is the
+better choice, because Graylog confirms each message (HTTP 202) and the
+monitor only moves on once it does. **GELF TCP** works too, but TCP can't
+confirm receipt, so after a network fault a batch may arrive twice. Port 12201
+is the usual choice. Don't use GELF UDP: it drops messages without telling anyone.
+
+**2. Open the path** from this server to the Graylog host on that port (its
+firewall, and Docker's if Graylog runs in a container). If the two hosts talk
+over anything you don't trust, use TLS: an `https://` URL for HTTP, or
+`GRAYLOG_GELF_TLS=true` for TCP. For a private CA, copy its certificate into
+the monitor's state volume, e.g.
+`docker compose cp graylog-ca.pem mileage-monitor:/state/graylog-ca.pem`, and
+set `GRAYLOG_GELF_CA_FILE=/state/graylog-ca.pem`.
+
+**3. Configure the monitor** in `monitor.env` (`MONITOR_ENABLED=true` is required):
+
+```dotenv
+GRAYLOG_ENABLED=true
+GRAYLOG_GELF_URL=http://<graylog-host>:12201/gelf
+# or: GRAYLOG_GELF_TCP=<graylog-host>:12201
+```
+
+`GRAYLOG_GELF_HEADER=<Header-Name>: <value>` adds one HTTP header, for a proxy
+in front of the input. Apply with `docker compose --profile monitor up -d
+mileage-monitor`, then check the log for `Graylog enabled` and, once there is
+something to send, `Graylog accepted N message(s)`. If Graylog is down, the
+monitor logs the failure, keeps its place, and retries after 60 seconds,
+doubling to an hour. ntfy alerts and trip uploads are unaffected.
+
+**4. Alert in Graylog.** Create a stream for `source:mileage-tracker`, then
+Event Definitions (*Alerts → Event Definitions*, a filter-and-aggregation
+condition over that stream) with the notifications you want:
+
+| Alert | Search query |
+|---|---|
+| Active error or critical fault | `kind:condition AND state:active AND level:<=3` |
+| Tracker silent | `kind:condition AND code:7001 AND state:active` |
+| Fault cleared (optional) | `kind:condition AND state:clear AND NOT code:7001` |
+
+A condition message is sent only when the state changes, so a search window of
+a few minutes, run every minute, catches each change once. Graylog's grace
+period stops repeats. For a "still broken" reminder, build it from the
+dashboard or use ntfy's daily reminder instead.
+
+To stop sending, set `GRAYLOG_ENABLED=false` and apply. The monitor remembers
+how far it got in `monitor-state`; turning it back on resumes from there.
 
 ## Troubleshooting
 
