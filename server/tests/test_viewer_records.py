@@ -90,6 +90,38 @@ class ViewerRecords(unittest.TestCase):
                 with self.subTest(year=year, route=route):
                     self.assertEqual(self.client.get(route, query_string={"year": year}).status_code, 400)
 
+    def test_partial_timing_uses_first_observed_local_year_and_sort_date(self):
+        self.trip("complete", "2026-01-01T12:00:00Z", 1)
+        self.trip("untimed", None, 4)
+        for name, observed, miles in (
+            ("dec_partial", "2027-01-01T07:59:59Z", 2),
+            ("jan_partial", "2027-01-01T08:00:00Z", 3),
+        ):
+            self.trip(name, None, miles)
+            path = self.month / f"{name}.json"
+            record = json.loads(path.read_bytes())
+            record.update(timing_status="partial", timed_from=observed,
+                          recorded_until=observed, end_time=None,
+                          duration_seconds=None, avg_speed_mph=None)
+            path.write_text(json.dumps(record))
+        for year, expected_ids, expected_total in (
+            (2026, {"complete", "dec_partial"}, 3),
+            (2027, {"jan_partial"}, 3),
+        ):
+            rows = self.csv_rows(f"?year={year}")
+            trips = [r for r in rows if r["row_type"] == "trip"]
+            self.assertEqual({r["trip_id"] for r in trips}, expected_ids)
+            total = next(r for r in rows if r["row_type"] == "total" and r["category"] == "all")
+            self.assertEqual(float(total["distance_miles"]), expected_total)
+            partial = next(r for r in trips if r["timing_status"] == "partial")
+            self.assertEqual(partial["year_basis"], "first_recorded_time")
+            self.assertIn(f"Timed from {year}", partial["date"])
+            self.assertEqual(partial["start_time"], "")
+            page = self.client.get(f"/?year={year}").get_data(as_text=True)
+            self.assertIn("actual start can be in an earlier year", page)
+        trips, _ = self.viewer.load_trips()
+        self.assertEqual([t["id"] for t in trips], ["jan_partial", "dec_partial", "complete", "untimed"])
+
     def test_edit_and_save_preserve_year_selection(self):
         self.trip("a", "2026-08-01T12:00:00Z")
         page = self.client.get("/?year=2026").get_data(as_text=True)

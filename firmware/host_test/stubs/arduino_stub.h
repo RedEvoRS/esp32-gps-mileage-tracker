@@ -137,6 +137,7 @@ struct FakeDisk {
     std::string failOpenPath;
     std::string failReadPath;
     size_t failReadAfter = 0;
+    void (*onRead)() = nullptr;  // simulate the other core interrupting a queue scan
     int removeCount = 0;
     bool invalidateDirectoryOnMutation = false;
     unsigned directoryRevision = 0;
@@ -223,6 +224,7 @@ public:
     int available() override { return (int)(size() - p->pos); }
     int read() override { return p->pos < size() ? (uint8_t)data()[p->pos++] : -1; }
     int read(uint8_t* b, size_t n) {
+        if (g_disk.onRead) g_disk.onRead();
         if (p->path == g_disk.failReadPath && p->pos >= g_disk.failReadAfter) return 0;
         size_t k = std::min(n, size() - std::min(size(), p->pos));
         memcpy(b, data().data() + p->pos, k); p->pos += k; return (int)k;

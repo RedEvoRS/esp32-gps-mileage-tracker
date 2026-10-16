@@ -51,11 +51,20 @@ three rules, all in `summarize()`:
   so bridging can only undercount, and leaving the gap out lost real miles.
   A bridge needs timestamps at both ends and a plausible speed.
 
-`end_time` is the last moving fix, so the firmware's 3-minute cooldown
+For completely timed trips, `end_time` is the last moving fix, so the firmware's 3-minute cooldown
 doesn't stretch every trip; `recorded_until` keeps the final timestamp.
+Summary version 3 records `timing_status` as `complete`, `partial`, or
+`untimed`. A partly timed trip retains its distance, but full-trip
+`start_time`, `end_time`, `duration_seconds`, and `avg_speed_mph` are null.
+`timed_from` and `recorded_until` describe only the timestamps actually
+recorded. No timestamps are invented for the missing portion. The trip ID
+and storage month keep using the same observed timestamps as before, so
+retries update the same trip and preserve annotations.
 Each summary records `summary_version`, and the raw GPX is never touched,
 so summaries can be recomputed if the rules change. The tests are in
 `server/tests/` (`python -m unittest discover -s server/tests`).
+Existing summaries are not rewritten at startup; new uploads and retries
+write the current version.
 
 The service is intentionally minimal. It does not generate reports,
 provide a web UI, or classify trips. Those are separate concerns handled
@@ -234,8 +243,16 @@ What it does:
 Years are based on **trip start in `DISPLAY_TZ`**, including at the New Year
 boundary. A trip crossing midnight belongs entirely to its start year; it
 is not split. The storage folder is not used for filtering, except for
-unreadable summaries (below). Trips with
-missing or invalid start dates appear only under All years. Direct exports
+unreadable summaries (below). The viewer labels partly timed trips with
+**Partial timing** and leaves
+unknown duration and average speed blank. CSV/XLSX include `timing_status`,
+`timed_from`, and `recorded_until`; older summaries without a status export
+`unknown`. For partly timed trips, year selection and sorting
+use `timed_from`, the first recorded timestamp in `DISPLAY_TZ`, so their miles
+remain in year totals and exports. The date is labeled **Timed from** and
+`year_basis` exports `first_recorded_time`. Their actual start may be in an
+earlier year, which the viewer states explicitly. Wholly undated trips appear
+only under All years. Direct exports
 accept `?year=2026`; omit `year` for all years. Empty years export headers
 and zero totals. Totals cover the recorded trips in the selection, not an
 odometer measurement of all vehicle use or a determination of deductibility.

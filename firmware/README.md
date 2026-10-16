@@ -320,8 +320,14 @@ How it behaves once flashed:
   points are written to flash without times; the latest 90 stay buffered
   for back-dating if UTC arrives later. Already-written untimed points stay
   untimed. The viewer lists a wholly untimed trip without a date.
+  A partly timed trip is marked **Partial timing**; its full-trip dates,
+  duration and average speed remain unknown while its distance is retained.
+  GPS segment boundaries stay attached to the first fix after each gap,
+  including fixes buffered before UTC.
 - **Upload:** the board checks for finished trips every 30 s and scans
-  for your home WiFi when a retry is due. Failed scans, connections, or
+  for your home WiFi when a retry is due and a complete trip is waiting.
+  Incomplete files are preserved for recovery and do not trigger radio work.
+  Failed scans, connections, or
   uploads double the retry wait (60 s, 120 s, 240 s, then at most 5 min).
   The wait starts after the attempt finishes; the next 30 s check runs it
   once due. A successful upload resets the wait to 30 s, and an empty

@@ -163,6 +163,32 @@ class DistanceModel(unittest.TestCase):
         s = summary([[pt(0, 0, 0, 5.0), pt(1, 0, 0, 5.0)]])
         self.assertEqual(s["duration_seconds"], 0)
 
+    def test_partial_timing_retains_distance_without_claiming_trip_bounds(self):
+        for missing in ({0, 1}, {2}, {4}):
+            with self.subTest(missing=missing):
+                points = [pt(i * 15, 0, None if i in missing else i, 15) for i in range(5)]
+                s = summary([points])
+                self.assertAlmostEqual(meters(s), 60, delta=1)
+                self.assertEqual(s["timing_status"], "partial")
+                for field in ("start_time", "end_time", "duration_seconds", "avg_speed_mph"):
+                    self.assertIsNone(s[field], field)
+                observed = [i for i in range(5) if i not in missing]
+                self.assertEqual(s["timed_from"], (T0 + timedelta(seconds=min(observed))).isoformat())
+                self.assertEqual(s["recorded_until"], (T0 + timedelta(seconds=max(observed))).isoformat())
+
+    def test_complete_and_untimed_timing_are_distinct(self):
+        timed = summary([[pt(0, 0, 0, 15), pt(15, 0, 1, 15)]])
+        self.assertEqual(timed["timing_status"], "complete")
+        self.assertEqual(timed["duration_seconds"], 1)
+        self.assertAlmostEqual(timed["avg_speed_mph"], 15 * ing.MPS_TO_MPH, delta=.2)
+        untimed = summary([[pt(0, 0, None, 15), pt(15, 0, None, 15)]])
+        self.assertEqual(untimed["timing_status"], "untimed")
+        self.assertIsNone(untimed["timed_from"])
+        self.assertIsNone(untimed["recorded_until"])
+        self.assertIsNone(untimed["duration_seconds"])
+        self.assertIsNone(untimed["avg_speed_mph"])
+        self.assertAlmostEqual(meters(untimed), 15, delta=1)
+
     def test_gpx_11_with_garmin_extension_still_read(self):
         doc = (SERVER / "sample.gpx").read_bytes()
         self.assertIn(b"gpxtpx:speed", doc)

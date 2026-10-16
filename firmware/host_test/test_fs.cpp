@@ -34,7 +34,7 @@ static void resetWorld() {
     LittleFS.mkdir(TRIP_DIR);
     prefs.kv.clear();
     Serial.log.clear();
-    gState = IDLE; gTripPath[0] = 0; gTripWriteFailed = false; gNeedNewSeg = false;
+    gState = IDLE; gTripPath[0] = 0; gTripWriteFailed = false;
     gPendCount = gPendHead = 0; armBufReset(); gHaveLastFix = false;
     gClockSet = true;
     PMU = XPowersAXP2101(); gPmuIrqFlag = false;
@@ -143,14 +143,14 @@ int main(int argc, char** argv) {
         for (int seg = 0; seg < 2; ++seg) {
             g_disk.files["/t.gpx"] = "";
             File f = LittleFS.open("/t.gpx", FILE_APPEND);
-            FileWriter w(f); gNeedNewSeg = seg; appendTrkpt(w, fx);
+            FileWriter w(f); fx.newSegment = seg; appendTrkpt(w, fx);
             CHECK(w.commit(), "commit ok");
             f.close();
             CHECK(g_disk.files["/t.gpx"] == (seg ? "</trkseg><trkseg>\n" + pt : pt),
                   seg ? "exact line (with segment break)" : "exact line");
-            CHECK(!gNeedNewSeg, "segment flag consumed");
         }
         // A typical point, against the F1 budget.
+        fx.newSegment = false;
         fx.lat = 37.123456; fx.lon = -122.123456; fx.speedMps = 15; fx.hdop = 0.9f;
         g_disk.files["/t.gpx"] = "";
         File f = LittleFS.open("/t.gpx", FILE_APPEND); FileWriter w(f); appendTrkpt(w, fx); w.commit(); f.close();
@@ -1270,6 +1270,121 @@ int main(int argc, char** argv) {
                   "one join failure line includes the status captured before disconnect");
         }
         CHECK(!logHas(WIFI_PASSWORD) && !logHas(AUTH_TOKEN), "diagnostics never print credentials");
+    }
+
+    printf("T44 segment boundaries stay with buffered fixes (#99)\n");
+    {
+        for (int prefix : {20, 100}) for (bool lateUtc : {false, true}) {
+            resetWorld();
+            gClockSet = false;
+            drive(15, prefix);
+            auto gapFix = [] {
+                g_millis += SEG_GAP_MS + 1000;
+                g_epochMs += SEG_GAP_MS + 1000;
+                gLat += 15.0 / 111320.0;
+                Fix fx{};
+                fx.lat = gLat; fx.lon = gLon; fx.speedMps = 15; fx.hdop = .9f;
+                fx.monoMs = g_millis; fx.newSegment = true;
+                tripFsmOnFix(fx);
+            };
+            gapFix(); drive(15, 30); gapFix(); drive(15, 120);
+            if (lateUtc) {
+                g_epochBaseMs = g_epochMs - g_millis;
+                gClockSet = true;
+                drive(15, 10);
+            }
+            endTrip(false);
+            const std::string& d = g_disk.files.begin()->second;
+            size_t first = d.find("</trkseg><trkseg>");
+            size_t second = first == std::string::npos ? first : d.find("</trkseg><trkseg>", first + 1);
+            CHECK(wellFormedShape(d) && count(d, "<trkpt ") == prefix + 152 + (lateUtc ? 10 : 0),
+                  "multiple gaps preserve every pre-UTC and later fix");
+            CHECK(count(d, "</trkseg><trkseg>") == 2 &&
+                  count(d.substr(0, first), "<trkpt ") == prefix &&
+                  count(d.substr(0, second), "<trkpt ") == prefix + 31,
+                  "segment starts appear at the first post-gap fixes after ring wrap");
+            CHECK(lateUtc ? times(d).size() == 100 : times(d).empty(),
+                  "late UTC back-dates only the buffered tail without moving segment boundaries");
+        }
+        // UTC arriving while the marked fix is still buffered uses flushPending,
+        // rather than the spill path exercised above.
+        resetWorld(); gClockSet = false;
+        drive(15, 20);
+        Fix fx = gLastFix; fx.monoMs = ++g_millis; fx.newSegment = true;
+        tripFsmOnFix(fx);
+        g_epochBaseMs = g_epochMs - g_millis; gClockSet = true;
+        drive(15, 10); endTrip(false);
+        const std::string& d = g_disk.files.begin()->second;
+        CHECK(count(d, "<trkpt ") == 31 && times(d).size() == 31 &&
+              count(d.substr(0, d.find("</trkseg><trkseg>")), "<trkpt ") == 20,
+              "late-UTC flush places a still-buffered segment marker on its own fix");
+    }
+
+    printf("T45 incomplete-only queues leave the radio off (#101)\n");
+    {
+        for (bool fullPaths : {false, true}) {
+            resetWorld(); g_disk.fullPathNames = fullPaths;
+            drive(15, 40); endTrip(false);
+            const std::string complete = g_disk.files.begin()->second;
+            const std::string incomplete = complete.substr(0, complete.find(GPX_EPILOGUE));
+            g_disk.files.clear();
+            for (int i = 0; i < 16; ++i) {
+                char path[40]; snprintf(path, sizeof(path), "/trips/t%06d.gpx", i);
+                g_disk.files[path] = incomplete;
+            }
+            g_disk.capacity = g_disk.used(); fsckAllTrips();
+            auto originals = g_disk.files;
+            WiFi.scanSsids = {WIFI_SSID}; WiFi.connectionStatus = WL_CONNECTED;
+            for (int i = 0; i < 3; ++i) { netCycle(); g_millis += NET_RETRY_MAX_MS; }
+            CHECK(!hasPending() && WiFi.scans == 0 && WiFi.joins == 0 && g_httpRequests == 0 &&
+                  logCount("Network: ") == 0 && gNetRetryMs == 0,
+                  "incomplete-only queue causes no radio work or repeated failure logs");
+            CHECK(g_disk.files == originals && g_lockDepth == 0 && g_disk.openDirectories == 0,
+                  "preserved originals and lookup handles remain intact");
+            g_disk.files["/trips/t999999.gpx"] = complete;
+            g_disk.capacity += complete.size();
+            gNetHold = true; netCycle();
+            CHECK(WiFi.scans == 0 && g_httpRequests == 0, "sleep hold suppresses uploadable work");
+            gNetHold = false; gNetAbort = true; netCycle();
+            CHECK(WiFi.scans == 0 && g_httpRequests == 0, "abort suppresses uploadable work");
+            gNetAbort = false;
+            netCycle();
+            CHECK(WiFi.scans == 1 && WiFi.joins == 1 && g_httpRequests == 1 &&
+                  g_httpLastBody == complete && g_disk.files == originals,
+                  "a complete trip beyond 16 incomplete files still uploads immediately");
+            CHECK(g_disk.mutationsWithDirectoryOpen == 0, "all lookup and upload directory handles close before mutation");
+        }
+    }
+
+    printf("T46 interruption during queue lookup preserves retry backoff\n");
+    {
+        for (bool abort : {false, true}) {
+            resetWorld(); drive(15, 40); endTrip(false);
+            const std::string complete = g_disk.files.begin()->second;
+            g_disk.files.clear();
+            g_disk.files["/trips/t000000.gpx"] = complete.substr(0, complete.find(GPX_EPILOGUE));
+            g_disk.files["/trips/t999999.gpx"] = complete;
+            const auto originals = g_disk.files;
+            gNetRetryNow = false;
+            gNetRetryMs = NET_RETRY_MAX_MS; gNetLastAttemptMs = g_millis;
+            if (abort) g_disk.onRead = [] { g_disk.onRead = nullptr; gNetAbort = true; };
+            else g_disk.onRead = [] { g_disk.onRead = nullptr; gNetHold = true; };
+            netCycle();
+            CHECK(gNetRetryMs == NET_RETRY_MAX_MS && !gNetBusy &&
+                  WiFi.scans == 0 && g_httpRequests == 0,
+                  "hold/abort arriving inside the filesystem read leaves the retry delay intact");
+            CHECK(g_disk.files == originals && g_lockDepth == 0 && g_disk.openDirectories == 0,
+                  "interrupted lookup preserves all files and releases every handle and lock");
+            gNetHold = false; gNetAbort = false;
+            netCycle();
+            CHECK(WiFi.scans == 0, "releasing the interruption does not start an early retry");
+            WiFi.scanSsids = {WIFI_SSID}; WiFi.connectionStatus = WL_CONNECTED;
+            g_millis = gNetLastAttemptMs + gNetRetryMs;
+            netCycle();
+            CHECK(g_httpRequests == 1 && !g_disk.files.count("/trips/t999999.gpx") &&
+                  g_disk.files.count("/trips/t000000.gpx"),
+                  "the due retry still uploads complete work and preserves the incomplete original");
+        }
     }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
