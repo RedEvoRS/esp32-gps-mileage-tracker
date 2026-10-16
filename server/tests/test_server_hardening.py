@@ -34,7 +34,8 @@ ING_DATA = Path(tempfile.mkdtemp())
 ing = _load(
     "ingest_hardening",
     "mileage-ingest/app.py",
-    {"INGEST_AUTH_TOKEN": TOKEN, "INGEST_DATA_ROOT": str(ING_DATA)},
+    {"INGEST_AUTH_TOKEN": TOKEN, "INGEST_DATA_ROOT": str(ING_DATA),
+     "DISPLAY_TZ": "America/Los_Angeles"},
 )
 
 VIEW_DATA = Path(tempfile.mkdtemp())
@@ -49,6 +50,7 @@ view = _load(
         # Cheap hash: these tests aren't about hash strength.
         "VIEWER_PASSWORD_HASH": generate_password_hash("pw", "pbkdf2:sha256:1000"),
         "VIEWER_SECRET_KEY": "x" * 32,
+        "DISPLAY_TZ": "America/Los_Angeles",
     },
 )
 

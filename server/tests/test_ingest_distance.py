@@ -17,7 +17,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SERVER = HERE.parent
 _DATA = tempfile.mkdtemp()
-os.environ.update(INGEST_AUTH_TOKEN="test-token", INGEST_DATA_ROOT=_DATA)
+os.environ.update(INGEST_AUTH_TOKEN="test-token", INGEST_DATA_ROOT=_DATA,
+                  DISPLAY_TZ="America/Los_Angeles")
 _spec = importlib.util.spec_from_file_location("ingest", SERVER / "mileage-ingest" / "app.py")
 ing = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ing)

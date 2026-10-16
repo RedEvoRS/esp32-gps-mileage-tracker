@@ -80,9 +80,17 @@ DB_PATH = Path(os.environ.get("VIEWER_DB_PATH", "/db/annotations.db"))
 # the artifact this produces is an IRS mileage record and "what day was
 # that drive" has to match the day you actually drove.
 #
-# Must be a named IANA zone, never a fixed offset: Pacific observes DST,
-# so a hardcoded -08:00 would be an hour wrong from March to November.
-DISPLAY_TZ_NAME = os.environ.get("DISPLAY_TZ", "America/Los_Angeles")
+# Must be a named IANA zone, never a fixed offset: most zones observe
+# DST, so a hardcoded -08:00 would be an hour wrong for half the year.
+# It comes from DISPLAY_TZ in .env, which install.sh asks for. There's no
+# default, because whichever zone was guessed would be wrong for someone.
+DISPLAY_TZ_NAME = os.environ.get("DISPLAY_TZ", "").strip()
+if not DISPLAY_TZ_NAME:
+    raise RuntimeError(
+        "DISPLAY_TZ is not set. Set it in .env to your IANA timezone, e.g. "
+        "DISPLAY_TZ=America/Chicago (install.sh asks for it), then run "
+        "docker compose up -d."
+    )
 
 try:
     DISPLAY_TZ = ZoneInfo(DISPLAY_TZ_NAME)

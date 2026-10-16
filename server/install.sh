@@ -293,6 +293,37 @@ default_addr() {
     ip -4 route get 1.1.1.1 2> /dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p;T;q'
 }
 
+# IANA timezone names this machine knows, one per line. Empty if it has
+# no timezone data, in which case any well-formed name is accepted and a
+# wrong one shows up when the services refuse to start.
+tz_names() {
+    if [[ -z ${TZ_NAMES+set} ]]; then
+        TZ_NAMES=$(timedatectl list-timezones 2> /dev/null) || TZ_NAMES=
+        if [[ -z $TZ_NAMES && -f /usr/share/zoneinfo/tzdata.zi ]]; then
+            TZ_NAMES=$(awk '$1 == "Z" { print $2 } $1 == "L" { print $3 }' \
+                /usr/share/zoneinfo/tzdata.zi | sort -u)
+        fi
+    fi
+    if [[ -n $TZ_NAMES ]]; then printf '%s\n' "$TZ_NAMES"; fi
+}
+
+tz_ok() {
+    [[ $1 =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] || return 1
+    tz_names > /dev/null
+    [[ -z $TZ_NAMES ]] || grep -qxF -- "$1" <<< "$TZ_NAMES"
+}
+
+# This machine's own timezone as an IANA name, or nothing.
+host_tz() {
+    local zone
+    zone=$(timedatectl show -p Timezone --value 2> /dev/null) || zone=
+    if [[ -z $zone ]]; then zone=$(cat /etc/timezone 2> /dev/null) || zone=; fi
+    if [[ -z $zone ]]; then
+        zone=$(readlink /etc/localtime 2> /dev/null | sed -n 's|.*/zoneinfo/||p') || zone=
+    fi
+    printf '%s' "$zone"
+}
+
 token_ok() { [[ $1 =~ ^[A-Za-z0-9._~+/=-]{32,}$ && $1 != replace-me* ]]; }
 username_ok() { [[ $1 =~ ^[A-Za-z0-9._@-]{1,64}$ && $1 != replace-me* ]]; }
 # A werkzeug hash: method$salt$hex, e.g. scrypt:32768:8:1$abc...$0f3...
@@ -557,6 +588,7 @@ setup_env() {
     fi
 
     setup_bind_addr
+    setup_display_tz
 
     if [[ $(stat -c %a .env) != 600 ]]; then
         if [[ $MODE == install ]]; then
@@ -614,6 +646,72 @@ setup_bind_addr() {
         ok "The ports will be published on $BIND_ADDR only"
         dhcp_reminder
     fi
+}
+
+# The zone trip times are shown in, which also decides a trip's month
+# folder. Both services read DISPLAY_TZ from .env and won't start without
+# it, so nobody gets a zone picked for them.
+setup_display_tz() {
+    local zone
+    zone=$(env_raw .env DISPLAY_TZ)
+    if [[ -n $zone ]] && tz_ok "$zone"; then
+        ok "Trips are filed and shown in $zone (DISPLAY_TZ in .env)"
+        return 0
+    fi
+    if [[ $MODE == check ]]; then
+        if [[ -n $zone ]]; then
+            problem "DISPLAY_TZ=$zone in .env isn't a timezone name, so neither service will start" \
+                "Use an IANA name like America/Chicago (timedatectl list-timezones lists them)," \
+                "then: docker compose up -d"
+        else
+            problem "DISPLAY_TZ isn't set in .env, so neither service will start" \
+                "Set it to your timezone, e.g. DISPLAY_TZ=America/Chicago, then: docker compose up -d"
+        fi
+        return 0
+    fi
+
+    if [[ -n $zone ]]; then
+        warn "DISPLAY_TZ=$zone in .env isn't a timezone name; choose again"
+    fi
+    # A server clock on UTC says nothing about where the car is, so only
+    # a real local zone is offered as the default.
+    local suggested answer exact matches
+    suggested=$(host_tz)
+    case $suggested in UTC | Etc/* | Universal | Zulu) suggested= ;; esac
+    note "Trip times are shown and exported in the timezone you pick here, and it" \
+        "decides which month a trip is filed under, so pick the one you drive in." \
+        "Give its IANA name, like America/Chicago or Europe/London, or type part" \
+        "of one (a city, say) to search."
+    tz_names > /dev/null
+    while :; do
+        ask answer DISPLAY_TZ "Timezone" "$suggested"
+        # Accept any capitalisation of a real name, e.g. america/chicago.
+        exact=$(grep -ixF -m 1 -- "$answer" <<< "$TZ_NAMES") || exact=
+        answer=${exact:-$answer}
+        if [[ -n $answer ]] && tz_ok "$answer"; then break; fi
+        if [[ -n ${INSTALL_DISPLAY_TZ+set} ]]; then
+            die "INSTALL_DISPLAY_TZ=$answer isn't a timezone name." \
+                "Use an IANA name like America/Chicago; timedatectl list-timezones lists them."
+        fi
+        if [[ -z $answer ]]; then
+            note "There's no default timezone; type yours, or part of its name."
+            continue
+        fi
+        matches=$(grep -iF -- "$answer" <<< "$TZ_NAMES") || matches=
+        if [[ -z $TZ_NAMES ]]; then
+            note "\"$answer\" isn't a timezone name. They look like America/Chicago."
+        elif [[ -z $matches ]]; then
+            note "No timezone name contains \"$answer\". Try a nearby big city, e.g. denver."
+        elif [[ $matches != *$'\n'* ]]; then
+            suggested=$matches
+            note "That matches $matches; press Enter to use it."
+        else
+            note "\"$answer\" matches these (up to 20 shown):"
+            head -n 20 <<< "$matches" | indent
+        fi
+    done
+    env_set .env DISPLAY_TZ "$answer"
+    ok "Trips will be filed and shown in $answer"
 }
 
 dhcp_reminder() {
@@ -836,8 +934,8 @@ service_failed() {
     compose logs --no-color --tail 25 "$svc" < /dev/null 2>&1 | indent || true
     if [[ -n $error ]]; then note "Docker says: $error"; fi
     case $svc in
-        mileage-ingest) hints=("The usual causes: INGEST_AUTH_TOKEN missing from .env, or data/ not owned by UID $CONTAINER_UID.") ;;
-        mileage-viewer) hints=("The usual cause is a missing or mangled setting in viewer.env; the log names it.") ;;
+        mileage-ingest) hints=("The usual causes: INGEST_AUTH_TOKEN or DISPLAY_TZ missing from .env, or data/ not owned by UID $CONTAINER_UID.") ;;
+        mileage-viewer) hints=("The usual cause is a missing or mangled setting in viewer.env, or DISPLAY_TZ in .env; the log names it.") ;;
     esac
     if [[ $error == *"assign requested address"* ]]; then
         hints+=("BIND_ADDR isn't on this server right now. After a reboot, that means Docker started"
@@ -856,14 +954,16 @@ verify_services() {
     wait_healthy mileage-viewer || healthy=no
     [[ $healthy == yes ]] || return 1
 
-    local tz_ingest tz_viewer
+    local tz_env tz_ingest tz_viewer
+    tz_env=$(env_raw .env DISPLAY_TZ)
     tz_ingest=$(compose exec -T mileage-ingest printenv DISPLAY_TZ < /dev/null 2> /dev/null) || tz_ingest=
     tz_viewer=$(compose exec -T mileage-viewer printenv DISPLAY_TZ < /dev/null 2> /dev/null) || tz_viewer=
-    if [[ -n $tz_ingest && $tz_ingest == "$tz_viewer" ]]; then
+    if [[ -n $tz_ingest && $tz_ingest == "$tz_viewer" && $tz_ingest == "$tz_env" ]]; then
         ok "Both services file and show trips in $tz_ingest (DISPLAY_TZ)"
     else
-        problem "DISPLAY_TZ differs between the services (ingest: ${tz_ingest:-unset}, viewer: ${tz_viewer:-unset})" \
-            "Set the same zone on both in docker-compose.yml, then: docker compose up -d"
+        problem "The services aren't both using DISPLAY_TZ=${tz_env:-<unset>} from .env (ingest: ${tz_ingest:-unset}, viewer: ${tz_viewer:-unset})" \
+            "Recreate them so they pick it up: docker compose up -d" \
+            "If that doesn't fix it, docker-compose.yml was edited; compare it with the original."
     fi
     if compose exec -T mileage-viewer python -c "$PY_HASH_INTACT" < /dev/null > /dev/null 2>&1; then
         ok "The viewer's password hash reached the container intact"

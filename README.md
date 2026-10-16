@@ -165,8 +165,8 @@ bash ~/mileage-tracker/install.sh
 ```
 
 It installs Docker if it isn't there, generates the upload token and the
-viewer's session key, asks for a username and password for the web page,
-and starts both services. Then it checks the whole thing actually works:
+viewer's session key, asks for your timezone and a username and password
+for the web page, and starts both services. Then it checks the whole thing actually works:
 it uploads the sample trip, logs in to the viewer, finds the trip on the
 list, the map and in both exports, and deletes it again. It also sets up
 nightly backups to another machine if you let it. If any step fails it
@@ -388,14 +388,14 @@ folder read-only and keeps your notes in its own SQLite database, so editing
 a trip's purpose can't touch the record underneath. If the summary ever gets
 lost, it can be rebuilt from the GPX.
 
-Times are stored in UTC, which is what the GPS reports, and shown in Pacific
-time everywhere a person reads them. That way a 6pm drive shows up as 6pm
-on the right day instead of 1am the next one. Trips are also filed by local
-month, so a New Year's Eve drive lands in `2026-12/` and not `2027-01/`. To
-use a different timezone, change `DISPLAY_TZ` in
-[docker-compose.yml](server/docker-compose.yml). Change it on both services,
-or the folder a trip lands in and the date the viewer shows can disagree
-near the end of a month.
+Times are stored in UTC, which is what the GPS reports, and shown in your
+local timezone everywhere a person reads them. That way a 6pm drive shows
+up as 6pm on the right day instead of 1am the next one. Trips are also
+filed by local month, so a New Year's Eve drive lands in `2026-12/` and not
+`2027-01/`. There's no built-in timezone: the server installer asks for
+yours and saves it as `DISPLAY_TZ` in `server/.env`, and both services
+refuse to start until it's set. Both read that one setting, so the folder
+a trip lands in and the date the viewer shows always agree.
 
 ## Security
 

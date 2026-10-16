@@ -136,10 +136,11 @@ firmware hasn't been road-tested.
   15 min via a `login_attempts` table (SQLite, so it's shared across workers).
   Sessions carry an HMAC of the password hash, so a new hash logs everyone out.
   App fail-fasts if auth config is missing or the hash lost its `$` chars.
-- Timezone: stored UTC, displayed/exported Pacific (`America/Los_Angeles`)
-  via `ZoneInfo`, DST-aware — never a fixed offset. `DISPLAY_TZ` env var on
-  **both** services (viewer renders it; ingest buckets `data/YYYY-MM/` by it,
-  so they must match). `tzdata` pinned in both requirements; services
+- Timezone: stored UTC, displayed/exported in `DISPLAY_TZ` via `ZoneInfo`,
+  DST-aware — never a fixed offset. No default: `install.sh` asks for it and
+  writes it to `.env`, Compose passes it to **both** services (viewer
+  renders it; ingest buckets `data/YYYY-MM/` by it), and both refuse to
+  start without it. `tzdata` pinned in both requirements; services
   fail-fast if the zone db is missing. Distinct from `TZ`, which only
   affects log lines.
 - Trip detection: start >5 mph for 10s; end <2 mph for 3 min
