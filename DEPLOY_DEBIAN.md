@@ -711,6 +711,150 @@ can write to `data/` again.
 
 ---
 
+## Step 11 — Optional device notifications
+
+Skip this step to keep notifications off. The installer adds no prompts for it.
+Two optional services provide alerts: a monitor checks health every minute;
+**ntfy** delivers notifications from your own server. No subscription or cloud
+account is required. Its local user is a login on your server. If you already
+host ntfy, skip 11a and use that server's topic URL and token.
+
+Run these commands **on the Debian server**, in `~/mileage-tracker` (the copied
+`server/` directory). Replace angle-bracket placeholders before running commands.
+
+### 11a — Start and secure ntfy
+
+Set `BIND_ADDR` in `.env` to the server's LAN IP first (Step 7). ntfy publishes
+port **8092** on that address, just like the other ports; Docker ports bypass
+UFW. A LAN-only ntfy reaches your phone only on home WiFi or over a VPN that
+can reach this server. Away from that connection, messages wait in its cache
+(72 hours by default). The owner decides about remote access; opening an
+internet port is not part of this setup. Use HTTPS for remote ntfy endpoints:
+HTTP sends credentials and messages unencrypted.
+
+```bash
+cd ~/mileage-tracker
+docker compose --profile ntfy up -d ntfy
+docker compose exec ntfy ntfy user add "<username>"
+docker compose exec ntfy ntfy access "<username>" "<topic>" rw
+docker compose exec ntfy ntfy token add "<username>"
+```
+
+`user add` prompts for a new password privately. Use an ordinary user, not an
+administrator. `access` grants only the named topic; the token inherits that
+user's permissions. Save the printed token privately for 11b; do not put it in
+screenshots, logs or Git. The bundled `ntfy/server.yml` sets
+`auth-default-access: deny-all`, preventing anonymous reading and publishing.
+Its cache and auth databases persist in the `ntfy-state` named volume.
+[ntfy's reference covers access and tokens](https://docs.ntfy.sh/config/#access-control).
+
+Install the free ntfy phone app (Android: Play Store or F-Droid; iOS: App Store).
+Add your server `http://<host>:8092`, log in with the local username/password,
+and subscribe to the same `<topic>`.
+
+**iOS instant push:** edit `ntfy/server.yml`, replacing `upstream-base-url: ""`
+with `upstream-base-url: "https://ntfy.sh"`. Add `NTFY_BASE_URL=http://<host>:8092`
+to `.env`, using exactly the server URL the phone subscribes to (HTTPS if you
+provide it). Apply both changes with `docker compose --profile ntfy up -d ntfy`
+then `docker compose restart ntfy`. The free upstream relays a wake-up poke,
+not message text; the phone fetches text from your server and must still be
+able to reach it. Android needs no relay. Without the setting, iOS delivery
+can be delayed by hours. See [ntfy's iOS explanation](https://docs.ntfy.sh/config/#ios-instant-notifications).
+
+### 11b — Enable the monitor
+
+```bash
+install -m 600 monitor.env.example monitor.env
+nano monitor.env
+```
+
+Set `MONITOR_ENABLED=true`, `NOTIFY_ENABLED=true`,
+`NTFY_URL=http://ntfy:80/<topic>` and `NTFY_TOKEN=<token>` in that private file.
+`ntfy` is the container name on the Compose network; the phone uses
+`http://<host>:8092`. For an existing ntfy server, use its complete topic URL.
+Keep the ingest token and viewer secrets out of this file.
+
+Add the filename selector to `.env` (not the token):
+
+```dotenv
+MONITOR_ENV_FILE=./monitor.env
+```
+
+```bash
+docker compose --profile monitor up -d --build mileage-monitor
+docker compose logs --tail 30 mileage-monitor
+```
+
+Look for `Monitor enabled; delivery enabled`. Bad enabled settings fail startup
+with a message naming the setting. A missing diagnostics DB means no device
+has checked in yet; an unreadable DB logs unavailable and retries next minute.
+The monitor publishes no port, mounts `/data` read-only, and persists policy
+and delivery state in `monitor-state`. The `monitor` and `ntfy` profiles keep
+both optional services out of ordinary installs and `install.sh --check`.
+Once started, their restart policies also bring them back on reboot.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `MONITOR_ENABLED` | `false` | Watch every device that has ever checked in; no watchlist |
+| `NOTIFY_ENABLED` | `false` | Allow ntfy sends; false still tracks conditions locally |
+| `NOTIFY_MIN_SEVERITY` | `error` | Minimum catalog severity for device faults |
+| `NOTIFY_HOLD_SECONDS` | `300` | Hold from first eligible monitor observation; critical bypasses it |
+| `NOTIFY_REPEAT_HOURS` | `24` | Minimum time after successful delivery before a reminder |
+| `NOTIFY_MAX_PER_HOUR` | `6` | Rolling-hour successful POST cap, including digests and resolutions |
+| `MONITOR_STALE_DAYS` | `7` | No-contact threshold, using server receipt time including identified GPX uploads |
+
+Booleans are `true`/`false`; severity is `info`, `warning`, `error` or `critical`.
+Hold accepts 0–604800 seconds, repeat 1 second–8760 hours, cap an integer
+1–1000, and silence 1 second–36500 days. Fractional hours/days are allowed.
+Delivery requires an HTTP(S) topic URL without embedded credentials, query or
+fragment, plus a token. `MONITOR_ENABLED=false` idles without DB reads.
+
+Silence **E7001 DEVICE_SILENT** reads "No contact for N days", bypasses the
+device-fault severity threshold and hold, and shares reminders and the cap.
+It resolves on genuinely newer contact. Parking away from WiFi can cause it.
+The opportunistic firmware heartbeat is #125; this service adds no heartbeat
+and does not wake the tracker. Retiring an obsolete identity needs a future
+explicit policy; all devices remain watched.
+
+Faults need a snapshot at most **24 hours** old; GPX contact alone does not
+refresh it. Old events, unknown conditions and a reboot do not imply recovery.
+A resolution needs a successfully sent alert and a newer snapshot explicitly
+observing that code clear. Overflow coalesces into digests of at most 3500
+UTF-8 bytes; unsent work persists and is rechecked before delivery. Failed
+posts retry after 60, 120, 240 seconds, and so on, capped at an hour. Delivery
+is **at least once**: a crash after ntfy accepts a message but before success
+is recorded can produce a duplicate.
+
+### 11c — Check delivery and turn it off
+
+Enter the topic token privately for an authenticated manual test:
+
+```bash
+read -rs -p 'ntfy token: ' NTFY_TEST_TOKEN; echo
+curl -fsS -H "Authorization: Bearer $NTFY_TEST_TOKEN" \
+  --data-binary 'Mileage tracker test notification' 'http://<host>:8092/<topic>'
+curl -fsS -H "Authorization: Bearer $NTFY_TEST_TOKEN" \
+  'http://<host>:8092/<topic>/json?poll=1'
+unset NTFY_TEST_TOKEN
+```
+
+The poll response and phone should show the text. This checks ntfy; a synthetic
+diagnostic batch with a current critical fault checks the whole ingest/monitor
+path (batch format: `DIAGNOSTICS.md`).
+
+After editing `monitor.env`, run `docker compose --profile monitor up -d
+mileage-monitor` to apply it; restart alone keeps the old environment. To
+disable sends, set `NOTIFY_ENABLED=false` and run that command. To stop both:
+
+```bash
+docker compose --profile monitor --profile ntfy stop mileage-monitor ntfy
+```
+
+Keep the named volumes: deleting monitor state loses deduplication and can
+replay alerts; deleting ntfy state loses users, tokens and cached messages.
+Consistent SQLite backup/restore remains #129; the existing trip backup does
+not cover these named volumes.
+
 ## Troubleshooting
 
 **Container is `unhealthy` or restarting**

@@ -2,6 +2,7 @@
 firmware/secrets.h
 server/.env
 server/viewer.env
+server/monitor.env
 server/backup/backup.conf
 
 # Trip data and databases

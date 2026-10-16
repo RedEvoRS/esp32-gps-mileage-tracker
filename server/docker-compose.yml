@@ -1,6 +1,6 @@
 # Mileage Tracker server
 #
-# Two services:
+# Two default services (optional monitor and ntfy profiles below):
 #   mileage-ingest  (port 8090) accepts trip uploads from the T-Beam and
 #                   stores each one in ./data as the raw GPX plus a JSON
 #                   summary.
@@ -115,6 +115,39 @@ services:
       retries: 3
       start_period: 10s
 
-# Named volume for the viewer's annotations database.
+  # Opt in with --profile monitor. No port, no ingest/viewer credentials.
+  mileage-monitor:
+    profiles: ["monitor"]
+    build:
+      context: .
+      dockerfile: mileage-monitor/Dockerfile
+    restart: unless-stopped
+    volumes:
+      - ./data:/data:ro
+      - monitor-state:/state
+    # Defaulting to the disabled example keeps install.sh and --check usable
+    # without creating another private env file or needing newer env_file syntax.
+    env_file:
+      - ${MONITOR_ENV_FILE:-./monitor.env.example}
+    depends_on:
+      - mileage-ingest
+
+  # Opt in separately: an existing self-hosted ntfy can be used instead.
+  ntfy:
+    profiles: ["ntfy"]
+    image: binwiederhier/ntfy:v2.31.0
+    command: ["serve"]
+    restart: unless-stopped
+    ports:
+      - "${BIND_ADDR:-0.0.0.0}:8092:80"
+    volumes:
+      - ./ntfy/server.yml:/etc/ntfy/server.yml:ro
+      - ntfy-state:/var/lib/ntfy
+    environment:
+      - NTFY_BASE_URL=${NTFY_BASE_URL:-}
+
+# Separate named volumes; none of these lives in the ingest data directory.
 volumes:
   viewer-db:
+  monitor-state:
+  ntfy-state:

@@ -379,11 +379,12 @@ preflight() {
     esac
 
     local f missing=()
-    for f in docker-compose.yml .dockerignore .env.example viewer.env.example sample.gpx \
+    for f in docker-compose.yml .dockerignore .env.example viewer.env.example monitor.env.example sample.gpx \
         common/__init__.py common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json} \
         mileage-ingest/{Dockerfile,app.py,diag_store.py,requirements.txt} \
         mileage-viewer/{Dockerfile,app.py,requirements.txt} \
         mileage-viewer/static/{leaflet.js,leaflet.css,gpx.js} \
+        mileage-monitor/{Dockerfile,monitor.py} ntfy/server.yml \
         backup/{backup.sh,restore.sh,lib.sh,backup.conf.example} \
         backup/mileage-backup@.{service,timer}; do
         if [[ ! -e $f ]]; then missing+=("$f"); fi
@@ -400,7 +401,7 @@ preflight() {
     # a stray \r on the end of every value in the env files.
     local crlf=()
     for f in backup/*.sh backup/*.service backup/*.timer backup/backup.conf* \
-        .env.example .env viewer.env.example viewer.env; do
+        .env.example .env viewer.env.example viewer.env monitor.env.example monitor.env; do
         if [[ -f $f ]] && grep -q $'\r' "$f"; then crlf+=("$f"); fi
     done
     if (( ${#crlf[@]} == 0 )); then

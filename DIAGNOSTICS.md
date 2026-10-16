@@ -4,8 +4,9 @@ This is the reference for issues #117 through #130. It describes the complete
 planned framework, including features that are not implemented yet. **#117 adds
 the shared catalog, protocol validation, generated C++ header, tests and this
 document; #118 adds the ingest endpoint, storage and GPX contact refresh;
-#119 adds the viewer's Device health page.**
-Firmware diagnostics and notifications follow in later issues.
+#119 adds the viewer's Device health page; #120/#121 add the optional server
+monitor, ntfy deployment and silence policy.**
+Firmware diagnostics follow in later issues.
 Existing firmware and server behavior remains described in
 [README.md](README.md) and [DEPLOY_DEBIAN.md](DEPLOY_DEBIAN.md).
 
@@ -33,8 +34,8 @@ numeric measurements and fixed enumerated values in context.
   snapshot ordering, and packaging the shared Python code into both services.
 - **#119:** shipped Device health at `/device-health`, with current conditions
   and paginated history behind the viewer login.
-- **#120:** independent monitor service and optional ntfy fault notifications.
-- **#121:** server-side device-silence detection and firmware heartbeat policy.
+- **#120:** shipped independent monitor service and optional ntfy fault notifications.
+- **#121:** shipped server-side device-silence detection; heartbeat integration is #125.
 - **#122:** host-testable EventLog, bounded queues, segmented persistence and
   acknowledgment recovery. Also owns durable identity/revision allocation.
 - **#123:** pure DisplayModel and host tests for display policy.
@@ -343,7 +344,7 @@ long blocking socket call would not enforce this rule. Recheck trip eligibility
 before each batch so a backlog cannot starve recording or trips. Send a current
 snapshot alongside old journal records; their boot IDs need not match.
 
-#121 adds a heartbeat if no contact has occurred for 24 hours, using an existing
+#125 adds a heartbeat if no contact has occurred for 24 hours, using an existing
 awake/network opportunity. Do not wake a parked car solely for a heartbeat.
 Being parked away from WiFi can legitimately trigger the optional silence alert.
 
@@ -434,11 +435,11 @@ remains significant, so firmware must preserve list order when retrying the
 same revision. Optional-field omission differs from an explicitly supplied
 field; revisions can be reused only for identical decoded check-ins.
 
-Both Docker builds use `server/` as context, copy their application plus
+All three Python Docker builds use `server/` as context, copy their application plus
 `common/` (including `catalog.json`) to `/app`, and set `PYTHONPATH=/app`.
 `server/.dockerignore` defaults to denying everything and explicitly allows
 only the required runtime files. Secrets, data and development artifacts stay
-outside the build context. Both services load the catalog once at startup and
+outside the build context. All three services load the catalog once at startup and
 fail fast if it is missing or invalid.
 
 ### Device health page (#119, shipped)
@@ -475,24 +476,24 @@ migrates, writes or recovers the diagnostics DB. An absent file gives a normal
 and hot journals requiring recovery give **Diagnostics unavailable**, HTTP 503,
 and a viewer warning log, with no healthy empty state substituted.
 
-## Optional monitor and notifications (#120/#121)
+## Optional monitor and notifications (#120/#121, shipped)
 
-Add a `mileage-monitor` Compose service with no published port. Every 60 seconds
+The stdlib-only `mileage-monitor` service has no published port. Every 60 seconds
 it reads `/data:ro` and stores its own delivery/deduplication state in a separate
 writable volume. It watches **every device that has ever checked in**; there is
-no `MONITOR_DEVICE_IDS` watchlist. Removing an obsolete device requires an
-explicit administrative retirement policy in #121, rather than an implicit
+no `MONITOR_DEVICE_IDS` watchlist. Removing an obsolete device requires a future
+explicit administrative retirement policy, rather than an implicit
 watchlist omission. The intended installation has a single tracker.
 
 Notifications use [ntfy](https://ntfy.sh), **self-hosted** on the same
 server: it is free, open-source software with no account or subscription, and
-#120 adds it as an optional Compose service. Phones subscribe with the free
+it is included as an optional Compose service. Phones subscribe with the free
 ntfy app (Android: Play Store or F-Droid; iOS: App Store). Gotcha: on iOS,
 instant push from a self-hosted server needs its `upstream-base-url` set to
 `https://ntfy.sh`, which relays only a wake-up poke (no message text) through
 the public instance, still free; Android needs no relay. ntfy allows anonymous
 access by default, so #120 sets `auth-default-access: deny-all` and uses a token.
-Notifications are off by default. Planned settings:
+Notifications are off by default. Settings in the separate private `monitor.env`:
 
 ```dotenv
 MONITOR_ENABLED=false
@@ -506,10 +507,9 @@ NOTIFY_MAX_PER_HOUR=6
 MONITOR_STALE_DAYS=7
 ```
 
-Validate these settings at startup; keep tokens in private environment files,
-never event context or public examples. #120 must also define an explicit
-snapshot freshness interval (proposed initial policy: 24 hours, aligned with
-the opportunistic heartbeat), measured from accepted snapshot receipt time.
+Enabled settings are validated at startup; keep tokens in private environment
+files, never event context or public examples. Snapshot freshness is **24 hours
+inclusive**, aligned with the opportunistic heartbeat, measured from accepted snapshot receipt time.
 GPX-only contact does not make an old health snapshot fresh.
 
 Alert only for catalog-eligible current faults in a fresh snapshot. Hold a new
@@ -526,13 +526,71 @@ between ntfy acceptance and state update can produce a duplicate; do not claim
 exactly-once delivery. Notification text excludes location, raw context and
 credentials. Missing database, stale data and ntfy outages do not affect trips.
 
-#121 compares last **server receipt time**, including accepted GPX contact,
+The monitor compares last **server receipt time**, including accepted GPX contact,
 against `MONITOR_STALE_DAYS`. Never use device UTC for silence. Derive 7001
 locally with a stable monitor episode and resolve only after genuine newer
 contact. Silence is a monitoring policy separate from the device-fault minimum
-severity: its warning-level alert is enabled by `MONITOR_ENABLED` with delivery
+severity and hold: its warning-level alert is enabled by `MONITOR_ENABLED` with delivery
 gated by `NOTIFY_ENABLED`, otherwise the default `error` threshold would
-silently suppress it. Document that distinction in deployment settings.
+silently suppress it.
+
+### Shipped service and state policy
+
+Use [DEPLOY_DEBIAN.md Step 11](DEPLOY_DEBIAN.md#step-11--optional-device-notifications)
+for manual enablement. `monitor` and `ntfy` are independent Compose profiles;
+an existing self-hosted ntfy can replace the bundled one. Profile gating avoids
+an idle container on a normal install. If explicitly started while disabled,
+the monitor logs that it is idling, loads the required catalog, and does no
+database reads or sends. Compose loads `monitor.env.example` by default; set
+`MONITOR_ENV_FILE=./monitor.env` in `.env` to select the private file. Neither
+the ingest token nor viewer secrets enter this service. No new Python packages
+are needed. ntfy uses a pinned image, a deny-all config, `BIND_ADDR` port 8092,
+and its own `ntfy-state` cache/auth volume.
+
+The monitor opens schema-v1 `events.db` with `mode=ro`, a two-second busy
+timeout and a consistent read transaction, closing every connection. No
+initialization, migration or recovery is attempted there. An absent DB means
+nothing to do. A read/schema/lock/hot-journal failure logs unavailable and
+suspends all sends, including pending retries, until a successful read.
+Only accepted snapshots and contact receipt times drive policy; journal events
+and their stored severity are never queried.
+
+`monitor-state:/state/monitor.db` has its own version-1 schema, DELETE journal
+and synchronous=FULL. `episodes` retains device/code/episode identity, current
+evidence, eligibility start, observed revision, silence contact anchor, first
+alert, last successful alert/reminder and resolution delivery. `work` coalesces
+one pending action per episode/kind; `outbox` commits the selected delivery
+intent before posting; `deliveries` holds the rolling-hour successful POST
+window; `retry` persists global retry attempts and the next attempt time.
+An unsupported state version fails startup. Run one monitor replica per volume.
+
+Hold starts at the monitor's first eligible observation, survives restarts,
+and restarts after observed unknown/stale/ineligible evidence. Critical faults
+and server silence bypass hold. Unknown or superseded episodes retain sent
+history; neither a new boot nor a new episode emits an invented resolution.
+An explicit newer clear can resolve previously alerted episodes of that code.
+Silence identity is stable from the last contact receipt and resolves only
+when that receipt advances, not when a server clock adjustment changes age.
+
+Every successful POST consumes a slot, including reminders, resolutions and
+digests. At the rolling-hour cap, unsent work stays durable and marked for
+digest delivery when a slot opens; a burst is coalesced rather than replayed
+as individual delayed alerts. Digests are split at 3500 UTF-8 bytes, below
+ntfy's default message limit; remaining entries stay queued. Recheck pending
+fault alerts/reminders against current fresh eligibility before retrying:
+withdraw them if they became unknown, stale, ineligible or clear. Never send a
+resolution for an alert with no recorded successful delivery. Retry failures
+globally after 60 seconds, doubling to at most 3600 seconds, so an ntfy outage
+does not cause one retry storm per condition. Posts have a ten-second timeout
+and do not follow redirects with the token. At-least-once duplicates after an
+ambiguous response/crash can exceed the recorded successful-POST cap.
+
+Bodies contain only alert/reminder/resolution, E-code, catalog title, validated
+device label and catalog recovery hint (silence adds whole days without contact).
+No context, device clock, location, links or credentials are included. Configure
+booleans and bounded numeric values as described in the deployment settings;
+default silence is exactly seven days with an inclusive threshold. Firmware
+heartbeat integration remains #125, and consistent state backups remain #129.
 
 ## Backups and acceptance (#129/#130)
 
