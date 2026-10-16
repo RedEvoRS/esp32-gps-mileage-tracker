@@ -110,6 +110,12 @@ class EarlyReplies(unittest.TestCase):
 class DefaultCap(unittest.TestCase):
     """The real default cap, not the small one EarlyReplies uses (#114)."""
 
+    def test_default_cap_is_16_mib(self):
+        # ~39 h of nonstop driving. Sized for the server's memory, not the
+        # V1.2's partition: an upload peaks at ~9x its size while parsing.
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(load_ingest(root).MAX_UPLOAD_BYTES, 16 * 1024 * 1024)
+
     def test_discard_limit_stays_above_the_cap(self):
         # At or under the cap, every over-cap upload would be past the
         # discard limit too, and get a reset the device retries forever.
