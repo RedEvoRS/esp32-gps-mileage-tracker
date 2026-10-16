@@ -30,6 +30,7 @@ HARNESS = textwrap.dedent("""\
     UNIT_DIR=$FAKE_UNITS
     DEFAULT_DIR=$FAKE_DEFAULT
     sudo() { "$@"; }
+    SUDO_READY=yes
     journalctl() { :; }
     # ExecStart as systemd would load it: the last one in the drop-in if
     # there is one, otherwise the template's, with %i filled in.

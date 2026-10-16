@@ -7,8 +7,9 @@
 #   bash install.sh --check   leave configuration unchanged; upload and
 #                             remove a test trip, optionally test login
 #
-# Run it as your normal login user, not root; it asks for sudo when it
-# needs it. It works on the directory it's in, normally ~/mileage-tracker
+# Run it as your normal login user, not root. If any step will need root,
+# it asks for sudo once, at the start; if none will, it doesn't ask at
+# all. It works on the directory it's in, normally ~/mileage-tracker
 # (your copy of server/). It's safe to run again: anything already set up
 # is checked and kept, so after fixing a problem, just run it again.
 #
@@ -200,6 +201,9 @@ confirm() {
 
 # --- sudo and Docker access --------------------------------------------
 
+# need_sudo [why]: make sure sudo works, asking for the password if it
+# has to. Every step that runs sudo calls this first, though plan_sudo
+# has usually asked already.
 need_sudo() {
     [[ $SUDO_READY == no ]] || return 0
     command -v sudo > /dev/null \
@@ -216,7 +220,7 @@ need_sudo() {
                 "Run it from a login session, or over ssh with -t:" \
                 "ssh -t <user>@<host> bash $SCRIPT_DIR/install.sh"
         fi
-        note "Some steps need root, so sudo asks for your password."
+        note "${1:-The next step needs root}, so sudo asks for your password."
         sudo -v \
             || die "sudo didn't let you in (its reason is just above)." \
                 "A mistyped password: just run this again." \
@@ -421,24 +425,94 @@ preflight() {
             "The Docker images need about 1 GB, and trips and backups grow from there."
     fi
 
-    if [[ $MODE == install ]]; then need_sudo; fi
+    plan_sudo
+}
+
+# Work out what this run will need root for before anything runs. If
+# anything, ask for sudo now, so the password prompt doesn't come halfway
+# through a long image build; if nothing, don't ask at all (#22). Each
+# step still calls need_sudo itself, in case this misses something.
+plan_sudo() {
+    local reasons=() missing unit
+    if [[ $MODE == install ]]; then
+        missing=$(missing_packages)
+        if [[ -n $missing ]]; then reasons+=("install packages: $missing"); fi
+        if ! command -v docker > /dev/null; then
+            reasons+=("install Docker")
+        elif [[ -d /run/systemd/system ]] \
+            && [[ $(systemctl is-active docker 2> /dev/null) != active \
+                || $(systemctl is-enabled docker 2> /dev/null) != enabled ]]; then
+            reasons+=("start Docker, and have it start at boot")
+        fi
+    fi
+    if command -v docker > /dev/null && ! docker info > /dev/null 2>&1; then
+        reasons+=("use Docker until you log in again (this session isn't in the docker group)")
+    fi
+    if [[ $MODE == install ]] \
+        && { [[ -d data && $(stat -c %u data) != "$CONTAINER_UID" ]] \
+            || [[ ! -d data && $(id -u) != "$CONTAINER_UID" ]]; }; then
+        reasons+=("hand data/ to UID $CONTAINER_UID, which the containers run as")
+    fi
+    if (( ${#DATA_SUDO[@]} )); then
+        reasons+=("check and delete the test trip, whose files belong to UID $CONTAINER_UID")
+    fi
+    if [[ $MODE == install && -d /run/systemd/system && -n $(env_raw .env BIND_ADDR) \
+        && ${INSTALL_WAIT_ONLINE:-y} != [Nn]* ]]; then
+        unit=$(wait_online_unit)
+        if [[ -n $unit ]] && ! wait_online_enabled "$unit"; then
+            reasons+=("make Docker wait for the network at boot, if you say yes to that")
+        fi
+    fi
+    if [[ $MODE == install && $(id -u) == "$CONTAINER_UID" ]]; then
+        if backups_configured; then
+            if ! { timer_ok && timer_current; }; then
+                reasons+=("set up the daily backup timer")
+            fi
+        elif [[ ${INSTALL_BACKUPS:-y} != [Nn]* ]]; then
+            reasons+=("set up the daily backup timer, if you set up backups")
+        fi
+    fi
+
+    if (( ${#reasons[@]} == 0 )); then
+        ok "Nothing needs root this time, so no sudo"
+        return 0
+    fi
+    local reason
+    note "Root is needed to:"
+    for reason in "${reasons[@]}"; do note "  - $reason"; done
+    need_sudo "Asking once now, not partway through"
+    ok "sudo works"
 }
 
 # --- Packages and Docker -----------------------------------------------
 
 apt_get() {
+    need_sudo
     sudo DEBIAN_FRONTEND=noninteractive apt-get -q -y "$@" < /dev/null
 }
 
-install_packages() {
-    local wanted=(ca-certificates curl gnupg jq openssl openssh-client rsync iproute2)
+WANTED_PACKAGES=(ca-certificates curl gnupg jq openssl openssh-client rsync iproute2)
+
+have_apt() { command -v apt-get > /dev/null && command -v dpkg-query > /dev/null; }
+
+# The WANTED_PACKAGES that aren't installed, space-separated. Empty
+# without apt, where install_packages only checks for the commands.
+missing_packages() {
     local p missing=()
-    if command -v apt-get > /dev/null && command -v dpkg-query > /dev/null; then
-        for p in "${wanted[@]}"; do
-            if [[ $(dpkg-query -W -f='${Status}' "$p" 2> /dev/null) != *'ok installed' ]]; then
-                missing+=("$p")
-            fi
-        done
+    have_apt || return 0
+    for p in "${WANTED_PACKAGES[@]}"; do
+        if [[ $(dpkg-query -W -f='${Status}' "$p" 2> /dev/null) != *'ok installed' ]]; then
+            missing+=("$p")
+        fi
+    done
+    printf '%s' "${missing[*]}"
+}
+
+install_packages() {
+    local wanted=("${WANTED_PACKAGES[@]}")
+    local p missing=()
+    if have_apt; then
+        read -r -a missing <<< "$(missing_packages)"
         if (( ${#missing[@]} )) && [[ $MODE == check ]]; then
             problem "Packages not installed: ${missing[*]}" "Run install.sh to install them."
             return 0
@@ -471,6 +545,7 @@ install_docker() {
             "then run this again." ;;
     esac
     [[ -n $OS_CODENAME ]] || die "Couldn't tell which $OS_ID release this is (no VERSION_CODENAME in /etc/os-release)."
+    need_sudo
     note "Installing Docker from Docker's apt repository"
     # A second entry for the same repository with a different key path
     # makes apt refuse to update, so reuse one set up some other way
@@ -516,6 +591,7 @@ setup_docker() {
     # Docker's daemon has to be running and start at boot.
     if [[ -d /run/systemd/system && $(systemctl is-active docker 2> /dev/null) != active ]]; then
         [[ $MODE == install ]] || die "The Docker service isn't running." "sudo systemctl enable --now docker"
+        need_sudo
         sudo systemctl enable --now docker
     fi
 
@@ -572,6 +648,7 @@ setup_data_dir() {
     fi
     if [[ $(stat -c %u data) != "$CONTAINER_UID" ]]; then
         if [[ $MODE == install ]]; then
+            need_sudo
             sudo chown -R "$CONTAINER_UID:$CONTAINER_UID" data
         else
             problem "data/ doesn't belong to UID $CONTAINER_UID, so uploads will fail" \
@@ -1286,6 +1363,7 @@ verify_reboots() {
     if [[ $(systemctl is-enabled docker 2> /dev/null) == enabled ]]; then
         ok "Docker starts at boot"
     elif [[ $MODE == install ]]; then
+        need_sudo
         sudo systemctl enable --quiet docker
         ok "Docker now starts at boot"
     else
@@ -1310,8 +1388,10 @@ verify_reboots() {
 # means something if a wait-online service for the network stack in use
 # is enabled. Without one, Docker can start before BIND_ADDR exists and
 # the containers don't come back after a reboot.
-check_wait_online() {
-    local unit='' state
+# The wait-online unit for the network stack in use, or nothing if it
+# can't tell or that unit doesn't exist.
+wait_online_unit() {
+    local unit=''
     if systemctl is-active --quiet NetworkManager 2> /dev/null; then
         unit=NetworkManager-wait-online.service
     elif systemctl is-active --quiet systemd-networkd 2> /dev/null; then
@@ -1319,19 +1399,33 @@ check_wait_online() {
     elif systemctl is-active --quiet networking 2> /dev/null; then
         unit=ifupdown-wait-online.service
     fi
-    if [[ -z $unit ]] || ! systemctl cat "$unit" > /dev/null 2>&1; then
+    if [[ -n $unit ]] && systemctl cat "$unit" > /dev/null 2>&1; then
+        printf '%s' "$unit"
+    fi
+}
+
+wait_online_enabled() {
+    local state
+    state=$(systemctl is-enabled "$1" 2> /dev/null) || true
+    case $state in
+        enabled | enabled-runtime | static | indirect | alias) return 0 ;;
+    esac
+    return 1
+}
+
+check_wait_online() {
+    local unit
+    unit=$(wait_online_unit)
+    if [[ -z $unit ]]; then
         warn "Couldn't tell whether Docker waits for the network at boot" \
             "If the containers are missing after a reboot, see 'Containers missing after" \
             "a reboot' in DEPLOY_DEBIAN.md."
         return 0
     fi
-    state=$(systemctl is-enabled "$unit" 2> /dev/null) || true
-    case $state in
-        enabled | enabled-runtime | static | indirect | alias)
-            ok "Docker waits for the network at boot ($unit)"
-            return 0
-            ;;
-    esac
+    if wait_online_enabled "$unit"; then
+        ok "Docker waits for the network at boot ($unit)"
+        return 0
+    fi
     if [[ $MODE == check ]]; then
         warn "At boot, Docker may start before $BIND_ADDR is up and leave the containers down" \
             "sudo systemctl enable $unit"
@@ -1340,6 +1434,7 @@ check_wait_online() {
     note "With BIND_ADDR set, Docker can only publish the ports once $BIND_ADDR is up." \
         "If Docker starts first at boot, the containers stay down until you start them."
     if confirm WAIT_ONLINE "Make Docker wait for the network at boot ($unit)?" y; then
+        need_sudo
         sudo systemctl enable --quiet "$unit"
         ok "Docker waits for the network at boot ($unit)"
     else
@@ -1498,6 +1593,7 @@ install_backup_timer() {
     local unit dropin
     unit=$(backup_unit)
     dropin=$(backup_dropin)
+    need_sudo
     sudo install -m 644 backup/mileage-backup@.service backup/mileage-backup@.timer "$UNIT_DIR/"
     # The unit runs /home/<user>/mileage-tracker/backup/backup.sh. If the
     # files are somewhere else, a drop-in points it at them.
