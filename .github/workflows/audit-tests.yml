@@ -148,6 +148,23 @@ jobs:
         run: |
           sudo -u "$TEST_USER" -H env INSTALL_KEEP_LOGIN=y INSTALL_VIEWER_PASSWORD="$PASSWORD" \
             bash "$INSTALLER" < /dev/null
+      - name: A re-run with nothing to fix doesn't ask for sudo
+        # With a password-only sudo rule and no terminal, any sudo prompt
+        # stops the run, so this only passes if it never asks (#22).
+        run: |
+          if [ "$TEST_USER" = "$(id -un)" ]; then
+            echo "Skipped: the test user is the runner itself"
+            exit 0
+          fi
+          echo "$TEST_USER ALL=(ALL) ALL" | sudo tee /etc/sudoers.d/zz-installer-test
+          status=0
+          sudo -u "$TEST_USER" -H env INSTALL_KEEP_LOGIN=y INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+            bash "$INSTALLER" < /dev/null > rerun.log 2>&1 || status=$?
+          echo "$TEST_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/zz-installer-test
+          cat rerun.log
+          test "$status" = 0
+          grep -q "Nothing needs root so far" rerun.log
+          ! grep -q "Root is needed" rerun.log
       - name: Repair a hash that lost its quotes and a .env with CRLF endings
         run: |
           dir=$(dirname "$INSTALLER")
