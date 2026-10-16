@@ -50,14 +50,15 @@ HARNESS = textwrap.dedent("""\
         }
     fi
     cd "$WORK"
+    trap cleanup EXIT
     if upload_test_trip; then result=0; else result=1; fi
     printf 'RESULT=%s\\nTEST_ID=%s\\n' "$result" "$TEST_ID"
+    if [[ -n ${DENY_SEARCH:-} ]]; then chmod a-x "${TEST_TRIP%/*}"; fi
     # The end-to-end check runs under `|| true`, so errexit is off here.
     if [[ -n ${REMOVE:-} ]]; then
         { if remove_test_trip; then removed=yes; else removed=no; fi; } || true
         printf 'REMOVED=%s\\nLEFT=%s\\n' "$removed" "$TEST_TRIP"
     fi
-    cleanup
     """)
 
 
@@ -95,14 +96,19 @@ class InstallerTestTrip(unittest.TestCase):
                              f"{content}{ext}")
 
     def run_check(self, code, body="", write=None, content="", hex_=HEX,
-                  rm_fails=False, remove=False, status=0):
+                  rm_fails=False, remove=False, status=0, deny_search=False):
         env = dict(os.environ, INSTALL=str(INSTALL), WORK=str(self.work),
                    FAKE_HEX=hex_ or "", FAKE_CODE=code, FAKE_BODY=body,
                    FAKE_WRITE=str(write.relative_to(self.work)) if write else "",
                    FAKE_CONTENT=content, FAKE_RM_FAIL="1" if rm_fails else "",
-                   REMOVE="1" if remove else "")
-        proc = subprocess.run(["bash", "-c", HARNESS], env=env, text=True,
-                              capture_output=True, timeout=60)
+                   REMOVE="1" if remove else "",
+                   DENY_SEARCH="1" if deny_search else "")
+        try:
+            proc = subprocess.run(["bash", "-c", HARNESS], env=env, text=True,
+                                  capture_output=True, timeout=60)
+        finally:
+            if deny_search:
+                self.month.chmod(0o700)
         self.assertEqual(proc.returncode, status, proc.stdout + proc.stderr)
         out = dict(line.split("=", 1) for line in proc.stdout.splitlines()
                    if line.startswith(("RESULT=", "TEST_ID=", "REMOVED=", "LEFT=")))
@@ -176,6 +182,21 @@ class InstallerTestTrip(unittest.TestCase):
         self.assertIn("The test trip is still on disk", out["output"])
         self.assertRegex(out["output"], rf"rm -f \S*/data/2026-04/{self.ID}\.gpx ")
         self.assertTrue(self.own.with_suffix(".gpx").exists())
+
+    @unittest.skipIf(os.name != "nt" and os.geteuid() == 0,
+                     "root bypasses directory search permissions")
+    def test_inaccessible_trip_is_not_mistaken_for_deleted(self):
+        # Real rm and test -e both fail when the month cannot be searched.
+        # The failed rm must keep cleanup armed even though test -e is false.
+        out = self.run_check("200", self.accepted(), write=self.own,
+                             content=SAMPLE.read_text(), deny_search=True,
+                             remove=True, status=1)
+        self.assertEqual(out["REMOVED"], "no", out["output"])
+        self.assertEqual(out["LEFT"], "data/2026-04/" + self.ID)
+        self.assertIn("Permission denied", out["output"])
+        self.assertIn("The test trip is still on disk", out["output"])
+        for ext in (".gpx", ".json"):
+            self.assertTrue(self.own.with_suffix(ext).exists())
 
     def test_each_run_gets_its_own_id(self):
         ids = {self.run_check("401", "{}", hex_=None)["TEST_ID"]

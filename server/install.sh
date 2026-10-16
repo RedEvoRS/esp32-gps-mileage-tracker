@@ -992,13 +992,16 @@ verify_services() {
 
 # --- End to end --------------------------------------------------------
 
-# Fails, leaving TEST_TRIP set, while either file is still there. It goes
-# by what's on disk rather than rm's status: the end-to-end check runs
-# with errexit off, and a failed rm mustn't pass for a deleted trip (#44).
+# Keep TEST_TRIP set if removal fails or either file remains. A failed
+# test -e can also mean the directory is inaccessible, so it cannot
+# override a failed rm. Handle errors explicitly: the end-to-end check
+# runs with errexit off (#44).
 remove_test_trip() {
     local trip=$TEST_TRIP
     [[ -n $trip ]] || return 0
-    "${DATA_SUDO[@]}" rm -f -- "$trip.gpx" "$trip.json" 2>&1 | indent || true
+    if ! "${DATA_SUDO[@]}" rm -f -- "$trip.gpx" "$trip.json" 2>&1 | indent; then
+        return 1
+    fi
     if data_exists "$trip.gpx" "$trip.json"; then return 1; fi
     TEST_TRIP=
     # Only a month folder the test upload made, and only if it's empty:
@@ -1592,13 +1595,15 @@ summary() {
     printf '    the top of the repo, "Setting it up", steps 3 to 5. A new board needs\n'
     printf '    a one-time storage setup on its first flash (firmware/README.md).\n'
     if [[ $FIRST_BACKUP == yes ]]; then
-        # The test trip is gone before the backup step, so that first
-        # restore test had no trips or annotations to bring back (#23).
-        printf '  - After the first real drives, annotate one in the viewer and run\n'
-        printf '      bash %s/install.sh --check\n' "$SCRIPT_DIR"
-        printf '    The backup tested above was empty, so it proved the plumbing but\n'
-        printf '    not that trips and annotations come back. --check tests the newest\n'
-        printf '    backup, which by then holds them.\n'
+        # --check tests an existing snapshot; make one after real data
+        # arrives instead of checking the empty install-time copy (#23).
+        printf '  - After the first real drives, annotate one in the viewer, then run:\n'
+        printf '      bash %q\n' "$SCRIPT_DIR/backup/backup.sh"
+        printf '      bash %q --check\n' "$SCRIPT_DIR/install.sh"
+        printf '    Or wait for a successful nightly backup before running --check.\n'
+        printf '    --check tests the newest existing backup; it does not make one.\n'
+        printf '    Confirm its trip and annotation counts match the viewer. An empty\n'
+        printf '    snapshot proves the plumbing, but not that real data comes back.\n'
     fi
 }
 

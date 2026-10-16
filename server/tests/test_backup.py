@@ -196,6 +196,61 @@ class BackupScripts(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not in SHA256SUMS", result.stderr)
 
+    def test_installer_advice_creates_a_populated_backup_before_checking(self):
+        # The initial install has no trips or annotations to restore.
+        for path in self.data.rglob("*"):
+            if path.is_file():
+                path.unlink()
+        with sqlite3.connect(self.db_dir / "annotations.db") as conn:
+            conn.execute("DELETE FROM annotations")
+        conn.close()
+        self.run_script("backup.sh")
+
+        # A first drive and annotation arrive before the nightly backup.
+        self.add_trip("2026-10/2026-10-02T08-00-00", "first drive")
+        with sqlite3.connect(self.db_dir / "annotations.db") as conn:
+            conn.execute("INSERT INTO annotations VALUES (?, ?, ?, ?, ?)",
+                         ("2026-10/2026-10-02T08-00-00", "business", "client visit",
+                          "2026-10-02T09:00:00Z", "Acme"))
+        conn.close()
+        stale = self.run_script("restore.sh", "check")
+        self.assertIn("0 annotations", stale.stderr)
+        self.assertIn("0 trip GPX files", stale.stderr)
+
+        # Exercise the backup command the real install summary gives the user.
+        shutil.copytree(BACKUP, self.compose_dir / "backup")
+        (self.compose_dir / ".env").write_text("INGEST_AUTH_TOKEN=example-token\n")
+        env = dict(self.env, INSTALL=str(SERVER / "install.sh"),
+                   WORK=str(self.compose_dir))
+        setup = textwrap.dedent("""\
+            source <(sed '$d' "$INSTALL")
+            cd "$WORK"
+            SCRIPT_DIR=$WORK
+            BIND_ADDR=192.0.2.10
+            """)
+        summary = subprocess.run(["bash", "-c", setup + "FIRST_BACKUP=yes\nsummary\n"],
+                                 env=env, text=True,
+                                 capture_output=True, timeout=30)
+        self.assertEqual(summary.returncode, 0, summary.stdout + summary.stderr)
+        commands = [line.strip() for line in summary.stdout.splitlines()
+                    if line.strip().startswith("bash ")]
+        backups = [command for command in commands if "/backup/backup.sh" in command]
+        self.assertEqual(len(backups), 1, summary.stdout)
+        self.assertTrue(commands[-1].endswith("/install.sh --check"), summary.stdout)
+        self.assertLess(commands.index(backups[0]), len(commands) - 1)
+        backup = subprocess.run(["bash", "-c", backups[0]], env=env, text=True,
+                                capture_output=True, timeout=30)
+        self.assertEqual(backup.returncode, 0, backup.stdout + backup.stderr)
+
+        # --check's backup step now verifies the populated off-host snapshot.
+        harness = setup + "MODE=check\nrestore_test\nsummary\n"
+        checked = subprocess.run(["bash", "-c", harness], env=env, text=True,
+                                 capture_output=True, timeout=30)
+        self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+        self.assertIn("1 annotations (1 tagged)", checked.stdout)
+        self.assertIn("1 trip GPX files", checked.stdout)
+        self.assertIn("Restore test passed", checked.stdout)
+
     def test_restore_rebuilds_a_wiped_server_and_keeps_what_it_replaced(self):
         self.run_script("backup.sh")
         shutil.rmtree(self.data)

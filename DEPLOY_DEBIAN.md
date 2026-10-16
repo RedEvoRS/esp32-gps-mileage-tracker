@@ -631,8 +631,17 @@ On a new install the first snapshot is empty (`0 annotations`, `0 trip
 GPX files`): the installer deletes its test trip before it gets to
 backups. That proves the SSH key, rsync and checksums, but not that real
 trips and annotations come back. After the first real drives, annotate
-one in the viewer and run `install.sh --check` (or the nightly backup,
-then `restore.sh check`), and check the counts are no longer zero.
+one in the viewer, make a fresh backup, then check it:
+
+```bash
+bash ~/mileage-tracker/backup/backup.sh
+bash ~/mileage-tracker/install.sh --check
+```
+
+Or wait for a successful nightly backup before running `--check` (or
+`restore.sh check`). These checks only test the newest existing snapshot;
+they do not create one. Confirm the trip and annotation counts match the
+viewer and are no longer zero.
 
 ### 10e — Schedule it
 
