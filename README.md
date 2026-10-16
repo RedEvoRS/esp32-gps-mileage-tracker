@@ -35,6 +35,11 @@ through it end to end, then flashing the board and taking it for a drive.
 
 ## How it works
 
+The planned device health, error-code and notification framework is described in
+[DIAGNOSTICS.md](DIAGNOSTICS.md), with implementation tracked by issues #117-#130.
+The shared catalog and protocol are available; device/server integration follows
+in those issues.
+
 ```
    ┌──────────────────┐        drive        ┌──────────────────┐
    │  T-Beam in car   │  ── logs GPX to ──▶ │    LittleFS      │

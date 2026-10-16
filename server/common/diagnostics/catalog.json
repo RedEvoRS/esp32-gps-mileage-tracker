@@ -1,0 +1,959 @@
+{
+  "catalog_version": 1,
+  "codes": [
+    {
+      "code": 1000,
+      "symbol": "BOOT",
+      "severity": "info",
+      "oled": [
+        "Device started"
+      ],
+      "title": "Boot completed",
+      "explanation": "A new boot started, including wake from deep sleep. This is history rather than a current fault.",
+      "recovery": "No action is needed for normal wakes. Inspect reset events if restarts are unexpected.",
+      "context": {
+        "reset_reason": {
+          "type": "enum",
+          "values": [
+            "power_on",
+            "deep_sleep",
+            "software",
+            "watchdog",
+            "brownout",
+            "panic",
+            "other"
+          ]
+        }
+      },
+      "notify": false,
+      "journal": "per_occurrence"
+    },
+    {
+      "code": 1001,
+      "symbol": "FS_MUTEX_FAILED",
+      "severity": "critical",
+      "oled": [
+        "Storage lock failed"
+      ],
+      "title": "Filesystem mutex creation failed",
+      "explanation": "The shared filesystem lock could not be created. Concurrent storage access cannot safely continue.",
+      "recovery": "Keep the device powered for diagnostics; inspect memory use and restart after addressing the cause.",
+      "context": {},
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 1002,
+      "symbol": "NET_TASK_FAILED",
+      "severity": "error",
+      "oled": [
+        "Network task failed"
+      ],
+      "title": "Networking task creation failed",
+      "explanation": "The networking task could not be started, so uploads cannot run.",
+      "recovery": "Inspect available memory and task configuration; recording may continue locally.",
+      "context": {},
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 1003,
+      "symbol": "WATCHDOG_RESET",
+      "severity": "error",
+      "oled": [
+        "Watchdog reset"
+      ],
+      "title": "Watchdog reset detected",
+      "explanation": "The previous run stopped servicing a watchdog and was reset. This record is created on the next boot.",
+      "recovery": "Inspect the preceding journal and task timing; repeated resets need a firmware investigation.",
+      "context": {},
+      "notify": true,
+      "journal": "per_occurrence"
+    },
+    {
+      "code": 1004,
+      "symbol": "BROWNOUT_RESET",
+      "severity": "warning",
+      "oled": [
+        "Supply voltage low"
+      ],
+      "title": "Brownout reset detected",
+      "explanation": "The previous run reset because supply voltage fell too low.",
+      "recovery": "Check the USB supply, cable and battery before relying on recording.",
+      "context": {},
+      "notify": true,
+      "journal": "per_occurrence"
+    },
+    {
+      "code": 1005,
+      "symbol": "PANIC_RESET",
+      "severity": "error",
+      "oled": [
+        "Firmware panic"
+      ],
+      "title": "Panic reset detected",
+      "explanation": "The previous run ended in a panic. Raw crash text is deliberately excluded from diagnostic context.",
+      "recovery": "Inspect a private serial trace and the firmware build; verify recording after restart.",
+      "context": {},
+      "notify": true,
+      "journal": "per_occurrence"
+    },
+    {
+      "code": 1006,
+      "symbol": "ID_STATE_FAILED",
+      "severity": "warning",
+      "oled": [
+        "Boot counter failed"
+      ],
+      "title": "Persistent identity state unavailable",
+      "explanation": "The diagnostic boot counter could not be read or saved. Random boot IDs still identify records.",
+      "recovery": "Inspect NVS health; do not infer boot order from the failed counter.",
+      "context": {},
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 1007,
+      "symbol": "NET_STACK_LOW",
+      "severity": "warning",
+      "oled": [
+        "Network stack low"
+      ],
+      "title": "Network task stack margin low",
+      "explanation": "The networking task has little measured stack headroom and may fail on a larger upload.",
+      "recovery": "Measure stack use on hardware and adjust task sizing before road use.",
+      "context": {
+        "free_bytes": {
+          "type": "integer",
+          "min": 0,
+          "max": 1048576
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 2001,
+      "symbol": "PMU_INIT_FAILED",
+      "severity": "critical",
+      "oled": [
+        "Power control failed"
+      ],
+      "title": "Power management initialization failed",
+      "explanation": "The power-management chip could not be initialized. Battery and peripheral power controls are unreliable.",
+      "recovery": "Check the board variant, power and I2C wiring; do not assume charging or rail control works.",
+      "context": {},
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 2002,
+      "symbol": "BATTERY_LOW",
+      "severity": "warning",
+      "oled": [
+        "Battery low"
+      ],
+      "title": "Battery charge is low",
+      "explanation": "The measured battery voltage crossed the configured low threshold.",
+      "recovery": "Connect a suitable supply and check battery condition if this recurs.",
+      "context": {
+        "battery_mv": {
+          "type": "integer",
+          "min": 0,
+          "max": 6000
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 2003,
+      "symbol": "BATTERY_CRITICAL",
+      "severity": "error",
+      "oled": [
+        "Battery very low"
+      ],
+      "title": "Battery charge is critical",
+      "explanation": "The battery voltage crossed the critical threshold; safe recording time is limited.",
+      "recovery": "Restore external power and let the device close files before it sleeps.",
+      "context": {
+        "battery_mv": {
+          "type": "integer",
+          "min": 0,
+          "max": 6000
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 2004,
+      "symbol": "CHARGE_HOT",
+      "severity": "warning",
+      "oled": [
+        "Charging paused",
+        "Temperature high"
+      ],
+      "title": "Charging paused for high temperature",
+      "explanation": "The charge guard paused charging because its temperature estimate is too high. This is not a calibrated cell-temperature measurement.",
+      "recovery": "Let the device cool and check its placement. Charging resumes only when the guard permits it.",
+      "context": {
+        "temperature_mc": {
+          "type": "integer",
+          "min": -50000,
+          "max": 150000
+        }
+      },
+      "notify": false,
+      "journal": "transitions"
+    },
+    {
+      "code": 2005,
+      "symbol": "CHARGE_COLD",
+      "severity": "warning",
+      "oled": [
+        "Charging paused",
+        "Temperature low"
+      ],
+      "title": "Charging paused for low temperature",
+      "explanation": "The charge guard paused charging because its temperature estimate is too low.",
+      "recovery": "Move the device into a suitable temperature range and wait for the guard to permit charging.",
+      "context": {
+        "temperature_mc": {
+          "type": "integer",
+          "min": -50000,
+          "max": 150000
+        }
+      },
+      "notify": false,
+      "journal": "transitions"
+    },
+    {
+      "code": 2006,
+      "symbol": "CHARGE_TEMP_UNREADABLE",
+      "severity": "error",
+      "oled": [
+        "Charge sensor failed"
+      ],
+      "title": "Charge temperature unavailable",
+      "explanation": "The charge guard cannot obtain a usable temperature reading and cannot safely permit charging.",
+      "recovery": "Inspect sensor readings and power management; do not bypass the charge guard.",
+      "context": {},
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 3001,
+      "symbol": "GPS_NO_DATA",
+      "severity": "error",
+      "oled": [
+        "GPS data missing"
+      ],
+      "title": "No GPS serial data",
+      "explanation": "No usable GPS serial data arrived within the configured interval.",
+      "recovery": "Check GPS power, UART pins and board selection; recording needs a working GPS stream.",
+      "context": {
+        "elapsed_ms": {
+          "type": "integer",
+          "min": 0,
+          "max": 9223372036854775807
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 3002,
+      "symbol": "GPS_NO_FIX",
+      "severity": "warning",
+      "oled": [
+        "Waiting for GPS fix"
+      ],
+      "title": "GPS has no position fix",
+      "explanation": "GPS data is arriving but no acceptable position fix is available.",
+      "recovery": "Allow time with a clear sky view and check the antenna if the condition persists.",
+      "context": {
+        "elapsed_ms": {
+          "type": "integer",
+          "min": 0,
+          "max": 9223372036854775807
+        },
+        "satellites": {
+          "type": "integer",
+          "min": 0,
+          "max": 255
+        }
+      },
+      "notify": false,
+      "journal": "transitions"
+    },
+    {
+      "code": 3003,
+      "symbol": "GPS_CONFIG_NACK",
+      "severity": "warning",
+      "oled": [
+        "GPS config rejected"
+      ],
+      "title": "GPS rejected configuration",
+      "explanation": "The GPS returned a negative acknowledgment for a configuration message.",
+      "recovery": "Check the receiver model and supported configuration; some defaults may remain active.",
+      "context": {
+        "message_class": {
+          "type": "integer",
+          "min": 0,
+          "max": 255
+        },
+        "message_id": {
+          "type": "integer",
+          "min": 0,
+          "max": 255
+        }
+      },
+      "notify": true,
+      "journal": "per_occurrence"
+    },
+    {
+      "code": 3004,
+      "symbol": "GPS_CONFIG_TIMEOUT",
+      "severity": "warning",
+      "oled": [
+        "GPS config timeout"
+      ],
+      "title": "GPS configuration acknowledgment timed out",
+      "explanation": "No acknowledgment arrived before the configuration timeout.",
+      "recovery": "Check UART traffic and receiver compatibility; verify the settings actually in use.",
+      "context": {
+        "message_class": {
+          "type": "integer",
+          "min": 0,
+          "max": 255
+        },
+        "message_id": {
+          "type": "integer",
+          "min": 0,
+          "max": 255
+        }
+      },
+      "notify": true,
+      "journal": "per_occurrence"
+    },
+    {
+      "code": 3005,
+      "symbol": "GPS_TRIP_FIX_LOST",
+      "severity": "warning",
+      "oled": [
+        "GPS fix lost"
+      ],
+      "title": "Position fix lost during a trip",
+      "explanation": "A trip is active but acceptable GPS positions stopped. Distance across the gap may be underestimated.",
+      "recovery": "Restore sky view and inspect the antenna if recurring; review the trip gap later.",
+      "context": {
+        "elapsed_ms": {
+          "type": "integer",
+          "min": 0,
+          "max": 9223372036854775807
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 3006,
+      "symbol": "UTC_UNAVAILABLE",
+      "severity": "warning",
+      "oled": [
+        "Clock not set"
+      ],
+      "title": "Usable UTC time unavailable",
+      "explanation": "No trusted UTC clock is available. Uptime still orders diagnostic events within this boot.",
+      "recovery": "Wait for GPS or a permitted time sync; do not use these device timestamps for liveness.",
+      "context": {},
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 3007,
+      "symbol": "RTC_UNAVAILABLE",
+      "severity": "warning",
+      "oled": [
+        "RTC unavailable"
+      ],
+      "title": "Real-time clock unavailable",
+      "explanation": "The external real-time clock did not respond or could not be initialized.",
+      "recovery": "Check the board variant and RTC bus; GPS or network time may still become available.",
+      "context": {},
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 3008,
+      "symbol": "RTC_TIME_INVALID",
+      "severity": "warning",
+      "oled": [
+        "RTC time invalid"
+      ],
+      "title": "Real-time clock value invalid",
+      "explanation": "The RTC was readable but its time cannot be trusted, for example after power loss.",
+      "recovery": "Acquire trusted GPS or network time before updating the RTC.",
+      "context": {
+        "reason": {
+          "type": "enum",
+          "values": [
+            "stopped",
+            "invalid_date",
+            "out_of_range",
+            "read_failed"
+          ]
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 4001,
+      "symbol": "SD_UNAVAILABLE",
+      "severity": "warning",
+      "oled": [
+        "SD card unavailable"
+      ],
+      "title": "SD storage unavailable",
+      "explanation": "The SD card could not be mounted or used. Recording may fall back to internal flash.",
+      "recovery": "Check the card and its power rail; preserve existing files before repair or replacement.",
+      "context": {},
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 4002,
+      "symbol": "LITTLEFS_UNAVAILABLE",
+      "severity": "error",
+      "oled": [
+        "Flash unavailable"
+      ],
+      "title": "LittleFS storage unavailable",
+      "explanation": "Internal flash storage could not be mounted or used.",
+      "recovery": "Preserve data and inspect the partition; never format automatically on a mount failure.",
+      "context": {},
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 4003,
+      "symbol": "NO_RECORDING_STORAGE",
+      "severity": "critical",
+      "oled": [
+        "Cannot record trips",
+        "No usable storage"
+      ],
+      "title": "No recording storage available",
+      "explanation": "Neither recording backend is usable. The degraded service loop can report the failure but cannot record trips.",
+      "recovery": "Restore a usable storage backend and verify a test trip before relying on the tracker.",
+      "context": {},
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 4004,
+      "symbol": "STORAGE_LOW",
+      "severity": "warning",
+      "oled": [
+        "Storage nearly full"
+      ],
+      "title": "Recording storage is low",
+      "explanation": "Available recording space is below the configured reserve.",
+      "recovery": "Upload pending trips and inspect retention; preserve unuploaded trips.",
+      "context": {
+        "backend": {
+          "type": "enum",
+          "values": [
+            "sd",
+            "littlefs",
+            "ram",
+            "none"
+          ]
+        },
+        "free_bytes": {
+          "type": "integer",
+          "min": 0,
+          "max": 9223372036854775807
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 4005,
+      "symbol": "STORAGE_FULL",
+      "severity": "critical",
+      "oled": [
+        "Storage full",
+        "Cannot record trips"
+      ],
+      "title": "Recording storage is full",
+      "explanation": "There is insufficient usable space for recording safely.",
+      "recovery": "Upload and verify stored trips before reclaiming space; check diagnostic quota enforcement.",
+      "context": {
+        "backend": {
+          "type": "enum",
+          "values": [
+            "sd",
+            "littlefs",
+            "ram",
+            "none"
+          ]
+        },
+        "free_bytes": {
+          "type": "integer",
+          "min": 0,
+          "max": 9223372036854775807
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 4006,
+      "symbol": "TRIP_WRITE_FAILED",
+      "severity": "critical",
+      "oled": [
+        "Trip write failed"
+      ],
+      "title": "Trip file write failed",
+      "explanation": "A trip file operation failed. Some points may be missing or the trip may need recovery.",
+      "recovery": "Check storage health and space; preserve the partial trip for recovery.",
+      "context": {
+        "backend": {
+          "type": "enum",
+          "values": [
+            "sd",
+            "littlefs",
+            "ram",
+            "none"
+          ]
+        },
+        "operation": {
+          "type": "enum",
+          "values": [
+            "open",
+            "write",
+            "close",
+            "rename"
+          ]
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 4007,
+      "symbol": "TRIP_RECOVERY_FAILED",
+      "severity": "error",
+      "oled": [
+        "Trip recovery failed"
+      ],
+      "title": "Incomplete trip recovery failed",
+      "explanation": "A partial trip could not be recovered safely.",
+      "recovery": "Preserve the original file and inspect it with recovery tooling before deletion.",
+      "context": {
+        "backend": {
+          "type": "enum",
+          "values": [
+            "sd",
+            "littlefs",
+            "ram",
+            "none"
+          ]
+        },
+        "reason": {
+          "type": "enum",
+          "values": [
+            "read",
+            "parse",
+            "write",
+            "rename"
+          ]
+        }
+      },
+      "notify": true,
+      "journal": "per_occurrence"
+    },
+    {
+      "code": 4008,
+      "symbol": "EVENT_WRITE_FAILED",
+      "severity": "error",
+      "oled": [
+        "Event write failed"
+      ],
+      "title": "Diagnostic journal write failed",
+      "explanation": "A diagnostic record or acknowledgment could not be persisted. The fallback queue may still hold it.",
+      "recovery": "Check diagnostic storage and space; inspect dropped-event counts for loss.",
+      "context": {
+        "backend": {
+          "type": "enum",
+          "values": [
+            "sd",
+            "littlefs",
+            "ram",
+            "none"
+          ]
+        },
+        "operation": {
+          "type": "enum",
+          "values": [
+            "open",
+            "write",
+            "close",
+            "rename",
+            "ack"
+          ]
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 4009,
+      "symbol": "EVENTS_DROPPED",
+      "severity": "warning",
+      "oled": [
+        "Diagnostics lost"
+      ],
+      "title": "Diagnostic events were dropped",
+      "explanation": "The bounded journal or fallback queue discarded records. Trip files are not deleted to make diagnostic space.",
+      "recovery": "Restore storage or upload the backlog; use the dropped count to identify incomplete history.",
+      "context": {
+        "count": {
+          "type": "integer",
+          "min": 0,
+          "max": 2147483647
+        },
+        "backend": {
+          "type": "enum",
+          "values": [
+            "sd",
+            "littlefs",
+            "ram",
+            "none"
+          ]
+        }
+      },
+      "notify": true,
+      "journal": "per_occurrence"
+    },
+    {
+      "code": 4010,
+      "symbol": "TRIP_RECOVERED",
+      "severity": "info",
+      "oled": [
+        "Trip recovered"
+      ],
+      "title": "Incomplete trip recovered",
+      "explanation": "A partial trip was recovered after interruption.",
+      "recovery": "Review the recovered trip if the interruption may have lost points.",
+      "context": {
+        "backend": {
+          "type": "enum",
+          "values": [
+            "sd",
+            "littlefs",
+            "ram",
+            "none"
+          ]
+        },
+        "points": {
+          "type": "integer",
+          "min": 0,
+          "max": 2147483647
+        }
+      },
+      "notify": false,
+      "journal": "per_occurrence"
+    },
+    {
+      "code": 5001,
+      "symbol": "HOME_AP_ABSENT",
+      "severity": "info",
+      "oled": [
+        "Home WiFi absent"
+      ],
+      "title": "Home access point not seen",
+      "explanation": "The configured home access point was absent from a scan. Each scan increments a boot-local check-in counter; it does not create a journal event.",
+      "recovery": "No action is usually needed away from home; uploads wait until the configured network is available.",
+      "context": {},
+      "notify": false,
+      "journal": "counter"
+    },
+    {
+      "code": 5002,
+      "symbol": "WIFI_JOIN_FAILED",
+      "severity": "warning",
+      "oled": [
+        "WiFi join failed"
+      ],
+      "title": "WiFi association failed",
+      "explanation": "The configured access point was seen but the device could not join it.",
+      "recovery": "Check network availability and credentials privately; credentials and network names are never event context.",
+      "context": {
+        "attempts": {
+          "type": "integer",
+          "min": 0,
+          "max": 255
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 5003,
+      "symbol": "UPLOAD_TRANSPORT_FAILED",
+      "severity": "warning",
+      "oled": [
+        "Upload link failed"
+      ],
+      "title": "Upload transport failed",
+      "explanation": "An upload failed before a usable HTTP response, such as a timeout or connection loss.",
+      "recovery": "Check connectivity and retry later; retain data until an exact acknowledgment arrives.",
+      "context": {
+        "attempts": {
+          "type": "integer",
+          "min": 0,
+          "max": 255
+        },
+        "target": {
+          "type": "enum",
+          "values": [
+            "trip",
+            "events"
+          ]
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 5004,
+      "symbol": "UPLOAD_AUTH_FAILED",
+      "severity": "error",
+      "oled": [
+        "Upload unauthorized"
+      ],
+      "title": "Upload authentication failed",
+      "explanation": "The server rejected upload authentication.",
+      "recovery": "Check the configured bearer token privately and back off retries.",
+      "context": {
+        "http_status": {
+          "type": "integer",
+          "min": 100,
+          "max": 599
+        },
+        "target": {
+          "type": "enum",
+          "values": [
+            "trip",
+            "events"
+          ]
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 5005,
+      "symbol": "UPLOAD_TOO_LARGE",
+      "severity": "error",
+      "oled": [
+        "Upload too large"
+      ],
+      "title": "Upload exceeded server limit",
+      "explanation": "The server rejected the request size. Diagnostic batches can shrink; trip splitting is a separate feature.",
+      "recovery": "Reduce the diagnostic batch or check trip split limits; retain the rejected data.",
+      "context": {
+        "http_status": {
+          "type": "integer",
+          "min": 100,
+          "max": 599
+        },
+        "target": {
+          "type": "enum",
+          "values": [
+            "trip",
+            "events"
+          ]
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 5006,
+      "symbol": "UPLOAD_INVALID",
+      "severity": "error",
+      "oled": [
+        "Upload rejected"
+      ],
+      "title": "Upload payload invalid",
+      "explanation": "The server rejected the upload schema or content.",
+      "recovery": "Isolate the offending record and inspect protocol compatibility without logging raw bodies.",
+      "context": {
+        "http_status": {
+          "type": "integer",
+          "min": 100,
+          "max": 599
+        },
+        "target": {
+          "type": "enum",
+          "values": [
+            "trip",
+            "events"
+          ]
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 5007,
+      "symbol": "UPLOAD_CONFLICT",
+      "severity": "error",
+      "oled": [
+        "Upload ID conflict"
+      ],
+      "title": "Upload identity conflict",
+      "explanation": "The server already has the same record identity with different content.",
+      "recovery": "Isolate the conflicting record and investigate identity or persistence logic; never overwrite silently.",
+      "context": {
+        "http_status": {
+          "type": "integer",
+          "min": 100,
+          "max": 599
+        },
+        "target": {
+          "type": "enum",
+          "values": [
+            "trip",
+            "events"
+          ]
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 5008,
+      "symbol": "UPLOAD_SERVER_FAILED",
+      "severity": "warning",
+      "oled": [
+        "Server unavailable"
+      ],
+      "title": "Upload server failed",
+      "explanation": "The server returned a retryable server error.",
+      "recovery": "Retain queued data and retry with backoff after checking server health.",
+      "context": {
+        "http_status": {
+          "type": "integer",
+          "min": 100,
+          "max": 599
+        },
+        "target": {
+          "type": "enum",
+          "values": [
+            "trip",
+            "events"
+          ]
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 5009,
+      "symbol": "UPLOAD_HTTP_OTHER",
+      "severity": "warning",
+      "oled": [
+        "Unexpected response"
+      ],
+      "title": "Unexpected upload HTTP status",
+      "explanation": "The server returned an HTTP status outside the specifically handled cases.",
+      "recovery": "Inspect the status and server configuration; retain unacknowledged data.",
+      "context": {
+        "http_status": {
+          "type": "integer",
+          "min": 100,
+          "max": 599
+        },
+        "target": {
+          "type": "enum",
+          "values": [
+            "trip",
+            "events"
+          ]
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 5010,
+      "symbol": "EVENT_ACK_INVALID",
+      "severity": "error",
+      "oled": [
+        "Event reply invalid"
+      ],
+      "title": "Diagnostic acknowledgment invalid",
+      "explanation": "The response did not acknowledge exactly the submitted event identities.",
+      "recovery": "Retain the batch and inspect server compatibility; do not advance acknowledgment metadata.",
+      "context": {
+        "reason": {
+          "type": "enum",
+          "values": [
+            "parse",
+            "missing_ids",
+            "unexpected_ids",
+            "duplicate_ids"
+          ]
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 6001,
+      "symbol": "DISPLAY_UNAVAILABLE",
+      "severity": "warning",
+      "oled": [
+        "Display unavailable"
+      ],
+      "title": "OLED display unavailable",
+      "explanation": "The OLED could not be initialized or updated. Logging and networking continue independently.",
+      "recovery": "Check display power, address and wiring; use the server health page meanwhile.",
+      "context": {},
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 7001,
+      "symbol": "DEVICE_SILENT",
+      "severity": "warning",
+      "oled": [
+        "Device silent"
+      ],
+      "title": "Device has not contacted the server",
+      "explanation": "Server receipt time is older than the configured silence threshold. This condition is derived by the monitor, not proof of a device failure.",
+      "recovery": "Check whether the vehicle has been used, network coverage and device power before investigating hardware.",
+      "context": {
+        "age_seconds": {
+          "type": "integer",
+          "min": 0,
+          "max": 9223372036854775807
+        },
+        "threshold_seconds": {
+          "type": "integer",
+          "min": 0,
+          "max": 9223372036854775807
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    }
+  ]
+}

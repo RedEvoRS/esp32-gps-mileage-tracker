@@ -32,6 +32,7 @@ firmware/
   README.md              Full setup guide + pin reference
 
 server/
+  common/diagnostics/    Shared catalog and protocol validators (stdlib only)
   docker-compose.yml     Compose definition (ports 8090 + 8091)
   .env.example           Copy to .env, set INGEST_AUTH_TOKEN and BIND_ADDR
   viewer.env.example     Copy to viewer.env, set the viewer login
@@ -44,6 +45,8 @@ server/
   README.md              Deployment + curl test guide
 
 tools/check_pii.py                  Personal-info scan (CI runs it; see Do Not)
+tools/generate_error_catalog.py     Generates sketch-local diag_catalog.h
+DIAGNOSTICS.md                     Framework reference and issue delivery map
 .github/workflows/audit-tests.yml   CI: PII scan + server tests + firmware host tests
 .github/dependabot.yml              Dependabot: monthly pip, Docker and Actions bumps
 CODE_REVIEW_2026-06-09.md, AUDIT_2026-08-04.md, AUDIT_2026-10-05.md,
