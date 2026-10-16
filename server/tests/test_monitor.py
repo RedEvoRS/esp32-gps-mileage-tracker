@@ -457,6 +457,16 @@ class MonitorTests(unittest.TestCase):
         self.tick()
         self.assertEqual(self.messages, [])
 
+    def test_code_unknown_to_new_catalog_cannot_generate_a_resolution(self):
+        self.snapshot(active=(4003,))
+        self.tick()
+        self.snapshot(active=(), observed=[4003])
+        self.catalog = copy.deepcopy(self.catalog)
+        self.catalog["codes"] = [row for row in self.catalog["codes"] if row["code"] != 4003]
+        self.worker = self.make_monitor()
+        self.tick()
+        self.assertEqual(len(self.messages), 1)
+
     def test_link_free_minimal_message(self):
         self.snapshot(active=(4003,))
         self.tick()

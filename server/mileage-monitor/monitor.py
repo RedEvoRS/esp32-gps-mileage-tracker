@@ -275,7 +275,7 @@ class Monitor:
         for row in db.execute("SELECT device,code,episode,state,eligible_since,alerted_at,"
                               "last_sent_at,resolved_at FROM episodes"):
             device, code, episode, state, since, alerted, last_sent, resolved = row
-            if (state == "clear" and (device, code) in clear_codes
+            if (state == "clear" and code in self.codes and (device, code) in clear_codes
                     and alerted is not None and resolved is None):
                 desired.add((device, code, episode, "resolution"))
             elif state == "active" and self.eligible(code):

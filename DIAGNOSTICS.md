@@ -593,6 +593,8 @@ No context, device clock, location, links or credentials are included. Configure
 booleans and bounded numeric values as described in the deployment settings;
 default silence is exactly seven days with an inclusive threshold. Firmware
 heartbeat integration remains #125, and consistent state backups remain #129.
+Installer test uploads omit `X-Device-Id` so a routine `--check` does not enroll
+an ever-watched synthetic device; their unique `X-Trip-Id` still owns cleanup.
 
 ## Backups and acceptance (#129/#130)
 
