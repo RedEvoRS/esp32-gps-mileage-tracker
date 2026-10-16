@@ -124,11 +124,14 @@ firmware hasn't been road-tested.
   steps only (speed > 2 mph at either end), HDOP > 5 and > 60 m/s jumps
   skipped, GPS gaps bridged by straight line (`summarize()`, tests in
   `server/tests/`)
-- Upload limits: 4 MiB body cap (`INGEST_MAX_UPLOAD_BYTES`); the device's
-  largest possible trip is ~2.4 MB, its whole partition. gunicorn
-  `--timeout 300`, because the timeout includes reading the body and 30 s
-  dropped big trips on slow links. Early 401/413 replies read the body
-  first so the device sees the status, not a reset.
+- Upload limits: 16 MiB body cap (`INGEST_MAX_UPLOAD_BYTES`, ~39 h of
+  nonstop driving). It protects the server's memory: the ingest parses the
+  whole body at once, peaking at ~9x its size. The V1.2's largest possible
+  trip is ~2.4 MB, its whole partition; on the Supreme the firmware has
+  to split trips under the cap (#110). gunicorn `--timeout 300`, because
+  the timeout includes reading the body and 30 s dropped big trips on slow
+  links. Early 401/413 replies read and discard up to 4x the cap first, so
+  the device sees the status, not a reset.
   `server/tests/test_upload_limits.py` ties these to `partitions.csv`
 - Viewer port: 8091, session login (LAN-only), reads `./data` read-only, owns
   `annotations.db` (SQLite) in the `viewer-db` volume
