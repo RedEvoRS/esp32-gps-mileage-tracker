@@ -87,8 +87,9 @@ static constexpr uint32_t SEG_GAP_MS      = 5000;
 static constexpr uint32_t FIX_LOSS_END_MS = 300UL * 1000;   // 5 min
 
 // On battery (VBUS lost) with no trip in progress, deep sleep after this
-// long. Ample time for the post-drive upload (net task ticks every 30 s),
-// and it stops the GPS rail + WiFi scans from draining the 18650 for days.
+// long. Ample time for the post-drive upload (a trip ending clears the
+// retry backoff, so tries come at ~0, 1, 3 and 7 min after parking), and
+// it stops the GPS rail + WiFi scans from draining the 18650 for days.
 // VBUS insert (car back on) wakes us.
 static constexpr uint32_t IDLE_BATT_SLEEP_MS = 10UL * 60 * 1000;
 
@@ -103,6 +104,7 @@ static constexpr uint32_t NET_ABORT_MS = 15UL * 1000;
 
 // How often the networking task wakes to look for pending uploads.
 static constexpr uint32_t NET_TICK_MS     = 30000;
+static constexpr uint32_t NET_RETRY_MAX_MS = 5UL * 60 * 1000;
 // Restore the brief's conservative allocation until measured on hardware.
 // ESP-IDF task stack sizes and high-water marks are in bytes, not words.
 static constexpr uint32_t NET_STACK_BYTES = 12288;
@@ -154,6 +156,12 @@ std::atomic<bool> gClockSet{false};  // a source has synchronized UTC this boot
 std::atomic<bool> gNetBusy{false};   // a network cycle is running
 std::atomic<bool> gNetHold{false};   // don't start a cycle or another file
 std::atomic<bool> gNetAbort{false};  // stop the current upload now
+// Set by core 1 when a trip ends: the car just parked, maybe at home, and
+// on battery it sleeps in IDLE_BATT_SLEEP_MS. Core 0 clears the backoff.
+std::atomic<bool> gNetRetryNow{false};
+// Owned by core 0. Zero wait means the next queued trip can try immediately.
+uint32_t          gNetLastAttemptMs = 0;
+uint32_t          gNetRetryMs = 0;
 // GPS correction cadence belongs only to core 1; SNTP never suppresses it.
 bool              gGpsClockSet = false;
 uint32_t          gLastGpsSyncMs = 0;
@@ -628,6 +636,7 @@ static void endTrip(bool discardIfMicro) {
     gPendCount = gPendHead = 0;
     gTripWriteFailed = false;
     gState = IDLE;
+    gNetRetryNow.store(true);   // after the file is closed and no longer active
 }
 
 // The five-state machine, driven once per fix.
@@ -881,6 +890,13 @@ static bool repairIfNeeded(const char* path) {
     return true;
 }
 
+static String tripEntryPath(const File& entry) {
+    // ESP32 Arduino core 3.x File::name() is a basename; core 2.x returned
+    // the full path. Keep that difference here, shared by every trip walk.
+    const char* name = entry.name();
+    return name[0] == '/' ? String(name) : String(TRIP_DIR) + "/" + name;
+}
+
 static void fsckAllTrips() {
     FS_LOCK();
     std::vector<String> paths;
@@ -888,7 +904,7 @@ static void fsckAllTrips() {
     if (dir && dir.isDirectory()) {
         File e = dir.openNextFile();
         while (e) {
-            String name = String(TRIP_DIR) + "/" + e.name();
+            String name = tripEntryPath(e);
             if (!e.isDirectory() && (name.endsWith(".gpx") || name.endsWith(".gpx.fix"))) {
                 if (name.endsWith(".fix")) name = name.substring(0, name.length() - 4);
                 bool seen = false;
@@ -1077,15 +1093,19 @@ static void reportNetworkStack(const char* phase) {
 
 static bool homeApInRange() {
     int16_t n = WiFi.scanNetworks(false, false, false, 150);
-    if (n <= 0) return false;
+    bool found = false;
     for (int i = 0; i < n; ++i) {
         if (WiFi.SSID(i) != WIFI_SSID) continue;
 #if USE_BSSID_FILTER
         if (memcmp(WiFi.BSSID(i), WIFI_BSSID, 6) != 0) continue;
 #endif
-        return true;
+        found = true;
+        break;
     }
-    return false;
+    // Also release an empty/failed scan, and never keep pointers into its
+    // results (including BSSID) after this call.
+    WiFi.scanDelete();
+    return found;
 }
 
 static bool connectWifi() {
@@ -1194,7 +1214,7 @@ static bool uploadFile(const char* path) {
     // No X-Trip-Id, by design: the server names the trip by its GPX start
     // time. Don't send the local name -- its NVS counter can reset and
     // reuse a name, the server answers a reused id holding different GPX
-    // with 409, and a 409 stays queued, retried every 30 s indefinitely.
+    // with 409, and a 409 stays queued, retried indefinitely.
 
     // Size and time go in the log so a real upload shows the link speed:
     // the server's worker timeout (300 s) bounds how slow it can be.
@@ -1209,7 +1229,7 @@ static bool uploadFile(const char* path) {
     bool ok = (code == 200);
     // 400 (malformed GPX) and 413 (too large) mean the server read this
     // file and rejected it: resending the same bytes can never succeed, and
-    // retrying every 30 s forever burns battery and radio time. Set it
+    // retrying forever burns battery and radio time. Set it
     // aside as .bad -- kept for inspection, ignored by uploads and fsck.
     // Every other failure (401 token mismatch, 404 wrong host/port, 5xx,
     // network errors) is a fixable setup or server problem, not this
@@ -1239,7 +1259,9 @@ static bool uploadFile(const char* path) {
 }
 
 // Collect names of complete, non-active trip files, then upload each.
-static void uploadPending() {
+// Any successful upload resets the network retry delay, even if a later
+// file fails or a sleep request stops the batch.
+static bool uploadPending() {
     String pending[16];
     int    count = 0;
 
@@ -1248,7 +1270,7 @@ static void uploadPending() {
     if (dir && dir.isDirectory()) {
         File e = dir.openNextFile();
         while (e && count < 16) {
-            String name = String(TRIP_DIR) + "/" + e.name();
+            String name = tripEntryPath(e);
             if (name.endsWith(".gpx") &&
                 (gTripPath[0] == 0 || name != String(gTripPath))) {
                 pending[count++] = name;
@@ -1259,11 +1281,13 @@ static void uploadPending() {
     FS_UNLOCK();
 
     // A sleep request (gNetHold) lets the current file finish, then stops.
+    bool uploaded = false;
     for (int i = 0; i < count && !gNetHold.load(); ++i) {
         if (isComplete(pending[i].c_str())) {
-            uploadFile(pending[i].c_str());
+            if (uploadFile(pending[i].c_str())) uploaded = true;
         }
     }
+    return uploaded;
 }
 
 static bool hasPending() {
@@ -1273,7 +1297,7 @@ static bool hasPending() {
     if (dir && dir.isDirectory()) {
         File e = dir.openNextFile();
         while (e) {
-            String name = String(TRIP_DIR) + "/" + e.name();
+            String name = tripEntryPath(e);
             if (name.endsWith(".gpx") &&
                 (gTripPath[0] == 0 || name != String(gTripPath))) {
                 found = true;
@@ -1291,14 +1315,35 @@ static bool hasPending() {
 // handshake note at the globals).
 static void netCycle() {
     gNetBusy.store(true);
-    if (!gNetHold.load() && hasPending()) {
-        if (homeApInRange() && connectWifi()) {
-            trySntp();
-            uploadPending();
+    if (!gNetHold.load()) {
+        // A trip just ended, so the car may be parked at home: try now,
+        // whatever the backoff reached while driving or parked elsewhere.
+        if (gNetRetryNow.exchange(false)) gNetRetryMs = 0;
+        if (!hasPending()) {
+            gNetRetryMs = 0;
+        } else if (gNetRetryMs == 0 || millis() - gNetLastAttemptMs >= gNetRetryMs) {
+            bool uploaded = false;
+            const char* miss = nullptr;
+            if (!homeApInRange()) {
+                miss = "home WiFi not found";
+            } else if (!connectWifi()) {
+                miss = "couldn't join home WiFi";
+            } else {
+                trySntp();
+                uploaded = uploadPending();
+                if (!uploaded) miss = "no trip uploaded";
+            }
+            WiFi.disconnect(true);
+            WiFi.mode(WIFI_OFF);
+            // Back off AP misses, failed joins, and server failures alike.
+            // Seeing the AP alone must not undo a server-failure backoff.
+            gNetRetryMs = uploaded ? NET_TICK_MS :
+                min((gNetRetryMs ? gNetRetryMs : NET_TICK_MS) * 2, NET_RETRY_MAX_MS);
+            gNetLastAttemptMs = millis();  // wait after the attempt finishes
+            if (miss) Serial.printf("Network: %s -- next try in %lu s.\n",
+                                    miss, (unsigned long)(gNetRetryMs / 1000));
+            reportNetworkStack("after network cycle");
         }
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
-        reportNetworkStack("after network cycle");
     }
     gNetBusy.store(false);
 }
@@ -1440,6 +1485,12 @@ void setup() {
     Serial.println("\n=== Stage 4: Trip Logger ===");
 
     gFsMutex = xSemaphoreCreateMutex();
+    if (!gFsMutex) {
+        Serial.println("ERROR: LittleFS mutex allocation failed. Restarting.");
+        delay(1000);
+        ESP.restart();
+        return;
+    }
 
     // --- PMU + GPS power (Stages 2-3) ---
     Wire.begin(I2C_SDA, I2C_SCL);

@@ -317,11 +317,13 @@ discarded as noise has nothing to upload. Then look for the upload result:
   `rename failed, will retry` instead.
 - `HTTP 409` or a `5xx` status: the trip stays queued for retry. Check
   server logs for a conflicting trip identity (409) or a server error.
-- No upload result after a saved trip: WiFi is one possible cause. Check
-  the name and password, and that the network is 2.4 GHz and not hidden;
-  the firmware doesn't print scan/join failures yet. Also check earlier
-  serial messages for storage errors, incomplete files or files set aside
-  as `.bad`, which are not eligible for normal upload.
+- `Network: home WiFi not found` or `Network: couldn't join home WiFi`:
+  check the name and password, and that the network is 2.4 GHz and not
+  hidden. After repeated failures the board waits up to 5 minutes between
+  tries; the message says how long. Press **RST** to try again at once.
+- No upload result and no `Network:` line after a saved trip: check
+  earlier serial messages for storage errors, incomplete files or files
+  set aside as `.bad`, which are not eligible for normal upload.
 
 Once it's in the car, the viewer is the only sign the board is working.
 Look at it every so often after you've driven. If trips stop showing up,

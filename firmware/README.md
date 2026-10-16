@@ -293,9 +293,18 @@ How it behaves once flashed:
   before the clock was ever set (by GPS or NTP) writes the points still
   in its 90-point buffer without times rather than guessing them; earlier
   points may already have been dropped. The viewer lists it without a date.
-- **Upload:** every 30 s, if finished trips are waiting, the board scans
-  for your home WiFi. When it finds it, it POSTs each trip to the ingest
-  server as GPX and deletes it locally once the server accepts it. GPS
+- **Upload:** the board checks for finished trips every 30 s and scans
+  for your home WiFi when a retry is due. Failed scans, connections, or
+  uploads double the retry wait (60 s, 120 s, 240 s, then at most 5 min).
+  The wait starts after the attempt finishes; the next 30 s check runs it
+  once due. A successful upload resets the wait to 30 s, and an empty
+  queue clears it. A trip ending clears it too, since the car may just
+  have parked at home: the board tries within 30 s, then about 1, 3 and
+  7 minutes later, all before it sleeps. Each failed try prints why and
+  when the next one is, e.g.
+  `Network: home WiFi not found -- next try in 60 s.` When connected, it
+  POSTs each trip to the ingest server as GPX and deletes it locally once
+  the server accepts it. GPS
   parsing runs on core 1; networking runs on core 0 and never blocks
   it.
 - **Power loss:** when the car turns off (USB power off for 10 s), the
@@ -331,8 +340,10 @@ token does not match. A negative result means a connection or transfer
 failure, including timeouts after reaching the server. `HTTP 400/413`
 normally sets the file aside as `.bad` without further retries, while
 `409` and `5xx` leave it queued. No upload result can mean WiFi trouble,
-but also an incomplete file or one set aside during repair. The firmware
-does not log WiFi scan/join failures yet. See the
+but also an incomplete file or one set aside during repair. A failed WiFi
+scan or join prints `Network: home WiFi not found` or
+`Network: couldn't join home WiFi`, with the time until the next try
+(up to 5 minutes); press **RST** to try again at once. See the
 [upload troubleshooting steps](../README.md#4-check-it-works) for what to
 check and preserve in each case.
 

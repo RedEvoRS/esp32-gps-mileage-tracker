@@ -1,6 +1,6 @@
 // Host-side stand-ins for the Arduino/ESP32 APIs 04_trip_logger.ino uses.
-// Only the FS is modeled faithfully (stdio buffering, capacity, fault
-// injection); everything else exists just so the sketch compiles.
+// Models FS buffering/faults, network retry inputs, and selected hardware
+// events. The remaining APIs exist just so the sketch compiles.
 #pragma once
 #include <cstdint>
 #include <cstdio>
@@ -142,11 +142,13 @@ struct FakeDisk {
     unsigned directoryRevision = 0;
     int openDirectories = 0;
     int mutationsWithDirectoryOpen = 0;
+    bool fullPathNames = false;  // core 2.x File::name() compatibility
     void mutatedDirectory() {
         directoryRevision++;
         if (openDirectories) mutationsWithDirectoryOpen++;
     }
     bool failMount = false;
+    int mountAttempts = 0;
     void (*onMount)() = nullptr;   // runs at each mount attempt
     bool formatRequested = false;
     bool mounted = true;
@@ -191,6 +193,7 @@ public:
     explicit operator bool() const { return (bool)p; }
     bool isDirectory() const { return p && p->isDir; }
     const char* name() const {
+        if (g_disk.fullPathNames) return p->path.c_str();
         static std::string n; n = p->path.substr(p->path.rfind('/') + 1); return n.c_str();
     }
     File openNextFile() {
@@ -226,6 +229,7 @@ public:
 
 struct LittleFSStub {
     bool begin(bool formatOnFail = false) {
+        g_disk.mountAttempts++;
         if (g_disk.onMount) g_disk.onMount();
         g_disk.formatRequested = formatOnFail;
         if (!g_disk.failMount) return true;
@@ -293,7 +297,8 @@ struct Preferences {
 // ---- FreeRTOS -------------------------------------------------------------
 typedef void* SemaphoreHandle_t;
 #define portMAX_DELAY 0xffffffff
-inline SemaphoreHandle_t xSemaphoreCreateMutex() { return (void*)1; }
+inline bool g_failMutexCreate = false;
+inline SemaphoreHandle_t xSemaphoreCreateMutex() { return g_failMutexCreate ? nullptr : (void*)1; }
 extern int g_lockDepth;
 inline int xSemaphoreTake(SemaphoreHandle_t, uint32_t) {
     if (g_lockDepth != 0) { fprintf(stderr, "FATAL: re-entrant FS_LOCK (would deadlock)\n"); exit(3); }
@@ -301,7 +306,10 @@ inline int xSemaphoreTake(SemaphoreHandle_t, uint32_t) {
 }
 inline int xSemaphoreGive(SemaphoreHandle_t) { g_lockDepth--; return 1; }
 constexpr int pdPASS = 1;
-inline int xTaskCreatePinnedToCore(void (*)(void*), const char*, int, void*, int, void*, int) { return pdPASS; }
+inline int g_taskCreates = 0;
+inline int xTaskCreatePinnedToCore(void (*)(void*), const char*, int, void*, int, void*, int) {
+    g_taskCreates++; return pdPASS;
+}
 inline unsigned g_stackHighWaterBytes = 4096;
 inline unsigned uxTaskGetStackHighWaterMark(void*) { return g_stackHighWaterBytes; }
 inline void vTaskDelay(uint32_t ms) { g_millis += ms; }
@@ -365,14 +373,36 @@ struct HardwareSerial {
 #define WIFI_STA 1
 #define WIFI_OFF 0
 struct WiFiStub {
-    int scanNetworks(bool, bool, bool, int) { return 0; }
-    String SSID(int) { return String(""); }
-    const uint8_t* BSSID(int) { static uint8_t b[6]; return b; }
-    void mode(int) {} void setAutoReconnect(bool) {}
-    void begin(const char*, const char*, int = 0, const uint8_t* = nullptr, bool = false) {}
-    int status() { return 0; } void disconnect(bool) {}
+    std::vector<std::string> scanSsids;
+    int scanError = 0, scans = 0, scanDeletes = 0, joins = 0, disconnects = 0;
+    int connectionStatus = 0, currentMode = WIFI_OFF, readsAfterDelete = 0;
+    uint32_t scanDurationMs = 0;
+    bool scanResultsAvailable = false;
+    int scanNetworks(bool, bool, bool, int) {
+        scans++; g_millis += scanDurationMs; scanResultsAvailable = true;
+        return scanError < 0 ? scanError : (int)scanSsids.size();
+    }
+    void scanDelete() { scanDeletes++; scanResultsAvailable = false; }
+    String SSID(int i) {
+        if (!scanResultsAvailable) readsAfterDelete++;
+        return String(scanSsids.at(i));
+    }
+    const uint8_t* BSSID(int) {
+        if (!scanResultsAvailable) readsAfterDelete++;
+        static uint8_t b[6]; return b;
+    }
+    void mode(int m) { currentMode = m; } void setAutoReconnect(bool) {}
+    void begin(const char*, const char*, int = 0, const uint8_t* = nullptr, bool = false) { joins++; }
+    int status() { return connectionStatus; }
+    void disconnect(bool) { disconnects++; }
 };
 extern WiFiStub WiFi;
+// A real restart never returns. Unwind setup() so a test can inspect what
+// happened before the reset, without continuing into storage or tasks.
+struct Restarted {};
+inline int g_restarts = 0;
+struct ESPStub { void restart() { g_restarts++; throw Restarted{}; } };
+inline ESPStub ESP;
 struct WiFiClient {};
 // HTTP: the response code is set by the test; each request's body is read
 // through the sketch's stream exactly as HTTPClient would, and recorded.
