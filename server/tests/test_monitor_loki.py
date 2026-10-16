@@ -1,0 +1,330 @@
+"""Durable JSON-log push to an external Loki: config, privacy, cursor and HTTP."""
+
+import json
+import sqlite3
+import tempfile
+import threading
+import unittest
+import urllib.error
+from contextlib import closing
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from unittest import mock
+
+from test_monitor import BOOT, monitor, store_module
+from common.diagnostics import load_catalog
+
+loki = monitor.loki
+PUSH_URL = "http://127.0.0.1:3100/loki/api/v1/push"
+HTTP = loki.LokiConfig(enabled=True, url=PUSH_URL, bearer_token="loki-test-token", tenant="test-tenant")
+
+
+class LokiConfigTests(unittest.TestCase):
+    def test_off_by_default_and_valid_auth_modes(self):
+        self.assertFalse(monitor.Config.from_env({}).loki.enabled)
+        self.assertFalse(monitor.Config.from_env({"MONITOR_ENABLED": "true"}).loki.enabled)
+        basic = loki.LokiConfig.from_env({"LOKI_PUSH_URL": PUSH_URL,
+                                          "LOKI_BASIC_AUTH_USER": "service",
+                                          "LOKI_BASIC_AUTH_PASSWORD": "private-password",
+                                          "LOKI_TENANT_ID": "org-a"})
+        self.assertEqual(basic.headers()["Authorization"], "Basic c2VydmljZTpwcml2YXRlLXBhc3N3b3Jk")
+        self.assertEqual(basic.headers()["X-Scope-OrgID"], "org-a")
+        bearer = loki.LokiConfig.from_env({"LOKI_PUSH_URL": "https://logs.example.net/loki/api/v1/push",
+                                           "LOKI_BEARER_TOKEN": "abc123"})
+        self.assertEqual(bearer.headers()["Authorization"], "Bearer abc123")
+        self.assertEqual(monitor.Config.from_env({"MONITOR_ENABLED": "true",
+            "LOKI_PUSH_URL": PUSH_URL}).loki.enabled, True)
+
+    def test_invalid_url_and_ambiguous_or_incomplete_auth_fail_without_echo(self):
+        cases = [
+            {"LOKI_PUSH_URL": "ftp://host/loki/api/v1/push"},
+            {"LOKI_PUSH_URL": "http://user:secret@host/loki/api/v1/push"},
+            {"LOKI_PUSH_URL": "http://host/loki/api/v1/push?secret=value"},
+            {"LOKI_PUSH_URL": "http://host/elsewhere"},
+            {"LOKI_PUSH_URL": PUSH_URL, "LOKI_BASIC_AUTH_USER": "only-user"},
+            {"LOKI_PUSH_URL": PUSH_URL, "LOKI_BEARER_TOKEN": "bearer-secret",
+             "LOKI_BASIC_AUTH_USER": "user", "LOKI_BASIC_AUTH_PASSWORD": "password"},
+            {"LOKI_PUSH_URL": PUSH_URL, "LOKI_TENANT_ID": "bad\r\nheader"},
+            {"LOKI_PUSH_URL": PUSH_URL, "LOKI_BEARER_TOKEN": "<token>"},
+            {"LOKI_BASIC_AUTH_USER": "user", "LOKI_BASIC_AUTH_PASSWORD": "password"},
+        ]
+        for values in cases:
+            with self.subTest(values=values), self.assertRaises(ValueError) as caught:
+                loki.LokiConfig.from_env(values)
+            for value in ("secret", "private-password", "bearer-secret", "bad\r\nheader"):
+                self.assertNotIn(value, str(caught.exception))
+
+    def test_output_requires_monitor_enabled(self):
+        with self.assertRaisesRegex(ValueError, "MONITOR_ENABLED"):
+            monitor.Config.from_env({"LOKI_PUSH_URL": PUSH_URL})
+
+
+class LokiLineTests(unittest.TestCase):
+    def setUp(self):
+        self.catalog = load_catalog()
+        self.codes = {row["code"]: row for row in self.catalog["codes"]}
+
+    def test_event_line_uses_catalog_context_and_fixed_labels(self):
+        received = "2027-01-15T08:00:00.123456+00:00"
+        canonical = json.dumps({"schema_version": 1, "catalog_version": 1,
+                                "transition": "raise", "episode_id": BOOT + ":3",
+                                "firmware_version": "test-1.0", "boot_id": BOOT,
+                                "boot_counter": 1, "sequence": 3, "code": 4005,
+                                "uptime_ms": 10, "time_source": "gps",
+                                "utc_ms": 1800000000000, "sync_age_ms": 1,
+                                "context": {"backend": "sd", "free_bytes": 32,
+                                            "ssid": "<ssid>", "latitude": "<coordinates>",
+                                            "free_text": "<context>"}})
+        row = (7, "tracker-1", BOOT, 3, 4005, received, canonical)
+        result = loki.event_log(self.catalog, row)
+        self.assertIsNotNone(result)
+        (device, severity), stamp, line = result
+        body = json.loads(line)
+        self.assertEqual((device, severity), ("tracker-1", "critical"))
+        self.assertEqual(stamp, loki._iso_timestamp_ns(received))
+        self.assertEqual((body["kind"], body["transition"], body["title"]),
+                         ("event", "raise", self.codes[4005]["title"]))
+        self.assertEqual((body["ctx_backend"], body["ctx_free_bytes"]), ("sd", 32))
+        serialized = json.dumps(body)
+        for forbidden in ("<ssid>", "latitude", "<coordinates>", "<context>", "ssid"):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_damaged_protocol_text_is_skipped(self):
+        event = {"schema_version": 1, "catalog_version": 1, "transition": "notice",
+                 "episode_id": None, "firmware_version": "test-1.0", "boot_id": BOOT,
+                 "boot_counter": 1, "sequence": 3, "code": 1000, "uptime_ms": 1,
+                 "time_source": "<context>", "utc_ms": None, "sync_age_ms": None, "context": {}}
+        row = (7, "tracker-1", BOOT, 3, 1000, "2027-01-15T08:00:00+00:00", json.dumps(event))
+        self.assertIsNone(loki.event_log(self.catalog, row))
+
+    def test_decision_line_is_bounded_to_catalog_and_decision(self):
+        result = loki.decision_log(self.codes, (1, 1800000000.25, "tracker-1", 4003, "resolution"))
+        self.assertIsNotNone(result)
+        labels, stamp, line = result
+        body = json.loads(line)
+        self.assertEqual(labels, ("tracker-1", "critical"))
+        self.assertEqual(stamp, 1800000000250000000)
+        self.assertEqual(body["kind"], "alert_decision")
+        self.assertEqual(body["decision"], "resolution")
+        self.assertIsNone(loki.decision_log(self.codes, (1, 1, "tracker-1", 9999, "alert")))
+
+    def test_each_stream_is_sorted_and_timestamps_advance_past_previous(self):
+        items = [(("tracker-1", "critical"), 300, '{"line":"late"}'),
+                 (("tracker-1", "critical"), 100, '{"line":"early"}'),
+                 (("tracker-1", "critical"), 300, '{"line":"tie"}')]
+        payload, watermark = loki.push_payload(items, {})
+        stream = json.loads(payload)["streams"][0]
+        self.assertEqual([int(value[0]) for value in stream["values"]], [100, 300, 301])
+        self.assertEqual([json.loads(value[1])["line"] for value in stream["values"]],
+                         ["early", "late", "tie"])
+        payload, watermark = loki.push_payload(items[:2], watermark)
+        self.assertEqual([int(value[0]) for value in json.loads(payload)["streams"][0]["values"]],
+                         [302, 303])
+
+
+class LokiPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.now = 1800000000.0
+        self.catalog = load_catalog()
+        self.store = store_module.DiagnosticsStore(self.root / "data", self.catalog)
+        self.state = self.root / "state/monitor.db"
+        self.revision = 0
+        self.sequence = 0
+        self.payloads = []
+        self.ntfy = []
+        self.graylog = []
+        self.worker = self.make_monitor()
+
+    def make_monitor(self, *, notify=False, sender=None, graylog=False, loki_sender=None):
+        graylog_config = monitor.gelf.GelfConfig(enabled=True, url="http://127.0.0.1:12201/gelf") if graylog else monitor.gelf.GelfConfig()
+        config = monitor.Config(enabled=True, notify=notify, hold_seconds=0,
+                                graylog=graylog_config, loki=HTTP)
+        return monitor.Monitor(config, self.store.path, self.state, clock=lambda: self.now,
+                               sender=sender or self.ntfy.append, catalog=self.catalog,
+                               gelf_sender=self.capture_gelf if graylog else None,
+                               loki_sender=loki_sender or self.capture_loki)
+
+    def capture_loki(self, payload):
+        self.payloads.append(json.loads(payload.decode("utf-8")))
+
+    def capture_gelf(self, payloads):
+        self.graylog.extend(json.loads(payload.decode("ascii")) for payload in payloads)
+        return len(payloads)
+
+    def sql(self, sql, parameters=(), *, state=False):
+        with closing(sqlite3.connect(self.state if state else self.store.path)) as db:
+            with db:
+                return db.execute(sql, parameters).fetchall()
+
+    def post(self, *, active=(), observed=None, events=(), boot=BOOT):
+        self.revision += 1
+        checkin = {"boot_id": boot, "status_sequence": self.revision, "uptime_ms": 100,
+                   "active": [{"code": code, "episode_id": boot + ":1"} for code in active]}
+        if observed is not None:
+            checkin["observed"] = observed
+        records = []
+        for code, transition, context in events:
+            self.sequence += 1
+            records.append({"schema_version": 1, "catalog_version": 1, "firmware_version": "test-1.0",
+                            "boot_id": boot, "boot_counter": 1, "sequence": self.sequence, "code": code,
+                            "transition": transition,
+                            "episode_id": None if transition == "notice" else
+                            f"{boot}:{self.sequence if transition == 'raise' else 1}",
+                            "uptime_ms": 10, "utc_ms": None, "time_source": "unknown", "sync_age_ms": None,
+                            "context": context})
+        self.store.accept("tracker-1", {"schema_version": 1, "checkin": checkin, "events": records})
+        stamp = datetime.fromtimestamp(self.now, timezone.utc).isoformat()
+        self.sql("UPDATE devices SET last_contact_at=?,snapshot_received_at=?", (stamp, stamp))
+
+    def tick(self, seconds=0):
+        self.now += seconds
+        before = sum(len(stream["values"]) for payload in self.payloads for stream in payload["streams"])
+        self.assertTrue(self.worker.tick())
+        entries = [(stream["stream"], json.loads(line), int(timestamp))
+                   for payload in self.payloads for stream in payload["streams"]
+                   for timestamp, line in stream["values"]]
+        return entries[before:]
+
+    def test_events_forward_once_with_fixed_labels_and_independent_cursor(self):
+        self.post(events=[(4005, "raise", {"backend": "sd", "free_bytes": 0}),
+                          (1000, "notice", {})])
+        entries = self.tick()
+        self.assertEqual(len(entries), 2)
+        self.assertEqual({entry[0]["job"] for entry in entries}, {"mileage-tracker"})
+        self.assertEqual({frozenset(entry[0]) for entry in entries},
+                         {frozenset(("job", "device_id", "severity"))})
+        self.assertEqual({entry[1]["kind"] for entry in entries}, {"event"})
+        self.assertEqual(self.sql("SELECT event_rowid FROM loki_cursor", state=True), [(2,)])
+        self.assertEqual(self.sql("SELECT event_rowid FROM gelf_cursor", state=True), [(0,)])
+        self.assertEqual(self.tick(60), [])
+        self.worker = self.make_monitor()
+        self.assertEqual(self.tick(60), [])
+
+    def test_successful_alert_and_resolution_are_pushed_as_decisions(self):
+        self.worker = self.make_monitor(notify=True)
+        self.post(active=(4003,), observed=[4003])
+        alert = self.tick()
+        self.assertEqual([entry[1]["decision"] for entry in alert], ["alert"])
+        self.post(active=(), observed=[4003])
+        resolution = self.tick(60)
+        self.assertEqual([entry[1]["decision"] for entry in resolution], ["resolution"])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM loki_decisions", state=True), [(0,)])
+        self.assertEqual(self.sql("SELECT decision_id FROM loki_cursor", state=True), [(2,)])
+
+    def test_restored_events_db_resets_only_loki_cursor_and_resends(self):
+        self.post(events=[(1000, "notice", {})] * 3)
+        self.assertEqual(len(self.tick()), 3)
+        self.sql("UPDATE gelf_cursor SET event_rowid=77", state=True)
+        self.sql("DELETE FROM events WHERE sequence>1")
+        with self.assertLogs("mileage-monitor", "WARNING") as logs:
+            self.assertEqual(self.tick(60), [])
+        self.assertIn("Loki cursor", logs.output[0])
+        self.assertEqual(self.sql("SELECT event_rowid FROM loki_cursor", state=True), [(0,)])
+        self.assertEqual(self.sql("SELECT event_rowid FROM gelf_cursor", state=True), [(77,)])
+        self.assertEqual(len(self.tick(60)), 1)
+
+    def test_existing_monitor_state_adds_loki_tables_to_schema_v1(self):
+        state = self.root / "legacy.db"
+        monitor.Monitor(monitor.Config(enabled=True), self.store.path, state, catalog=self.catalog)
+        with closing(sqlite3.connect(state)) as db, db:
+            for table in ("loki_cursor", "loki_retry", "loki_decisions", "loki_streams"):
+                db.execute("DROP TABLE " + table)
+        monitor.Monitor(monitor.Config(enabled=True, loki=HTTP), self.store.path, state,
+                        catalog=self.catalog, loki_sender=self.capture_loki)
+        with closing(sqlite3.connect(state)) as db:
+            self.assertEqual(db.execute("SELECT event_rowid,decision_id FROM loki_cursor").fetchall(), [(0, 0)])
+            self.assertEqual(db.execute("SELECT attempts,next_attempt FROM loki_retry").fetchall(), [(0, 0.0)])
+
+    def test_loki_failure_does_not_prevent_ntfy_or_gelf_and_retries(self):
+        self.worker = self.make_monitor(notify=True, graylog=True,
+                                       loki_sender=mock.Mock(side_effect=OSError("private endpoint")))
+        self.post(active=(4003,), observed=[4003], events=[(1000, "notice", {})])
+        with self.assertLogs("mileage-monitor", "WARNING") as logs:
+            self.worker.tick()
+        self.assertNotIn("private endpoint", str(logs.output))
+        self.assertEqual(len(self.ntfy), 1)
+        self.assertTrue(self.graylog)
+        self.assertEqual(self.sql("SELECT attempts FROM loki_retry", state=True), [(1,)])
+        self.assertEqual(self.sql("SELECT next_attempt FROM loki_retry", state=True), [(self.now + 60,)])
+        self.assertEqual(self.sql("SELECT event_rowid FROM loki_cursor", state=True), [(0,)])
+
+    def test_bounded_backoff_and_resume_after_restart(self):
+        calls = []
+
+        def fail(payload):
+            calls.append(payload)
+            raise OSError("private endpoint")
+
+        self.worker = self.make_monitor(loki_sender=fail)
+        self.post(events=[(1000, "notice", {})])
+        with self.assertLogs("mileage-monitor", "WARNING"):
+            self.worker.tick()
+        self.tick(59)
+        self.assertEqual(len(calls), 1)
+        self.worker = self.make_monitor()
+        entries = self.tick(1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(self.sql("SELECT attempts,next_attempt FROM loki_retry", state=True), [(0, 0.0)])
+
+    def test_events_db_is_never_written(self):
+        self.post(events=[(1000, "notice", {})])
+        before = (self.store.path.read_bytes(), self.store.path.stat().st_mtime_ns)
+        self.tick()
+        self.assertEqual(before, (self.store.path.read_bytes(), self.store.path.stat().st_mtime_ns))
+
+
+class LokiReceiver(BaseHTTPRequestHandler):
+    status = 204
+    received = []
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        type(self).received.append((dict(self.headers), body, self.path))
+        self.send_response(self.status)
+        if self.status == 302:
+            self.send_header("Location", "http://127.0.0.1:1/elsewhere")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *_):
+        pass
+
+
+class LokiTransportTests(unittest.TestCase):
+    def serve(self, status):
+        handler = type("Handler", (LokiReceiver,), {"status": status, "received": []})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return handler, f"http://127.0.0.1:{server.server_port}/loki/api/v1/push"
+
+    def test_http_posts_loki_payload_with_bearer_and_tenant(self):
+        handler, url = self.serve(204)
+        config = loki.LokiConfig(enabled=True, url=url, bearer_token="token-value", tenant="org-a")
+        loki.transport(config)(b'{"streams":[]}')
+        headers, body, path = handler.received[0]
+        self.assertEqual(path, "/loki/api/v1/push")
+        self.assertEqual(body, b'{"streams":[]}')
+        self.assertEqual(headers["Authorization"], "Bearer token-value")
+        self.assertEqual(next(value for key, value in headers.items()
+                              if key.lower() == "x-scope-orgid"), "org-a")
+        self.assertEqual(headers["Content-Type"], "application/json")
+
+    def test_http_error_and_redirect_are_failures_without_following(self):
+        for status in (500, 302):
+            handler, url = self.serve(status)
+            with self.subTest(status=status), self.assertRaises(urllib.error.HTTPError):
+                loki.transport(loki.LokiConfig(enabled=True, url=url))(b'{"streams":[]}')
+            self.assertEqual(len(handler.received), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

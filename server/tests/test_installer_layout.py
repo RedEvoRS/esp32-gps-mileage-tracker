@@ -19,7 +19,8 @@ class InstallerLayout(unittest.TestCase):
         for required in (".dockerignore", "common/__init__.py",
                          "common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json}",
                          "mileage-ingest/{Dockerfile,app.py,diag_store.py,requirements.txt}",
-                         "mileage-monitor/{Dockerfile,monitor.py,gelf.py}", "monitor.env.example", "ntfy/server.yml"):
+                         "mileage-monitor/{Dockerfile,monitor.py,gelf.py,prometheus.py,loki.py}",
+                         "monitor.env.example", "ntfy/server.yml"):
             self.assertIn(required, preflight)
         main = INSTALL.split("main() {", 1)[1]
         self.assertRegex(main, r"preflight\s+setup_docker\s+configure\s+if.*MODE.*install")
@@ -40,8 +41,9 @@ class InstallerLayout(unittest.TestCase):
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 for missing in (".dockerignore", "common/diagnostics/catalog.json", "mileage-ingest/diag_store.py",
-                                "mileage-monitor/monitor.py", "mileage-monitor/gelf.py", "mileage-monitor/Dockerfile", "monitor.env.example",
-                                "ntfy/server.yml"):
+                                "mileage-monitor/monitor.py", "mileage-monitor/gelf.py",
+                                "mileage-monitor/prometheus.py", "mileage-monitor/loki.py",
+                                "mileage-monitor/Dockerfile", "monitor.env.example", "ntfy/server.yml"):
                     file = tree / missing
                     content = file.read_bytes()
                     file.unlink()

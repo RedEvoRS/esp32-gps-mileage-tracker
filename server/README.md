@@ -84,7 +84,8 @@ by the `mileage-viewer` service, which reads these files independently.
     ├── viewer.env.example     # Template for viewer.env
     ├── viewer.env             # The viewer login (created by you or install.sh, never committed)
     ├── monitor.env.example    # Disabled defaults; template for private monitor.env
-    ├── mileage-monitor/       # monitor.py, gelf.py, prometheus.py + Dockerfile; Python stdlib only
+    ├── mileage-monitor/       # monitor.py, gelf.py, prometheus.py, loki.py + Dockerfile; stdlib only
+    ├── grafana/               # Importable Prometheus/Grafana/Loki starter files; no bundled services
     ├── ntfy/server.yml        # Optional ntfy deny-all config; no credentials
     ├── install.sh             # First-time install with checks; --check later
     ├── sample.gpx             # A short test trip for checking uploads
@@ -164,6 +165,15 @@ the only access protection. A Prometheus server on another host scrapes it over
 the LAN or VPN, then Grafana reads that Prometheus data source. The monitor does
 not install Prometheus or Grafana. Dashboard, scrape and alert examples are in
 `grafana/`; setup is in DEPLOY_DEBIAN.md Step 11e.
+
+If you also run Loki, a nonempty `LOKI_PUSH_URL` can send new diagnostic
+events and successful monitor alert/reminder/resolution decisions. Loki is
+external and is not bundled in Compose. Its HTTP push has an independent
+cursor, retry state and timestamp order per stream; a failed Loki push does
+not stop ntfy or Graylog. JSON lines use only current catalog fields and
+bounded context, with `job`, validated `device_id` and catalog `severity` as
+the only labels. Importable panel and LogQL alert examples are in `grafana/`;
+see DEPLOY_DEBIAN.md Step 11f.
 
 Consistent DB backups/restores, including monitor state, remain #129. The
 existing trip backup does not include either optional named volume. Full

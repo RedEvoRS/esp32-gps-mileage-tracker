@@ -789,7 +789,7 @@ docker compose --profile monitor up -d --build mileage-monitor
 docker compose logs --tail 30 mileage-monitor
 ```
 
-Look for `Monitor enabled; ntfy enabled, Graylog disabled, Prometheus disabled`. Bad enabled settings fail startup
+Look for `Monitor enabled; ntfy enabled, Graylog disabled, Prometheus disabled, Loki disabled`. Bad enabled settings fail startup
 with a message naming the setting. A missing diagnostics DB means no device
 has checked in yet; an unreadable DB logs unavailable and retries next minute.
 The monitor mounts `/data` read-only and persists policy and delivery state in
@@ -808,6 +808,11 @@ Once started, their restart policies also bring them back on reboot.
 | `NOTIFY_REPEAT_HOURS` | `24` | Minimum time after successful delivery before a reminder |
 | `NOTIFY_MAX_PER_HOUR` | `6` | Rolling-hour successful POST cap, including digests and resolutions |
 | `MONITOR_STALE_DAYS` | `7` | No-contact threshold, using server receipt time including identified GPX uploads |
+| `METRICS_ENABLED` | `false` | Start token-protected Prometheus `/metrics` on port 8093 |
+| `METRICS_TOKEN` | unset | Separate 32+ character bearer token, required when metrics are enabled |
+| `LOKI_PUSH_URL` | blank | Enable event and delivered-decision pushes to an external Loki |
+| `LOKI_BASIC_AUTH_*`, `LOKI_BEARER_TOKEN` | blank | Choose basic or bearer auth for Loki, never both |
+| `LOKI_TENANT_ID` | blank | Optional value for Loki's `X-Scope-OrgID` header |
 
 Booleans are `true`/`false`; severity is `info`, `warning`, `error` or `critical`.
 Hold accepts 0–604800 seconds, repeat 1 second–8760 hours, cap an integer
@@ -1001,6 +1006,70 @@ published snapshot and does not query SQLite during scrapes.
 
 To stop exposing metrics, set `METRICS_ENABLED=false` and reapply the monitor
 profile. Keep the separate token private; it is not the ingest token.
+
+### 11f — Optional: push to external Loki
+
+Skip this unless you run Loki elsewhere. Nothing in this Compose project
+installs Loki or Grafana. The monitor container must be able to reach the Loki
+host and port over the server's outbound LAN or VPN route. Use the Loki host's
+LAN address or a reachable DNS name: `localhost` inside the monitor container
+means the container itself. Permit that outbound path in the relevant host and
+network firewalls. Use HTTPS when the path leaves a trusted network; the
+request contains diagnostic facts, not credentials in its JSON body.
+
+Set `LOKI_PUSH_URL` to the full HTTP(S) `/loki/api/v1/push` endpoint in the
+private `monitor.env`. Configure either bearer auth or basic auth, never both.
+Add the tenant ID only if your Loki requires `X-Scope-OrgID`:
+
+```dotenv
+MONITOR_ENABLED=true
+LOKI_PUSH_URL=https://<host>/loki/api/v1/push
+LOKI_BEARER_TOKEN=<token>
+# Or use these two lines instead of LOKI_BEARER_TOKEN:
+# LOKI_BASIC_AUTH_USER=<user>
+# LOKI_BASIC_AUTH_PASSWORD=<password>
+# Optional multi-tenant header:
+# LOKI_TENANT_ID=<tenant>
+```
+
+If Loki has no authentication, leave all three auth settings blank. Do not put
+credentials in the URL or commit them. In `.env`, select the private file with
+`MONITOR_ENV_FILE=./monitor.env`, then recreate the monitor:
+
+```bash
+cd ~/mileage-tracker
+docker compose --profile monitor up -d --build mileage-monitor
+docker compose logs --tail 30 mileage-monitor
+```
+
+The startup line should say `Loki enabled`; once it has new records, the log
+reports how many lines Loki accepted. On first enable, the separate persisted
+cursor starts at rowid zero and the monitor sends stored event history in
+batches of at most 200 per tick. It also pushes each alert, reminder or
+resolution that ntfy successfully accepted while Loki was enabled. If ntfy is
+disabled, no notification decisions are produced, but diagnostic events still
+flow to Loki.
+
+Each line is JSON. Loki stream labels are only `job=mileage-tracker`, validated
+`device_id`, and current-catalog `severity`; context and other fields stay in
+the line. To satisfy Loki's per-stream timestamp ordering, each push sorts its
+lines and stores the last timestamp per label set. If source timestamps tie or
+move backward, Loki's entry timestamp advances by one nanosecond; the original
+server receipt time remains in the JSON. Delivery uses a ten-second timeout,
+does not follow redirects, and retries independently from one minute to one
+hour. An ambiguous response can cause a duplicate, but does not lose a cursor.
+Restoring `events.db` below the Loki rowid resets only the Loki event cursor;
+GELF's cursor and progress are unchanged.
+
+Import [`grafana/loki-panel.json`](server/grafana/loki-panel.json) after adding
+your external Loki data source. [`grafana/loki-alerts.md`](server/grafana/loki-alerts.md)
+contains LogQL examples for new alert and resolution decisions. They alert on
+decision lines in a short time window; use the Prometheus rule from Step 11e
+when you need the monitor's current active condition or no-contact state.
+
+To pause the sink, blank `LOKI_PUSH_URL` and reapply the monitor profile. Its
+cursor and pending decisions stay in `monitor-state`; when re-enabled, it
+resumes from those cursors.
 
 ## Troubleshooting
 

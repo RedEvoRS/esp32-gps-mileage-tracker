@@ -42,7 +42,7 @@ server/
   install.sh             First-time install with checks; --check re-verifies
   mileage-ingest/        Flask ingest (app.py), diagnostics SQLite (diag_store.py), Dockerfile
   mileage-viewer/        Flask trip viewer/export + Device health (app.py, static/)
-  mileage-monitor/       Stdlib monitor.py, gelf.py (Graylog), prometheus.py (metrics); own state volume
+  mileage-monitor/       Stdlib monitor.py, gelf.py, prometheus.py, loki.py; own state volume
   ntfy/server.yml        Optional self-hosted ntfy; deny-all access, ntfy-state volume
   backup/                backup.sh + restore.sh, systemd timer, backup.conf.example
   tests/                 Server tests (unittest) + map-parser check (node)
@@ -111,7 +111,7 @@ firmware hasn't been road-tested.
   - Server: `python -m unittest discover -s server/tests` and
     `node server/tests/test_viewer_map.js`. Needs the service requirements
     installed. Monitor needs no additional dependencies and uses fake time,
-    real SQLite and a local fake ntfy HTTP server in `test_monitor.py`.
+    real SQLite, and local fake HTTP receivers for ntfy, GELF and Loki.
     `test_backup` needs bash and rsync, so it skips on Windows; run it in
     WSL (`wsl -d Ubuntu -- python3 -m unittest server/tests/test_backup.py`).
   - Firmware: `bash firmware/host_test/run.sh` (`test_fs`, and `test_gps`
@@ -192,6 +192,12 @@ firmware hasn't been road-tested.
   The HTTP thread serves the latest published snapshot and never queries SQLite.
   Importable scrape config, Tracker health dashboard and alert examples are in
   `server/grafana/`; setup is DEPLOY_DEBIAN Step 11e.
+- Optional Loki push (#136, `loki.py`): a nonempty `LOKI_PUSH_URL` enables
+  JSON event lines and successful alert/reminder/resolution decisions. Labels
+  stay fixed (`job`, validated `device_id`, catalog severity); the independent
+  cursor resets on a lower restored events.db rowid, timestamps remain ordered
+  per stream, and retries never affect ntfy or GELF. Tables are additive to
+  monitor schema v1. Setup and LogQL examples: DEPLOY_DEBIAN Step 11f.
 - Port binding: `BIND_ADDR` in `.env` sets the host IP published ports bind
   on (unset = all interfaces). UFW does not filter Docker-published ports,
   so the bind address is the LAN-only control (`DEPLOY_DEBIAN.md` Step 7)

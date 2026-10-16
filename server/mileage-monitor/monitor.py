@@ -33,7 +33,10 @@ for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resol
 from common.diagnostics import CatalogError, load_catalog, validate_device_id, validate_request  # noqa: E402
 
 import gelf  # noqa: E402
+import loki  # noqa: E402
 import prometheus  # noqa: E402
+
+loki_export = loki
 
 
 LOG = logging.getLogger("mileage-monitor")
@@ -56,6 +59,7 @@ class Config:
     stale_seconds: float = 7 * 86400
     graylog: gelf.GelfConfig = gelf.GelfConfig()
     metrics: prometheus.MetricsConfig = field(default_factory=prometheus.MetricsConfig)
+    loki: loki_export.LokiConfig = field(default_factory=loki_export.LokiConfig)
 
     @classmethod
     def from_env(cls, env=None):
@@ -68,10 +72,13 @@ class Config:
             return value == "true"
 
         metrics = prometheus.MetricsConfig.from_env(env)
+        loki_config = loki.LokiConfig.from_env(env)
         enabled = boolean("MONITOR_ENABLED")
         if not enabled:
             if metrics.enabled:
                 raise ValueError("METRICS_ENABLED requires MONITOR_ENABLED=true")
+            if loki_config.enabled:
+                raise ValueError("LOKI_PUSH_URL requires MONITOR_ENABLED=true")
             return cls()  # Inactive profile can carry unfilled example settings.
         notify = boolean("NOTIFY_ENABLED")
 
@@ -119,7 +126,7 @@ class Config:
         return cls(enabled=enabled, notify=notify, url=url, token=token,
                    min_severity=severity, hold_seconds=hold, repeat_seconds=repeat,
                    max_per_hour=maximum, stale_seconds=stale,
-                   graylog=gelf.GelfConfig.from_env(env), metrics=metrics)
+                   graylog=gelf.GelfConfig.from_env(env), metrics=metrics, loki=loki_config)
 
 
 def receipt(value):
@@ -236,7 +243,7 @@ CREATE TABLE IF NOT EXISTS snapshot_warnings (
 class Monitor:
     def __init__(self, config, events_path="/data/diagnostics/events.db",
                  state_path="/state/monitor.db", *, clock=time.time, sender=None, catalog=None,
-                 gelf_sender=None):
+                 gelf_sender=None, loki_sender=None):
         self.config = config
         try:
             self.catalog = load_catalog() if catalog is None else catalog
@@ -250,6 +257,8 @@ class Monitor:
         self.sender = NtfySender(config) if sender is None else sender
         self.gelf_sender = (gelf.transport(config.graylog) if gelf_sender is None and config.graylog.enabled
                             else gelf_sender)
+        self.loki_sender = (loki.transport(config.loki) if loki_sender is None and config.loki.enabled
+                            else loki_sender)
         self.metrics_snapshot = (prometheus.MetricsSnapshot(self.codes, config.stale_seconds)
                                  if config.metrics.enabled else None)
         if config.enabled:
@@ -261,14 +270,14 @@ class Monitor:
                 if db.execute("SELECT name FROM sqlite_master WHERE name='schema_version'").fetchone():
                     if db.execute("SELECT singleton,version FROM schema_version").fetchall() != [(1, 1)]:
                         raise ValueError("unsupported monitor state schema version")
-                # GELF tables are additive to schema v1 (CREATE IF NOT EXISTS),
+                # Export tables are additive to schema v1 (CREATE IF NOT EXISTS),
                 # so an existing monitor.db gains them without a migration.
-                for statement in (SCHEMA + gelf.SCHEMA).split(";"):
+                for statement in (SCHEMA + gelf.SCHEMA + loki.SCHEMA).split(";"):
                     if statement.strip():
                         db.execute(statement)
                 db.execute("INSERT OR IGNORE INTO schema_version VALUES (1,1)")
                 db.execute("INSERT OR IGNORE INTO retry VALUES (1,0,0)")
-                for statement in gelf.SEED:
+                for statement in gelf.SEED + loki.SEED:
                     db.execute(statement)
 
     def _connect(self):
@@ -500,6 +509,9 @@ class Monitor:
                         else:
                             db.execute("UPDATE episodes SET alerted_at=COALESCE(alerted_at,?),last_sent_at=? "
                                        "WHERE device=? AND code=? AND episode=?", (now, now, *key))
+                        if self.config.loki.enabled:
+                            db.execute("INSERT INTO loki_decisions(occurred_at,device,code,decision) "
+                                       "VALUES (?,?,?,?)", (now, row[1], row[2], row[4]))
                         db.execute("DELETE FROM work WHERE id=?", (row[0],))
                     db.execute("INSERT INTO deliveries VALUES (?)", (now,))
                     db.execute("DELETE FROM outbox")
@@ -508,7 +520,15 @@ class Monitor:
             try:
                 self._forward_gelf(db, devices, now)
             except Exception as exc:  # Graylog problems must never affect ntfy or trips.
+                if isinstance(exc, sqlite3.Error) and self.metrics_snapshot is not None:
+                    self.metrics_snapshot.record_read_error()
                 LOG.warning("Graylog export unavailable (%s); retry next tick", type(exc).__name__)
+            try:
+                self._forward_loki(db, now)
+            except Exception as exc:  # Loki outages never affect ntfy or Graylog.
+                if isinstance(exc, sqlite3.Error) and self.metrics_snapshot is not None:
+                    self.metrics_snapshot.record_read_error()
+                LOG.warning("Loki export unavailable (%s); retry next tick", type(exc).__name__)
             self._publish_metrics(devices, now, db)
         return True
 
@@ -578,6 +598,76 @@ class Monitor:
             LOG.warning("Graylog delivery failed (%s) after %s message(s); retry in %s seconds",
                         error, delivered, delay)
 
+    def _forward_loki(self, db, now):
+        """Push new event and delivered-alert lines using an independent cursor."""
+        if not self.config.loki.enabled:
+            return
+        attempts, next_attempt = db.execute(
+            "SELECT attempts,next_attempt FROM loki_retry WHERE singleton=1").fetchone()
+        if now < next_attempt:
+            return
+        event_cursor, decision_cursor = db.execute(
+            "SELECT event_rowid,decision_id FROM loki_cursor WHERE singleton=1").fetchone()
+        highest, rows = gelf.read_events(self.events_path, event_cursor, loki.MAX_PER_TICK)
+        if highest < event_cursor:
+            # A restored events.db can be shorter than this sink's cursor.
+            # Start its history over without changing GELF progress.
+            with db:
+                db.execute("UPDATE loki_cursor SET event_rowid=0 WHERE singleton=1")
+            LOG.warning("Diagnostics events restarted below the Loki cursor; resending from the start")
+            return
+
+        selected_events = []
+        push_items = []
+        for row in rows:
+            selected_events.append(row[0])
+            item = loki.event_log(self.catalog, row)
+            if item is None:
+                LOG.warning("Skipping a damaged diagnostics event for Loki")
+            else:
+                push_items.append(item)
+        decisions = db.execute(
+            "SELECT id,occurred_at,device,code,decision FROM loki_decisions "
+            "WHERE id>? ORDER BY id LIMIT ?", (decision_cursor, loki.MAX_PER_TICK)).fetchall()
+        for row in decisions:
+            item = loki.decision_log(self.codes, row)
+            if item is None:
+                LOG.warning("Skipping a damaged monitor decision for Loki")
+            else:
+                push_items.append(item)
+        if not rows and not decisions:
+            return
+
+        updated_timestamps = {}
+        if push_items:
+            previous_timestamps = {(device, severity): timestamp for device, severity, timestamp in
+                                   db.execute("SELECT device,severity,timestamp_ns FROM loki_streams")}
+            payload, updated_timestamps = loki.push_payload(push_items, previous_timestamps)
+            try:
+                self.loki_sender(payload)
+            except Exception as exc:
+                attempts += 1
+                delay = min(3600, 60 * 2 ** min(attempts - 1, 6))
+                with db:
+                    db.execute("UPDATE loki_retry SET attempts=?,next_attempt=? WHERE singleton=1",
+                               (attempts, now + delay))
+                LOG.warning("Loki delivery failed (%s); retry in %s seconds", type(exc).__name__, delay)
+                return
+
+        next_event = max(selected_events, default=event_cursor)
+        next_decision = max((row[0] for row in decisions), default=decision_cursor)
+        with db:
+            db.execute("UPDATE loki_cursor SET event_rowid=?,decision_id=? WHERE singleton=1",
+                       (next_event, next_decision))
+            for (device, severity), timestamp in updated_timestamps.items():
+                db.execute("INSERT INTO loki_streams VALUES (?,?,?) ON CONFLICT(device,severity) "
+                           "DO UPDATE SET timestamp_ns=excluded.timestamp_ns",
+                           (device, severity, timestamp))
+            db.execute("DELETE FROM loki_decisions WHERE id<=?", (next_decision,))
+            db.execute("UPDATE loki_retry SET attempts=0,next_attempt=0 WHERE singleton=1")
+        if push_items:
+            LOG.info("Loki accepted %s log line(s)", len(push_items))
+
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -589,10 +679,11 @@ def main():
     monitor = Monitor(config)
     metrics_server = monitor.start_metrics()
     if config.enabled:
-        LOG.info("Monitor enabled; ntfy %s, Graylog %s, Prometheus %s",
+        LOG.info("Monitor enabled; ntfy %s, Graylog %s, Prometheus %s, Loki %s",
                  "enabled" if config.notify else "disabled",
                  "enabled" if config.graylog.enabled else "disabled",
-                 "enabled" if config.metrics.enabled else "disabled")
+                 "enabled" if config.metrics.enabled else "disabled",
+                 "enabled" if config.loki.enabled else "disabled")
         if config.graylog.enabled and not config.graylog.tls_verify:
             LOG.warning("Graylog TLS certificate verification is off (GRAYLOG_GELF_TLS_VERIFY=false)")
     else:

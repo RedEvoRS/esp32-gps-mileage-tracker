@@ -10,5 +10,7 @@ elsewhere. The Compose project does not install either service.
   source that contains the `mileage-tracker` scrape job.
 - `alert-rules.yml` contains Prometheus alert-rule examples and the same
   PromQL expressions can be used in Grafana-managed rules.
+- Import `loki-panel.json` in Grafana after adding your Loki data source.
+  `loki-alerts.md` has LogQL examples for new alert and resolution decisions.
 
 The metrics names and labels are documented in [DIAGNOSTICS.md](../../DIAGNOSTICS.md).

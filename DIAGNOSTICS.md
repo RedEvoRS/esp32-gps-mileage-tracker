@@ -692,6 +692,42 @@ doubling to an hour, in `gelf_retry`, separate from ntfy's `retry`. The GELF
 tables are additive to monitor schema v1 (`CREATE TABLE IF NOT EXISTS`), so an
 existing `monitor.db` gains them at startup without a migration.
 
+### Loki push (#136)
+
+The monitor can push to an external Loki endpoint; Compose does not install
+Loki. Set `LOKI_PUSH_URL` to its `/loki/api/v1/push` endpoint in `monitor.env`
+to enable the sink. Optional basic auth (`LOKI_BASIC_AUTH_USER` and
+`LOKI_BASIC_AUTH_PASSWORD`) or bearer auth (`LOKI_BEARER_TOKEN`) is supported,
+but not both. `LOKI_TENANT_ID` sets `X-Scope-OrgID`. Credentials are not
+accepted in the URL. Setup and sample LogQL are in
+[DEPLOY_DEBIAN.md Step 11f](DEPLOY_DEBIAN.md#11f--optional-push-to-external-loki).
+
+Each new `events.db` row becomes one JSON log line; each successful ntfy
+alert, reminder or resolution becomes one `alert_decision` line. A decision
+line records only the catalog title/symbol/severity, code, validated device ID
+and decision. Event lines use the current catalog fields and only context
+fields allowed for that event's code; they never carry free text, coordinates,
+SSIDs or credentials. Loki streams have exactly three labels: fixed
+`job=mileage-tracker`, validated `device_id`, and current catalog `severity`.
+All other fields stay in the JSON line to keep label cardinality low.
+
+`loki_cursor` keeps event rowid and delivered-decision progress independently
+from GELF. The outbox, retry state and per-stream timestamp watermark are also
+stored in additive tables in monitor schema v1. Each tick reads up to 200 new
+events and 200 decisions. Lines are sorted by timestamp within each label set;
+if an event timestamp ties or predates one already sent for that stream, its
+Loki entry timestamp is advanced by one nanosecond. The original server receipt
+time remains in the JSON line. This avoids Loki rejecting out-of-order writes.
+
+The monitor uses one HTTP push with a ten-second timeout and never follows
+redirects. Failed pushes back off from 60 seconds to one hour. A successful
+HTTP response advances both Loki cursors; an ambiguous response can be retried
+and duplicated. If `events.db` is restored with a lower rowid than Loki's
+cursor, only the Loki event cursor resets and that history is sent again.
+Loki runs after ntfy and GELF; its failures are caught separately and do not
+change either sink's progress or trip uploads. Decision lines exist only for
+actions that ntfy successfully accepted while Loki was enabled.
+
 ## Backups and acceptance (#129/#130)
 
 Use SQLite's backup API (or a coordinated service pause) to take consistent
