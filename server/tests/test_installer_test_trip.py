@@ -31,6 +31,7 @@ HARNESS = textwrap.dedent("""\
     # The ingest service: optionally writes files, then answers.
     curl() {
         echo upload >> curl.log
+        printf '%s\\n' "$@" > curl.args
         if [[ -n ${FAKE_WRITE:-} ]]; then
             mkdir -p "${FAKE_WRITE%/*}"
             printf '%s' "$FAKE_CONTENT" > "$FAKE_WRITE.gpx"
@@ -204,6 +205,12 @@ class InstallerTestTrip(unittest.TestCase):
         self.assertEqual(len(ids), 2)
         for test_id in ids:
             self.assertRegex(test_id, r"^install-check-[0-9a-f]{12}$")
+
+    def test_synthetic_upload_does_not_enroll_a_monitored_device(self):
+        self.run_check("200", self.accepted())
+        args = (self.work / "curl.args").read_text().splitlines()
+        self.assertIn("X-Trip-Id: " + self.ID, args)
+        self.assertFalse(any(arg.startswith("X-Device-Id:") for arg in args))
 
 
 if __name__ == "__main__":

@@ -13,10 +13,11 @@ AXP2101 PMU) at 915 MHz. 18650 battery. Enclosure 3D-printed and in use.
 Two-component system:
 - **Firmware** (Arduino/C++) — runs on T-Beam, logs trips to LittleFS, uploads
   over home WiFi
-- **Server** (Flask + Gunicorn, Docker, Debian Linux) — two services. Ingest
+- **Server** (Flask + Gunicorn, Docker, Debian Linux) — two default services. Ingest
   accepts authenticated GPX uploads and writes `/data/YYYY-MM/<trip>.gpx`
   plus a derived `<trip>.json` summary; the viewer lists, maps, annotates
-  and exports them
+  and exports them. Optional stdlib monitor and self-hosted ntfy services
+  deliver device fault/silence notifications
 
 ## Project Layout
 
@@ -33,13 +34,16 @@ firmware/
 
 server/
   common/diagnostics/    Shared catalog and protocol validators (stdlib only)
-  docker-compose.yml     Compose definition (ports 8090 + 8091; server/ build contexts)
+  docker-compose.yml     Default ports 8090 + 8091; optional monitor/ntfy profiles (8092)
   .dockerignore          Default-deny runtime allowlist; excludes secrets and data
   .env.example           Copy to .env, set INGEST_AUTH_TOKEN and BIND_ADDR
   viewer.env.example     Copy to viewer.env, set the viewer login
+  monitor.env.example    Disabled defaults; private monitor.env selected via MONITOR_ENV_FILE
   install.sh             First-time install with checks; --check re-verifies
   mileage-ingest/        Flask ingest (app.py), diagnostics SQLite (diag_store.py), Dockerfile
   mileage-viewer/        Flask trip viewer/export + Device health (app.py, static/)
+  mileage-monitor/       Stdlib monitor.py + Dockerfile; own monitor-state volume
+  ntfy/server.yml        Optional self-hosted ntfy; deny-all access, ntfy-state volume
   backup/                backup.sh + restore.sh, systemd timer, backup.conf.example
   tests/                 Server tests (unittest) + map-parser check (node)
   sample.gpx             Test upload for the end-to-end check
@@ -106,8 +110,8 @@ firmware hasn't been road-tested.
     before pushing) and `python -m unittest discover -s tools`.
   - Server: `python -m unittest discover -s server/tests` and
     `node server/tests/test_viewer_map.js`. Needs the service requirements
-    installed. On Windows, `test_viewer_security` reports a tearDown error
-    because SQLite still holds the temp DB; the tests themselves pass.
+    installed. Monitor needs no additional dependencies and uses fake time,
+    real SQLite and a local fake ntfy HTTP server in `test_monitor.py`.
     `test_backup` needs bash and rsync, so it skips on Windows; run it in
     WSL (`wsl -d Ubuntu -- python3 -m unittest server/tests/test_backup.py`).
   - Firmware: `bash firmware/host_test/run.sh` (`test_fs`, and `test_gps`
@@ -153,6 +157,26 @@ firmware hasn't been road-tested.
   code/severity filters. Severity/text come from the current startup catalog,
   never stored severity. Missing DB means no diagnostics yet; read/schema/lock
   errors mean unavailable (503 + warning log). No diagnostics writes or recovery.
+- Optional monitor (#120/#121): `monitor` Compose profile, no port, stdlib only,
+  catalog loaded at startup. `events.db` schema v1 is read with `mode=ro` and
+  a 2 s busy timeout; missing means no work, unreadable logs unavailable and
+  suspends sends until a successful read. Own `/state/monitor.db` schema v1 in
+  `monitor-state` stores episodes, pending work/outbox, successful delivery
+  window and retry state. Every 60 s, all devices are watched, with no watchlist.
+  Freshness is 24 h of accepted snapshot receipt, independent of GPX contact.
+  Catalog severity/notify control faults; 300 s hold (critical bypass), 24 h
+  reminders, six successful posts per rolling hour including bounded digests
+  and resolutions. Unknown/reboot is not recovery; explicit newer clear and
+  recorded alert success are required. Delivery is at least once; persistent
+  global retry doubles from 60 s to 3600 s, HTTP timeout 10 s, no redirects.
+  E7001 uses server last-contact age >= seven days, bypasses fault severity/hold,
+  resolves on newer contact; firmware heartbeat is #125. State backups are #129.
+  Separate `monitor.env` (selected by `MONITOR_ENV_FILE` in `.env`) holds only
+  monitor settings/token, defaults to disabled `monitor.env.example` for normal
+  install/--check. Disabled monitor idles without DB reads. Optional `ntfy`
+  profile uses port 8092 with `BIND_ADDR`, deny-all auth and `ntfy-state` cache/auth
+  volume. Self-hosted only; iOS instant push requires ntfy.sh wake-up relay
+  (no message text), Android does not. Manual enablement: DEPLOY_DEBIAN Step 11.
 - Port binding: `BIND_ADDR` in `.env` sets the host IP both ports publish
   on (unset = all interfaces). UFW does not filter Docker-published ports,
   so the bind address is the LAN-only control (`DEPLOY_DEBIAN.md` Step 7)
@@ -201,7 +225,7 @@ small, never as an item on a checklist issue.
 
 - Put IRS classification logic in firmware — server-side only
 - Power SX1262 LoRa without antenna (RF damage risk)
-- Commit `secrets.h`, `.env`, or `viewer.env` to version control
+- Commit `secrets.h`, `.env`, `viewer.env`, or `monitor.env` to version control
 - Commit anything personal. The repo will go public, and that exposes
   everything from its private period too, so docs, examples, tests,
   commit messages, issues and PRs use placeholders (`<user>`, `<host>`,

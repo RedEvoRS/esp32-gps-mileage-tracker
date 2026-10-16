@@ -418,18 +418,41 @@ class DiagnosticsPackaging(unittest.TestCase):
                     "common/diagnostics/catalog.py", "common/diagnostics/protocol.py",
                     "common/diagnostics/catalog.json"}
         self.assertTrue(expected <= allowed)
-        for secret in (".env", "viewer.env", "data/", "backups/", "tests/", "common/__pycache__/",
+        for secret in (".env", "viewer.env", "monitor.env", "monitor.env.example", "ntfy/server.yml",
+                       "data/", "backups/", "tests/", "common/__pycache__/",
                        "mileage-ingest/.env", "common/diagnostics/private.json"):
             self.assertNotIn(secret, allowed)
         self.assertTrue(all("*" not in item for item in allowed))
-        for service in ("mileage-ingest", "mileage-viewer"):
+        for service in ("mileage-ingest", "mileage-viewer", "mileage-monitor"):
             self.assertIn(f"context: .\n      dockerfile: {service}/Dockerfile", compose)
             dockerfile = (SERVER / service / "Dockerfile").read_text(encoding="utf-8")
             self.assertIn("COPY common/ /app/common/", dockerfile)
             self.assertIn("ENV PYTHONPATH=/app", dockerfile)
-            self.assertIn(f"COPY {service}/requirements.txt", dockerfile)
-            self.assertIn(f"{service}/app.py", dockerfile)
+            if service != "mileage-monitor":
+                self.assertIn(f"COPY {service}/requirements.txt", dockerfile)
+                self.assertIn(f"{service}/app.py", dockerfile)
+            else:
+                self.assertIn("COPY mileage-monitor/monitor.py", dockerfile)
+                self.assertIn("!mileage-monitor/monitor.py", rules)
+                self.assertNotIn("EXPOSE", dockerfile)
         self.assertIn("!mileage-ingest/diag_store.py", rules)
+
+    def test_monitor_and_ntfy_are_optional_and_isolated(self):
+        compose = (SERVER / "docker-compose.yml").read_text(encoding="utf-8")
+        section = compose.split("  mileage-monitor:\n", 1)[1].split("\n  ntfy:", 1)[0]
+        for expected in ('profiles: ["monitor"]', "./data:/data:ro", "monitor-state:/state",
+                         "${MONITOR_ENV_FILE:-./monitor.env.example}"):
+            self.assertIn(expected, section)
+        for forbidden in ("ports:", "INGEST_AUTH_TOKEN", "viewer.env", "VIEWER_", "./.env"):
+            self.assertNotIn(forbidden, section)
+        ntfy = compose.split("  ntfy:\n", 1)[1]
+        for expected in ('profiles: ["ntfy"]', '${BIND_ADDR:-0.0.0.0}:8092:80',
+                         "ntfy-state:/var/lib/ntfy", "./ntfy/server.yml:/etc/ntfy/server.yml:ro"):
+            self.assertIn(expected, ntfy)
+        config = (SERVER / "ntfy/server.yml").read_text(encoding="utf-8")
+        self.assertIn('auth-default-access: "deny-all"', config)
+        self.assertIn('auth-file: "/var/lib/ntfy/auth.db"', config)
+        self.assertIn('cache-file: "/var/lib/ntfy/cache.db"', config)
 
 
 if __name__ == "__main__":

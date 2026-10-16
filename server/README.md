@@ -6,12 +6,15 @@ review, tag and export the trips in a web page. The
 [top-level README](../README.md) explains how the pieces fit together and
 the order to set them up in.
 
-It runs as two Docker containers, both defined in `docker-compose.yml`:
+It runs as two default Docker containers, with two optional services, all
+defined in `docker-compose.yml`:
 
 | Service | Port | What it does |
 |---|---|---|
 | `mileage-ingest` | 8090 | Accepts trip uploads from the board (bearer token) and stores each one as GPX plus a JSON summary |
 | `mileage-viewer` | 8091 | A web page, behind a login, to list trips, check them on a map, tag their purpose, and export CSV/XLSX |
+| `mileage-monitor` | none | Optional `monitor` profile: current-fault and seven-day no-contact alerts |
+| `ntfy` | 8092 | Optional `ntfy` profile: self-hosted phone notifications, authenticated topic access |
 
 **To set it up, run `bash install.sh`** on the server, from this folder
 once it's copied over (normally `~/mileage-tracker`). It does everything
@@ -73,13 +76,16 @@ by the `mileage-viewer` service, which reads these files independently.
 ## Directory Layout
 
     mileage-tracker/           # this folder, copied to the server
-    ├── docker-compose.yml     # Both builds use this server directory as context
+    ├── docker-compose.yml     # All Python builds use this server directory as context
     ├── .dockerignore          # Runtime allowlist; excludes secrets, tests and data
     ├── common/diagnostics/    # Shared validators and catalog.json (required)
     ├── .env.example           # Template for .env
     ├── .env                   # Upload token and BIND_ADDR (created by you or install.sh, never committed)
     ├── viewer.env.example     # Template for viewer.env
     ├── viewer.env             # The viewer login (created by you or install.sh, never committed)
+    ├── monitor.env.example    # Disabled defaults; template for private monitor.env
+    ├── mileage-monitor/       # monitor.py + Dockerfile; Python stdlib only
+    ├── ntfy/server.yml        # Optional ntfy deny-all config; no credentials
     ├── install.sh             # First-time install with checks; --check later
     ├── sample.gpx             # A short test trip for checking uploads
     ├── data/                  # Trip files (create it before the first start, see below)
@@ -99,6 +105,53 @@ by the `mileage-viewer` service, which reads these files independently.
         ├── requirements.txt
         ├── app.py             # The web UI (Flask)
         └── static/            # Leaflet and its GPX plugin, bundled
+
+## Optional diagnostics notifications
+
+Follow [DEPLOY_DEBIAN.md Step 11](../DEPLOY_DEBIAN.md#step-11--optional-device-notifications)
+to enable them manually. No subscriptions or cloud accounts are required.
+The `monitor` and `ntfy` Compose profiles are off by default, keeping ordinary
+installation and `install.sh --check` unchanged. Copy `monitor.env.example` to
+private `monitor.env` (mode 600), select it with `MONITOR_ENV_FILE=./monitor.env`
+in `.env`, and enable monitoring/delivery there. The monitor receives neither
+ingest nor viewer credentials. If explicitly started with disabled settings,
+it logs that it is idling and does no database reads or sends.
+
+The monitor reads every known device from `/data/diagnostics/events.db` using
+SQLite `mode=ro`, schema v1 and a two-second busy timeout. A missing file means
+nothing to monitor; unreadable/schema/lock errors are logged and retried next
+minute, never treated as healthy. It cannot write trip data or annotations.
+Its versioned state DB, `/state/monitor.db` in `monitor-state`, persists
+episodes, delivery intent, digest overflow, reminders, rolling-hour cap and
+retry backoff. Use one replica and preserve the volume to retain deduplication.
+
+Fault notifications require eligible severity from the current catalog and
+a snapshot at most 24 hours old. Hold defaults to 300 seconds (critical skips
+it), reminders to 24 hours, and the cap to six successful posts per rolling
+hour. Overflow becomes bounded digests. Recovery needs an actually sent alert
+and an ordered explicit clear; unknown, reboot or historical events do not
+resolve faults. Delivery is at least once, with exponential retries from one
+minute to one hour; a crash after acceptance can duplicate a message. Bodies
+include code, catalog title/recovery and device label, with no links or context.
+
+E7001, "No contact for N days", defaults to seven days of **server receipt
+time**, including identified GPX uploads. It bypasses the device-fault severity
+filter and hold, shares reminders/cap, and resolves on newer contact. There is
+no watchlist; all devices remain monitored. Firmware heartbeat work is #125.
+
+The bundled ntfy is locked down with `auth-default-access: deny-all`; create a
+local user, grant only the alert topic, and give the monitor its access token.
+Cache/auth DBs live in `ntfy-state`. Set `BIND_ADDR` before publishing port
+8092. LAN-only delivery reaches the phone on home WiFi or a VPN; the owner
+decides about remote access. iOS instant push needs
+`upstream-base-url: https://ntfy.sh` plus the phone-facing base URL, relaying
+only a free wake-up poke, not message text. Android needs no relay.
+[ntfy documents the settings](https://docs.ntfy.sh/config/).
+An existing self-hosted ntfy can be selected with `NTFY_URL` instead.
+
+Consistent DB backups/restores, including monitor state, remain #129. The
+existing trip backup does not include either optional named volume. Full
+policy and schema details are in [DIAGNOSTICS.md](../DIAGNOSTICS.md).
 
 ## First-Time Setup
 

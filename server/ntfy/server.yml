@@ -1,0 +1,13 @@
+# Optional self-hosted ntfy. No anonymous reading or publishing.
+listen-http: ":80"
+auth-file: "/var/lib/ntfy/auth.db"
+cache-file: "/var/lib/ntfy/cache.db"
+cache-duration: "72h"
+auth-default-access: "deny-all"
+enable-login: true
+enable-signup: false
+# iOS instant push needs this free wake-up relay (no message text). Set
+# NTFY_BASE_URL in .env to the same server URL used by the phone before enabling.
+# Android does not need it. See DEPLOY_DEBIAN.md Step 11.
+upstream-base-url: ""
+# upstream-base-url: "https://ntfy.sh"

@@ -18,7 +18,8 @@ class InstallerLayout(unittest.TestCase):
         preflight = INSTALL.split("preflight() {", 1)[1].split("\n}\n", 1)[0]
         for required in (".dockerignore", "common/__init__.py",
                          "common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json}",
-                         "mileage-ingest/{Dockerfile,app.py,diag_store.py,requirements.txt}"):
+                         "mileage-ingest/{Dockerfile,app.py,diag_store.py,requirements.txt}",
+                         "mileage-monitor/{Dockerfile,monitor.py}", "monitor.env.example", "ntfy/server.yml"):
             self.assertIn(required, preflight)
         main = INSTALL.split("main() {", 1)[1]
         self.assertRegex(main, r"preflight\s+setup_docker\s+configure\s+if.*MODE.*install")
@@ -32,13 +33,15 @@ class InstallerLayout(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             tree = Path(root) / "server"
             shutil.copytree(SERVER, tree, ignore=shutil.ignore_patterns(
-                ".env", "viewer.env", "data", "backups", "__pycache__"))
+                ".env", "viewer.env", "monitor.env", "data", "backups", "__pycache__"))
             for mode in ("install", "check"):
                 env = dict(os.environ, MODE=mode, SCRIPT_DIR=str(tree))
                 result = subprocess.run(["bash", "-c", script], cwd=tree, env=env,
                                         capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                for missing in (".dockerignore", "common/diagnostics/catalog.json", "mileage-ingest/diag_store.py"):
+                for missing in (".dockerignore", "common/diagnostics/catalog.json", "mileage-ingest/diag_store.py",
+                                "mileage-monitor/monitor.py", "mileage-monitor/Dockerfile", "monitor.env.example",
+                                "ntfy/server.yml"):
                     file = tree / missing
                     content = file.read_bytes()
                     file.unlink()
