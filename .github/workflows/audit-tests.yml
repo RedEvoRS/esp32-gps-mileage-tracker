@@ -208,10 +208,15 @@ jobs:
           grep -q 'CRLF) line endings in .env' crlf.log
           test "$(grep -c '  FAIL  ' crlf.log)" = 1
           sudo -u "$TEST_USER" sed -i 's/\r$//' "$dir/.env"
-      - name: --check fails on a broken install
+      - name: --check reports a stopped viewer without blaming its config
         run: |
           docker stop mileage-viewer
-          if sudo -u "$TEST_USER" -H bash "$INSTALLER" --check < /dev/null; then
+          if sudo -u "$TEST_USER" -H bash "$INSTALLER" --check < /dev/null > stopped.log 2>&1; then
+            cat stopped.log
             echo "--check passed with the viewer stopped"
             exit 1
           fi
+          cat stopped.log
+          grep -q 'mileage-viewer is stopped (exit code 0)' stopped.log
+          grep -q 'docker compose up -d' stopped.log
+          ! grep -q 'missing or mangled setting in viewer.env' stopped.log

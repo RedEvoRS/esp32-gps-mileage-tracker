@@ -945,8 +945,16 @@ wait_healthy() {
 }
 
 service_failed() {
-    local svc=$1 status=$2 health=$3 error hints=()
+    local svc=$1 status=$2 health=$3 error exit_code hints=()
     error=$("${DOCKER[@]}" inspect -f '{{.State.Error}}' "$svc" 2> /dev/null) || error=
+    exit_code=$("${DOCKER[@]}" inspect -f '{{.State.ExitCode}}' "$svc" 2> /dev/null) || exit_code=
+    # A clean exit says the service stopped, not that its config is bad.
+    # Don't print old logs or configuration hints as the cause of a stop.
+    if [[ $status == exited && $exit_code == 0 && -z $error ]]; then
+        problem "$svc is stopped (exit code 0)" \
+            "Start it with: docker compose up -d, then run this script again."
+        return 0
+    fi
     note "The last lines of its log:"
     compose logs --no-color --tail 25 "$svc" < /dev/null 2>&1 | indent || true
     if [[ -n $error ]]; then note "Docker says: $error"; fi
