@@ -131,6 +131,7 @@ jobs:
         run: |
           sudo -u "$TEST_USER" -H env \
             INSTALL_BIND_ADDR="$LAN_ADDR" \
+            INSTALL_DISPLAY_TZ=America/Chicago \
             INSTALL_VIEWER_USER=tester \
             INSTALL_VIEWER_PASSWORD="$PASSWORD" \
             INSTALL_WAIT_ONLINE=y \
@@ -139,6 +140,7 @@ jobs:
             INSTALL_SAME_DISK=y \
             INSTALL_PING_URL= \
             bash "$INSTALLER" < /dev/null
+          test "$(docker exec mileage-viewer printenv DISPLAY_TZ)" = America/Chicago
           # Backups are private to the backup user (umask 077).
           test -n "$(sudo ls /srv/offhost/snapshots)"
           systemctl is-enabled "mileage-backup@$TEST_USER.timer"

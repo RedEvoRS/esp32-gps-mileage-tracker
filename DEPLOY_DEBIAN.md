@@ -32,8 +32,9 @@ bash ~/mileage-tracker/install.sh
 ```
 
 It works through Steps 1 and 3 to 10 below, checking each one, and asks
-for only three things: the LAN address to publish the ports on, a
-username and password for the viewer, and where backups should go. It
+for only four things: the LAN address to publish the ports on, the
+timezone trips are shown in, a username and password for the viewer, and
+where backups should go. It
 uploads `sample.gpx`, logs in to the viewer, finds the trip in the list,
 on its map and in both exports, then deletes it again. At the end it
 prints the lines for the firmware's `secrets.h` (Step 8).
@@ -206,10 +207,11 @@ Copy that 64-char hex string, then edit `.env`:
 nano .env
 ```
 
-Set:
+Set the token, and the timezone you drive in:
 
 ```
 INGEST_AUTH_TOKEN=<paste the hex string>
+DISPLAY_TZ=America/Chicago
 ```
 
 Lock it down and confirm it's not world-readable:
@@ -222,15 +224,18 @@ chmod 600 .env
 `firmware/04_trip_logger/secrets.h` in Step 8. It is an upload credential,
 not the password used for SSH or for the viewer web page.
 
-**Not in Pacific time?** Trip times are shown and exported in
-`America/Los_Angeles` until you change `DISPLAY_TZ` in `docker-compose.yml`.
-Edit it now, on **both** services, to your zone's name: `America/Chicago`
-or `Europe/London`, say. Never use a fixed offset like `-06:00`; it's an
-hour wrong for half the year wherever clocks change for daylight saving.
-Ingest also uses `DISPLAY_TZ` to pick the month folder a trip is filed
-in, which is why the two have to match. `TZ`, also set on both, only
-changes the times on log lines; change it too if you want those in local
-time.
+**`DISPLAY_TZ` has no default.** It's the timezone every trip time is
+shown and exported in, and ingest uses it to pick the month folder a trip
+is filed in. Use your zone's IANA name, `America/Chicago` or
+`Europe/London`, say; `timedatectl list-timezones` lists them all. Never
+use a fixed offset like `-06:00`; it's an hour wrong for half the year
+wherever clocks change for daylight saving. Leave it blank and both
+services stop at startup with a log line saying so. `install.sh` asks for
+it, offering the server's own zone unless that's UTC. Both services get
+it from `.env` (and their log timestamps follow it too), so they can't
+disagree. If you change it later, run `docker compose up -d`: trips
+already filed stay in their folders, and every time shown switches to the
+new zone.
 
 ---
 

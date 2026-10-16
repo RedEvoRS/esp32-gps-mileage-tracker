@@ -74,10 +74,18 @@ DATA_ROOT = Path(os.environ.get("INGEST_DATA_ROOT", "/data"))
 # which YYYY-MM/ folder a trip is filed under. It has to match the zone
 # the viewer displays in, or a late-December drive lands in next year's
 # folder while showing December on screen. Keep it in step with
-# DISPLAY_TZ in mileage-viewer/app.py.
+# DISPLAY_TZ in mileage-viewer/app.py. Both come from DISPLAY_TZ in .env,
+# which install.sh asks for.
 #
-# Named IANA zone only, never a fixed offset -- Pacific observes DST.
-DISPLAY_TZ_NAME = os.environ.get("DISPLAY_TZ", "America/Los_Angeles")
+# Named IANA zone only, never a fixed offset -- most zones observe DST.
+# There's no default: guessing a zone files trips under the wrong month.
+DISPLAY_TZ_NAME = os.environ.get("DISPLAY_TZ", "").strip()
+if not DISPLAY_TZ_NAME:
+    raise RuntimeError(
+        "DISPLAY_TZ is not set. Set it in .env to your IANA timezone, e.g. "
+        "DISPLAY_TZ=America/Chicago (install.sh asks for it), then run "
+        "docker compose up -d."
+    )
 
 try:
     DISPLAY_TZ = ZoneInfo(DISPLAY_TZ_NAME)

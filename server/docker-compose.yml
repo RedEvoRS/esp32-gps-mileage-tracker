@@ -10,7 +10,8 @@
 # install.sh sets all of this up and checks it. By hand, before first run
 # (README.md in this folder and DEPLOY_DEBIAN.md have the details):
 #   1. Create ./data yourself, owned by UID 1000, or uploads fail with 500
-#   2. Copy .env.example to .env and set INGEST_AUTH_TOKEN to a long random string
+#   2. Copy .env.example to .env, set INGEST_AUTH_TOKEN to a long random
+#      string and DISPLAY_TZ to your timezone (e.g. America/Chicago)
 #   3. Copy viewer.env.example to viewer.env and set the viewer login.
 #      Compose won't build or start anything until viewer.env exists.
 #   4. Run: docker compose up -d --build
@@ -43,12 +44,14 @@ services:
     environment:
       # The auth token is read from the .env file (never commit .env!)
       - INGEST_AUTH_TOKEN=${INGEST_AUTH_TOKEN}
-      # Set your timezone so log timestamps match local time
-      - TZ=America/Los_Angeles
-      # Which local month a trip is filed under (data/YYYY-MM/). Must match
-      # DISPLAY_TZ on the viewer, or the folder and the displayed date
-      # disagree at month boundaries. Timestamps in the files stay UTC.
-      - DISPLAY_TZ=America/Los_Angeles
+      # DISPLAY_TZ comes from .env (install.sh asks for it). Here it picks
+      # which local month a trip is filed under (data/YYYY-MM/); the viewer
+      # gets the same value, so the folder and the displayed date agree at
+      # month boundaries. Timestamps in the files stay UTC. There's no
+      # default: unset, the service stops with a message saying so.
+      - DISPLAY_TZ=${DISPLAY_TZ:-}
+      # Log timestamps in the same zone (UTC if DISPLAY_TZ is unset)
+      - TZ=${DISPLAY_TZ:-UTC}
 
     # Healthcheck lets Docker know when the service is actually ready
     # to accept requests, not just when the container has started.
@@ -91,10 +94,10 @@ services:
 
     environment:
       - VIEWER_DB_PATH=/db/annotations.db
-      - TZ=America/Los_Angeles
-      # Timezone all trip times are displayed and exported in. Must match
-      # DISPLAY_TZ on the ingest service (see the note there).
-      - DISPLAY_TZ=America/Los_Angeles
+      # Timezone all trip times are displayed and exported in, from .env
+      # (see the note on the ingest service).
+      - DISPLAY_TZ=${DISPLAY_TZ:-}
+      - TZ=${DISPLAY_TZ:-UTC}
 
     # Wait for the ingest service so ./data exists, though the viewer
     # tolerates an empty/missing data dir on its own.

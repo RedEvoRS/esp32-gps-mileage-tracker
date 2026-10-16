@@ -324,33 +324,38 @@ the new password.
 
 ## Timezone
 
-Trip times are **stored in UTC** and **displayed and exported in Pacific
-Time** (`America/Los_Angeles`). The raw GPX and the summary JSON both keep
-UTC; only what you read on screen and in the exports is converted.
+Trip times are **stored in UTC** and **displayed and exported in the
+timezone you choose** (`DISPLAY_TZ`). The raw GPX and the summary JSON both
+keep UTC; only what you read on screen and in the exports is converted.
 
 This matters because the export is an IRS mileage record. A 6:00 pm drive
 stored as `01:00Z` would otherwise appear on the *following* day, and a
 New Year's Eve evening trip would land in the wrong tax year entirely.
 
-Both services take a `DISPLAY_TZ` environment variable, set in
-`docker-compose.yml`:
+There is no default zone. `install.sh` asks for one and writes it to
+`.env`:
 
-    - DISPLAY_TZ=America/Los_Angeles
+    DISPLAY_TZ=America/Chicago
 
-Set it on **both** services to the same value. The viewer uses it to
-render times; the ingest service uses it to decide which `data/YYYY-MM/`
-folder a trip is filed under. If they disagree, a trip near a month
-boundary sits in one folder while displaying a date in another.
+`docker-compose.yml` passes that one value to **both** services. The viewer
+uses it to render times; the ingest service uses it to decide which
+`data/YYYY-MM/` folder a trip is filed under. Because both read the same
+line, a trip near a month boundary can't sit in one folder while
+displaying a date in another. `install.sh --check` confirms both running
+containers have the value `.env` holds.
 
 Use a named IANA zone (`America/Denver`, `Europe/London`), never a fixed
-offset like `-08:00` — Pacific observes DST, so a fixed offset is an hour
-wrong from March to November. Both services refuse to start if the zone
-name is unknown or the `tzdata` package is missing, rather than quietly
-falling back to UTC.
+offset like `-08:00`: most zones observe DST, so a fixed offset is an hour
+wrong for half the year. Both services refuse to start if `DISPLAY_TZ` is
+unset, the zone name is unknown, or the `tzdata` package is missing,
+rather than guessing a zone or quietly falling back to UTC.
 
-`TZ` and `DISPLAY_TZ` are different knobs: `TZ` affects container log
-timestamps, `DISPLAY_TZ` affects trip data. They're both set to Pacific
-here, but changing one does not change the other.
+After changing it, run `docker compose up -d` (a plain restart keeps the
+old value). Trips already filed stay in the month folder they were filed
+under; only the displayed and exported times change.
+
+The containers' `TZ`, which only affects log timestamps, follows
+`DISPLAY_TZ` too (UTC if it's unset).
 
 ## Security Notes
 
