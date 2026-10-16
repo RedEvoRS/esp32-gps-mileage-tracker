@@ -638,7 +638,9 @@ sudo systemctl enable --now mileage-backup@$USER.timer
 
 The unit runs `/home/<user>/mileage-tracker/backup/backup.sh` as `<user>`.
 If the server files live somewhere else, edit `ExecStart` in the
-`.service` file first.
+`.service` file first. If you move them later, the timer keeps running the
+old path: edit it again, or rerun `install.sh` from the new place, which
+fixes it (`install.sh --check` reports the mismatch).
 
 Run it once through systemd to prove the unattended path works (the SSH key,
 the paths, the user):
