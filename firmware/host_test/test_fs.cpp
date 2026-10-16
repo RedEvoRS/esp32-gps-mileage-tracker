@@ -41,7 +41,7 @@ static void resetWorld() {
     g_httpCode = 200; g_httpRequests = 0; g_httpLastBody.clear(); g_httpHook = nullptr;
     gChargePaused = false; gChargeApplied = false; gChargeCheckT0 = 0;
     gNetBusy = false; gNetHold = false; gNetAbort = false;
-    gNetLastAttemptMs = 0; gNetRetryMs = 0; WiFi = WiFiStub();
+    gNetLastAttemptMs = 0; gNetRetryMs = 0; gNetRetryNow = false; WiFi = WiFiStub();
     g_failMutexCreate = false; g_taskCreates = 0; g_restarts = 0;
     gIdleSince = g_millis; g_deepSleeps = 0; g_lockDepth = 0;
     g_delayHook = nullptr;
@@ -937,6 +937,9 @@ int main(int argc, char** argv) {
             CHECK(WiFi.scans == before + 1, "no scan before retry is due");
             ++g_millis;
         }
+        CHECK(logHas("Network: home WiFi not found -- next try in 60 s.") &&
+              logHas("Network: home WiFi not found -- next try in 300 s."),
+              "each miss logs why and when the next try is");
         int scans = WiFi.scans;
         gNetHold = true; netCycle();
         CHECK(WiFi.scans == scans && !gNetBusy, "sleep hold suppresses even an overdue retry");
@@ -947,6 +950,7 @@ int main(int argc, char** argv) {
         CHECK(WiFi.joins == 1 && g_millis - joinStart == 17000 && gNetRetryMs == NET_RETRY_MAX_MS,
               "seeing the AP but failing to join keeps the backoff");
         CHECK(gNetLastAttemptMs == g_millis, "join timeout does not consume the next retry wait");
+        CHECK(logHas("Network: couldn't join home WiFi -- next try in 300 s."), "join failure logged");
 
         WiFi.connectionStatus = WL_CONNECTED;
         g_httpCode = 503;
@@ -954,12 +958,15 @@ int main(int argc, char** argv) {
         netCycle();
         CHECK(g_httpRequests == 1 && gNetRetryMs == NET_RETRY_MAX_MS && hasPending(),
               "server failure stays queued and keeps the backoff");
+        CHECK(logHas("Network: no trip uploaded -- next try in 300 s."), "server failure logged");
         g_disk.files["/trips/t999999.gpx"] = complete;
         g_httpHook = [] { g_httpCode = g_httpRequests == 2 ? 200 : 503; };
         g_millis = gNetLastAttemptMs + gNetRetryMs;
+        int misses = logCount("Network: ");
         netCycle();
         CHECK(g_httpRequests == 3 && tripFiles().size() == 1 && gNetRetryMs == NET_TICK_MS,
               "one successful upload resets the wait even if a later file fails");
+        CHECK(logCount("Network: ") == misses, "a cycle that uploaded anything logs no miss");
         g_httpHook = nullptr;
         scans = WiFi.scans;
         g_millis = gNetLastAttemptMs + NET_TICK_MS - 1; netCycle();
@@ -1025,6 +1032,40 @@ int main(int argc, char** argv) {
         setup();
         CHECK(gFsMutex && g_restarts == 0 && g_disk.mountAttempts == 1 && g_taskCreates == 1,
               "successful allocation still mounts storage and starts the network task");
+    }
+
+    printf("T40 a trip ending clears the backoff, so arriving home retries at once (#16)\n");
+    {
+        for (bool atHome : {true, false}) {
+            // The drive to work stays queued all day, and by the drive home
+            // every miss has pushed the wait to the cap.
+            resetWorld();
+            drive(15, 40); endTrip(false);
+            WiFi.scanDurationMs = 2000;
+            netCycle();
+            for (int i = 0; i < 4; ++i) { g_millis = gNetLastAttemptMs + gNetRetryMs; netCycle(); }
+            CHECK(WiFi.scans == 5 && gNetRetryMs == NET_RETRY_MAX_MS, "away from home the wait reaches the cap");
+            drive(15, 40);
+            netCycle();
+            CHECK(gTripPath[0] && WiFi.scans == 5, "starting the next trip doesn't cut the wait short");
+
+            if (atHome) { WiFi.scanSsids = {WIFI_SSID}; WiFi.connectionStatus = WL_CONNECTED; }
+            vbus(false);
+            drive(0, 12);   // parked; USB off confirmed after 10 s
+            CHECK(!gTripPath[0] && tripFiles().size() == 2, "car off finalizes the trip; both trips queued");
+
+            if (atHome) {
+                netCycle();
+                CHECK(WiFi.scans == 6 && g_httpRequests == 2 && tripFiles().empty(),
+                      "first tick after parking uploads both trips despite the 5 min wait");
+            } else {
+                // Tick as the network task does until the idle sleep is due.
+                uint32_t parked = g_millis;
+                while (g_millis - parked < IDLE_BATT_SLEEP_MS) { netCycle(); g_millis += NET_TICK_MS; }
+                CHECK(WiFi.scans == 5 + 4, "four tries (~0, 1, 3, 7 min) before the 10 min idle sleep");
+                CHECK(gNetRetryMs == NET_RETRY_MAX_MS, "misses after parking back off again");
+            }
+        }
     }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);

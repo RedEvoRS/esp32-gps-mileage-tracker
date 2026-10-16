@@ -17,7 +17,8 @@ There are two suites:
   write error, or a full filesystem. The trip state machine is driven
   directly with synthetic fixes. Network-cycle tests simulate AP scans,
   connection failures, and HTTP responses to check retry backoff, recovery,
-  scan cleanup, sleep holds, and clock wraparound. Boot tests inject mutex
+  the reset when a trip ends, scan cleanup, sleep holds, and clock
+  wraparound. Boot tests inject mutex
   allocation failure and check that storage and workers never start.
   Trip-directory walks are checked with both basename and full-path names.
 - **`test_gps`**: the GPS input path, built against the **real** TinyGPSPlus.

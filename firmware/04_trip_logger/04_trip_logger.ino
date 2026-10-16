@@ -87,8 +87,9 @@ static constexpr uint32_t SEG_GAP_MS      = 5000;
 static constexpr uint32_t FIX_LOSS_END_MS = 300UL * 1000;   // 5 min
 
 // On battery (VBUS lost) with no trip in progress, deep sleep after this
-// long. Ample time for the post-drive upload (net task ticks every 30 s),
-// and it stops the GPS rail + WiFi scans from draining the 18650 for days.
+// long. Ample time for the post-drive upload (a trip ending clears the
+// retry backoff, so tries come at ~0, 1, 3 and 7 min after parking), and
+// it stops the GPS rail + WiFi scans from draining the 18650 for days.
 // VBUS insert (car back on) wakes us.
 static constexpr uint32_t IDLE_BATT_SLEEP_MS = 10UL * 60 * 1000;
 
@@ -155,6 +156,9 @@ std::atomic<bool> gClockSet{false};  // a source has synchronized UTC this boot
 std::atomic<bool> gNetBusy{false};   // a network cycle is running
 std::atomic<bool> gNetHold{false};   // don't start a cycle or another file
 std::atomic<bool> gNetAbort{false};  // stop the current upload now
+// Set by core 1 when a trip ends: the car just parked, maybe at home, and
+// on battery it sleeps in IDLE_BATT_SLEEP_MS. Core 0 clears the backoff.
+std::atomic<bool> gNetRetryNow{false};
 // Owned by core 0. Zero wait means the next queued trip can try immediately.
 uint32_t          gNetLastAttemptMs = 0;
 uint32_t          gNetRetryMs = 0;
@@ -632,6 +636,7 @@ static void endTrip(bool discardIfMicro) {
     gPendCount = gPendHead = 0;
     gTripWriteFailed = false;
     gState = IDLE;
+    gNetRetryNow.store(true);   // after the file is closed and no longer active
 }
 
 // The five-state machine, driven once per fix.
@@ -1209,7 +1214,7 @@ static bool uploadFile(const char* path) {
     // No X-Trip-Id, by design: the server names the trip by its GPX start
     // time. Don't send the local name -- its NVS counter can reset and
     // reuse a name, the server answers a reused id holding different GPX
-    // with 409, and a 409 stays queued, retried every 30 s indefinitely.
+    // with 409, and a 409 stays queued, retried indefinitely.
 
     // Size and time go in the log so a real upload shows the link speed:
     // the server's worker timeout (300 s) bounds how slow it can be.
@@ -1311,13 +1316,22 @@ static bool hasPending() {
 static void netCycle() {
     gNetBusy.store(true);
     if (!gNetHold.load()) {
+        // A trip just ended, so the car may be parked at home: try now,
+        // whatever the backoff reached while driving or parked elsewhere.
+        if (gNetRetryNow.exchange(false)) gNetRetryMs = 0;
         if (!hasPending()) {
             gNetRetryMs = 0;
         } else if (gNetRetryMs == 0 || millis() - gNetLastAttemptMs >= gNetRetryMs) {
             bool uploaded = false;
-            if (homeApInRange() && connectWifi()) {
+            const char* miss = nullptr;
+            if (!homeApInRange()) {
+                miss = "home WiFi not found";
+            } else if (!connectWifi()) {
+                miss = "couldn't join home WiFi";
+            } else {
                 trySntp();
                 uploaded = uploadPending();
+                if (!uploaded) miss = "no trip uploaded";
             }
             WiFi.disconnect(true);
             WiFi.mode(WIFI_OFF);
@@ -1326,6 +1340,8 @@ static void netCycle() {
             gNetRetryMs = uploaded ? NET_TICK_MS :
                 min((gNetRetryMs ? gNetRetryMs : NET_TICK_MS) * 2, NET_RETRY_MAX_MS);
             gNetLastAttemptMs = millis();  // wait after the attempt finishes
+            if (miss) Serial.printf("Network: %s -- next try in %lu s.\n",
+                                    miss, (unsigned long)(gNetRetryMs / 1000));
             reportNetworkStack("after network cycle");
         }
     }
