@@ -1211,6 +1211,8 @@ verify_viewer() {
 verify_binding() {
     local pair svc port mapped
     if [[ -z $BIND_ADDR ]]; then return 0; fi
+    # Check these containers' mappings. A response from localhost could
+    # belong to another service bound there, so it can't prove exposure.
     for pair in mileage-ingest:8090 mileage-viewer:8091; do
         svc=${pair%:*}
         port=${pair#*:}
@@ -1222,12 +1224,6 @@ verify_binding() {
                 "Recreate the containers so they pick up BIND_ADDR: docker compose up -d"
         fi
     done
-    if curl -s -m 3 -o /dev/null http://127.0.0.1:8090/health; then
-        problem "Port 8090 still answers on localhost, though BIND_ADDR is $BIND_ADDR" \
-            "Recreate the containers: docker compose up -d"
-    else
-        ok "Nothing answers on localhost:8090, as expected with BIND_ADDR set"
-    fi
 }
 
 # --- Reboots -----------------------------------------------------------

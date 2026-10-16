@@ -455,15 +455,19 @@ The `PORTS` column should read `192.168.1.10:8090->8090/tcp` and
 pick up `BIND_ADDR`; check the spelling and that `.env` is next to
 `docker-compose.yml`.
 
-Confirm it from the server:
+Confirm the mappings and health from the server:
 
 ```bash
+docker compose port mileage-ingest 8090   # expect 192.168.1.10:8090
+docker compose port mileage-viewer 8091   # expect 192.168.1.10:8091
 curl http://192.168.1.10:8090/health    # expect {"service":"mileage-ingest","status":"ok"}
-curl http://localhost:8090/health       # expect "Connection refused"
 ```
 
-`localhost` stops answering once the ports are bound to the LAN address.
-That's expected. Use the LAN IP for any curl tests from here on.
+Both mappings must show only the LAN address; a wildcard (`0.0.0.0` or
+`[::]`) or an extra mapping means the ports aren't restricted to it.
+Another application may listen on `localhost:8090` while the tracker is
+bound only to the LAN address, so a response there doesn't tell you where
+the tracker is published. Use the LAN IP for any curl tests from here on.
 
 ---
 
