@@ -98,9 +98,10 @@ The target hardware:
 - **The GPS antenna**, attached.
 - An enclosure. Mine is 3D printed.
 
-The LoRa radio isn't used by this project. Follow LilyGO's hardware guide
-for antenna requirements, and connect the correct LoRa antenna before
-transmitting.
+The LoRa radio isn't used by this project, but the Supreme may arrive with
+factory firmware that transmits. Attach the correct 915 MHz LoRa antenna
+**before connecting USB or inserting the 18650 battery**, and leave it
+attached while the board is powered.
 
 And around it:
 
