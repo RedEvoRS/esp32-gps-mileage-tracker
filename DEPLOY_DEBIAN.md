@@ -779,8 +779,11 @@ without asking anything else and without sending any test. It recreates the
 monitor only when its code or settings changed, so a re-run after copying new
 server code picks that code up. It starts the bundled ntfy if that's on, and
 it checks everything. Answers come back as defaults, and a secret you already
-set is never wiped: press Enter at its question and it's kept. Turning an
-output off keeps its URL and secrets in `monitor.env`, so turning it back on
+set is never wiped: press Enter at its question and it's kept. For the bundled
+ntfy, the phone username offered is the owner of the token already in
+`monitor.env`, so Enter keeps that user and its token. Typing a different
+username gets that user a new token, since the old one doesn't grant it
+access. Turning an output off keeps its URL and secrets in `monitor.env`, so turning it back on
 needs no re-entry, except Loki's URL and login: those are commented out when
 it's off, and you type them again when it's turned back on.
 
@@ -792,13 +795,17 @@ anonymous reads. Outputs that are off are reported as "off", never as
 problems, so a check with nothing turned on passes.
 
 For an unattended install, every question has an environment variable. Set
-`INSTALL_OUTPUTS` to `none` or a list such as `ntfy,metrics`, and
-`INSTALL_KEEP_OUTPUTS=y` to keep what's on during a re-run (or `n` to change
-it). The rest:
+`INSTALL_OUTPUTS` to `none` or a list such as `ntfy,metrics`. Set
+`INSTALL_KEEP_OUTPUTS` too, to answer the keep question on a re-run: `y` keeps
+what's on, `n` uses the list in `INSTALL_OUTPUTS`. If you preset
+`INSTALL_OUTPUTS` but not `INSTALL_KEEP_OUTPUTS`, the keep question is skipped,
+the preset list is used, and the installer says so. If you preset neither, a
+re-run asks the keep question, so an unattended re-run has to preset one of
+the two. The rest:
 
 - `INSTALL_STALE_DAYS`: days without an upload before a silence alert (default 7)
 - `INSTALL_NOTIFY_MIN_SEVERITY`: lowest severity to send, `info`, `warning`, `error` or `critical` (default `error`)
-- ntfy: `INSTALL_NTFY_MODE` (`bundled` or `existing`), `INSTALL_NTFY_TOPIC`, `INSTALL_NTFY_USER`, `INSTALL_NTFY_PASSWORD` (the phone login), `INSTALL_NTFY_URL` and `INSTALL_NTFY_TOKEN` (existing server), `INSTALL_NTFY_READY` (`y` once the phone is set up, `n` to skip the test) and `INSTALL_NTFY_ARRIVED` (`y` or `n`)
+- ntfy: `INSTALL_NTFY_MODE` (`bundled` or `existing`), `INSTALL_NTFY_TOPIC`, `INSTALL_NTFY_USER` (on a re-run, the owner of the current token by default; otherwise `mileage`), `INSTALL_NTFY_PASSWORD` (the phone login), `INSTALL_NTFY_URL` and `INSTALL_NTFY_TOKEN` (existing server), `INSTALL_NTFY_READY` (`y` once the phone is set up, `n` to skip the test) and `INSTALL_NTFY_ARRIVED` (`y` or `n`)
 - graylog: `INSTALL_GRAYLOG_TARGET` (a GELF HTTP URL, or `host:port` for TCP) and `INSTALL_GRAYLOG_ARRIVED` (`y` or `n`)
 - loki: `INSTALL_LOKI_URL`, `INSTALL_LOKI_AUTH` (`none`, `bearer` or `basic`), `INSTALL_LOKI_BEARER_TOKEN`, `INSTALL_LOKI_BASIC_AUTH_USER`, `INSTALL_LOKI_BASIC_AUTH_PASSWORD` and `INSTALL_LOKI_TENANT_ID`
 
