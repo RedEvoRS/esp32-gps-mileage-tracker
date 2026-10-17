@@ -5,11 +5,12 @@ and business purpose of each trip. Phone apps will keep one, but they depend
 on the phone being in the car with location access, most are subscriptions,
 and the location history ends up on the vendor's servers.
 
-This project moves the logging onto dedicated hardware. A LilyGO T-Beam
-(ESP32 with a u-blox NEO-M8N) runs from a USB port in the car, detects the
-start and end of each trip from GPS speed, and writes the track as GPX to
-on-board flash. Once it sees the home WiFi network, it uploads whatever
-trips it has stored.
+This project is intended to move mileage logging onto a LilyGO **T-Beam
+Supreme with the u-blox MAX-M10S GPS** (choose the MAX-M10S version, not the
+L76K version). Its microSD slot will hold a **SanDisk 32 GB Max Endurance**
+card for trip storage. Once the firmware port is complete, the board will
+detect trips from GPS speed, save tracks as GPX, and upload stored trips over
+home WiFi.
 
 The server side is two small Flask services on the LAN. One accepts the
 uploads and computes trip distance. The other shows each trip on a map,
@@ -19,19 +20,12 @@ OpenStreetMap tiles when the viewer draws a map.
 
 ## Where it's at
 
-Honestly: not finished. The server side works in testing and the firmware
-compiles, but neither has done a real drive yet.
-
-- Firmware stages 1 to 3 (toolchain, power chip, GPS) work on the actual
-  hardware.
-- Stage 4, the real trip logger, compiles but hasn't been road-tested. If
-  you build one, put a meter on the GPS power rail and watch the serial
-  monitor through a full trip and upload before you trust it.
-- The ingest and viewer services pass their test suites locally but aren't
-  deployed anywhere yet.
-
-Next up is deploying the server on a Debian box, running `sample.gpx`
-through it end to end, then flashing the board and taking it for a drive.
+The hardware target has changed from the T-Beam V1.2 to the T-Beam Supreme
+with MAX-M10S GPS and the SanDisk microSD card above. The checked-in firmware
+and its detailed flashing guide still target the retired V1.2 with NEO-M8N
+GPS and LittleFS storage. The Supreme firmware port, including MAX-M10S setup
+and microSD trip storage, has not landed. **Do not flash the current sketches
+to a T-Beam Supreme.** Project progress is tracked in GitHub issues.
 
 ## How it works
 
@@ -41,43 +35,39 @@ The shared catalog and protocol are available; device/server integration follows
 in those issues.
 
 ```
-   ┌──────────────────┐        drive        ┌──────────────────┐
-   │  T-Beam in car   │  ── logs GPX to ──▶ │    LittleFS      │
-   │  (ESP32 + GPS)   │                     │  (on-board flash)│
-   └──────────────────┘                     └────────┬─────────┘
-            │                                        │
-            │  park at home, home WiFi seen          │
-            ▼                                        ▼
-   ┌─────────────────────────────────────────────────────────┐
-   │  POST /upload  (bearer token, GPX body)   :8090 ingest  │
-   │      ├── stores raw  data/YYYY-MM/<id>.gpx              │
-   │      └── derives     data/YYYY-MM/<id>.json  (summary)  │
-   └─────────────────────────────────────────────────────────┘
-                              │  read-only
-                              ▼
-   ┌─────────────────────────────────────────────────────────┐
-   │  Viewer / export UI                        :8091 viewer │
-   │  trip list · Leaflet map audit · annotate · CSV / XLSX  │
-   └─────────────────────────────────────────────────────────┘
+Target device: LilyGO T-Beam Supreme (ESP32-S3 + MAX-M10S GPS)
+       | records GPX to
+       v
+SanDisk 32 GB Max Endurance microSD
+       | uploads over home WiFi
+       v
+POST /upload (GPX) --> mileage-ingest --> GPX + JSON summary
+                                      |
+                                      v
+                         read-only viewer and exports
 ```
 
-The board decides on its own when a trip starts and stops. Going faster than
-5 mph for 10 seconds starts one; staying under 2 mph for 3 minutes ends it,
-which is long enough that a red light doesn't chop one drive into six.
-Anything shorter than 30 seconds or about a tenth of a mile gets thrown away.
+This is the intended Supreme data path. The current firmware does not yet
+implement the logger for this board.
 
-Once the clock is set, each GPS point is written to flash and the file is
-closed right after to limit data loss if power is cut. Points waiting for
-the clock are buffered in memory and can be lost on a reset. On the next
-boot the firmware attempts to repair incomplete files. Hardware power-cut
-testing is still needed; there is no verified one-point loss limit.
+The trip rules below describe the current V1.2 logger; the Supreme port has
+not yet been implemented. The logger decides on its own when a trip starts
+and stops. Going faster than 5 mph for 10 seconds starts one; staying under
+2 mph for 3 minutes ends it, which is long enough that a red light doesn't
+chop one drive into six. Anything shorter than 30 seconds or about a tenth
+of a mile gets thrown away.
 
-The board runs off the car's USB port, with an 18650 battery as backup. When
-you turn the car off and the port goes dead, the board closes out the trip
-and keeps running on the battery for 10 more minutes. If the car is parked
-in range of your home WiFi, that's when it uploads. Then it goes to sleep
-until the car starts again. Trips recorded away from home wait on the board
-until it's next in range.
+The V1.2 firmware writes each GPS point to LittleFS on the board's flash and
+closes the file right after to limit data loss if power is cut. The target
+Supreme firmware is intended to store GPX files on the microSD card; its
+write, recovery, and power-loss behavior still needs to be implemented and
+validated.
+
+The V1.2 firmware runs from the car's USB port, with an 18650 battery as
+backup. When the car's port goes dead, it closes out the trip and keeps
+running on battery for 10 more minutes to upload over home WiFi, then sleeps.
+The Supreme port's power and sleep behavior has not been established; do not
+assume the V1.2 pin, rail, or button instructions apply to it.
 
 The server adds up distance point to point, with a few corrections. Wobble
 while you're parked doesn't count (at least one end of a step must be over
@@ -89,26 +79,29 @@ with the IRS.
 
 ## What you need
 
-The hardware:
+The target hardware:
 
-- **LilyGO TTGO T-Beam V1.2.** ESP32, u-blox NEO-M8N GPS, and an SX1262 LoRa
-  radio at 915 MHz. Make sure it's the V1.2 with the AXP2101 power chip.
-  Most tutorials out there are for older boards with the AXP192, and the
-  code for one doesn't work on the other.
-- **An 18650 cell**, preferably a protected one. Treat it as required: it
-  keeps the board running for the upload after you park. Without it the
-  board shuts off with the car, so it can only upload while the engine is
-  running within range of your WiFi.
-- **A USB port in the car that turns off with the ignition.** That's how
-  the board knows the car is off. See
-  [Put it in the car](#5-put-it-in-the-car).
-- **A micro-USB cable that carries data**, not a charge-only one, or you
-  won't be able to flash it.
+- **LilyGO T-Beam Supreme with MAX-M10S GPS.** Select the MAX-M10S version,
+  not the L76K version. It uses an ESP32-S3 and has an onboard microSD slot.
+  See LilyGO's [T-Beam Supreme hardware guide](https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/docs/en/t_beam_supreme/t_beam_supreme_hw.md).
+- **SanDisk 32 GB Max Endurance microSD card.** This is the selected card
+  for trip storage on the Supreme; card formatting and firmware setup will
+  be documented with the Supreme firmware port.
+- **An 18650 cell** for the onboard holder. The Supreme supports this cell;
+  runtime, charging, and sleep behavior will be documented after the new
+  firmware is validated.
+- **A car USB power connection.** The legacy V1.2 firmware expects power
+  from an ignition-switched port. The Supreme's vehicle-power requirements
+  are part of the pending firmware shakedown.
+- **A USB-C data cable**, not a charge-only one, for the Supreme's USB-C
+  connection.
 - **The GPS antenna**, attached.
 - An enclosure. Mine is 3D printed.
 
-The LoRa radio isn't used, but don't power the board without its LoRa
-antenna attached either. Running the SX1262 without a load can damage it.
+The LoRa radio isn't used by this project, but the Supreme may arrive with
+factory firmware that transmits. Attach the correct 915 MHz LoRa antenna
+**before connecting USB or inserting the 18650 battery**, and leave it
+attached while the board is powered.
 
 And around it:
 
@@ -118,19 +111,18 @@ And around it:
   sets up. For automatic backups, that account currently needs numeric
   user ID **1000**; run `id -u` on the server to check. The installer skips
   backups for other IDs. See [backup setup](DEPLOY_DEBIAN.md#step-10--backups).
-- **Home WiFi on 2.4 GHz that reaches where you park.** The ESP32 has no
-  5 GHz radio. A network that uses one name for both bands is fine.
-  **Hidden networks won't work**: the board only uploads when it sees
-  your network's name in a scan.
-- **A computer with the Arduino IDE** (Windows, macOS or Linux) to flash
-  the board.
+- **Home WiFi on 2.4 GHz** that reaches where you park. The ESP32-S3 does
+  not have 5 GHz WiFi.
+- **A computer for firmware development and flashing.** Supreme board
+  settings and tool instructions will be published with the firmware port;
+  the Arduino IDE steps below are for the V1.2 only.
 
 ## Setting it up
 
-Go in this order: get the code, set up the server, flash the board, check
-that it works, then put it in the car. The server comes first because the
-firmware is built with the server's address and upload token, so you need
-those before you can flash.
+Get the code and set up the server first. The server's address and upload
+token will be needed by the Supreme firmware once its port is available.
+The firmware and vehicle setup steps below are explicitly marked as legacy
+V1.2 instructions; they are not a procedure for the new board.
 
 ### 1. Get the code
 
@@ -150,8 +142,9 @@ server.
 ### 2. Set up the server
 
 Before you start, give the server a fixed address on your network: a DHCP
-reservation in your router, or a static IP. The board is flashed with this
-address, so if it ever changes, uploads stop until you reflash.
+reservation in your router, or a static IP. The Supreme firmware will need
+this address to upload; if it changes, the firmware configuration will need
+to be updated.
 
 **On your computer**, in the repo's top folder, copy `server/` over and
 connect to the server. `<user>` is your Linux login on the server;
@@ -178,10 +171,11 @@ nightly backups to another machine if you let it. If any step fails it
 tells you what to fix, and you just run it again; whatever's already done
 stays done.
 
-At the end it prints the viewer's address and three lines for the
-firmware's `secrets.h`: `SERVER_HOST`, `SERVER_PORT` and `AUTH_TOKEN`. Keep
-them for the next step. The token is also in `~/mileage-tracker/.env` on
-the server, as `INGEST_AUTH_TOKEN`.
+At the end it prints the viewer's address and three settings for the current
+V1.2 firmware's `secrets.h`: `SERVER_HOST`, `SERVER_PORT` and `AUTH_TOKEN`.
+Keep the server address and token for the Supreme port instructions; the
+V1.2-specific file settings may change. The token is also in
+`~/mileage-tracker/.env` on the server, as `INGEST_AUTH_TOKEN`.
 
 `bash ~/mileage-tracker/install.sh --check` reruns the checks later
 without changing the configuration. It uploads and removes a temporary
@@ -193,9 +187,9 @@ There are three separate credentials to keep straight:
 |---|---|
 | Server SSH login | To connect to and administer the Linux server |
 | Viewer username and password | To sign in to the trips web page |
-| Upload token | In the board's `AUTH_TOKEN` and the server's `INGEST_AUTH_TOKEN`; it is not either login password |
+| Upload token | Used by the board firmware and set on the server as `INGEST_AUTH_TOKEN`; it is not either login password |
 
-When the installer finishes and you have saved its firmware settings,
+When the installer finishes and you have saved the server details and token,
 leave the SSH session to return to your computer:
 
 ```bash
@@ -205,7 +199,13 @@ exit
 If you'd rather do it by hand, [DEPLOY_DEBIAN.md](DEPLOY_DEBIAN.md) goes
 through the same steps one at a time.
 
-### 3. Flash the board
+### 3. Legacy V1.2 firmware (do not use with the Supreme)
+
+The remaining flashing, check-it-works, and in-car instructions in this
+section apply only to the retired T-Beam V1.2 with NEO-M8N GPS. They use
+V1.2-specific USB, pin, power, and LittleFS settings. **Do not follow them
+for the T-Beam Supreme.** The Supreme MAX-M10S firmware and microSD setup
+instructions will be added when that port is ready.
 
 **Back on your computer**, connect the T-Beam with the data-capable USB
 cable. A *sketch* is an Arduino program (`.ino`); *uploading* or *flashing*
@@ -271,18 +271,19 @@ gets home and uploads, so any driving after that isn't logged. Keep it in
 mind on a long trip away from home, or if uploads have been failing for a
 while.
 
-**First flash on a new, empty board.** If the Serial Monitor shows
-`ERROR: LittleFS mount failed. Storage preserved; halting.`, nothing gets
-logged. On a new board this usually means the trip storage hasn't been
-set up yet. The firmware never formats it on its own, so
-a glitch can't wipe trips that are waiting to upload. Set it up once by
-following [First flash on a new board](firmware/README.md#first-flash-on-a-new-board)
-in the firmware README: one temporary edit and two flashes. A normal
-reflash with the same partition layout and erasing disabled preserves it.
-**If the board has already recorded trips, do not format it:** follow
-[storage recovery](firmware/README.md#if-the-trip-storage-wont-mount-later).
+**First flash on a new, empty V1.2 board.** With the bundled partition
+layout and erase-all disabled, Stage 4 checks every byte of the trip
+partition and formats it only if the whole partition is erased. No sketch
+edit or second flash is needed. A board sold as new may still contain
+factory test data. If the Serial Monitor shows
+`ERROR: LittleFS mount failed. Storage preserved; halting.`, the firmware
+has left storage untouched; follow [storage recovery](firmware/README.md#if-the-trip-storage-wont-mount-later)
+instead of trying to format it. See [First flash on a new board](firmware/README.md#first-flash-on-a-new-board)
+for the startup messages and recovery details. A normal reflash with the
+same partition layout and erase-all disabled preserves existing trips.
+**If the board has already recorded trips, do not format it.**
 
-### 4. Check it works
+### 4. Check it works (legacy V1.2 only)
 
 The board has no screen and the firmware doesn't use any status light, so
 open **Tools → Serial Monitor** in Arduino IDE and set its baud rate
@@ -338,7 +339,7 @@ Look at it every so often after you've driven. If trips stop showing up,
 check whether any of the `secrets.h` settings have changed, then plug in a
 laptop and watch the Serial Monitor.
 
-### 5. Put it in the car
+### 5. Put it in the car (legacy V1.2 only)
 
 - **Power.** Use a USB port that turns off with the ignition. To check,
   plug in a phone, turn the car off, and see whether it stops charging. A
@@ -381,6 +382,11 @@ Trips are stored as GPX, so you can open the raw files in GPXSee,
 gpx.studio, Google Earth, QGIS, or pretty much any other map tool. Next to
 each one the server writes a small JSON summary so the viewer doesn't have
 to re-read every track to list them. Trimmed down, one looks like this:
+
+On the target Supreme, the firmware port is intended to keep the GPX files
+on the SanDisk 32 GB Max Endurance microSD card. The current V1.2 firmware
+uses LittleFS on internal flash instead; that legacy storage layout and its
+capacity limits do not describe the Supreme target.
 
 ```json
 {

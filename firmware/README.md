@@ -1,15 +1,26 @@
-# T-Beam GPS Mileage Tracker — Firmware
+# Firmware — Legacy T-Beam V1.2 Reference
+
+> **Current hardware target:** LilyGO T-Beam Supreme with the u-blox
+> **MAX-M10S GPS** version (not L76K), plus a **SanDisk 32 GB Max Endurance
+> microSD card** for trip storage. See LilyGO's [T-Beam Supreme hardware
+> guide](https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/docs/en/t_beam_supreme/t_beam_supreme_hw.md).
+>
+> **The Supreme firmware port has not landed.** The sketches and procedures
+> in this README are for the retired T-Beam V1.2 with NEO-M8N GPS and
+> LittleFS. Do not use them on a T-Beam Supreme. MAX-M10S setup, SD-card
+> formatting, and Supreme flashing instructions will be documented with the
+> port.
 
 This directory contains the firmware for the LilyGO TTGO T-Beam V1.2
 with NEO-M8N GPS module. The firmware is organized into progressive
 stages that let you verify each hardware subsystem before building
 the full mileage tracker.
 
-This is the board half of the project. The [top-level README](../README.md)
-gives the whole setup in order (server first, then the board, then the
-car); this file has the firmware details it points to.
+This is the legacy V1.2 firmware reference. The [top-level README](../README.md)
+describes the Supreme MAX-M10S target and server setup; it marks the steps
+below as V1.2-only because the Supreme port is still pending.
 
-## Hardware
+## Legacy V1.2 Hardware
 
 - **Board:** LilyGO TTGO T-Beam V1.2 (ESP32 + SX1262 LoRa + NEO-M8N GPS)
 - **PMU:** AXP2101 (NOT AXP192 — older code examples need updating)
@@ -197,7 +208,8 @@ Before flashing:
    `firmware/secrets.h.example` to `firmware/04_trip_logger/secrets.h`,
    next to the `.ino` (the build won't find it anywhere else), and fill
    it in. The top-level README has a table of
-   the settings under [Flash the board](../README.md#3-flash-the-board).
+   the settings in the
+   [legacy V1.2 flashing section](../README.md#3-legacy-v12-firmware-do-not-use-with-the-supreme).
    The ones that catch people out:
    - The WiFi has to be 2.4 GHz (the ESP32 has no 5 GHz radio), and
      **hidden networks won't work**: the board only uploads when it sees
@@ -381,8 +393,8 @@ a scan miss. Join status `4` (`WL_CONNECT_FAILED`) can indicate a wrong
 password; `1` is `WL_NO_SSID_AVAIL` and `6` is `WL_DISCONNECTED`. These are
 connection states, not a definitive diagnosis. Press **RST** to try again
 at once. See the
-[upload troubleshooting steps](../README.md#4-check-it-works) for what to
-check and preserve in each case.
+[legacy V1.2 troubleshooting steps](../README.md#4-check-it-works-legacy-v12-only)
+for what to check and preserve in each case.
 
 Boot repair also examines `.gpx.fix` files left by interrupted repairs.
 It reclaims a temporary copy only when its bytes match the original or its

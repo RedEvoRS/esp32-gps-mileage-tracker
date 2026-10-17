@@ -1,10 +1,14 @@
 # Mileage Tracker Server
 
-This folder is the server half of the GPS mileage tracker. The board in
-the car uploads each finished trip here over your home WiFi, and you
-review, tag and export the trips in a web page. The
-[top-level README](../README.md) explains how the pieces fit together and
-the order to set them up in.
+This folder is the server half of the GPS mileage tracker. Once the target
+board firmware is ready, it will upload each finished trip here over your
+home WiFi, and you can review, tag and export the trips in a web page. The
+[top-level README](../README.md) explains the current hardware target and
+which parts of the project can be set up now.
+
+The current hardware target is the LilyGO T-Beam Supreme with MAX-M10S
+GPS. Its firmware port is pending, but the server accepts GPX uploads
+independently of the board model, so the server can be set up ahead of it.
 
 It runs as two default Docker containers, with two optional services, all
 defined in `docker-compose.yml`:
@@ -30,7 +34,7 @@ currently require the server login's numeric user ID to be **1000**
 
 ## What the Ingest Service Does
 
-When your T-Beam completes a trip and detects it's on your home WiFi,
+When the tracker board completes a trip and detects it's on your home WiFi,
 it POSTs the trip as a **GPX** file to this service. The service verifies
 an auth token, parses the GPX, and writes two files using atomic writes
 so they can never be left partially written:
@@ -210,7 +214,7 @@ Step 1).
        openssl rand -hex 32
 
    Copy the output and set `INGEST_AUTH_TOKEN` in `.env` to that value.
-   You'll use the same token in the T-Beam firmware later. This token is
+   You'll use the same token in the tracker firmware later. This token is
    separate from your SSH login and the viewer's username/password.
 
 4. Create `viewer.env` and set the viewer login, as described under

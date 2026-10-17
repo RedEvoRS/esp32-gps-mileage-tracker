@@ -10,8 +10,10 @@ Deploys both services from `server/`:
 | `mileage-monitor` | 8093 | Bearer token when enabled | Optional Prometheus `/metrics` endpoint in the `monitor` profile |
 
 This is the server half of the project. The top-level `README.md` gives
-the whole setup in order (server, then the board, then the car); come
-back to it after Step 8.
+the server setup and the current board target. The target is now a T-Beam
+Supreme with MAX-M10S GPS and a SanDisk 32 GB Max Endurance microSD card,
+but the firmware port is pending. Step 8 below is retained for the retired
+V1.2 only; do not flash those instructions to a Supreme.
 
 Assumes: Debian 12/13, a non-root user with sudo, SSH reachable.
 Placeholders: `<user>` = your Debian login, `<host>` = server IP or hostname.
@@ -486,7 +488,12 @@ the tracker is published. Use the LAN IP for any curl tests from here on.
 
 ---
 
-## Step 8 — Point the firmware at it
+## Step 8 — Point the legacy V1.2 firmware at it (reference only)
+
+> The board target is the T-Beam Supreme with MAX-M10S GPS and microSD
+> storage, but its firmware port is not available yet. The `secrets.h`,
+> flashing, and storage instructions in this step apply only to the retired
+> T-Beam V1.2. Do not use them for the Supreme.
 
 **On your computer**, create the firmware's settings file from the
 example. If you are still in the server's SSH session, type `exit` first:
@@ -511,8 +518,9 @@ to paste. The WiFi has to be 2.4 GHz, and hidden networks won't work.
 
 `secrets.h` is gitignored. Keep it that way.
 
-Then flash `firmware/04_trip_logger`, check it works and put it in the car.
-The top-level README covers all three under "Setting it up", steps 3 to 5:
+For a retired V1.2 board only, flash `firmware/04_trip_logger`, check it
+works and put it in the car. The top-level README covers those legacy steps
+under "Setting it up", steps 3 to 5:
 the Arduino IDE setup (ESP32 core 3.3.11, XPowersLib 0.3.3, TinyGPSPlus
 1.0.3), the rest of the WiFi requirements, and the **one-time storage setup
 a new, empty board may need on its first flash**. For a board that has
@@ -1219,7 +1227,9 @@ was flashed: the server's IP (check the DHCP reservation), the token in
 in, so update `secrets.h` and reflash (Step 8). The top-level README's
 "Check it works" section says how to read the board's Serial Monitor
 output. Trips recorded meanwhile wait on the board, but once its storage
-fills (about 5 to 6 hours of driving) it stops recording.
+fills (about 5 to 6 hours of driving on the legacy V1.2 LittleFS partition)
+it stops recording. That estimate does not describe the Supreme microSD
+target.
 
 **Compose says `INGEST_AUTH_TOKEN` is unset** — `.env` must sit next to
 `docker-compose.yml` in `~/mileage-tracker/`, not inside `mileage-ingest/`.
