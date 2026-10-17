@@ -26,6 +26,11 @@ METRICS_TOKEN = "m" * 32 + "0123456789abcdef"
 NTFY_TOKEN = "tk_fakeTOKEN12345"
 PHONE_PASSWORD = "correct-horse-1"
 LOKI_BEARER = "bearer-token-value-1234"
+# `ntfy token list` with no username (cmd/token.go, v2.31.0): a "user <name>"
+# line, then one "- tk_..." line per token.
+MILEAGE_TOKEN_LIST = ("user mileage (role: user, tier: none)\n"
+                      "- tk_fakeTOKEN12345, never expires, accessed from 127.0.0.1 at 16 Oct 26 16:00 UTC")
+BOB_TOKEN_LIST = MILEAGE_TOKEN_LIST.replace("user mileage", "user bob")
 
 HARNESS = textwrap.dedent("""\
     source <(sed '$d' "$INSTALL")
@@ -65,6 +70,7 @@ HARNESS = textwrap.dedent("""\
                 return 0 ;;
             *"exec -T ntfy sh -c"*) cat > "$WORK/stdin.log"; return 0 ;;
             *"exec -T ntfy ntfy user list"*) printf '%s\\n' "${FAKE_USERS-}"; return 0 ;;
+            *"exec -T ntfy ntfy token list"*) printf '%s\\n' "${FAKE_TOKEN_LIST-}"; return 0 ;;
             *"exec -T ntfy ntfy token add"*)
                 printf 'Created token %s for user\\n' "$FAKE_NTFY_TOKEN"; return 0 ;;
             *"exec -T ntfy ntfy access"*) return 0 ;;
@@ -171,7 +177,7 @@ class InstallerOutputs(unittest.TestCase):
         env.update({"INSTALL": str(INSTALL), "WORK": str(self.work), "FAKE_MODE": mode,
                     "FAKE_RUNNING": "mileage-monitor ntfy", "FAKE_NTFY_TOKEN": NTFY_TOKEN,
                     "INSTALL_STALE_DAYS": "7", "INSTALL_NOTIFY_MIN_SEVERITY": "error",
-                    "INSTALL_LOKI_TENANT_ID": ""})
+                    "INSTALL_LOKI_TENANT_ID": "", "FAKE_TOKEN_LIST": MILEAGE_TOKEN_LIST})
         env.update(fakes)
         for key in drop:
             env.pop(key, None)
@@ -640,6 +646,127 @@ class InstallerOutputs(unittest.TestCase):
             "MONITOR_ENABLED=[true]", "NOTIFY_ENABLED=[true]", "NTFY_URL=[http://ntfy:80/x]",
             "NTFY_TOKEN=[plain]", "A=[it's]", 'B=["quoted"]', "C=[\"mismatched']",
             "D=[]", "E=[]", "F=[]", "ntfy-on"])
+
+
+    def bundled_setup(self, user, token_list=BOB_TOKEN_LIST):
+        result = self.run_step(INSTALL_OUTPUTS="ntfy", INSTALL_NTFY_MODE="bundled",
+                               INSTALL_NTFY_TOPIC="mileage-tracker", INSTALL_NTFY_USER=user,
+                               INSTALL_NTFY_PASSWORD=PHONE_PASSWORD, INSTALL_NTFY_READY="n",
+                               FAKE_USERS="", FAKE_TOKEN_LIST=token_list)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_a_rerun_offers_the_token_owner_and_keeps_the_token(self):
+        self.bundled_setup("bob")
+        self.assertEqual(self.setting("NTFY_TOKEN"), NTFY_TOKEN)
+        (self.work / "compose.log").unlink()
+        # Enter for the username (the default), Enter for the password (keep it).
+        result = self.run_step(
+            "\n\n", INSTALL_KEEP_OUTPUTS="n", INSTALL_OUTPUTS="ntfy", INSTALL_NTFY_MODE="bundled",
+            INSTALL_NTFY_TOPIC="mileage-tracker", INSTALL_NTFY_READY="n",
+            drop=("INSTALL_NTFY_USER", "INSTALL_NTFY_PASSWORD"),
+            FAKE_USERS="user bob (role: user, tier: none)", FAKE_TOKEN_LIST=BOB_TOKEN_LIST)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("[bob]", result.stdout)
+        self.assertNotIn("[mileage]", result.stdout)
+        log = self.compose_log()
+        for action in ("user add", "change-pass", "token add"):
+            self.assertNotIn(action, log)
+        self.assertIn("ntfy access bob mileage-tracker rw", log)
+        self.assertEqual(self.setting("NTFY_TOKEN"), NTFY_TOKEN)
+        self.assertIn("Kept the access token already in monitor.env (it belongs to bob)", result.stdout)
+        self.assertEqual(self.sent(), [])
+        self.assert_no_secret(result, NTFY_TOKEN, PHONE_PASSWORD)
+
+    def test_a_changed_username_gets_a_new_token(self):
+        self.bundled_setup("bob")
+        carol_token = "tk_carolNEWTOKEN000000000000"
+        (self.work / "compose.log").unlink()
+        # A new user: the password is asked for, and the token is new.
+        result = self.run_step(
+            INSTALL_KEEP_OUTPUTS="n", INSTALL_OUTPUTS="ntfy", INSTALL_NTFY_MODE="bundled",
+            INSTALL_NTFY_TOPIC="mileage-tracker", INSTALL_NTFY_USER="carol",
+            INSTALL_NTFY_PASSWORD="carol-phone-pw", INSTALL_NTFY_READY="n",
+            FAKE_USERS="user bob (role: user, tier: none)", FAKE_TOKEN_LIST=BOB_TOKEN_LIST,
+            FAKE_NTFY_TOKEN=carol_token)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.work / "stdin.log").read_text(encoding="utf-8").strip(), "carol-phone-pw")
+        log = self.compose_log()
+        self.assertIn("ntfy token add carol", log)
+        self.assertIn("ntfy access carol mileage-tracker rw", log)
+        self.assertEqual(self.setting("NTFY_TOKEN"), carol_token)
+        self.assert_no_secret(result, NTFY_TOKEN, carol_token, "carol-phone-pw")
+
+        # An existing user who doesn't own the token: the token is replaced.
+        dave_token = "tk_daveNEWTOKEN0000000000000"
+        carol_list = f"user carol (role: user, tier: none)\n- {carol_token}, never expires, accessed from 127.0.0.1"
+        result = self.run_step(
+            INSTALL_KEEP_OUTPUTS="n", INSTALL_OUTPUTS="ntfy", INSTALL_NTFY_MODE="bundled",
+            INSTALL_NTFY_TOPIC="mileage-tracker", INSTALL_NTFY_USER="dave", INSTALL_NTFY_PASSWORD="",
+            INSTALL_NTFY_READY="n",
+            FAKE_USERS="user bob (role: user)\nuser carol (role: user)\nuser dave (role: user)",
+            FAKE_TOKEN_LIST=carol_list, FAKE_NTFY_TOKEN=dave_token)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("The token in monitor.env belongs to carol, not dave, so a new one is made.", result.stdout)
+        self.assertIn("ntfy token add dave", self.compose_log())
+        self.assertEqual(self.setting("NTFY_TOKEN"), dave_token)
+        self.assert_no_secret(result, carol_token, dave_token)
+
+    def test_the_token_owner_is_found_for_each_token_in_the_listing(self):
+        (self.work / "listing.txt").write_text(
+            "user alice (role: admin, tier: none)\n"
+            "- tk_aaaa1111bbbb2222cccc3333dddd, never expires, accessed from 1.2.3.4 at 1 Jan 26 00:00 UTC\n"
+            "user mileage (role: user, tier: none)\n"
+            "- tk_fakeTOKEN12345 (phone), expires 1 Jan 27 00:00 UTC, accessed from 0.0.0.0 at 1 Jan 26 00:00 UTC\n"
+            "- tk_zzz0000000000000000000000, never expires, accessed from 0.0.0.0 at 1 Jan 26 00:00 UTC\n"
+            "user bob (role: user, tier: none)\n"
+            "user dave has no access tokens\n", encoding="utf-8")
+        snippet = textwrap.dedent("""\
+            source <(sed '$d' "$INSTALL")
+            SCRIPT_DIR=$WORK
+            cd "$WORK"
+            compose() { cat "$WORK/listing.txt"; }
+            for token in tk_aaaa1111bbbb2222cccc3333dddd tk_fakeTOKEN12345 tk_zzz0000000000000000000000 tk_missing tk_fakeTOKEN ""; do
+                printf '%s -> [%s]\\n' "$token" "$(ntfy_token_owner "$token")"
+            done
+            """)
+        env = {**os.environ, "INSTALL": str(INSTALL), "WORK": str(self.work)}
+        result = subprocess.run(["bash", "-c", snippet], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            "tk_aaaa1111bbbb2222cccc3333dddd -> [alice]",
+            "tk_fakeTOKEN12345 -> [mileage]",
+            "tk_zzz0000000000000000000000 -> [mileage]",
+            "tk_missing -> []",
+            "tk_fakeTOKEN -> []",
+            " -> []"])
+
+    def test_preset_outputs_without_a_keep_answer_skip_the_keep_question(self):
+        self.run_step(INSTALL_OUTPUTS="metrics", INSTALL_STALE_DAYS="7")
+        (self.work / "compose.log").unlink()
+        # No stdin: if the keep question were asked, it would fail on end of input.
+        result = self.run_step("", INSTALL_OUTPUTS="metrics", drop=("INSTALL_KEEP_OUTPUTS",))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("INSTALL_OUTPUTS is set, so the keep question is skipped", result.stdout)
+        self.assertNotIn("Keep them as they are?", result.stdout)
+        self.assertIn("up -d --build --no-deps mileage-monitor", self.compose_log())
+        self.assertIn("Metrics answer with the token (200)", result.stdout)
+
+        (self.work / "compose.log").unlink()
+        result = self.run_step("", INSTALL_OUTPUTS="none", drop=("INSTALL_KEEP_OUTPUTS",))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("Keep them as they are?", result.stdout)
+        self.assertIn("stop mileage-monitor", self.compose_log())
+        self.assertIn("Notification outputs: off", result.stdout)
+        self.assertEqual(self.setting("METRICS_ENABLED"), "false")
+
+    def test_keep_yes_still_wins_over_a_preset_outputs_list(self):
+        self.run_step(INSTALL_OUTPUTS="metrics", INSTALL_STALE_DAYS="7")
+        result = self.run_step(INSTALL_KEEP_OUTPUTS="y", INSTALL_OUTPUTS="ntfy")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Kept the notification outputs", result.stdout)
+        self.assertNotIn("Outputs to turn on", result.stdout)
+        self.assertEqual(self.setting("METRICS_ENABLED"), "true")
+        self.assertEqual(self.setting("NOTIFY_ENABLED"), "false")
 
 
 if __name__ == "__main__":

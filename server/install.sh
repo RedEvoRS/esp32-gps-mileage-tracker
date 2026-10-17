@@ -1759,8 +1759,9 @@ setup_backups() {
 # The order of work: before the first question, monitor.env and the pointer
 # are created if they're missing, with every output off (ensure_monitor_file).
 # Then the questions. The one exception to "questions first" is the bundled
-# ntfy: it's started as soon as its user question is answered, because the
-# phone user is looked up in the running container. Nothing else changes until
+# ntfy: it's started once its topic is answered, before the user question,
+# because the default phone user and the phone user are both looked up in
+# the running container. Nothing else changes until
 # every answer is in: then the phone user and token are made (prepare_ntfy),
 # monitor.env is written (write_monitor_settings), and containers are started
 # or stopped (apply_outputs).
@@ -2168,13 +2169,21 @@ ask_ntfy() {
 }
 
 ask_bundled_ntfy() {
-    local current_url=$1 topic_default=mileage-tracker
+    local current_url=$1 topic_default=mileage-tracker user_default=mileage current_token owner
     if [[ $current_url == http://ntfy:80/* ]]; then topic_default=${current_url##*/}; fi
     ask_checked NTFY_TOPIC_NEW NTFY_TOPIC "Topic name (letters, digits, _ or -)" "$topic_default" valid_topic \
         "Use 1 to 64 letters, digits, _ or -."
-    ask_checked NTFY_USER_NEW NTFY_USER "Username for the phone app" mileage valid_ntfy_user \
-        "Use 1 to 64 letters, digits, _ or -."
+    # The container has to be running before the user question: the default
+    # user is the owner of the token already in monitor.env, and ntfy reports
+    # that owner only from inside the container.
     start_bundled_ntfy
+    current_token=$(mon_value "$MONITOR_FILE" NTFY_TOKEN)
+    if [[ $current_url == http://ntfy:80/* && -n $current_token ]]; then
+        owner=$(ntfy_token_owner "$current_token")
+        if valid_ntfy_user "$owner"; then user_default=$owner; fi
+    fi
+    ask_checked NTFY_USER_NEW NTFY_USER "Username for the phone app" "$user_default" valid_ntfy_user \
+        "Use 1 to 64 letters, digits, _ or -."
     if ntfy_user_exists "$NTFY_USER_NEW"; then
         NTFY_USER_EXISTS=yes
         note "$NTFY_USER_NEW already exists in the bundled ntfy. Its password stays as it is" \
@@ -2262,6 +2271,23 @@ ntfy_user_exists() {
     grep -Eq "(^|[^A-Za-z0-9_-])user[[:space:]]+$1([^A-Za-z0-9_-]|\$)" <<< "$listing"
 }
 
+# The user TOKEN belongs to, printed alone, or nothing. With no username,
+# `ntfy token list` lists every user's tokens: a "user <name>" line, then
+# "- tk_..." lines under it (cmd/token.go, v2.31.0). The listing holds live
+# tokens, so it's captured here and never printed.
+ntfy_token_owner() {
+    local listing
+    if [[ -z $1 ]]; then return 0; fi
+    listing=$(compose --profile ntfy exec -T ntfy ntfy token list < /dev/null 2> /dev/null) || return 0
+    awk -v want="$1" '
+        $1 == "user" { owner = $2 }
+        $1 == "-" && owner != "" {
+            token = $2
+            sub(/,$/, "", token)
+            if (token == want) { print owner; exit }
+        }' <<< "$listing"
+}
+
 # ntfy user add/change-pass USER PASSWORD. The password goes in on stdin,
 # is exported as NTFY_PASSWORD inside the container, and never appears on a
 # command line, in a file or in this output.
@@ -2307,7 +2333,7 @@ ntfy_new_token() {
 # Create or update the bundled phone user, give it the topic, and make the
 # token the monitor will use. Only runs once every answer is in.
 prepare_ntfy() {
-    local current
+    local current owner
     if [[ $NTFY_MODE_NEW != bundled ]]; then
         NTFY_TOKEN_OUT=$NTFY_TOKEN_NEW
         return 0
@@ -2322,15 +2348,22 @@ prepare_ntfy() {
     fi
     ntfy_grant "$NTFY_USER_NEW" "$NTFY_TOPIC_NEW"
     ok "$NTFY_USER_NEW can read and post to $NTFY_TOPIC_NEW"
+    # Keep the token already in monitor.env only if it's this user's: after a
+    # rename, or a username that exists but owns a different token, its access
+    # may not cover the topic.
     current=$(mon_value "$MONITOR_FILE" NTFY_TOKEN)
     if [[ $NTFY_USER_EXISTS == yes && -n $current ]] && ntfy_bundled; then
-        NTFY_TOKEN_OUT=$current
-        ok "Kept the access token already in monitor.env"
-    else
-        ntfy_new_token "$NTFY_USER_NEW"
-        NTFY_TOKEN_OUT=$NEW_TOKEN
-        ok "Made an access token for $NTFY_USER_NEW (saved in monitor.env, not printed)"
+        owner=$(ntfy_token_owner "$current")
+        if [[ $owner == "$NTFY_USER_NEW" ]]; then
+            NTFY_TOKEN_OUT=$current
+            ok "Kept the access token already in monitor.env (it belongs to $NTFY_USER_NEW)"
+            return 0
+        fi
+        note "The token in monitor.env belongs to ${owner:-nobody listed}, not $NTFY_USER_NEW, so a new one is made."
     fi
+    ntfy_new_token "$NTFY_USER_NEW"
+    NTFY_TOKEN_OUT=$NEW_TOKEN
+    ok "Made an access token for $NTFY_USER_NEW (saved in monitor.env, not printed)"
 }
 
 # Comment out KEY in an env file and keep its value, so it no longer applies.
@@ -2753,7 +2786,12 @@ setup_outputs() {
     if [[ $MONITOR_CONFIGURED == yes ]]; then
         current=$(outputs_on | paste -sd, -)
         note "Notification outputs now: $(outputs_text "$current")"
-        if confirm KEEP_OUTPUTS "Keep them as they are?" y; then
+        # A preset list means "set them to this", so it doesn't need the keep
+        # question answered too. KEEP_OUTPUTS, if preset as well, still wins.
+        if [[ -n ${INSTALL_OUTPUTS+set} && -z ${INSTALL_KEEP_OUTPUTS+set} ]]; then
+            note "INSTALL_OUTPUTS is set, so the keep question is skipped and that list is used." \
+                "Set INSTALL_KEEP_OUTPUTS as well to answer the keep question instead."
+        elif confirm KEEP_OUTPUTS "Keep them as they are?" y; then
             ok "Kept the notification outputs"
             apply_outputs
             if [[ -n $(outputs_on) ]]; then wait_monitor_start; fi
