@@ -141,6 +141,7 @@ jobs:
             INSTALL_BACKUP_REMOTE=/srv/offhost \
             INSTALL_SAME_DISK=y \
             INSTALL_PING_URL= \
+            INSTALL_OUTPUTS=none \
             bash "$INSTALLER" < /dev/null
           test "$(docker exec mileage-viewer printenv DISPLAY_TZ)" = America/Chicago
           # Backups are private to the backup user (umask 077).
@@ -148,7 +149,7 @@ jobs:
           systemctl is-enabled "mileage-backup@$TEST_USER.timer"
       - name: Run it again; it keeps everything
         run: |
-          sudo -u "$TEST_USER" -H env INSTALL_KEEP_LOGIN=y INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+          sudo -u "$TEST_USER" -H env INSTALL_KEEP_LOGIN=y INSTALL_KEEP_OUTPUTS=y INSTALL_VIEWER_PASSWORD="$PASSWORD" \
             bash "$INSTALLER" < /dev/null
       - name: A re-run with nothing to fix doesn't ask for sudo
         # With a password-only sudo rule and no terminal, any sudo prompt
@@ -160,7 +161,7 @@ jobs:
           fi
           echo "$TEST_USER ALL=(ALL) ALL" | sudo tee /etc/sudoers.d/zz-installer-test
           status=0
-          sudo -u "$TEST_USER" -H env INSTALL_KEEP_LOGIN=y INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+          sudo -u "$TEST_USER" -H env INSTALL_KEEP_LOGIN=y INSTALL_KEEP_OUTPUTS=y INSTALL_VIEWER_PASSWORD="$PASSWORD" \
             bash "$INSTALLER" < /dev/null > rerun.log 2>&1 || status=$?
           echo "$TEST_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/zz-installer-test
           cat rerun.log
@@ -172,7 +173,7 @@ jobs:
           dir=$(dirname "$INSTALLER")
           sudo -u "$TEST_USER" sed -i "s/^VIEWER_PASSWORD_HASH='\(.*\)'\$/VIEWER_PASSWORD_HASH=\1/" "$dir/viewer.env"
           sudo -u "$TEST_USER" sed -i 's/$/\r/' "$dir/.env"
-          sudo -u "$TEST_USER" -H env INSTALL_KEEP_LOGIN=y INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+          sudo -u "$TEST_USER" -H env INSTALL_KEEP_LOGIN=y INSTALL_KEEP_OUTPUTS=y INSTALL_VIEWER_PASSWORD="$PASSWORD" \
             bash "$INSTALLER" < /dev/null
           sudo grep -q "^VIEWER_PASSWORD_HASH='" "$dir/viewer.env"
           ! sudo grep -q $'\r' "$dir/.env"
@@ -227,6 +228,28 @@ jobs:
           grep -q 'CRLF) line endings in .env' crlf.log
           test "$(grep -c '  FAIL  ' crlf.log)" = 1
           sudo -u "$TEST_USER" sed -i 's/\r$//' "$dir/.env"
+      - name: Turn on metrics; only the monitor restarts, and it refuses unauthenticated scrapes
+        # Runs before the stopped-viewer step, which leaves the viewer down.
+        # The monitor's answers go to monitor.env, never to .env.
+        run: |
+          dir=$(dirname "$INSTALLER")
+          before=$(docker inspect -f '{{.State.StartedAt}}' mileage-ingest mileage-viewer)
+          sudo -u "$TEST_USER" -H env INSTALL_KEEP_LOGIN=y INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+            INSTALL_KEEP_OUTPUTS=n INSTALL_OUTPUTS=metrics INSTALL_STALE_DAYS=7 \
+            bash "$INSTALLER" < /dev/null > metrics.log 2>&1 || status=$?
+          cat metrics.log
+          test "${status:-0}" = 0
+          grep -q 'Monitor enabled; ntfy disabled, Graylog disabled, Prometheus enabled, Loki disabled' metrics.log \
+            || sudo -u "$TEST_USER" -H bash -c "cd '$dir' && docker compose --profile monitor logs --no-color mileage-monitor" \
+              | grep -q 'Monitor enabled; ntfy disabled, Graylog disabled, Prometheus enabled, Loki disabled'
+          test "$before" = "$(docker inspect -f '{{.State.StartedAt}}' mileage-ingest mileage-viewer)"
+          test "$(curl -s -o /dev/null -w '%{http_code}' "http://$LAN_ADDR:8093/metrics")" = 401
+          test "$(sudo grep -c METRICS_TOKEN "$dir/.env" || true)" = 0
+          sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+            bash "$INSTALLER" --check < /dev/null > metrics-check.log 2>&1
+          cat metrics-check.log
+          test "$(grep -c '  FAIL  ' metrics-check.log)" = 0
+          grep -q 'Metrics answer with the token (200)' metrics-check.log
       - name: --check reports a stopped viewer without blaming its config
         run: |
           docker stop mileage-viewer

@@ -34,12 +34,18 @@ bash ~/mileage-tracker/install.sh
 ```
 
 It works through Steps 1 and 3 to 10 below, checking each one, and asks
-for only four things: the LAN address to publish the ports on, the
-timezone trips are shown in, a username and password for the viewer, and
-where backups should go. It
-uploads `sample.gpx`, logs in to the viewer, finds the trip in the list,
-on its map and in both exports, then deletes it again. At the end it
-prints the lines for the firmware's `secrets.h` (Step 8).
+for the few things only you can answer: the LAN address to publish the
+ports on, the timezone trips are shown in, a username and password for the
+viewer, where backups should go, and, last, which optional alert and dashboard
+outputs to turn on (none by default; [Step 11](#step-11--optional-device-notifications)
+explains each one). Those optional outputs come after the backups, so a
+problem with one can't hold them up. It uploads `sample.gpx`, logs in to the viewer, finds
+the trip in the list, on its map and in both exports, then deletes it
+again. At the end it prints the lines for the firmware's `secrets.h` (Step 8).
+
+Every question can also be answered in advance with an `INSTALL_` variable
+(for example `INSTALL_DISPLAY_TZ=America/Chicago`), which is how an
+unattended run works. The names are listed where each question is explained.
 
 If something fails, it says what and stops. Fix that and run it again:
 anything already set up is checked and kept, never redone.
@@ -717,11 +723,110 @@ can write to `data/` again.
 
 ## Step 11 — Optional device notifications
 
-Skip this step to keep notifications off. The installer adds no prompts for it.
-Two optional services provide alerts: a monitor checks health every minute;
-**ntfy** delivers notifications from your own server. No subscription or cloud
-account is required. Its local user is a login on your server. If you already
-host ntfy, skip 11a and use that server's topic URL and token.
+Skip this step to keep notifications off, which is the default. The tracker
+logs trips the same way either way; these outputs only tell you about faults
+in the tracker and let you see its health.
+
+### What the installer asks
+
+`install.sh` asks in its **Notifications** step. That step runs last: after
+the services are up and the backups are set up, so nothing optional here can
+hold up the backups. You can pick none, or any of these. Each one runs on a
+server you control, with no subscription or cloud account:
+
+- **ntfy** sends phone notifications when a tracker reports a fault, or goes
+  silent (no upload for the number of days you choose). Choose *bundled* to
+  run ntfy in a container here (11a), or *existing* to send to an ntfy server
+  you already run.
+- **metrics** opens a token-protected Prometheus page on port 8093, for Grafana
+  dashboards and alert rules (11e).
+- **graylog** sends each diagnostics event to a Graylog you already run (11d).
+- **loki** pushes the same events to a Loki you already run (11f).
+
+Then the installer tests each output that reaches a destination. None of
+these tests is a real alert:
+
+- **ntfy** (bundled or existing): the monitor posts one test notification to
+  the topic, and then asks whether it arrived on the phone. A "no" gets a
+  warning with the likely causes. A refused post is a failure.
+- **graylog**: the monitor sends one test message through its own GELF sender,
+  then asks whether it shows up in Graylog (search `source:mileage-tracker`).
+  A "no" gets a warning. A refused message is a failure.
+- **loki**: the monitor pushes one test line and checks only the HTTP status:
+  a 2xx passes. Nothing asks you to find the line in Grafana.
+- **metrics**: nothing is sent. The installer checks from this server that
+  `/metrics` answers 401 without the token and 200 with it.
+- **bundled ntfy** also gets a deny-all check. The installer reads the topic
+  from inside the monitor's container with no login. A refusal (401 or 403)
+  passes. Anything else fails, because it would mean anyone who can reach
+  port 8092 can read your alerts. The setting behind it is
+  `auth-default-access: "deny-all"` in `ntfy/server.yml`, which the installer
+  also checks.
+
+A failure stops the install at that point, with the reason. The backups are
+already done by then.
+
+Your answers go to `monitor.env`, in the server directory. That file is
+gitignored and mode 600, and it holds the tokens and passwords. `.env` gets
+one line, pointing at `monitor.env`, and nothing else. Only the monitor (and
+the bundled ntfy, when you choose it) is started or restarted, so trips and
+the viewer keep running through the change. Nothing is ever deleted: the ntfy
+users and the monitor's delivery state live in named volumes.
+
+Running `install.sh` again shows the outputs that are on and asks whether to
+keep them. If you keep them, the installer still applies `monitor.env`
+without asking anything else and without sending any test. It recreates the
+monitor only when its code or settings changed, so a re-run after copying new
+server code picks that code up. It starts the bundled ntfy if that's on, and
+it checks everything. Answers come back as defaults, and a secret you already
+set is never wiped: press Enter at its question and it's kept. For the bundled
+ntfy, the phone username offered is the owner of the token already in
+`monitor.env`, so Enter keeps that user and its token. Typing a different
+username gets that user a new token, since the old one doesn't grant it
+access. Turning an output off keeps its URL and secrets in `monitor.env`, so turning it back on
+needs no re-entry, except Loki's URL and login: those are commented out when
+it's off, and you type them again when it's turned back on.
+
+`install.sh --check` only checks, and changes nothing or sends nothing. It
+verifies what is on: the monitor must be running with the settings in
+`monitor.env`, each destination must be reachable from the monitor, metrics
+must refuse a request without the token, and the bundled ntfy must refuse
+anonymous reads. Outputs that are off are reported as "off", never as
+problems, so a check with nothing turned on passes.
+
+For an unattended install, every question has an environment variable. Set
+`INSTALL_OUTPUTS` to `none` or a list such as `ntfy,metrics`. Set
+`INSTALL_KEEP_OUTPUTS` too, to answer the keep question on a re-run: `y` keeps
+what's on, `n` uses the list in `INSTALL_OUTPUTS`. If you preset
+`INSTALL_OUTPUTS` but not `INSTALL_KEEP_OUTPUTS`, the keep question is skipped,
+the preset list is used, and the installer says so. If you preset neither, a
+re-run asks the keep question, so an unattended re-run has to preset one of
+the two. The rest:
+
+- `INSTALL_STALE_DAYS`: days without an upload before a silence alert (default 7)
+- `INSTALL_NOTIFY_MIN_SEVERITY`: lowest severity to send, `info`, `warning`, `error` or `critical` (default `error`)
+- ntfy: `INSTALL_NTFY_MODE` (`bundled` or `existing`), `INSTALL_NTFY_TOPIC`, `INSTALL_NTFY_USER` (on a re-run, the owner of the current token by default; otherwise `mileage`), `INSTALL_NTFY_PASSWORD` (the phone login), `INSTALL_NTFY_URL` and `INSTALL_NTFY_TOKEN` (existing server), `INSTALL_NTFY_READY` (`y` once the phone is set up, `n` to skip the test) and `INSTALL_NTFY_ARRIVED` (`y` or `n`)
+- graylog: `INSTALL_GRAYLOG_TARGET` (a GELF HTTP URL, or `host:port` for TCP) and `INSTALL_GRAYLOG_ARRIVED` (`y` or `n`)
+- loki: `INSTALL_LOKI_URL`, `INSTALL_LOKI_AUTH` (`none`, `bearer` or `basic`), `INSTALL_LOKI_BEARER_TOKEN`, `INSTALL_LOKI_BASIC_AUTH_USER`, `INSTALL_LOKI_BASIC_AUTH_PASSWORD` and `INSTALL_LOKI_TENANT_ID`
+
+A preset that isn't usable stops the install with a message, as the other
+questions do. Metrics has no question of its own: its token is generated and
+kept in `monitor.env`, never printed.
+
+**Phone alerts only reach the phone where it can reach this server.** The
+bundled ntfy is published on your LAN address, port 8092, like the other
+ports. So the phone gets alerts on home WiFi or over a VPN into your network.
+Away from that, alerts wait in ntfy's cache (72 hours by default).
+
+**Metrics on port 8093** is published on the same LAN address only. Its token
+is its only protection, so never forward that port from the internet. Prometheus
+has to be on your LAN, or reach it over a VPN, to scrape it.
+
+Opening either port to the internet is your decision and isn't part of this
+setup.
+
+The sections below are the same steps by hand, for when you'd rather not use
+the installer or want to see what it does.
 
 Run these commands **on the Debian server**, in `~/mileage-tracker` (the copied
 `server/` directory). Replace angle-bracket placeholders before running commands.

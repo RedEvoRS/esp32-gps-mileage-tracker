@@ -203,7 +203,8 @@ each on the bench before relying on it.
   install/--check. Disabled monitor idles without DB reads. Optional `ntfy`
   profile uses port 8092 with `BIND_ADDR`, deny-all auth and `ntfy-state` cache/auth
   volume. Self-hosted only; iOS instant push requires ntfy.sh wake-up relay
-  (no message text), Android does not. Manual enablement: DEPLOY_DEBIAN Step 11.
+  (no message text), Android does not. install.sh's Notifications step turns them on
+  (INSTALL_OUTPUTS); the by-hand route is DEPLOY_DEBIAN Step 11.
 - Optional Graylog export (`gelf.py`): `GRAYLOG_ENABLED` plus exactly one
   of `GRAYLOG_GELF_URL` (GELF HTTP, preferred) or `GRAYLOG_GELF_TCP` (optional
   TLS) in `monitor.env`. Graylog runs on the owner's own server; never bundle it.
