@@ -12,7 +12,7 @@ SerialStub Serial;
 FakeDisk g_disk;
 LittleFSStub LittleFS;
 int g_lockDepth = 0;
-TwoWire Wire;
+TwoWire Wire, Wire1;
 WiFiStub WiFi;
 
 #include "04_trip_logger.ino"
@@ -38,6 +38,7 @@ static void resetWorld() {
     gPendCount = gPendHead = 0; armBufReset(); gHaveLastFix = false;
     gClockSet = true;
     PMU = XPowersAXP2101(); gPmuIrqFlag = false;
+    Wire = TwoWire(); Wire1 = TwoWire(); g_pinModes.clear(); g_pinLevels.clear();
     gVbusLost = false; gVbusOffPending = false;
     g_httpCode = 200; g_httpRequests = 0; g_httpLastBody.clear(); g_httpHook = nullptr;
     gChargePaused = false; gChargeApplied = false; gChargeCheckT0 = 0;
@@ -1384,6 +1385,43 @@ int main(int argc, char** argv) {
             CHECK(g_httpRequests == 1 && !g_disk.files.count("/trips/t999999.gpx") &&
                   g_disk.files.count("/trips/t000000.gpx"),
                   "the due retry still uploads complete work and preserves the incomplete original");
+        }
+    }
+
+    printf("T47 Supreme boot disables LoRa before any delay, including failed startup (#107)\n");
+    {
+        for (bool failMutex : {false, true}) {
+            resetWorld();
+            g_failMutexCreate = failMutex;
+            g_delayHook = [](uint32_t) {
+                CHECK(!PMU.aldo3 && !PMU.bldo1 && !PMU.vbackup,
+                      "radio, SD and VBACKUP are off before a startup delay");
+                g_delayHook = nullptr;
+            };
+            try { setup(); } catch (const Restarted&) {}
+            CHECK(PMU.bus == &Wire1 && Wire1.sda == 42 && Wire1.scl == 41 && Wire.begins == 0,
+                  "PMU uses only Wire1 on SDA 42 / SCL 41");
+            CHECK(PMU.operations == std::vector<std::string>({"begin", "disableALDO3", "isEnableALDO3"}),
+                  "radio disable and readback are the first operations after PMU.begin");
+            CHECK(logHas("power-on source 0x04, power-off source 0x02"), "boot logs PMU power sources");
+            if (!failMutex) {
+                CHECK(PMU.aldo4 && PMU.aldo4Mv == 3300 &&
+                      g_pinModes[7] == OUTPUT && g_pinLevels[7] == HIGH,
+                      "GPS is on ALDO4 at 3.3 V with GPS_EN HIGH");
+                CHECK(GPSSerial.baud == 9600 && GPSSerial.rxPin == 9 && GPSSerial.txPin == 8,
+                      "MAX-M10S UART uses RX 9 / TX 8 at 9600 baud");
+            }
+        }
+        for (bool writeFailed : {false, true}) {
+            resetWorld();
+            PMU.failRadioDisable = writeFailed;
+            PMU.radioStuckOn = !writeFailed;
+            g_delayHook = [](uint32_t) { throw Halted{}; };
+            try { setup(); } catch (const Halted&) {}
+            g_delayHook = nullptr;
+            CHECK(logHas("ALDO3) could not be verified off") &&
+                  g_disk.mountAttempts == 0 && g_taskCreates == 0 && !PMU.aldo4,
+                  "failed radio write or readback halts before GPS, storage or workers");
         }
     }
 

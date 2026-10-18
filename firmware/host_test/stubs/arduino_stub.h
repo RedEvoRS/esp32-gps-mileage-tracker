@@ -30,8 +30,12 @@ inline double radians(double d) { return d * M_PI / 180.0; }
 using std::min;
 #define IRAM_ATTR
 #define INPUT 0
+#define OUTPUT 1
+#define HIGH 1
 #define FALLING 0
-inline void pinMode(int, int) {}
+inline std::map<int, int> g_pinModes, g_pinLevels;
+inline void pinMode(int pin, int mode) { g_pinModes[pin] = mode; }
+inline void digitalWrite(int pin, int level) { g_pinLevels[pin] = level; }
 inline int digitalPinToInterrupt(int p) { return p; }
 inline void attachInterrupt(int, void (*)(), int) {}
 
@@ -332,8 +336,11 @@ inline void vTaskDelay(uint32_t ms) { g_millis += ms; }
 #define pdMS_TO_TICKS(x) (x)
 
 // ---- hardware odds and ends (compile-only) ----------------------------------
-struct TwoWire { void begin(int, int) {} };
-extern TwoWire Wire;
+struct TwoWire {
+    int sda = -1, scl = -1, begins = 0;
+    void begin(int a, int b) { sda = a; scl = b; begins++; }
+};
+extern TwoWire Wire, Wire1;
 #define AXP2101_SLAVE_ADDRESS 0x34
 #define XPOWERS_AXP2101_ALL_IRQ 0xffffffff
 #define XPOWERS_AXP2101_VBUS_REMOVE_IRQ 1
@@ -346,11 +353,24 @@ extern TwoWire Wire;
 // interrupt flags, then raise gPmuIrqFlag as the IRQ pin would.
 struct XPowersAXP2101 {
     bool vbusIn = true, removeIrq = false, insertIrq = false;
-    bool begin(TwoWire&, int, int, int) { return true; }
-    void setALDO3Voltage(int) {} void enableALDO3() {} void disableALDO3() {}
-    void setALDO4Voltage(int) {} void enableALDO4() {} void disableALDO4() {}
-    void setButtonBatteryChargeVoltage(int) {} void enableButtonBatteryCharge() {}
-    bool isEnableButtonBatteryCharge() { return true; }
+    bool aldo3 = true, aldo4 = false, bldo1 = true, vbackup = true;
+    bool failRadioDisable = false, radioStuckOn = false;
+    int aldo4Mv = 0;
+    TwoWire* bus = nullptr;
+    std::vector<std::string> operations;
+    bool begin(TwoWire& wire, int, int, int) { bus = &wire; operations.push_back("begin"); return true; }
+    bool disableALDO3() {
+        operations.push_back("disableALDO3");
+        if (!failRadioDisable && !radioStuckOn) aldo3 = false;
+        return !failRadioDisable;
+    }
+    bool isEnableALDO3() { operations.push_back("isEnableALDO3"); return aldo3; }
+    void setALDO4Voltage(int mv) { aldo4Mv = mv; }
+    void enableALDO4() { aldo4 = true; } void disableALDO4() { aldo4 = false; }
+    void disableBLDO1() { bldo1 = false; }
+    void disableButtonBatteryCharge() { vbackup = false; }
+    uint8_t getPowerOnSource() { return 0x04; }
+    uint8_t getPowerOffSource() { return 0x02; }
     uint8_t chgVol = 3;
     bool setChargeTargetVoltage(uint8_t v) { chgVol = v; return true; }
     uint8_t getChargeTargetVoltage() { return chgVol; }
@@ -375,7 +395,9 @@ struct HardwareSerial {
     std::string rx, tx;
     size_t rxPos = 0;
     HardwareSerial(int) {}
-    void setRxBufferSize(int) {} void begin(int, int, int, int) {}
+    int baud = 0, rxPin = -1, txPin = -1;
+    void setRxBufferSize(int) {}
+    void begin(int b, int, int rx, int tx) { baud = b; rxPin = rx; txPin = tx; }
     int available() {
         if (rxPos >= rx.size()) { g_millis += 1; return 0; }
         return (int)(rx.size() - rxPos);

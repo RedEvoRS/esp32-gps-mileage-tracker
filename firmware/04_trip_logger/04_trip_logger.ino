@@ -2,7 +2,7 @@
 // Stage 4: Trip Logger (GPX logging + WiFi upload)
 // =================================================================
 // This is the real firmware. It ties together everything proven in
-// Stages 1-3 (toolchain, AXP2101 PMU + GPS power, NEO-M8N parsing) and
+// Stages 1-3 (toolchain, AXP2101 PMU + GPS power, NMEA parsing) and
 // adds the four pieces that make it a mileage tracker:
 //
 //   1. A trip state machine that auto-detects start (>5 mph for 10 s)
@@ -60,14 +60,15 @@
 #include "secrets.h"
 
 // -----------------------------------------------------------------
-// Pin definitions for T-Beam V1.2 (identical to Stages 2-3)
+// LilyGO T-Beam Supreme (ESP32-S3 + MAX-M10S), measured 2026-10-18
 // -----------------------------------------------------------------
-#define I2C_SDA      21
-#define I2C_SCL      22
-#define GPS_RX_PIN   34
-#define GPS_TX_PIN   12
+#define I2C_SDA      42   // Wire1: PMU + PCF8563 RTC
+#define I2C_SCL      41
+#define GPS_RX_PIN   9
+#define GPS_TX_PIN   8
+#define GPS_EN_PIN   7
 #define GPS_BAUD     9600
-#define PMU_IRQ_PIN  35   // AXP2101 IRQ, input-only, active-low
+#define PMU_IRQ_PIN  40   // active-low; not an RTC GPIO on the S3
 
 // -----------------------------------------------------------------
 // Trip state machine tuning (from brief section 5)
@@ -136,7 +137,7 @@ Preferences    prefs;
 // RMC status field ('A' = valid fix). Committed only when an RMC sentence
 // passes its checksum, so isUpdated() means "an RMC just arrived" -- the
 // once-per-epoch signal loop() processes fixes on. "GN" is the talker ID
-// when the M8N uses more than one constellation (its default), "GP" when
+// when the receiver uses more than one constellation, "GP" when
 // it uses GPS alone.
 TinyGPSCustom  gRmcStatusGN(gps, "GNRMC", 2);
 TinyGPSCustom  gRmcStatusGP(gps, "GPRMC", 2);
@@ -970,11 +971,9 @@ static void deepSleepForVbus() {
     // that never stopped can't reach the filesystem once it's unmounted.
     FS_LOCK();
     LittleFS.end();
-    // GPS main supply off. The receiver keeps its clock and satellite data
-    // on the backup supply (enabled in setup), so the next fix is a hot
-    // start.
-    PMU.disableALDO3();
-    PMU.disableALDO4();   // unused here; set by older builds
+    // MAX-M10S main supply off. Its backup RAM is fed directly by the
+    // 18650 on the Supreme, independently of the PMU's VBACKUP output.
+    PMU.disableALDO4();
     // Disable before clearing: an interrupt landing between a clear and the
     // disable would hold the IRQ line low and wake us immediately.
     PMU.disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
@@ -1401,9 +1400,9 @@ static void networkTask(void*) {
 // =================================================================
 // GPS receiver configuration (u-blox UBX protocol, sent at boot)
 // =================================================================
-// The M8N's defaults work, but they send four NMEA sentences nothing here
-// parses and use the "portable" motion model. The settings live in the
-// receiver's RAM, so they're re-sent on every boot.
+// The MAX-M10S (SPG 5.10) ACKed these legacy messages on 2026-10-18.
+// Leave this configuration unchanged until #108 handles VALSET separately.
+// Re-send at every boot rather than rely on retained receiver settings.
 
 // Frame: B5 62 | class id | length (LE16) | payload | Fletcher-8 checksum
 // over class..payload.
@@ -1561,9 +1560,36 @@ static bool mountTripStorage() {
 }
 
 void setup() {
+    // VBUS-insert power-on brings the Supreme's LoRa rail up ON. Disable
+    // and verify it as the first PMU operation, BEFORE Serial, delays,
+    // allocation, storage or GPS setup can block. Stage 4 never uses LoRa.
+    Wire1.begin(I2C_SDA, I2C_SCL);
+    if (!PMU.begin(Wire1, AXP2101_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {
+        Serial.begin(115200);
+        Serial.println("ERROR: AXP2101 not found. Halting.");
+        while (1) delay(1000);
+    }
+    if (!PMU.disableALDO3() || PMU.isEnableALDO3()) {
+        Serial.begin(115200);
+        Serial.println("ERROR: LoRa rail (ALDO3) could not be verified off. Halting.");
+        while (1) delay(1000);
+    }
+    // BLDO1 powers the SD slot but starts at 1.8 V. Keep it off: #109
+    // must set 3.3 V BEFORE enabling it for SD support.
+    PMU.disableBLDO1();
+    // Supreme GPS backup RAM comes straight from the 18650. LilyGO also
+    // disables VBACKUP; a 60 s ALDO4-off test hot-started in 2.0 s with it off.
+    PMU.disableButtonBatteryCharge();
+    // Leave ALDO1/ALDO2 and DCDC4/DCDC5 as found. Peripheral loads and
+    // PMU/RTC bus pull-up dependencies need proof before disabling them;
+    // #25 owns the measured current decision. Never touch DCDC1 (ESP32).
+
     Serial.begin(115200);
     delay(1000);
     Serial.println("\n=== Stage 4: Trip Logger ===");
+    Serial.println("LoRa rail (ALDO3) verified off; SD rail (BLDO1) off; VBACKUP off.");
+    Serial.printf("PMU power-on source 0x%02X, power-off source 0x%02X.\n",
+                  (unsigned)PMU.getPowerOnSource(), (unsigned)PMU.getPowerOffSource());
 
     gFsMutex = xSemaphoreCreateMutex();
     if (!gFsMutex) {
@@ -1573,24 +1599,11 @@ void setup() {
         return;
     }
 
-    // --- PMU + GPS power (Stages 2-3) ---
-    Wire.begin(I2C_SDA, I2C_SCL);
-    if (!PMU.begin(Wire, AXP2101_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {
-        Serial.println("ERROR: AXP2101 not found. Halting.");
-        while (1) delay(1000);
-    }
-    // The NEO-M8N runs on ALDO3 -- measured on this board: with ALDO4 off
-    // the GPS kept talking, with ALDO3 off it went silent. ALDO3 is on by
-    // default at power-up, which is why earlier stages enabling ALDO4
-    // appeared to work. Set it explicitly rather than rely on that.
-    PMU.setALDO3Voltage(3300);
-    PMU.enableALDO3();
-    // GPS backup supply (VBACKUP): keeps the receiver's clock and satellite
-    // data while ALDO3 is off in deep sleep, so a drive starts with a hot
-    // start (~1 s) instead of a cold one (~30 s of unlogged driving). Off
-    // by default on this board.
-    PMU.setButtonBatteryChargeVoltage(3300);
-    PMU.enableButtonBatteryCharge();
+    // --- Supreme GPS: ALDO4 at 3.3 V, GPS_EN HIGH as in LilyGO's setup ---
+    pinMode(GPS_EN_PIN, OUTPUT);
+    digitalWrite(GPS_EN_PIN, HIGH);
+    PMU.setALDO4Voltage(3300);
+    PMU.enableALDO4();
     // Full-charge voltage 4.1 V instead of the 4.2 V default: ~10% less
     // capacity, much less stress on a cell that lives in a hot car (the
     // charge temperature guard, below, covers charging when it's too hot).
@@ -1611,8 +1624,7 @@ void setup() {
     // power key away from the car) must still hit the idle sleep timer.
     gVbusLost = !PMU.isVbusIn();
     gIdleSince = millis();
-    Serial.printf("PMU ready, GPS rail (ALDO3) on, GPS backup %s, charge to %s. VBUS %s.\n",
-                  PMU.isEnableButtonBatteryCharge() ? "on" : "OFF",
+    Serial.printf("PMU ready, MAX-M10S GPS rail (ALDO4) on at 3.3 V, charge to %s. VBUS %s.\n",
                   PMU.getChargeTargetVoltage() == XPOWERS_AXP2101_CHG_VOL_4V1 ? "4.1 V" : "NOT 4.1 V",
                   gVbusLost ? "absent (on battery)" : "present");
 

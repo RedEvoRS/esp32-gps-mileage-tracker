@@ -12,7 +12,7 @@ SerialStub Serial;
 FakeDisk g_disk;
 LittleFSStub LittleFS;
 int g_lockDepth = 0;
-TwoWire Wire;
+TwoWire Wire, Wire1;
 WiFiStub WiFi;
 
 #include "04_trip_logger.ino"
