@@ -5,20 +5,152 @@
 > microSD card** for trip storage. See LilyGO's [T-Beam Supreme hardware
 > guide](https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/docs/en/t_beam_supreme/t_beam_supreme_hw.md).
 >
-> **The Supreme firmware port has not landed.** The sketches and procedures
-> in this README are for the retired T-Beam V1.2 with NEO-M8N GPS and
-> LittleFS. Do not use them on a T-Beam Supreme. MAX-M10S setup, SD-card
-> formatting, and Supreme flashing instructions will be documented with the
-> port.
+> **The Supreme port is in progress.** Stages 1–3 run on the Supreme: see
+> [T-Beam Supreme bring-up](#t-beam-supreme-bring-up). Stage 4, the trip
+> logger, and the rest of this README are still for the retired T-Beam V1.2
+> with NEO-M8N GPS and LittleFS. **Don't flash Stage 4 on a Supreme yet.**
+> SD-card formatting and the Supreme trip logger will be documented with
+> the port.
 
-This directory contains the firmware for the LilyGO TTGO T-Beam V1.2
-with NEO-M8N GPS module. The firmware is organized into progressive
-stages that let you verify each hardware subsystem before building
-the full mileage tracker.
+The firmware is organized into progressive stages that let you verify
+each hardware subsystem before building the full mileage tracker. The
+bring-up stages (1–3) are ported to the T-Beam Supreme; Stage 4 still
+targets the LilyGO TTGO T-Beam V1.2 with NEO-M8N GPS module.
 
-This is the legacy V1.2 firmware reference. The [top-level README](../README.md)
-describes the Supreme MAX-M10S target and server setup; it marks the steps
-below as V1.2-only because the Supreme port is still pending.
+The [top-level README](../README.md) describes the Supreme MAX-M10S target
+and server setup; it marks the Stage 4 steps below as V1.2-only because the
+rest of the Supreme port is still pending.
+
+## T-Beam Supreme bring-up
+
+These steps were checked on a real T-Beam Supreme (MAX-M10S version) on
+2026-10-18. They cover the factory backup and Stages 1–3. Stage 4 isn't
+ported yet.
+
+### Before the first power-up
+
+- **Attach the 915 MHz LoRa antenna** to the SMA socket first. The board
+  ships with Meshtastic, which can transmit, and transmitting without an
+  antenna can damage the radio.
+- **Connect the GPS antenna** to the small push-on socket marked **GPS**,
+  which sits next to the one marked **LORA**. Press it on until it clicks.
+  A loose GPS cable looks exactly like a dead antenna: no satellites at
+  all, even outdoors.
+- The board powers an **active** GPS antenna, so an external active antenna
+  on an SMA cable works (through an adapter cable to the GPS socket).
+- **18650:** match the + marking on the holder. While a cell is fitted,
+  unplugging USB does not switch the board off.
+
+### Buttons
+
+Hold the board (or its case) with the screen on the left and the USB-C
+port on the right. The buttons sit along the bottom edge:
+
+| Button | Where | What it does |
+|---|---|---|
+| **RESET** | Left of the close pair near the middle | Restarts the ESP32 |
+| **POWER** | Right of that pair | Power key on the PMU: ~1 s switches the board on, ~6 s switches it off |
+| **BOOT** | On its own, further right | GPIO 0. Held while the board powers up, it selects download mode |
+
+### Board settings
+
+In the Arduino IDE pick **Tools → Board → esp32 → ESP32S3 Dev Module**, then:
+
+- **USB CDC On Boot:** Enabled
+- **USB Mode:** Hardware CDC and JTAG
+- **Flash Size:** 8MB (64Mb)
+- **PSRAM:** QSPI PSRAM
+
+Install the libraries from [step 5](#5-install-required-libraries) below.
+The same settings as an arduino-cli FQBN, which CI uses to compile every
+sketch:
+
+```text
+esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled
+```
+
+The Supreme uses the ESP32-S3's built-in USB port, so it needs no CH9102
+driver. Windows lists it as **USB Serial Device (COMn)**, USB ID 303A:1001.
+The COM number can change between a normal boot and download mode, so
+check **Tools → Port** after each restart.
+
+### Back up the factory flash first
+
+Uploading anything replaces the factory firmware. Read the whole 8 MB
+first, so the board can go back to stock. esptool comes with the ESP32
+core, at
+`%LOCALAPPDATA%\Arduino15\packages\esp32\tools\esptool_py\<version>\esptool.exe`.
+Put the board in [download mode](#download-mode), then:
+
+```text
+esptool --chip esp32s3 --port COMn --before no-reset read-flash 0 0x800000 supreme-factory.bin
+```
+
+Read it a second time into another file and compare the two
+(`certutil -hashfile <file> SHA256` on Windows). Keep the backup outside
+this repo: it can hold the factory firmware's device keys. To go back to
+stock later:
+
+```text
+esptool --chip esp32s3 --port COMn write-flash 0 supreme-factory.bin
+```
+
+**Windows read quirk:** on our board, reading the factory flash over the
+built-in USB port failed every time at one 4 KB block (address 0x1A6000)
+with `No more data to read from the serial port`. Reading that block as
+two 2 KB halves worked. If a full read stops at the same address on every
+try, read the flash in pieces (say 1 MB at a time) and split any piece
+that fails into smaller reads. It's a USB transfer quirk, not a faulty
+board.
+
+### Download mode
+
+- **While one of this project's sketches is running**, Upload switches the
+  board into download mode by itself. No buttons needed.
+- **Under the factory firmware** that automatic reset didn't work, so enter
+  download mode by hand. With an 18650 fitted: hold POWER for about 6 s
+  until the board is off, hold BOOT, press POWER for about 1 s, keep
+  holding BOOT for 2–3 s more, then release. The screen stays dark.
+  Without a battery: unplug USB, hold BOOT, plug USB back in, and release
+  BOOT after 2–3 s.
+- **After uploading from download mode entered by hand,** the board can
+  restart straight back into download mode. The serial log then shows
+  `boot:0x0 (DOWNLOAD(USB/UART0))` and `waiting for download`. Press RESET
+  once to run the new sketch.
+- Opening the serial port can restart the board, so startup messages may
+  appear twice.
+
+### Supreme pin and power reference
+
+Measured with Stages 1–3 unless marked.
+
+| Function | Connection | Notes |
+|---|---|---|
+| PMU (AXP2101) | `Wire1`, SDA 42 / SCL 41, address 0x34 | Interrupt on GPIO 40, which can't wake the ESP32-S3 from deep sleep |
+| RTC (PCF8563) | `Wire1`, address 0x51 | Shares the PMU's bus |
+| OLED (SH1106), BME280 | `Wire`, SDA 17 / SCL 18, 0x3C / 0x77 | |
+| GPS UART | ESP32 RX 9 / TX 8, 9600 baud | u-blox MAX-M10S, firmware SPG 5.10 |
+| GPS_EN | GPIO 7 | Drive HIGH. Low or high made no difference on this GPS |
+| GPS PPS | GPIO 6 | One pulse per second once the GPS has a fix |
+| GPS power | ALDO4, 3.3 V | |
+| LoRa power | ALDO3 | Keep it off. It comes up **on** after a power-on by USB |
+| SD card power | BLDO1 | Comes up at 1.8 V: set 3.3 V before use. SD pins per LilyGO (not yet checked): SPI 35/36/37, CS 47 |
+| GPS backup supply | The 18650 directly | Not the PMU's VBACKUP output, which can stay off |
+
+**Rails at power-up (AXP2101 defaults):** DCDC1 3.3 V on (this powers the
+ESP32: never switch it off), DCDC4 1.8 V on, DCDC5 3.3 V on, ALDO1 1.8 V on,
+ALDO2 3.3 V on, ALDO3 on after a power-on by USB (off after one by the
+POWER button), ALDO4 off, BLDO1 1.8 V on, VBACKUP off, the rest off.
+
+**Power-off and wake:** `PMU.shutdown()` switches the whole board off. It
+stays off while USB stays plugged in, and the next time USB power is
+plugged in, the board switches on and boots normally.
+
+**GPS starts:** with the 18650 fitted, the GPS keeps its satellite data
+while it's powered down, and found a fix 2 s after being off for a minute
+(a hot start). With the cell removed it forgets everything, and the next
+fix took 33 s outdoors (a cold start). It also keeps its settings until
+the cell comes out, including any left by the factory firmware.
 
 ## Legacy V1.2 Hardware
 
@@ -165,37 +297,60 @@ Holding IO38 while pressing RST does not select the ESP32 bootloader.
 Work through these in order. Each stage builds on the previous one
 and verifies a specific hardware subsystem before moving on.
 
+Stages 1–3 are for the **T-Beam Supreme**. Use the
+[Supreme board settings](#board-settings) and
+[back up the factory flash](#back-up-the-factory-flash-first) before the
+first upload. Stage 4 is still the V1.2 trip logger. Every stage prints at
+115200 baud; open the Serial Monitor after uploading.
+
 ### Stage 1: Hello World (`01_hello_world/`)
 
-**Verifies:** USB serial communication, compiler, upload process
+**Verifies:** USB serial, the board settings, uploading
 
-Open `01_hello_world.ino`, upload it, then open Serial Monitor at
-115200 baud. You should see "T-Beam is alive!" and heartbeat messages.
-
-If uploading fails, follow [If uploading fails](#if-uploading-fails).
+Prints the chip, the flash and PSRAM sizes and the reason for the last
+restart, then a heartbeat every 2 s. Expect
+`Flash: 8388608 bytes | PSRAM: 8388608 bytes`. A PSRAM size of 0 means
+the PSRAM setting is wrong. Stage 1 doesn't touch the power chip.
 
 ### Stage 2: Power Manager (`02_pmu_test/`)
 
-**Verifies:** I2C bus, AXP2101 communication, GPS power rail
+**Verifies:** both I2C buses, the AXP2101, the power rails, power-off and
+wake
 
-Open `02_pmu_test.ino` and upload. Serial Monitor should show the
-PMU initializing, GPS power being enabled, and battery status.
+Prints every rail as it found them at boot, then switches ALDO3 (LoRa) off
+(it stops if it can't) and ALDO4 (GPS) on. It scans both I2C buses
+(expect 0x34 and 0x51 on `Wire1`, 0x3C and 0x77 on `Wire`) and repeats the
+power status every 5 s. Keys: `h` help, `p` status, `i` scan again, `o`
+sensor rails on/off, `s` then `Y` to power the board off. Unplug and
+replug USB to switch it back on.
 
-If "Failed to find AXP2101" appears, check that XPowersLib is
-installed and your board is genuinely a V1.2 (check PCB silkscreen).
+If "AXP2101 not found" appears straight after the board was restarted
+from the PC, restart it once more. A restart in the middle of a PMU read
+can leave the bus stuck (issue #145).
 
-### Stage 3: GPS Fix (`03_gps_test/`)
+### Stage 3: GPS (`03_gps_test/`)
 
-**Verifies:** GPS UART, NMEA parsing, satellite acquisition
+**Verifies:** GPS power, the GPS UART, the antenna, getting a fix, hot
+starts
 
-Open `03_gps_test.ino` and upload. Take the board OUTSIDE — GPS
-does not work indoors. Watch Serial Monitor for:
-- "Chars from GPS" incrementing (proves UART works)
-- Satellite count climbing (proves antenna works)
-- Lat/Lon coordinates appearing (proves everything works)
+Needs the GPS antenna under open sky: outdoors, or at a window without
+metal-coated glass. Every 2 s it prints whether NMEA is arriving, whether
+there's a fix, satellites used, HDOP, PPS pulses and the time to first fix
+since the GPS rail came on. Coordinates stay hidden unless you press `l`.
+Don't paste logs with coordinates or raw NMEA anywhere public: they show
+where you are.
 
-Cold start takes 30-60 seconds outdoors. If "Chars from GPS"
-stays at 0, GPS power didn't enable (go back to Stage 2).
+Keys: `g` signal strength of every satellite heard plus the antenna/RF
+status, `4` GPS power off/on (time a hot start), `v` GPS firmware version,
+`u` the legacy UBX config Stage 4 sends, `e` GPS_EN, `b` VBACKUP, `3` LoRa
+rail (needs the antenna attached and a confirmation), `r` raw NMEA, `h`
+help.
+
+What good looks like outdoors: a cold start in about 33 s, a hot start in
+about 2 s, and `g` showing 19 or more satellites heard at 40+ dBHz with
+the AGC around 30%. `heard=0` with the AGC stuck near 80% means no signal
+reaches the receiver: check that the GPS cable is clicked onto the **GPS**
+socket.
 
 ### Stage 4: Full Mileage Tracker (`04_trip_logger/`)
 
