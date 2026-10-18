@@ -122,6 +122,44 @@ One note on HTTPS payloads: the ESP32 TLS hardware record size tops out at 16,38
 
 ## 3. AXP2101 VBUS-loss handling via XPowersLib
 
+**Supreme decision, measured 2026-10-18 (#106): use PMU power-off plus
+VBUS-insert power-on.** The ESP32-S3's PMU IRQ is GPIO 40, which is not an
+RTC GPIO and cannot wake ext0/ext1 deep sleep. It remains a normal awake
+interrupt. `PMU.shutdown()` powered the entire Supreme off and it stayed
+off with USB still connected. Unplugging and replugging USB powered it on;
+the AXP2101 reported power-on source `0x04` (VBUS insert) and power-off
+source `0x02` (software). This requires an **insert edge**, so Stage 4 must
+never request shutdown while VBUS is present.
+
+The existing 10 s USB-loss confirmation and 10 min battery-idle grace
+remain. A running upload can finish within the existing drain window;
+otherwise it is aborted. The trip is finalized, storage is closed and
+unmounted under its mutex, and VBUS is read again **immediately before**
+`PMU.shutdown()`, with no logging or delay between the read and request.
+If USB has returned, storage is remounted without formatting and logging
+resumes; the network is released only after an aborted upload closes. A
+VBUS edge between the final I2C read and shutdown write is still a race.
+XPowersLib's shutdown call only writes the request bit; if power remains
+on after 1 s, firmware logs an error and restores storage/logging, with a
+fresh idle grace before retry. If an upload is still busy after the abort
+timeout, recovery keeps storage locked and restarts; it never remounts
+under that task's old file handle. A failed recovery remount also restarts
+into normal boot. GPIO wake configuration is not involved.
+
+Every power-on is a full boot: no RTC RAM or deep-sleep reset cause is
+required. Trip numbering persists in Preferences/NVS and queued GPX files
+in LittleFS (SD migration is #109). Supreme GPS main power is ALDO4 at
+3.3 V; backup RAM is fed directly by the 18650, independently of VBACKUP.
+With VBACKUP off, a hot start after ALDO4 was off for 60 s took 2.0 s, and
+GPS settings survived PMU shutdowns. Keep VBACKUP disabled. VBUS power-on
+also brings LoRa ALDO3 up on, so Stage 4 disables and verifies it as its
+first PMU operation, before any Serial wait or storage/GPS setup.
+**Parked current is still unmeasured (#25);** this change does not establish
+battery runtime or the overnight hot-start time (#26).
+
+The comparison and recommendation below record the original **V1.2**
+design; they are retained as history and do not describe the Supreme path.
+
 On T-Beam V1.2 the **AXP2101 IRQ pin is wired to ESP32 GPIO 35** (open-drain, active-low, asserts ≥16 ms per datasheet). GPIO 35 is input-only and has no internal pull-up hardware — LilyGo does not populate an external pull-up, and `pinMode(PMU_IRQ, INPUT_PULLUP)` is a no-op there. In practice it works due to trace capacitance and the AXP2101's strong active pull-down, but **if you observe missed IRQs, add an external 10 kΩ pull-up to 3V3**. GPIO 35 is RTC_GPIO5, so it is wakeup-capable for `ext1`.
 
 Enable the two VBUS IRQs and the low-battery warnings; leave the rest masked unless you need them:

@@ -51,7 +51,6 @@
 #include <Preferences.h>
 #include <time.h>
 #include <sys/time.h>
-#include <esp_sleep.h>
 #include <vector>
 #include <esp_sntp.h>
 #include <esp_partition.h>
@@ -89,14 +88,14 @@ static constexpr uint32_t SEG_GAP_MS      = 5000;
 // it open until a power event.
 static constexpr uint32_t FIX_LOSS_END_MS = 300UL * 1000;   // 5 min
 
-// On battery (VBUS lost) with no trip in progress, deep sleep after this
+// On battery (VBUS lost) with no trip in progress, power off after this
 // long. Ample time for the post-drive upload (a trip ending clears the
 // retry backoff, so tries come at ~0, 1, 3 and 7 min after parking), and
 // it stops the GPS rail + WiFi scans from draining the 18650 for days.
-// VBUS insert (car back on) wakes us.
+// A VBUS insert edge (car back on) powers the PMU on for a full boot.
 static constexpr uint32_t IDLE_BATT_SLEEP_MS = 10UL * 60 * 1000;
 
-// Sleep never unmounts storage under an upload (issue #3). When the idle
+// Power-off never unmounts storage under an upload (issue #3). When the idle
 // timer runs out mid-upload, the file gets up to NET_DRAIN_MS to finish:
 // the server's 300 s worker timeout bounds one upload, plus time to scan
 // and connect. After that, or at once for a critical battery or a held
@@ -115,6 +114,7 @@ static constexpr uint32_t NET_STACK_WARN_BYTES = 1024;
 
 // Storage layout.
 static const char* TRIP_DIR = "/trips";
+static constexpr const char* TRIP_PARTITION_LABEL = "spiffs";
 
 // Free-space guard. A full partition silently loses points, and LittleFS
 // misbehaves at 100% (joltwallet/esp_littlefs#183). Don't start a trip
@@ -151,7 +151,7 @@ volatile bool     gVbusLost   = false;
 volatile bool     gPmuIrqFlag = false;
 // Shared by core 0 (SNTP) and core 1 (GPS/fix construction).
 std::atomic<bool> gClockSet{false};  // a source has synchronized UTC this boot
-// Sleep/upload handshake (issue #3). Core 0 raises gNetBusy before it reads
+// Power-off/upload handshake (issue #3). Core 0 raises gNetBusy before it reads
 // gNetHold; core 1 sets gNetHold before it reads gNetBusy. With seq_cst
 // atomics at least one side sees the other, so once core 1 reads gNetBusy
 // false the network task can't start a new cycle. gNetAbort cuts off an
@@ -160,7 +160,7 @@ std::atomic<bool> gNetBusy{false};   // a network cycle is running
 std::atomic<bool> gNetHold{false};   // don't start a cycle or another file
 std::atomic<bool> gNetAbort{false};  // stop the current upload now
 // Set by core 1 when a trip ends: the car just parked, maybe at home, and
-// on battery it sleeps in IDLE_BATT_SLEEP_MS. Core 0 clears the backoff.
+// on battery it powers off in IDLE_BATT_SLEEP_MS. Core 0 clears the backoff.
 std::atomic<bool> gNetRetryNow{false};
 // Owned by core 0. Zero wait means the next queued trip can try immediately.
 uint32_t          gNetLastAttemptMs = 0;
@@ -960,27 +960,7 @@ static void stopNetworkTask() {
     Serial.println("Stopping the upload in progress -- the trip stays queued.");
     uint32_t t0 = millis();
     while (gNetBusy.load() && millis() - t0 < NET_ABORT_MS) vTaskDelay(pdMS_TO_TICKS(20));
-    if (gNetBusy.load()) Serial.println("Network task still busy -- sleeping anyway.");
-}
-
-static void deepSleepForVbus() {
-    Serial.println("Entering deep sleep (battery critical / idle).");
-    if (gTripPath[0]) endTrip(/*discardIfMicro=*/false);
-    stopNetworkTask();
-    // Keep the lock: this boot ends in deep sleep, so even a network task
-    // that never stopped can't reach the filesystem once it's unmounted.
-    FS_LOCK();
-    LittleFS.end();
-    // MAX-M10S main supply off. Its backup RAM is fed directly by the
-    // 18650 on the Supreme, independently of the PMU's VBACKUP output.
-    PMU.disableALDO4();
-    // Disable before clearing: an interrupt landing between a clear and the
-    // disable would hold the IRQ line low and wake us immediately.
-    PMU.disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
-    PMU.clearIrqStatus();
-    PMU.enableIRQ(XPOWERS_AXP2101_VBUS_INSERT_IRQ | XPOWERS_AXP2101_PKEY_SHORT_IRQ);
-    esp_sleep_enable_ext1_wakeup(1ULL << PMU_IRQ_PIN, ESP_EXT1_WAKEUP_ALL_LOW);
-    esp_deep_sleep_start();
+    if (gNetBusy.load()) Serial.println("Network task still busy -- powering off with storage locked.");
 }
 
 // USB power must stay off this long before it counts as "car off". Engine
@@ -989,6 +969,68 @@ static void deepSleepForVbus() {
 static constexpr uint32_t VBUS_OFF_CONFIRM_MS = 10UL * 1000;
 static bool     gVbusOffPending = false;
 static uint32_t gVbusOffT0 = 0;
+
+static void powerOffForVbus() {
+    // AXP2101 powers on on a VBUS INSERT EDGE, not its steady level. Never
+    // shut down on USB, even for a power-key or low-battery interrupt: the
+    // board would stay off until USB was unplugged and replugged (#106).
+    if (PMU.isVbusIn()) {
+        Serial.println("VBUS present -- staying awake instead of powering off.");
+        gVbusLost = false;
+        gVbusOffPending = false;
+        gIdleSince = millis();
+        gNetHold.store(false);
+        return;
+    }
+
+    Serial.println("Preparing PMU power-off (battery critical / idle).");
+    if (gTripPath[0]) endTrip(/*discardIfMicro=*/false);
+    stopNetworkTask();
+    // Keep the lock through power-off, so even a network task
+    // that never stopped can't reach the filesystem once it's unmounted.
+    FS_LOCK();
+    LittleFS.end();
+    // PMU shutdown cuts all main rails, including GPS ALDO4. Leave rails
+    // and awake IRQs alone until then, so a cancelled shutdown can resume.
+    // GPS backup RAM is supplied directly by the 18650, not VBACKUP.
+    Serial.println("PMU power-off: storage closed; checking VBUS before shutdown.");
+    if (!PMU.isVbusIn()) {
+        // Last possible level check: no log, delay or other work before
+        // shutdown. A VBUS edge between this read and the PMU's I2C
+        // shutdown write remains a race; software cannot make them atomic.
+        PMU.shutdown();
+        // XPowersLib only writes the shutdown bit. Allow the rails to fall
+        // before treating a returning call as failure; don't spin or leave
+        // the logger alive with storage unmounted if power stays on.
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        Serial.println("ERROR: PMU.shutdown() did not power off -- resuming logging.");
+    } else {
+        Serial.println("VBUS returned -- PMU power-off cancelled.");
+    }
+
+    // An upload that outlived the abort timeout may still own a File from
+    // before unmount. Never release it against remounted storage: keep the
+    // mutex/hold/abort in place and restart into an ordinary boot instead.
+    if (gNetBusy.load()) {
+        Serial.println("ERROR: upload task still busy after power-off recovery; restarting.");
+        ESP.restart();
+        return;
+    }
+    // Resume without formatting or changing the trip counter. The network
+    // stays held until storage is mounted again.
+    if (!LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL)) {
+        Serial.println("ERROR: storage remount after cancelled/failed power-off failed; restarting.");
+        ESP.restart();
+        return;
+    }
+    FS_UNLOCK();
+    gVbusLost = !PMU.isVbusIn();   // also catches a missed INSERT interrupt
+    gVbusOffPending = false;
+    gIdleSince = millis();        // failed power-off retries after the idle grace
+    gNetAbort.store(false);
+    gNetHold.store(false);
+    Serial.println("Power-off recovery complete; storage mounted, logging continues.");
+}
 
 static void pollPmu() {
     if (!gPmuIrqFlag) return;
@@ -1010,8 +1052,8 @@ static void pollPmu() {
             gVbusOffT0 = millis();
         }
     }
-    if (PMU.isPekeyLongPressIrq())    deepSleepForVbus();
-    if (PMU.isDropWarningLevel2Irq()) deepSleepForVbus();
+    if (PMU.isPekeyLongPressIrq())    powerOffForVbus();
+    if (PMU.isDropWarningLevel2Irq()) powerOffForVbus();
 
     PMU.clearIrqStatus();   // write-1-to-clear, or the line never re-fires
 }
@@ -1510,8 +1552,6 @@ static bool buildFix(Fix& fx) {
 // =================================================================
 // setup / loop
 // =================================================================
-static constexpr const char* TRIP_PARTITION_LABEL = "spiffs";
-
 static bool tripPartitionIsErased() {
     // Use the same data partition label as LittleFS, never a fixed address
     // or a sample of the partition: even its last byte could hold trip data.
@@ -1621,7 +1661,7 @@ void setup() {
     PMU.enableSystemVoltageMeasure();
     setupPmuIrq();
     // Seed VBUS state from hardware: a battery-only boot (e.g. wake via
-    // power key away from the car) must still hit the idle sleep timer.
+    // power key away from the car) must still hit the idle power-off timer.
     gVbusLost = !PMU.isVbusIn();
     gIdleSince = millis();
     Serial.printf("PMU ready, MAX-M10S GPS rail (ALDO4) on at 3.3 V, charge to %s. VBUS %s.\n",
@@ -1706,21 +1746,21 @@ void loop() {
     confirmVbusOff();
     serviceChargeTemp();
 
-    // Battery idle sleep: on battery with no trip in progress for
-    // IDLE_BATT_SLEEP_MS, deep sleep (GPS rail off, WiFi off). The 10 min
+    // Battery idle power-off: on battery with no trip in progress for
+    // IDLE_BATT_SLEEP_MS, PMU shutdown. The 10 min
     // grace gives the network task ample time to upload after a drive.
-    // VBUS insert wakes us when the car turns back on.
+    // A VBUS insert edge powers us on when the car turns back on.
     if (!gVbusLost || gState != IDLE) {
         gIdleSince = millis();
         gNetHold.store(false);
     } else if (millis() - gIdleSince >= IDLE_BATT_SLEEP_MS) {
         // Not under a running upload (issue #3): the network task finishes
-        // its current file and stops, and we sleep once it's idle. Logging
+        // its current file and stops, and we power off once it's idle. Logging
         // carries on while it finishes, and power or a trip coming back
         // cancels the wait. A file still going after NET_DRAIN_MS is cut off.
         if (!gNetHold.exchange(true) && gNetBusy.load())
-            Serial.println("Idle on battery -- letting the upload finish before sleeping.");
+            Serial.println("Idle on battery -- letting the upload finish before powering off.");
         if (!gNetBusy.load() || millis() - gIdleSince >= IDLE_BATT_SLEEP_MS + NET_DRAIN_MS)
-            deepSleepForVbus();
+            powerOffForVbus();
     }
 }

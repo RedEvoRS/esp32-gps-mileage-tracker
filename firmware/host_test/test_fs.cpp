@@ -45,15 +45,17 @@ static void resetWorld() {
     gNetBusy = false; gNetHold = false; gNetAbort = false;
     gNetLastAttemptMs = 0; gNetRetryMs = 0; gNetRetryNow = false; WiFi = WiFiStub();
     g_failMutexCreate = false; g_taskCreates = 0; g_restarts = 0;
-    gIdleSince = g_millis; g_deepSleeps = 0; g_lockDepth = 0;
-    g_delayHook = nullptr;
+    gIdleSince = g_millis; g_lockDepth = 0;
+    g_delayHook = nullptr; g_taskDelayHook = nullptr;
 }
 
-// Run loop() every 100 ms for `ms`, stopping at deep sleep (the stub returns
-// from it, but the real board never runs loop() again).
+// Run loop() every 100 ms for `ms`, stopping when simulated PMU power-off
+// ends the boot. A deliberately failed shutdown returns for recovery tests.
 static void loopFor(uint32_t ms) {
     uint32_t end = g_millis + ms;
-    while ((int32_t)(g_millis - end) < 0 && !g_deepSleeps) { g_millis += 100; loop(); }
+    try {
+        while ((int32_t)(g_millis - end) < 0) { g_millis += 100; loop(); }
+    } catch (const PoweredOff&) {}
 }
 
 // Advance the clock a second at a time with the die at `c`, servicing the
@@ -785,7 +787,7 @@ int main(int argc, char** argv) {
 
     // Issue #3. gNetBusy = true stands in for core 0 mid-upload; these
     // check the handshake, not real multicore timing.
-    printf("T30 idle sleep lets a running upload finish, then sleeps (#3)\n");
+    printf("T30 idle power-off lets a running upload finish (#3, #106)\n");
     {
         resetWorld();
         drive(15, 40); drive(0, 5);
@@ -794,42 +796,45 @@ int main(int argc, char** argv) {
         gIdleSince = g_millis;                       // as loop() last saw the trip
         gNetBusy = true;                             // uploading it
         loopFor(IDLE_BATT_SLEEP_MS + 1000);
-        CHECK(g_deepSleeps == 0 && gNetHold, "10 min: no sleep yet, network task told to stop");
+        CHECK(PMU.shutdownCalls == 0 && gNetHold, "10 min: no power-off yet, network task told to stop");
         CHECK(logHas("letting the upload finish"), "logged");
         loopFor(60000);
-        CHECK(g_deepSleeps == 0, "keeps waiting while the upload runs");
+        CHECK(PMU.shutdownCalls == 0, "keeps waiting while the upload runs");
         gNetBusy = false;                            // its file is done
         loopFor(1000);
-        CHECK(g_deepSleeps == 1 && !gNetAbort, "sleeps once it's idle, nothing cut off");
-        CHECK(!g_disk.mounted && g_lockDepth == 1, "storage unmounted, lock kept into sleep");
+        CHECK(PMU.shutdownCalls == 1 && !gNetAbort, "powers off once it's idle, nothing cut off");
+        CHECK(!g_disk.mounted && g_lockDepth == 1, "storage unmounted, lock kept through power-off");
 
         resetWorld();
+        PMU.vbusIn = false;
         gVbusLost = true; gNetBusy = true;
         loopFor(IDLE_BATT_SLEEP_MS + 1000);
-        CHECK(g_deepSleeps == 0 && gNetHold, "waiting on the upload");
+        CHECK(PMU.shutdownCalls == 0 && gNetHold, "waiting on the upload");
         vbus(true); loopFor(1000);
-        CHECK(!gVbusLost && !gNetHold && g_deepSleeps == 0, "car back on: wait cancelled, uploads resume");
+        CHECK(!gVbusLost && !gNetHold && PMU.shutdownCalls == 0, "car back on: wait cancelled, uploads resume");
     }
 
     printf("T31 an upload that won't finish is cut off, and storage stays locked (#3)\n");
     {
         resetWorld();
+        PMU.vbusIn = false;
         gVbusLost = true; gNetBusy = true;           // and it never finishes
         loopFor(IDLE_BATT_SLEEP_MS + NET_DRAIN_MS - 1000);
-        CHECK(g_deepSleeps == 0 && !gNetAbort, "waits out the drain limit");
+        CHECK(PMU.shutdownCalls == 0 && !gNetAbort, "waits out the drain limit");
         loopFor(2000 + NET_ABORT_MS);
-        CHECK(g_deepSleeps == 1 && gNetAbort, "then cuts the upload off and sleeps");
-        CHECK(logHas("sleeping anyway") && g_lockDepth == 1, "a stuck task still can't reach storage");
+        CHECK(PMU.shutdownCalls == 1 && gNetAbort, "then cuts the upload off and powers off");
+        CHECK(logHas("powering off with storage locked") && g_lockDepth == 1, "a stuck task still can't reach storage");
 
         resetWorld();                                // critical battery / power key
+        PMU.vbusIn = false;
         drive(15, 40); drive(0, 5);
         gNetBusy = true;
         uint32_t t0 = g_millis;
-        deepSleepForVbus();                          // as pollPmu() calls it
+        try { powerOffForVbus(); } catch (const PoweredOff&) {} // as pollPmu() calls it
         CHECK(gNetAbort && g_millis - t0 <= NET_ABORT_MS + 100, "upload cut off without waiting for it");
         auto v = tripFiles();
         CHECK(v.size() == 1 && wellFormedShape(g_disk.files[v[0]]), "trip finalized first");
-        CHECK(g_deepSleeps == 1 && g_lockDepth == 1, "asleep with storage locked");
+        CHECK(PMU.shutdownCalls == 1 && g_lockDepth == 1, "powered off with storage locked");
     }
 
     printf("T32 network task: stops between files, ends a cut-off body, starts nothing when held (#3)\n");
@@ -1423,6 +1428,101 @@ int main(int argc, char** argv) {
                   g_disk.mountAttempts == 0 && g_taskCreates == 0 && !PMU.aldo4,
                   "failed radio write or readback halts before GPS, storage or workers");
         }
+    }
+
+    printf("T48 power-off is cancelled on USB, including a late return without an IRQ (#106)\n");
+    {
+        for (bool critical : {false, true}) {
+            resetWorld(); drive(15, 40);
+            const std::string path = gTripPath;
+            PMU.criticalIrq = critical; PMU.longPressIrq = !critical; gPmuIrqFlag = true;
+            pollPmu();
+            CHECK(PMU.shutdownCalls == 0 && g_disk.mounted && g_lockDepth == 0 &&
+                  gState == ACTIVE && path == gTripPath,
+                  "power-key and critical-battery IRQs on USB keep the current trip running");
+        }
+        resetWorld(); drive(15, 40);
+        PMU.vbusIn = false; gVbusLost = true; PMU.aldo4 = true;
+        g_disk.onUnmount = [] { PMU.vbusIn = true; };  // no INSERT flag delivered
+        powerOffForVbus();
+        CHECK(PMU.shutdownCalls == 0 && logHas("power-off cancelled"),
+              "final level read catches USB returning after storage closes");
+        CHECK(!gVbusLost && !gVbusOffPending && !gNetHold && !gNetAbort &&
+              g_disk.mounted && g_lockDepth == 0 && PMU.aldo4,
+              "late return restores storage and network flags, leaving GPS powered");
+        CHECK(tripFiles().size() == 1 && wellFormedShape(g_disk.files.begin()->second),
+              "the finalized trip remains queued through cancellation");
+        drive(15, 40); endTrip(false);
+        CHECK(tripFiles().size() == 2, "logging resumes in a distinct trip file");
+        WiFi.scanSsids = {WIFI_SSID}; WiFi.connectionStatus = WL_CONNECTED; netCycle();
+        CHECK(g_httpRequests == 2 && tripFiles().empty(), "queued trips can upload after cancellation");
+
+        resetWorld(); PMU.vbusIn = false; gVbusLost = true; gNetBusy = true;
+        g_taskDelayHook = [](uint32_t) { PMU.vbusIn = true; gNetBusy = false; };
+        powerOffForVbus(); g_taskDelayHook = nullptr;
+        CHECK(PMU.shutdownCalls == 0 && !gNetHold && !gNetAbort && !gVbusLost && g_lockDepth == 0,
+              "USB returning during upload abort cancels power-off and resumes networking");
+    }
+
+    printf("T49 failed PMU power-off restores logging and handles recovery failures (#106)\n");
+    {
+        resetWorld(); drive(15, 40);
+        PMU.vbusIn = false; PMU.failShutdown = true;
+        PMU.onShutdown = [] {
+            CHECK(!PMU.vbusIn && !g_disk.mounted && g_lockDepth == 1 && gNetHold,
+                  "shutdown is requested only on battery with storage closed and locked");
+            CHECK(gState == IDLE && wellFormedShape(g_disk.files.begin()->second),
+                  "trip is complete before the PMU shutdown request");
+        };
+        uint32_t t0 = g_millis;
+        powerOffForVbus();
+        CHECK(PMU.shutdownCalls == 1 && g_millis - t0 >= 1000 && logHas("did not power off"),
+              "a returning shutdown gets time for rail collapse, then reports failure");
+        CHECK(gVbusLost && g_disk.mounted && !gNetHold && !gNetAbort && g_lockDepth == 0,
+              "failed shutdown stays up with storage and logging usable");
+        loopFor(1000);
+        CHECK(PMU.shutdownCalls == 1, "failed shutdown does not create a tight retry loop");
+        drive(15, 40); endTrip(false);
+        CHECK(tripFiles().size() == 2, "a new trip can record after failed power-off");
+
+        for (bool failedShutdown : {false, true}) {
+            resetWorld(); PMU.vbusIn = false; gNetBusy = true;
+            PMU.failShutdown = failedShutdown;
+            if (!failedShutdown) g_disk.onUnmount = [] { PMU.vbusIn = true; };
+            try { powerOffForVbus(); } catch (const Restarted&) {}
+            CHECK(g_restarts == 1 && gNetHold && gNetAbort && logHas("upload task still busy") &&
+                  !g_disk.mounted && g_lockDepth == 1 && g_disk.mountAttempts == 0 &&
+                  PMU.shutdownCalls == (failedShutdown ? 1 : 0),
+                  "a stuck upload restarts with storage locked, without remounting under its old file handle");
+        }
+
+        resetWorld(); drive(15, 40); PMU.vbusIn = false;
+        g_disk.onUnmount = [] { PMU.vbusIn = true; g_disk.failMount = true; };
+        try { powerOffForVbus(); } catch (const Restarted&) {}
+        CHECK(g_restarts == 1 && gNetHold && g_lockDepth == 1 &&
+              !g_disk.formatRequested && g_disk.formatAttempts == 0 &&
+              wellFormedShape(g_disk.files.begin()->second),
+              "failed recovery remount preserves the trip and restarts without formatting or releasing storage");
+    }
+
+    printf("T50 PMU power-off uses a full boot with filesystem/NVS persistence (#106)\n");
+    {
+        resetWorld(); drive(15, 40); PMU.vbusIn = false;
+        try { powerOffForVbus(); } catch (const PoweredOff&) {}
+        CHECK(PMU.shutdownCalls == 1 && !g_disk.mounted && g_lockDepth == 1,
+              "successful power-off ends this boot with storage locked");
+        const auto savedFiles = g_disk.files;
+        const auto savedPrefs = prefs.kv;
+        resetWorld();
+        g_disk.files = savedFiles; prefs.kv = savedPrefs;
+        gClockSet = false; gGpsClockSet = false; g_epochBaseMs = 0;
+        setup();
+        CHECK(g_disk.files == savedFiles && hasPending() && !gClockSet &&
+              gState == IDLE && logHas("Setup complete"),
+              "ordinary boot finds the queued trip without any retained RTC clock or trip state");
+        char nextPath[48]; makeTripPath(nextPath, sizeof(nextPath));
+        CHECK(!g_disk.files.count(nextPath) && prefs.kv["tripno"] == savedPrefs.at("tripno") + 1,
+              "Preferences retains the counter and the next trip cannot overwrite the previous one");
     }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);

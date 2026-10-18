@@ -25,6 +25,12 @@ There are two suites:
   the reset when a trip ends, scan cleanup, sleep holds, and clock
   wraparound. Boot tests inject mutex
   allocation failure and check that storage and workers never start.
+  Supreme boot tests verify the early LoRa ALDO3 disable/readback, Wire1
+  pins, GPS ALDO4/GPS_EN and disabled SD/VBACKUP supplies. Power-off tests
+  cover upload drain/abort, VBUS returning just before shutdown without an
+  IRQ, cancellation with usable storage and networking, a returning PMU
+  shutdown, recovery failures, and a full boot using only NVS/filesystem
+  persistence. These model control flow, not PMU timing or electrical rails.
   Provisioning tests read a separate raw partition model: an entirely
   erased partition completes first-boot setup, while a programmed bit
   anywhere, read errors, or missing storage prevents formatting. Format

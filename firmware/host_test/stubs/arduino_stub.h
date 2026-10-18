@@ -155,6 +155,7 @@ struct FakeDisk {
     bool failMount = false;
     int mountAttempts = 0;
     void (*onMount)() = nullptr;   // runs at each mount attempt
+    void (*onUnmount)() = nullptr; // power may return during shutdown preparation
     bool formatRequested = false;
     int formatAttempts = 0;
     bool failFormat = false;
@@ -244,7 +245,7 @@ struct LittleFSStub {
         g_disk.partitionLabel = partitionLabel;
         if (g_disk.onMount) g_disk.onMount();
         g_disk.formatRequested |= formatOnFail;
-        if (!g_disk.failMount) return true;
+        if (!g_disk.failMount) { g_disk.mounted = true; return true; }
         if (!formatOnFail) return false;
         g_disk.files.clear();
         return true;
@@ -257,7 +258,7 @@ struct LittleFSStub {
         g_disk.failMount = g_disk.failRemount;
         return true;
     }
-    void end() { g_disk.mounted = false; }
+    void end() { g_disk.mounted = false; if (g_disk.onUnmount) g_disk.onUnmount(); }
     bool exists(const char* path) {
         std::string pre = std::string(path) + "/";
         if (g_disk.files.count(path)) return true;
@@ -332,7 +333,8 @@ inline int xTaskCreatePinnedToCore(void (*)(void*), const char*, int, void*, int
 }
 inline unsigned g_stackHighWaterBytes = 4096;
 inline unsigned uxTaskGetStackHighWaterMark(void*) { return g_stackHighWaterBytes; }
-inline void vTaskDelay(uint32_t ms) { g_millis += ms; }
+inline void (*g_taskDelayHook)(uint32_t ms) = nullptr;
+inline void vTaskDelay(uint32_t ms) { g_millis += ms; if (g_taskDelayHook) g_taskDelayHook(ms); }
 #define pdMS_TO_TICKS(x) (x)
 
 // ---- hardware odds and ends (compile-only) ----------------------------------
@@ -351,8 +353,13 @@ extern TwoWire Wire, Wire1;
 #define XPOWERS_AXP2101_CHG_VOL_4V1 2
 // PMU: tests set vbusIn (the USB power level) and the latched VBUS
 // interrupt flags, then raise gPmuIrqFlag as the IRQ pin would.
+struct PoweredOff {};
 struct XPowersAXP2101 {
     bool vbusIn = true, removeIrq = false, insertIrq = false;
+    bool longPressIrq = false, criticalIrq = false;
+    bool failShutdown = false;
+    int shutdownCalls = 0;
+    void (*onShutdown)() = nullptr;
     bool aldo3 = true, aldo4 = false, bldo1 = true, vbackup = true;
     bool failRadioDisable = false, radioStuckOn = false;
     int aldo4Mv = 0;
@@ -382,11 +389,16 @@ struct XPowersAXP2101 {
     void enableBattDetection() {} void enableBattVoltageMeasure() {}
     void enableVbusVoltageMeasure() {} void enableSystemVoltageMeasure() {}
     void disableIRQ(uint32_t) {} void enableIRQ(uint32_t) {}
-    void clearIrqStatus() { removeIrq = insertIrq = false; }
+    void clearIrqStatus() { removeIrq = insertIrq = longPressIrq = criticalIrq = false; }
     uint32_t getIrqStatus() { return 0; }
     bool isVbusRemoveIrq() { return removeIrq; } bool isVbusInsertIrq() { return insertIrq; }
-    bool isPekeyLongPressIrq() { return false; } bool isDropWarningLevel2Irq() { return false; }
+    bool isPekeyLongPressIrq() { return longPressIrq; } bool isDropWarningLevel2Irq() { return criticalIrq; }
     bool isVbusIn() { return vbusIn; }
+    void shutdown() {
+        shutdownCalls++;
+        if (onShutdown) onShutdown();
+        if (!failShutdown) throw PoweredOff{};  // successful hardware power-off never resumes
+    }
 };
 // GPS UART: tests append NMEA/UBX bytes to rx and inspect what the sketch
 // sends in tx. Polling an empty port advances the clock 1 ms, so timeout
@@ -473,8 +485,3 @@ struct HTTPClient {
     }
     void end() {}
 };
-#define ESP_EXT1_WAKEUP_ALL_LOW 0
-inline void esp_sleep_enable_ext1_wakeup(uint64_t, int) {}
-// Returns, unlike the real call, so tests can count it and look around.
-inline int g_deepSleeps = 0;
-inline void esp_deep_sleep_start() { g_deepSleeps++; }
