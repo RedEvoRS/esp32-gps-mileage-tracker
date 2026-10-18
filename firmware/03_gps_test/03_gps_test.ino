@@ -1,199 +1,480 @@
 // =================================================================
-// Stage 3: GPS Fix Test
+// Stage 3: Supreme MAX-M10S GPS / Rail / Legacy UBX Test
 // =================================================================
-// Purpose: Enable GPS power (via the AXP2101 PMU from Stage 2),
-// read NMEA data from the NEO-M8N module, and display parsed
-// position data when a satellite fix is acquired.
+// Purpose: Make #105's GPS wiring/backup checks and #108's UBX checks
+// testable without changing Stage 4. No receiver configuration at boot.
+// Requires XPowersLib 0.3.3 and TinyGPSPlus 1.0.3 (ESP32 core 3.3.11).
+// What to expect: boot rail snapshot, ALDO3 OFF, ALDO4 power cycle at
+// 3.3 V, GPS_EN HIGH, UART RX9/TX8 at 9600; probe other bauds if silent.
+// Summary every 2 s: fresh fix, satellites USED, HDOP, NMEA counts,
+// checksum failures, PPS rate on GPIO6, and time to first fix (TTFF).
+// Use open sky and a connected GPS antenna. No fix indoors is normal.
+// Coordinates are OFF by default: serial logs may be pasted into issues.
+// l opts into coordinates; r opts into raw NMEA (also contains location).
+// h lists keys. 4 toggles GPS rail; e toggles GPS_EN; b toggles VBACKUP.
+// 3 then uppercase Y within 10 s enables ALDO3 ONLY WITH LoRa antenna.
+// u sends Stage 4's legacy CFG-MSG x4 + CFG-NAV5 bytes; expect NAKs or
+// silence from M10S. v polls MON-VER for software/hardware/extensions.
 //
-// Required libraries (install all via Library Manager):
-//   1. XPowersLib by lewisxhe  (same as Stage 2)
-//   2. TinyGPSPlus by Mikal Hart
-//      Search for "TinyGPSPlus" in Library Manager and install it
+// Bench sequence: with ALDO3 OFF, confirm NMEA at ALDO4 ON; turn ALDO4
+// OFF and check it goes silent. If testing the alternate rail, attach
+// LoRa antenna, use 3/Y, then 4 to compare. Turn ALDO3 OFF afterwards.
+// Compare ALDO4 off/on TTFF with b OFF and b ON; this tests backup
+// retention, not just its charge-enable register. A reset restarts the
+// experiment. GPS_EN HIGH follows LilyGO, but #105 must confirm its
+// function and polarity specifically on the MAX-M10S version.
 //
-// CRITICAL: GPS needs open sky to get a fix!
-//   - This will NOT work indoors at your desk
-//   - Take the board outside or place it on a windowsill
-//   - Cold start (first ever fix) takes 30-60 seconds outdoors
-//   - Subsequent starts are faster because the module caches data
+// Supreme upload settings (for the owner when the board arrives):
+//   Before ANY power, attach the 915 MHz LoRa antenna: factory firmware
+//   may transmit. Back up the factory flash before the first upload.
+//   Arduino IDE: ESP32S3 Dev Module, USB CDC On Boot Enabled,
+//   USB Mode Hardware CDC and JTAG, Flash Size 8 MB, PSRAM QSPI PSRAM.
+//   CLI FQBN (ESP32 core 3.3.11):
+//   esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled
+//   Select the Supreme's port, then Upload. If native USB disappears,
+//   hold BOOT, tap RST, release BOOT; select the new port and retry.
+//   QSPI follows LilyGO's boards/t-beams3-supreme.json (qio_qspi), but is
+//   unconfirmed: use Stage 1's PSRAM size; if zero try OPI (PSRAM=opi).
 //
-// What to expect:
-//   - "Chars received from GPS:" should increment (proves UART works)
-//   - "Satellites visible:" should climb from 0 as module acquires
-//   - Eventually you'll see lat/lon coordinates when fix is achieved
-//
-// Troubleshooting:
-//   - If "Chars received" stays at 0: PMU didn't enable GPS power,
-//     or UART pins are wrong for your board revision
-//   - If chars increment but no fix after 5+ min outdoors: antenna
-//     connection may be loose, check the IPEX GPS antenna cable
+// Pin/rail/baud source: Xinyuan-LilyGO/LilyGo-LoRa-Series, commit
+// 1991b1ed70915d4f246b841f99f6027166ea7330, examples/Factory/utilities.h
+// and LoRaBoards.cpp (Supreme). DCDC1/core rails and BLDO1/SD untouched.
+// No LoRa initialization. VBACKUP is left as found until the b key.
 // =================================================================
 
 #include <Wire.h>
 #include <XPowersLib.h>
 #include <TinyGPSPlus.h>
 
-// -----------------------------------------------------------------
-// Pin definitions for T-Beam V1.2
-// -----------------------------------------------------------------
-
-// I2C pins for the AXP2101 power manager
-#define I2C_SDA 21
-#define I2C_SCL 22
-
-// UART pins for the NEO-M8N GPS module
-// GPIO 34 receives data FROM the GPS (GPS TX → ESP32 RX)
-// GPIO 12 sends data TO the GPS (ESP32 TX → GPS RX)
-#define GPS_RX_PIN 34
-#define GPS_TX_PIN 12
-#define GPS_BAUD   9600
-
-// -----------------------------------------------------------------
-// Global objects
-// -----------------------------------------------------------------
-
+static const int PMU_SDA = 42, PMU_SCL = 41, PMU_IRQ = 40;
+static const int GPS_RX = 9, GPS_TX = 8, GPS_EN = 7, GPS_PPS = 6;
+static const uint32_t BAUDS[] = {9600, 38400, 115200, 19200, 57600};
 XPowersAXP2101 PMU;
-TinyGPSPlus    gps;
-HardwareSerial GPSSerial(1);  // Use hardware UART1 for GPS
+TinyGPSPlus gps;
+HardwareSerial GPSSerial(1);
+bool rawEcho = false, showCoordinates = false, gpsEnHigh = true;
+bool radioConfirm = false, baudLocked = false, firstFix = false;
+bool gpsRailOn = false;
+uint32_t confirmStarted = 0, gpsPoweredAt = 0, firstFixMs = 0;
+uint32_t probeStarted = 0, lastNmeaAt = 0;
+size_t baudIndex = 0;
+volatile uint32_t ppsPulses = 0;
+portMUX_TYPE ppsMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Track whether we've ever gotten a fix, so we can print a
-// celebratory message the first time it happens
-bool firstFixAchieved = false;
+// A bounded UBX decoder checks BOTH checksum bytes before accepting ACK
+// or MON-VER. Binary responses are not passed to the NMEA decoder/echo.
+uint8_t ubxState = 0, ubxClass = 0, ubxId = 0, ubxA = 0, ubxB = 0;
+uint8_t ubxReceivedA = 0;
+uint16_t ubxLength = 0, ubxOffset = 0;
+uint8_t ubxPayload[1024];
+uint32_t ubxLastByte = 0;
+uint8_t ackClass = 0, ackId = 0;
+bool awaitingAck = false, awaitingVersion = false, versionReceived = false;
+int ackResult = -1;
 
-void setup() {
-    Serial.begin(115200);
-    delay(2000);
+static void printRail(const char* name, bool enabled, uint16_t millivolts) {
+    // These are register setpoints, not measured output voltages.
+    Serial.printf("  %-8s %-3s %u mV setpoint\n", name, enabled ? "ON" : "OFF", millivolts);
+}
 
-    Serial.println("========================================");
-    Serial.println("  Stage 3: GPS Fix Test");
-    Serial.println("========================================");
-    Serial.println();
+static void printStatus() {
+    Serial.println("Rail enable states and programmed voltages (not measurements):");
+    printRail("DCDC1", PMU.isEnableDC1(), PMU.getDC1Voltage());
+    printRail("DCDC2", PMU.isEnableDC2(), PMU.getDC2Voltage());
+    printRail("DCDC3", PMU.isEnableDC3(), PMU.getDC3Voltage());
+    printRail("DCDC4", PMU.isEnableDC4(), PMU.getDC4Voltage());
+    printRail("DCDC5", PMU.isEnableDC5(), PMU.getDC5Voltage());
+    printRail("ALDO1", PMU.isEnableALDO1(), PMU.getALDO1Voltage());
+    printRail("ALDO2", PMU.isEnableALDO2(), PMU.getALDO2Voltage());
+    printRail("ALDO3", PMU.isEnableALDO3(), PMU.getALDO3Voltage());
+    printRail("ALDO4", PMU.isEnableALDO4(), PMU.getALDO4Voltage());
+    printRail("BLDO1", PMU.isEnableBLDO1(), PMU.getBLDO1Voltage());
+    printRail("BLDO2", PMU.isEnableBLDO2(), PMU.getBLDO2Voltage());
+    printRail("DLDO1", PMU.isEnableDLDO1(), PMU.getDLDO1Voltage());
+    printRail("DLDO2", PMU.isEnableDLDO2(), PMU.getDLDO2Voltage());
+    printRail("CPUSLDO", PMU.isEnableCPUSLDO(), PMU.getCPUSLDOVoltage());
+    printRail("VBACKUP", PMU.isEnableButtonBatteryCharge(), PMU.getButtonBatteryVoltage());
+    Serial.println("  VBACKUP = button-battery charge enable/target; actual GPS backup wiring unknown.");
+    Serial.printf("VBUS present=%s, %u mV | battery present=%s, %u mV, %d%%\n",
+                  PMU.isVbusIn() ? "yes" : "no", PMU.getVbusVoltage(),
+                  PMU.isBatteryConnect() ? "yes" : "no", PMU.getBattVoltage(),
+                  PMU.getBatteryPercent());
+    Serial.printf("Charging=%s (state %d) | system=%u mV | PMU IRQ GPIO %d=%d\n",
+                  PMU.isCharging() ? "yes" : "no", (int)PMU.getChargerStatus(),
+                  PMU.getSystemVoltage(), PMU_IRQ, digitalRead(PMU_IRQ));
+    Serial.println("  Charge states: 0 trickle, 1 precharge, 2 constant current, 3 constant voltage, 4 done, 5 stopped.");
+    // XPowersLib returns the raw bitmask, not a single enumerated cause.
+    int on = (int)PMU.getPowerOnSource(), off = (int)PMU.getPowerOffSource();
+    Serial.printf("Power-on source=0x%02X | power-off source=0x%02X\n", on, off);
+    Serial.println("  ON bits: 5 POWERON high, 4 battery insert, 3 battery charged >3.3 V,");
+    Serial.println("           2 VBUS insert, 1 IRQ low, 0 POWERON low; zero = unknown.");
+    Serial.println("  OFF bits: 7 overtemp, 6 DC overvolt, 5 DC undervolt, 4 VBUS overvolt,");
+    Serial.println("            3 system undervolt, 2 POWERON held low, 1 software, 0 POWERON pull-down.");
+}
 
-    // --- Initialize the PMU (same as Stage 2) ---
-    Wire.begin(I2C_SDA, I2C_SCL);
-    if (!PMU.begin(Wire, AXP2101_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {
-        Serial.println("ERROR: Failed to find AXP2101!");
-        Serial.println("Did Stage 2 work? Check connections.");
-        while (1) delay(1000);
+static void ARDUINO_ISR_ATTR onPps() {
+    portENTER_CRITICAL_ISR(&ppsMux);
+    ppsPulses = ppsPulses + 1;
+    portEXIT_CRITICAL_ISR(&ppsMux);
+}
+
+static void printVersionField(const char* label, const uint8_t* bytes, size_t length) {
+    Serial.print(label);
+    for (size_t i = 0; i < length && bytes[i] != 0; ++i) {
+        Serial.write(bytes[i] >= 32 && bytes[i] <= 126 ? bytes[i] : '.');
     }
-    Serial.println("AXP2101 initialized.");
-
-    // Enable GPS power rail (ALDO3 on the T-Beam V1.2 -- see Stage 2)
-    PMU.setALDO3Voltage(3300);
-    PMU.enableALDO3();
-    Serial.println("GPS power enabled (ALDO3 → 3.3V)");
-
-    // Give the GPS module a moment to boot up after power is applied.
-    // The NEO-M8N needs a brief moment to initialize its internal
-    // circuits before it starts sending NMEA data.
-    delay(500);
-
-    // --- Start the GPS UART ---
-    // This opens a hardware serial port on the specified pins.
-    // Hardware UART is rock solid at 9600 baud — no bit-banging issues.
-    GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-    Serial.println("GPS serial opened at 9600 baud");
-    Serial.println();
-    Serial.println("Waiting for GPS data...");
-    Serial.println("(Take the board outside for a satellite fix!)");
     Serial.println();
 }
 
+static void handleUbx() {
+    if (awaitingAck && ubxClass == 0x05 && ubxLength == 2 &&
+        ubxPayload[0] == ackClass && ubxPayload[1] == ackId) {
+        if (ubxId == 0x01) ackResult = 1;
+        if (ubxId == 0x00) ackResult = 0;
+    }
+    if (awaitingVersion && ubxClass == 0x0A && ubxId == 0x04) {
+        if (ubxLength < 40 || (ubxLength - 40) % 30 != 0) {
+            Serial.println("MON-VER: malformed length; ignoring.");
+            return;
+        }
+        printVersionField("MON-VER software: ", ubxPayload, 30);
+        printVersionField("MON-VER hardware: ", ubxPayload + 30, 10);
+        for (size_t offset = 40; offset < ubxLength; offset += 30) {
+            printVersionField("MON-VER extension: ", ubxPayload + offset, 30);
+        }
+        versionReceived = true;
+    }
+}
+
+static void feedNmea(uint8_t byte) {
+    if (rawEcho) Serial.write(byte);
+    if (!gps.encode((char)byte)) return;
+    lastNmeaAt = millis();  // Only a complete, checksum-valid sentence gets here.
+    if (!baudLocked) {
+        baudLocked = true;
+        Serial.printf("\nValid NMEA detected at %lu baud.\n", (unsigned long)BAUDS[baudIndex]);
+    }
+    if (gpsRailOn && !firstFix && gps.location.isUpdated() &&
+        gps.location.isValid() && gps.location.age() < 1000) {
+        firstFix = true;
+        firstFixMs = millis() - gpsPoweredAt;
+        Serial.printf("\nFIRST FIX: TTFF %lu ms since ALDO4 switched ON.\n", (unsigned long)firstFixMs);
+    }
+}
+
+static void receiveByte(uint8_t byte) {
+    // An incomplete/corrupted frame must not swallow NMEA indefinitely.
+    if (ubxState && millis() - ubxLastByte > 500) ubxState = 0;
+    ubxLastByte = millis();
+    switch (ubxState) {
+        case 0:
+            if (byte == 0xB5) ubxState = 1;
+            else feedNmea(byte);
+            return;
+        case 1:
+            if (byte == 0x62) { ubxState = 2; ubxA = ubxB = 0; }
+            else { ubxState = byte == 0xB5 ? 1 : 0; if (!ubxState) feedNmea(byte); }
+            return;
+        case 2: ubxClass = byte; ubxState = 3; break;
+        case 3: ubxId = byte; ubxState = 4; break;
+        case 4: ubxLength = byte; ubxState = 5; break;
+        case 5:
+            ubxLength |= (uint16_t)byte << 8;
+            ubxOffset = 0;
+            ubxState = ubxLength ? 6 : 7;
+            break;
+        case 6:
+            if (ubxOffset < sizeof(ubxPayload)) ubxPayload[ubxOffset] = byte;
+            if (++ubxOffset == ubxLength) ubxState = 7;
+            break;
+        case 7: ubxReceivedA = byte; ubxState = 8; return;
+        case 8:
+            if (ubxReceivedA == ubxA && byte == ubxB) {
+                if (ubxLength <= sizeof(ubxPayload)) handleUbx();
+                else Serial.println("UBX frame too large for diagnostic buffer; ignored.");
+            } else Serial.println("UBX checksum failed; frame ignored.");
+            ubxState = 0;
+            return;
+    }
+    ubxA += byte;
+    ubxB += ubxA;
+}
+
+static void pumpGps() {
+    while (GPSSerial.available()) receiveByte((uint8_t)GPSSerial.read());
+}
+
+static void resetDecoder() {
+    // Do not allow a buffered/pre-power-cycle fix to satisfy the new TTFF.
+    while (GPSSerial.available()) GPSSerial.read();
+    gps = TinyGPSPlus();
+    ubxState = 0;
+    lastNmeaAt = 0;
+    baudLocked = false;
+    probeStarted = millis();
+}
+
+static void selectBaud(size_t index) {
+    baudIndex = index;
+    GPSSerial.end();
+    GPSSerial.begin(BAUDS[index], SERIAL_8N1, GPS_RX, GPS_TX);
+    resetDecoder();
+    Serial.printf("Probing GPS RX9/TX8 at %lu baud (4 s window)...\n", (unsigned long)BAUDS[index]);
+}
+
+static void checkBaud() {
+    if (baudLocked || millis() - probeStarted < 4000) return;
+    Serial.printf("No valid NMEA at %lu baud.\n", (unsigned long)BAUDS[baudIndex]);
+    selectBaud((baudIndex + 1) % (sizeof(BAUDS) / sizeof(BAUDS[0])));
+}
+
+static void ubxSend(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t length) {
+    // Same frame and payload bytes as Stage 4; zero length is a poll.
+    uint8_t header[6] = {0xB5, 0x62, cls, id, (uint8_t)length, (uint8_t)(length >> 8)};
+    uint8_t a = 0, b = 0;
+    for (int i = 2; i < 6; ++i) { a += header[i]; b += a; }
+    for (uint16_t i = 0; i < length; ++i) { a += payload[i]; b += a; }
+    GPSSerial.write(header, sizeof(header));
+    if (length) GPSSerial.write(payload, length);
+    GPSSerial.write(a);
+    GPSSerial.write(b);
+}
+
+static int ubxCommand(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t length) {
+    // Stage 4's policy: three attempts, 300 ms each, stop on ACK or NAK.
+    pumpGps();
+    ackClass = cls;
+    ackId = id;
+    awaitingAck = true;
+    ackResult = -1;
+    for (int attempt = 0; attempt < 3 && ackResult < 0; ++attempt) {
+        ubxSend(cls, id, payload, length);
+        uint32_t sentAt = millis();
+        while (ackResult < 0 && millis() - sentAt < 300) { pumpGps(); delay(1); }
+    }
+    awaitingAck = false;
+    return ackResult;
+}
+
+static const char* ackText(int result) {
+    return result == 1 ? "ACK" : result == 0 ? "NAK" : "no answer";
+}
+
+static void testLegacyConfig() {
+    Serial.println("Sending Stage 4 legacy config. M10S is expected to NAK or stay silent (#108).");
+    Serial.println("If accepted, these RAM settings silence GLL/GSA/GSV/VTG and select automotive.");
+    static const uint8_t silence[] = {0x01, 0x02, 0x03, 0x05};
+    static const char* names[] = {"GLL", "GSA", "GSV", "VTG"};
+    for (size_t i = 0; i < sizeof(silence); ++i) {
+        uint8_t payload[3] = {0xF0, silence[i], 0};
+        int result = ubxCommand(0x06, 0x01, payload, sizeof(payload));
+        Serial.printf("CFG-MSG %s: %s\n", names[i], ackText(result));
+    }
+    // Exactly configureGps()'s 36 bytes: mask bit 0, dynModel=4, rest zero.
+    uint8_t nav5[36] = {0};
+    nav5[0] = 0x01;
+    nav5[2] = 4;
+    int result = ubxCommand(0x06, 0x24, nav5, sizeof(nav5));
+    Serial.printf("CFG-NAV5 automotive: %s\n", ackText(result));
+    // Unlike Stage 4's early exit, diagnostics try every message even if
+    // the first is silent, so every requested result appears in the log.
+}
+
+static void pollVersion() {
+    pumpGps();
+    awaitingVersion = true;
+    versionReceived = false;
+    ubxSend(0x0A, 0x04, nullptr, 0);  // UBX-MON-VER poll.
+    uint32_t sentAt = millis();
+    while (!versionReceived && millis() - sentAt < 2000) { pumpGps(); delay(1); }
+    awaitingVersion = false;
+    if (!versionReceived) Serial.println("MON-VER: no valid answer within 2 s. Check baud, TX8, GPS power/EN.");
+}
+
+static void toggleGpsPower() {
+    bool turnOn = !PMU.isEnableALDO4();
+    resetDecoder();
+    bool ok;
+    if (turnOn) {
+        ok = PMU.setALDO4Voltage(3300);
+        ok &= PMU.enableALDO4();
+        gpsPoweredAt = millis();
+        firstFix = false;
+        firstFixMs = 0;
+    } else ok = PMU.disableALDO4();
+    gpsRailOn = PMU.isEnableALDO4();
+    Serial.printf("ALDO4 requested %s: %s, readback=%s, %u mV\n",
+                  turnOn ? "ON" : "OFF", ok ? "OK" : "ERROR",
+                  gpsRailOn ? "ON" : "OFF", PMU.getALDO4Voltage());
+    if (turnOn && gpsRailOn) Serial.println("TTFF restarted from ALDO4 ON. Compare b OFF/ON with equal off intervals.");
+    if (!turnOn) Serial.println("ALDO4 OFF: check NMEA/PPS stop. Unexpected continuing data is useful rail evidence.");
+    // Keep receiving even when ALDO4 is off: this is a rail-discovery test.
+    // Restart the probe window to give the current baud a full 4 seconds.
+    probeStarted = millis();
+}
+
+static void toggleBackup() {
+    bool turnOn = !PMU.isEnableButtonBatteryCharge();
+    bool ok;
+    if (turnOn) {
+        // Same calls/target as Stage 4. LilyGO disables VBACKUP in its
+        // Supreme setup; whether this pin backs up GPS needs measurement.
+        ok = PMU.setButtonBatteryChargeVoltage(3300);
+        ok &= PMU.enableButtonBatteryCharge();
+    } else ok = PMU.disableButtonBatteryCharge();
+    Serial.printf("VBACKUP charge requested %s: %s, readback=%s, target=%u mV\n",
+                  turnOn ? "ON" : "OFF", ok ? "OK" : "ERROR",
+                  PMU.isEnableButtonBatteryCharge() ? "ON" : "OFF", PMU.getButtonBatteryVoltage());
+    Serial.println("This is charge control, not proof of GPS backup supply. Compare ALDO4-cycle TTFF.");
+}
+
+static void printHelp() {
+    Serial.println("Keys: h help | r raw NMEA (includes private coordinates!) | l coordinates (default OFF)");
+    Serial.println("      4 ALDO4 GPS power/TTFF reset | e GPS_EN HIGH/LOW | b VBACKUP charge toggle");
+    Serial.println("      3 ALDO3 LoRa toggle: ON requires 3 then uppercase Y within 10 s and antenna");
+    Serial.println("      u Stage 4 legacy UBX config | v UBX-MON-VER | p rails/power status");
+    Serial.println("Counters reset on baud/power/EN changes; TTFF resets only on ALDO4 ON.");
+    Serial.println("For #105: compare NMEA/PPS with ALDO4 off, then separately ALDO3 off.");
+}
+
+static void handleKey(char key) {
+    if (key == '\r' || key == '\n') return;
+    if (radioConfirm) {
+        radioConfirm = false;
+        if (key == 'Y' && millis() - confirmStarted < 10000) {
+            bool ok = PMU.setALDO3Voltage(3300);
+            ok &= PMU.enableALDO3();
+            Serial.printf("ALDO3 LoRa requested ON at 3300 mV: %s, readback=%s\n",
+                          ok ? "OK" : "ERROR", PMU.isEnableALDO3() ? "ON" : "OFF");
+            resetDecoder();
+        } else Serial.println("ALDO3 enable cancelled.");
+        return;
+    }
+    switch (key) {
+        case 'h': printHelp(); break;
+        case 'p': printStatus(); break;
+        case 'r':
+            rawEcho = !rawEcho;
+            Serial.println(rawEcho ? "WARNING: raw NMEA ON includes coordinates. Redact before sharing logs!" : "Raw NMEA OFF.");
+            break;
+        case 'l':
+            showCoordinates = !showCoordinates;
+            Serial.println(showCoordinates ? "Coordinates ON: private location, redact before sharing logs!" : "Parsed coordinates OFF. Raw echo is controlled separately by r.");
+            break;
+        case '4': toggleGpsPower(); break;
+        case 'e':
+            gpsEnHigh = !gpsEnHigh;
+            digitalWrite(GPS_EN, gpsEnHigh ? HIGH : LOW);
+            resetDecoder();
+            Serial.printf("GPS_EN GPIO7=%s. Polarity/function on MAX-M10S is a bench check.\n", gpsEnHigh ? "HIGH" : "LOW");
+            break;
+        case 'b': toggleBackup(); break;
+        case '3':
+            if (PMU.isEnableALDO3()) {
+                bool ok = PMU.disableALDO3();
+                Serial.printf("ALDO3 LoRa requested OFF: %s, readback=%s\n", ok ? "OK" : "ERROR", PMU.isEnableALDO3() ? "ON" : "OFF");
+                resetDecoder();
+            } else {
+                Serial.println("WARNING: ALDO3 powers SX1262 LoRa. Attach the 915 MHz LoRa antenna BEFORE enabling!");
+                Serial.println("Press uppercase Y within 10 s ONLY with antenna attached; any other key cancels.");
+                radioConfirm = true;
+                confirmStarted = millis();
+            }
+            break;
+        case 'u': testLegacyConfig(); break;
+        case 'v': pollVersion(); break;
+        default: Serial.println("Unknown key; h shows help."); break;
+    }
+}
+
+static void printSummary(uint32_t elapsedMs) {
+    static uint32_t previousPulses = 0;
+    portENTER_CRITICAL(&ppsMux);
+    uint32_t pulses = ppsPulses;
+    portEXIT_CRITICAL(&ppsMux);
+    float ppsRate = (pulses - previousPulses) * 1000.0f / elapsedMs;
+    previousPulses = pulses;
+    bool freshFix = gps.location.isValid() && gps.location.age() < 3000;
+    Serial.printf("[%lus] baud=%lu NMEA=%s | fix=%s | sats=",
+                  (unsigned long)(millis() / 1000), (unsigned long)BAUDS[baudIndex],
+                  baudLocked && millis() - lastNmeaAt < 3000 ? "fresh" : "silent/probing",
+                  freshFix ? "valid/fresh" : "none/stale");
+    if (gps.satellites.isValid() && gps.satellites.age() < 3000) Serial.print(gps.satellites.value());
+    else Serial.print("n/a");
+    Serial.print(" | HDOP=");
+    if (gps.hdop.isValid() && gps.hdop.age() < 3000) Serial.print(gps.hdop.hdop(), 2);
+    else Serial.print("n/a");
+    Serial.printf(" | chars=%lu sentences=%lu withFix=%lu checksumFail=%lu | PPS=%.2f/s (%lu total) | TTFF=",
+                  (unsigned long)gps.charsProcessed(), (unsigned long)gps.passedChecksum(),
+                  (unsigned long)gps.sentencesWithFix(), (unsigned long)gps.failedChecksum(),
+                  ppsRate, (unsigned long)pulses);
+    if (!gpsRailOn) Serial.println("ALDO4 OFF");
+    else if (firstFix) Serial.printf("%lu ms\n", (unsigned long)firstFixMs);
+    else Serial.printf("waiting (%lu ms since ALDO4 ON)\n", (unsigned long)(millis() - gpsPoweredAt));
+    if (showCoordinates && freshFix) {
+        Serial.printf("  PRIVATE coordinates: %.6f, %.6f\n", gps.location.lat(), gps.location.lng());
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    uint32_t started = millis();
+    while (!Serial && millis() - started < 3000) delay(10);
+    Serial.println("\nStage 3: Supreme MAX-M10S GPS bring-up");
+    Serial.println("Coordinates and raw NMEA OFF: logs may be shared publicly; location is private.");
+    Wire1.begin(PMU_SDA, PMU_SCL);
+    Wire1.setTimeOut(50);
+    pinMode(PMU_IRQ, INPUT);
+    if (!PMU.begin(Wire1, AXP2101_SLAVE_ADDRESS, PMU_SDA, PMU_SCL)) {
+        Serial.println("ERROR: AXP2101 missing at Wire1 42/41, 0x34. No rail changes made.");
+        while (true) delay(1000);
+    }
+    Serial.println("BOOT SNAPSHOT before sketch rail/ADC changes (ADC may be disabled/stale).");
+    printStatus();
+    bool ok = PMU.disableALDO3();
+    if (!ok || PMU.isEnableALDO3()) {
+        Serial.println("ERROR: cannot verify ALDO3 OFF. Attach LoRa antenna; stopping.");
+        while (true) delay(1000);
+    }
+    // Establish a known OFF -> ON edge; boot may have left GPS powered.
+    ok = PMU.disableALDO4();
+    if (!ok || PMU.isEnableALDO4()) {
+        Serial.println("ERROR: cannot switch ALDO4 OFF for a known TTFF epoch; stopping.");
+        while (true) delay(1000);
+    }
+    delay(250);
+    pinMode(GPS_EN, OUTPUT);
+    digitalWrite(GPS_EN, HIGH);  // LilyGO beginGPS(): HIGH; #105 must confirm for MAX-M10S.
+    pinMode(GPS_PPS, INPUT);
+    attachInterrupt(digitalPinToInterrupt(GPS_PPS), onPps, RISING);
+    selectBaud(0);
+    toggleGpsPower();
+    if (!gpsRailOn || PMU.getALDO4Voltage() != 3300) {
+        Serial.println("ERROR: cannot verify GPS ALDO4 ON at 3300 mV; stopping.");
+        while (true) delay(1000);
+    }
+    ok = PMU.enableVbusVoltageMeasure();
+    ok &= PMU.enableBattVoltageMeasure();
+    ok &= PMU.enableSystemVoltageMeasure();
+    if (!ok) Serial.println("WARNING: could not enable all voltage measurements.");
+    // No backup/charger changes at boot: b makes the backup experiment explicit.
+    printStatus();
+    printHelp();
+}
+
 void loop() {
-    // -----------------------------------------------------------------
-    // Core GPS read loop
-    // -----------------------------------------------------------------
-    // Every byte that arrives from the GPS module gets fed into
-    // TinyGPSPlus, which accumulates characters until it has a
-    // complete NMEA sentence, then parses it into structured data.
-    while (GPSSerial.available() > 0) {
-        char c = GPSSerial.read();
-        gps.encode(c);
-
-        // Uncomment the line below to see raw NMEA sentences for debugging.
-        // This is very verbose but useful if you suspect the GPS module is
-        // sending corrupted data or an unexpected format.
-        // Serial.write(c);
+    pumpGps();
+    if (radioConfirm && millis() - confirmStarted >= 10000) {
+        radioConfirm = false;
+        Serial.println("ALDO3 enable confirmation expired.");
     }
-
-    // -----------------------------------------------------------------
-    // Status update every 2 seconds
-    // -----------------------------------------------------------------
-    static unsigned long lastPrint = 0;
-    if (millis() - lastPrint > 2000) {
-        lastPrint = millis();
-
-        // charsProcessed tells us if the GPS is even talking to us.
-        // If this stays at 0, the UART wiring or GPS power is wrong.
-        Serial.print("[");
-        Serial.print(millis() / 1000);
-        Serial.print("s] ");
-
-        Serial.print("Chars from GPS: ");
-        Serial.print(gps.charsProcessed());
-
-        Serial.print(" | Sentences parsed: ");
-        Serial.print(gps.sentencesWithFix());
-
-        Serial.print(" | Satellites: ");
-        Serial.print(gps.satellites.value());
-
-        if (gps.location.isValid()) {
-            // We have a fix! Print the coordinates.
-            if (!firstFixAchieved) {
-                firstFixAchieved = true;
-                Serial.println();
-                Serial.println("  *** FIRST GPS FIX ACQUIRED! ***");
-            }
-
-            Serial.println();
-            Serial.print("  Lat:      ");
-            Serial.println(gps.location.lat(), 6);
-            Serial.print("  Lon:      ");
-            Serial.println(gps.location.lng(), 6);
-            Serial.print("  Alt:      ");
-            Serial.print(gps.altitude.meters(), 1);
-            Serial.println(" m");
-            Serial.print("  Speed:    ");
-            Serial.print(gps.speed.mph(), 1);
-            Serial.println(" mph");
-            Serial.print("  Course:   ");
-            Serial.print(gps.course.deg(), 1);
-            Serial.println(" deg");
-            Serial.print("  HDOP:     ");
-            Serial.println(gps.hdop.hdop(), 2);
-
-            // Print the GPS time (UTC)
-            if (gps.date.isValid() && gps.time.isValid()) {
-                Serial.print("  GPS Time: ");
-                Serial.print(gps.date.year());
-                Serial.print("-");
-                if (gps.date.month() < 10) Serial.print("0");
-                Serial.print(gps.date.month());
-                Serial.print("-");
-                if (gps.date.day() < 10) Serial.print("0");
-                Serial.print(gps.date.day());
-                Serial.print("T");
-                if (gps.time.hour() < 10) Serial.print("0");
-                Serial.print(gps.time.hour());
-                Serial.print(":");
-                if (gps.time.minute() < 10) Serial.print("0");
-                Serial.print(gps.time.minute());
-                Serial.print(":");
-                if (gps.time.second() < 10) Serial.print("0");
-                Serial.print(gps.time.second());
-                Serial.println("Z");
-            }
-        } else {
-            // Still waiting for a fix
-            Serial.println(" | No fix yet");
-        }
-
-        // Warn if we're not receiving any data at all
-        if (gps.charsProcessed() < 10) {
-            Serial.println("  WARNING: No data from GPS module!");
-            Serial.println("  Check: Is GPS power enabled? (Stage 2)");
-            Serial.println("  Check: Are UART pins correct for your board?");
-            Serial.println("  Check: Is the GPS antenna connected?");
-        }
+    while (Serial.available()) { handleKey(Serial.read()); pumpGps(); }
+    checkBaud();
+    static uint32_t lastPrint = 0;
+    uint32_t now = millis();
+    if (now - lastPrint >= 2000) {
+        printSummary(now - lastPrint);
+        lastPrint = now;
     }
+    delay(1);
 }
