@@ -17,6 +17,7 @@ using std::isnan;
 #include <vector>
 #include <algorithm>
 #include <set>
+#include <functional>
 #include <sys/time.h>
 
 // ---- time / misc ------------------------------------------------------
@@ -30,8 +31,12 @@ inline double radians(double d) { return d * M_PI / 180.0; }
 using std::min;
 #define IRAM_ATTR
 #define INPUT 0
+#define OUTPUT 1
+#define HIGH 1
 #define FALLING 0
-inline void pinMode(int, int) {}
+inline std::map<int, int> g_pinModes, g_pinLevels;
+inline void pinMode(int pin, int mode) { g_pinModes[pin] = mode; }
+inline void digitalWrite(int pin, int level) { g_pinLevels[pin] = level; }
 inline int digitalPinToInterrupt(int p) { return p; }
 inline void attachInterrupt(int, void (*)(), int) {}
 
@@ -151,6 +156,7 @@ struct FakeDisk {
     bool failMount = false;
     int mountAttempts = 0;
     void (*onMount)() = nullptr;   // runs at each mount attempt
+    void (*onUnmount)() = nullptr; // power may return during shutdown preparation
     bool formatRequested = false;
     int formatAttempts = 0;
     bool failFormat = false;
@@ -240,7 +246,7 @@ struct LittleFSStub {
         g_disk.partitionLabel = partitionLabel;
         if (g_disk.onMount) g_disk.onMount();
         g_disk.formatRequested |= formatOnFail;
-        if (!g_disk.failMount) return true;
+        if (!g_disk.failMount) { g_disk.mounted = true; return true; }
         if (!formatOnFail) return false;
         g_disk.files.clear();
         return true;
@@ -253,7 +259,7 @@ struct LittleFSStub {
         g_disk.failMount = g_disk.failRemount;
         return true;
     }
-    void end() { g_disk.mounted = false; }
+    void end() { g_disk.mounted = false; if (g_disk.onUnmount) g_disk.onUnmount(); }
     bool exists(const char* path) {
         std::string pre = std::string(path) + "/";
         if (g_disk.files.count(path)) return true;
@@ -328,12 +334,16 @@ inline int xTaskCreatePinnedToCore(void (*)(void*), const char*, int, void*, int
 }
 inline unsigned g_stackHighWaterBytes = 4096;
 inline unsigned uxTaskGetStackHighWaterMark(void*) { return g_stackHighWaterBytes; }
-inline void vTaskDelay(uint32_t ms) { g_millis += ms; }
+inline void (*g_taskDelayHook)(uint32_t ms) = nullptr;
+inline void vTaskDelay(uint32_t ms) { g_millis += ms; if (g_taskDelayHook) g_taskDelayHook(ms); }
 #define pdMS_TO_TICKS(x) (x)
 
 // ---- hardware odds and ends (compile-only) ----------------------------------
-struct TwoWire { void begin(int, int) {} };
-extern TwoWire Wire;
+struct TwoWire {
+    int sda = -1, scl = -1, begins = 0;
+    void begin(int a, int b) { sda = a; scl = b; begins++; }
+};
+extern TwoWire Wire, Wire1;
 #define AXP2101_SLAVE_ADDRESS 0x34
 #define XPOWERS_AXP2101_ALL_IRQ 0xffffffff
 #define XPOWERS_AXP2101_VBUS_REMOVE_IRQ 1
@@ -344,13 +354,31 @@ extern TwoWire Wire;
 #define XPOWERS_AXP2101_CHG_VOL_4V1 2
 // PMU: tests set vbusIn (the USB power level) and the latched VBUS
 // interrupt flags, then raise gPmuIrqFlag as the IRQ pin would.
+struct PoweredOff {};
 struct XPowersAXP2101 {
     bool vbusIn = true, removeIrq = false, insertIrq = false;
-    bool begin(TwoWire&, int, int, int) { return true; }
-    void setALDO3Voltage(int) {} void enableALDO3() {} void disableALDO3() {}
-    void setALDO4Voltage(int) {} void enableALDO4() {} void disableALDO4() {}
-    void setButtonBatteryChargeVoltage(int) {} void enableButtonBatteryCharge() {}
-    bool isEnableButtonBatteryCharge() { return true; }
+    bool longPressIrq = false, criticalIrq = false;
+    bool failShutdown = false;
+    int shutdownCalls = 0;
+    void (*onShutdown)() = nullptr;
+    bool aldo3 = true, aldo4 = false, bldo1 = true, vbackup = true;
+    bool failRadioDisable = false, radioStuckOn = false;
+    int aldo4Mv = 0;
+    TwoWire* bus = nullptr;
+    std::vector<std::string> operations;
+    bool begin(TwoWire& wire, int, int, int) { bus = &wire; operations.push_back("begin"); return true; }
+    bool disableALDO3() {
+        operations.push_back("disableALDO3");
+        if (!failRadioDisable && !radioStuckOn) aldo3 = false;
+        return !failRadioDisable;
+    }
+    bool isEnableALDO3() { operations.push_back("isEnableALDO3"); return aldo3; }
+    void setALDO4Voltage(int mv) { aldo4Mv = mv; }
+    void enableALDO4() { aldo4 = true; } void disableALDO4() { aldo4 = false; }
+    void disableBLDO1() { bldo1 = false; }
+    void disableButtonBatteryCharge() { vbackup = false; }
+    uint8_t getPowerOnSource() { return 0x04; }
+    uint8_t getPowerOffSource() { return 0x02; }
     uint8_t chgVol = 3;
     bool setChargeTargetVoltage(uint8_t v) { chgVol = v; return true; }
     uint8_t getChargeTargetVoltage() { return chgVol; }
@@ -362,11 +390,16 @@ struct XPowersAXP2101 {
     void enableBattDetection() {} void enableBattVoltageMeasure() {}
     void enableVbusVoltageMeasure() {} void enableSystemVoltageMeasure() {}
     void disableIRQ(uint32_t) {} void enableIRQ(uint32_t) {}
-    void clearIrqStatus() { removeIrq = insertIrq = false; }
+    void clearIrqStatus() { removeIrq = insertIrq = longPressIrq = criticalIrq = false; }
     uint32_t getIrqStatus() { return 0; }
     bool isVbusRemoveIrq() { return removeIrq; } bool isVbusInsertIrq() { return insertIrq; }
-    bool isPekeyLongPressIrq() { return false; } bool isDropWarningLevel2Irq() { return false; }
+    bool isPekeyLongPressIrq() { return longPressIrq; } bool isDropWarningLevel2Irq() { return criticalIrq; }
     bool isVbusIn() { return vbusIn; }
+    void shutdown() {
+        shutdownCalls++;
+        if (onShutdown) onShutdown();
+        if (!failShutdown) throw PoweredOff{};  // successful hardware power-off never resumes
+    }
 };
 // GPS UART: tests append NMEA/UBX bytes to rx and inspect what the sketch
 // sends in tx. Polling an empty port advances the clock 1 ms, so timeout
@@ -374,15 +407,26 @@ struct XPowersAXP2101 {
 struct HardwareSerial {
     std::string rx, tx;
     size_t rxPos = 0;
+    std::function<void(HardwareSerial&)> onWrite;
     HardwareSerial(int) {}
-    void setRxBufferSize(int) {} void begin(int, int, int, int) {}
+    int baud = 0, rxPin = -1, txPin = -1;
+    void setRxBufferSize(int) {}
+    void begin(int b, int, int rx, int tx) { baud = b; rxPin = rx; txPin = tx; }
     int available() {
         if (rxPos >= rx.size()) { g_millis += 1; return 0; }
         return (int)(rx.size() - rxPos);
     }
     int read() { return rxPos < rx.size() ? (uint8_t)rx[rxPos++] : -1; }
-    size_t write(uint8_t c) { tx.push_back((char)c); return 1; }
-    size_t write(const uint8_t* b, size_t n) { tx.append((const char*)b, n); return n; }
+    size_t write(uint8_t c) {
+        tx.push_back((char)c);
+        if (onWrite) onWrite(*this);
+        return 1;
+    }
+    size_t write(const uint8_t* b, size_t n) {
+        tx.append((const char*)b, n);
+        if (onWrite) onWrite(*this);
+        return n;
+    }
 };
 #define SERIAL_8N1 0
 #define WL_CONNECTED 3
@@ -451,8 +495,3 @@ struct HTTPClient {
     }
     void end() {}
 };
-#define ESP_EXT1_WAKEUP_ALL_LOW 0
-inline void esp_sleep_enable_ext1_wakeup(uint64_t, int) {}
-// Returns, unlike the real call, so tests can count it and look around.
-inline int g_deepSleeps = 0;
-inline void esp_deep_sleep_start() { g_deepSleeps++; }

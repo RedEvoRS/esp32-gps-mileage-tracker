@@ -2,7 +2,7 @@
 // Stage 4: Trip Logger (GPX logging + WiFi upload)
 // =================================================================
 // This is the real firmware. It ties together everything proven in
-// Stages 1-3 (toolchain, AXP2101 PMU + GPS power, NEO-M8N parsing) and
+// Stages 1-3 (toolchain, AXP2101 PMU + GPS power, NMEA parsing) and
 // adds the four pieces that make it a mileage tracker:
 //
 //   1. A trip state machine that auto-detects start (>5 mph for 10 s)
@@ -51,7 +51,6 @@
 #include <Preferences.h>
 #include <time.h>
 #include <sys/time.h>
-#include <esp_sleep.h>
 #include <vector>
 #include <esp_sntp.h>
 #include <esp_partition.h>
@@ -60,14 +59,15 @@
 #include "secrets.h"
 
 // -----------------------------------------------------------------
-// Pin definitions for T-Beam V1.2 (identical to Stages 2-3)
+// LilyGO T-Beam Supreme (ESP32-S3 + MAX-M10S), measured 2026-10-18
 // -----------------------------------------------------------------
-#define I2C_SDA      21
-#define I2C_SCL      22
-#define GPS_RX_PIN   34
-#define GPS_TX_PIN   12
+#define I2C_SDA      42   // Wire1: PMU + PCF8563 RTC
+#define I2C_SCL      41
+#define GPS_RX_PIN   9
+#define GPS_TX_PIN   8
+#define GPS_EN_PIN   7
 #define GPS_BAUD     9600
-#define PMU_IRQ_PIN  35   // AXP2101 IRQ, input-only, active-low
+#define PMU_IRQ_PIN  40   // active-low; not an RTC GPIO on the S3
 
 // -----------------------------------------------------------------
 // Trip state machine tuning (from brief section 5)
@@ -88,14 +88,14 @@ static constexpr uint32_t SEG_GAP_MS      = 5000;
 // it open until a power event.
 static constexpr uint32_t FIX_LOSS_END_MS = 300UL * 1000;   // 5 min
 
-// On battery (VBUS lost) with no trip in progress, deep sleep after this
+// On battery (VBUS lost) with no trip in progress, power off after this
 // long. Ample time for the post-drive upload (a trip ending clears the
 // retry backoff, so tries come at ~0, 1, 3 and 7 min after parking), and
 // it stops the GPS rail + WiFi scans from draining the 18650 for days.
-// VBUS insert (car back on) wakes us.
+// A VBUS insert edge (car back on) powers the PMU on for a full boot.
 static constexpr uint32_t IDLE_BATT_SLEEP_MS = 10UL * 60 * 1000;
 
-// Sleep never unmounts storage under an upload (issue #3). When the idle
+// Power-off never unmounts storage under an upload (issue #3). When the idle
 // timer runs out mid-upload, the file gets up to NET_DRAIN_MS to finish:
 // the server's 300 s worker timeout bounds one upload, plus time to scan
 // and connect. After that, or at once for a critical battery or a held
@@ -114,6 +114,7 @@ static constexpr uint32_t NET_STACK_WARN_BYTES = 1024;
 
 // Storage layout.
 static const char* TRIP_DIR = "/trips";
+static constexpr const char* TRIP_PARTITION_LABEL = "spiffs";
 
 // Free-space guard. A full partition silently loses points, and LittleFS
 // misbehaves at 100% (joltwallet/esp_littlefs#183). Don't start a trip
@@ -136,7 +137,7 @@ Preferences    prefs;
 // RMC status field ('A' = valid fix). Committed only when an RMC sentence
 // passes its checksum, so isUpdated() means "an RMC just arrived" -- the
 // once-per-epoch signal loop() processes fixes on. "GN" is the talker ID
-// when the M8N uses more than one constellation (its default), "GP" when
+// when the receiver uses more than one constellation, "GP" when
 // it uses GPS alone.
 TinyGPSCustom  gRmcStatusGN(gps, "GNRMC", 2);
 TinyGPSCustom  gRmcStatusGP(gps, "GPRMC", 2);
@@ -150,7 +151,7 @@ volatile bool     gVbusLost   = false;
 volatile bool     gPmuIrqFlag = false;
 // Shared by core 0 (SNTP) and core 1 (GPS/fix construction).
 std::atomic<bool> gClockSet{false};  // a source has synchronized UTC this boot
-// Sleep/upload handshake (issue #3). Core 0 raises gNetBusy before it reads
+// Power-off/upload handshake (issue #3). Core 0 raises gNetBusy before it reads
 // gNetHold; core 1 sets gNetHold before it reads gNetBusy. With seq_cst
 // atomics at least one side sees the other, so once core 1 reads gNetBusy
 // false the network task can't start a new cycle. gNetAbort cuts off an
@@ -159,7 +160,7 @@ std::atomic<bool> gNetBusy{false};   // a network cycle is running
 std::atomic<bool> gNetHold{false};   // don't start a cycle or another file
 std::atomic<bool> gNetAbort{false};  // stop the current upload now
 // Set by core 1 when a trip ends: the car just parked, maybe at home, and
-// on battery it sleeps in IDLE_BATT_SLEEP_MS. Core 0 clears the backoff.
+// on battery it powers off in IDLE_BATT_SLEEP_MS. Core 0 clears the backoff.
 std::atomic<bool> gNetRetryNow{false};
 // Owned by core 0. Zero wait means the next queued trip can try immediately.
 uint32_t          gNetLastAttemptMs = 0;
@@ -168,6 +169,35 @@ uint32_t          gNetRetryMs = 0;
 bool              gGpsClockSet = false;
 uint32_t          gLastGpsSyncMs = 0;
 static constexpr uint32_t GPS_CLOCK_SYNC_MS = 60UL * 1000;
+
+// Core 1 owns receiver configuration. UART receive and ACK deadlines are
+// serviced by loop(), never by a blocking ACK wait during a drive.
+static constexpr uint32_t GPS_READY_MS = 3000;
+// NMEA can start before UBX input is ready. Five attempts spaced 8 s after
+// each failure put the last attempt at least 32 s after configuration starts.
+static constexpr uint32_t GPS_CONFIG_RETRY_MS = 8000;
+static constexpr uint32_t GPS_ACK_MS = 300;
+static constexpr uint8_t GPS_CONFIG_ATTEMPTS = 5;
+static constexpr uint8_t GPS_COMMAND_SENDS = 3;
+enum GpsConfigState { GPS_CONFIG_OFF, GPS_WAIT_READY, GPS_WAIT_ACK, GPS_RETRY, GPS_CONFIG_DONE };
+struct GpsConfig {
+    GpsConfigState state = GPS_CONFIG_OFF;
+    uint32_t since = 0, started = 0;
+    uint8_t attempts = 0, command = 0, sends = 0;
+    int8_t ack = -1;
+    bool readyLogged = false, retryLogged = false;
+};
+static GpsConfig gGpsConfig;
+
+// Demultiplex UBX packets before feeding NMEA to TinyGPSPlus. Only the
+// first two payload bytes (the command echoed by ACK/NAK) need storage.
+struct GpsUbxRx {
+    uint32_t pos = 0, since = 0;
+    uint16_t len = 0;
+    uint8_t cls = 0, id = 0, payload[2] = {0}, a = 0, b = 0;
+    bool checksumA = false;
+};
+static GpsUbxRx gGpsUbxRx;
 
 #define FS_LOCK()   xSemaphoreTake(gFsMutex, portMAX_DELAY)
 #define FS_UNLOCK() xSemaphoreGive(gFsMutex)
@@ -959,29 +989,7 @@ static void stopNetworkTask() {
     Serial.println("Stopping the upload in progress -- the trip stays queued.");
     uint32_t t0 = millis();
     while (gNetBusy.load() && millis() - t0 < NET_ABORT_MS) vTaskDelay(pdMS_TO_TICKS(20));
-    if (gNetBusy.load()) Serial.println("Network task still busy -- sleeping anyway.");
-}
-
-static void deepSleepForVbus() {
-    Serial.println("Entering deep sleep (battery critical / idle).");
-    if (gTripPath[0]) endTrip(/*discardIfMicro=*/false);
-    stopNetworkTask();
-    // Keep the lock: this boot ends in deep sleep, so even a network task
-    // that never stopped can't reach the filesystem once it's unmounted.
-    FS_LOCK();
-    LittleFS.end();
-    // GPS main supply off. The receiver keeps its clock and satellite data
-    // on the backup supply (enabled in setup), so the next fix is a hot
-    // start.
-    PMU.disableALDO3();
-    PMU.disableALDO4();   // unused here; set by older builds
-    // Disable before clearing: an interrupt landing between a clear and the
-    // disable would hold the IRQ line low and wake us immediately.
-    PMU.disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
-    PMU.clearIrqStatus();
-    PMU.enableIRQ(XPOWERS_AXP2101_VBUS_INSERT_IRQ | XPOWERS_AXP2101_PKEY_SHORT_IRQ);
-    esp_sleep_enable_ext1_wakeup(1ULL << PMU_IRQ_PIN, ESP_EXT1_WAKEUP_ALL_LOW);
-    esp_deep_sleep_start();
+    if (gNetBusy.load()) Serial.println("Network task still busy -- powering off with storage locked.");
 }
 
 // USB power must stay off this long before it counts as "car off". Engine
@@ -990,6 +998,68 @@ static void deepSleepForVbus() {
 static constexpr uint32_t VBUS_OFF_CONFIRM_MS = 10UL * 1000;
 static bool     gVbusOffPending = false;
 static uint32_t gVbusOffT0 = 0;
+
+static void powerOffForVbus() {
+    // AXP2101 powers on on a VBUS INSERT EDGE, not its steady level. Never
+    // shut down on USB, even for a power-key or low-battery interrupt: the
+    // board would stay off until USB was unplugged and replugged (#106).
+    if (PMU.isVbusIn()) {
+        Serial.println("VBUS present -- staying awake instead of powering off.");
+        gVbusLost = false;
+        gVbusOffPending = false;
+        gIdleSince = millis();
+        gNetHold.store(false);
+        return;
+    }
+
+    Serial.println("Preparing PMU power-off (battery critical / idle).");
+    if (gTripPath[0]) endTrip(/*discardIfMicro=*/false);
+    stopNetworkTask();
+    // Keep the lock through power-off, so even a network task
+    // that never stopped can't reach the filesystem once it's unmounted.
+    FS_LOCK();
+    LittleFS.end();
+    // PMU shutdown cuts all main rails, including GPS ALDO4. Leave rails
+    // and awake IRQs alone until then, so a cancelled shutdown can resume.
+    // GPS backup RAM is supplied directly by the 18650, not VBACKUP.
+    Serial.println("PMU power-off: storage closed; checking VBUS before shutdown.");
+    if (!PMU.isVbusIn()) {
+        // Last possible level check: no log, delay or other work before
+        // shutdown. A VBUS edge between this read and the PMU's I2C
+        // shutdown write remains a race; software cannot make them atomic.
+        PMU.shutdown();
+        // XPowersLib only writes the shutdown bit. Allow the rails to fall
+        // before treating a returning call as failure; don't spin or leave
+        // the logger alive with storage unmounted if power stays on.
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        Serial.println("ERROR: PMU.shutdown() did not power off -- resuming logging.");
+    } else {
+        Serial.println("VBUS returned -- PMU power-off cancelled.");
+    }
+
+    // An upload that outlived the abort timeout may still own a File from
+    // before unmount. Never release it against remounted storage: keep the
+    // mutex/hold/abort in place and restart into an ordinary boot instead.
+    if (gNetBusy.load()) {
+        Serial.println("ERROR: upload task still busy after power-off recovery; restarting.");
+        ESP.restart();
+        return;
+    }
+    // Resume without formatting or changing the trip counter. The network
+    // stays held until storage is mounted again.
+    if (!LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL)) {
+        Serial.println("ERROR: storage remount after cancelled/failed power-off failed; restarting.");
+        ESP.restart();
+        return;
+    }
+    FS_UNLOCK();
+    gVbusLost = !PMU.isVbusIn();   // also catches a missed INSERT interrupt
+    gVbusOffPending = false;
+    gIdleSince = millis();        // failed power-off retries after the idle grace
+    gNetAbort.store(false);
+    gNetHold.store(false);
+    Serial.println("Power-off recovery complete; storage mounted, logging continues.");
+}
 
 static void pollPmu() {
     if (!gPmuIrqFlag) return;
@@ -1011,8 +1081,8 @@ static void pollPmu() {
             gVbusOffT0 = millis();
         }
     }
-    if (PMU.isPekeyLongPressIrq())    deepSleepForVbus();
-    if (PMU.isDropWarningLevel2Irq()) deepSleepForVbus();
+    if (PMU.isPekeyLongPressIrq())    powerOffForVbus();
+    if (PMU.isDropWarningLevel2Irq()) powerOffForVbus();
 
     PMU.clearIrqStatus();   // write-1-to-clear, or the line never re-fires
 }
@@ -1399,11 +1469,11 @@ static void networkTask(void*) {
 }
 
 // =================================================================
-// GPS receiver configuration (u-blox UBX protocol, sent at boot)
+// GPS receiver configuration (u-blox UBX protocol, started at boot)
 // =================================================================
-// The M8N's defaults work, but they send four NMEA sentences nothing here
-// parses and use the "portable" motion model. The settings live in the
-// receiver's RAM, so they're re-sent on every boot.
+// The MAX-M10S (SPG 5.10) ACKed these legacy messages on 2026-10-18.
+// Leave this configuration unchanged until #108 handles VALSET separately.
+// Re-send at every boot rather than rely on retained receiver settings.
 
 // Frame: B5 62 | class id | length (LE16) | payload | Fletcher-8 checksum
 // over class..payload.
@@ -1418,70 +1488,92 @@ static void ubxSend(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t le
     GPSSerial.write(b);
 }
 
-// Watch the UART for UBX-ACK-ACK (1) or ACK-NAK (0) answering (cls, id);
-// -1 on timeout. NMEA arriving meanwhile is discarded -- setup() only.
-static int ubxWaitAck(uint8_t cls, uint8_t id, uint32_t timeoutMs) {
-    // B5 62 05 {01=ACK|00=NAK} 02 00 <cls> <id>
-    uint8_t win[8] = {0};
-    uint32_t t0 = millis();
-    while (millis() - t0 < timeoutMs) {
-        if (GPSSerial.available() <= 0) { delay(1); continue; }
-        memmove(win, win + 1, 7);
-        win[7] = (uint8_t)GPSSerial.read();
-        if (win[0] == 0xB5 && win[1] == 0x62 && win[2] == 0x05 &&
-            win[4] == 0x02 && win[5] == 0x00 && win[6] == cls && win[7] == id) {
-            if (win[3] == 0x01) return 1;
-            if (win[3] == 0x00) return 0;
-        }
-    }
-    return -1;
-}
-
-// Send one configuration message, retrying while the receiver is silent.
-static int ubxCommand(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len) {
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        ubxSend(cls, id, payload, len);
-        int r = ubxWaitAck(cls, id, 300);
-        if (r >= 0) return r;
-    }
-    return -1;
-}
-
-// Returns true only if every setting was acknowledged. Failure is logged
-// and is not fatal: loop() already processes one fix per RMC sentence
-// whatever the receiver sends, so the defaults still log correctly.
-static bool configureGps() {
-    // Give a freshly powered receiver up to 2 s to start talking.
-    uint32_t t0 = millis();
-    while (GPSSerial.available() <= 0 && millis() - t0 < 2000) delay(10);
-
-    bool ok = true;
+// Send one message and arm its deadline. Only one frame (at most 44 bytes)
+// is written per call; there is no flush or ACK wait.
+static void sendGpsConfigCommand() {
     // UBX-CFG-MSG (3-byte form: rate on the current port) = 0 for the NMEA
     // sentences TinyGPSPlus ignores: GLL, GSA, GSV, VTG. RMC and GGA stay --
     // GGA carries altitude, HDOP and satellite count.
     static const uint8_t kSilence[] = { 0x01, 0x02, 0x03, 0x05 };
-    for (size_t i = 0; i < sizeof(kSilence); ++i) {
-        uint8_t p[3] = { 0xF0, kSilence[i], 0 };
-        int r = ubxCommand(0x06, 0x01, p, sizeof(p));
-        if (r < 0 && i == 0) {
-            // Nothing answered at all: the receiver isn't hearing us (wiring,
-            // still booting). Don't spend seconds on the rest.
-            Serial.println("WARNING: GPS did not acknowledge UBX config -- using its defaults.");
-            return false;
-        }
-        ok &= (r == 1);
+    if (gGpsConfig.command < sizeof(kSilence)) {
+        uint8_t p[3] = { 0xF0, kSilence[gGpsConfig.command], 0 };
+        ubxSend(0x06, 0x01, p, sizeof(p));
+    } else {
+        // UBX-CFG-NAV5: apply only dynamic model "automotive" (4).
+        uint8_t nav5[36] = {0};
+        nav5[0] = 0x01;
+        nav5[2] = 4;
+        ubxSend(0x06, 0x24, nav5, sizeof(nav5));
     }
+    gGpsConfig.sends++;
+    gGpsConfig.ack = -1;
+    gGpsConfig.since = millis();
+    gGpsConfig.state = GPS_WAIT_ACK;
+}
 
-    // UBX-CFG-NAV5: dynamic model "automotive" (4). Mask bit 0 applies only
-    // the dynModel field; every other field in the payload is ignored.
-    uint8_t nav5[36] = {0};
-    nav5[0] = 0x01;
-    nav5[2] = 4;
-    ok &= (ubxCommand(0x06, 0x24, nav5, sizeof(nav5)) == 1);
+static void gpsConfigAttemptFailed() {
+    gGpsConfig.since = millis();
+    if (gGpsConfig.attempts >= GPS_CONFIG_ATTEMPTS) {
+        gGpsConfig.state = GPS_CONFIG_DONE;
+        Serial.printf("WARNING: GPS not configured after %u attempts -- continuing with current receiver settings.\n",
+                      (unsigned)GPS_CONFIG_ATTEMPTS);
+    } else {
+        gGpsConfig.state = GPS_RETRY;
+        if (!gGpsConfig.retryLogged) {
+            Serial.println("WARNING: GPS config incomplete -- retrying in background.");
+            gGpsConfig.retryLogged = true;
+        }
+    }
+}
 
-    Serial.println(ok ? "GPS configured: RMC+GGA only, automotive model."
-                      : "WARNING: GPS rejected part of the UBX config.");
-    return ok;
+static void configureGps() {
+    gGpsConfig = GpsConfig();
+    gGpsConfig.state = GPS_WAIT_READY;
+    gGpsConfig.attempts = 1;
+    gGpsConfig.since = millis();
+    gGpsConfig.started = gGpsConfig.since;
+    Serial.println("GPS: waiting for checksum-valid NMEA (up to 3 s).");
+}
+
+static void serviceGpsConfiguration() {
+    if (gGpsConfig.state == GPS_RETRY) {
+        if (millis() - gGpsConfig.since < GPS_CONFIG_RETRY_MS) return;
+        gGpsConfig.attempts++;
+        gGpsConfig.command = gGpsConfig.sends = 0;
+        gGpsConfig.since = millis();
+        gGpsConfig.state = GPS_WAIT_READY;
+    }
+    if (gGpsConfig.state == GPS_WAIT_READY) {
+        // Any complete, checksum-valid NMEA sentence proves the receiver
+        // is running; a position fix is unnecessary. A glitch byte cannot.
+        if (gps.passedChecksum() > 0) {
+            if (!gGpsConfig.readyLogged) {
+                Serial.println("GPS ready: checksum-valid NMEA received.");
+                gGpsConfig.readyLogged = true;
+            }
+            sendGpsConfigCommand();
+        } else if (millis() - gGpsConfig.since >= GPS_READY_MS) {
+            gpsConfigAttemptFailed();
+        }
+        return;
+    }
+    if (gGpsConfig.state != GPS_WAIT_ACK) return;
+    if (gGpsConfig.ack == 1) {
+        if (++gGpsConfig.command == 5) {
+            gGpsConfig.state = GPS_CONFIG_DONE;
+            Serial.printf("GPS configured on attempt %u (%lu ms after config start): RMC+GGA only, automotive model.\n",
+                          (unsigned)gGpsConfig.attempts,
+                          (unsigned long)(millis() - gGpsConfig.started));
+        } else {
+            gGpsConfig.sends = 0;
+            sendGpsConfigCommand();
+        }
+    } else if (gGpsConfig.ack == 0) {
+        gpsConfigAttemptFailed();  // NAK: retry the entire set later
+    } else if (millis() - gGpsConfig.since >= GPS_ACK_MS) {
+        if (gGpsConfig.sends < GPS_COMMAND_SENDS) sendGpsConfigCommand();
+        else gpsConfigAttemptFailed();
+    }
 }
 
 // True when an RMC sentence carrying a valid fix has arrived since the last
@@ -1508,11 +1600,75 @@ static bool buildFix(Fix& fx) {
     return true;
 }
 
+// Handle each RMC as soon as it commits, including multiple epochs in one
+// UART drain. ACK handling never consumes bytes on a separate read path.
+// RMC carries position and speed together; GGA supplies the latest HDOP
+// but must not log a second point with the previous epoch's speed.
+static void receiveGpsNmea(uint8_t c) {
+    if (!gps.encode((char)c)) return;
+    setClockFromGps();
+    if (rmcFixArrived()) {
+        Fix fx;
+        if (buildFix(fx)) {
+            if (gHaveLastFix && (fx.monoMs - gLastFixMonoMs) > SEG_GAP_MS) {
+                if (gState == ACTIVE || gState == COOLDOWN) {
+                    fx.newSegment = true;
+                } else if (gState == ARMING) {
+                    gState = IDLE;
+                    armBufReset();
+                }
+            }
+            tripFsmOnFix(fx);
+        }
+    }
+}
+
+static void receiveGpsByte(uint8_t c) {
+    GpsUbxRx& rx = gGpsUbxRx;
+    // Recover from a truncated or noise-induced UBX header. Expected ACKs
+    // are 10 bytes; bound other packets to 256 payload bytes / 500 ms.
+    if (rx.pos && millis() - rx.since >= 500) rx = GpsUbxRx();
+    if (rx.pos == 0) {
+        if (c == 0xB5) { rx.pos = 1; rx.since = millis(); }
+        else receiveGpsNmea(c);
+        return;
+    }
+    if (rx.pos == 1) {
+        if (c == 0x62) rx.pos++;
+        else {
+            rx = GpsUbxRx();
+            if (c == 0xB5) { rx.pos = 1; rx.since = millis(); }
+            else receiveGpsNmea(c);
+        }
+        return;
+    }
+    if (rx.pos < 6 || rx.pos < (uint32_t)rx.len + 6) {
+        rx.a += c; rx.b += rx.a;
+        if (rx.pos == 2) rx.cls = c;
+        else if (rx.pos == 3) rx.id = c;
+        else if (rx.pos == 4) rx.len = c;
+        else if (rx.pos == 5) rx.len |= (uint16_t)c << 8;
+        else if (rx.pos < 8) rx.payload[rx.pos - 6] = c;
+        rx.pos++;
+        if (rx.len > 256) rx = GpsUbxRx();
+    } else if (rx.pos == (uint32_t)rx.len + 6) {
+        rx.checksumA = (c == rx.a);
+        rx.pos++;
+    } else {
+        uint8_t expectedId = gGpsConfig.command < 4 ? 0x01 : 0x24;
+        if (rx.checksumA && c == rx.b && rx.cls == 0x05 && rx.len == 2 &&
+            (rx.id == 0x01 || rx.id == 0x00) && rx.payload[0] == 0x06 &&
+            rx.payload[1] == expectedId && gGpsConfig.state == GPS_WAIT_ACK &&
+            gGpsConfig.ack < 0) {
+            gGpsConfig.ack = rx.id == 0x01 ? 1 : 0;
+        }
+        rx = GpsUbxRx();
+    }
+}
+
 // =================================================================
 // setup / loop
 // =================================================================
-static constexpr const char* TRIP_PARTITION_LABEL = "spiffs";
-
 static bool tripPartitionIsErased() {
     // Use the same data partition label as LittleFS, never a fixed address
     // or a sample of the partition: even its last byte could hold trip data.
@@ -1561,9 +1717,36 @@ static bool mountTripStorage() {
 }
 
 void setup() {
+    // VBUS-insert power-on brings the Supreme's LoRa rail up ON. Disable
+    // and verify it as the first PMU operation, BEFORE Serial, delays,
+    // allocation, storage or GPS setup can block. Stage 4 never uses LoRa.
+    Wire1.begin(I2C_SDA, I2C_SCL);
+    if (!PMU.begin(Wire1, AXP2101_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {
+        Serial.begin(115200);
+        Serial.println("ERROR: AXP2101 not found. Halting.");
+        while (1) delay(1000);
+    }
+    if (!PMU.disableALDO3() || PMU.isEnableALDO3()) {
+        Serial.begin(115200);
+        Serial.println("ERROR: LoRa rail (ALDO3) could not be verified off. Halting.");
+        while (1) delay(1000);
+    }
+    // BLDO1 powers the SD slot but starts at 1.8 V. Keep it off: #109
+    // must set 3.3 V BEFORE enabling it for SD support.
+    PMU.disableBLDO1();
+    // Supreme GPS backup RAM comes straight from the 18650. LilyGO also
+    // disables VBACKUP; a 60 s ALDO4-off test hot-started in 2.0 s with it off.
+    PMU.disableButtonBatteryCharge();
+    // Leave ALDO1/ALDO2 and DCDC4/DCDC5 as found. Peripheral loads and
+    // PMU/RTC bus pull-up dependencies need proof before disabling them;
+    // #25 owns the measured current decision. Never touch DCDC1 (ESP32).
+
     Serial.begin(115200);
     delay(1000);
     Serial.println("\n=== Stage 4: Trip Logger ===");
+    Serial.println("LoRa rail (ALDO3) verified off; SD rail (BLDO1) off; VBACKUP off.");
+    Serial.printf("PMU power-on source 0x%02X, power-off source 0x%02X.\n",
+                  (unsigned)PMU.getPowerOnSource(), (unsigned)PMU.getPowerOffSource());
 
     gFsMutex = xSemaphoreCreateMutex();
     if (!gFsMutex) {
@@ -1573,24 +1756,11 @@ void setup() {
         return;
     }
 
-    // --- PMU + GPS power (Stages 2-3) ---
-    Wire.begin(I2C_SDA, I2C_SCL);
-    if (!PMU.begin(Wire, AXP2101_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {
-        Serial.println("ERROR: AXP2101 not found. Halting.");
-        while (1) delay(1000);
-    }
-    // The NEO-M8N runs on ALDO3 -- measured on this board: with ALDO4 off
-    // the GPS kept talking, with ALDO3 off it went silent. ALDO3 is on by
-    // default at power-up, which is why earlier stages enabling ALDO4
-    // appeared to work. Set it explicitly rather than rely on that.
-    PMU.setALDO3Voltage(3300);
-    PMU.enableALDO3();
-    // GPS backup supply (VBACKUP): keeps the receiver's clock and satellite
-    // data while ALDO3 is off in deep sleep, so a drive starts with a hot
-    // start (~1 s) instead of a cold one (~30 s of unlogged driving). Off
-    // by default on this board.
-    PMU.setButtonBatteryChargeVoltage(3300);
-    PMU.enableButtonBatteryCharge();
+    // --- Supreme GPS: ALDO4 at 3.3 V, GPS_EN HIGH as in LilyGO's setup ---
+    pinMode(GPS_EN_PIN, OUTPUT);
+    digitalWrite(GPS_EN_PIN, HIGH);
+    PMU.setALDO4Voltage(3300);
+    PMU.enableALDO4();
     // Full-charge voltage 4.1 V instead of the 4.2 V default: ~10% less
     // capacity, much less stress on a cell that lives in a hot car (the
     // charge temperature guard, below, covers charging when it's too hot).
@@ -1608,11 +1778,10 @@ void setup() {
     PMU.enableSystemVoltageMeasure();
     setupPmuIrq();
     // Seed VBUS state from hardware: a battery-only boot (e.g. wake via
-    // power key away from the car) must still hit the idle sleep timer.
+    // power key away from the car) must still hit the idle power-off timer.
     gVbusLost = !PMU.isVbusIn();
     gIdleSince = millis();
-    Serial.printf("PMU ready, GPS rail (ALDO3) on, GPS backup %s, charge to %s. VBUS %s.\n",
-                  PMU.isEnableButtonBatteryCharge() ? "on" : "OFF",
+    Serial.printf("PMU ready, MAX-M10S GPS rail (ALDO4) on at 3.3 V, charge to %s. VBUS %s.\n",
                   PMU.getChargeTargetVoltage() == XPOWERS_AXP2101_CHG_VOL_4V1 ? "4.1 V" : "NOT 4.1 V",
                   gVbusLost ? "absent (on battery)" : "present");
 
@@ -1631,7 +1800,8 @@ void setup() {
     prefs.begin("mileage", false);
     fsckAllTrips();
 
-    // After the fsck so the receiver has had time to boot.
+    // Start a bounded readiness wait; loop() receives NMEA and configures
+    // the receiver without blocking trip logging or power/charge checks.
     configureGps();
 
     // First charge-temperature check now, not 30 s in: charging has been off
@@ -1650,35 +1820,12 @@ void setup() {
 }
 
 void loop() {
-    // Core 1: drain the GPS UART into the parser.
+    // Core 1: one UART reader routes NMEA/fixes and checksum-checked UBX
+    // ACKs. Configuration deadlines never block receive or trip processing.
     while (GPSSerial.available() > 0) {
-        if (gps.encode(GPSSerial.read())) setClockFromGps();
+        receiveGpsByte((uint8_t)GPSSerial.read());
     }
-
-    // Process one fix per epoch, on its RMC sentence. TinyGPSPlus commits
-    // the location on both RMC and GGA, and the receiver sends both every
-    // second, so gating on location.isUpdated() logged each position twice
-    // -- the GGA copy carrying the previous epoch's speed. RMC holds the
-    // position, speed and course together; altitude/HDOP/satellites come
-    // from the latest GGA, at most one epoch old.
-    if (rmcFixArrived()) {
-        Fix fx;
-        if (buildFix(fx)) {
-            // Fix-loss detection: a long gap since the last good fix
-            // means the next point should start a fresh segment. A gap
-            // during ARMING invalidates the arm timer entirely (a stale
-            // gArmT0 would otherwise start a trip on the very next fix).
-            if (gHaveLastFix && (fx.monoMs - gLastFixMonoMs) > SEG_GAP_MS) {
-                if (gState == ACTIVE || gState == COOLDOWN) {
-                    fx.newSegment = true;
-                } else if (gState == ARMING) {
-                    gState = IDLE;
-                    armBufReset();
-                }
-            }
-            tripFsmOnFix(fx);
-        }
-    }
+    serviceGpsConfiguration();
 
     // Fix-loss watchdog: a recording trip with no valid fix at all for
     // FIX_LOSS_END_MS (parked indoors, antenna failure) is finalized so
@@ -1694,21 +1841,21 @@ void loop() {
     confirmVbusOff();
     serviceChargeTemp();
 
-    // Battery idle sleep: on battery with no trip in progress for
-    // IDLE_BATT_SLEEP_MS, deep sleep (GPS rail off, WiFi off). The 10 min
+    // Battery idle power-off: on battery with no trip in progress for
+    // IDLE_BATT_SLEEP_MS, PMU shutdown. The 10 min
     // grace gives the network task ample time to upload after a drive.
-    // VBUS insert wakes us when the car turns back on.
+    // A VBUS insert edge powers us on when the car turns back on.
     if (!gVbusLost || gState != IDLE) {
         gIdleSince = millis();
         gNetHold.store(false);
     } else if (millis() - gIdleSince >= IDLE_BATT_SLEEP_MS) {
         // Not under a running upload (issue #3): the network task finishes
-        // its current file and stops, and we sleep once it's idle. Logging
+        // its current file and stops, and we power off once it's idle. Logging
         // carries on while it finishes, and power or a trip coming back
         // cancels the wait. A file still going after NET_DRAIN_MS is cut off.
         if (!gNetHold.exchange(true) && gNetBusy.load())
-            Serial.println("Idle on battery -- letting the upload finish before sleeping.");
+            Serial.println("Idle on battery -- letting the upload finish before powering off.");
         if (!gNetBusy.load() || millis() - gIdleSince >= IDLE_BATT_SLEEP_MS + NET_DRAIN_MS)
-            deepSleepForVbus();
+            powerOffForVbus();
     }
 }

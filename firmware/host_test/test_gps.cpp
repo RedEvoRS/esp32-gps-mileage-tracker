@@ -3,7 +3,7 @@
 // NEO-M8N sends at its defaults (RMC, VTG, GGA, GSA, 3x GSV, GLL every
 // second), one sentence per loop() call as the UART would deliver it, and
 // checks one trackpoint is logged per epoch. Also checks the UBX config
-// frames sent at boot and the ACK handling.
+// frames, cold-start readiness, and nonblocking ACK/retry handling.
 #include "arduino_stub.h"
 
 uint32_t g_millis = 0;
@@ -12,7 +12,7 @@ SerialStub Serial;
 FakeDisk g_disk;
 LittleFSStub LittleFS;
 int g_lockDepth = 0;
-TwoWire Wire;
+TwoWire Wire, Wire1;
 WiFiStub WiFi;
 
 #include "04_trip_logger.ino"
@@ -102,7 +102,8 @@ static void resetWorld() {
     gRmcDateGN.begin(gps, "GNRMC", 9);
     gRmcTimeGP.begin(gps, "GPRMC", 1);
     gRmcDateGP.begin(gps, "GPRMC", 9);
-    GPSSerial.rx.clear(); GPSSerial.rxPos = 0; GPSSerial.tx.clear();
+    GPSSerial = HardwareSerial(1);
+    gGpsConfig = GpsConfig(); gGpsUbxRx = GpsUbxRx();
     gState = IDLE; gTripPath[0] = 0; gTripWriteFailed = false;
     gPendCount = gPendHead = 0; armBufReset(); gHaveLastFix = false;
     gClockSet = false; gVbusLost = false;
@@ -110,6 +111,7 @@ static void resetWorld() {
     g_sntpStatus = SNTP_SYNC_STATUS_RESET;
     g_sntpCompleteAfterPolls = -1; g_sntpStopCalls = g_sntpPolls = 0;
     g_sntpPollHook = nullptr;
+    g_delayHook = nullptr;
     g_millis = 0; gT = 0; gLat = 37.0;
     g_epochBaseMs = 0;
 }
@@ -153,18 +155,43 @@ static std::string ack(uint8_t cls, uint8_t id, bool ok = true) {
     return frame(0x05, ok ? 0x01 : 0x00, { cls, id });
 }
 
+// Only respond once the entire command (including checksum) is on the
+// wire. Preloading ACKs would incorrectly allow a reply before its send.
+static void respondToGps(std::function<std::string(uint8_t, uint8_t)> reply) {
+    GPSSerial.onWrite = [parsed = GPSSerial.tx.size(), reply](HardwareSerial& port) mutable {
+        if (port.tx.size() - parsed < 6) return;
+        const auto* p = (const uint8_t*)port.tx.data() + parsed;
+        size_t len = p[4] | (p[5] << 8);
+        if (port.tx.size() - parsed < len + 8) return;
+        uint8_t cls = p[2], id = p[3];
+        parsed += len + 8;
+        port.rx += reply(cls, id);
+    };
+}
+static void ackGps() {
+    respondToGps([](uint8_t cls, uint8_t id) { return ack(cls, id); });
+}
+static void gpsLoops(int count = 8) {
+    for (int i = 0; i < count; ++i) loop();
+}
+static int logCount(const char* fragment) {
+    int count = 0;
+    for (const auto& line : Serial.log) if (line.find(fragment) != std::string::npos) count++;
+    return count;
+}
+
 int main(int argc, char** argv) {
     g_outDir = argc > 1 ? argv[1] : ".";
 
     printf("G1 UBX config frames + ACKs\n");
     {
         resetWorld();
-        GPSSerial.rx = nmea("GNTXT,01,01,02,u-blox AG - www.u-blox.com");
-        for (uint8_t m : { 0x01, 0x02, 0x03, 0x05 }) GPSSerial.rx += ack(0x06, 0x01);
-        GPSSerial.rx += nmea("GNRMC,143000.00,V,,,,,,,140426,,,N");   // NMEA interleaves
-        GPSSerial.rx += ack(0x06, 0x24);
-        bool ok = configureGps();
-        CHECK(ok, "returns true when everything is ACKed");
+        ackGps(); configureGps();
+        CHECK(GPSSerial.tx.empty(), "no command before checksum-valid NMEA");
+        GPSSerial.rx = nmea("GNTXT,01,01,02,receiver booting");
+        gpsLoops();
+        CHECK(gGpsConfig.state == GPS_CONFIG_DONE && gGpsConfig.command == 5,
+              "all five messages are ACKed without needing a position fix");
         std::vector<uint8_t> nav5(36, 0); nav5[0] = 0x01; nav5[2] = 4;
         std::string want = frame(0x06, 0x01, { 0xF0, 0x01, 0 }) + frame(0x06, 0x01, { 0xF0, 0x02, 0 }) +
                            frame(0x06, 0x01, { 0xF0, 0x03, 0 }) + frame(0x06, 0x01, { 0xF0, 0x05, 0 }) +
@@ -173,26 +200,54 @@ int main(int argc, char** argv) {
         const char gll[] = "\xB5\x62\x06\x01\x03\x00\xF0\x01\x00\xFB\x11";
         CHECK(GPSSerial.tx.compare(0, 11, std::string(gll, 11)) == 0,
               "GLL-off frame matches the published u-blox bytes");
+        CHECK(g_millis <= 8 && logCount("GPS configured on attempt 1 (") == 1 &&
+              logCount("ms after config start") == 1,
+              "loop does not wait for ACKs and success is logged once");
     }
 
-    printf("G2 receiver not listening\n");
+    printf("G2 glitch, invalid checksum and incomplete NMEA cannot prove readiness\n");
     {
-        resetWorld();
-        uint32_t t0 = g_millis;
-        bool ok = configureGps();
-        std::string first = frame(0x06, 0x01, { 0xF0, 0x01, 0 });
-        CHECK(!ok, "returns false");
-        CHECK(GPSSerial.tx == first + first + first, "gives up after 3 tries of the first message");
-        CHECK(g_millis - t0 < 5000, "boot isn't held up for long");
+        resetWorld(); ackGps(); configureGps();
+        GPSSerial.rx = std::string(1, '\xFF');
+        loop();
+        CHECK(GPSSerial.tx.empty(), "UART glitch does not trigger a command");
+        std::string bad = nmea("GNTXT,01,01,02,not ready");
+        bad[bad.size() - 4] = bad[bad.size() - 4] == '0' ? '1' : '0';
+        GPSSerial.rx += bad;
+        loop();
+        CHECK(GPSSerial.tx.empty(), "a bad NMEA checksum does not trigger a command");
+        std::string ready = nmea("GNRMC,143000.00,V,,,,,,,140426,,,N");
+        GPSSerial.rx += ready.substr(0, ready.size() - 2);
+        g_millis = 999; loop();
+        CHECK(GPSSerial.tx.empty(), "a sentence without its terminator is not ready");
+        GPSSerial.rx += "\r\n";
+        loop();
+        CHECK(!GPSSerial.tx.empty() && gGpsConfig.state == GPS_WAIT_ACK,
+              "configuration starts as soon as a complete valid sentence arrives");
+        gpsLoops();
+        CHECK(logCount("GPS ready:") == 1 && logCount("GPS configured on attempt 1 (") == 1,
+              "readiness and first-attempt success each log once");
     }
 
-    printf("G3 receiver NAKs a setting\n");
+    printf("G3 a NAK schedules another complete attempt\n");
     {
-        resetWorld();
-        for (int i = 0; i < 4; ++i) GPSSerial.rx += ack(0x06, 0x01);
-        GPSSerial.rx += ack(0x06, 0x24, false);
-        CHECK(!configureGps(), "returns false");
-        CHECK(GPSSerial.tx.size() == 4 * 11 + 44, "a NAK isn't retried");
+        resetWorld(); configureGps();
+        respondToGps([](uint8_t cls, uint8_t id) { return ack(cls, id, id != 0x24); });
+        GPSSerial.rx = nmea("GNTXT,01,01,02,ready");
+        gpsLoops();
+        CHECK(gGpsConfig.state == GPS_RETRY && gGpsConfig.attempts == 1,
+              "NAV5 NAK leaves the first attempt pending for retry");
+        CHECK(GPSSerial.tx.size() == 4 * 11 + 44, "a NAK stops this attempt without repeating the rejected command");
+        ackGps();
+        uint32_t retryAt = gGpsConfig.since + GPS_CONFIG_RETRY_MS;
+        g_millis = retryAt - 2; loop();
+        CHECK(gGpsConfig.attempts == 1, "no retry before the eight-second spacing");
+        g_millis = retryAt; gpsLoops();
+        CHECK(gGpsConfig.command == 5 && gGpsConfig.attempts == 2 && GPSSerial.tx.size() == 2 * 88,
+              "second attempt resends all five unchanged messages and succeeds");
+        CHECK(logCount("retrying in background") == 1 && logCount("configured on attempt 2 (") == 1 &&
+              logCount("ms after config start") == 1,
+              "pending and eventual success each log once");
     }
 
     printf("G4 default M8N output -> one point per second (F2)\n");
@@ -336,6 +391,150 @@ int main(int argc, char** argv) {
               d.find("</trkseg><trkseg>", split + 1) == std::string::npos &&
               trkpts(d.substr(0, split)).size() == 30,
               "real NMEA/loop path marks only the first post-gap fix");
+    }
+
+    printf("G13 silent first configuration retries during an active trip\n");
+    {
+        resetWorld(); run(15, 20);
+        CHECK(gState == ACTIVE, "trip is recording before configuration is requested");
+        configureGps();
+        respondToGps([](uint8_t cls, uint8_t id) {
+            return gGpsConfig.attempts > 1 ? ack(cls, id) : std::string();
+        });
+        g_delayHook = [](uint32_t) { CHECK(false, "configuration must not delay loop"); };
+        run(15, 20);
+        g_delayHook = nullptr;
+        CHECK(gGpsConfig.command == 5 && gGpsConfig.attempts == 2,
+              "no-answer first attempt succeeds on a later loop attempt");
+        std::string first = frame(0x06, 0x01, {0xF0, 0x01, 0});
+        CHECK(GPSSerial.tx.substr(0, first.size() * 3) == first + first + first &&
+              GPSSerial.tx.size() == 3 * 11 + 88,
+              "silent attempt sends only the first command three times, then retries the entire set");
+        CHECK(logCount("retrying in background") == 1 && logCount("configured on attempt 2 (") == 1,
+              "no per-send or per-attempt log spam");
+        endTrip(false);
+        auto files = tripFiles();
+        CHECK(files.size() == 1, "the active trip remains intact");
+        if (files.size() == 1) {
+            auto pts = trkpts(g_disk.files[files[0]]);
+            bool intact = pts.size() == 40;
+            for (size_t i = 0; i < pts.size(); ++i) {
+                char want[32];
+                snprintf(want, sizeof want, "2026-04-14T14:30:%02uZ", (unsigned)i);
+                // The first RMC precedes the first GGA in this fixture.
+                intact &= field(pts[i], "time") == want &&
+                          field(pts[i], "hdop") == (i == 0 ? "99.9" : "0.9");
+            }
+            CHECK(intact, "all 40 consecutive RMC fixes and GGA HDOP survive the silent ACK deadlines and retry");
+        }
+    }
+
+    printf("G14 ACK framing/checksum and interleaved NMEA\n");
+    {
+        resetWorld(); configureGps();
+        GPSSerial.rx = nmea("GNTXT,01,01,02,ready"); loop();
+        std::string corrupt = ack(0x06, 0x01); corrupt.back() ^= 1;
+        GPSSerial.rx += ack(0x06, 0x24) + ack(0x07, 0x01) + corrupt;
+        loop();
+        CHECK(gGpsConfig.command == 0 && gGpsConfig.sends == 1,
+              "wrong command/class and bad ACK checksum cannot acknowledge a setting");
+        std::string rmc = sentences({0, 37, -122, 15, true})[0];
+        size_t split = rmc.size() / 2;
+        GPSSerial.rx += rmc.substr(0, split) + ack(0x06, 0x01).substr(0, 9);
+        loop();
+        CHECK(gArmCount == 0 && gGpsConfig.command == 0,
+              "partial NMEA and an ACK missing its checksum byte remain pending");
+        GPSSerial.rx += ack(0x06, 0x01).substr(9) + rmc.substr(split);
+        loop();
+        CHECK(gArmCount == 1 && gGpsConfig.command == 1 && gps.passedChecksum() == 2,
+              "binary ACK is removed and the split RMC resumes with its checksum and fix intact");
+        // Ignore binary payload, even one containing complete-looking NMEA.
+        std::string fakeNmea = nmea("GNTXT,01,01,02,binary payload");
+        std::vector<uint8_t> payload(fakeNmea.begin(), fakeNmea.end());
+        GPSSerial.rx += frame(0x0A, 0x04, payload);
+        GPSSerial.rx += sentences({1, 37.001, -122, 15, true})[0];
+        GPSSerial.rx += sentences({2, 37.002, -122, 15, true})[0];
+        loop();
+        CHECK(gArmCount == 3 && gps.passedChecksum() == 4,
+              "UBX payload is never NMEA; two RMC epochs in one drain each reach the trip FSM");
+    }
+
+    printf("G15 retries and readiness are bounded, with one final failure log\n");
+    for (int response : {0, 1, 2}) {  // no NMEA, NMEA + silence, NMEA + immediate NAK
+        resetWorld(); configureGps();
+        uint32_t lastSendMs = 0;
+        if (response) {
+            GPSSerial.rx = nmea("GNTXT,01,01,02,ready");
+            respondToGps([response, &lastSendMs](uint8_t cls, uint8_t id) {
+                lastSendMs = g_millis;
+                return response == 2 ? ack(cls, id, false) : std::string();
+            });
+        }
+        for (uint32_t ms = 0; ms <= 60000; ms += 100) { g_millis = ms; loop(); }
+        CHECK(gGpsConfig.state == GPS_CONFIG_DONE && gGpsConfig.attempts == 5,
+              "stops after five attempts, including a receiver that never emits valid NMEA");
+        CHECK(GPSSerial.tx.size() == (response == 0 ? 0 : response == 1 ? 15 * 11 : 5 * 11),
+              "only a ready receiver receives commands, each silence is limited to three sends");
+        if (response) CHECK(lastSendMs - gGpsConfig.started >= 32000,
+                            "even immediate NAKs keep attempts available at least 32 seconds after startup");
+        size_t sent = GPSSerial.tx.size();
+        g_millis += 60000; gpsLoops();
+        CHECK(GPSSerial.tx.size() == sent && logCount("not configured after 5 attempts") == 1 &&
+              logCount("retrying in background") == 1 && logCount("GPS configured") == 0,
+              "stays stopped and logs pending/final failure only once");
+    }
+
+    printf("G16 readiness can arrive after the first three-second timeout\n");
+    {
+        resetWorld(); configureGps();
+        g_millis = GPS_READY_MS - 2; loop();
+        CHECK(gGpsConfig.state == GPS_WAIT_READY && GPSSerial.tx.empty(),
+              "readiness timeout does not expire early");
+        g_millis = GPS_READY_MS; loop();
+        CHECK(gGpsConfig.state == GPS_RETRY && GPSSerial.tx.empty(),
+              "three seconds without valid NMEA schedules a retry without sending UBX");
+        uint32_t retryAt = gGpsConfig.since + GPS_CONFIG_RETRY_MS;
+        GPSSerial.rx = sentences({4, 37, -122, 15, true})[0]; loop();
+        CHECK(gArmCount == 1 && GPSSerial.tx.empty(),
+              "new fixes still reach the FSM while waiting for the scheduled retry");
+        ackGps(); g_millis = retryAt; gpsLoops();
+        CHECK(gGpsConfig.command == 5 && gGpsConfig.attempts == 2,
+              "late readiness configures successfully on the next loop attempt");
+    }
+
+    printf("G17 configuration deadlines survive millis rollover\n");
+    {
+        resetWorld(); g_millis = UINT32_MAX - 1000; configureGps();
+        GPSSerial.rx = nmea("GNTXT,01,01,02,ready"); loop();
+        for (int send = 0; send < 3; ++send) {
+            g_millis = gGpsConfig.since + GPS_ACK_MS; loop();
+        }
+        CHECK(gGpsConfig.state == GPS_RETRY, "ACK timeouts reach the scheduled retry");
+        uint32_t retryAt = gGpsConfig.since + GPS_CONFIG_RETRY_MS;
+        g_millis = retryAt - 2; loop();
+        CHECK(gGpsConfig.attempts == 1, "retry spacing is respected across wrap");
+        ackGps(); g_millis = retryAt; gpsLoops();
+        CHECK(gGpsConfig.command == 5 && gGpsConfig.attempts == 2,
+              "retry succeeds after unsigned deadline wraps to a small millis value");
+    }
+
+    printf("G18 receiver emits NMEA but ignores UBX for the first 30 seconds\n");
+    {
+        resetWorld(); configureGps();
+        respondToGps([](uint8_t cls, uint8_t id) {
+            return g_millis - gGpsConfig.started >= 30000 ? ack(cls, id) : std::string();
+        });
+        run(15, 45);
+        CHECK(gGpsConfig.command == 5 && gGpsConfig.attempts == 5 &&
+              gGpsConfig.since - gGpsConfig.started >= 32000,
+              "last attempt configures a receiver that stays unresponsive well after valid NMEA starts");
+        CHECK(logCount("configured on attempt 5 (") == 1 && logCount("ms after config start") == 1 &&
+              logCount("retrying in background") == 1 && logCount("not configured after") == 0,
+              "reports the successful late attempt and elapsed time once");
+        endTrip(false);
+        auto files = tripFiles();
+        CHECK(files.size() == 1 && trkpts(g_disk.files[files[0]]).size() == 45,
+              "all 45 fixes survive the full cold-start retry window");
     }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
