@@ -58,6 +58,7 @@ bool gpsRailOn = false;
 uint32_t confirmStarted = 0, gpsPoweredAt = 0, firstFixMs = 0;
 uint32_t probeStarted = 0, lastNmeaAt = 0;
 size_t baudIndex = 0;
+int knownBaudIndex = -1;  // Last baud that produced valid NMEA, -1 = none yet.
 volatile uint32_t ppsPulses = 0;
 portMUX_TYPE ppsMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -152,6 +153,7 @@ static void feedNmea(uint8_t byte) {
     lastNmeaAt = millis();  // Only a complete, checksum-valid sentence gets here.
     if (!baudLocked) {
         baudLocked = true;
+        knownBaudIndex = (int)baudIndex;
         Serial.printf("\nValid NMEA detected at %lu baud.\n", (unsigned long)BAUDS[baudIndex]);
     }
     if (gpsRailOn && !firstFix && gps.location.isUpdated() &&
@@ -222,8 +224,16 @@ static void selectBaud(size_t index) {
     Serial.printf("Probing GPS RX9/TX8 at %lu baud (4 s window)...\n", (unsigned long)BAUDS[index]);
 }
 
+static void resumeKnownBaud() {
+    // Go straight back to the baud that last worked, so a hot start isn't
+    // timed while the probe cycles through wrong bauds (inflates TTFF).
+    if (knownBaudIndex >= 0 && (size_t)knownBaudIndex != baudIndex) selectBaud(knownBaudIndex);
+}
+
 static void checkBaud() {
-    if (baudLocked || millis() - probeStarted < 4000) return;
+    // A silent receiver with ALDO4 off is expected: don't wander off the
+    // known-good baud while the rail is off.
+    if (baudLocked || !gpsRailOn || millis() - probeStarted < 4000) return;
     Serial.printf("No valid NMEA at %lu baud.\n", (unsigned long)BAUDS[baudIndex]);
     selectBaud((baudIndex + 1) % (sizeof(BAUDS) / sizeof(BAUDS[0])));
 }
@@ -309,6 +319,7 @@ static void toggleGpsPower() {
     if (turnOn && gpsRailOn) Serial.println("TTFF restarted from ALDO4 ON. Compare b OFF/ON with equal off intervals.");
     if (!turnOn) Serial.println("ALDO4 OFF: check NMEA/PPS stop. Unexpected continuing data is useful rail evidence.");
     // Keep receiving even when ALDO4 is off: this is a rail-discovery test.
+    if (turnOn) resumeKnownBaud();
     // Restart the probe window to give the current baud a full 4 seconds.
     probeStarted = millis();
 }
@@ -366,6 +377,7 @@ static void handleKey(char key) {
             gpsEnHigh = !gpsEnHigh;
             digitalWrite(GPS_EN, gpsEnHigh ? HIGH : LOW);
             resetDecoder();
+            if (gpsEnHigh) resumeKnownBaud();
             Serial.printf("GPS_EN GPIO7=%s. Polarity/function on MAX-M10S is a bench check.\n", gpsEnHigh ? "HIGH" : "LOW");
             break;
         case 'b': toggleBackup(); break;
