@@ -21,11 +21,15 @@ OpenStreetMap tiles when the viewer draws a map.
 ## Where it's at
 
 The hardware target has changed from the T-Beam V1.2 to the T-Beam Supreme
-with MAX-M10S GPS and the SanDisk microSD card above. The checked-in firmware
-and its detailed flashing guide still target the retired V1.2 with NEO-M8N
-GPS and LittleFS storage. The Supreme firmware port, including MAX-M10S setup
-and microSD trip storage, has not landed. **Do not flash the current sketches
-to a T-Beam Supreme.** Project progress is tracked in GitHub issues.
+with MAX-M10S GPS and the SanDisk microSD card above. As of 2026-10-18 the
+firmware runs on the Supreme: the bring-up sketches and the trip logger use
+its pins and power rails, and the logger switches the board off when the car
+is parked and back on when the car starts (bench-tested). Two things are
+still missing. Trips are stored in the board's internal flash (about 6 hours
+of driving between uploads) until microSD support lands. And the
+step-by-step flashing guide below still describes the retired V1.2; for the
+Supreme, use [T-Beam Supreme bring-up](firmware/README.md#t-beam-supreme-bring-up).
+Project progress is tracked in GitHub issues.
 
 ## How it works
 
@@ -47,27 +51,26 @@ POST /upload (GPX) --> mileage-ingest --> GPX + JSON summary
                          read-only viewer and exports
 ```
 
-This is the intended Supreme data path. The current firmware does not yet
-implement the logger for this board.
+This is the Supreme data path. Until microSD support lands, the logger stores
+trips in the board's internal flash instead of on the card.
 
-The trip rules below describe the current V1.2 logger; the Supreme port has
-not yet been implemented. The logger decides on its own when a trip starts
-and stops. Going faster than 5 mph for 10 seconds starts one; staying under
+The trip rules are the same on both boards. The logger decides on its own
+when a trip starts and stops. Going faster than 5 mph for 10 seconds starts one; staying under
 2 mph for 3 minutes ends it, which is long enough that a red light doesn't
 chop one drive into six. Anything shorter than 30 seconds or about a tenth
 of a mile gets thrown away.
 
-The V1.2 firmware writes each GPS point to LittleFS on the board's flash and
-closes the file right after to limit data loss if power is cut. The target
-Supreme firmware is intended to store GPX files on the microSD card; its
-write, recovery, and power-loss behavior still needs to be implemented and
-validated.
+The firmware writes each GPS point to LittleFS on the board's flash and
+closes the file right after to limit data loss if power is cut. Moving the
+GPX files to the microSD card, with its write, recovery and power-loss
+behavior, still needs to be implemented and validated.
 
-The V1.2 firmware runs from the car's USB port, with an 18650 battery as
-backup. When the car's port goes dead, it closes out the trip and keeps
-running on battery for 10 more minutes to upload over home WiFi, then sleeps.
-The Supreme port's power and sleep behavior has not been established; do not
-assume the V1.2 pin, rail, or button instructions apply to it.
+The firmware runs from the car's USB port, with an 18650 battery as backup.
+When the car's port goes dead, it closes out the trip and keeps running on
+battery for 10 more minutes to upload over home WiFi. On the Supreme it then
+switches itself off completely, and power coming back to the USB port
+switches it on again. The V1.2 deep-slept instead. Don't assume the V1.2
+pin, rail or button instructions apply to the Supreme.
 
 The server adds up distance point to point, with a few corrections. Wobble
 while you're parked doesn't count (at least one end of a step must be over
@@ -204,8 +207,11 @@ through the same steps one at a time.
 The remaining flashing, check-it-works, and in-car instructions in this
 section apply only to the retired T-Beam V1.2 with NEO-M8N GPS. They use
 V1.2-specific USB, pin, power, and LittleFS settings. **Do not follow them
-for the T-Beam Supreme.** The Supreme MAX-M10S firmware and microSD setup
-instructions will be added when that port is ready.
+for the T-Beam Supreme.** For the Supreme, use
+[T-Beam Supreme bring-up](firmware/README.md#t-beam-supreme-bring-up) for
+the board settings, the factory flash backup and download mode. Full
+Supreme setup instructions, including the microSD card, will replace this
+section when the port is finished.
 
 **Back on your computer**, connect the T-Beam with the data-capable USB
 cable. A *sketch* is an Arduino program (`.ino`); *uploading* or *flashing*

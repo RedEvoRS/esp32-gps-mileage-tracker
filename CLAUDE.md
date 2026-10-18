@@ -18,11 +18,12 @@ held only ~6 h of driving between uploads. Its last firmware is on the
 backports. Never commit to it or base work on it; all work targets the
 Supreme on `main`.
 
-**Port in progress:** the bring-up Stages 1–3 run on the Supreme (bench-checked
-2026-10-18), but until the rest of the port lands (label `supreme-port`), the
-trip logger (Stage 4) on `main` is still the V1.2 code: don't flash it on the
-Supreme. Don't assume a Supreme pin, rail or peripheral works until its port
-issue is closed and it's verified on the bench.
+**Port in progress:** Stages 1–3 and the trip logger (Stage 4) run on the
+Supreme: pins, rails, PMU power-off and USB wake were bench-checked
+2026-10-18. Stage 4 still stores trips in the internal 2.375 MB LittleFS
+partition until microSD support lands, and the rest of the port (label
+`supreme-port`) is open. Don't assume a Supreme pin, rail or peripheral works
+until its port issue is closed and it's verified on the bench.
 
 ## Architecture
 
@@ -134,7 +135,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   BME280 are on `Wire`, SDA 17 / SCL 18
 - GPS: MAX-M10S, firmware SPG 5.10, 9600 baud on RX 9 / TX 8, GPS_EN GPIO 7
   driven HIGH (low/high made no difference). It still ACKs the legacy UBX
-  CFG-MSG and CFG-NAV5; UBX-CFG-VALSET is the future-proof interface
+  CFG-MSG and CFG-NAV5; UBX-CFG-VALSET is the future-proof interface. After
+  a cold power-up it sends NMEA before it accepts UBX (config took ~10 s),
+  so Stage 4 retries its config in the background
 - GPS backup RAM is fed from the 18650, not the PMU's VBACKUP (leave
   VBACKUP off): hot start 2 s, cold 33 s. The board powers an active antenna
 - PMU interrupt is GPIO 40, which isn't an RTC GPIO on the ESP32-S3, so it
@@ -149,7 +152,7 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 - Before first power, attach the LoRa antenna; before first flash, back up
   the factory flash
 
-### V1.2 (what the firmware on `main` still targets until the port lands)
+### V1.2 (retired; its last firmware is on the frozen `tbeam-v1.2` branch)
 
 - GPS power: AXP2101 **ALDO3** rail at 3.3V (measured 2026-10-05). VBACKUP
   enabled for GPS hot starts. ALDO2 = LoRa + OLED header — leave it alone
@@ -179,7 +182,7 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   nonstop driving). It protects the server's memory: the ingest parses the
   whole body at once, peaking at ~9x its size. Issue #110 proposes an 8 MiB
   trip split for the Supreme firmware, half the server cap; this is not
-  implemented yet, and `main` still has the V1.2 logger. Do not assume
+  implemented yet, and Stage 4 still stores trips in LittleFS. Do not assume
   runaway trips are split until the port and issue #110 are complete.
   gunicorn `--timeout 300`, because the timeout includes reading the body
   and 30 s dropped big trips on slow links. Early 401/413 replies read and
