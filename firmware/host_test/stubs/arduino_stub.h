@@ -17,6 +17,7 @@ using std::isnan;
 #include <vector>
 #include <algorithm>
 #include <set>
+#include <functional>
 #include <sys/time.h>
 
 // ---- time / misc ------------------------------------------------------
@@ -406,6 +407,7 @@ struct XPowersAXP2101 {
 struct HardwareSerial {
     std::string rx, tx;
     size_t rxPos = 0;
+    std::function<void(HardwareSerial&)> onWrite;
     HardwareSerial(int) {}
     int baud = 0, rxPin = -1, txPin = -1;
     void setRxBufferSize(int) {}
@@ -415,8 +417,16 @@ struct HardwareSerial {
         return (int)(rx.size() - rxPos);
     }
     int read() { return rxPos < rx.size() ? (uint8_t)rx[rxPos++] : -1; }
-    size_t write(uint8_t c) { tx.push_back((char)c); return 1; }
-    size_t write(const uint8_t* b, size_t n) { tx.append((const char*)b, n); return n; }
+    size_t write(uint8_t c) {
+        tx.push_back((char)c);
+        if (onWrite) onWrite(*this);
+        return 1;
+    }
+    size_t write(const uint8_t* b, size_t n) {
+        tx.append((const char*)b, n);
+        if (onWrite) onWrite(*this);
+        return n;
+    }
 };
 #define SERIAL_8N1 0
 #define WL_CONNECTED 3

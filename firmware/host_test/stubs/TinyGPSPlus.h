@@ -16,6 +16,7 @@ struct TinyGPSPlus {
     TinyGPSLocation location; TinyGPSDate date; TinyGPSTime time; TinyGPSAltitude altitude;
     TinyGPSSpeed speed; TinyGPSCourse course; TinyGPSHDOP hdop; TinyGPSInteger satellites;
     bool encode(int) { return false; }
+    uint32_t passedChecksum() const { return 0; }
 };
 struct TinyGPSCustom {
     TinyGPSCustom(TinyGPSPlus&, const char*, int) {}

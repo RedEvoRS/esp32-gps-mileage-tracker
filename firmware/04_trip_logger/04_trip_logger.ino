@@ -170,6 +170,35 @@ bool              gGpsClockSet = false;
 uint32_t          gLastGpsSyncMs = 0;
 static constexpr uint32_t GPS_CLOCK_SYNC_MS = 60UL * 1000;
 
+// Core 1 owns receiver configuration. UART receive and ACK deadlines are
+// serviced by loop(), never by a blocking ACK wait during a drive.
+static constexpr uint32_t GPS_READY_MS = 3000;
+// NMEA can start before UBX input is ready. Five attempts spaced 8 s after
+// each failure put the last attempt at least 32 s after configuration starts.
+static constexpr uint32_t GPS_CONFIG_RETRY_MS = 8000;
+static constexpr uint32_t GPS_ACK_MS = 300;
+static constexpr uint8_t GPS_CONFIG_ATTEMPTS = 5;
+static constexpr uint8_t GPS_COMMAND_SENDS = 3;
+enum GpsConfigState { GPS_CONFIG_OFF, GPS_WAIT_READY, GPS_WAIT_ACK, GPS_RETRY, GPS_CONFIG_DONE };
+struct GpsConfig {
+    GpsConfigState state = GPS_CONFIG_OFF;
+    uint32_t since = 0, started = 0;
+    uint8_t attempts = 0, command = 0, sends = 0;
+    int8_t ack = -1;
+    bool readyLogged = false, retryLogged = false;
+};
+static GpsConfig gGpsConfig;
+
+// Demultiplex UBX packets before feeding NMEA to TinyGPSPlus. Only the
+// first two payload bytes (the command echoed by ACK/NAK) need storage.
+struct GpsUbxRx {
+    uint32_t pos = 0, since = 0;
+    uint16_t len = 0;
+    uint8_t cls = 0, id = 0, payload[2] = {0}, a = 0, b = 0;
+    bool checksumA = false;
+};
+static GpsUbxRx gGpsUbxRx;
+
 #define FS_LOCK()   xSemaphoreTake(gFsMutex, portMAX_DELAY)
 #define FS_UNLOCK() xSemaphoreGive(gFsMutex)
 
@@ -1440,7 +1469,7 @@ static void networkTask(void*) {
 }
 
 // =================================================================
-// GPS receiver configuration (u-blox UBX protocol, sent at boot)
+// GPS receiver configuration (u-blox UBX protocol, started at boot)
 // =================================================================
 // The MAX-M10S (SPG 5.10) ACKed these legacy messages on 2026-10-18.
 // Leave this configuration unchanged until #108 handles VALSET separately.
@@ -1459,70 +1488,92 @@ static void ubxSend(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t le
     GPSSerial.write(b);
 }
 
-// Watch the UART for UBX-ACK-ACK (1) or ACK-NAK (0) answering (cls, id);
-// -1 on timeout. NMEA arriving meanwhile is discarded -- setup() only.
-static int ubxWaitAck(uint8_t cls, uint8_t id, uint32_t timeoutMs) {
-    // B5 62 05 {01=ACK|00=NAK} 02 00 <cls> <id>
-    uint8_t win[8] = {0};
-    uint32_t t0 = millis();
-    while (millis() - t0 < timeoutMs) {
-        if (GPSSerial.available() <= 0) { delay(1); continue; }
-        memmove(win, win + 1, 7);
-        win[7] = (uint8_t)GPSSerial.read();
-        if (win[0] == 0xB5 && win[1] == 0x62 && win[2] == 0x05 &&
-            win[4] == 0x02 && win[5] == 0x00 && win[6] == cls && win[7] == id) {
-            if (win[3] == 0x01) return 1;
-            if (win[3] == 0x00) return 0;
-        }
-    }
-    return -1;
-}
-
-// Send one configuration message, retrying while the receiver is silent.
-static int ubxCommand(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len) {
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        ubxSend(cls, id, payload, len);
-        int r = ubxWaitAck(cls, id, 300);
-        if (r >= 0) return r;
-    }
-    return -1;
-}
-
-// Returns true only if every setting was acknowledged. Failure is logged
-// and is not fatal: loop() already processes one fix per RMC sentence
-// whatever the receiver sends, so the defaults still log correctly.
-static bool configureGps() {
-    // Give a freshly powered receiver up to 2 s to start talking.
-    uint32_t t0 = millis();
-    while (GPSSerial.available() <= 0 && millis() - t0 < 2000) delay(10);
-
-    bool ok = true;
+// Send one message and arm its deadline. Only one frame (at most 44 bytes)
+// is written per call; there is no flush or ACK wait.
+static void sendGpsConfigCommand() {
     // UBX-CFG-MSG (3-byte form: rate on the current port) = 0 for the NMEA
     // sentences TinyGPSPlus ignores: GLL, GSA, GSV, VTG. RMC and GGA stay --
     // GGA carries altitude, HDOP and satellite count.
     static const uint8_t kSilence[] = { 0x01, 0x02, 0x03, 0x05 };
-    for (size_t i = 0; i < sizeof(kSilence); ++i) {
-        uint8_t p[3] = { 0xF0, kSilence[i], 0 };
-        int r = ubxCommand(0x06, 0x01, p, sizeof(p));
-        if (r < 0 && i == 0) {
-            // Nothing answered at all: the receiver isn't hearing us (wiring,
-            // still booting). Don't spend seconds on the rest.
-            Serial.println("WARNING: GPS did not acknowledge UBX config -- using its defaults.");
-            return false;
-        }
-        ok &= (r == 1);
+    if (gGpsConfig.command < sizeof(kSilence)) {
+        uint8_t p[3] = { 0xF0, kSilence[gGpsConfig.command], 0 };
+        ubxSend(0x06, 0x01, p, sizeof(p));
+    } else {
+        // UBX-CFG-NAV5: apply only dynamic model "automotive" (4).
+        uint8_t nav5[36] = {0};
+        nav5[0] = 0x01;
+        nav5[2] = 4;
+        ubxSend(0x06, 0x24, nav5, sizeof(nav5));
     }
+    gGpsConfig.sends++;
+    gGpsConfig.ack = -1;
+    gGpsConfig.since = millis();
+    gGpsConfig.state = GPS_WAIT_ACK;
+}
 
-    // UBX-CFG-NAV5: dynamic model "automotive" (4). Mask bit 0 applies only
-    // the dynModel field; every other field in the payload is ignored.
-    uint8_t nav5[36] = {0};
-    nav5[0] = 0x01;
-    nav5[2] = 4;
-    ok &= (ubxCommand(0x06, 0x24, nav5, sizeof(nav5)) == 1);
+static void gpsConfigAttemptFailed() {
+    gGpsConfig.since = millis();
+    if (gGpsConfig.attempts >= GPS_CONFIG_ATTEMPTS) {
+        gGpsConfig.state = GPS_CONFIG_DONE;
+        Serial.printf("WARNING: GPS not configured after %u attempts -- continuing with current receiver settings.\n",
+                      (unsigned)GPS_CONFIG_ATTEMPTS);
+    } else {
+        gGpsConfig.state = GPS_RETRY;
+        if (!gGpsConfig.retryLogged) {
+            Serial.println("WARNING: GPS config incomplete -- retrying in background.");
+            gGpsConfig.retryLogged = true;
+        }
+    }
+}
 
-    Serial.println(ok ? "GPS configured: RMC+GGA only, automotive model."
-                      : "WARNING: GPS rejected part of the UBX config.");
-    return ok;
+static void configureGps() {
+    gGpsConfig = GpsConfig();
+    gGpsConfig.state = GPS_WAIT_READY;
+    gGpsConfig.attempts = 1;
+    gGpsConfig.since = millis();
+    gGpsConfig.started = gGpsConfig.since;
+    Serial.println("GPS: waiting for checksum-valid NMEA (up to 3 s).");
+}
+
+static void serviceGpsConfiguration() {
+    if (gGpsConfig.state == GPS_RETRY) {
+        if (millis() - gGpsConfig.since < GPS_CONFIG_RETRY_MS) return;
+        gGpsConfig.attempts++;
+        gGpsConfig.command = gGpsConfig.sends = 0;
+        gGpsConfig.since = millis();
+        gGpsConfig.state = GPS_WAIT_READY;
+    }
+    if (gGpsConfig.state == GPS_WAIT_READY) {
+        // Any complete, checksum-valid NMEA sentence proves the receiver
+        // is running; a position fix is unnecessary. A glitch byte cannot.
+        if (gps.passedChecksum() > 0) {
+            if (!gGpsConfig.readyLogged) {
+                Serial.println("GPS ready: checksum-valid NMEA received.");
+                gGpsConfig.readyLogged = true;
+            }
+            sendGpsConfigCommand();
+        } else if (millis() - gGpsConfig.since >= GPS_READY_MS) {
+            gpsConfigAttemptFailed();
+        }
+        return;
+    }
+    if (gGpsConfig.state != GPS_WAIT_ACK) return;
+    if (gGpsConfig.ack == 1) {
+        if (++gGpsConfig.command == 5) {
+            gGpsConfig.state = GPS_CONFIG_DONE;
+            Serial.printf("GPS configured on attempt %u (%lu ms after config start): RMC+GGA only, automotive model.\n",
+                          (unsigned)gGpsConfig.attempts,
+                          (unsigned long)(millis() - gGpsConfig.started));
+        } else {
+            gGpsConfig.sends = 0;
+            sendGpsConfigCommand();
+        }
+    } else if (gGpsConfig.ack == 0) {
+        gpsConfigAttemptFailed();  // NAK: retry the entire set later
+    } else if (millis() - gGpsConfig.since >= GPS_ACK_MS) {
+        if (gGpsConfig.sends < GPS_COMMAND_SENDS) sendGpsConfigCommand();
+        else gpsConfigAttemptFailed();
+    }
 }
 
 // True when an RMC sentence carrying a valid fix has arrived since the last
@@ -1547,6 +1598,72 @@ static bool buildFix(Fix& fx) {
     fx.hasUtc    = gClockSet.load();
     fx.utcMs     = fx.hasUtc ? nowEpochMs() : 0;
     return true;
+}
+
+// Handle each RMC as soon as it commits, including multiple epochs in one
+// UART drain. ACK handling never consumes bytes on a separate read path.
+// RMC carries position and speed together; GGA supplies the latest HDOP
+// but must not log a second point with the previous epoch's speed.
+static void receiveGpsNmea(uint8_t c) {
+    if (!gps.encode((char)c)) return;
+    setClockFromGps();
+    if (rmcFixArrived()) {
+        Fix fx;
+        if (buildFix(fx)) {
+            if (gHaveLastFix && (fx.monoMs - gLastFixMonoMs) > SEG_GAP_MS) {
+                if (gState == ACTIVE || gState == COOLDOWN) {
+                    fx.newSegment = true;
+                } else if (gState == ARMING) {
+                    gState = IDLE;
+                    armBufReset();
+                }
+            }
+            tripFsmOnFix(fx);
+        }
+    }
+}
+
+static void receiveGpsByte(uint8_t c) {
+    GpsUbxRx& rx = gGpsUbxRx;
+    // Recover from a truncated or noise-induced UBX header. Expected ACKs
+    // are 10 bytes; bound other packets to 256 payload bytes / 500 ms.
+    if (rx.pos && millis() - rx.since >= 500) rx = GpsUbxRx();
+    if (rx.pos == 0) {
+        if (c == 0xB5) { rx.pos = 1; rx.since = millis(); }
+        else receiveGpsNmea(c);
+        return;
+    }
+    if (rx.pos == 1) {
+        if (c == 0x62) rx.pos++;
+        else {
+            rx = GpsUbxRx();
+            if (c == 0xB5) { rx.pos = 1; rx.since = millis(); }
+            else receiveGpsNmea(c);
+        }
+        return;
+    }
+    if (rx.pos < 6 || rx.pos < (uint32_t)rx.len + 6) {
+        rx.a += c; rx.b += rx.a;
+        if (rx.pos == 2) rx.cls = c;
+        else if (rx.pos == 3) rx.id = c;
+        else if (rx.pos == 4) rx.len = c;
+        else if (rx.pos == 5) rx.len |= (uint16_t)c << 8;
+        else if (rx.pos < 8) rx.payload[rx.pos - 6] = c;
+        rx.pos++;
+        if (rx.len > 256) rx = GpsUbxRx();
+    } else if (rx.pos == (uint32_t)rx.len + 6) {
+        rx.checksumA = (c == rx.a);
+        rx.pos++;
+    } else {
+        uint8_t expectedId = gGpsConfig.command < 4 ? 0x01 : 0x24;
+        if (rx.checksumA && c == rx.b && rx.cls == 0x05 && rx.len == 2 &&
+            (rx.id == 0x01 || rx.id == 0x00) && rx.payload[0] == 0x06 &&
+            rx.payload[1] == expectedId && gGpsConfig.state == GPS_WAIT_ACK &&
+            gGpsConfig.ack < 0) {
+            gGpsConfig.ack = rx.id == 0x01 ? 1 : 0;
+        }
+        rx = GpsUbxRx();
+    }
 }
 
 // =================================================================
@@ -1683,7 +1800,8 @@ void setup() {
     prefs.begin("mileage", false);
     fsckAllTrips();
 
-    // After the fsck so the receiver has had time to boot.
+    // Start a bounded readiness wait; loop() receives NMEA and configures
+    // the receiver without blocking trip logging or power/charge checks.
     configureGps();
 
     // First charge-temperature check now, not 30 s in: charging has been off
@@ -1702,35 +1820,12 @@ void setup() {
 }
 
 void loop() {
-    // Core 1: drain the GPS UART into the parser.
+    // Core 1: one UART reader routes NMEA/fixes and checksum-checked UBX
+    // ACKs. Configuration deadlines never block receive or trip processing.
     while (GPSSerial.available() > 0) {
-        if (gps.encode(GPSSerial.read())) setClockFromGps();
+        receiveGpsByte((uint8_t)GPSSerial.read());
     }
-
-    // Process one fix per epoch, on its RMC sentence. TinyGPSPlus commits
-    // the location on both RMC and GGA, and the receiver sends both every
-    // second, so gating on location.isUpdated() logged each position twice
-    // -- the GGA copy carrying the previous epoch's speed. RMC holds the
-    // position, speed and course together; altitude/HDOP/satellites come
-    // from the latest GGA, at most one epoch old.
-    if (rmcFixArrived()) {
-        Fix fx;
-        if (buildFix(fx)) {
-            // Fix-loss detection: a long gap since the last good fix
-            // means the next point should start a fresh segment. A gap
-            // during ARMING invalidates the arm timer entirely (a stale
-            // gArmT0 would otherwise start a trip on the very next fix).
-            if (gHaveLastFix && (fx.monoMs - gLastFixMonoMs) > SEG_GAP_MS) {
-                if (gState == ACTIVE || gState == COOLDOWN) {
-                    fx.newSegment = true;
-                } else if (gState == ARMING) {
-                    gState = IDLE;
-                    armBufReset();
-                }
-            }
-            tripFsmOnFix(fx);
-        }
-    }
+    serviceGpsConfiguration();
 
     // Fix-loss watchdog: a recording trip with no valid fix at all for
     // FIX_LOSS_END_MS (parked indoors, antenna failure) is finalized so

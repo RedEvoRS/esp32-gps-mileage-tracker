@@ -34,6 +34,8 @@ static void resetWorld() {
     LittleFS.mkdir(TRIP_DIR);
     prefs.kv.clear();
     Serial.log.clear();
+    GPSSerial = HardwareSerial(1);
+    gGpsConfig = GpsConfig(); gGpsUbxRx = GpsUbxRx();
     gState = IDLE; gTripPath[0] = 0; gTripWriteFailed = false;
     gPendCount = gPendHead = 0; armBufReset(); gHaveLastFix = false;
     gClockSet = true;
