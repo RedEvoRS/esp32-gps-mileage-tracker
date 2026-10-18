@@ -69,6 +69,80 @@ jobs:
           test -f "$TINYGPS_DIR/TinyGPS++.cpp"
           bash firmware/host_test/run.sh
 
+  firmware-compile:
+    # One runner shares the toolchain and core build cache across all sketches.
+    # This checks compilation; the V1.2 sketches still need their Supreme port.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      ARDUINO_CLI_VERSION: '1.5.1'
+      ESP32_CORE_VERSION: '3.3.11'
+      XPOWERS_VERSION: '0.3.3'
+      TINYGPS_VERSION: '1.0.3'
+      ESP32_INDEX_URL: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+      FQBN: esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@81d310742121c928ea9c8bbd407b4217b432ae02 # v2.0.0
+        with:
+          version: ${{ env.ARDUINO_CLI_VERSION }}
+      - name: Cache ESP32 core, toolchain downloads and libraries
+        id: arduino-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.arduino15
+            ~/Arduino/libraries
+          key: ${{ runner.os }}-${{ runner.arch }}-arduino-v1-cli-${{ env.ARDUINO_CLI_VERSION }}-esp32-${{ env.ESP32_CORE_VERSION }}-xpowers-${{ env.XPOWERS_VERSION }}-tinygps-${{ env.TINYGPS_VERSION }}
+      - name: Install pinned core and libraries
+        if: steps.arduino-cache.outputs.cache-hit != 'true'
+        run: |
+          arduino-cli core update-index --additional-urls "$ESP32_INDEX_URL"
+          arduino-cli core install "esp32:esp32@$ESP32_CORE_VERSION" --additional-urls "$ESP32_INDEX_URL"
+          arduino-cli lib update-index
+          arduino-cli lib install "XPowersLib@$XPOWERS_VERSION" "TinyGPSPlus@$TINYGPS_VERSION"
+      - name: Compile all four sketches
+        shell: bash
+        run: |
+          cp firmware/secrets.h.example firmware/04_trip_logger/secrets.h
+          trap 'rm -f firmware/04_trip_logger/secrets.h' EXIT
+          for sketch in 01_hello_world 02_pmu_test 03_gps_test 04_trip_logger; do
+            echo "::group::Compile $sketch"
+            size_args=()
+            if [ -f "firmware/$sketch/partitions.csv" ]; then
+              # The core copies this CSV, but CLI still uses the board menu's
+              # upload.maximum_size. Tie its built-in size check to the CSV.
+              max_size=$(python3 - "firmware/$sketch/partitions.csv" <<'PY'
+          import csv
+          import sys
+
+          def size_bytes(value):
+              value = value.strip().upper()
+              if value.endswith(("K", "M")):
+                  return int(value[:-1], 0) * {"K": 1024, "M": 1024 * 1024}[value[-1]]
+              return int(value, 0)
+
+          with open(sys.argv[1]) as source:
+              rows = csv.reader(line.split("#", 1)[0] for line in source)
+              sizes = [size_bytes(row[4]) for row in rows
+                       if len(row) >= 5 and row[1].strip().lower() in ("app", "0", "0x00")]
+          if not sizes or min(sizes) <= 0:
+              raise SystemExit("Partition table must contain a positive app partition")
+          # Require the image to fit every app slot if OTA partitions are added.
+          print(min(sizes))
+          PY
+              )
+              echo "App partition limit: $max_size bytes"
+              size_args=(--build-property "upload.maximum_size=$max_size")
+            fi
+            arduino-cli compile --fqbn "$FQBN" --warnings default --jobs 2 \
+              "${size_args[@]}" "firmware/$sketch"
+            echo "::endgroup::"
+          done
+
   installer:
     # Runs server/install.sh for real on a fresh VM: Docker builds, the
     # test upload, the viewer login and exports, and backups through
