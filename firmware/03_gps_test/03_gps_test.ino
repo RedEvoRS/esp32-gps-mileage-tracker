@@ -11,31 +11,46 @@
 // Use open sky and a connected GPS antenna. No fix indoors is normal.
 // Coordinates are OFF by default: serial logs may be pasted into issues.
 // l opts into coordinates; r opts into raw NMEA (also contains location).
-// h lists keys. 4 toggles GPS rail; e toggles GPS_EN; b toggles VBACKUP.
+// h lists keys. 4 toggles GPS rail; e toggles GPS_EN; b toggles VBACKUP
+// for completeness: VBACKUP is not needed for hot starts on this board.
 // 3 then uppercase Y within 10 s enables ALDO3 ONLY WITH LoRa antenna.
-// u sends Stage 4's legacy CFG-MSG x4 + CFG-NAV5 bytes; expect NAKs or
-// silence from M10S. v polls MON-VER for software/hardware/extensions.
+// u sends Stage 4's CFG-MSG GLL/GSA/GSV/VTG + CFG-NAV5: SPG 5.10
+// ACKed all five. VALSET is future-proofing tracked in #108.
+// v polls MON-VER: bench ROM SPG 5.10, PROTVER=34.10, MOD=MAX-M10S.
 // g polls NAV-SAT (signal strength per satellite) and MON-RF (antenna/AGC).
+// Bench: unplugged/dead antenna gave heard=0, AGC stuck around 79%; a
+// connected active antenna outdoors gave ~19-25 satellites, 42-48 dBHz,
+// AGC ~29%. This board powers an active GPS antenna.
 //
-// Bench sequence: with ALDO3 OFF, confirm NMEA at ALDO4 ON; turn ALDO4
-// OFF and check it goes silent. If testing the alternate rail, attach
-// LoRa antenna, use 3/Y, then 4 to compare. Turn ALDO3 OFF afterwards.
-// Compare ALDO4 off/on TTFF with b OFF and b ON; this tests backup
-// retention, not just its charge-enable register. A reset restarts the
-// experiment. GPS_EN HIGH follows LilyGO, but #105 must confirm its
-// function and polarity specifically on the MAX-M10S version.
+// Bench 2026-10-18: NMEA at 9600 on RX9/TX8. ALDO4 is the GPS rail:
+// OFF = silent, ON = talking, with ALDO3 OFF throughout. GPS_EN (GPIO7)
+// LOW vs HIGH made no difference on MAX-M10S; keep HIGH like LilyGO.
+// GPS backup RAM uses the 18650, not PMU VBACKUP. With VBACKUP OFF,
+// a hot start after 60 s ALDO4 OFF took 2.0 s; pulling the battery wiped
+// backup RAM, and the next cold start took 32.8 s. Saved factory settings
+// also survived PMU shutdowns until the battery was pulled.
 //
-// Supreme upload settings (for the owner when the board arrives):
+// Supreme upload settings (bench-confirmed 2026-10-18):
 //   Before ANY power, attach the 915 MHz LoRa antenna: factory firmware
 //   may transmit. Back up the factory flash before the first upload.
 //   Arduino IDE: ESP32S3 Dev Module, USB CDC On Boot Enabled,
 //   USB Mode Hardware CDC and JTAG, Flash Size 8 MB, PSRAM QSPI PSRAM.
 //   CLI FQBN (ESP32 core 3.3.11):
 //   esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled
-//   Select the Supreme's port, then Upload. If native USB disappears,
-//   hold BOOT, tap RST, release BOOT; select the new port and retry.
-//   QSPI follows LilyGO's boards/t-beams3-supreme.json (qio_qspi), but is
-//   unconfirmed: use Stage 1's PSRAM size; if zero try OPI (PSRAM=opi).
+//   Stage 1 printed flash 8388608 and PSRAM 8388608 bytes with QSPI.
+//   Native USB-Serial/JTAG is VID:PID 303A:1001; the COM number varies.
+//   With our sketches running, esptool auto-reset needs no buttons;
+//   it failed under the factory Meshtastic firmware.
+//   Manual download with an 18650 (USB unplug alone leaves it powered):
+//   hold POWER ~6 s to switch off, hold BOOT, press POWER ~1 s, keep
+//   BOOT held 2-3 s, then release. Without a battery: unplug USB, hold
+//   BOOT, plug USB in, wait 2-3 s, then release BOOT.
+//   After a manual-download flash, software/RTS reset returns to download
+//   mode: the BOOT strap stays latched until a real reset. Press RESET
+//   once to run the sketch.
+//   Buttons (LilyGO photo, bench-confirmed): screen left, USB-C right.
+//   RESET/POWER are a close pair near the middle, RESET on the left;
+//   BOOT is on its own further right. Hold POWER ~6 s to switch off.
 //
 // Pin/rail/baud source: Xinyuan-LilyGO/LilyGo-LoRa-Series, commit
 // 1991b1ed70915d4f246b841f99f6027166ea7330, examples/Factory/utilities.h
@@ -97,7 +112,7 @@ static void printStatus() {
     printRail("DLDO2", PMU.isEnableDLDO2(), PMU.getDLDO2Voltage());
     printRail("CPUSLDO", PMU.isEnableCPUSLDO(), PMU.getCPUSLDOVoltage());
     printRail("VBACKUP", PMU.isEnableButtonBatteryCharge(), PMU.getButtonBatteryVoltage());
-    Serial.println("  VBACKUP = button-battery charge enable/target; actual GPS backup wiring unknown.");
+    Serial.println("  VBACKUP = button-battery charge enable/target; GPS backup uses the 18650, not VBACKUP.");
     Serial.printf("VBUS present=%s, %u mV | battery present=%s, %u mV, %d%%\n",
                   PMU.isVbusIn() ? "yes" : "no", PMU.getVbusVoltage(),
                   PMU.isBatteryConnect() ? "yes" : "no", PMU.getBattVoltage(),
@@ -326,7 +341,7 @@ static const char* ackText(int result) {
 }
 
 static void testLegacyConfig() {
-    Serial.println("Sending Stage 4 legacy config. M10S is expected to NAK or stay silent (#108).");
+    Serial.println("Sending Stage 4 legacy config: SPG 5.10 ACKed all five on the bench; VALSET is future-proofing (#108).");
     Serial.println("If accepted, these RAM settings silence GLL/GSA/GSV/VTG and select automotive.");
     static const uint8_t silence[] = {0x01, 0x02, 0x03, 0x05};
     static const char* names[] = {"GLL", "GSA", "GSV", "VTG"};
@@ -390,9 +405,9 @@ static void toggleGpsPower() {
     Serial.printf("ALDO4 requested %s: %s, readback=%s, %u mV\n",
                   turnOn ? "ON" : "OFF", ok ? "OK" : "ERROR",
                   gpsRailOn ? "ON" : "OFF", PMU.getALDO4Voltage());
-    if (turnOn && gpsRailOn) Serial.println("TTFF restarted from ALDO4 ON. Compare b OFF/ON with equal off intervals.");
-    if (!turnOn) Serial.println("ALDO4 OFF: check NMEA/PPS stop. Unexpected continuing data is useful rail evidence.");
-    // Keep receiving even when ALDO4 is off: this is a rail-discovery test.
+    if (turnOn && gpsRailOn) Serial.println("TTFF restarted from ALDO4 ON. Bench hot start: 2.0 s after 60 s OFF, VBACKUP OFF.");
+    if (!turnOn) Serial.println("ALDO4 OFF: bench NMEA stopped; ON restored it, with ALDO3 OFF throughout.");
+    // Keep receiving during rail-off checks; bench NMEA stopped with ALDO4 OFF.
     if (turnOn) resumeKnownBaud();
     // Restart the probe window to give the current baud a full 4 seconds.
     probeStarted = millis();
@@ -402,25 +417,25 @@ static void toggleBackup() {
     bool turnOn = !PMU.isEnableButtonBatteryCharge();
     bool ok;
     if (turnOn) {
-        // Same calls/target as Stage 4. LilyGO disables VBACKUP in its
-        // Supreme setup; whether this pin backs up GPS needs measurement.
+        // b is kept for completeness: GPS backup RAM uses the 18650.
+        // Same calls/target as Stage 4; LilyGO leaves VBACKUP OFF here.
         ok = PMU.setButtonBatteryChargeVoltage(3300);
         ok &= PMU.enableButtonBatteryCharge();
     } else ok = PMU.disableButtonBatteryCharge();
     Serial.printf("VBACKUP charge requested %s: %s, readback=%s, target=%u mV\n",
                   turnOn ? "ON" : "OFF", ok ? "OK" : "ERROR",
                   PMU.isEnableButtonBatteryCharge() ? "ON" : "OFF", PMU.getButtonBatteryVoltage());
-    Serial.println("This is charge control, not proof of GPS backup supply. Compare ALDO4-cycle TTFF.");
+    Serial.println("GPS backup uses the 18650; VBACKUP is not needed for hot starts on this board.");
 }
 
 static void printHelp() {
     Serial.println("Keys: h help | r raw NMEA (includes private coordinates!) | l coordinates (default OFF)");
-    Serial.println("      4 ALDO4 GPS power/TTFF reset | e GPS_EN HIGH/LOW | b VBACKUP charge toggle");
+    Serial.println("      4 ALDO4 GPS power/TTFF reset | e GPS_EN HIGH/LOW | b VBACKUP charge (optional)");
     Serial.println("      3 ALDO3 LoRa toggle: ON requires 3 then uppercase Y within 10 s and antenna");
-    Serial.println("      u Stage 4 legacy UBX config | v UBX-MON-VER | p rails/power status");
+    Serial.println("      u legacy UBX (SPG 5.10 accepts; VALSET #108) | v MON-VER | p rails/power");
     Serial.println("      g satellite signal strengths (NAV-SAT) + RF/antenna status (MON-RF)");
     Serial.println("Counters reset on baud/power/EN changes; TTFF resets only on ALDO4 ON.");
-    Serial.println("For #105: compare NMEA/PPS with ALDO4 off, then separately ALDO3 off.");
+    Serial.println("GPS backup uses the 18650; b is kept for completeness, not needed for hot starts.");
 }
 
 static void handleKey(char key) {
@@ -453,7 +468,7 @@ static void handleKey(char key) {
             digitalWrite(GPS_EN, gpsEnHigh ? HIGH : LOW);
             resetDecoder();
             if (gpsEnHigh) resumeKnownBaud();
-            Serial.printf("GPS_EN GPIO7=%s. Polarity/function on MAX-M10S is a bench check.\n", gpsEnHigh ? "HIGH" : "LOW");
+            Serial.printf("GPS_EN GPIO7=%s. Bench: LOW/HIGH made no difference to MAX-M10S NMEA; default HIGH follows LilyGO.\n", gpsEnHigh ? "HIGH" : "LOW");
             break;
         case 'b': toggleBackup(); break;
         case '3':
@@ -519,6 +534,8 @@ void setup() {
     }
     Serial.println("BOOT SNAPSHOT before sketch rail/ADC changes (ADC may be disabled/stale).");
     printStatus();
+    // VBUS-insert boot left ALDO3 ON; POWER-button boot left it OFF.
+    // Disable LoRa first so its boot state cannot leave the radio powered.
     bool ok = PMU.disableALDO3();
     if (!ok || PMU.isEnableALDO3()) {
         Serial.println("ERROR: cannot verify ALDO3 OFF. Attach LoRa antenna; stopping.");
@@ -532,7 +549,7 @@ void setup() {
     }
     delay(250);
     pinMode(GPS_EN, OUTPUT);
-    digitalWrite(GPS_EN, HIGH);  // LilyGO beginGPS(): HIGH; #105 must confirm for MAX-M10S.
+    digitalWrite(GPS_EN, HIGH);  // LilyGO HIGH; bench LOW/HIGH made no NMEA difference.
     pinMode(GPS_PPS, INPUT);
     attachInterrupt(digitalPinToInterrupt(GPS_PPS), onPps, RISING);
     selectBaud(0);
@@ -545,7 +562,7 @@ void setup() {
     ok &= PMU.enableBattVoltageMeasure();
     ok &= PMU.enableSystemVoltageMeasure();
     if (!ok) Serial.println("WARNING: could not enable all voltage measurements.");
-    // No backup/charger changes at boot: b makes the backup experiment explicit.
+    // Leave VBACKUP as found; b is optional, not needed for GPS hot starts.
     printStatus();
     printHelp();
 }

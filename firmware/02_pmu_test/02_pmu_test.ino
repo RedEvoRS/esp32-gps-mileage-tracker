@@ -2,29 +2,46 @@
 // Stage 2: Supreme AXP2101 / Both I2C Buses / Shutdown Test
 // =================================================================
 // Purpose: Record boot rails before changing them, safely power the GPS,
-// and make the shutdown/VBUS power-on experiment in #106 repeatable.
+// and repeat #106's shutdown/VBUS power-on check.
 // What to expect: a boot snapshot, ALDO3 OFF, ALDO4 at 3.3 V, bus scans,
 // then status every 5 s. Keys: h help, p status, i scan, o sensors,
 // s then uppercase Y within 10 s to shut down (any other key cancels).
-// PMU = Wire1 SDA 42/SCL 41 at 0x34; sensors = Wire SDA 17/SCL 18.
-// OLED may answer at 0x3C (or 0x3D), PCF8563 RTC at 0x51.
+// Bench 2026-10-18: Wire1 SDA42/SCL41 = PMU 0x34 + PCF8563 RTC 0x51.
+// Wire SDA17/SCL18 = SH1106 OLED 0x3C + BME280 0x77; unexplained ACKs
+// at reserved 0x7C/0x7E were harmless. The RTC is on the PMU bus.
+// Boot snapshot: DCDC1/5 3.3 V ON, DCDC4 1.8 V ON, ALDO1 1.8 V ON,
+// ALDO2 3.3 V ON, BLDO1 1.8 V ON; ALDO4/VBACKUP and other rails OFF,
+// except ALDO3: ON after VBUS insert, OFF after POWER-button power-on.
+// PMU.shutdown() switched off and stayed off 15 s with USB connected.
+// USB unplug/replug powered it on: ON source 0x04 (VBUS insert),
+// OFF source 0x02 (software).
 // Requires installed XPowersLib 0.3.3; do not substitute a different API.
 //
-// Supreme upload settings (for the owner when the board arrives):
+// Supreme upload settings (bench-confirmed 2026-10-18):
 //   Before ANY power, attach the 915 MHz LoRa antenna: factory firmware
 //   may transmit. Back up the factory flash before the first upload.
 //   Arduino IDE: ESP32S3 Dev Module, USB CDC On Boot Enabled,
 //   USB Mode Hardware CDC and JTAG, Flash Size 8 MB, PSRAM QSPI PSRAM.
 //   CLI FQBN (ESP32 core 3.3.11):
 //   esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled
-//   Select the Supreme's port, then Upload. If native USB disappears,
-//   hold BOOT, tap RST, release BOOT; select the new port and retry.
-//   QSPI follows LilyGO's boards/t-beams3-supreme.json (qio_qspi), but is
-//   unconfirmed: use Stage 1's PSRAM size; if zero try OPI (PSRAM=opi).
+//   Stage 1 printed flash 8388608 and PSRAM 8388608 bytes with QSPI.
+//   Native USB-Serial/JTAG is VID:PID 303A:1001; the COM number varies.
+//   With our sketches running, esptool auto-reset needs no buttons;
+//   it failed under the factory Meshtastic firmware.
+//   Manual download with an 18650 (USB unplug alone leaves it powered):
+//   hold POWER ~6 s to switch off, hold BOOT, press POWER ~1 s, keep
+//   BOOT held 2-3 s, then release. Without a battery: unplug USB, hold
+//   BOOT, plug USB in, wait 2-3 s, then release BOOT.
+//   After a manual-download flash, software/RTS reset returns to download
+//   mode: the BOOT strap stays latched until a real reset. Press RESET
+//   once to run the sketch.
+//   Buttons (LilyGO photo, bench-confirmed): screen left, USB-C right.
+//   RESET/POWER are a close pair near the middle, RESET on the left;
+//   BOOT is on its own further right. Hold POWER ~6 s to switch off.
 //
 // Pin/rail source: Xinyuan-LilyGO/LilyGo-LoRa-Series, commit
 // 1991b1ed70915d4f246b841f99f6027166ea7330, examples/Factory/utilities.h
-// and LoRaBoards.cpp, T_BEAM_S3_SUPREME sections. Bench checks pending.
+// and LoRaBoards.cpp, T_BEAM_S3_SUPREME sections. Bench results above.
 // Unlike LilyGO's factory setup, never enable ALDO3 (LoRa) here, and
 // never configure/disable DCDC1 (ESP32), other core rails, or BLDO1 (SD).
 // =================================================================
@@ -60,7 +77,7 @@ static void printStatus() {
     printRail("DLDO2", PMU.isEnableDLDO2(), PMU.getDLDO2Voltage());
     printRail("CPUSLDO", PMU.isEnableCPUSLDO(), PMU.getCPUSLDOVoltage());
     printRail("VBACKUP", PMU.isEnableButtonBatteryCharge(), PMU.getButtonBatteryVoltage());
-    Serial.println("  VBACKUP = button-battery charge enable/target; actual GPS backup wiring unknown.");
+    Serial.println("  VBACKUP = button-battery charge enable/target; GPS backup uses the 18650, not VBACKUP.");
     Serial.printf("VBUS present=%s, %u mV | battery present=%s, %u mV, %d%%\n",
                   PMU.isVbusIn() ? "yes" : "no", PMU.getVbusVoltage(),
                   PMU.isBatteryConnect() ? "yes" : "no", PMU.getBattVoltage(),
@@ -95,8 +112,8 @@ static void scanBus(TwoWire& bus, const char* name) {
 }
 
 static void scanBoth() {
-    scanBus(Wire1, "Wire1 SDA42/SCL41 (PMU expected 0x34)");
-    scanBus(Wire, "Wire SDA17/SCL18 (OLED ~0x3C, RTC 0x51)");
+    scanBus(Wire1, "Wire1 SDA42/SCL41 (PMU 0x34, PCF8563 RTC 0x51)");
+    scanBus(Wire, "Wire SDA17/SCL18 (SH1106 0x3C, BME280 0x77; harmless reserved ACKs 0x7C/0x7E)");
 }
 
 static void printHelp() {
@@ -143,6 +160,8 @@ void setup() {
     // begin() identifies the PMU and disables its TS measurement, but does
     // not change rail enable/voltage registers. Record ALL rails first.
     printStatus();
+    // VBUS-insert boot left ALDO3 ON; POWER-button boot left it OFF.
+    // Disable LoRa first so its boot state cannot leave the radio powered.
     bool ok = PMU.disableALDO3();
     if (!ok || PMU.isEnableALDO3()) {
         Serial.println("ERROR: cannot verify ALDO3 OFF. Attach LoRa antenna; stopping.");
@@ -173,9 +192,9 @@ void loop() {
         if (shutdownPending) {
             shutdownPending = false;
             if (key == 'Y' && millis() - confirmStarted < 10000) {
-                Serial.println("Shutting down: board goes dark and native USB disappears.");
-                Serial.println("Unplug/replug USB: it should boot IF VBUS insert powers on this PMU.");
-                Serial.println("If it stays dark, press PWR. Record next boot's power-on source for #106.");
+                Serial.println("Shutting down: bench confirmed board off, USB gone; stayed off 15 s with USB connected.");
+                Serial.println("USB unplug/replug powered it on in the bench test (#106).");
+                Serial.println("Bench sources: power-on 0x04 = VBUS insert; power-off 0x02 = software.");
                 Serial.flush();
                 delay(100);
                 PMU.shutdown();
@@ -189,7 +208,7 @@ void loop() {
             case 'i': scanBoth(); break;
             case 'o': toggleSensors(); break;
             case 's':
-                Serial.println("Shutdown test: board goes dark. Unplug/replug USB to test VBUS power-on; use PWR if needed.");
+                Serial.println("Shutdown test: bench confirmed off for 15 s with USB connected; USB replug powered it on.");
                 Serial.println("Press uppercase Y within 10 s to confirm; any other key cancels.");
                 shutdownPending = true;
                 confirmStarted = millis();
