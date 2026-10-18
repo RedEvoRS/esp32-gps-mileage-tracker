@@ -15,6 +15,7 @@
 // 3 then uppercase Y within 10 s enables ALDO3 ONLY WITH LoRa antenna.
 // u sends Stage 4's legacy CFG-MSG x4 + CFG-NAV5 bytes; expect NAKs or
 // silence from M10S. v polls MON-VER for software/hardware/extensions.
+// g polls NAV-SAT (signal strength per satellite) and MON-RF (antenna/AGC).
 //
 // Bench sequence: with ALDO3 OFF, confirm NMEA at ALDO4 ON; turn ALDO4
 // OFF and check it goes silent. If testing the alternate rail, attach
@@ -71,6 +72,7 @@ uint8_t ubxPayload[1024];
 uint32_t ubxLastByte = 0;
 uint8_t ackClass = 0, ackId = 0;
 bool awaitingAck = false, awaitingVersion = false, versionReceived = false;
+bool awaitingSat = false, satReceived = false, awaitingRf = false, rfReceived = false;
 int ackResult = -1;
 
 static void printRail(const char* name, bool enabled, uint16_t millivolts) {
@@ -127,7 +129,60 @@ static void printVersionField(const char* label, const uint8_t* bytes, size_t le
     Serial.println();
 }
 
+static uint16_t le16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+
+static void printNavSat() {
+    // UBX-NAV-SAT: 8-byte header, then 12 bytes per satellite. Signal
+    // strength (C/N0) tells a dead/unpowered antenna (nothing heard) from a
+    // poor sky view (weak signals). Sky positions are not printed.
+    uint8_t numSvs = ubxPayload[5];
+    if (ubxLength < 8 || ubxLength != 8 + 12u * numSvs) {
+        Serial.println("NAV-SAT: malformed length; ignoring.");
+        return;
+    }
+    static const char kGnss[] = "GSEBIQR";  // GPS, SBAS, Galileo, BeiDou, IMES, QZSS, GLONASS
+    unsigned heard = 0, used = 0, maxCno = 0, sumCno = 0;
+    Serial.printf("NAV-SAT: %u satellites known. Heard (C/N0 dBHz, * = used in fix):\n ", numSvs);
+    for (unsigned i = 0; i < numSvs; ++i) {
+        const uint8_t* sv = ubxPayload + 8 + 12 * i;
+        uint8_t cno = sv[2];
+        bool svUsed = sv[8] & 0x08;
+        if (svUsed) ++used;
+        if (!cno) continue;
+        ++heard;
+        sumCno += cno;
+        if (cno > maxCno) maxCno = cno;
+        Serial.printf(" %c%02u:%u%s", sv[0] < 7 ? kGnss[sv[0]] : '?', sv[1], cno, svUsed ? "*" : "");
+        if (heard % 10 == 0) Serial.print("\n ");
+    }
+    Serial.printf("\n  heard=%u used=%u max=%u avg=%u dBHz\n", heard, used, maxCno, heard ? sumCno / heard : 0);
+    Serial.println("  C/N0 guide: none = no signal reaching the receiver; <25 weak; 30-45 good sky view.");
+}
+
+static void printMonRf() {
+    // UBX-MON-RF: 4-byte header, then 24 bytes per RF block.
+    uint8_t nBlocks = ubxPayload[1];
+    if (ubxLength < 4 || ubxLength != 4 + 24u * nBlocks) {
+        Serial.println("MON-RF: malformed length; ignoring.");
+        return;
+    }
+    static const char* kAnt[] = {"INIT", "DONTKNOW", "OK", "SHORT", "OPEN"};
+    static const char* kPower[] = {"OFF", "ON", "DONTKNOW"};
+    static const char* kJam[] = {"unknown", "ok", "warning", "critical"};
+    for (unsigned i = 0; i < nBlocks; ++i) {
+        const uint8_t* b = ubxPayload + 4 + 24 * i;
+        uint16_t agc = le16(b + 14);
+        Serial.printf("MON-RF block %u: antenna %s, antenna power %s, jamming %s, noise %u/ms, AGC %u (%u%% of max)\n",
+                      b[0], b[2] < 5 ? kAnt[b[2]] : "?", b[3] < 3 ? kPower[b[3]] : "?",
+                      kJam[b[1] & 0x03], le16(b + 12), agc, (unsigned)(agc * 100UL / 8191));
+    }
+    Serial.println("  Antenna status/power need the antenna supervisor set up; DONTKNOW is normal.");
+    Serial.println("  AGC near max = receiver at full gain = little signal coming in.");
+}
+
 static void handleUbx() {
+    if (awaitingSat && ubxClass == 0x01 && ubxId == 0x35) { printNavSat(); satReceived = true; }
+    if (awaitingRf && ubxClass == 0x0A && ubxId == 0x38) { printMonRf(); rfReceived = true; }
     if (awaitingAck && ubxClass == 0x05 && ubxLength == 2 &&
         ubxPayload[0] == ackClass && ubxPayload[1] == ackId) {
         if (ubxId == 0x01) ackResult = 1;
@@ -301,6 +356,25 @@ static void pollVersion() {
     if (!versionReceived) Serial.println("MON-VER: no valid answer within 2 s. Check baud, TX8, GPS power/EN.");
 }
 
+static void pollSignal() {
+    // Poll satellite signal strengths, then the RF front end.
+    pumpGps();
+    awaitingSat = true;
+    satReceived = false;
+    ubxSend(0x01, 0x35, nullptr, 0);  // UBX-NAV-SAT poll.
+    uint32_t sentAt = millis();
+    while (!satReceived && millis() - sentAt < 2000) { pumpGps(); delay(1); }
+    awaitingSat = false;
+    if (!satReceived) Serial.println("NAV-SAT: no valid answer within 2 s.");
+    awaitingRf = true;
+    rfReceived = false;
+    ubxSend(0x0A, 0x38, nullptr, 0);  // UBX-MON-RF poll.
+    sentAt = millis();
+    while (!rfReceived && millis() - sentAt < 2000) { pumpGps(); delay(1); }
+    awaitingRf = false;
+    if (!rfReceived) Serial.println("MON-RF: no valid answer within 2 s.");
+}
+
 static void toggleGpsPower() {
     bool turnOn = !PMU.isEnableALDO4();
     resetDecoder();
@@ -344,6 +418,7 @@ static void printHelp() {
     Serial.println("      4 ALDO4 GPS power/TTFF reset | e GPS_EN HIGH/LOW | b VBACKUP charge toggle");
     Serial.println("      3 ALDO3 LoRa toggle: ON requires 3 then uppercase Y within 10 s and antenna");
     Serial.println("      u Stage 4 legacy UBX config | v UBX-MON-VER | p rails/power status");
+    Serial.println("      g satellite signal strengths (NAV-SAT) + RF/antenna status (MON-RF)");
     Serial.println("Counters reset on baud/power/EN changes; TTFF resets only on ALDO4 ON.");
     Serial.println("For #105: compare NMEA/PPS with ALDO4 off, then separately ALDO3 off.");
 }
@@ -395,6 +470,7 @@ static void handleKey(char key) {
             break;
         case 'u': testLegacyConfig(); break;
         case 'v': pollVersion(); break;
+        case 'g': pollSignal(); break;
         default: Serial.println("Unknown key; h shows help."); break;
     }
 }
