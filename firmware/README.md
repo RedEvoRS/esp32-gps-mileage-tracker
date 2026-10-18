@@ -5,21 +5,20 @@
 > microSD card** for trip storage. See LilyGO's [T-Beam Supreme hardware
 > guide](https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/docs/en/t_beam_supreme/t_beam_supreme_hw.md).
 >
-> **The Supreme port is in progress.** Stages 1–3 run on the Supreme: see
-> [T-Beam Supreme bring-up](#t-beam-supreme-bring-up). Stage 4, the trip
-> logger, and the rest of this README are still for the retired T-Beam V1.2
-> with NEO-M8N GPS and LittleFS. **Don't flash Stage 4 on a Supreme yet.**
-> SD-card formatting and the Supreme trip logger will be documented with
-> the port.
+> **The Supreme port is in progress.** All four stages run on the Supreme:
+> start with [T-Beam Supreme bring-up](#t-beam-supreme-bring-up). Stage 4,
+> the trip logger, still stores trips in the internal LittleFS partition
+> (about 6 hours of driving between uploads) until microSD support lands.
+> Much of the rest of this README, including most of the Stage 4 section,
+> still describes the retired T-Beam V1.2 with NEO-M8N GPS. Read
+> [Stage 4 on the Supreme](#stage-4-on-the-supreme) for what differs.
+> SD-card formatting will be documented with the port.
 
 The firmware is organized into progressive stages that let you verify
-each hardware subsystem before building the full mileage tracker. The
-bring-up stages (1–3) are ported to the T-Beam Supreme; Stage 4 still
-targets the LilyGO TTGO T-Beam V1.2 with NEO-M8N GPS module.
+each hardware subsystem before building the full mileage tracker.
 
 The [top-level README](../README.md) describes the Supreme MAX-M10S target
-and server setup; it marks the Stage 4 steps below as V1.2-only because the
-rest of the Supreme port is still pending.
+and server setup; its step-by-step flashing guide is still the V1.2 one.
 
 ## T-Beam Supreme bring-up
 
@@ -300,8 +299,10 @@ and verifies a specific hardware subsystem before moving on.
 Stages 1–3 are for the **T-Beam Supreme**. Use the
 [Supreme board settings](#board-settings) and
 [back up the factory flash](#back-up-the-factory-flash-first) before the
-first upload. Stage 4 is still the V1.2 trip logger. Every stage prints at
-115200 baud; open the Serial Monitor after uploading.
+first upload. Stage 4 runs on the Supreme too; see
+[Stage 4 on the Supreme](#stage-4-on-the-supreme) for where its section
+still describes the V1.2. Every stage prints at 115200 baud; open the
+Serial Monitor after uploading.
 
 ### Stage 1: Hello World (`01_hello_world/`)
 
@@ -356,6 +357,47 @@ socket.
 
 **Purpose:** Trip detection, mileage accumulation, crash-safe GPX
 logging to LittleFS, and WiFi upload to your home server.
+
+#### Stage 4 on the Supreme
+
+The rest of this section was written for the V1.2. On the Supreme
+(bench-tested 2026-10-18), these things differ:
+
+- **Build** with the [Supreme board settings](#board-settings), not the
+  V1.2 ones in [step 4](#4-configure-board-settings). Stage 4's
+  `partitions.csv` still applies.
+- **First flash:** trip storage is only set up on a fully erased partition
+  (see [First flash on a new board](#first-flash-on-a-new-board)). The trip
+  partition can still hold leftover data, from the factory firmware for
+  example, and startup then halts rather than format over it. So erase the
+  flash once for the first Stage 4 upload (Arduino IDE: **Tools → Erase All
+  Flash Before Sketch Upload → Enabled** for that one upload, then set it
+  back to Disabled so later uploads keep your trips).
+- **Pins and power** are the Supreme's: see the
+  [Supreme pin and power reference](#supreme-pin-and-power-reference), not
+  the V1.2 pin table further down. At boot the logger switches the LoRa
+  rail off first, the SD rail and VBACKUP off, and the GPS rail on.
+- **Parking:** after the car's USB power has been gone 10 s and the board
+  has idled on battery for 10 minutes (the upload window), it **switches
+  itself off completely**, not into deep sleep. Power returning to the USB
+  port switches it back on. The boot log shows
+  `PMU power-on source 0x04, power-off source 0x02` when that worked.
+- **GPS settings:** after a cold power-up the MAX-M10S ignores
+  configuration for a few seconds, so the logger retries in the
+  background. Expect `GPS configured on attempt 2 (… ms after config
+  start)` about 10 s after power-up.
+- **Expected boot log:**
+
+  ```text
+  === Stage 4: Trip Logger ===
+  LoRa rail (ALDO3) verified off; SD rail (BLDO1) off; VBACKUP off.
+  PMU power-on source 0x04, power-off source 0x02.
+  PMU ready, MAX-M10S GPS rail (ALDO4) on at 3.3 V, charge to 4.1 V. VBUS present.
+  GPS: waiting for checksum-valid NMEA (up to 3 s).
+  Setup complete. Logging trips.
+  GPS ready: checksum-valid NMEA received.
+  GPS configured on attempt 2 (9874 ms after config start): RMC+GGA only, automotive model.
+  ```
 
 Before flashing:
 
