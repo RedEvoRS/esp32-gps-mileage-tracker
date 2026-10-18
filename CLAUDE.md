@@ -18,10 +18,11 @@ held only ~6 h of driving between uploads. Its last firmware is on the
 backports. Never commit to it or base work on it; all work targets the
 Supreme on `main`.
 
-**Port in progress:** until the Supreme port lands (label `supreme-port`),
-the firmware on `main` is still the V1.2 code. Don't assume a Supreme pin,
-rail or peripheral works until its port issue is closed and it's verified
-on the bench.
+**Port in progress:** the bring-up Stages 1–3 run on the Supreme (bench-checked
+2026-10-18), but until the rest of the port lands (label `supreme-port`), the
+trip logger (Stage 4) on `main` is still the V1.2 code: don't flash it on the
+Supreme. Don't assume a Supreme pin, rail or peripheral works until its port
+issue is closed and it's verified on the bench.
 
 ## Architecture
 
@@ -124,15 +125,27 @@ CI runs all of these on every PR:
 
 ### Supreme (target hardware)
 
-Taken from LilyGO's source (LilyGo-LoRa-Series `examples/Factory/`); confirm
-each on the bench before relying on it.
-- **Rails differ from the V1.2:** ALDO3 = LoRa, ALDO4 = GPS. Never run V1.2
-  rail code on the Supreme
-- microSD: FAT32, powered from BLDO1, SPI on GPIO 35/36/37, CS GPIO 47
+Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
+`firmware/README.md`.
+- **Rails differ from the V1.2:** ALDO3 = LoRa, ALDO4 = GPS (3.3 V). Never
+  run V1.2 rail code on the Supreme. **ALDO3 comes up ON after a USB-power
+  power-on**, so firmware switches it off first thing after `PMU.begin()`
+- PMU (0x34) and PCF8563 RTC (0x51) share `Wire1`, SDA 42 / SCL 41. OLED and
+  BME280 are on `Wire`, SDA 17 / SCL 18
+- GPS: MAX-M10S, firmware SPG 5.10, 9600 baud on RX 9 / TX 8, GPS_EN GPIO 7
+  driven HIGH (low/high made no difference). It still ACKs the legacy UBX
+  CFG-MSG and CFG-NAV5; UBX-CFG-VALSET is the future-proof interface
+- GPS backup RAM is fed from the 18650, not the PMU's VBACKUP (leave
+  VBACKUP off): hot start 2 s, cold 33 s. The board powers an active antenna
 - PMU interrupt is GPIO 40, which isn't an RTC GPIO on the ESP32-S3, so it
-  can't wake the chip from deep sleep via ext1
-- The MAX-M10S drops UBX CFG-MSG and CFG-NAV5; configure it with
-  UBX-CFG-VALSET
+  can't wake deep sleep. Wake instead: `PMU.shutdown()` powers the board
+  off, and the next USB power insert powers it on (not while USB stays in)
+- microSD (from LilyGO's source, not yet bench-checked): FAT32, powered from
+  BLDO1, SPI on GPIO 35/36/37, CS GPIO 47. BLDO1 powers up at 1.8 V: set
+  3.3 V before use
+- Build: `esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled`
+  (8 MB flash, 8 MB QSPI PSRAM, native USB). Download mode, the factory
+  flash backup and its Windows read quirk: `firmware/README.md`
 - Before first power, attach the LoRa antenna; before first flash, back up
   the factory flash
 
