@@ -117,7 +117,8 @@ CI runs all of these on every PR:
 - Firmware: `bash firmware/host_test/run.sh` (`test_fs`, and `test_gps`
   against the real TinyGPSPlus). No host compiler on this PC: set
   `CXX="<venv python> -m ziglang c++"`.
-- Firmware compile: all four sketches for the Supreme (ESP32-S3), with pinned Arduino tools and libraries.
+- Firmware compile: all four sketches for the Supreme (ESP32-S3), with
+  pinned Arduino tools and libraries.
 
 ## Key Technical Details
 
