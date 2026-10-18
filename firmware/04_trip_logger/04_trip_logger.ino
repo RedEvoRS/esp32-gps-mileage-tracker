@@ -8,7 +8,7 @@
 //   1. A trip state machine that auto-detects start (>5 mph for 10 s)
 //      and end (<2 mph for 3 min), with hysteresis so stop-and-go
 //      traffic doesn't split one drive into many.
-//   2. GPX logging to LittleFS -- one trkpt line appended per timed fix,
+//   2. GPX logging to microSD (LittleFS fallback) -- one line per timed fix,
 //      file.close() after every write to limit power-cut data loss.
 //      The latest 90 untimed points are buffered in RAM; older ones spill
 //      to flash without times. Boot-time "fsck" attempts
@@ -27,12 +27,12 @@
 //
 // Required libraries (all used in earlier stages except none new):
 //   XPowersLib (lewisxhe), TinyGPSPlus (Mikal Hart). WiFi, HTTPClient,
-//   LittleFS, and Preferences ship with the ESP32 Arduino core.
+//   SD, SPI, LittleFS, and Preferences ship with the ESP32 Arduino core.
 //
-// PARTITIONS: partitions.csv in this folder (no OTA, 2.375 MB of trip
-// storage) is picked up automatically and overrides Tools -> Partition
-// Scheme. Trips are ~118 B per second of driving, so that holds roughly
-// 5-6 hours of driving between uploads.
+// PARTITIONS: partitions.csv is unchanged (no OTA, 2.375 MB LittleFS
+// fallback, about 5-6 driving hours). SD requires FAT32; never auto-format.
+// New trips use SD when it mounts at boot. Both mounted stores are repaired
+// and drained, SD first, so flash trips from a previous boot are not stranded.
 //
 // NOTE: compiles on ESP32 Arduino core 3.3.11 (XPowersLib 0.3.3,
 // TinyGPSPlus 1.0.3) but has not yet had its on-hardware shakedown --
@@ -46,6 +46,8 @@
 #include <XPowersLib.h>
 #include <TinyGPSPlus.h>
 #include <LittleFS.h>
+#include <SD.h>
+#include <SPI.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
@@ -68,6 +70,11 @@
 #define GPS_EN_PIN   7
 #define GPS_BAUD     9600
 #define PMU_IRQ_PIN  40   // active-low; not an RTC GPIO on the S3
+// LilyGO utilities.h / LoRaBoards.cpp at 1991b1ed70915d4f246b841f99f6027166ea7330.
+// SD wiring still needs Stage 2 d on the bench. Board uses QSPI, not octal PSRAM.
+static constexpr int SD_MOSI = 35, SD_SCK = 36, SD_MISO = 37, SD_CS = 47, IMU_CS = 34;
+static constexpr uint32_t SD_SPI_HZ = 4000000; // core default; ample for ~119 B/s GPX
+static constexpr uint32_t SD_SETTLE_MS = 250;
 
 // -----------------------------------------------------------------
 // Trip state machine tuning (from brief section 5)
@@ -146,7 +153,12 @@ TinyGPSCustom  gRmcDateGN(gps, "GNRMC", 9);
 TinyGPSCustom  gRmcTimeGP(gps, "GPRMC", 1);
 TinyGPSCustom  gRmcDateGP(gps, "GPRMC", 9);
 
-SemaphoreHandle_t gFsMutex;     // serializes ALL LittleFS access
+SemaphoreHandle_t gFsMutex;     // serializes ALL filesystem access
+SPIClass          gSdSpi(HSPI); // dedicated bus instance; radio is never initialized
+fs::FS*           gTripFS = &LittleFS;
+// Store membership is fixed for this boot, including recovery after unmount.
+// Do not switch destinations mid-trip or remount an absent card at runtime.
+bool              gSdMounted = false, gFlashMounted = false;
 volatile bool     gVbusLost   = false;
 volatile bool     gPmuIrqFlag = false;
 // Shared by core 0 (SNTP) and core 1 (GPS/fix construction).
@@ -295,9 +307,7 @@ static void isoFromEpochMs(uint64_t ms, char* out, size_t n) {
     time_t secs = (time_t)(ms / 1000);
     struct tm tmv;
     gmtime_r(&secs, &tmv);
-    snprintf(out, n, "%04d-%02d-%02dT%02d:%02d:%02dZ",
-             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    if (n && strftime(out, n, "%Y-%m-%dT%H:%M:%SZ", &tmv) == 0) out[0] = 0;
 }
 
 // Convert a UTC struct tm to a Unix epoch. The newlib that ships with
@@ -399,16 +409,17 @@ static const char* GPX_EPILOGUE = "</trkseg></trk></gpx>\n";
 // counter. The server renames trips by their GPX timestamps on receipt,
 // so the local name only needs to be unique on the device.
 static void makeTripPath(char* out, size_t n) {
+    fs::FS& storage = *gTripFS;
     uint32_t c = prefs.getUInt("tripno", 0);
     // NVS may be reset independently of LittleFS, or its last counter write
     // may have failed. Never let FILE_WRITE truncate a queued trip. The
     // caller holds the FS mutex while selecting and creating this path.
     do {
         ++c;
-        snprintf(out, n, "%s/t%06u.gpx", TRIP_DIR, c);
-    } while (LittleFS.exists(out) ||
-             LittleFS.exists((String(out) + ".bad").c_str()) ||
-             LittleFS.exists((String(out) + ".fix").c_str()));
+        snprintf(out, n, "%s/t%06u.gpx", TRIP_DIR, (unsigned)c);
+    } while (storage.exists(out) ||
+             storage.exists((String(out) + ".bad").c_str()) ||
+             storage.exists((String(out) + ".fix").c_str()));
     prefs.putUInt("tripno", c);
 }
 
@@ -475,24 +486,30 @@ static void flushPending(FileWriter& w) {
 // =================================================================
 // Trip lifecycle
 // =================================================================
-// Free bytes on the trip partition. Takes the FS lock; callers must not
-// hold it.
-static size_t fsFreeBytes() {
-    FS_LOCK();
-    size_t total = LittleFS.totalBytes();
-    size_t used  = LittleFS.usedBytes();
-    FS_UNLOCK();
+// Only called before workers start or with FS_LOCK held. SD capacity must
+// stay 64 bit: size_t on the ESP32 cannot represent a 32 GB card.
+static uint64_t storageFreeBytes(fs::FS& storage) {
+    uint64_t total = &storage == &SD ? SD.totalBytes() : LittleFS.totalBytes();
+    uint64_t used = &storage == &SD ? SD.usedBytes() : LittleFS.usedBytes();
     return used < total ? total - used : 0;
+}
+
+// Takes the FS lock; callers must not hold it.
+static uint64_t fsFreeBytes() {
+    FS_LOCK();
+    uint64_t free = storageFreeBytes(*gTripFS);
+    FS_UNLOCK();
+    return free;
 }
 
 // True if there's room to start a trip. Logs (at most once a minute while
 // driving) when there isn't, since otherwise the miles vanish silently.
 static bool roomForNewTrip(uint32_t now) {
-    size_t freeB = fsFreeBytes();
+    uint64_t freeB = fsFreeBytes();
     if (freeB >= FS_START_FREE) return true;
     if (!gFullWarned || now - gFullWarnT0 >= 60000) {
-        Serial.printf("ERROR: trip storage full (%u bytes free) -- NOT recording. "
-                      "Upload at home to free space.\n", (unsigned)freeB);
+        Serial.printf("ERROR: trip storage full (%llu bytes free) -- NOT recording. "
+                      "Upload at home to free space.\n", (unsigned long long)freeB);
         gFullWarned = true;
         gFullWarnT0 = now;
     }
@@ -504,10 +521,10 @@ static bool roomForNewTrip(uint32_t now) {
 static bool tripStorageLow(uint32_t now) {
     if (now - gFsCheckT0 < FS_CHECK_MS) return false;
     gFsCheckT0 = now;
-    size_t freeB = fsFreeBytes();
+    uint64_t freeB = fsFreeBytes();
     if (freeB >= FS_STOP_FREE) return false;
-    Serial.printf("ERROR: trip storage nearly full (%u bytes free) -- ending trip.\n",
-                  (unsigned)freeB);
+    Serial.printf("ERROR: trip storage nearly full (%llu bytes free) -- ending trip.\n",
+                  (unsigned long long)freeB);
     return true;
 }
 
@@ -516,6 +533,7 @@ static bool tripStorageLow(uint32_t now) {
 // carrying on as ACTIVE would let FILE_APPEND create a file with no
 // prologue, which uploads as invalid GPX and is rejected forever.
 static bool beginTrip(const Fix& fx) {
+    fs::FS& storage = *gTripFS;
     gTripMeters = 0;
     gMaxSpeedMps = 0;
     gTripWriteFailed = false;
@@ -525,7 +543,7 @@ static bool beginTrip(const Fix& fx) {
     FS_LOCK();
     makeTripPath(gTripPath, sizeof(gTripPath));
     bool ok = false;
-    File f = LittleFS.open(gTripPath, FILE_WRITE);
+    File f = storage.open(gTripPath, FILE_WRITE);
     if (f) {
         FileWriter w(f);
         w.put(GPX_PROLOGUE);
@@ -546,7 +564,7 @@ static bool beginTrip(const Fix& fx) {
         }
         ok = w.commit();
         f.close();
-        if (!ok) LittleFS.remove(gTripPath);
+        if (!ok) storage.remove(gTripPath);
     }
     if (!ok) {
         Serial.printf("ERROR: could not create trip file %s -- not recording.\n",
@@ -582,6 +600,7 @@ static bool beginTrip(const Fix& fx) {
 // Returns false if the write didn't reach flash; the caller must end the
 // trip, since a partial line may now sit at the tail of the file.
 static bool writeOrBufferTrkpt(const Fix& fx) {
+    fs::FS& storage = *gTripFS;
     if (gTripPath[0] == 0) return true;
     if (!fx.hasUtc && gPendCount < PENDING_CAPACITY) {
         pushPending(fx);
@@ -589,7 +608,7 @@ static bool writeOrBufferTrkpt(const Fix& fx) {
     }
     FS_LOCK();
     bool ok = false;
-    File f = LittleFS.open(gTripPath, FILE_APPEND);
+    File f = storage.open(gTripPath, FILE_APPEND);
     // FILE_APPEND creates a missing file. A real trip file always holds at
     // least the prologue, so an empty one means ours is gone -- never write
     // points into a file with no <gpx> header.
@@ -618,12 +637,13 @@ static bool writeOrBufferTrkpt(const Fix& fx) {
     return ok;
 }
 
-static bool repairIfNeeded(const char* path);
+static bool repairIfNeeded(fs::FS& storage, const char* path);
 
 // Close out the active trip. If it's too short/slow it's discarded --
 // unless this is a power-loss finalize, where a genuine short drive that
 // ended in a power cut is still data worth keeping.
 static void endTrip(bool discardIfMicro) {
+    fs::FS& storage = *gTripFS;
     if (gTripPath[0] == 0) { gState = IDLE; return; }
 
     // Duration runs to the last moving fix: the 3 min parked cooldown (or
@@ -637,11 +657,11 @@ static void endTrip(bool discardIfMicro) {
     if (discardIfMicro && micro) {
         Serial.printf("Discarding micro-trip (%.0f m, %lu ms)\n",
                       gTripMeters, (unsigned long)tripMs);
-        LittleFS.remove(gTripPath);
+        storage.remove(gTripPath);
     } else {
         bool ok = false;
         if (!gTripWriteFailed) {
-            File f = LittleFS.open(gTripPath, FILE_APPEND);
+            File f = storage.open(gTripPath, FILE_APPEND);
             // Same guard as writeOrBufferTrkpt: never turn a missing trip
             // file into one holding only the epilogue.
             if (f && f.size() > 0) {
@@ -660,7 +680,7 @@ static void endTrip(bool discardIfMicro) {
         // the document there. If even that fails (e.g. no room for the
         // repair copy) the file stays incomplete -- never uploaded -- and
         // the boot-time fsck retries it.
-        if (!ok) ok = repairIfNeeded(gTripPath);
+        if (!ok) ok = repairIfNeeded(storage, gTripPath);
 
         if (ok) {
             Serial.printf("Trip finalized: %s (%.2f mi)\n",
@@ -810,19 +830,29 @@ static bool fileMatchesText(File& f, const char* text, size_t bytes) {
     return true;
 }
 
+static bool publishRepair(fs::FS& storage, const char* tmp, const char* path) {
+    // FatFs rename refuses an existing destination. Only remove the original
+    // AFTER a complete, verified, closed repair exists. If power fails in
+    // between, fsckAllTrips discovers the orphan .gpx.fix and recovers it.
+    // FAT metadata itself is not power-loss atomic; the battery/clean
+    // shutdown is still essential. LittleFS retains its atomic replacement.
+    if (&storage == &SD && storage.exists(path) && !storage.remove(path)) return false;
+    return storage.rename(tmp, path);
+}
+
 // Deal with previous repair attempts before FILE_WRITE can truncate them.
 // Called under the same FS lock as repairIfNeeded. Ambiguous copies are
 // retained for inspection; only proven redundant bytes may be discarded.
-static bool recoverRepairCopy(const char* path) {
+static bool recoverRepairCopy(fs::FS& storage, const char* path) {
     String tmp = String(path) + ".fix";
-    if (!LittleFS.exists(tmp.c_str())) return true;
-    if (LittleFS.exists((String(path) + ".bad").c_str())) {
+    if (!storage.exists(tmp.c_str())) return true;
+    if (storage.exists((String(path) + ".bad").c_str())) {
         Serial.printf("fsck: retained %s (quarantine collision)\n", tmp.c_str());
         return false;
     }
-    File copy = LittleFS.open(tmp.c_str(), FILE_READ);
+    File copy = storage.open(tmp.c_str(), FILE_READ);
     if (!copy) return false;
-    if (!LittleFS.exists(path)) {
+    if (!storage.exists(path)) {
         // A historical interrupted replacement may have left this as the
         // only copy. Rename without copying, then use normal repair below.
         // An incomplete/unknown header or no complete point is not safe to
@@ -830,7 +860,7 @@ static bool recoverRepairCopy(const char* path) {
         bool recoverable = fileMatchesText(copy, GPX_PROLOGUE, strlen(GPX_PROLOGUE)) &&
                            findLastTrkptEnd(copy) > (long)strlen(GPX_PROLOGUE);
         copy.close();
-        if (recoverable && LittleFS.rename(tmp.c_str(), path)) {
+        if (recoverable && storage.rename(tmp.c_str(), path)) {
             Serial.printf("fsck: recovered orphan %s\n", path);
             return true;
         }
@@ -838,7 +868,7 @@ static bool recoverRepairCopy(const char* path) {
         return false;
     }
 
-    File original = LittleFS.open(path, FILE_READ);
+    File original = storage.open(path, FILE_READ);
     if (!original) { copy.close(); return false; }
     const size_t copySize = copy.size();
     bool redundant = copySize <= original.size() && sameFilePrefix(original, copy, copySize);
@@ -860,15 +890,15 @@ static bool recoverRepairCopy(const char* path) {
         return false;
     }
     // A complete verified repair can be published even with no free space.
-    // Failed rename/remove leaves both copies for a later boot to retry.
-    return finishedRepair ? LittleFS.rename(tmp.c_str(), path) : LittleFS.remove(tmp.c_str());
+    // Failed publication retains at least the verified copy for a later boot.
+    return finishedRepair ? publishRepair(storage, tmp.c_str(), path) : storage.remove(tmp.c_str());
 }
 
 // Returns true if the file is complete afterwards (or was removed as empty),
 // false if it had to be left as it was.
-static bool repairIfNeeded(const char* path) {
-    if (!recoverRepairCopy(path)) return false;
-    File f = LittleFS.open(path, FILE_READ);
+static bool repairIfNeeded(fs::FS& storage, const char* path) {
+    if (!recoverRepairCopy(storage, path)) return false;
+    File f = storage.open(path, FILE_READ);
     if (!f) return false;
     size_t sz = f.size();
 
@@ -888,13 +918,13 @@ static bool repairIfNeeded(const char* path) {
     if (end == -2) { f.close(); return false; }
     if (end <= 0) {
         f.close();
-        LittleFS.remove(path);
+        storage.remove(path);
         Serial.printf("fsck: removed empty/garbage %s\n", path);
         return true;
     }
 
     String tmp = String(path) + ".fix";
-    File out = LittleFS.open(tmp.c_str(), FILE_WRITE);
+    File out = storage.open(tmp.c_str(), FILE_WRITE);
     if (!out) { f.close(); return false; }
     FileWriter w(out);
     f.seek(0);
@@ -915,14 +945,13 @@ static bool repairIfNeeded(const char* path) {
     out.close();
     f.close();
     if (!ok) {
-        LittleFS.remove(tmp.c_str());
+        storage.remove(tmp.c_str());
         Serial.printf("fsck: could not repair %s (write failed)\n", path);
         return false;
     }
-    // LittleFS rename atomically replaces an existing file. Removing the
-    // original first creates a power-loss window in which only an ignored
-    // .fix remains. On failure keep both copies for the next boot to retry.
-    if (!LittleFS.rename(tmp.c_str(), path)) {
+    // Publish only after both handles are closed and the repair is verified.
+    // A surviving .fix is discovered on the next boot, including on FAT.
+    if (!publishRepair(storage, tmp.c_str(), path)) {
         Serial.printf("fsck: could not replace %s (rename failed)\n", path);
         return false;
     }
@@ -937,10 +966,10 @@ static String tripEntryPath(const File& entry) {
     return name[0] == '/' ? String(name) : String(TRIP_DIR) + "/" + name;
 }
 
-static void fsckAllTrips() {
+static void fsckAllTrips(fs::FS& storage) {
     FS_LOCK();
     std::vector<String> paths;
-    File dir = LittleFS.open(TRIP_DIR);
+    File dir = storage.open(TRIP_DIR);
     if (dir && dir.isDirectory()) {
         File e = dir.openNextFile();
         while (e) {
@@ -958,7 +987,7 @@ static void fsckAllTrips() {
     // LittleFS directory cursors can change when repair creates, removes or
     // renames entries. Finish enumeration and close every handle first.
     dir.close();
-    for (const String& path : paths) repairIfNeeded(path.c_str());
+    for (const String& path : paths) repairIfNeeded(storage, path.c_str());
     FS_UNLOCK();
 }
 
@@ -999,6 +1028,8 @@ static constexpr uint32_t VBUS_OFF_CONFIRM_MS = 10UL * 1000;
 static bool     gVbusOffPending = false;
 static uint32_t gVbusOffT0 = 0;
 
+static bool mountSdStorage();
+
 static void powerOffForVbus() {
     // AXP2101 powers on on a VBUS INSERT EDGE, not its steady level. Never
     // shut down on USB, even for a power-key or low-battery interrupt: the
@@ -1018,9 +1049,10 @@ static void powerOffForVbus() {
     // Keep the lock through power-off, so even a network task
     // that never stopped can't reach the filesystem once it's unmounted.
     FS_LOCK();
-    LittleFS.end();
-    // PMU shutdown cuts all main rails, including GPS ALDO4. Leave rails
-    // and awake IRQs alone until then, so a cancelled shutdown can resume.
+    if (gSdMounted) SD.end();
+    if (gFlashMounted) LittleFS.end();
+    // PMU shutdown cuts all main rails, including SD BLDO1 and GPS ALDO4.
+    // Leave rails and awake IRQs alone so a cancelled shutdown can resume.
     // GPS backup RAM is supplied directly by the 18650, not VBACKUP.
     Serial.println("PMU power-off: storage closed; checking VBUS before shutdown.");
     if (!PMU.isVbusIn()) {
@@ -1047,7 +1079,10 @@ static void powerOffForVbus() {
     }
     // Resume without formatting or changing the trip counter. The network
     // stays held until storage is mounted again.
-    if (!LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL)) {
+    bool remounted = true;
+    if (gSdMounted) remounted = mountSdStorage();
+    if (gFlashMounted) remounted = LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL) && remounted;
+    if (!remounted) {
         Serial.println("ERROR: storage remount after cancelled/failed power-off failed; restarting.");
         ESP.restart();
         return;
@@ -1243,9 +1278,9 @@ static bool isCompleteFile(File& f) {
     return ok;
 }
 
-static bool isComplete(const char* path) {
+static bool isComplete(fs::FS& storage, const char* path) {
     FS_LOCK();
-    File f = LittleFS.open(path, FILE_READ);
+    File f = storage.open(path, FILE_READ);
     bool ok = isCompleteFile(f);
     if (f) f.close();
     FS_UNLOCK();
@@ -1282,13 +1317,13 @@ public:
     size_t write(uint8_t) override { return 0; }   // read-only proxy
 };
 
-static bool uploadFile(const char* path) {
+static bool uploadFile(fs::FS& storage, const char* path) {
     String url = String("http://") + SERVER_HOST + ":" + String(SERVER_PORT) + "/upload";
     WiFiClient client;
     HTTPClient http;
 
     FS_LOCK();
-    File f = LittleFS.open(path, FILE_READ);
+    File f = storage.open(path, FILE_READ);
     if (!f) { FS_UNLOCK(); return false; }
     size_t sz = f.size();
     FS_UNLOCK();
@@ -1324,10 +1359,10 @@ static bool uploadFile(const char* path) {
     bool rejected = (code == 400 || code == 413);
     bool setAside = false;
     if (ok) {
-        LittleFS.remove(path);
+        storage.remove(path);
     } else if (rejected) {
         String bad = String(path) + ".bad";
-        setAside = LittleFS.rename(path, bad.c_str());
+        setAside = storage.rename(path, bad.c_str());
     }
     FS_UNLOCK();
 
@@ -1348,18 +1383,18 @@ static bool uploadFile(const char* path) {
 // Collect names of complete, non-active trip files, then upload each.
 // Any successful upload resets the network retry delay, even if a later
 // file fails or a sleep request stops the batch.
-static bool uploadPending() {
+static bool uploadPending(fs::FS& storage) {
     String pending[16];
     int    count = 0;
 
     FS_LOCK();
-    File dir = LittleFS.open(TRIP_DIR);
+    File dir = storage.open(TRIP_DIR);
     if (dir && dir.isDirectory()) {
         File e = dir.openNextFile();
         while (e && count < 16 && !gNetHold.load() && !gNetAbort.load()) {
             String name = tripEntryPath(e);
             if (name.endsWith(".gpx") &&
-                (gTripPath[0] == 0 || name != String(gTripPath)) &&
+                (&storage != gTripFS || gTripPath[0] == 0 || name != String(gTripPath)) &&
                 isCompleteFile(e)) {
                 pending[count++] = name;
             }
@@ -1372,25 +1407,25 @@ static bool uploadPending() {
     // A sleep request (gNetHold) lets the current file finish, then stops.
     bool uploaded = false;
     for (int i = 0; i < count && !gNetHold.load() && !gNetAbort.load(); ++i) {
-        if (isComplete(pending[i].c_str())) {
-            if (uploadFile(pending[i].c_str())) uploaded = true;
+        if (isComplete(storage, pending[i].c_str())) {
+            if (uploadFile(storage, pending[i].c_str())) uploaded = true;
         }
     }
     return uploaded;
 }
 
-static bool hasPending() {
+static bool hasPending(fs::FS& storage) {
     // Preserved incomplete files need recovery, not radio work. Scan past
     // them so a complete trip later in directory order is still found.
     bool found = false;
     FS_LOCK();
-    File dir = LittleFS.open(TRIP_DIR);
+    File dir = storage.open(TRIP_DIR);
     if (dir && dir.isDirectory()) {
         File e = dir.openNextFile();
         while (e && !gNetHold.load() && !gNetAbort.load()) {
             String name = tripEntryPath(e);
             if (name.endsWith(".gpx") &&
-                (gTripPath[0] == 0 || name != String(gTripPath)) &&
+                (&storage != gTripFS || gTripPath[0] == 0 || name != String(gTripPath)) &&
                 isCompleteFile(e)) {
                 found = true;
                 break;
@@ -1401,6 +1436,20 @@ static bool hasPending() {
     if (dir) dir.close();
     FS_UNLOCK();
     return found;
+}
+
+static bool uploadPending() {
+    // Separate batches prevent a large SD queue from starving old flash
+    // trips. A filename can exist on both stores: every operation keeps its
+    // filesystem identity, and only the recording store has an active file.
+    bool uploaded = false;
+    if (gSdMounted) uploaded = uploadPending(SD);
+    if (gFlashMounted) uploaded = uploadPending(LittleFS) || uploaded;
+    return uploaded;
+}
+
+static bool hasPending() {
+    return (gSdMounted && hasPending(SD)) || (gFlashMounted && hasPending(LittleFS));
 }
 
 // One pass of the network task. gNetBusy covers everything that touches
@@ -1699,7 +1748,7 @@ static bool tripPartitionIsErased() {
     return true;
 }
 
-static bool mountTripStorage() {
+static bool mountFlashStorage() {
     // Mount failures alone never authorize erasure. Only a successful read
     // of EVERY byte as 0xFF proves that provisioning cannot lose queued data.
     if (LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL)) return true;
@@ -1707,13 +1756,70 @@ static bool mountTripStorage() {
         Serial.println("LittleFS partition is fully erased; provisioning trip storage.");
         if (LittleFS.format() &&
             LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL)) return true;
-        Serial.println("ERROR: LittleFS provisioning failed; halting. "
+        Serial.println("ERROR: LittleFS provisioning failed. "
                        "See firmware README for storage recovery.");
         return false;
     }
-    Serial.println("ERROR: LittleFS mount failed. Storage preserved; halting. "
+    Serial.println("ERROR: LittleFS mount failed. Storage preserved. "
                    "See firmware README for first-time provisioning/recovery.");
     return false;
+}
+
+static bool mountSdStorage() {
+    // Also used for cancelled/failed shutdown recovery, under FS_LOCK and
+    // gNetHold, with no live handles. Never provision or format the card.
+    if (!PMU.disableBLDO1() || !PMU.setBLDO1Voltage(3300) || !PMU.enableBLDO1()) {
+        Serial.println("WARNING: microSD power setup failed (BLDO1 must be 3.3 V before enable).");
+        PMU.disableBLDO1();
+        return false;
+    }
+    pinMode(IMU_CS, OUTPUT);
+    digitalWrite(IMU_CS, HIGH);
+    pinMode(SD_CS, OUTPUT);
+    digitalWrite(SD_CS, HIGH);
+    delay(SD_SETTLE_MS);
+    bool busReady = gSdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    if (busReady && SD.begin(SD_CS, gSdSpi, SD_SPI_HZ, "/sd", 10, false) && SD.cardType() != CARD_NONE) {
+        if (SD.exists(TRIP_DIR) || SD.mkdir(TRIP_DIR)) {
+            File dir = SD.open(TRIP_DIR);
+            bool ready = dir && dir.isDirectory();
+            dir.close();
+            if (ready) return true;
+        }
+        Serial.println("WARNING: microSD trip directory unavailable; card preserved.");
+    } else {
+        // SD.begin discards card type on failure; there is no card-detect
+        // pin. Be explicit that absence and bus/format faults look alike.
+        Serial.println("WARNING: no microSD card or mount failed -- check power/wiring and FAT32 (exFAT unsupported); card never formatted.");
+    }
+    SD.end();
+    gSdSpi.end();
+    PMU.disableBLDO1();
+    return false;
+}
+
+static bool mountTripStorage() {
+    gSdMounted = mountSdStorage();
+    // Keep the existing preservation-first provisioning rule for flash.
+    // If flash is damaged but SD works, record to SD and preserve flash
+    // for recovery; #126 owns degraded service when neither store works.
+    gFlashMounted = mountFlashStorage();
+    if (gFlashMounted && !LittleFS.exists(TRIP_DIR)) {
+        gFlashMounted = LittleFS.mkdir(TRIP_DIR);
+        if (!gFlashMounted) LittleFS.end();
+    }
+    gTripFS = gSdMounted ? static_cast<fs::FS*>(&SD) : static_cast<fs::FS*>(&LittleFS);
+    if (gSdMounted) {
+        Serial.printf("Trip storage: microSD (%.2f GiB free); internal flash queue %s.\n",
+                      storageFreeBytes(SD) / (1024.0 * 1024 * 1024),
+                      gFlashMounted ? "mounted" : "unavailable -- preserved for recovery");
+    } else if (gFlashMounted) {
+        Serial.printf("WARNING: microSD unavailable -- using internal flash (%.2f MiB free).\n",
+                      storageFreeBytes(LittleFS) / (1024.0 * 1024));
+    } else {
+        Serial.println("ERROR: no usable trip storage; halting with charge guard active.");
+    }
+    return gSdMounted || gFlashMounted;
 }
 
 void setup() {
@@ -1731,8 +1837,8 @@ void setup() {
         Serial.println("ERROR: LoRa rail (ALDO3) could not be verified off. Halting.");
         while (1) delay(1000);
     }
-    // BLDO1 powers the SD slot but starts at 1.8 V. Keep it off: #109
-    // must set 3.3 V BEFORE enabling it for SD support.
+    // BLDO1 powers the SD slot but starts ON at 1.8 V. Disable it early;
+    // mountSdStorage sets 3.3 V before enabling it, after safety setup.
     PMU.disableBLDO1();
     // Supreme GPS backup RAM comes straight from the 18650. LilyGO also
     // disables VBACKUP; a 60 s ALDO4-off test hot-started in 2.0 s with it off.
@@ -1796,9 +1902,9 @@ void setup() {
         // ADC has converted before the first reading.
         while (1) { delay(1000); serviceChargeTemp(); }
     }
-    if (!LittleFS.exists(TRIP_DIR)) LittleFS.mkdir(TRIP_DIR);
     prefs.begin("mileage", false);
-    fsckAllTrips();
+    if (gSdMounted) fsckAllTrips(SD);
+    if (gFlashMounted) fsckAllTrips(LittleFS);
 
     // Start a bounded readiness wait; loop() receives NMEA and configures
     // the receiver without blocking trip logging or power/charge checks.
