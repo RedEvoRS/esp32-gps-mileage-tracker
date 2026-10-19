@@ -545,7 +545,7 @@ a firmware build toggle, `DISPLAY_DEBUG` in the sketch (on for the first
 builds):
 
 - **Debug on:** a status page for bench and shakedown work: FSM state,
-  satellites in view and used, fix/HDOP, storage backend and free space,
+  satellites heard and used, GPS AGC, fix/HDOP, storage backend and free space,
   pending trips/events, WiFi/upload result, battery. It is the only mode that
   may stay lit, so it is for development, not everyday driving.
 - **Debug off:** minimal: the number of satellites in view, plus the error

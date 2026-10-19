@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
 
 enum class DebugWifi : uint8_t { Off, Scan, Join, On };
 struct DebugNetwork {
@@ -15,7 +16,7 @@ struct DebugNetwork {
 struct DebugStatus {
     const char* state = "IDLE";
     uint32_t now = 0;
-    int inView = -1, used = -1;
+    int heard = -1, used = -1, agcPct = -1;
     bool fix = false;
     float hdop = -1, mph = -1;
     uint32_t fixAgeMs = UINT32_MAX;
@@ -43,10 +44,13 @@ static inline void debugCount(int value, char* out, size_t n) {
 static inline void formatDebugStatus(const DebugStatus& s, char lines[8][22]) {
     unsigned up = s.now / 1000;
     snprintf(lines[0], 22, "%.10s %uh%02um", s.state, up / 3600, up / 60 % 60);
-    char view[4], used[4], age[5], hdop[5];
-    debugCount(s.inView, view, sizeof view);
+    char heard[4], used[4], agc[4], age[5], hdop[5];
+    debugCount(s.heard, heard, sizeof heard);
     debugCount(s.used, used, sizeof used);
-    snprintf(lines[1], 22, "SATS V:%s U:%s", view, used);
+    debugCount(s.agcPct < 0 ? -1 : (int)debugBound(s.agcPct, 100), agc, sizeof agc);
+    // Keep the percent sign even with two 999 counts and full-scale AGC.
+    const char* gap = strlen(heard) + strlen(used) + strlen(agc) > 8 ? "" : " ";
+    snprintf(lines[1], 22, "SATS R:%s U:%s%sA%s%%", heard, used, gap, agc);
     if (s.fixAgeMs == UINT32_MAX) snprintf(age, sizeof age, "--");
     else snprintf(age, sizeof age, "%u", debugBound(s.fixAgeMs / 1000, 999));
     if (!isfinite(s.hdop) || s.hdop < 0) snprintf(hdop, sizeof hdop, "--");
