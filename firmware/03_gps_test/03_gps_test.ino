@@ -61,6 +61,7 @@
 #include <Wire.h>
 #include <XPowersLib.h>
 #include <TinyGPSPlus.h>
+#include "i2c_recovery.h"
 
 static const int PMU_SDA = 42, PMU_SCL = 41, PMU_IRQ = 40;
 static const int GPS_RX = 9, GPS_TX = 8, GPS_EN = 7, GPS_PPS = 6;
@@ -525,10 +526,11 @@ void setup() {
     while (!Serial && millis() - started < 3000) delay(10);
     Serial.println("\nStage 3: Supreme MAX-M10S GPS bring-up");
     Serial.println("Coordinates and raw NMEA OFF: logs may be shared publicly; location is private.");
-    Wire1.begin(PMU_SDA, PMU_SCL);
-    Wire1.setTimeOut(50);
     pinMode(PMU_IRQ, INPUT);
-    if (!PMU.begin(Wire1, AXP2101_SLAVE_ADDRESS, PMU_SDA, PMU_SCL)) {
+    PmuStartupResult pmuStartup;
+    bool pmuReady = beginPmuWithRecovery(Wire1, PMU, PMU_SDA, PMU_SCL, pmuStartup);
+    printPmuStartup(pmuStartup);
+    if (!pmuReady) {
         Serial.println("ERROR: AXP2101 missing at Wire1 42/41, 0x34. No rail changes made.");
         while (true) delay(1000);
     }

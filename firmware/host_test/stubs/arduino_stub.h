@@ -32,14 +32,31 @@ using std::min;
 #define IRAM_ATTR
 #define INPUT 0
 #define OUTPUT 1
+#define INPUT_PULLUP 2
+#define OUTPUT_OPEN_DRAIN 3
+#define PULLUP 4
+#define LOW 0
 #define HIGH 1
 #define FALLING 0
 inline std::map<int, int> g_pinModes, g_pinLevels;
-inline void pinMode(int pin, int mode) { g_pinModes[pin] = mode; }
+inline std::function<void(int)> g_gpioHook;
+inline std::function<int(int)> g_digitalReadHook;
+inline std::function<void()> g_microDelayHook;
+inline uint64_t g_micros = 0;
+inline void delayMicroseconds(unsigned us) {
+    g_micros += us;
+    if (g_microDelayHook) g_microDelayHook();
+}
+inline void pinMode(int pin, int mode) {
+    g_pinModes[pin] = mode;
+    if (g_gpioHook) g_gpioHook(pin);
+}
 inline void digitalWrite(int pin, int level) {
     // ESP32 core 3.x ignores digitalWrite before pinMode registers a GPIO.
     if (g_pinModes.count(pin)) g_pinLevels[pin] = level;
+    if (g_gpioHook) g_gpioHook(pin);
 }
+inline int digitalRead(int pin) { return g_digitalReadHook ? g_digitalReadHook(pin) : HIGH; }
 inline int digitalPinToInterrupt(int p) { return p; }
 inline void attachInterrupt(int, void (*)(), int) {}
 
@@ -395,8 +412,23 @@ inline void vTaskDelay(uint32_t ms) { g_millis += ms; if (g_taskDelayHook) g_tas
 
 // ---- hardware odds and ends (compile-only) ----------------------------------
 struct TwoWire {
-    int sda = -1, scl = -1, begins = 0;
-    void begin(int a, int b) { sda = a; scl = b; begins++; }
+    int sda = -1, scl = -1, begins = 0, ends = 0, failBegins = 0;
+    bool started = false, failEnd = false;
+    uint16_t timeout = 0;
+    std::function<void()> onBegin, onEnd;
+    bool begin(int a, int b) {
+        sda = a; scl = b; begins++;
+        if (onBegin) onBegin();
+        if (failBegins) { failBegins--; return false; }
+        started = true; return true;
+    }
+    bool end() {
+        ends++;
+        if (onEnd) onEnd();
+        if (failEnd) return false;
+        started = false; return true;
+    }
+    void setTimeOut(uint16_t ms) { timeout = ms; }
 };
 extern TwoWire Wire, Wire1;
 #define AXP2101_SLAVE_ADDRESS 0x34
@@ -422,7 +454,14 @@ struct XPowersAXP2101 {
     bool failSdVoltage = false, failSdEnable = false, failSdDisable = false;
     TwoWire* bus = nullptr;
     std::vector<std::string> operations;
-    bool begin(TwoWire& wire, int, int, int) { bus = &wire; operations.push_back("begin"); return true; }
+    int beginCalls = 0, failBegins = 0;
+    std::function<void()> onBegin;
+    bool begin(TwoWire& wire, int, int, int) {
+        bus = &wire; operations.push_back("begin"); beginCalls++;
+        if (onBegin) onBegin();
+        if (failBegins) { failBegins--; return false; }
+        return true;
+    }
     bool disableALDO3() {
         operations.push_back("disableALDO3");
         if (!failRadioDisable && !radioStuckOn) aldo3 = false;

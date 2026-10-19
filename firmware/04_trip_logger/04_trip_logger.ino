@@ -59,6 +59,7 @@
 #include <atomic>
 
 #include "secrets.h"
+#include "i2c_recovery.h"
 
 // -----------------------------------------------------------------
 // LilyGO T-Beam Supreme (ESP32-S3 + MAX-M10S), measured 2026-10-18
@@ -1865,16 +1866,18 @@ static bool mountTripStorage() {
 
 void setup() {
     // VBUS-insert power-on brings the Supreme's LoRa rail up ON. Disable
-    // and verify it as the first PMU operation, BEFORE Serial, delays,
-    // allocation, storage or GPS setup can block. Stage 4 never uses LoRa.
-    Wire1.begin(I2C_SDA, I2C_SCL);
-    if (!PMU.begin(Wire1, AXP2101_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {
+    // and verify it as the first PMU operation after bounded bus recovery
+    // and initialization, BEFORE Serial, storage or GPS setup can block.
+    PmuStartupResult pmuStartup;
+    if (!beginPmuWithRecovery(Wire1, PMU, I2C_SDA, I2C_SCL, pmuStartup)) {
         Serial.begin(115200);
+        printPmuStartup(pmuStartup);
         Serial.println("ERROR: AXP2101 not found. Halting.");
         while (1) delay(1000);
     }
     if (!PMU.disableALDO3() || PMU.isEnableALDO3()) {
         Serial.begin(115200);
+        printPmuStartup(pmuStartup);
         Serial.println("ERROR: LoRa rail (ALDO3) could not be verified off. Halting.");
         while (1) delay(1000);
     }
@@ -1891,6 +1894,7 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
     Serial.println("\n=== Stage 4: Trip Logger ===");
+    printPmuStartup(pmuStartup);
     Serial.println("LoRa rail (ALDO3) verified off; SD rail (BLDO1) off; VBACKUP off.");
     Serial.printf("PMU power-on source 0x%02X, power-off source 0x%02X.\n",
                   (unsigned)PMU.getPowerOnSource(), (unsigned)PMU.getPowerOffSource());

@@ -1409,7 +1409,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    printf("T47 Supreme boot disables LoRa before any delay, including failed startup (#107)\n");
+    printf("T47 Supreme boot disables LoRa after bounded PMU startup, before other setup (#107)\n");
     {
         for (bool failMutex : {false, true}) {
             resetWorld();
@@ -1444,6 +1444,29 @@ int main(int argc, char** argv) {
                   g_disk.mountAttempts == 0 && g_taskCreates == 0 && !PMU.aldo4,
                   "failed radio write or readback halts before GPS, storage or workers");
         }
+        resetWorld();
+        PMU.failBegins = 2;
+        g_delayHook = [](uint32_t ms) {
+            if (ms == 10) {
+                CHECK(Serial.log.empty() && !PMU.aldo4 && g_disk.mountAttempts == 0 && g_taskCreates == 0,
+                      "PMU retry waits precede Serial, GPS, storage and worker startup");
+            } else {
+                CHECK(!PMU.aldo3, "successful PMU retry disables LoRa before later setup delays");
+            }
+        };
+        setup(); g_delayHook = nullptr;
+        CHECK(PMU.beginCalls == 3 && Wire1.ends == 2 && !PMU.aldo3 && logHas("retry 3/3"),
+              "Stage 4 uses bounded retries and prints the saved startup report");
+
+        resetWorld();
+        PMU.failBegins = 3;
+        g_delayHook = [](uint32_t ms) { if (ms == 1000) throw Halted{}; };
+        try { setup(); } catch (const Halted&) {}
+        g_delayHook = nullptr;
+        CHECK(PMU.beginCalls == 3 && Wire1.ends == 2 && logHas("attempt 3/3 failed") &&
+              logHas("AXP2101 not found. Halting.") && !PMU.aldo4 &&
+              g_disk.mountAttempts == 0 && g_taskCreates == 0,
+              "exhausted PMU retries report and enter the existing halt before other setup");
     }
 
     printf("T48 power-off is cancelled on USB, including a late return without an IRQ (#106)\n");
