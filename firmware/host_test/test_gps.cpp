@@ -122,8 +122,9 @@ static void resetWorld() {
     GPSSerial = HardwareSerial(1);
     gGpsConfig = GpsConfig(); gGpsUbxRx = GpsUbxRx();
     gNavPvt = GpsNavPvt(); gSpeedFallback = false; gLatestSpeedTrusted = false;
-    // Legacy regressions model a boot that has already waited >10 s for PVT.
+    // Legacy regressions model completed config and a >10 s wait for PVT.
     // Startup/freshness tests below explicitly restore the real boot deadline.
+    gGpsConfig.state = GPS_CONFIG_DONE;
     gNavPvtWaitMs = uint32_t(0 - NAV_PVT_FALLBACK_MS - 1);
     gDistanceContinuous = true;
     gState = IDLE; gTripPath[0] = 0; gTripWriteFailed = false;
@@ -449,14 +450,15 @@ int main(int argc, char** argv) {
 
     printf("G13 silent first configuration retries during an active trip\n");
     {
-        resetWorld(); run(15, 20);
+        resetWorld(); gGpsConfig.state = GPS_CONFIG_OFF;
+        run(15, 20, true, false, 100);
         CHECK(gState == ACTIVE, "trip is recording before configuration is requested");
         configureGps();
         respondToGps([](uint8_t cls, uint8_t id) {
             return gGpsConfig.attempts > 1 ? ack(cls, id) : std::string();
         });
         g_delayHook = [](uint32_t) { CHECK(false, "configuration must not delay loop"); };
-        run(15, 20);
+        run(15, 20, true, false, 100);
         g_delayHook = nullptr;
         CHECK(gGpsConfig.command == 6 && gGpsConfig.attempts == 2,
               "no-answer first attempt succeeds on a later loop attempt");
@@ -498,7 +500,7 @@ int main(int argc, char** argv) {
         loop();
         CHECK(gArmCount == 0 && gGpsConfig.command == 0,
               "partial NMEA and an ACK missing its checksum byte remain pending");
-        GPSSerial.rx += ack(0x06, 0x01).substr(9) + rmc.substr(split);
+        GPSSerial.rx += ack(0x06, 0x01).substr(9) + navPvt(0, 100) + rmc.substr(split);
         loop();
         CHECK(gArmCount == 1 && gGpsConfig.command == 1 && gps.passedChecksum() == 2,
               "binary ACK is removed and the split RMC resumes with its checksum and fix intact");
@@ -524,9 +526,25 @@ int main(int argc, char** argv) {
                 return response == 2 ? ack(cls, id, false) : std::string();
             });
         }
-        for (uint32_t ms = 0; ms <= 60000; ms += 100) { g_millis = ms; loop(); }
+        bool prematureFallback = false;
+        for (uint32_t ms = 0; ms <= 60000; ms += 100) {
+            g_millis = ms; loop();
+            if (gGpsConfig.state != GPS_CONFIG_DONE)
+                prematureFallback |= gSpeedFallback || gpsSpeedTrusted(true) || logCount("NAV-PVT unavailable");
+            else break;
+        }
         CHECK(gGpsConfig.state == GPS_CONFIG_DONE && gGpsConfig.attempts == 5,
               "stops after five attempts, including a receiver that never emits valid NMEA");
+        CHECK(!prematureFallback && !gSpeedFallback && !gpsSpeedTrusted(true) &&
+              logCount("NAV-PVT unavailable") == 0 && gNavPvtWaitMs == gGpsConfig.since,
+              "all give-up paths keep speed untrusted and start the PVT wait at config completion");
+        g_millis = gNavPvtWaitMs + NAV_PVT_FALLBACK_MS;
+        serviceGpsSpeedFallback();
+        CHECK(!gSpeedFallback && logCount("NAV-PVT unavailable") == 0,
+              "giving up still allows the full ten-second PVT wait");
+        ++g_millis; serviceGpsSpeedFallback(); gpsLoops();
+        CHECK(gSpeedFallback && gpsSpeedTrusted(true) && logCount("NAV-PVT unavailable") == 1,
+              "more than ten seconds after giving up enters fallback with exactly one warning");
         CHECK(GPSSerial.tx.size() == (response == 0 ? 0 : response == 1 ? 15 * 11 : 5 * 11) + (DISPLAY_DEBUG ? 8 : 0),
               "config sends remain bounded; debug RF polling begins after giving up");
         if (response) CHECK(lastSendMs - gGpsConfig.started >= 32000,
@@ -534,7 +552,8 @@ int main(int argc, char** argv) {
         size_t sent = GPSSerial.tx.size();
         g_millis += 60000; gpsLoops();
         CHECK(GPSSerial.tx.size() == sent + (DISPLAY_DEBUG ? 8 : 0) && logCount("not configured after 5 attempts") == 1 &&
-              logCount("retrying in background") == 1 && logCount("GPS configured") == 0,
+              logCount("retrying in background") == 1 && logCount("GPS configured") == 0 &&
+              logCount("NAV-PVT unavailable") == 1,
               "config stays stopped and logs failure once while debug polling continues");
     }
 
@@ -548,7 +567,7 @@ int main(int argc, char** argv) {
         CHECK(gGpsConfig.state == GPS_RETRY && GPSSerial.tx.empty(),
               "three seconds without valid NMEA schedules a retry without sending UBX");
         uint32_t retryAt = gGpsConfig.since + GPS_CONFIG_RETRY_MS;
-        GPSSerial.rx = sentences({4, 37, -122, 15, true})[0]; loop();
+        GPSSerial.rx = navPvt(4000, 100) + sentences({4, 37, -122, 15, true})[0]; loop();
         CHECK(gArmCount == 1 && GPSSerial.tx.empty(),
               "new fixes still reach the FSM while waiting for the scheduled retry");
         ackGps(); g_millis = retryAt; gpsLoops();
@@ -578,17 +597,28 @@ int main(int argc, char** argv) {
         respondToGps([](uint8_t cls, uint8_t id) {
             return g_millis - gGpsConfig.started >= 30000 ? ack(cls, id) : std::string();
         });
-        run(15, 45);
+        bool prematureTrust = false;
+        while (gGpsConfig.state != GPS_CONFIG_DONE && gT < 60) {
+            run(15, 1);
+            prematureTrust |= gSpeedFallback || gpsSpeedTrusted(true) || gLatestSpeedTrusted ||
+                              gState != IDLE || gArmCount || gPendCount || !tripFiles().empty() ||
+                              logCount("NAV-PVT unavailable");
+        }
+        CHECK(!prematureTrust && gNavPvtWaitMs >= 30000 && gNavPvtWaitMs <= g_millis,
+              "slow cold-start config never trusts raw RMC, arms, records or warns before completion");
         CHECK(gGpsConfig.command == 6 && gGpsConfig.attempts == 5 &&
               gGpsConfig.since - gGpsConfig.started >= 32000,
               "last attempt configures a receiver that stays unresponsive well after valid NMEA starts");
         CHECK(logCount("configured on attempt 5 (") == 1 && logCount("ms after config start") == 1 &&
               logCount("retrying in background") == 1 && logCount("not configured after") == 0,
               "reports the successful late attempt and elapsed time once");
-        endTrip(false);
-        auto files = tripFiles();
-        CHECK(files.size() == 1 && trkpts(g_disk.files[files[0]]).size() == 45,
-              "all 45 fixes survive the full cold-start retry window");
+        g_millis = gNavPvtWaitMs + NAV_PVT_FALLBACK_MS;
+        serviceGpsSpeedFallback();
+        CHECK(!gSpeedFallback && !gpsSpeedTrusted(true) && logCount("NAV-PVT unavailable") == 0,
+              "late successful config starts its own full ten-second PVT wait");
+        ++g_millis; serviceGpsSpeedFallback(); gpsLoops();
+        CHECK(gSpeedFallback && gpsSpeedTrusted(true) && logCount("NAV-PVT unavailable") == 1,
+              "late successful config without PVT enters fallback once after its deadline");
     }
 
     printf("G19 debug RF polling and receive demux\n");
@@ -792,13 +822,18 @@ int main(int argc, char** argv) {
 
     printf("G26 fallback transitions and old RMC-only behavior\n");
     {
-        resetWorld(); gNavPvtWaitMs = 0;
-        g_millis = NAV_PVT_FALLBACK_MS; loop();
-        CHECK(!gSpeedFallback && !logCount("fallback"), "boot gives NAV-PVT the full ten seconds");
-        ++g_millis; loop(); gpsLoops();
+        resetWorld(); g_millis = 5000; ackGps(); configureGps();
+        GPSSerial.rx = nmea("GNTXT,01,01,02,ready"); gpsLoops();
+        CHECK(gGpsConfig.state == GPS_CONFIG_DONE && gNavPvtWaitMs >= 5000 && gNavPvtWaitMs <= g_millis,
+              "successful config records a nonzero PVT wait start");
+        g_millis = gNavPvtWaitMs + NAV_PVT_FALLBACK_MS;
+        serviceGpsSpeedFallback();
+        CHECK(!gSpeedFallback && !gpsSpeedTrusted(true) && !logCount("fallback"),
+              "successful config gives NAV-PVT the full ten seconds after config end");
+        ++g_millis; serviceGpsSpeedFallback(); gpsLoops();
         CHECK(gSpeedFallback && logCount("WARNING: GPS NAV-PVT unavailable") == 1,
               "missing NAV-PVT logs exactly one warning on fallback entry");
-        gT = 11; run(15, 60); run(0, 200);
+        gT = 16; run(15, 60); run(0, 200);
         auto files = tripFiles();
         CHECK(files.size() == 1 && trkpts(g_disk.files[files[0]]).size() == 241 && gState == IDLE &&
               logCount("WARNING: GPS NAV-PVT unavailable") == 1,

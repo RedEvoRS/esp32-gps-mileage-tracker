@@ -664,7 +664,10 @@ How it behaves once flashed:
   the distance total, and distance never bridges across them. A gap over
   five seconds between accepted points starts a new track segment. The
   separate five-minute watchdog still ends a trip if all fixes disappear.
-  If NAV-PVT is absent for more than ten seconds (including at boot), one
+  Fallback is disabled until boot GPS configuration finishes, whether it
+  succeeds or gives up after five attempts. Until then, speeds without
+  fresh, accurate NAV-PVT stay untrusted. If NAV-PVT is absent for more
+  than ten seconds after configuration ends (or since the last NAV-PVT), one
   `WARNING:` announces fallback to the previous RMC-only behavior. A single
   return message announces restored accuracy gating. Fallback can still
   record false movement: check the warning during the hardware shakedown.

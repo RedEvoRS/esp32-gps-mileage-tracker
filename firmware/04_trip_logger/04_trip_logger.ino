@@ -329,6 +329,8 @@ static Fix    gArmBuf[16];
 static size_t gArmHead = 0, gArmCount = 0;
 
 static void serviceGpsSpeedFallback() {
+    // NAV-PVT is not expected until boot configuration finishes (or gives up).
+    if (gGpsConfig.state != GPS_CONFIG_DONE) return;
     bool fallback = uint32_t(millis() - (gNavPvt.seen ? gNavPvt.receivedMs : gNavPvtWaitMs)) >
                     NAV_PVT_FALLBACK_MS;
     if (fallback != gSpeedFallback) {
@@ -1778,6 +1780,7 @@ static void gpsConfigAttemptFailed() {
     gGpsConfig.since = millis();
     if (gGpsConfig.attempts >= GPS_CONFIG_ATTEMPTS) {
         gGpsConfig.state = GPS_CONFIG_DONE;
+        gNavPvtWaitMs = millis();
         Serial.printf("WARNING: GPS not configured after %u attempts -- continuing with current receiver settings.\n",
                       (unsigned)GPS_CONFIG_ATTEMPTS);
     } else {
@@ -1824,6 +1827,7 @@ static void serviceGpsConfiguration() {
     if (gGpsConfig.ack == 1) {
         if (++gGpsConfig.command == 6) {
             gGpsConfig.state = GPS_CONFIG_DONE;
+            gNavPvtWaitMs = millis();
             Serial.printf("GPS configured on attempt %u (%lu ms after config start): "
 #if DISPLAY_DEBUG
                           "RMC+GGA+NAV-PVT, GSV every 5 epochs, automotive model.\n",
