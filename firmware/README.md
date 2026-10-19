@@ -498,11 +498,16 @@ The rest of this section was written for the V1.2. On the Supreme
   - The screen can't stop logging. If it's missing or an I2C write fails,
     the serial log says `WARNING: debug OLED I2C failed` once and the
     screen stays off until the next boot.
-  - It runs dim, shifts sideways a few pixels each minute to limit burn-in,
-    and switches off before the board powers down.
+  - It uses maximum SH1106 contrast (`DEBUG_OLED_CONTRAST = 255`). The old
+    setting (`16`) was unreadable outdoors on the first road test
+    (2026-10-19). Full contrast speeds OLED burn-in and draws a little more
+    current, acceptable for this temporary shakedown-only page. It shifts
+    sideways a few pixels each minute to limit burn-in and switches off
+    before the board powers down. The future everyday display has its own
+    burn-in rules (see the display policy in `DIAGNOSTICS.md`).
   - Not yet checked on the board: the screen's supply rail and current
-    draw, whether it's readable in daylight, and which GSV talkers the
-    MAX-M10S actually sends.
+    draw, whether full contrast is readable in daylight, and which GSV
+    talkers the MAX-M10S actually sends.
 
   Bench check for the heard count: after a cold start under open sky, `R`
   should rise as signals arrive and `U` should rise when the receiver gets

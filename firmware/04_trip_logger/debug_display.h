@@ -4,6 +4,11 @@
 #include <Wire.h>
 #include "debug_status.h"
 
+// Raised from 16: unreadable outdoors on the first road test (2026-10-19).
+// Full contrast speeds OLED burn-in and draws a little more current;
+// acceptable for this shakedown-only page, which shifts horizontally each minute.
+static constexpr uint8_t DEBUG_OLED_CONTRAST = 255;  // SH1106 maximum
+
 static U8G2_SH1106_128X64_NONAME_F_HW_I2C gDebugOled(U8G2_R0, U8X8_PIN_NONE);
 static bool gDebugDisplayReady = false, gDebugDisplayFailed = false;
 static uint32_t gDebugDrawMs = 0;
@@ -54,7 +59,7 @@ static void beginDebugDisplay() {
         gDebugOled.setI2CAddress(0x3C << 1);  // U8g2 takes an 8-bit address
         gDebugOled.setBusClock(400000);
         gDebugOled.begin();
-        gDebugOled.setContrast(16);
+        gDebugOled.setContrast(DEBUG_OLED_CONTRAST);
         gDebugOled.setFont(u8g2_font_5x8_tf);  // 21 chars = 105 px; 8 rows
         gDebugOled.setFontPosTop();
     }
