@@ -18,6 +18,7 @@ WiFiStub WiFi;
 #include "04_trip_logger.ino"
 
 #include <fstream>
+#include <new>
 
 static int g_fail = 0;
 static std::string g_outDir;
@@ -106,6 +107,12 @@ static void resetWorld() {
     gRmcDateGN.begin(gps, "GNRMC", 9);
     gRmcTimeGP.begin(gps, "GPRMC", 1);
     gRmcDateGP.begin(gps, "GPRMC", 9);
+#if DISPLAY_DEBUG
+    new (&gDebugGsv) DebugGsv(gps);  // re-register after resetting parser listeners
+    gDebugRmcValid = false;
+    gDebugDisplayReady = gDebugDisplayFailed = false;
+    gDebugNet = DebugNetwork{};
+#endif
     GPSSerial = HardwareSerial(1);
     gGpsConfig = GpsConfig(); gGpsUbxRx = GpsUbxRx();
     gState = IDLE; gTripPath[0] = 0; gTripWriteFailed = false;
@@ -198,9 +205,9 @@ int main(int argc, char** argv) {
               "all five messages are ACKed without needing a position fix");
         std::vector<uint8_t> nav5(36, 0); nav5[0] = 0x01; nav5[2] = 4;
         std::string want = frame(0x06, 0x01, { 0xF0, 0x01, 0 }) + frame(0x06, 0x01, { 0xF0, 0x02, 0 }) +
-                           frame(0x06, 0x01, { 0xF0, 0x03, 0 }) + frame(0x06, 0x01, { 0xF0, 0x05, 0 }) +
+                           frame(0x06, 0x01, { 0xF0, 0x03, DISPLAY_DEBUG ? 5 : 0 }) + frame(0x06, 0x01, { 0xF0, 0x05, 0 }) +
                            frame(0x06, 0x24, nav5);
-        CHECK(GPSSerial.tx == want, "sends exactly GLL/GSA/GSV/VTG off + NAV5 automotive");
+        CHECK(GPSSerial.tx == want, "sends configured GLL/GSA/GSV/VTG rates + NAV5 automotive");
         const char gll[] = "\xB5\x62\x06\x01\x03\x00\xF0\x01\x00\xFB\x11";
         CHECK(GPSSerial.tx.compare(0, 11, std::string(gll, 11)) == 0,
               "GLL-off frame matches the published u-blox bytes");
@@ -275,6 +282,19 @@ int main(int argc, char** argv) {
                   "HDOP still comes through from GGA");
         }
         dump("G4");
+#if DISPLAY_DEBUG
+        CHECK(gDebugGsv.inView(g_millis) == 11,
+              "live GSV multipart totals are consumed while the same drive logs normally");
+        g_disk.files["/trips/incomplete.gpx"] = "<gpx>";
+        g_disk.files["/trips/rejected.gpx.bad"] = "</gpx>";
+        refreshDebugPending();
+        CHECK(gDebugNet.pending == 1 && g_lockDepth == 0,
+              "cached queue counts complete trips only and releases every FS lock");
+        gNetHold.store(true); gDebugNet.pending = 7;
+        refreshDebugPending();
+        CHECK(gDebugNet.pending == 7,
+              "power-off interruption preserves the previous cache instead of publishing a partial scan");
+#endif
     }
 
     printf("G5 GGA before RMC\n");

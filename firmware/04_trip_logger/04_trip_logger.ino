@@ -25,9 +25,10 @@
 // so until the first fix we buffer points by millis() and back-date them
 // once UTC arrives. Fresh GPS time corrects the system clock every minute.
 //
-// Required libraries (all used in earlier stages except none new):
+// Required libraries (U8g2 is only needed with DISPLAY_DEBUG):
 //   XPowersLib (lewisxhe), TinyGPSPlus (Mikal Hart). WiFi, HTTPClient,
 //   SD, SPI, LittleFS, and Preferences ship with the ESP32 Arduino core.
+//   U8g2 2.36.18 (olikraus) drives the optional test-drive OLED page.
 //
 // PARTITIONS: partitions.csv is unchanged (no OTA, 2.375 MB LittleFS
 // fallback, about 5-6 driving hours). SD requires FAT32; never auto-format.
@@ -60,6 +61,14 @@
 
 #include "secrets.h"
 #include "pmu_startup_event.h"
+
+#ifndef DISPLAY_DEBUG
+#define DISPLAY_DEBUG 1
+#endif
+#if DISPLAY_DEBUG
+#include "debug_display.h"
+#include "debug_gsv.h"
+#endif
 
 // -----------------------------------------------------------------
 // LilyGO T-Beam Supreme (ESP32-S3 + MAX-M10S), measured 2026-10-18
@@ -157,6 +166,15 @@ TinyGPSCustom  gRmcTimeGN(gps, "GNRMC", 1);
 TinyGPSCustom  gRmcDateGN(gps, "GNRMC", 9);
 TinyGPSCustom  gRmcTimeGP(gps, "GPRMC", 1);
 TinyGPSCustom  gRmcDateGP(gps, "GPRMC", 9);
+
+#if DISPLAY_DEBUG
+static DebugGsv gDebugGsv(gps);
+static bool gDebugRmcValid = false;
+// Core 0 publishes a coherent network snapshot; core 1 only copies it.
+// Critical sections contain just scalar copies, never I/O or formatting.
+static portMUX_TYPE gDebugNetMux = portMUX_INITIALIZER_UNLOCKED;
+static DebugNetwork gDebugNet;
+#endif
 
 SemaphoreHandle_t gFsMutex;     // serializes ALL filesystem access
 SPIClass          gSdSpi(HSPI); // dedicated bus instance; radio is never initialized
@@ -298,6 +316,22 @@ static bool      gTripWriteFailed = false;  // a write to gTripPath didn't land
 static bool      gHaveLastFix = false;
 static Fix       gLastFix;
 static uint32_t  gLastFixMonoMs = 0;
+
+#if DISPLAY_DEBUG
+static void debugWifi(DebugWifi wifi) {
+    portENTER_CRITICAL(&gDebugNetMux);
+    gDebugNet.wifi = wifi;
+    portEXIT_CRITICAL(&gDebugNetMux);
+}
+
+static void debugUpload(int code) {
+    uint32_t now = millis();
+    portENTER_CRITICAL(&gDebugNetMux);
+    gDebugNet.uploadCode = code ? code : -1;
+    gDebugNet.uploadMs = now;
+    portEXIT_CRITICAL(&gDebugNetMux);
+}
+#endif
 
 // =================================================================
 // Time helpers
@@ -1095,6 +1129,10 @@ static void powerOffForVbus() {
     FS_LOCK();
     if (gSdMounted) SD.end();
     if (gFlashMounted) LittleFS.end();
+#if DISPLAY_DEBUG
+    // Before the final VBUS read, preserving its immediate shutdown write.
+    debugDisplayPowerSave(true);
+#endif
     // PMU shutdown cuts all main rails, including SD BLDO1 and GPS ALDO4.
     // Leave rails and awake IRQs alone so a cancelled shutdown can resume.
     // GPS backup RAM is supplied directly by the 18650, not VBACKUP.
@@ -1133,6 +1171,9 @@ static void powerOffForVbus() {
     }
     FS_UNLOCK();
     gVbusLost = !PMU.isVbusIn();   // also catches a missed INSERT interrupt
+#if DISPLAY_DEBUG
+    debugDisplayPowerSave(false);
+#endif
     gVbusOffPending = false;
     gIdleSince = millis();        // failed power-off retries after the idle grace
     gNetAbort.store(false);
@@ -1368,7 +1409,13 @@ static bool uploadFile(fs::FS& storage, const char* path) {
 
     FS_LOCK();
     File f = storage.open(path, FILE_READ);
-    if (!f) { FS_UNLOCK(); return false; }
+    if (!f) {
+        FS_UNLOCK();
+#if DISPLAY_DEBUG
+        debugUpload(-1);
+#endif
+        return false;
+    }
     size_t sz = f.size();
     FS_UNLOCK();
 
@@ -1410,6 +1457,9 @@ static bool uploadFile(fs::FS& storage, const char* path) {
     }
     FS_UNLOCK();
 
+#if DISPLAY_DEBUG
+    debugUpload(code);
+#endif
     if (ok) {
         Serial.printf("Upload %s (%u B, %.1f s) -> HTTP 200 (deleted)\n",
                       path, (unsigned)sz, secs);
@@ -1496,12 +1546,57 @@ static bool hasPending() {
     return (gSdMounted && hasPending(SD)) || (gFlashMounted && hasPending(LittleFS));
 }
 
+#if DISPLAY_DEBUG
+// Only the network task scans: once per ~30 s cycle, and again after an
+// upload batch. gNetBusy protects unmount; per-entry FS locking lets GPS
+// writes interleave even with a large SD backlog. Count complete files on
+// BOTH stores, excluding .bad/.tmp and the still-incomplete current trip.
+static unsigned debugPendingCount(fs::FS& storage) {
+    unsigned count = 0;
+    FS_LOCK();
+    File dir = storage.open(TRIP_DIR);
+    bool directory = dir && dir.isDirectory();
+    FS_UNLOCK();
+    if (directory) {
+        while (!gNetHold.load() && !gNetAbort.load()) {
+            FS_LOCK();
+            File e = dir.openNextFile();
+            bool end = !e;
+            if (e) {
+                if (tripEntryPath(e).endsWith(".gpx") && isCompleteFile(e)) ++count;
+                e.close();
+            }
+            FS_UNLOCK();
+            if (end || count >= 999) break;
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+    FS_LOCK();
+    if (dir) dir.close();
+    FS_UNLOCK();
+    return count;
+}
+
+static void refreshDebugPending() {
+    unsigned count = 0;
+    if (gSdMounted) count += debugPendingCount(SD);
+    if (gFlashMounted) count += debugPendingCount(LittleFS);
+    if (gNetHold.load() || gNetAbort.load()) return; // partial count is unknown
+    portENTER_CRITICAL(&gDebugNetMux);
+    gDebugNet.pending = (int)count;
+    portEXIT_CRITICAL(&gDebugNetMux);
+}
+#endif
+
 // One pass of the network task. gNetBusy covers everything that touches
 // WiFi or the filesystem, and is raised before gNetHold is read (see the
 // handshake note at the globals).
 static void netCycle() {
     gNetBusy.store(true);
     if (!gNetHold.load()) {
+#if DISPLAY_DEBUG
+        refreshDebugPending();
+#endif
         // A trip just ended, so the car may be parked at home: try now,
         // whatever the backoff reached while driving or parked elsewhere.
         if (gNetRetryNow.exchange(false)) gNetRetryMs = 0;
@@ -1517,19 +1612,34 @@ static void netCycle() {
             bool uploaded = false;
             const char* miss = nullptr;
             int joinStatus = -1;
+#if DISPLAY_DEBUG
+            debugWifi(DebugWifi::Scan);
+#endif
             bool homeFound = homeApInRange();
+#if DISPLAY_DEBUG
+            debugWifi(homeFound ? DebugWifi::Join : DebugWifi::Off);
+#endif
             if (!homeFound) {
                 miss = "home WiFi not found";
             } else if (!connectWifi()) {
                 miss = "couldn't join home WiFi";
                 joinStatus = (int)WiFi.status();  // capture before disconnect
             } else {
+#if DISPLAY_DEBUG
+                debugWifi(DebugWifi::On);
+#endif
                 trySntp();
                 uploaded = uploadPending();
+#if DISPLAY_DEBUG
+                refreshDebugPending();
+#endif
                 if (!uploaded) miss = "no trip uploaded";
             }
             WiFi.disconnect(true);
             WiFi.mode(WIFI_OFF);
+#if DISPLAY_DEBUG
+            debugWifi(DebugWifi::Off);
+#endif
             // Back off AP misses, failed joins, and server failures alike.
             // Seeing the AP alone must not undo a server-failure backoff.
             gNetRetryMs = uploaded ? NET_TICK_MS :
@@ -1565,7 +1675,7 @@ static void networkTask(void*) {
 // GPS receiver configuration (u-blox UBX protocol, started at boot)
 // =================================================================
 // The MAX-M10S (SPG 5.10) ACKed these legacy messages on 2026-10-18.
-// Leave this configuration unchanged until #108 handles VALSET separately.
+// Keep the legacy ACK/retry protocol until #108 handles VALSET separately.
 // Re-send at every boot rather than rely on retained receiver settings.
 
 // Frame: B5 62 | class id | length (LE16) | payload | Fletcher-8 checksum
@@ -1590,6 +1700,12 @@ static void sendGpsConfigCommand() {
     static const uint8_t kSilence[] = { 0x01, 0x02, 0x03, 0x05 };
     if (gGpsConfig.command < sizeof(kSilence)) {
         uint8_t p[3] = { 0xF0, kSilence[gGpsConfig.command], 0 };
+#if DISPLAY_DEBUG
+        // GSV every fifth 1 Hz epoch: multi-constellation bursts can be
+        // ~1 KB; spreading them over 5 s leaves 9600-baud headroom for
+        // RMC+GGA and ACKs. The UART buffer is 2048 B. No VALSET changes.
+        if (p[1] == 0x03) p[2] = 5;
+#endif
         ubxSend(0x06, 0x01, p, sizeof(p));
     } else {
         // UBX-CFG-NAV5: apply only dynamic model "automotive" (4).
@@ -1654,7 +1770,12 @@ static void serviceGpsConfiguration() {
     if (gGpsConfig.ack == 1) {
         if (++gGpsConfig.command == 5) {
             gGpsConfig.state = GPS_CONFIG_DONE;
-            Serial.printf("GPS configured on attempt %u (%lu ms after config start): RMC+GGA only, automotive model.\n",
+            Serial.printf("GPS configured on attempt %u (%lu ms after config start): "
+#if DISPLAY_DEBUG
+                          "RMC+GGA, GSV every 5 epochs, automotive model.\n",
+#else
+                          "RMC+GGA only, automotive model.\n",
+#endif
                           (unsigned)gGpsConfig.attempts,
                           (unsigned long)(millis() - gGpsConfig.started));
         } else {
@@ -1673,8 +1794,20 @@ static void serviceGpsConfiguration() {
 // call. Reading value() clears the flag, so check both talker IDs each time.
 static bool rmcFixArrived() {
     bool fix = false;
-    if (gRmcStatusGN.isUpdated()) fix |= gRmcStatusGN.value()[0] == 'A';
-    if (gRmcStatusGP.isUpdated()) fix |= gRmcStatusGP.value()[0] == 'A';
+    if (gRmcStatusGN.isUpdated()) {
+        bool valid = gRmcStatusGN.value()[0] == 'A';
+        fix |= valid;
+#if DISPLAY_DEBUG
+        gDebugRmcValid = valid;
+#endif
+    }
+    if (gRmcStatusGP.isUpdated()) {
+        bool valid = gRmcStatusGP.value()[0] == 'A';
+        fix |= valid;
+#if DISPLAY_DEBUG
+        gDebugRmcValid = valid;
+#endif
+    }
     return fix;
 }
 
@@ -1699,6 +1832,9 @@ static bool buildFix(Fix& fx) {
 // but must not log a second point with the previous epoch's speed.
 static void receiveGpsNmea(uint8_t c) {
     if (!gps.encode((char)c)) return;
+#if DISPLAY_DEBUG
+    gDebugGsv.update(millis());
+#endif
     setClockFromGps();
     if (rmcFixArrived()) {
         Fix fx;
@@ -1866,6 +2002,37 @@ static bool mountTripStorage() {
     return gSdMounted || gFlashMounted;
 }
 
+#if DISPLAY_DEBUG
+static void serviceDebugDisplay() {
+    uint32_t now = millis();
+    if (!gDebugDisplayReady || now - gDebugDrawMs < 1000) return;
+    gDebugDrawMs = now;
+    DebugStatus s;
+    static const char* states[] = {"IDLE", "ARMING", "ACTIVE", "COOLDOWN", "FINALIZING"};
+    s.state = states[gState];
+    s.inView = gDebugGsv.inView(now);
+    if (gps.satellites.isValid() && gps.satellites.age() <= 15000)
+        s.used = (int)gps.satellites.value();
+    s.fixAgeMs = gps.location.isValid() ? gps.location.age() : UINT32_MAX;
+    s.fix = gDebugRmcValid && s.fixAgeMs <= 2500;
+    if (gps.hdop.isValid() && gps.hdop.age() <= 2500) s.hdop = gps.hdop.hdop();
+    if (s.fix && gps.speed.isValid() && gps.speed.age() <= 2500) s.mph = gps.speed.mph();
+    s.trip = gTripPath[0] != 0;
+    s.tripMs = now - gTripT0;
+    s.tripMiles = gTripMeters / 1609.344;
+    s.store = gSdMounted ? "SD" : (gFlashMounted ? "FLASH" : "NONE");
+    portENTER_CRITICAL(&gDebugNetMux);
+    s.net = gDebugNet;
+    portEXIT_CRITICAL(&gDebugNetMux);
+    s.now = millis();  // snapshot upload time cannot be newer than this clock read
+    s.batteryPct = PMU.getBatteryPercent();
+    s.batteryV = PMU.getBattVoltage() / 1000.0f;
+    s.usb = PMU.isVbusIn();
+    s.charging = PMU.isCharging();
+    drawDebugDisplay(s);
+}
+#endif
+
 void setup() {
     // VBUS-insert power-on brings the Supreme's LoRa rail up ON. Disable
     // and verify it as the first PMU operation after bounded bus recovery
@@ -1962,6 +2129,9 @@ void setup() {
     // PMU.)
     serviceChargeTemp();
 
+#if DISPLAY_DEBUG
+    beginDebugDisplay();
+#endif
     // --- Networking task on core 0; GPS/FSM stay on core 1 (loop) ---
     if (xTaskCreatePinnedToCore(networkTask, "net", NET_STACK_BYTES,
                                nullptr, 1, nullptr, 0) != pdPASS) {
@@ -2010,4 +2180,7 @@ void loop() {
         if (!gNetBusy.load() || millis() - gIdleSince >= IDLE_BATT_SLEEP_MS + NET_DRAIN_MS)
             powerOffForVbus();
     }
+#if DISPLAY_DEBUG
+    serviceDebugDisplay();
+#endif
 }

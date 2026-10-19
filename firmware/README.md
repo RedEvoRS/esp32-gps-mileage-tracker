@@ -285,6 +285,7 @@ picking the version from each one's version list:
 
 1. **XPowersLib** by lewisxhe, version **0.3.3** — for the AXP2101 power manager
 2. **TinyGPSPlus** by Mikal Hart, version **1.0.3** — for NMEA GPS parsing
+3. **U8g2** by olikraus, version **2.36.18** — for Stage 4's debug OLED page
 
 Those are the versions the trip logger is tested with. The Library Manager
 installs the newest unless you pick one.
@@ -451,6 +452,40 @@ The rest of this section was written for the V1.2. On the Supreme
   configuration for a few seconds, so the logger retries in the
   background. Expect `GPS configured on attempt 2 (… ms after config
   start)` about 10 s after power-up.
+- **Debug screen:** for road testing, the OLED shows a status page that
+  redraws about once a second. Example:
+
+  ```text
+  ACTIVE 0h12m          trip state, time since boot
+  SATS V:32 U:12        satellites in view / used in the fix
+  FIX OK H0.9 0s        fix yes/no, HDOP, seconds since last position
+  Speed 42.3 mph
+  Trip 12m 008.4mi      current trip: minutes, miles ("Trip --" if none)
+  Store SD Q:3          trip store (SD, FLASH, NONE), trips waiting to upload
+  Net OFF OK 20s        WiFi (OFF/SCAN/JOIN/ON), last upload, seconds ago
+  B85% 4.02V U1 C1      battery, USB power in (U1), charging (C1)
+  ```
+
+  `--` means unknown or stale. The queue count (`Q`) is refreshed by the
+  upload task about every 30 s, so a trip that just ended can take one
+  cycle to appear, and an upload age stops counting at 999 s.
+
+  Things to know:
+  - It's switched by `DISPLAY_DEBUG` at the top of the sketch (default `1`).
+    Set it to `0` for the old behaviour: screen untouched, no extra GPS
+    messages.
+  - Satellites *in view* come from GSV sentences, which the logger otherwise
+    turns off. With the screen on, the GPS sends them every 5th second
+    only, because a full set is about 1 KB and the GPS link runs at just
+    9600 baud (~960 bytes/s).
+  - The screen can't stop logging. If it's missing or an I2C write fails,
+    the serial log says `WARNING: debug OLED I2C failed` once and the
+    screen stays off until the next boot.
+  - It runs dim, shifts sideways a few pixels each minute to limit burn-in,
+    and switches off before the board powers down.
+  - Not yet checked on the board: the screen's supply rail and current
+    draw, whether it's readable in daylight, and which GSV talkers the
+    MAX-M10S actually sends.
 - **Expected boot log:**
 
   ```text
@@ -462,7 +497,7 @@ The rest of this section was written for the V1.2. On the Supreme
   GPS: waiting for checksum-valid NMEA (up to 3 s).
   Setup complete. Logging trips.
   GPS ready: checksum-valid NMEA received.
-  GPS configured on attempt 2 (9874 ms after config start): RMC+GGA only, automotive model.
+  GPS configured on attempt 2 (9874 ms after config start): RMC+GGA, GSV every 5 epochs, automotive model.
   ```
 
 Before flashing:

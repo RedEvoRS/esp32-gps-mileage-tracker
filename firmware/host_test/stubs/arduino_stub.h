@@ -390,6 +390,11 @@ struct Preferences {
 
 // ---- FreeRTOS -------------------------------------------------------------
 typedef void* SemaphoreHandle_t;
+// Display snapshots are exercised on one host thread; ESP32 uses a spinlock.
+typedef int portMUX_TYPE;
+#define portMUX_INITIALIZER_UNLOCKED 0
+inline void portENTER_CRITICAL(portMUX_TYPE*) {}
+inline void portEXIT_CRITICAL(portMUX_TYPE*) {}
 #define portMAX_DELAY 0xffffffff
 inline bool g_failMutexCreate = false;
 inline SemaphoreHandle_t xSemaphoreCreateMutex() { return g_failMutexCreate ? nullptr : (void*)1; }
@@ -416,7 +421,7 @@ struct TwoWire {
     bool started = false, failEnd = false;
     uint16_t timeout = 0;
     std::function<void()> onBegin, onEnd;
-    bool begin(int a, int b) {
+    bool begin(int a, int b, uint32_t = 0) {
         sda = a; scl = b; begins++;
         if (onBegin) onBegin();
         if (failBegins) { failBegins--; return false; }
@@ -429,6 +434,9 @@ struct TwoWire {
         started = false; return true;
     }
     void setTimeOut(uint16_t ms) { timeout = ms; }
+    void beginTransmission(uint8_t) {}
+    size_t write(const uint8_t*, size_t n) { return n; }
+    uint8_t endTransmission() { return 0; }
 };
 extern TwoWire Wire, Wire1;
 #define AXP2101_SLAVE_ADDRESS 0x34
@@ -504,6 +512,9 @@ struct XPowersAXP2101 {
     bool isVbusRemoveIrq() { return removeIrq; } bool isVbusInsertIrq() { return insertIrq; }
     bool isPekeyLongPressIrq() { return longPressIrq; } bool isDropWarningLevel2Irq() { return criticalIrq; }
     bool isVbusIn() { return vbusIn; }
+    int getBatteryPercent() { return 85; }
+    uint16_t getBattVoltage() { return 4020; }
+    bool isCharging() { return chargeEnabled && vbusIn; }
     void shutdown() {
         g_powerEvents.push_back("PMU.shutdown");
         shutdownCalls++;
