@@ -5,14 +5,17 @@
 #include <iostream>
 
 using namespace diagnostics;
-static_assert(kCatalogVersion == 1, "review the host fixture on catalog version changes");
+static_assert(kCatalogVersion == 2, "review the host fixture on catalog version changes");
 static_assert(static_cast<std::uint16_t>(Code::STORAGE_FULL) == 4005, "stable code");
 static_assert(find(4005)->severity == Severity::Critical, "constexpr lookup");
 static_assert(find(5001)->journal == Journal::Counter, "no event for each absent scan");
+static_assert(static_cast<std::uint16_t>(Code::PMU_STARTUP_RECOVERY) == 2007, "stable power code");
+static_assert(find(2007)->severity == Severity::Warning && !find(2007)->notify, "history without paging");
+static_assert(find(2007)->journal == Journal::PerOccurrence, "startup recovery is a notice");
 static_assert(find(7999) == nullptr, "unknown codes need a display fallback");
 
 int main() {
-    assert(kCatalogSize == 44);
+    assert(kCatalogSize == 45);
     for (std::size_t i = 0; i < kCatalogSize; ++i) {
         const auto& entry = kCatalog[i];
         assert(entry.oled_line_count >= 1 && entry.oled_line_count <= 3);
@@ -21,5 +24,5 @@ int main() {
             assert(std::strlen(entry.oled[line]) <= 21);
         }
     }
-    std::cout << "Diagnostic catalog: 44 entries passed\n";
+    std::cout << "Diagnostic catalog: 45 entries passed\n";
 }

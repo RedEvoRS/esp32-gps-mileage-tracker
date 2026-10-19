@@ -22,7 +22,10 @@ BOOT = "0" * 31 + "1"
 OTHER_BOOT = "0" * 31 + "2"
 # Append a new version/fingerprint when intentionally changing published entries.
 # Keeping prior fingerprints makes silent edits without a version bump fail.
-PUBLISHED_CATALOGS = {1: "d908fd028755d8a1eee07f0ee130ad12291f21e201ddc13214bde24212c393e0"}
+PUBLISHED_CATALOGS = {
+    1: "d908fd028755d8a1eee07f0ee130ad12291f21e201ddc13214bde24212c393e0",
+    2: "1f7bfdb3135fc7c92d17013d3c271d8514f5ffd692e81223ad85877dd2dcd3cb",
+}
 
 
 def event(code=4005, sequence=1, transition="raise", **overrides):
@@ -47,7 +50,7 @@ class CatalogTests(unittest.TestCase):
 
     def test_catalog_unique_codes_and_symbols(self):
         rows = self.catalog["codes"]
-        self.assertEqual(len(rows), 44)
+        self.assertEqual(len(rows), 45)
         self.assertEqual(len({r["code"] for r in rows}), len(rows))
         self.assertEqual(len({r["symbol"] for r in rows}), len(rows))
 
@@ -104,6 +107,13 @@ class CatalogTests(unittest.TestCase):
                 change(bad)
                 with self.assertRaises(CatalogError):
                     validate_catalog(bad)
+
+    def test_pmu_startup_recovery_is_non_notifying_boot_history(self):
+        row = next(row for row in self.catalog["codes"] if row["code"] == 2007)
+        self.assertEqual(row["symbol"], "PMU_STARTUP_RECOVERY")
+        self.assertEqual(row["severity"], "warning")
+        self.assertFalse(row["notify"])
+        self.assertEqual(row["journal"], "per_occurrence")
 
     def test_loader_fails_on_invalid_and_duplicate_json(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -195,6 +205,20 @@ class ProtocolTests(unittest.TestCase):
         value["events"][0]["severity"] = "info"
         self.invalid(value)
         self.invalid(request([event(code=4999, context={"raw": "untrusted"})]))
+
+    def test_pmu_startup_notice_context_and_no_condition_semantics(self):
+        context = dict(clock_count=27, attempt_count=3, recovery_state="sda_stuck",
+                       pmu_ready=False, wire_end_failed=False)
+        notice = event(2007, catalog_version=2, transition="notice", episode_id=None,
+                       context=context)
+        validate_request(request([notice]))
+        for transition in ("raise", "repeat", "clear"):
+            self.invalid(request([dict(notice, transition=transition, episode_id=f"{BOOT}:1")]))
+        for field in ("active", "observed"):
+            value = request([])
+            value["checkin"][field] = ([{"code": 2007, "episode_id": f"{BOOT}:1"}]
+                                          if field == "active" else [4005, 2007])
+            self.invalid(value)
 
     def test_devices_cannot_report_server_monitor_codes(self):
         self.invalid(request([event(code=7001)]))

@@ -1,5 +1,5 @@
 {
-  "catalog_version": 1,
+  "catalog_version": 2,
   "codes": [
     {
       "code": 1000,
@@ -241,6 +241,46 @@
       "context": {},
       "notify": true,
       "journal": "transitions"
+    },
+    {
+      "code": 2007,
+      "symbol": "PMU_STARTUP_RECOVERY",
+      "severity": "warning",
+      "oled": [
+        "PMU startup recovery"
+      ],
+      "title": "PMU startup needed recovery or retries",
+      "explanation": "The PMU/RTC I2C bus needed recovery or PMU startup needed another attempt. This boot history also records unsuccessful startup; PMU_INIT_FAILED describes the continuing failure.",
+      "recovery": "Inspect repeated occurrences for PMU/RTC wiring, power or unexpected resets. Check pmu_ready before assuming startup succeeded.",
+      "context": {
+        "clock_count": {
+          "type": "integer",
+          "min": 0,
+          "max": 27
+        },
+        "attempt_count": {
+          "type": "integer",
+          "min": 1,
+          "max": 3
+        },
+        "recovery_state": {
+          "type": "enum",
+          "values": [
+            "not_needed",
+            "recovered",
+            "sda_stuck",
+            "scl_stuck"
+          ]
+        },
+        "pmu_ready": {
+          "type": "boolean"
+        },
+        "wire_end_failed": {
+          "type": "boolean"
+        }
+      },
+      "notify": false,
+      "journal": "per_occurrence"
     },
     {
       "code": 3001,

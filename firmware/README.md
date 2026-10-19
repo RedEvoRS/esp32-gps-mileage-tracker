@@ -384,8 +384,11 @@ PMU startup gets up to three attempts, releasing `Wire1` and waiting 10 ms
 between attempts. Serial reports recovery results, clock counts and retries;
 Stage 4 prints these after its early LoRa rail safety check. If all attempts
 fail, the existing halt remains. Recovery is host-tested; repeatedly resetting
-during PMU reads still needs a bench check. Issue #151 tracks recording I2C
-recoveries and PMU startup retries in the diagnostics journal.
+during PMU reads still needs a bench check. Stage 4 retains the boot result
+and has a host-tested helper for E2007 PMU_STARTUP_RECOVERY (#151). Recording
+that notice still needs the diagnostics journal and fault hooks (#122/#124);
+failed-startup reporting also needs the degraded loop (#126). OLED reporting
+remains with #127.
 
 ### Stage 3: GPS (`03_gps_test/`)
 
