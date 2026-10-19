@@ -18,12 +18,13 @@ SERVER = Path(__file__).resolve().parents[1]
 APP_PATH = SERVER / "mileage-ingest" / "app.py"
 DOCKERFILE = SERVER / "mileage-ingest" / "Dockerfile"
 PARTITIONS = SERVER.parent / "firmware" / "04_trip_logger" / "partitions.csv"
+SKETCH = PARTITIONS.with_name("04_trip_logger.ino")
 
 TOKEN = "test-token"
 CAP = 1024  # small, so an over-cap body is cheap to build
 
-# A weak signal at the edge of the driveway. A trip that fills the whole
-# partition has to upload at this speed before gunicorn's worker timeout.
+# A weak signal at the edge of the driveway. A full split piece has to
+# upload at this speed before gunicorn's worker timeout.
 SLOW_LINK_BYTES_PER_S = 10_000
 
 
@@ -54,6 +55,17 @@ def trip_partition_bytes():
         if fields[0] == "spiffs":
             return int(fields[4], 0)
     raise AssertionError(f"no spiffs partition in {PARTITIONS}")
+
+
+def trip_split_bytes():
+    """Read the sketch's limit, accepting an integer product only."""
+    match = re.search(r"\bTRIP_SPLIT_BYTES\s*=\s*([\d\s*]+);", SKETCH.read_text())
+    if not match:
+        raise AssertionError("no numeric TRIP_SPLIT_BYTES constant in sketch")
+    size = 1
+    for factor in match.group(1).split("*"):
+        size *= int(factor.strip())
+    return size
 
 
 class EarlyReplies(unittest.TestCase):
@@ -142,18 +154,25 @@ class DefaultCap(unittest.TestCase):
 class DeviceTripsFit(unittest.TestCase):
     """Cross-checks between the firmware's storage and the server's limits."""
 
-    def test_trip_partition_is_under_the_default_cap(self):
+    def test_trip_split_is_at_most_half_the_default_cap(self):
         with tempfile.TemporaryDirectory() as root:
             cap = load_ingest(root).MAX_UPLOAD_BYTES
-        # No trip file can be bigger than the partition that holds it.
+        self.assertGreater(trip_split_bytes(), 0)
+        self.assertLessEqual(trip_split_bytes(), cap // 2,
+                             "a trip piece must fit within half the upload cap")
+
+    def test_fallback_partition_is_under_the_default_cap(self):
+        with tempfile.TemporaryDirectory() as root:
+            cap = load_ingest(root).MAX_UPLOAD_BYTES
+        # Flash fallback still bounds a trip below the server cap.
         self.assertLess(trip_partition_bytes(), cap,
                         "a full trip partition would be rejected with a 413")
 
-    def test_worker_timeout_lets_a_full_partition_through_a_slow_link(self):  # #30
+    def test_worker_timeout_lets_a_split_piece_through_a_slow_link(self):  # #30
         match = re.search(r'"--timeout",\s*"(\d+)"', DOCKERFILE.read_text())
         self.assertIsNotNone(match, "gunicorn's default 30 s timeout is too short")
         self.assertGreater(int(match.group(1)) * SLOW_LINK_BYTES_PER_S,
-                           trip_partition_bytes())
+                           trip_split_bytes())
 
 
 if __name__ == "__main__":

@@ -85,6 +85,8 @@ static constexpr uint32_t ARM_MS          = 10UL  * 1000;    // sustain to start
 static constexpr uint32_t COOL_MS         = 180UL * 1000;    // sustain to end
 static constexpr float    MIN_TRIP_METERS = 160.0f;          // ~0.1 mi
 static constexpr uint32_t MIN_TRIP_MS     = 30UL  * 1000;
+static constexpr size_t   TRIP_SPLIT_BYTES = 8 * 1024 * 1024; // half the server cap
+static constexpr size_t   TRKPT_LINE_BYTES = 256;            // includes terminating NUL
 
 // Fix-loss heuristic: gap this long between valid fixes starts a new
 // <trkseg> so viewers don't draw a straight line across a tunnel.
@@ -104,11 +106,11 @@ static constexpr uint32_t IDLE_BATT_SLEEP_MS = 10UL * 60 * 1000;
 
 // Power-off never unmounts storage under an upload (issue #3). When the idle
 // timer runs out mid-upload, the file gets up to NET_DRAIN_MS to finish:
-// the server's 300 s worker timeout bounds one upload, plus time to scan
+// the server's 900 s worker timeout bounds one upload, plus time to scan
 // and connect. After that, or at once for a critical battery or a held
 // power key, the upload is cut off and the network task gets NET_ABORT_MS
 // to close the file and switch WiFi off. A cut-off trip stays queued.
-static constexpr uint32_t NET_DRAIN_MS = 6UL * 60 * 1000;
+static constexpr uint32_t NET_DRAIN_MS = 16UL * 60 * 1000;
 static constexpr uint32_t NET_ABORT_MS = 15UL * 1000;
 
 // How often the networking task wakes to look for pending uploads.
@@ -272,6 +274,7 @@ static uint32_t  gFullWarnT0 = 0;       // last "storage full" log line
 static bool      gFullWarned = false;
 static uint32_t  gIdleSince = 0;        // last time we were NOT (on battery + IDLE)
 static double    gTripMeters = 0;
+static size_t    gTripBytes = 0;        // committed prologue + trackpoint bytes
 
 // Fixes seen while ARMING, so the first ~10 s of a trip isn't lost.
 // One fix per 1 Hz epoch makes a 10 s arm window 10-11 fixes; 16 slots is
@@ -442,7 +445,7 @@ static void appendTrkpt(FileWriter& w, const Fix& fx) {
         snprintf(timeEl, sizeof(timeEl), "<time>%s</time>", iso);
     }
 
-    char line[256];   // ~150 max for sane values; headroom for garbage floats
+    char line[TRKPT_LINE_BYTES]; // ~150 max for sane values; headroom for garbage floats
     int n = snprintf(line, sizeof(line),
         "%s<trkpt lat=\"%.6f\" lon=\"%.6f\">%s"
         "<speed>%.2f</speed><hdop>%.1f</hdop></trkpt>\n",
@@ -486,6 +489,14 @@ static void flushPending(FileWriter& w) {
 // =================================================================
 // Trip lifecycle
 // =================================================================
+// Reserve the pending tail, one more point (including a segment break),
+// and the closing tags. A point is at most 255 bytes, even when back-dated
+// with UTC. Checking after each fix leaves the complete file below 8 MiB.
+static bool tripShouldSplit(size_t bytes, size_t pendingCount) {
+    return bytes + (pendingCount + 1) * (TRKPT_LINE_BYTES - 1) +
+           strlen(GPX_EPILOGUE) >= TRIP_SPLIT_BYTES;
+}
+
 // Only called before workers start or with FS_LOCK held. SD capacity must
 // stay 64 bit: size_t on the ESP32 cannot represent a 32 GB card.
 static uint64_t storageFreeBytes(fs::FS& storage) {
@@ -535,7 +546,8 @@ static bool tripStorageLow(uint32_t now) {
 static bool beginTrip(const Fix& fx) {
     fs::FS& storage = *gTripFS;
     gTripMeters = 0;
-    gMaxSpeedMps = 0;
+    gMaxSpeedMps = fx.speedMps;
+    gTripBytes = 0;
     gTripWriteFailed = false;
     gTripT0 = gArmCount ? gArmBuf[gArmHead].monoMs : fx.monoMs;
     gLastMoveMs = fx.monoMs;
@@ -563,6 +575,7 @@ static bool beginTrip(const Fix& fx) {
             }
         }
         ok = w.commit();
+        if (ok) gTripBytes = w.queued;
         f.close();
         if (!ok) storage.remove(gTripPath);
     }
@@ -580,13 +593,16 @@ static bool beginTrip(const Fix& fx) {
     }
 
     // Count the distance covered while ARMING into the trip total.
-    for (size_t i = 1; i < gArmCount; ++i) {
-        const Fix& a = gArmBuf[(gArmHead + i - 1) % 16];
+    for (size_t i = 0; i < gArmCount; ++i) {
         const Fix& b = gArmBuf[(gArmHead + i) % 16];
-        gTripMeters += haversineM(a.lat, a.lon, b.lat, b.lon);
+        if (i > 0) {
+            const Fix& a = gArmBuf[(gArmHead + i - 1) % 16];
+            gTripMeters += haversineM(a.lat, a.lon, b.lat, b.lon);
+        }
         if (b.speedMps > gMaxSpeedMps) gMaxSpeedMps = b.speedMps;
     }
     armBufReset();
+    gCoolT0 = fx.monoMs;
     gFsCheckT0 = fx.monoMs;
     gFullWarned = false;
     Serial.printf("Trip started: %s\n", gTripPath);
@@ -621,6 +637,7 @@ static bool writeOrBufferTrkpt(const Fix& fx) {
             appendTrkpt(w, fx);
         }
         ok = w.commit();
+        if (ok) gTripBytes += w.queued;
     }
     if (f) f.close();   // close() as well as the commit's fsync
     FS_UNLOCK();
@@ -642,9 +659,10 @@ static bool repairIfNeeded(fs::FS& storage, const char* path);
 // Close out the active trip. If it's too short/slow it's discarded --
 // unless this is a power-loss finalize, where a genuine short drive that
 // ended in a power cut is still data worth keeping.
-static void endTrip(bool discardIfMicro) {
+// A size split keeps FINALIZING until its next piece has a valid prologue.
+static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
     fs::FS& storage = *gTripFS;
-    if (gTripPath[0] == 0) { gState = IDLE; return; }
+    if (gTripPath[0] == 0) { gState = nextState; return; }
 
     // Duration runs to the last moving fix: the 3 min parked cooldown (or
     // the wait before a fix-loss finalize) that ends every trip would
@@ -695,7 +713,7 @@ static void endTrip(bool discardIfMicro) {
 
     gPendCount = gPendHead = 0;
     gTripWriteFailed = false;
-    gState = IDLE;
+    gState = nextState;
     gNetRetryNow.store(true);   // after the file is closed and no longer active
 }
 
@@ -758,11 +776,34 @@ static void tripFsmOnFix(const Fix& fx) {
         break;   // handled immediately below, not on the NEXT fix
     }
 
+    TripState resumeState = gState;
+    bool split = (gState == ACTIVE || gState == COOLDOWN) &&
+                 tripShouldSplit(gTripBytes, gPendCount);
+    if (split) {
+        Serial.printf("Trip split at %u bytes: %s\n", (unsigned)gTripBytes, gTripPath);
+        gState = FINALIZING;
+    }
+
     // Finalize in the same pass that triggered it. Previously this only
     // ran on the next valid fix, so losing GPS right as the cooldown
     // expired (parked in a garage) left the trip open until power loss.
     if (gState == FINALIZING) {
-        endTrip(/*discardIfMicro=*/true);
+        uint32_t coolT0 = gCoolT0;
+        endTrip(/*discardIfMicro=*/!split, split ? FINALIZING : IDLE);
+        if (split) {
+            // Share the boundary fix so the join loses neither a point nor
+            // a distance step. Reuse startup without the 10 s arming wait.
+            armBufReset();
+            armBufPush(fx);
+            if (roomForNewTrip(now) && beginTrip(fx)) {
+                gState = resumeState;
+                if (resumeState == COOLDOWN) gCoolT0 = coolT0;
+            } else {
+                gState = IDLE;
+                armBufReset();
+                gPendCount = gPendHead = 0;
+            }
+        }
     }
 
     gLastFix = fx;
@@ -1339,7 +1380,7 @@ static bool uploadFile(fs::FS& storage, const char* path) {
     // with 409, and a 409 stays queued, retried indefinitely.
 
     // Size and time go in the log so a real upload shows the link speed:
-    // the server's worker timeout (300 s) bounds how slow it can be.
+    // the server's worker timeout (900 s) bounds how slow it can be.
     uint32_t t0 = millis();
     int code = http.sendRequest("POST", &body, sz);
     http.end();

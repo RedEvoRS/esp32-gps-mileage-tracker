@@ -154,9 +154,11 @@ Stage 2's `d` key is the first check to run when a card is fitted.
 - **Power cuts:** FAT copes with a sudden power loss worse than LittleFS
   does. The 18650 is what lets the logger close its files and unmount the
   card cleanly after the car's USB power goes away, so keep it fitted.
-- **Very long trips:** with no partition size to stop it, a trip that never
-  ends could grow past the server's 16 MiB upload limit. Splitting trips on
-  the device is still to be done (issue #110).
+- **Very long trips:** firmware splits a trip into pieces below 8 MiB,
+  half the server's 16 MiB upload limit. Recording continues immediately
+  with the boundary fix shared by both pieces, and each uploads separately.
+  A very long drive can therefore show up as more than one trip. This also
+  keeps a parked, powered device's GPS drift from creating one oversized file.
 
 ### Supreme pin and power reference
 
@@ -680,8 +682,8 @@ an unavailable server, rejected requests, and a dropped WiFi connection.
 Record the firmware commit, core/library versions, file sizes, HTTP outcomes,
 upload times, and lowest `Net stack ... minimum free` value. Each `Upload`
 line prints the file's size and how long it took. Size over time is the
-link speed, and the server's worker timeout (300 s) sets the slowest link
-the largest trip (~2.4 MB) can upload over, about 8 kB/s. A warning at
+link speed. The server's worker timeout (900 s) allows a full 8 MiB trip
+piece at 10 kB/s (~839 s), with a margin for handling it. A warning at
 1,024 bytes or less means the allocation needs review; absence of a warning
 is not proof that every path has been exercised. Keep issue #6 open until these measurements are
 recorded and the final allocation is justified. Host tests check diagnostics

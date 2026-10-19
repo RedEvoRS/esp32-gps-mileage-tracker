@@ -183,15 +183,15 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   `server/tests/`)
 - Upload limits: 16 MiB body cap (`INGEST_MAX_UPLOAD_BYTES`, ~39 h of
   nonstop driving). It protects the server's memory: the ingest parses the
-  whole body at once, peaking at ~9x its size. Issue #110 proposes an 8 MiB
-  trip split for the Supreme firmware, half the server cap; this is not
-  implemented yet. With trips on microSD there's no partition size to bound
-  one, so do not assume runaway trips are split until issue #110 is done.
-  gunicorn `--timeout 300`, because the timeout includes reading the body
-  and 30 s dropped big trips on slow links. Early 401/413 replies read and
+  whole body at once, peaking at ~9x its size. Firmware splits long trips
+  into pieces below 8 MiB, half the server cap, reserving room for pending
+  points and closing tags. Each piece uploads separately, with no arming
+  gap between pieces. gunicorn `--timeout 900` lets an 8 MiB piece upload
+  at 10 kB/s (~839 s), with a margin for handling it. The timeout includes
+  reading the body. Early 401/413 replies read and
   discard up to 4x the cap first, so the device sees the status, not a reset.
   `server/tests/test_upload_limits.py` ties the current upload limit to
-  `partitions.csv`
+  the firmware split limit and the flash fallback in `partitions.csv`
 - Diagnostics: `POST /v1/device-events` on ingest, same bearer auth plus validated
   `X-Device-Id`, 32 KiB streaming cap (also without Content-Length), protocol v1
   from `common.diagnostics`, catalog cached at startup. Ingest owns
