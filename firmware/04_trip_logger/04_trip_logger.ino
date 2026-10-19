@@ -68,6 +68,7 @@
 #if DISPLAY_DEBUG
 #include "debug_display.h"
 #include "debug_gsv.h"
+#include "debug_rf.h"
 #endif
 
 // -----------------------------------------------------------------
@@ -168,7 +169,10 @@ TinyGPSCustom  gRmcTimeGP(gps, "GPRMC", 1);
 TinyGPSCustom  gRmcDateGP(gps, "GPRMC", 9);
 
 #if DISPLAY_DEBUG
-static DebugGsv gDebugGsv(gps);
+static DebugGsv gDebugGsv;
+static DebugRf gDebugRf;
+static uint32_t gDebugRfPollMs = 0;
+static bool gDebugRfStarted = false;
 static bool gDebugRmcValid = false;
 // Core 0 publishes a coherent network snapshot; core 1 only copies it.
 // Critical sections contain just scalar copies, never I/O or formatting.
@@ -224,12 +228,17 @@ struct GpsConfig {
 };
 static GpsConfig gGpsConfig;
 
-// Demultiplex UBX packets before feeding NMEA to TinyGPSPlus. Only the
-// first two payload bytes (the command echoed by ACK/NAK) need storage.
+// Demultiplex UBX packets before feeding NMEA to TinyGPSPlus. Debug builds
+// retain bounded MON-RF payloads; other builds keep only the ACK/NAK echo.
 struct GpsUbxRx {
     uint32_t pos = 0, since = 0;
     uint16_t len = 0;
-    uint8_t cls = 0, id = 0, payload[2] = {0}, a = 0, b = 0;
+    uint8_t cls = 0, id = 0, a = 0, b = 0;
+#if DISPLAY_DEBUG
+    uint8_t payload[256] = {};
+#else
+    uint8_t payload[2] = {};
+#endif
     bool checksumA = false;
 };
 static GpsUbxRx gGpsUbxRx;
@@ -1831,6 +1840,9 @@ static bool buildFix(Fix& fx) {
 // RMC carries position and speed together; GGA supplies the latest HDOP
 // but must not log a second point with the previous epoch's speed.
 static void receiveGpsNmea(uint8_t c) {
+#if DISPLAY_DEBUG
+    gDebugGsv.encode((char)c);
+#endif
     if (!gps.encode((char)c)) return;
 #if DISPLAY_DEBUG
     gDebugGsv.update(millis());
@@ -1877,7 +1889,7 @@ static void receiveGpsByte(uint8_t c) {
         else if (rx.pos == 3) rx.id = c;
         else if (rx.pos == 4) rx.len = c;
         else if (rx.pos == 5) rx.len |= (uint16_t)c << 8;
-        else if (rx.pos < 8) rx.payload[rx.pos - 6] = c;
+        else if (rx.pos - 6 < sizeof rx.payload) rx.payload[rx.pos - 6] = c;
         rx.pos++;
         if (rx.len > 256) rx = GpsUbxRx();
     } else if (rx.pos == (uint32_t)rx.len + 6) {
@@ -1891,6 +1903,11 @@ static void receiveGpsByte(uint8_t c) {
             gGpsConfig.ack < 0) {
             gGpsConfig.ack = rx.id == 0x01 ? 1 : 0;
         }
+#if DISPLAY_DEBUG
+        if (rx.checksumA && c == rx.b && rx.cls == 0x0A && rx.id == 0x38 &&
+            gDebugRfStarted && gGpsConfig.state == GPS_CONFIG_DONE)
+            parseDebugMonRf(rx.payload, rx.len, gDebugRf);
+#endif
         rx = GpsUbxRx();
     }
 }
@@ -2003,6 +2020,36 @@ static bool mountTripStorage() {
 }
 
 #if DISPLAY_DEBUG
+static int debugSatellitesUsed() {
+    return gps.satellites.isValid() && gps.satellites.age() <= 15000 ?
+           (int)gps.satellites.value() : -1;
+}
+
+static float debugHdop() {
+    return gps.hdop.isValid() && gps.hdop.age() <= 2500 ? gps.hdop.hdop() : -1;
+}
+
+static void serviceDebugRf() {
+    if (gGpsConfig.state != GPS_CONFIG_DONE) return;
+    uint32_t now = millis();
+    if (gDebugRfStarted) {
+        if (uint32_t(now - gDebugRfPollMs) < 30000) return;
+        char fix = 0;
+        if ((gRmcStatusGN.isValid() && gRmcStatusGN.age() <= 2500) ||
+            (gRmcStatusGP.isValid() && gRmcStatusGP.age() <= 2500))
+            fix = gDebugRmcValid ? 'A' : 'V';
+        char line[DEBUG_RF_LINE_BYTES];
+        formatDebugRf(gDebugRf, gDebugGsv.signal(now), debugSatellitesUsed(),
+                      debugHdop(), fix, line, sizeof line);
+        Serial.println(line);
+    }
+    // First poll starts after config succeeds OR gives up. Each later poll
+    // logs the previous interval's reply, then invalidates it. Never wait.
+    gDebugRfStarted = true; gDebugRfPollMs = now;
+    gDebugRf.valid = false;
+    ubxSend(0x0A, 0x38, nullptr, 0);
+}
+
 static void serviceDebugDisplay() {
     uint32_t now = millis();
     if (!gDebugDisplayReady || now - gDebugDrawMs < 1000) return;
@@ -2010,12 +2057,12 @@ static void serviceDebugDisplay() {
     DebugStatus s;
     static const char* states[] = {"IDLE", "ARMING", "ACTIVE", "COOLDOWN", "FINALIZING"};
     s.state = states[gState];
-    s.inView = gDebugGsv.inView(now);
-    if (gps.satellites.isValid() && gps.satellites.age() <= 15000)
-        s.used = (int)gps.satellites.value();
+    s.heard = gDebugGsv.signal(now).heard;
+    s.used = debugSatellitesUsed();
+    if (gDebugRf.valid) s.agcPct = gDebugRf.agcPct;
     s.fixAgeMs = gps.location.isValid() ? gps.location.age() : UINT32_MAX;
     s.fix = gDebugRmcValid && s.fixAgeMs <= 2500;
-    if (gps.hdop.isValid() && gps.hdop.age() <= 2500) s.hdop = gps.hdop.hdop();
+    s.hdop = debugHdop();
     if (s.fix && gps.speed.isValid() && gps.speed.age() <= 2500) s.mph = gps.speed.mph();
     s.trip = gTripPath[0] != 0;
     s.tripMs = now - gTripT0;
@@ -2148,6 +2195,9 @@ void loop() {
         receiveGpsByte((uint8_t)GPSSerial.read());
     }
     serviceGpsConfiguration();
+#if DISPLAY_DEBUG
+    serviceDebugRf();
+#endif
 
     // Fix-loss watchdog: a recording trip with no valid fix at all for
     // FIX_LOSS_END_MS (parked indoors, antenna failure) is finalized so

@@ -457,7 +457,7 @@ The rest of this section was written for the V1.2. On the Supreme
 
   ```text
   ACTIVE 0h12m          trip state, time since boot
-  SATS V:32 U:12        satellites in view / used in the fix
+  SATS R:19 U:12 A31%   satellites heard / used in the fix, GPS AGC
   FIX OK H0.9 0s        fix yes/no, HDOP, seconds since last position
   Speed 42.3 mph
   Trip 12m 008.4mi      current trip: minutes, miles ("Trip --" if none)
@@ -474,10 +474,27 @@ The rest of this section was written for the V1.2. On the Supreme
   - It's switched by `DISPLAY_DEBUG` at the top of the sketch (default `1`).
     Set it to `0` for the old behaviour: screen untouched, no extra GPS
     messages.
-  - Satellites *in view* come from GSV sentences, which the logger otherwise
-    turns off. With the screen on, the GPS sends them every 5th second
-    only, because a full set is about 1 KB and the GPS link runs at just
-    9600 baud (~960 bytes/s).
+  - `R` counts satellites actually **heard**: GSV entries with a positive
+    C/N0 (signal strength), counted once even if several signals name the
+    same satellite. The receiver's predicted "in view" total can stay high
+    indoors with no signal, so it is not used. Each complete GSV group
+    replaces its previous signal group; data expires after 15 s. The GPS
+    sends GSV every 5th second, because a full set is about 1 KB and the
+    link runs at just 9600 baud (~960 bytes/s).
+  - `A` is GPS automatic gain control (AGC), as a percentage of its maximum.
+    Near 100% means the receiver is using full gain; compare it with `R`
+    and the serial RF log to investigate weak or missing signals. Counts
+    stop at 999; the space before `A` is omitted if needed to fit 21 chars.
+  - Every 30 s the serial log prints one `GPS RF:` line: jamming state,
+    CW jamming indicator (0-255), noise per ms, AGC, antenna status/power,
+    heard satellites (including how many reach 30 dBHz and the strongest
+    C/N0), satellites used, HDOP and RMC fix status (`A` valid, `V` invalid).
+    It contains no coordinates. MON-RF polling starts after boot GPS
+    configuration succeeds or gives up; each line reports the preceding
+    poll's reply without waiting for it. A missing/invalid reply shows
+    `rf --`, and unknown or stale NMEA values show `--`. Antenna status
+    and power may read `DONTKNOW` without an antenna supervisor; that
+    alone does not mean the antenna failed.
   - The screen can't stop logging. If it's missing or an I2C write fails,
     the serial log says `WARNING: debug OLED I2C failed` once and the
     screen stays off until the next boot.
@@ -486,6 +503,13 @@ The rest of this section was written for the V1.2. On the Supreme
   - Not yet checked on the board: the screen's supply rail and current
     draw, whether it's readable in daylight, and which GSV talkers the
     MAX-M10S actually sends.
+
+  Bench check for the heard count: after a cold start under open sky, `R`
+  should rise as signals arrive and `U` should rise when the receiver gets
+  a fix. Indoors or with a blocked antenna, `R` should fall as signals
+  disappear, even if the receiver still predicts satellites in view. Check
+  that both show `--` when their input is stale, and record the RF line
+  during a fix loss on the next drive. These checks still need the board.
 - **Expected boot log:**
 
   ```text
