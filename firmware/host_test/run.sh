@@ -25,7 +25,10 @@ else
     exit 2
 fi
 
-flags=(-std=gnu++20 -O1 -w -DDISPLAY_DEBUG=0)
+# Optimizing compilers (including zig c++) may define NDEBUG implicitly.
+# Apply these flags to EVERY build, including the C++14-only tests below.
+assert_flags=(-UNDEBUG -include "$here/assertions_enabled.h")
+flags=("${assert_flags[@]}" -std=gnu++20 -O1 -w -DDISPLAY_DEBUG=0)
 incs=(-I"$here/stubs" -I"$here/../04_trip_logger" -I"$build/include")
 status=0
 
@@ -35,7 +38,7 @@ echo "== test_debug_display (bus fault injection)"
 "$build/test_debug_display.exe" || status=1
 
 echo "== test_diag_catalog"
-"${cxx[@]}" -std=c++14 -Wall -Wextra -pedantic "$here/test_diag_catalog.cpp" -o "$build/test_diag_catalog.exe"
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -pedantic "$here/test_diag_catalog.cpp" -o "$build/test_diag_catalog.exe"
 "$build/test_diag_catalog.exe" || status=1
 
 echo "== test_pmu_startup_event"
@@ -43,7 +46,7 @@ echo "== test_pmu_startup_event"
 "$build/test_pmu_startup_event.exe" || status=1
 
 echo "== test_event_log"
-"${cxx[@]}" -std=c++14 -O1 -UNDEBUG -Wall -Wextra -pedantic -pthread "${incs[@]}" \
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -O1 -Wall -Wextra -pedantic -pthread "${incs[@]}" \
     "$here/test_event_log.cpp" "$here/../04_trip_logger/event_log.cpp" -o "$build/test_event_log.exe"
 "$build/test_event_log.exe" || status=1
 "${PYTHON:-python}" "$here/check_event_log_protocol.py" "$build/test_event_log.exe" || status=1
