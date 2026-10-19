@@ -18,13 +18,13 @@ USER app
 EXPOSE 8090
 
 # --timeout covers reading the upload, not just handling it. gunicorn's
-# default of 30 s killed a full trip partition's file (~2.4 MB) sent at
-# 50 kB/s; 300 s lets that file through down to ~8 kB/s, a weak signal
-# at the edge of the driveway. test_upload_limits.py checks the margin.
+# default of 30 s is too short for large trips on slow links. A full
+# 8 MiB split piece takes ~839 s at 10 kB/s; 900 s leaves a margin for
+# handling it. test_upload_limits.py checks the transfer-time margin.
 CMD ["gunicorn", \
      "--bind", "0.0.0.0:8090", \
      "--workers", "2", \
-     "--timeout", "300", \
+     "--timeout", "900", \
      "--access-logfile", "-", \
      "--error-logfile", "-", \
      "app:app"]

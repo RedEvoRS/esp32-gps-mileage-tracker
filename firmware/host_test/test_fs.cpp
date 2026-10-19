@@ -41,6 +41,7 @@ static void resetWorld() {
     GPSSerial = HardwareSerial(1);
     gGpsConfig = GpsConfig(); gGpsUbxRx = GpsUbxRx();
     gState = IDLE; gTripPath[0] = 0; gTripWriteFailed = false;
+    gTripBytes = 0;
     gPendCount = gPendHead = 0; armBufReset(); gHaveLastFix = false;
     gClockSet = true;
     PMU = XPowersAXP2101(); gPmuIrqFlag = false;
@@ -126,6 +127,14 @@ static bool wellFormedShape(const std::string& d) {
     if (d.rfind("<?xml", 0) != 0) return false;
     if (d.size() < 22 || d.compare(d.size() - 22, 22, "</trkseg></trk></gpx>\n") != 0) return false;
     return count(d, "<trkpt ") == count(d, "</trkpt>");
+}
+
+// XML whitespace grows a real SD trip near the boundary without simulating
+// twenty hours of driving. Keep the byte counter in sync with the file.
+static void padTripTo(size_t bytes) {
+    auto& data = g_sdDisk.files.at(gTripPath);
+    data.append(bytes - data.size(), ' ');
+    gTripBytes = data.size();
 }
 // setup()'s halt loops never return: a delay() hook throws this to stop one.
 struct Halted {};
@@ -1708,6 +1717,101 @@ int main(int argc, char** argv) {
               "failed FAT removal keeps the original and the verified repair");
         fsckAllTrips(SD);
         CHECK(wellFormedShape(g_sdDisk.files.at(path)), "a verified repair publishes on the next retry");
+    }
+
+    printf("T57 split decision reserves closing tags and buffered points\n");
+    {
+        for (size_t pending : {size_t(0), PENDING_CAPACITY}) {
+            size_t reserve = (pending + 1) * (TRKPT_LINE_BYTES - 1) + strlen(GPX_EPILOGUE);
+            CHECK(!tripShouldSplit(TRIP_SPLIT_BYTES - reserve - 1, pending),
+                  "one byte below the reserved boundary can accept another fix");
+            CHECK(tripShouldSplit(TRIP_SPLIT_BYTES - reserve, pending),
+                  "exact boundary splits before the next fix can exceed the cap");
+        }
+    }
+
+    printf("T58 SD split keeps the boundary fix, stats and upload queue\n");
+    {
+        resetWorld(); SD.cardPresent = true; g_sdDisk.capacity = 32 * 1024 * 1024;
+        setup(); drive(15, 40);
+        CHECK(gTripBytes == g_sdDisk.files.at(gTripPath).size(), "counts prologue and arm/active points");
+        std::string first = gTripPath;
+        padTripTo(TRIP_SPLIT_BYTES - (TRKPT_LINE_BYTES - 1) - strlen(GPX_EPILOGUE) - 1);
+        drive(5, 1);
+        std::string second = gTripPath;
+        CHECK(gState == ACTIVE && first != second && g_sdDisk.files.size() == 2 && logHas("Trip split at"),
+              "finalizes and starts a different file in the same fix, with a Serial split line");
+        CHECK(wellFormedShape(g_sdDisk.files.at(first)) && g_sdDisk.files.at(first).size() < TRIP_SPLIT_BYTES,
+              "closed first piece is valid and strictly under 8 MiB");
+        CHECK(times(g_sdDisk.files.at(first)).back() == times(g_sdDisk.files.at(second)).front() &&
+              count(g_sdDisk.files.at(second), "<trkpt ") == 1,
+              "boundary point belongs to both pieces without an arming gap");
+        CHECK(gTripMeters == 0 && gMaxSpeedMps == 5 && gTripT0 == gLastFix.monoMs &&
+              gLastMoveMs == gTripT0 && gPendCount == 0 && gArmCount == 0 &&
+              gTripBytes == g_sdDisk.files.at(second).size(),
+              "new piece starts with fresh distance, speed, time and byte count");
+        drive(5, 1);
+        CHECK(gTripMeters > 4 && gTripMeters < 6 && count(g_sdDisk.files.at(second), "<trkpt ") == 2,
+              "next fix adds one step from the shared boundary point");
+        // Repeat at the same timestamp, as can happen when startup and a
+        // split land within one clock second. Names must still be unique.
+        padTripTo(TRIP_SPLIT_BYTES - (TRKPT_LINE_BYTES - 1) - strlen(GPX_EPILOGUE) - 1);
+        tripFsmOnFix(gLastFix);
+        CHECK(gState == ACTIVE && gTripPath != second && gTripPath != first && g_sdDisk.files.size() == 3,
+              "persistent counter prevents same-second filename collisions");
+        CHECK(uploadPending() && g_httpRequests == 2 && g_sdDisk.files.size() == 1 &&
+              g_sdDisk.files.count(gTripPath), "each closed piece uploads while the new piece stays active");
+    }
+
+    printf("T59 split flushes pre-UTC points and preserves cooldown deadline\n");
+    {
+        resetWorld(); SD.cardPresent = true; g_sdDisk.capacity = 32 * 1024 * 1024;
+        setup(); gClockSet = false; drive(15, 110);
+        std::string first = gTripPath;
+        CHECK(gPendCount == PENDING_CAPACITY, "pending ring is full before split");
+        size_t reserve = (gPendCount + 1) * (TRKPT_LINE_BYTES - 1) + strlen(GPX_EPILOGUE);
+        padTripTo(TRIP_SPLIT_BYTES - reserve - 1);
+        drive(15, 1);
+        CHECK(gState == ACTIVE && first != gTripPath && gPendCount == 1 &&
+              wellFormedShape(g_sdDisk.files.at(first)) && g_sdDisk.files.at(first).size() < TRIP_SPLIT_BYTES &&
+              count(g_sdDisk.files.at(first), "<trkpt ") == 111 && times(g_sdDisk.files.at(first)).empty(),
+              "full pending tail closes under cap without dropping or inventing times");
+        CHECK(gTripBytes == strlen(GPX_PROLOGUE), "new untimed boundary fix is pending, prologue is counted");
+        gClockSet = true; drive(15, 1);
+        CHECK(gPendCount == 0 && gTripBytes == g_sdDisk.files.at(gTripPath).size() &&
+              count(g_sdDisk.files.at(gTripPath), "<trkpt ") == 2,
+              "UTC arrival counts the flushed boundary point and current fix");
+
+        drive(0, 1); uint32_t coolT0 = gCoolT0;
+        drive(0, 100); first = gTripPath;
+        padTripTo(TRIP_SPLIT_BYTES - (TRKPT_LINE_BYTES - 1) - strlen(GPX_EPILOGUE) - 1);
+        drive(0, 1);
+        CHECK(gState == COOLDOWN && first != gTripPath && gCoolT0 == coolT0 &&
+              gTripMeters == 0 && gMaxSpeedMps == 0 && gTripT0 == gLastFix.monoMs,
+              "stationary split keeps the original cooldown deadline and resets per-piece stats");
+        drive(0, 79);
+        CHECK(gState == IDLE && gTripPath[0] == 0,
+              "original three-minute cooldown still ends the trip after a split");
+    }
+
+    printf("T60 failed split startup leaves the old piece safe and stops recording\n");
+    {
+        for (int fault = 0; fault < 3; ++fault) {
+            resetWorld(); SD.cardPresent = true; g_sdDisk.capacity = 32 * 1024 * 1024;
+            setup(); drive(15, 40);
+            std::string first = gTripPath;
+            padTripTo(TRIP_SPLIT_BYTES - (TRKPT_LINE_BYTES - 1) - strlen(GPX_EPILOGUE) - 1);
+            if (fault == 0) g_sdDisk.capacity = g_sdDisk.used() + FS_START_FREE - 1;
+            if (fault == 1) g_sdDisk.failOpenPath = "/trips/t000002.gpx";
+            if (fault == 2) { g_sdDisk.flushesBeforeFail = 2; g_sdDisk.failFlushes = 1; }
+            drive(15, 1);
+            CHECK(gState == IDLE && gTripPath[0] == 0 && gPendCount == 0 && gArmCount == 0 &&
+                  g_sdDisk.files.size() == 1 && wellFormedShape(g_sdDisk.files.at(first)) &&
+                  g_sdDisk.files.at(first).size() < TRIP_SPLIT_BYTES,
+                  "storage full, open failure or prologue failure leaves only a valid queued old piece");
+            CHECK(logHas(fault == 0 ? "trip storage full" : "could not create trip file"),
+                  "split startup failure uses existing error logging");
+        }
     }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
