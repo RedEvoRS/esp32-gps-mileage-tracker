@@ -20,9 +20,9 @@ Supreme on `main`.
 
 **Port in progress:** Stages 1–3 and the trip logger (Stage 4) run on the
 Supreme: pins, rails, PMU power-off and USB wake were bench-checked
-2026-10-18. Stage 4 still stores trips in the internal 2.375 MB LittleFS
-partition until microSD support lands, and the rest of the port (label
-`supreme-port`) is open. Don't assume a Supreme pin, rail or peripheral works
+2026-10-18. Stage 4 stores trips on the microSD card, with the internal
+2.375 MB LittleFS partition as fallback; the SD support is not yet
+bench-tested, and the rest of the port (label `supreme-port`) is open. Don't assume a Supreme pin, rail or peripheral works
 until its port issue is closed and it's verified on the bench.
 
 ## Architecture
@@ -43,7 +43,7 @@ Two-component system:
 ```
 firmware/
   01_hello_world/        Stage 1: toolchain check
-  02_pmu_test/           Stage 2: AXP2101 PMU + GPS power rail
+  02_pmu_test/           Stage 2: AXP2101 PMU, power rails, power-off, SD check
   03_gps_test/           Stage 3: TinyGPSPlus NMEA parsing
   04_trip_logger/        Stage 4: the trip logger, plus its partitions.csv
   host_test/             Host-side tests for Stage 4 (run.sh, stubs/)
@@ -143,9 +143,12 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 - PMU interrupt is GPIO 40, which isn't an RTC GPIO on the ESP32-S3, so it
   can't wake deep sleep. Wake instead: `PMU.shutdown()` powers the board
   off, and the next USB power insert powers it on (not while USB stays in)
-- microSD (from LilyGO's source, not yet bench-checked): FAT32, powered from
-  BLDO1, SPI on GPIO 35/36/37, CS GPIO 47. BLDO1 powers up at 1.8 V: set
-  3.3 V before use
+- microSD (pins from LilyGO's source, not yet bench-checked; Stage 2 `d`
+  checks them): FAT32 only (exFAT unsupported), powered from BLDO1, SPI
+  MOSI 35 / SCK 36 / MISO 37, CS 47, IMU CS 34 held high. BLDO1 powers up
+  ON at 1.8 V: switch it off, set 3.3 V, then enable. Stage 4 picks its
+  trip store once at boot, never formats the card, falls back to LittleFS,
+  uploads from both stores, and unmounts both before `PMU.shutdown()`
 - Build: `esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled`
   (8 MB flash, 8 MB QSPI PSRAM, native USB). Download mode, the factory
   flash backup and its Windows read quirk: `firmware/README.md`
@@ -182,8 +185,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   nonstop driving). It protects the server's memory: the ingest parses the
   whole body at once, peaking at ~9x its size. Issue #110 proposes an 8 MiB
   trip split for the Supreme firmware, half the server cap; this is not
-  implemented yet, and Stage 4 still stores trips in LittleFS. Do not assume
-  runaway trips are split until the port and issue #110 are complete.
+  implemented yet. With trips on microSD there's no partition size to bound
+  one, so do not assume runaway trips are split until issue #110 is done.
   gunicorn `--timeout 300`, because the timeout includes reading the body
   and 30 s dropped big trips on slow links. Early 401/413 replies read and
   discard up to 4x the cap first, so the device sees the status, not a reset.
