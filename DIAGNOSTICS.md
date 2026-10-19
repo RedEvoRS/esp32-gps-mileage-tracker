@@ -36,11 +36,16 @@ numeric measurements and fixed enumerated values in context.
   and paginated history behind the viewer login.
 - **#120:** shipped independent monitor service and optional ntfy fault notifications.
 - **#121:** shipped server-side device-silence detection; heartbeat integration is #125.
-- **#122:** host-testable EventLog, bounded queues, segmented persistence and
-  acknowledgment recovery. Also owns durable identity/revision allocation.
+- **#122:** implemented board-independent EventLog and host fault tests: bounded
+  producer queue, CRC segments, durable acknowledgments/loss accounting and
+  snapshot revision allocator. Boot identity/counter are injected by the caller;
+  there are no runtime journal writes until #124 supplies the adapters/hooks.
 - **#123:** pure DisplayModel and host tests for display policy.
-- **#124:** firmware fault/reset hooks, **after Supreme port #107/#109**.
-- **#125:** diagnostics upload worker, trip priority and independent retries.
+- **#124:** mounted-filesystem adapters, fresh boot identity/NVS boot counter,
+  service calls under FS_LOCK, LittleFS trip reserve, and firmware fault/reset
+  hooks, **after Supreme port #107/#109**.
+- **#125:** diagnostics upload worker, current snapshots, revision enrollment/
+  recovery, complete ack verification, trip priority and independent retries.
 - **#126:** degraded service loop, **after Supreme port #107/#109**. Replaces
   permanent halts on storage/PMU failure with bounded reporting and retries.
 - **#127:** SH1106 hardware adapter on the Supreme, following #123 and the port.
@@ -286,8 +291,12 @@ delayed, previously unseen old boot from clearing a newer boot's faults. Random
 boot IDs, receipt order and the diagnostic boot counter cannot guarantee that.
 
 Persisting the revision once per new check-in has an NVS wear and recovery cost;
-do not write it for every scan or event. #122 must measure the write rate and
-recover the allocator before #125 relies on it. After NVS rollback/failure the
+do not write it for every scan or event. EventLog's allocator uses one durable
+80-byte SD metadata slot write per newly allocated revision, with no allocation
+on scans/events. This is an operation count verified by host tests, not an NVS
+wear measurement. #125 must establish its actual check-in rate and recovery
+policy before relying on it; any future NVS adapter needs its own wear review.
+After allocator rollback/failure the
 device may still upload events and GPX, but snapshots cannot advance until the
 revision exceeds the server high-water mark. Recovery must explicitly restore
 that allocator or re-enroll identity; never silently reset the server high-water
@@ -351,6 +360,158 @@ features. If both storage backends fail, use the bounded RAM queue; it is lost
 on reset, so report that limitation and cumulative known drops. Do not format a
 mount failure or delete unuploaded trips to make diagnostic space. #130 must
 power-cut test frame writes, sealing, acknowledgments and quota reclamation.
+
+### EventLog module (#122 implementation)
+
+`firmware/04_trip_logger/event_log.h` and `.cpp` build as standard C++14 on the
+host and as sketch-folder sources on the ESP32-S3. Stage 4 does not instantiate
+them yet: no new task, producer hook, mount or SD write runs at boot. The
+`EventLogFs` interface is the integration boundary for mounted SD/LittleFS;
+#124 must implement it using durable close/sync and propagate open, read, write,
+close, rename and enumeration errors. Neither the module nor an adapter may
+format media or remove trips. EventLog exclusively owns `/diag` and caches its
+inventory, allocated bytes and validated open-tail sizes. Successful writes,
+renames and removals update that cache; failed/uncertain I/O invalidates it.
+Recovery relists the directory and reloads metadata, then validates open files
+before appending again. Reconstruct EventLog after external changes or replacing/
+remounting media; do not reuse cached state for a different card.
+
+- `begin(boot_id, boot_counter, firmware_version)` accepts caller-owned identity
+  before tasks start. The caller supplies a new random boot ID on every wake;
+  NVS boot-counter persistence belongs to that integration. Event sequences
+  start at 1, are assigned only on acceptance, and stop at SQLite's signed
+  64-bit maximum. They are never regenerated on retry or rollover.
+- `submit(EventInput, optional_identity)` uses a 16-frame fixed RAM queue and
+  one try-lock, with no waits or filesystem calls. It is task-safe, not ISR/
+  panic-safe. Full/contention increments an atomic 32-bit drop accumulator
+  (saturating near 2^31 between service calls); invalid input is rejected.
+  Records validate catalog policy, all current context keys/types/ranges/enums,
+  episode references, time consistency and the complete 502-byte JSON budget.
+  Unknown device codes have empty context. No unbounded text enters a frame.
+- `service(maxRecords=4)` is single-consumer work under the existing FS_LOCK.
+  It tries SD, then LittleFS, retaining the queue in RAM when neither accepts
+  a frame. It drains at most 16 ordinary records per call and attempts at most
+  one coalesced E4009 notice. Storage errors increment a status counter without
+  calling producers or a logging sink. Known drop totals survive in metadata
+  once a backend is writable; RAM-only records/counts are lost on reset.
+- `nextBatch` exports up to 64 unchanged protocol-v1 JSON events and their
+  IDs, oldest segment first on SD, then LittleFS, then RAM. Cross-backend order
+  is not event-time order. The default 30 KiB events-array budget leaves room
+  for #125's current check-in; #125 must still enforce the full 32 KiB request.
+  Re-reads preserve exact JSON, including original timestamps and identity.
+  On the Windows host ABI, `sizeof(EventLog)` is **25,112 bytes** and
+  `sizeof(EventLog::Batch)` is **35,288 bytes**; the host test prints both.
+  ABI/alignment can differ on the ESP32-S3. #124 must place both objects in
+  **static DRAM or PSRAM**, never on a task stack. Only one batch ticket is
+  outstanding; a new read replaces it.
+- `acknowledge(batch, accepted_ids)` requires the exact complete ID set, with
+  no missing, unexpected or duplicate IDs. Persistent data advances only after
+  the new metadata slot is durably written and read back. A failed ack retains
+  retryability; RAM acknowledgments remove only matching queue heads. #125
+  still owns parsing/validating the HTTP acknowledgment and E5010 policy.
+
+For #124, start with `service(1)` on the **core-0 service task**, release FS_LOCK
+between calls and yield to pending GPS trip writes. Do not run journal recovery
+or eviction while the GPS task is waiting on a trip write for long. Measure the
+real adapter's latency before enabling it: operation counts bound work, not time.
+The work under one `service()` lock hold is bounded as follows:
+
+- Let `M = min(maxRecords, 16)`. There are at most `2*M` ordinary append attempts
+  (SD then flash), one loss-notice append attempt, two additional store loads
+  for loss accounting, and up to three bookkeeping metadata saves (two attempts
+  to persist queued drops, one to clear a persisted notice).
+- With valid caches and no roll/reclamation, each append uses **one write**,
+  with no listing or frame reads, independent of segment fill. A normal roll
+  adds one rename and one filename-reservation metadata save. Each save is one
+  80-byte write plus one 80-byte read-back; clearing a loss notice adds a save.
+- Each append's `makeRoom` can remove at most **512 segments**. Acknowledged or
+  already-discarded files need no frame scan or loss save. Each unacknowledged
+  eviction traverses at most **64 KiB** in `lostIn`, saves its loss/discard intent,
+  then removes the file. Thus one append can perform at most 512 eviction scans,
+  512 removals and 513 metadata saves including filename reservation. With a
+  normal full-size journal this is usually one eviction at a quota-driven roll;
+  tiny recovered segments can require more.
+- Each uncached load uses one `begin`, at most **1025 list calls**, and two
+  metadata reads. The next append validates at most **512 open segments**, each
+  at most **64 KiB**, sealing at most 512 files. A failed operation may require
+  this recovery again on a later attempt, even within the same service call.
+  There are at most `2*M+3` loads in a call. Each segment scan advances its offset
+  monotonically: at most 65,536 reads of at most 512 bytes even for pathological
+  one-byte damaged lines (healthy frames need roughly one read per event).
+
+These are conservative recovery limits, not a promise of a short lock hold in
+damaged/full media. #124 must schedule maintenance away from trip writes; small
+`maxRecords` only limits the number of append attempts in a call.
+
+The frame is compact event JSON, TAB, eight lowercase CRC32 hex digits, LF;
+CRC32/IEEE covers JSON only. Flat names have exactly eight decimal digits,
+`/diag/seg-00000001.open` becoming `.ready`. A clean tail can be appended across
+boots. Torn/damaged open files are sealed before further writes, and readers
+skip invalid physical lines and continue into later segments. Scan buffers are
+512 bytes, each segment is at most 64 KiB, inventory is capped at 512 segments
+and 1024 directory entries; exceeding these recovery bounds fails that backend
+closed. No recovery scratch files consume unbudgeted space. Unknown files in
+`/diag` count against quota and are never removed.
+
+Metadata is two alternating 80-byte binary files, `/diag/ack-0` and `ack-1`,
+reserved inside both quotas even before creation. All integers are little
+endian. Offsets: magic `ELG1` at 0; generation (u64) at 8; ack segment/byte
+offset (u32 each) at 16/20; next segment (u32) at 24; snapshot revision (u64)
+at 32; cumulative drops/pending loss notice count (u64 each) at 40/48; explicit
+quota-discard-through segment (u32) at 56; revision-enrolled flag at 60; reserved
+bytes zero; CRC32 over bytes 0-75 at 76. Recovery selects the highest valid
+generation with matching slot parity. A torn newest slot falls back to the
+older generation. If neither validates, no records are considered acknowledged
+and revision allocation is disabled. Filename allocation also scans existing
+segments, persists reservations before creation, and stops after 99999999;
+it never wraps or overwrites another segment.
+
+Normally only sealed, durably acknowledged segments are removed. When quota
+requires unacknowledged eviction, the oldest sealed segment's remaining frames
+are counted and loss/discard intent is durably committed **before** deletion.
+Interrupted deletion can finish after reboot without counting the loss twice.
+Corrupt physical frames crossed by an acknowledged batch are explicitly counted
+as loss in that same metadata update, never treated as successful delivery.
+Unidentifiable damaged frames are conservatively one loss each. A failed E4009
+write does not add losses, and retries within the running boot retain that
+notice's ID. An ambiguous close/metadata failure may retain identical frame
+copies; export coalesces identical IDs within a batch and the server dedupes
+across batches/backends. Reset between notice persistence and clearing its
+pending count can repeat a historical loss report; totals remain cumulative,
+so consumers must not sum notices as a separate authoritative counter.
+
+SD's allocated-file quota is **16 MiB**, superseding the original issue's 8 MiB.
+Every file's size is rounded up to its allocation unit, including unknown files
+and the two metadata slots (each slot is reserved before creation). Configure
+`Config::sdCluster` to the mounted FAT cluster size (default **32 KiB**) and
+`Config::littleFsBlock` to the LittleFS block size (default **4 KiB**); zero is
+rejected. Nonempty files consume at least one unit. LittleFS's **64 KiB includes
+both rounded metadata slots**, leaving at most **56 KiB** for segment allocation
+with the defaults, so its segment rolls early. The limits bound allocated file
+data with the correct units; media exhaustion or I/O errors still trigger
+fallback. The exported `kLittleFsJournalReserve` constant is available, but #124
+must subtract the
+reserve in trip free-space checks when activating diagnostics; today's trip
+behavior is unchanged.
+
+`restoreStatusSequence(highWater)` explicitly enrolls/restores the **SD-only**
+revision authority after comparison with the server's high-water mark.
+`allocateStatusSequence` persists the increment before returning it. It refuses
+uninitialized/corrupt metadata, exhaustion or unavailable SD, even when event
+journaling succeeds on flash/RAM. Never switch revision authorities during
+fallback or silently reset the server mark. One allocation is one 80-byte slot
+write; segment reservations, ack commits and loss bookkeeping also write slots.
+Actual FAT power-cut durability and flash wear still require integration and
+hardware testing.
+
+`firmware/host_test/run.sh` runs fault injection (including torn frames/acks,
+CRC damage, full/read-only media, overflow, retention, failures and exhaustion)
+and a stdlib Python bridge that feeds actual exported C++ events through
+`common.diagnostics.validate_request`, covering every catalog context field,
+integer endpoint and enum value. These tests do not validate an SD/FAT adapter.
+#124 wires producers (including the retained PMU startup helper) and storage;
+#125 wires transport, status snapshots and durable isolation for rejected events;
+#126 wires bounded degraded startup/retry behavior. None runs in Stage 4 yet.
 
 After the Supreme port, #124 wires PMU, charge guard, GPS/config/time, storage,
 trip recovery, networking, display and reset paths to these codes. Thresholds

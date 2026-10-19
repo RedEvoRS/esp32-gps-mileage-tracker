@@ -676,6 +676,18 @@ testing remains necessary to verify the flash driver's behavior.
 > rail with a meter and watch the Serial Monitor through a real trip and
 > upload before relying on it in the car.
 
+### Diagnostic journal module
+
+Stage 4 carries a board-independent `event_log.h` / `event_log.cpp` module with
+a fixed producer queue, CRC-protected rolling segments, durable acknowledgment
+metadata, SD/LittleFS/RAM fallback and host fault tests. It is not instantiated
+by the sketch yet, so it adds no runtime writes or tasks. The mounted-filesystem
+adapters, producer/service hooks, trip-space reserve and upload worker remain
+integration work. See [DIAGNOSTICS.md](../DIAGNOSTICS.md#eventlog-module-122-implementation)
+for the API, on-disk format, quota and recovery rules. Run
+`bash firmware/host_test/run.sh` for fault tests and the exported-event check
+against the server's stdlib protocol validator.
+
 ### Network stack shakedown (issue #6)
 
 This section is for validating the firmware on hardware. You don't need it
