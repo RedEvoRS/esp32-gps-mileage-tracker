@@ -5,8 +5,12 @@ the scanner it tests (CI runs the scanner over the whole repo).
 """
 
 import importlib.util
+import os
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 _spec = importlib.util.spec_from_file_location(
     "check_pii", Path(__file__).with_name("check_pii.py"))
@@ -86,6 +90,183 @@ class Macs(unittest.TestCase):
                               "{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };"), [])
         self.assertEqual(hits("00:00:00:00:00:00"), [])
         self.assertEqual(hits("const uint8_t ubx[] = { 0xB5, 0x62, 0x06, 0x01, 0x08, 0x00 };"), [])
+
+
+DECIMAL = "0.12345"  # Invented point near the equator in the Atlantic.
+NMEA_LAT = "0007.4070"
+NMEA_LON = "00007.4070"
+
+
+def nmea(kind, lat=NMEA_LAT, lon=NMEA_LON, talker="GP", status="A"):
+    fields = {
+        "RMC": ["120000", status, lat, "N", lon, "E", "0", "0", "010100"],
+        "GGA": ["120000", lat, "N", lon, "E", "1", "08", "0.9"],
+        "GLL": [lat, "N", lon, "E", "120000", status],
+    }
+    return "$" + talker + kind + "," + ",".join(fields[kind]) + "*00"
+
+
+class Coordinates(unittest.TestCase):
+    def test_nmea_positions_from_any_talker_are_flagged(self):
+        for kind in ("RMC", "GGA", "GLL"):
+            for talker in ("GP", "GN", "GL", "ZZ"):
+                with self.subTest(kind=kind, talker=talker):
+                    self.assertEqual(hits("serial: " + nmea(kind, talker=talker)),
+                                     ["f:1: NMEA position sentence"])
+
+    def test_nmea_empty_or_missing_position_fields_pass(self):
+        for kind in ("RMC", "GGA", "GLL"):
+            for lat, lon in (("", ""), ("", "00007.4070"), ("0007.4070", "")):
+                with self.subTest(kind=kind, empty_lat=not lat, empty_lon=not lon):
+                    self.assertEqual(hits(nmea(kind, lat=lat, lon=lon, status="V")), [])
+            self.assertEqual(hits("$" + "GP" + kind + ","), [])
+
+    def test_nmea_nonempty_positions_are_checked_even_without_a_valid_fix(self):
+        self.assertTrue(hits(nmea("RMC", status="V")))
+        self.assertTrue(hits(nmea("GLL", status="V")))
+
+    def test_nmea_multiple_sentences_and_other_sentence_types(self):
+        self.assertTrue(hits(nmea("RMC", lat="", lon="") + " " + nmea("GGA")))
+        self.assertEqual(hits("$" + "GPGSV,2,1,08,01,40,100,35*00"), [])
+        self.assertEqual(hits("$" + "GPGSA,A,3,,,,,,,,,,,,,1.5,0.9,1.2*00"), [])
+
+    def test_gpx_numeric_attribute_pairs_are_flagged(self):
+        whole = "0"
+        for attrs in (f'lat="{DECIMAL}" lon="{DECIMAL}"',
+                      f"lon='{DECIMAL}' other='x' lat='{DECIMAL}'",
+                      f'LAT = "{DECIMAL}" LON = "{DECIMAL}"',
+                      f'lat="{whole}" lon="{whole}"'):
+            with self.subTest(style=attrs.split("=", 1)[0]):
+                self.assertEqual(hits("<trkpt " + attrs + "/>"),
+                                 ["f:1: GPX latitude/longitude attributes"])
+
+    def test_escaped_gpx_attributes_in_source_are_flagged(self):
+        attrs = f'lat="{DECIMAL}" lon="{DECIMAL}"'.replace('"', '\\"')
+        self.assertEqual(hits(attrs), ["f:1: GPX latitude/longitude attributes"])
+
+    def test_gpx_single_empty_and_format_attributes_pass(self):
+        for attrs in (f'lat="{DECIMAL}"', f'lon="{DECIMAL}"',
+                      'lat="" lon=""', 'lat="%f" lon="%f"',
+                      'lat="{lat}" lon="{lon}"'):
+            self.assertEqual(hits("<trkpt " + attrs + "/>"), [])
+
+    def test_decimal_pairs_and_labels_are_flagged(self):
+        for text in (DECIMAL + ", -" + DECIMAL,
+                     DECIMAL + " " + DECIMAL,
+                     DECIMAL + "; " + DECIMAL,
+                     "(+" + DECIMAL + ", " + DECIMAL + ")",
+                     "lat " + DECIMAL + " lon -" + DECIMAL,
+                     "latitude=" + DECIMAL + "; longitude=" + DECIMAL,
+                     "LONGITUDE: " + DECIMAL + " LATITUDE: " + DECIMAL,
+                     DECIMAL[1:] + ", " + DECIMAL[1:]):
+            self.assertEqual(hits(text), ["f:1: decimal coordinate pair"])
+
+    def test_decimal_ranges_include_edges_and_reject_outside(self):
+        edge_lat, edge_lon = "90.0000", "180.0000"
+        for sign in ("", "-"):
+            self.assertTrue(hits(sign + edge_lat + ", " + sign + edge_lon))
+        for lat, lon in (("90.0001", DECIMAL), (DECIMAL, "180.0001"),
+                         ("-90.0001", DECIMAL), (DECIMAL, "-180.0001"),
+                         ("90.00000000000000001", DECIMAL),
+                         (DECIMAL, "180.00000000000000001")):
+            self.assertEqual(hits(lat + ", " + lon), [])
+
+    def test_unrelated_numbers_and_coarse_pairs_pass(self):
+        for text in ("HDOP 0.9000", "3.3 V, 5.0 V", "0, -1", "0.123, 0.456",
+                     DECIMAL + ", 0.123", "0.123, " + DECIMAL,
+                     "16.777216 MiB", "16.777216 x 32.123456",
+                     "version 1.2345.6789, 2.3456.7890",
+                     "version v" + DECIMAL + ", " + DECIMAL):
+            self.assertEqual(hits(text), [])
+
+    def test_findings_contain_only_location_and_rule(self):
+        self.assertEqual(hits("heading\n" + DECIMAL + ", " + DECIMAL),
+                         ["f:2: decimal coordinate pair"])
+        self.assertEqual(hits("heading\n" + nmea("GLL")),
+                         ["f:2: NMEA position sentence"])
+
+    def test_fixture_exemptions_apply_only_to_gpx_attributes(self):
+        gpx = f'<trkpt lat="{DECIMAL}" lon="{DECIMAL}"/>'.encode()
+        for path in check_pii.SYNTHETIC_GPX_CONTENT:
+            with self.subTest(path=path):
+                self.assertEqual(list(check_pii.check_blob(path, gpx, [])), [])
+                for text, rule in ((nmea("GGA"), "NMEA position sentence"),
+                                   (DECIMAL + ", " + DECIMAL, "decimal coordinate pair"),
+                                   ("fictionalterm", "personal term from the denylist")):
+                    findings = list(check_pii.check_blob(
+                        path, text.encode(), [check_pii.term_pattern("fictionalterm")]))
+                    self.assertEqual(findings, [f"{path}:1: {rule}"])
+
+    def test_new_gpx_and_other_source_files_are_not_exempt(self):
+        gpx = f'<trkpt lat="{DECIMAL}" lon="{DECIMAL}"/>'.encode()
+        self.assertEqual(list(check_pii.check_blob("docs/log.txt", gpx, [])),
+                         ["docs/log.txt:1: GPX latitude/longitude attributes"])
+        findings = list(check_pii.check_blob("server/tests/new.gpx", gpx, []))
+        self.assertEqual(len(findings), 2)
+        self.assertIn("GPX that isn't a known synthetic fixture", findings[0])
+
+
+class CommitMetadata(unittest.TestCase):
+    def setUp(self):
+        # Keep temporary repos inside the checkout, including on Windows.
+        temp = tempfile.TemporaryDirectory(dir=check_pii.ROOT)
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        root_patch = patch.object(check_pii, "ROOT", self.root)
+        root_patch.start()
+        self.addCleanup(root_patch.stop)
+        self.git("init", "-q")
+        (self.root / "readme.txt").write_text("Synthetic scanner fixture\n", encoding="utf-8")
+        self.git("add", "readme.txt")
+        self.tree = self.git("write-tree").decode().strip()
+
+    def git(self, *args, data=None, env=None):
+        return subprocess.run(["git", *args], cwd=self.root, input=data,
+                              capture_output=True, check=True, env=env).stdout
+
+    def commit(self, author_offset="+0000", committer_offset="+0000", message="Synthetic test"):
+        env = dict(os.environ, GIT_AUTHOR_NAME="Scanner Test", GIT_COMMITTER_NAME="Scanner Test",
+                   GIT_AUTHOR_EMAIL="scanner@users.noreply.github.com",
+                   GIT_COMMITTER_EMAIL="scanner@users.noreply.github.com",
+                   GIT_AUTHOR_DATE="946684800 " + author_offset,
+                   GIT_COMMITTER_DATE="946684800 " + committer_offset)
+        sha = self.git("commit-tree", self.tree, data=message.encode(), env=env).decode().strip()
+        self.git("update-ref", "HEAD", sha)
+        return sha
+
+    def test_utc_author_and_committer_pass(self):
+        sha = self.commit()
+        self.assertEqual(list(check_pii.scan_commits(sha, [])), [])
+
+    def test_non_utc_dates_report_each_role_without_the_offset(self):
+        for role in ("author", "committer"):
+            for offset in ("+0123", "-0042"):
+                with self.subTest(role=role, sign=offset[0]):
+                    sha = self.commit(**{role + "_offset": offset})
+                    self.assertEqual(list(check_pii.scan_commits(sha, [])),
+                                     [f"commit {sha[:12]}: {role} date isn't UTC (commit with TZ=UTC)"])
+
+    def test_both_non_utc_dates_are_reported(self):
+        sha = self.commit(author_offset="+0123", committer_offset="-0042")
+        self.assertEqual(list(check_pii.scan_commits(sha, [])),
+                         [f"commit {sha[:12]}: {role} date isn't UTC (commit with TZ=UTC)"
+                          for role in ("author", "committer")])
+
+    def test_tree_and_history_do_not_check_commit_dates(self):
+        self.commit(author_offset="+0123", committer_offset="-0042")
+        self.assertEqual(list(check_pii.scan_tree([])), [])
+        self.assertEqual(list(check_pii.scan_history([])), [])
+
+    def test_all_coordinate_rules_apply_to_commit_messages_without_fixture_exemptions(self):
+        examples = ((nmea("RMC"), "NMEA position sentence"),
+                    (f'<trkpt lat="{DECIMAL}" lon="{DECIMAL}"/>',
+                     "GPX latitude/longitude attributes"),
+                    (DECIMAL + ", " + DECIMAL, "decimal coordinate pair"))
+        for text, rule in examples:
+            with self.subTest(rule=rule):
+                sha = self.commit(message="Synthetic test\n\nserver/sample.gpx: " + text)
+                self.assertEqual(list(check_pii.scan_commits(sha, [])),
+                                 [f"commit {sha[:12]} message:3: {rule}"])
 
 
 class Denylist(unittest.TestCase):

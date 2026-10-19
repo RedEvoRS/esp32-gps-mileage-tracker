@@ -7,6 +7,7 @@ for strangers to read. This catches the leaks that have actually happened
 here (a Windows profile path, a first name, a personal email in commit
 metadata) and a few that easily could on a GPS project (real trip files,
 photos with location metadata, a router's MAC address).
+It also checks positions in text and new commit dates; commit with TZ=UTC.
 
 Names and other personal terms can't be listed in the repo without leaking
 them, so they come from a denylist that is never committed: the
@@ -17,7 +18,7 @@ Findings print as location + rule, never the matched text, so a CI log
 can't become the leak.
 
     python tools/check_pii.py                  # tracked files
-    python tools/check_pii.py --commits A..B   # plus those commits' emails and messages
+    python tools/check_pii.py --commits A..B   # plus commit emails, messages and UTC dates
     python tools/check_pii.py --history        # plus every file version ever committed
 """
 
@@ -26,6 +27,7 @@ import os
 import re
 import subprocess
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -39,7 +41,26 @@ VENDORED = {
 
 # GPX files that are made up. Real trips start and end at home and live in
 # server/data/ (gitignored), so a new fixture has to be added here on purpose.
-SYNTHETIC_GPX = {"server/sample.gpx"}
+SYNTHETIC_GPX = {
+    "server/sample.gpx",  # Handwritten sample used by the end-to-end upload check.
+}
+
+# Exempt only the GPX attribute rule for these reviewed, made-up fixtures.
+# NMEA, decimal pairs, names, denylisted terms and path checks still apply.
+SYNTHETIC_GPX_CONTENT = SYNTHETIC_GPX | {
+    # Example GPX track in the original firmware design document.
+    "firmware/STAGE4_TECHNICAL_BRIEF.md",
+    # Tiny GPX records exercise filesystem recovery and trip splitting.
+    "firmware/host_test/test_fs.cpp",
+    # Minimal GPX bodies exercise contact/header handling, not road trips.
+    "server/tests/test_ingest_diagnostics.py",
+    # Generated points exercise speed, HDOP and input validation.
+    "server/tests/test_ingest_safety.py",
+    # Two invented trackpoints exercise upload limits and request handling.
+    "server/tests/test_server_hardening.py",
+    # Invented waypoints/trackpoints exercise parsing and viewer exports.
+    "server/tests/test_viewer_records.py",
+}
 
 FORBIDDEN_PATHS = [
     (re.compile(r"(^|/)(secrets\.h|\.env|viewer\.env|backup\.conf|\.pii-denylist)$"),
@@ -67,6 +88,49 @@ EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}")
 MAC = re.compile(r"(?i)\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b")
 # A 6-byte array on a line about a BSSID/MAC, e.g. secrets.h's WIFI_BSSID.
 MAC_ARRAY = re.compile(r"(?i)0x[0-9a-f]{2}(?:\s*,\s*0x[0-9a-f]{2}){5}")
+
+# Position fields after the sentence type: latitude, hemisphere, longitude.
+NMEA = re.compile(r"\$[A-Z]{2}(RMC|GGA|GLL),([^$\r\n\"']*)", re.I)
+NMEA_POSITION_FIELDS = {"RMC": (2, 4), "GGA": (1, 3), "GLL": (0, 2)}
+GPX_POSITION_ATTRIBUTE = re.compile(
+    r"\b(lat|lon)\s*=\s*\\*[\"']\s*"
+    r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*\\*[\"']", re.I
+)
+
+# Both numbers need at least four decimal places. Boundaries exclude pieces
+# of version numbers, identifiers and larger numbers; whole degrees pass.
+COORD_DECIMAL = r"[+-]?(?:\d+\.\d{4,}|\.\d{4,})"
+COORD_LAT = rf"(?P<lat>{COORD_DECIMAL})(?![\w.])"
+COORD_LON = rf"(?P<lon>{COORD_DECIMAL})(?![\w.])"
+DECIMAL_COORDINATES = [
+    re.compile(rf"(?<![\w.+-]){COORD_LAT}(?:\s*[,;]\s*|\s+){COORD_LON}"),
+    re.compile(rf"\blat(?:itude)?\s*[:=]?\s*{COORD_LAT}\s*[,;]?\s*"
+               rf"lon(?:gitude)?\s*[:=]?\s*{COORD_LON}", re.I),
+    re.compile(rf"\blon(?:gitude)?\s*[:=]?\s*{COORD_LON}\s*[,;]?\s*"
+               rf"lat(?:itude)?\s*[:=]?\s*{COORD_LAT}", re.I),
+]
+
+
+def nmea_position(line):
+    for match in NMEA.finditer(line):
+        fields = match[2].split("*", 1)[0].split(",")
+        lat, lon = NMEA_POSITION_FIELDS[match[1].upper()]
+        if len(fields) > lon and fields[lat].strip() and fields[lon].strip():
+            return True
+    return False
+
+
+def decimal_coordinates(line):
+    return any(-90 <= Decimal(m["lat"]) <= 90 and -180 <= Decimal(m["lon"]) <= 180
+               for pattern in DECIMAL_COORDINATES for m in pattern.finditer(line))
+
+
+COORDINATE_RULES = [
+    ("NMEA position sentence", nmea_position),
+    ("GPX latitude/longitude attributes",
+     lambda l: set(GPX_POSITION_ATTRIBUTE.findall(l.lower())) == {"lat", "lon"}),
+    ("decimal coordinate pair", decimal_coordinates),
+]
 
 
 def email_allowed(addr):
@@ -107,10 +171,12 @@ def load_denylist():
     return [term_pattern(t) for t in sorted(terms) if t and not t.startswith("#")]
 
 
-def scan_text(label, text, deny):
+def scan_text(label, text, deny, *, synthetic_gpx=False):
     """Yield 'label:line: rule' for each problem line in text."""
     for n, line in enumerate(text.splitlines(), 1):
-        rules = {name for name, hit in LINE_RULES if hit(line)}
+        rules = {name for name, hit in LINE_RULES + COORDINATE_RULES
+                 if not (synthetic_gpx and name == "GPX latitude/longitude attributes")
+                 and hit(line)}
         if any(p.search(line) for p in deny):
             rules.add("personal term from the denylist")
         for rule in sorted(rules):
@@ -140,7 +206,8 @@ def check_blob(path, data, deny):
         yield f"{path}: image has EXIF metadata (can include GPS); strip it"
     if path in VENDORED or b"\0" in data[:8192]:
         return
-    yield from scan_text(path, data.decode("utf-8", "replace"), deny)
+    yield from scan_text(path, data.decode("utf-8", "replace"), deny,
+                         synthetic_gpx=path in SYNTHETIC_GPX_CONTENT)
 
 
 def git(*args, data=None):
@@ -176,15 +243,19 @@ def scan_history(deny):
 
 
 def scan_commits(rev_range, deny):
-    log = git("log", "--format=%H%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x1e", rev_range)
+    log = git("log", "--format=%H%x00%an%x00%ae%x00%cn%x00%ce%x00%ai%x00%ci%x00%B%x1e",
+              rev_range)
     for rec in log.decode("utf-8", "replace").split("\x1e"):
         if not rec.strip():
             continue
-        sha, an, ae, cn, ce, body = rec.strip("\n").split("\0", 5)
+        sha, an, ae, cn, ce, author_date, committer_date, body = rec.strip("\n").split("\0", 7)
         where = f"commit {sha[:12]}"
         for role, addr in (("author", ae), ("committer", ce)):
             if not email_allowed(addr):
                 yield f"{where}: {role} email isn't a noreply address"
+        for role, date in (("author", author_date), ("committer", committer_date)):
+            if date.rsplit(" ", 1)[-1] != "+0000":
+                yield f"{where}: {role} date isn't UTC (commit with TZ=UTC)"
         yield from scan_text(f"{where} names", f"{an}\n{cn}", deny)
         yield from scan_text(f"{where} message", body, deny)
 
@@ -192,7 +263,7 @@ def scan_commits(rev_range, deny):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--commits", metavar="RANGE",
-                    help="also check these commits' emails and messages, e.g. origin/main..HEAD")
+                    help="also check commit emails, messages and UTC dates, e.g. origin/main..HEAD")
     ap.add_argument("--history", action="store_true",
                     help="also check every file version ever committed")
     args = ap.parse_args(argv)
@@ -212,7 +283,7 @@ def main(argv=None):
         print(f"::warning::{note}" if os.environ.get("GITHUB_ACTIONS") else f"note: {note}")
     if findings:
         print(f"\n{len(findings)} finding(s). Use placeholders like <user>, <host> and "
-              "<username>; commit with your GitHub noreply email.", file=sys.stderr)
+              "<username>; commit with TZ=UTC and your GitHub noreply email.", file=sys.stderr)
         return 1
     print("No personal info found.")
     return 0
