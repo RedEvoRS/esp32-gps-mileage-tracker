@@ -556,26 +556,41 @@ a reboot" in Troubleshooting.
 
 ## Step 10 — Backups
 
-Two things need backing up:
+Back up these files and databases:
 
 - **Trip files** in `~/mileage-tracker/data`, the raw GPX and its summary.
   The GPX cannot be regenerated; a summary can be rebuilt from its GPX.
 - **The annotations database** (business/personal, purpose, destination)
   in the `viewer-db` Docker volume. It's easy to forget, and it's the
   record the IRS cares about. It can't be rebuilt from the trips.
+- **The diagnostics database** at `data/diagnostics/events.db`, containing
+  device events, contact times and current health. It may not exist before the
+  first device check-in.
+- **Optional monitor state** at `/state/monitor.db` in the `monitor-state`
+  volume: alert episodes, queued deliveries, retry state and export cursors.
+  Losing it can replay alerts and exports.
 
-`backup/backup.sh` does both. It runs daily from a systemd timer, keeps
-dated snapshots in `~/mileage-backups`, and copies them to another machine.
+`backup/backup.sh` covers these files and databases. It runs daily from a
+systemd timer, keeps dated snapshots in `~/mileage-backups`, and copies them
+to another machine.
 Tax records need keeping for years, and a backup on the same disk as the
 data won't survive the disk, so the script refuses to run without an
 off-host destination. Each run:
 
-- snapshots the database with SQLite's backup API, which gives a
-  consistent copy while the viewer is running, then checks its integrity.
-  It never copies the live `annotations.db` file, which can catch a write
-  half done.
+- snapshots each database with SQLite's backup API and checks its integrity,
+  even while services are writing. The throwaway viewer container reads both
+  annotations and diagnostics, using its read-only data mount; the monitor's
+  helper reads its own volume. A missing events DB is normal. If no monitor
+  volume exists, or it has no DB yet, that is recorded and skipped without
+  enabling the monitor. Snapshots are taken in sequence, so they do not share
+  one transaction across databases.
 - copies `data/` while holding ingest's upload lock, so it never catches
-  a trip with its GPX written and its summary not.
+  a trip with its GPX written and its summary not. The live
+  `diagnostics/events.db` and its SQLite sidecars are excluded from rsync.
+- stores `annotations.db`, optional `events.db` and optional `monitor.db`
+  beside `data/`, all covered by `SHA256SUMS`. Human-readable `INFO` records
+  annotation/event counts and monitor status. Restore checks report database
+  integrity, event counts and monitor state tables.
 - writes a `SHA256SUMS` manifest. Unchanged files are hard links to the
   previous snapshot, and a run where nothing changed doesn't add a
   snapshot at all, so daily runs cost almost nothing.
@@ -719,10 +734,23 @@ bash ~/mileage-tracker/backup/restore.sh restore latest
 
 `latest` means the newest snapshot on the off-host copy. You can also name
 one (`2026-10-06T103000Z`) or give a path. It runs the same checks as
-`restore.sh check`, asks you to type `RESTORE`, stops both services, saves
-the current database and any trip files it would overwrite to
-`~/mileage-backups/pre-restore-<time>/`, restores, and starts the services
-again. It never deletes trip files that aren't in the snapshot.
+`restore.sh check`, asks you to type `RESTORE`, and stops ingest, viewer and
+any installed monitor. It saves all current databases before replacing any,
+and saves trip files it would overwrite under
+`~/mileage-backups/pre-restore-<time>/`. It restores databases through SQLite's
+backup API with their writers stopped: the ingest helper writes events.db;
+the viewer and monitor helpers write their own databases. It starts the default
+services again and restarts the monitor if it was running. A saved monitor DB
+can create the volume on a replacement server without enabling notifications.
+It never deletes trip files that aren't in the snapshot.
+
+Old snapshots without `events.db` or `monitor.db` still restore trips and
+annotations. The script clearly reports missing DB snapshots and leaves the
+current corresponding databases unchanged. Old live copies of events.db and
+its journal under `data/` are always excluded from restore; they are not safe
+SQLite snapshots. Missing diagnostics or monitor state on a replacement server
+starts fresh when the owning service next creates it. The optional ntfy volume
+(users, tokens and cached messages) is not included; back it up separately.
 
 If your UID isn't 1000, re-run the `chown` from Step 3 afterwards so ingest
 can write to `data/` again.
@@ -977,8 +1005,8 @@ docker compose --profile monitor --profile ntfy stop mileage-monitor ntfy
 
 Keep the named volumes: deleting monitor state loses deduplication and can
 replay alerts; deleting ntfy state loses users, tokens and cached messages.
-Consistent SQLite backup/restore remains #129; the existing trip backup does
-not cover these named volumes.
+Step 10 backs up monitor state with SQLite's backup API and restores it with
+the monitor stopped. The ntfy volume is not included and needs its own backup.
 
 ### 11d — Optional: send diagnostics to your own Graylog
 

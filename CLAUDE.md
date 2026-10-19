@@ -257,6 +257,19 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   failures, 408, 429 and 5xx retry; other HTTP 4xx rejections skip the batch and
   advance its cursors. The condition table and cursor are additive to monitor
   schema v1. Setup and LogQL examples: DEPLOY_DEBIAN Step 11f.
+- Backups: `server/backup/backup.sh` saves trips plus consistent SQLite
+  snapshots of viewer annotations, ingest diagnostics (`events.db`), and optional
+  monitor delivery/export state (`monitor.db`, when its volume exists). Viewer
+  helpers read annotations and diagnostics; the monitor helper reads its volume.
+  Missing diagnostics/monitor databases are normal and recorded in `INFO`.
+  Live events.db and SQLite sidecars are excluded from data rsync; DB snapshots
+  sit beside annotations.db and are covered by `SHA256SUMS`. Each DB is coherent
+  individually, not a shared transaction across services. Restore validates all
+  saved DBs, stops their writers, takes safety snapshots before replacement, and
+  restarts the default services and any previously running monitor. Older backups
+  still restore trips/annotations with a message for missing new DBs, leaving
+  those live DBs unchanged and never replaying an old live diagnostics file.
+  Optional ntfy state needs a separate backup. Runbook: DEPLOY_DEBIAN Step 10.
 - Port binding: `BIND_ADDR` in `.env` sets the host IP published ports bind
   on (unset = all interfaces). UFW does not filter Docker-published ports,
   so the bind address is the LAN-only control (`DEPLOY_DEBIAN.md` Step 7)

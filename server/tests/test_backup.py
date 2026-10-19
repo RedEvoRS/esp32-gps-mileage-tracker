@@ -7,6 +7,7 @@ directory. Needs bash, rsync and GNU coreutils, so it skips on Windows.
 """
 
 import os
+import hashlib
 from pathlib import Path
 import shutil
 import sqlite3
@@ -21,15 +22,46 @@ SERVER = Path(__file__).resolve().parents[1]
 BACKUP = SERVER / "backup"
 
 FAKE_COMPOSE = textwrap.dedent("""\
-    import os, subprocess, sys
+    import json, os, subprocess, sys
     args = sys.argv[1:]
     with open(os.environ["FAKE_COMPOSE_LOG"], "a") as log:
         log.write(" ".join(a for a in args if "\\n" not in a) + "\\n")
+    if args[:2] == ["--profile", "monitor"]:
+        args = args[2:]
+    state = os.environ["FAKE_STATE_DIR"]
+    if args[0] == "config":
+        assert "--no-interpolate" in args and "--no-env-resolution" in args
+        print(json.dumps({"volumes": {"monitor-state": {"name": "test_monitor-state"}}}))
+    elif args[:2] == ["volume", "ls"]:
+        if os.environ.get("FAKE_MONITOR") == "yes":
+            print("test_monitor-state")
+        if os.environ.get("FAKE_VOLUME_ERROR") == "yes":
+            sys.exit(1)
+    elif args[0] == "ps":
+        if os.environ.get("FAKE_MONITOR_RUNNING", "yes") == "yes":
+            print("monitor-container")
+    elif args[0] == "stop":
+        for service in args[1:]:
+            open(state + "/" + service, "w").close()
     if args[0] == "run":
+        service = args[args.index("python") - 1]
         args = args[args.index("python"):]
-        db = os.environ["FAKE_DB_DIR"]
-        args = [a.replace("/db/", db + "/", 1) if a.startswith("/db/") else a
-                for a in args]
+        if len(args) > 4:  # A restore must run only after its writer is stopped.
+            writer = {"annotations": "mileage-viewer", "events": "mileage-ingest",
+                      "monitor": "mileage-monitor"}[args[3]]
+            if writer != "mileage-monitor" or os.environ.get("FAKE_MONITOR") == "yes":
+                assert os.path.exists(state + "/" + writer), writer + " is running"
+        mapped = []
+        for arg in args:
+            for prefix, key in (("/db/", "FAKE_DB_DIR"), ("/data/", "FAKE_DATA_DIR"),
+                                ("/state/", "FAKE_MONITOR_DIR")):
+                if arg.startswith(prefix):
+                    if prefix == "/data/" and len(args) > 4:
+                        assert service == "mileage-ingest", "viewer data mount is read-only"
+                    arg = os.environ[key] + "/" + arg[len(prefix):]
+                    break
+            mapped.append(arg)
+        args = mapped
         sys.exit(subprocess.call([sys.executable] + args[1:]))
     """)
 
@@ -59,9 +91,12 @@ class BackupScripts(unittest.TestCase):
         self.compose_dir = self.tmp / "mileage-tracker"
         self.data = self.compose_dir / "data"
         self.db_dir = self.tmp / "volume"
+        self.monitor_dir = self.tmp / "monitor-volume"
+        self.state_dir = self.tmp / "service-state"
         self.backups = self.tmp / "backups"
         self.remote = self.tmp / "nas"
-        for d in (self.data / "2026-10", self.db_dir, self.remote):
+        for d in (self.data / "2026-10", self.db_dir, self.remote,
+                  self.monitor_dir, self.state_dir):
             d.mkdir(parents=True)
         self.add_trip("2026-10/2026-10-01T15-00-00", "first")
         with sqlite3.connect(self.db_dir / "annotations.db") as conn:
@@ -85,10 +120,43 @@ class BackupScripts(unittest.TestCase):
         self.env = dict(os.environ,
                         MILEAGE_BACKUP_CONF=str(conf),
                         MILEAGE_COMPOSE=f"{sys.executable} {fake}",
+                        MILEAGE_DOCKER=f"{sys.executable} {fake}",
                         FAKE_DB_DIR=str(self.db_dir),
+                        FAKE_DATA_DIR=str(self.data),
+                        FAKE_MONITOR_DIR=str(self.monitor_dir),
+                        FAKE_STATE_DIR=str(self.state_dir),
                         FAKE_COMPOSE_LOG=str(self.compose_log),
                         TMPDIR=str(self.tmp))
         self.env.pop("JOURNAL_STREAM", None)
+
+    def add_events(self):
+        path = self.data / "diagnostics/events.db"
+        path.parent.mkdir(exist_ok=True)
+        with sqlite3.connect(path) as conn:
+            conn.executescript("CREATE TABLE events (sequence INTEGER PRIMARY KEY);"
+                               "INSERT INTO events VALUES (1);")
+        conn.close()
+        return path
+
+    def add_monitor(self):
+        self.env["FAKE_MONITOR"] = "yes"
+        path = self.monitor_dir / "monitor.db"
+        with sqlite3.connect(path) as conn:
+            conn.executescript("CREATE TABLE episodes (id INTEGER);"
+                               "INSERT INTO episodes VALUES (1);"
+                               "CREATE TABLE outbox (ids_json TEXT);"
+                               "CREATE TABLE retry (next_attempt REAL);"
+                               "CREATE TABLE gelf_cursor (rowid INTEGER);"
+                               "INSERT INTO gelf_cursor VALUES (9);")
+        conn.close()
+        return path
+
+    def refresh_manifest(self, snap):
+        files = sorted(p for p in snap.rglob("*")
+                       if p.is_file() and p.name not in ("SHA256SUMS", "INFO"))
+        (snap / "SHA256SUMS").write_text("".join(
+            f"{hashlib.sha256(p.read_bytes()).hexdigest()}  ./{p.relative_to(snap)}\n"
+            for p in files))
 
     def add_trip(self, stem, content):
         for suffix in (".gpx", ".json"):
@@ -99,7 +167,7 @@ class BackupScripts(unittest.TestCase):
     def run_script(self, name, *args, check=True):
         result = subprocess.run(["bash", str(BACKUP / name), *args],
                                 env=self.env, capture_output=True, text=True,
-                                stdin=subprocess.DEVNULL)
+                                stdin=subprocess.DEVNULL, timeout=60)
         if check and result.returncode != 0:
             self.fail(f"{name} {args} exited {result.returncode}:\n{result.stderr}")
         return result
@@ -279,6 +347,153 @@ class BackupScripts(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--yes", result.stderr)
         self.assertNotIn("stop", self.compose_log.read_text())
+
+    def test_events_snapshot_while_writer_has_uncommitted_transaction(self):
+        path = self.add_events()
+        writer = sqlite3.connect(path)
+        self.addCleanup(writer.close)
+        writer.execute("PRAGMA journal_mode=DELETE")
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute("INSERT INTO events VALUES (2)")
+        self.assertTrue(Path(str(path) + "-journal").exists())
+        self.run_script("backup.sh")
+        snap = self.backups / "latest"
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            self.assertFalse((snap / ("data/diagnostics/events.db" + suffix)).exists())
+        with sqlite3.connect(snap / "events.db") as conn:
+            self.assertEqual(conn.execute("PRAGMA integrity_check").fetchall(), [("ok",)])
+            self.assertEqual(conn.execute("SELECT * FROM events").fetchall(), [(1,)])
+        conn.close()
+        self.assertIn("events=1", (snap / "INFO").read_text())
+        self.assertIn("./events.db", (snap / "SHA256SUMS").read_text())
+        self.assertIn("1 events", self.run_script("restore.sh", "check").stderr)
+
+    def test_missing_events_and_uninstalled_monitor_are_normal(self):
+        result = self.run_script("backup.sh")
+        snap = self.backups / "latest"
+        self.assertFalse((snap / "events.db").exists())
+        self.assertFalse((self.data / "diagnostics/events.db").exists())
+        self.assertFalse((snap / "monitor.db").exists())
+        self.assertIn("events=missing", (snap / "INFO").read_text())
+        self.assertIn("monitor=not-installed", (snap / "INFO").read_text())
+        self.assertIn("Monitor is not installed", result.stderr)
+        self.assertNotIn("-T mileage-monitor", self.compose_log.read_text())
+
+    def test_monitor_volume_is_backed_up_even_without_running_service(self):
+        self.add_monitor()
+        self.env["FAKE_MONITOR_RUNNING"] = "no"
+        self.run_script("backup.sh")
+        snap = self.backups / "latest"
+        self.assertIn("monitor=snapshotted", (snap / "INFO").read_text())
+        self.assertIn("./monitor.db", (snap / "SHA256SUMS").read_text())
+        with sqlite3.connect(snap / "monitor.db") as conn:
+            self.assertEqual(conn.execute("SELECT * FROM gelf_cursor").fetchone(), (9,))
+        conn.close()
+        self.assertIn("4 monitor state tables", self.run_script("restore.sh", "check").stderr)
+
+    def test_installed_monitor_without_database_is_normal(self):
+        self.env["FAKE_MONITOR"] = "yes"
+        self.run_script("backup.sh")
+        self.assertFalse((self.backups / "latest/monitor.db").exists())
+        self.assertIn("monitor=missing", (self.backups / "latest/INFO").read_text())
+        self.assertFalse((self.monitor_dir / "monitor.db").exists())
+
+    def test_docker_volume_failure_is_not_treated_as_uninstalled_monitor(self):
+        self.env["FAKE_VOLUME_ERROR"] = "yes"
+        result = self.run_script("backup.sh", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not list Docker volumes", result.stderr)
+        self.assertFalse((self.backups / "last-success").exists())
+
+    def test_restore_new_databases_stops_writers_and_saves_current_state(self):
+        events = self.add_events()
+        monitor = self.add_monitor()
+        self.run_script("backup.sh")
+        for path, table in ((events, "events"), (monitor, "episodes")):
+            with sqlite3.connect(path) as conn:
+                conn.execute(f"INSERT INTO {table} VALUES (2)")
+            conn.close()
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+        [pre] = list(self.backups.glob("pre-restore-*"))
+        for path, table, name in ((events, "events", "events"),
+                                  (monitor, "episodes", "monitor")):
+            with sqlite3.connect(path) as conn:
+                self.assertEqual(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone(), (1,))
+            conn.close()
+            with sqlite3.connect(pre / f"{name}.db") as conn:
+                self.assertEqual(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone(), (2,))
+            conn.close()
+        calls = self.compose_log.read_text().splitlines()
+        self.assertIn("--profile monitor stop mileage-monitor", calls)
+        self.assertEqual(calls[-1], "--profile monitor start mileage-monitor")
+
+    def test_restore_to_replacement_server_creates_database_directories(self):
+        self.add_events()
+        self.add_monitor()
+        self.run_script("backup.sh")
+        shutil.rmtree(self.data / "diagnostics")
+        (self.monitor_dir / "monitor.db").unlink()
+        self.env.pop("FAKE_MONITOR")
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertTrue((self.data / "diagnostics/events.db").exists())
+        self.assertTrue((self.monitor_dir / "monitor.db").exists())
+        self.assertEqual(self.compose_log.read_text().splitlines()[-1], "up -d")
+
+    def test_restore_leaves_previously_stopped_monitor_stopped(self):
+        self.add_monitor()
+        self.env["FAKE_MONITOR_RUNNING"] = "no"
+        self.run_script("backup.sh")
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertNotIn("start mileage-monitor", self.compose_log.read_text())
+
+    def test_restore_old_snapshot_ignores_live_sqlite_copy_in_data(self):
+        events = self.add_events()
+        monitor = self.add_monitor()
+        self.run_script("backup.sh")
+        [name] = self.snapshots(self.remote)
+        snap = self.remote / "snapshots" / name
+        (snap / "events.db").unlink()
+        (snap / "monitor.db").unlink()
+        legacy = snap / "data/diagnostics/events.db"
+        legacy.write_bytes(b"unsafe old live copy")
+        Path(str(legacy) + "-journal").write_bytes(b"unsafe journal")
+        self.refresh_manifest(snap)
+        before = (events.read_bytes(), monitor.read_bytes())
+        result = self.run_script("restore.sh", "restore", name, "--yes")
+        self.assertIn("No events.db in this snapshot", result.stderr)
+        self.assertIn("No monitor.db in this snapshot", result.stderr)
+        self.assertEqual(before, (events.read_bytes(), monitor.read_bytes()))
+        self.assertFalse(Path(str(events) + "-journal").exists())
+
+    def test_corrupt_new_database_rejected_before_stopping_services(self):
+        self.add_events()
+        self.add_monitor()
+        self.run_script("backup.sh")
+        [name] = self.snapshots(self.remote)
+        snap = self.remote / "snapshots" / name
+        for kind in ("events", "monitor"):
+            path = snap / f"{kind}.db"
+            good = path.read_bytes()
+            path.write_bytes(b"not sqlite")
+            self.refresh_manifest(snap)
+            result = self.run_script("restore.sh", "restore", name, "--yes", check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f"{kind} database failed", result.stderr)
+            self.assertNotIn("stop ", self.compose_log.read_text())
+            path.write_bytes(good)
+            self.refresh_manifest(snap)
+
+    def test_safety_snapshot_failure_prevents_restore_and_restarts_services(self):
+        self.add_events()
+        monitor = self.add_monitor()
+        self.run_script("backup.sh")
+        before = (self.db_dir / "annotations.db").read_bytes()
+        monitor.write_bytes(b"broken live monitor database")
+        result = self.run_script("restore.sh", "restore", "latest", "--yes", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(before, (self.db_dir / "annotations.db").read_bytes())
+        self.assertEqual(self.compose_log.read_text().splitlines()[-1],
+                         "--profile monitor start mileage-monitor")
 
 
 if __name__ == "__main__":

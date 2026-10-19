@@ -9,8 +9,8 @@
 #       filing.
 #
 #   restore.sh restore SNAPSHOT [--yes]
-#       Puts a snapshot back. Runs the same checks first, stops both
-#       services, saves the current database and any trip files it would
+#       Puts a snapshot back. Runs the same checks first, stops the database-writing
+#       services, saves the current databases and any trip files it would
 #       replace under BACKUP_DIR/pre-restore-<time>/, restores, and starts
 #       the services again. Trip files that aren't in the snapshot are
 #       left alone; nothing is deleted.
@@ -67,8 +67,18 @@ fetch_and_check() {
     [[ $listed == "$actual" ]] || die "snapshot has files missing from or not in SHA256SUMS"
 
     log "Checking the database"
-    viewer_python "$PY_CHECK_RESTORE" < "$snap/annotations.db" >&2 \
+    viewer_python "$PY_CHECK_RESTORE" annotations < "$snap/annotations.db" >&2 \
         || die "the snapshot's database failed its check"
+
+    local kind
+    for kind in events monitor; do
+        if [[ -f $snap/$kind.db ]]; then
+            viewer_python "$PY_CHECK_RESTORE" "$kind" < "$snap/$kind.db" >&2 \
+                || die "the snapshot's $kind database failed its check"
+        else
+            log "No $kind.db in this snapshot (older backup or database absent); leaving live database unchanged"
+        fi
+    done
 
     local gpx json
     gpx=$(find "$snap/data" -type f -name '*.gpx' | wc -l)
@@ -77,11 +87,18 @@ fetch_and_check() {
     [[ -f $snap/INFO ]] && log "Snapshot INFO: $(tr '\n' ' ' < "$snap/INFO")"
 }
 
+start_services() {
+    compose up -d >&2 || return
+    if [[ ${monitor_running:-no} == yes ]]; then
+        compose --profile monitor start mileage-monitor >&2 || return
+    fi
+}
+
 cleanup() {
     local status=$?
     if [[ ${services_stopped:-no} == yes ]]; then
         log "Restore did not finish; starting the services again"
-        compose up -d >&2 || log "Could not start the services; run: docker compose up -d"
+        start_services || log "Could not start the services; check docker compose and the monitor profile"
     fi
     rm -rf "${scratch:-}"
     exit "$status"
@@ -114,7 +131,7 @@ fi
 
 if [[ $yes != yes ]]; then
     [[ -t 0 ]] || die "not a terminal; pass --yes to restore without asking"
-    printf 'This replaces the live annotations database and restores trip files\nin %s/data. Type RESTORE to continue: ' "$COMPOSE_DIR" >&2
+    printf 'This replaces the live databases present in the snapshot and restores trip files\nin %s/data. Type RESTORE to continue: ' "$COMPOSE_DIR" >&2
     read -r answer
     [[ $answer == RESTORE ]] || die "cancelled"
 fi
@@ -122,33 +139,52 @@ fi
 pre=$BACKUP_DIR/pre-restore-$(date -u +%Y-%m-%dT%H%M%SZ)
 mkdir -p "$pre" "$COMPOSE_DIR/data"
 
+find_monitor_volume
+monitor_running=no
+if [[ $MONITOR_PRESENT == yes ]]; then
+    running=$(compose --profile monitor ps --status running --quiet mileage-monitor) \
+        || die "could not inspect monitor service state"
+    [[ -z $running ]] || monitor_running=yes
+fi
+
 log "Stopping the services"
 services_stopped=yes
 compose stop mileage-ingest mileage-viewer >&2
-
-log "Saving the current database to $pre"
-if viewer_python "$PY_SNAPSHOT" /db/annotations.db > "$pre/annotations.db" 2> "$pre/snapshot.log"; then
-    rm "$pre/snapshot.log"
-else
-    status=$?
-    if [[ $status -eq 3 ]]; then
-        log "No current database to save"
-        rm "$pre/annotations.db" "$pre/snapshot.log"
-    else
-        cat "$pre/snapshot.log" >&2
-        die "could not save the current database, so nothing was restored"
-    fi
+if [[ $MONITOR_PRESENT == yes ]]; then
+    compose --profile monitor stop mileage-monitor >&2
 fi
 
-log "Restoring the database"
-viewer_python "$PY_CHECK_RESTORE" /db/annotations.db < "$scratch/snapshot/annotations.db" >&2
+# Save every current database before replacing any of them. The stopped
+# ingest helper has /data writable; the viewer's /data is read-only.
+log "Saving the current databases to $pre"
+snapshot_db viewer_python /db/annotations.db "$pre/annotations.db" yes
+snapshot_db ingest_python /data/diagnostics/events.db "$pre/events.db" yes
+if [[ $MONITOR_PRESENT == yes ]]; then
+    snapshot_db monitor_python /state/monitor.db "$pre/monitor.db" yes
+fi
+
+log "Restoring the annotations database"
+viewer_python "$PY_CHECK_RESTORE" annotations /db/annotations.db < "$scratch/snapshot/annotations.db" >&2
+if [[ -f $scratch/snapshot/events.db ]]; then
+    log "Restoring the diagnostics database"
+    ingest_python "$PY_CHECK_RESTORE" events /data/diagnostics/events.db < "$scratch/snapshot/events.db" >&2
+fi
+if [[ -f $scratch/snapshot/monitor.db ]]; then
+    # This may create the volume on a replacement server, without starting
+    # the monitor or enabling notifications. Its image supplies UID ownership.
+    log "Restoring the monitor database"
+    monitor_python "$PY_CHECK_RESTORE" monitor /state/monitor.db < "$scratch/snapshot/monitor.db" >&2
+fi
 
 log "Restoring trip files (anything replaced goes to $pre/data)"
+# Old backups may contain the unsafe live diagnostics copy. Never replay it
+# (or its journal) through rsync; only restore the checked SQLite snapshot.
 rsync -a --backup --backup-dir="$pre/data" --itemize-changes \
+    --exclude=/diagnostics/events.db --exclude='/diagnostics/events.db-*' \
     "$scratch/snapshot/data/" "$COMPOSE_DIR/data/" >&2
 
 log "Starting the services again"
-compose up -d >&2
+start_services
 services_stopped=no
 
 log "Restore complete. Check the viewer, then delete $pre once you're happy."

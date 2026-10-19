@@ -55,6 +55,65 @@ viewer_python() {
     compose run --rm --no-deps -T mileage-viewer python -c "$script" "$@"
 }
 
+ingest_python() {
+    local script=$1
+    shift
+    compose run --rm --no-deps -T mileage-ingest python -c "$script" "$@"
+}
+
+monitor_python() {
+    local script=$1
+    shift
+    compose run --rm --no-deps -T mileage-monitor python -c "$script" "$@"
+}
+
+# Resolve the actual Compose volume name (including project-name overrides).
+# Listing volumes must succeed: a Docker error is not an absent monitor.
+# Do not run a monitor helper until its volume exists; `run` would create it.
+find_monitor_volume() {
+    local volume volumes
+    # Leave service credentials uninterpolated and do not read env_file values
+    # into this report: the viewer only needs the generated volume name.
+    volume=$(compose --profile monitor config --format json --no-interpolate --no-env-resolution | viewer_python '
+import json, sys
+name = json.load(sys.stdin)["volumes"]["monitor-state"]["name"]
+if not name or "$" in name:
+    sys.exit("monitor-state volume name must be resolved without service credentials")
+print(name)
+') || die "could not resolve the monitor-state volume"
+    read -r -a DOCKER <<< "${MILEAGE_DOCKER:-docker}"
+    volumes=$("${DOCKER[@]}" volume ls --format '{{.Name}}') \
+        || die "could not list Docker volumes"
+    MONITOR_PRESENT=no
+    if grep -Fxq -- "$volume" <<< "$volumes"; then
+        MONITOR_PRESENT=yes
+    fi
+}
+
+# Sets SNAPSHOT_REPORT to the checked container report, or 'missing'.
+# Missing is only allowed for optional DBs (and pre-restore safety copies).
+snapshot_db() {
+    local runner=$1 path=$2 dest=$3 optional=$4 status expected actual
+    if "$runner" "$PY_SNAPSHOT" "$path" > "$dest" 2> "$dest.log"; then
+        SNAPSHOT_REPORT=$(grep -E '^sha256=' "$dest.log" | tail -n 1 || true)
+        expected=$(sed -E 's/^sha256=([0-9a-f]+) .*/\1/' <<< "$SNAPSHOT_REPORT")
+        actual=$(sha256sum "$dest" | cut -d ' ' -f 1)
+        [[ -n $SNAPSHOT_REPORT && $expected == "$actual" ]] \
+            || die "$path snapshot doesn't match what the container sent"
+        rm "$dest.log"
+    else
+        status=$?
+        cat "$dest.log" >&2
+        if [[ $status -eq 3 && $optional == yes ]]; then
+            rm "$dest" "$dest.log"
+            SNAPSHOT_REPORT=missing
+            log "$path: no database yet; skipped"
+        else
+            die "could not snapshot $path; nothing more was restored or backed up"
+        fi
+    fi
+}
+
 rsync_remote() {
     if [[ -n $RSYNC_SSH ]]; then
         rsync -e "$RSYNC_SSH" "$@"
@@ -82,45 +141,69 @@ require_commands() {
 # confirm nothing was lost on the way out. Exit 3 means no database yet.
 PY_SNAPSHOT=$(cat <<'PY'
 import hashlib, os, sqlite3, sys, tempfile
+from pathlib import Path
 src_path = sys.argv[1]
-if not os.path.exists(src_path):
+try:
+    os.stat(src_path)
+except FileNotFoundError:
     print(f"{src_path} does not exist", file=sys.stderr)
     sys.exit(3)
 fd, tmp = tempfile.mkstemp(suffix=".db")
 os.close(fd)
 try:
-    src = sqlite3.connect(src_path)
+    src = sqlite3.connect(Path(src_path).as_uri() + "?mode=ro", uri=True)
     dst = sqlite3.connect(tmp)
     src.backup(dst)
     src.close()
-    check = dst.execute("PRAGMA integrity_check").fetchone()[0]
-    if check != "ok":
+    check = dst.execute("PRAGMA integrity_check").fetchall()
+    if check != [("ok",)]:
         sys.exit(f"snapshot failed integrity_check: {check}")
     has_table = dst.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='annotations'"
     ).fetchone()
     rows = dst.execute("SELECT COUNT(*) FROM annotations").fetchone()[0] if has_table else 0
+    has_events = dst.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+    ).fetchone()
+    events = dst.execute("SELECT COUNT(*) FROM events").fetchone()[0] if has_events else 0
     dst.close()
     with open(tmp, "rb") as f:
         data = f.read()
     sys.stdout.buffer.write(data)
     sys.stdout.buffer.flush()
     digest = hashlib.sha256(data).hexdigest()
-    print(f"sha256={digest} bytes={len(data)} annotations={rows}", file=sys.stderr)
+    print(f"sha256={digest} bytes={len(data)} annotations={rows} events={events}", file=sys.stderr)
 finally:
     os.unlink(tmp)
 PY
 )
 
 # Read a database from stdin, check it, and report what it holds.
-# With argv[1], also copy it over that path (the live database) using
-# the backup API, then check the result.
+# argv[1] selects annotations/events/monitor. With argv[2], also copy it
+# over that path (the live database) using the backup API, then check it.
 PY_CHECK_RESTORE=$(cat <<'PY'
 import os, sqlite3, sys, tempfile
+from pathlib import Path
+
+kind = sys.argv[1] if len(sys.argv) > 1 else "annotations"
 def describe(conn, label):
-    check = conn.execute("PRAGMA integrity_check").fetchone()[0]
-    if check != "ok":
+    check = conn.execute("PRAGMA integrity_check").fetchall()
+    if check != [("ok",)]:
         sys.exit(f"{label} failed integrity_check: {check}")
+    if kind == "events":
+        rows = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        print(f"{label}: integrity ok, {rows} events")
+        return
+    if kind == "monitor":
+        # Enumerate stored tables, including additive export cursor/retry tables.
+        tables = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        names = {row[0] for row in tables}
+        if not {"episodes", "outbox", "retry"} <= names:
+            sys.exit(f"{label} has no monitor state tables")
+        print(f"{label}: integrity ok, {len(tables)} monitor state tables")
+        return
     has_table = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='annotations'"
     ).fetchone()
@@ -140,8 +223,10 @@ try:
         f.write(data)
     src = sqlite3.connect(tmp)
     describe(src, "snapshot")
-    if len(sys.argv) > 1:
-        dst = sqlite3.connect(sys.argv[1])
+    if len(sys.argv) > 2:
+        path = Path(sys.argv[2])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        dst = sqlite3.connect(path)
         src.backup(dst)
         describe(dst, "restored database")
         dst.close()

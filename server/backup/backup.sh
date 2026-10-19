@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Back up the trip files and the annotations database, and copy the
+# Back up the trip files and the SQLite databases, and copy the
 # backup off this machine. Meant to run daily from mileage-backup@.timer
 # (DEPLOY_DEBIAN.md Step 10), but safe to run by hand at any time.
 #
 # Each run:
 #   1. Snapshots the viewer's annotations DB with SQLite's backup API,
-#      which is consistent while the viewer is running, and checks it.
+#      diagnostics DB and optional monitor state, and checks each copy.
 #   2. Copies ./data while holding the ingest upload lock, so a trip's
 #      .gpx and .json are never caught half-written. Files unchanged
 #      since the last snapshot are hard links, so each snapshot is cheap.
@@ -16,7 +16,7 @@
 #      to confirm it matches byte for byte.
 #
 # Layout under BACKUP_DIR (the same under REMOTE, minus `latest`):
-#   snapshots/2026-10-06T033012Z/{annotations.db,data/,SHA256SUMS,INFO}
+#   snapshots/2026-10-06T033012Z/{annotations.db,events.db?,monitor.db?,data/,SHA256SUMS,INFO}
 #   latest -> snapshots/<newest>
 #   last-success
 #
@@ -48,18 +48,28 @@ mkdir "$work"
 # --- 1. Annotations database -------------------------------------------
 
 log "Snapshotting the annotations database"
-if ! viewer_python "$PY_SNAPSHOT" /db/annotations.db \
-        > "$work/annotations.db" 2> "$work/snapshot.log"; then
-    cat "$work/snapshot.log" >&2
-    die "could not snapshot the annotations database"
+snapshot_db viewer_python /db/annotations.db "$work/annotations.db" no
+annotations=$(sed -E 's/.* annotations=([0-9]+).*/\1/' <<< "$SNAPSHOT_REPORT")
+
+# The viewer already mounts /data read-only. SQLite mode=ro avoids creating
+# a missing diagnostics database and needs no ingest credentials.
+log "Snapshotting the diagnostics database"
+snapshot_db viewer_python /data/diagnostics/events.db "$work/events.db" yes
+events=missing
+if [[ $SNAPSHOT_REPORT != missing ]]; then
+    events=$(sed -E 's/.* events=([0-9]+).*/\1/' <<< "$SNAPSHOT_REPORT")
 fi
-report=$(grep -E '^sha256=' "$work/snapshot.log" | tail -n 1 || true)
-rm "$work/snapshot.log"
-expected=$(sed -E 's/^sha256=([0-9a-f]+) .*/\1/' <<< "$report")
-actual=$(sha256sum "$work/annotations.db" | cut -d ' ' -f 1)
-[[ -n $report && $expected == "$actual" ]] \
-    || die "annotations snapshot doesn't match what the container sent"
-annotations=$(sed -E 's/.* annotations=([0-9]+).*/\1/' <<< "$report")
+
+find_monitor_volume
+monitor=not-installed
+if [[ $MONITOR_PRESENT == yes ]]; then
+    log "Snapshotting the monitor database"
+    snapshot_db monitor_python /state/monitor.db "$work/monitor.db" yes
+    monitor=missing
+    [[ $SNAPSHOT_REPORT == missing ]] || monitor=snapshotted
+else
+    log "Monitor is not installed; skipping monitor.db"
+fi
 
 # --- 2. Trip files -----------------------------------------------------
 
@@ -68,7 +78,8 @@ link=()
 [[ -n $prev && -d $SNAPSHOTS/$prev/data ]] && link=(--link-dest="$SNAPSHOTS/$prev/data")
 # Ingest holds this lock for the whole write of a trip's GPX + JSON.
 flock -w 300 "$COMPOSE_DIR/data/.upload.lock" \
-    rsync -a --exclude=/.upload.lock --exclude='*.tmp' "${link[@]}" \
+    rsync -a --exclude=/.upload.lock --exclude='*.tmp' \
+        --exclude=/diagnostics/events.db --exclude='/diagnostics/events.db-*' "${link[@]}" \
         "$COMPOSE_DIR/data/" "$work/data/"
 trips=$(find "$work/data" -type f -name '*.gpx' | wc -l)
 
@@ -95,10 +106,12 @@ created_utc=$name
 host=$(hostname)
 trips=$trips
 annotations=$annotations
+events=$events
+monitor=$monitor
 EOF
     mv "$work" "$SNAPSHOTS/$name"
     current=$name
-    log "Created snapshot $name ($trips trips, $annotations annotations)"
+    log "Created snapshot $name ($trips trips, $annotations annotations, events=$events, monitor=$monitor)"
 fi
 ln -sfn "snapshots/$current" "$BACKUP_DIR/latest"
 
