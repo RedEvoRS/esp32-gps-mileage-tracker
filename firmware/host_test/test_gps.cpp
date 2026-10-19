@@ -91,6 +91,10 @@ static void run(float mps, int seconds, bool fix = true, bool ggaFirst = false) 
 
 static void resetWorld() {
     g_disk = FakeDisk();
+    g_sdDisk = FakeDisk(); g_sdDisk.mounted = false; g_sdDisk.renameOverwrites = false;
+    SD.dirs.clear(); SD.cardPresent = false; SD.begins = SD.ends = 0;
+    gTripFS = &LittleFS; gSdMounted = false; gFlashMounted = true;
+    g_powerEvents.clear();
     LittleFS.dirs.clear();
     LittleFS.mkdir(TRIP_DIR);
     prefs.kv.clear();

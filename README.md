@@ -24,9 +24,9 @@ The hardware target has changed from the T-Beam V1.2 to the T-Beam Supreme
 with MAX-M10S GPS and the SanDisk microSD card above. As of 2026-10-18 the
 firmware runs on the Supreme: the bring-up sketches and the trip logger use
 its pins and power rails, and the logger switches the board off when the car
-is parked and back on when the car starts (bench-tested). Two things are
-still missing. Trips are stored in the board's internal flash (about 6 hours
-of driving between uploads) until microSD support lands. And the
+is parked and back on when the car starts (bench-tested). Trips go to the
+microSD card, with the board's internal flash (about 6 hours of driving) as
+a fallback; that card support is written but not yet bench-tested. The
 step-by-step flashing guide below still describes the retired V1.2; for the
 Supreme, use [T-Beam Supreme bring-up](firmware/README.md#t-beam-supreme-bring-up).
 Project progress is tracked in GitHub issues.
@@ -51,8 +51,8 @@ POST /upload (GPX) --> mileage-ingest --> GPX + JSON summary
                          read-only viewer and exports
 ```
 
-This is the Supreme data path. Until microSD support lands, the logger stores
-trips in the board's internal flash instead of on the card.
+This is the Supreme data path. If no card mounts at boot, the logger stores
+trips in the board's internal flash instead, and uploads them from there.
 
 The trip rules are the same on both boards. The logger decides on its own
 when a trip starts and stops. Going faster than 5 mph for 10 seconds starts one; staying under
@@ -60,10 +60,10 @@ when a trip starts and stops. Going faster than 5 mph for 10 seconds starts one;
 chop one drive into six. Anything shorter than 30 seconds or about a tenth
 of a mile gets thrown away.
 
-The firmware writes each GPS point to LittleFS on the board's flash and
-closes the file right after to limit data loss if power is cut. Moving the
-GPX files to the microSD card, with its write, recovery and power-loss
-behavior, still needs to be implemented and validated.
+The firmware writes each GPS point to the microSD card (or the internal
+flash fallback) and closes the file right after to limit data loss if
+power is cut. The card's behavior when power is cut still needs testing on
+the bench.
 
 The firmware runs from the car's USB port, with an 18650 battery as backup.
 When the car's port goes dead, it closes out the trip and keeps running on
@@ -389,10 +389,10 @@ gpx.studio, Google Earth, QGIS, or pretty much any other map tool. Next to
 each one the server writes a small JSON summary so the viewer doesn't have
 to re-read every track to list them. Trimmed down, one looks like this:
 
-On the target Supreme, the firmware port is intended to keep the GPX files
-on the SanDisk 32 GB Max Endurance microSD card. The current V1.2 firmware
-uses LittleFS on internal flash instead; that legacy storage layout and its
-capacity limits do not describe the Supreme target.
+On the Supreme, the firmware keeps the GPX files on the SanDisk 32 GB Max
+Endurance microSD card (FAT32), and falls back to LittleFS on internal flash
+when no card mounts. The files stay there until the server accepts them;
+see [microSD card](firmware/README.md#microsd-card).
 
 ```json
 {

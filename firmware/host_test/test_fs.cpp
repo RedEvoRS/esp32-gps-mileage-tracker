@@ -29,6 +29,10 @@ static double gLat = 37.0, gLon = -122.0;
 
 static void resetWorld() {
     g_disk = FakeDisk();
+    g_sdDisk = FakeDisk(); g_sdDisk.mounted = false; g_sdDisk.renameOverwrites = false;
+    SD.dirs.clear(); SD.cardPresent = false; SD.begins = SD.ends = 0;
+    gTripFS = &LittleFS; gSdMounted = false; gFlashMounted = true;
+    g_powerEvents.clear();
     g_partition = PartitionStub();
     LittleFS.dirs.clear();
     LittleFS.mkdir(TRIP_DIR);
@@ -43,6 +47,7 @@ static void resetWorld() {
     Wire = TwoWire(); Wire1 = TwoWire(); g_pinModes.clear(); g_pinLevels.clear();
     gVbusLost = false; gVbusOffPending = false;
     g_httpCode = 200; g_httpRequests = 0; g_httpLastBody.clear(); g_httpHook = nullptr;
+    g_httpBodies.clear();
     gChargePaused = false; gChargeApplied = false; gChargeCheckT0 = 0;
     gNetBusy = false; gNetHold = false; gNetAbort = false;
     gNetLastAttemptMs = 0; gNetRetryMs = 0; gNetRetryNow = false; WiFi = WiFiStub();
@@ -237,12 +242,12 @@ int main(int argc, char** argv) {
         const std::string& d = g_disk.files[v[0]];
         CHECK(v.size() == 1 && d.find("</gpx>") == std::string::npos, "left incomplete (no room to repair)");
         CHECK(count(d, "<trkpt ") > count(d, "</trkpt>"), "a partial point sits at the tail (as on real flash)");
-        CHECK(!isComplete(v[0].c_str()), "incomplete file is not offered for upload");
+        CHECK(!isComplete(LittleFS, v[0].c_str()), "incomplete file is not offered for upload");
         CHECK(logHas("left for boot-time repair"), "logged loudly");
         drive(15, 20);
         CHECK(tripFiles().size() == 1 && gTripPath[0] == 0, "no new trip while full, nothing left behind");
         g_disk.capacity = 1 << 22;                // uploads freed space
-        fsckAllTrips();
+        fsckAllTrips(LittleFS);
         CHECK(wellFormedShape(g_disk.files[v[0]]), "boot fsck repairs it once there is room");
         dump("T5");
     }
@@ -284,7 +289,7 @@ int main(int argc, char** argv) {
         std::string partial = std::string(GPX_PROLOGUE) + "<trkpt lat=\"1\" lon=\"2\"></trkpt>\n<trkpt lat=";
         g_disk.files["/trips/t000009.gpx"] = partial;
         g_disk.failFlushes = 1;
-        CHECK(!repairIfNeeded("/trips/t000009.gpx"), "reports failure");
+        CHECK(!repairIfNeeded(LittleFS, "/trips/t000009.gpx"), "reports failure");
         CHECK(g_disk.files["/trips/t000009.gpx"] == partial, "original untouched");
         CHECK(!g_disk.files.count("/trips/t000009.gpx.fix"), "bad copy removed");
     }
@@ -301,7 +306,7 @@ int main(int argc, char** argv) {
         CHECK(logHas("storage nearly full"), "logged loudly");
         CHECK(!logHas("failed"), "no write ever failed");
         CHECK(v.size() == 1 && wellFormedShape(g_disk.files[v[0]]), "file complete");
-        CHECK(v.size() == 1 && isComplete(v[0].c_str()), "offered for upload");
+        CHECK(v.size() == 1 && isComplete(LittleFS, v[0].c_str()), "offered for upload");
         CHECK(g_disk.capacity - g_disk.used() >= 20 * 1024, "stopped with the reserve intact");
         dump("T10");
     }
@@ -392,7 +397,7 @@ int main(int argc, char** argv) {
         CHECK(!hasPending(), "nothing left to upload");
         uploadPending();
         CHECK(g_httpRequests == before, "never resent");
-        fsckAllTrips();
+        fsckAllTrips(LittleFS);
         CHECK(g_disk.files[path + ".bad"] == content, "fsck leaves it alone");
 
         drive(15, 40); drive(0, 200);              // next trip: 413
@@ -471,13 +476,13 @@ int main(int argc, char** argv) {
             "<trkpt lat=\"1\" lon=\"2\"></trkpt>\n<trkpt lat=";
         g_disk.files[path] = partial;
         g_disk.failRenames = 1;
-        CHECK(!repairIfNeeded(path.c_str()), "rename failure is reported");
+        CHECK(!repairIfNeeded(LittleFS, path.c_str()), "rename failure is reported");
         CHECK(g_disk.files.count(path) && g_disk.files[path] == partial,
               "original survives failed replacement byte for byte");
         CHECK(g_disk.removeCount == 0, "no delete-before-rename power-loss window");
         CHECK(g_disk.files.count(path + ".fix"), "complete repair copy also retained");
-        CHECK(!isComplete(path.c_str()), "partial original cannot upload");
-        fsckAllTrips();
+        CHECK(!isComplete(LittleFS, path.c_str()), "partial original cannot upload");
+        fsckAllTrips(LittleFS);
         CHECK(g_disk.files.count(path) && wellFormedShape(g_disk.files[path]),
               "next boot repairs and publishes the queued trip");
         CHECK(!g_disk.files.count(path + ".fix"), "successful rename consumes temporary copy");
@@ -605,7 +610,7 @@ int main(int argc, char** argv) {
         g_disk.files["/trips/c.gpx"] = partial;
         g_disk.files["/trips/d.gpx"] = partial;
         g_disk.files["/trips/e.gpx.bad"] = "quarantined evidence";
-        fsckAllTrips();
+        fsckAllTrips(LittleFS);
         CHECK(!g_disk.files.count("/trips/a.gpx"), "garbage entry removed");
         for (const char* path : {"/trips/b.gpx", "/trips/c.gpx", "/trips/d.gpx"})
             CHECK(wellFormedShape(g_disk.files[path]), "every snapshotted trip repaired");
@@ -637,24 +642,24 @@ int main(int argc, char** argv) {
             resetWorld();
             g_disk.files[path] = complete;
             g_disk.files[path + ".fix"] = stale;
-            fsckAllTrips();
+            fsckAllTrips(LittleFS);
             CHECK(g_disk.files[path] == complete, "complete original kept byte for byte");
             CHECK(!g_disk.files.count(path + ".fix"), "redundant repair bytes reclaimed");
             int removes = g_disk.removeCount;
-            fsckAllTrips();
+            fsckAllTrips(LittleFS);
             CHECK(g_disk.removeCount == removes, "second boot makes no further changes");
         }
         resetWorld();
         g_disk.files[path] = points + "\n<trkpt lat=";
         g_disk.files[path + ".fix"] = complete;
         g_disk.capacity = g_disk.used();
-        fsckAllTrips();
+        fsckAllTrips(LittleFS);
         CHECK(g_disk.files[path] == complete && !g_disk.files.count(path + ".fix"),
               "verified finished repair publishes without extra free space");
         resetWorld();
         g_disk.files[path] = points + "\n<trkpt lat=";
         g_disk.files[path + ".fix"] = points + "\n</trkseg>";
-        fsckAllTrips();
+        fsckAllTrips(LittleFS);
         CHECK(g_disk.files[path] == complete && !g_disk.files.count(path + ".fix"),
               "interrupted repair epilogue is safely regenerated");
         resetWorld();
@@ -662,10 +667,10 @@ int main(int argc, char** argv) {
         g_disk.files[path] = partial;
         g_disk.files[path + ".fix"] = complete;
         g_disk.failRenames = 1;
-        fsckAllTrips();
+        fsckAllTrips(LittleFS);
         CHECK(g_disk.files[path] == partial && g_disk.files[path + ".fix"] == complete,
               "failed publish of existing repair leaves both copies intact");
-        fsckAllTrips();
+        fsckAllTrips(LittleFS);
         CHECK(g_disk.files[path] == complete && !g_disk.files.count(path + ".fix"),
               "existing repair rename retries on next boot");
     }
@@ -679,26 +684,26 @@ int main(int argc, char** argv) {
         for (const std::string& orphan : {complete, points + "\n<trkpt lat="}) {
             resetWorld();
             g_disk.files[path + ".fix"] = orphan;
-            fsckAllTrips();
+            fsckAllTrips(LittleFS);
             CHECK(g_disk.files[path] == complete && !g_disk.files.count(path + ".fix"),
                   "complete points from orphan become a queued GPX");
-            fsckAllTrips();
+            fsckAllTrips(LittleFS);
             CHECK(g_disk.files[path] == complete, "recovered trip survives repeated boot");
         }
         for (const std::string& unknown : {std::string("unrecognized evidence"), std::string(GPX_PROLOGUE)}) {
             resetWorld();
             g_disk.files[path + ".fix"] = unknown;
-            fsckAllTrips();
+            fsckAllTrips(LittleFS);
             CHECK(g_disk.files[path + ".fix"] == unknown && !g_disk.files.count(path),
                   "unrecoverable sole copy retained without publishing");
         }
         resetWorld();
         g_disk.files[path + ".fix"] = complete;
         g_disk.failRenames = 1;
-        fsckAllTrips();
+        fsckAllTrips(LittleFS);
         CHECK(g_disk.files[path + ".fix"] == complete && !g_disk.files.count(path),
               "failed orphan rename preserves sole copy");
-        fsckAllTrips();
+        fsckAllTrips(LittleFS);
         CHECK(g_disk.files[path] == complete, "orphan rename retried next boot");
 
         for (bool full : {false, true}) {
@@ -707,11 +712,11 @@ int main(int argc, char** argv) {
             g_disk.files[path + ".fix"] = partial;
             if (full) g_disk.capacity = g_disk.used();
             else g_disk.failFlushes = 2;
-            fsckAllTrips();
+            fsckAllTrips(LittleFS);
             CHECK(g_disk.files[path] == partial, "failed orphan repair preserves renamed original");
-            CHECK(!isComplete(path.c_str()), "failed repair is not uploaded");
+            CHECK(!isComplete(LittleFS, path.c_str()), "failed repair is not uploaded");
             g_disk.capacity = 1 << 22;
-            fsckAllTrips();
+            fsckAllTrips(LittleFS);
             CHECK(g_disk.files[path] == complete, "repair retries after storage recovers");
         }
     }
@@ -726,14 +731,14 @@ int main(int argc, char** argv) {
         resetWorld();
         g_disk.files[path] = partial;
         g_disk.files[path + ".fix"] = other;
-        fsckAllTrips();
+        fsckAllTrips(LittleFS);
         CHECK(g_disk.files[path] == partial && g_disk.files[path + ".fix"] == other,
               "unequal original and repair copy both retained");
         CHECK(g_disk.flushCount == 0 && g_disk.removeCount == 0, "ambiguous copy is never truncated");
         resetWorld();
         g_disk.files[path + ".bad"] = "quarantined evidence";
         g_disk.files[path + ".fix"] = other;
-        fsckAllTrips();
+        fsckAllTrips(LittleFS);
         CHECK(g_disk.files[path + ".fix"] == other && !g_disk.files.count(path),
               "quarantined trip name is not republished");
         for (int fault = 0; fault < 5; ++fault) {
@@ -746,11 +751,11 @@ int main(int argc, char** argv) {
             if (fault == 2) g_disk.failReadPath = path;
             if (fault == 3) g_disk.failReadPath = path + ".fix";
             if (fault == 4) g_disk.failRemoves = 1;
-            fsckAllTrips();
+            fsckAllTrips(LittleFS);
             CHECK(g_disk.files[path] == partial && g_disk.files[path + ".fix"] == stale,
                   "open/read/cleanup failure leaves original and temporary unchanged");
             g_disk.failOpenPath.clear(); g_disk.failReadPath.clear();
-            fsckAllTrips();
+            fsckAllTrips(LittleFS);
             CHECK(wellFormedShape(g_disk.files[path]) && !g_disk.files.count(path + ".fix"),
                   "next boot completes after IO failure clears");
         }
@@ -769,20 +774,20 @@ int main(int argc, char** argv) {
         g_disk.files[path + ".fix"] = shorter;
         g_disk.failReadPath = path;
         g_disk.failReadAfter = 512;
-        fsckAllTrips();
+        fsckAllTrips(LittleFS);
         CHECK(g_disk.files[path] == partial && g_disk.files[path + ".fix"] == shorter,
               "read failure after first point cannot publish shorter repair");
         resetWorld();
         g_disk.files[path + ".fix"] = partial;
         g_disk.failReadPath = path + ".fix";
         g_disk.failReadAfter = 512;
-        fsckAllTrips();
+        fsckAllTrips(LittleFS);
         CHECK(g_disk.files[path + ".fix"] == partial && !g_disk.files.count(path),
               "partially unreadable orphan stays intact and unpublished");
         resetWorld();
         g_disk.files[path] = partial;
         g_disk.failReadPath = path;
-        fsckAllTrips();
+        fsckAllTrips(LittleFS);
         CHECK(g_disk.files[path] == partial && g_disk.removeCount == 0,
               "unreadable original is not classified as garbage");
     }
@@ -916,7 +921,7 @@ int main(int argc, char** argv) {
             endTrip(false);                          // car off, still no UTC
             auto v = tripFiles();
             std::string d = v.size() == 1 ? g_disk.files[v[0]] : "";
-            CHECK(v.size() == 1 && isComplete(v[0].c_str()), "trip kept, complete");
+            CHECK(v.size() == 1 && isComplete(LittleFS, v[0].c_str()), "trip kept, complete");
             CHECK(count(d, "<trkpt ") == 40, "every point kept");
             CHECK(times(d).empty(), base ? "carried-over date not written as UTC"
                                          : "1970 not written as UTC");
@@ -1089,7 +1094,7 @@ int main(int argc, char** argv) {
             const std::string complete = g_disk.files.begin()->second;
             g_disk.files.clear();
             g_disk.files["/trips/t000038.gpx.fix"] = complete;  // orphan boot repair
-            fsckAllTrips();
+            fsckAllTrips(LittleFS);
             CHECK(g_disk.files.count("/trips/t000038.gpx") == 1 &&
                   !g_disk.files.count("/trips/t000038.gpx.fix"), "fsck resolves the actual trip path");
             strcpy(gTripPath, "/trips/t000038.gpx");
@@ -1169,7 +1174,7 @@ int main(int argc, char** argv) {
                 g_disk.files[path] = i < 16 ? incomplete : complete;
             }
             g_disk.capacity = g_disk.used();
-            fsckAllTrips();
+            fsckAllTrips(LittleFS);
             CHECK(tripFiles().size() == 36 && g_disk.used() == g_disk.capacity,
                   "full flash cannot repair the 16 incomplete originals");
             CHECK(uploadPending() && g_httpRequests == 16,
@@ -1340,7 +1345,7 @@ int main(int argc, char** argv) {
                 char path[40]; snprintf(path, sizeof(path), "/trips/t%06d.gpx", i);
                 g_disk.files[path] = incomplete;
             }
-            g_disk.capacity = g_disk.used(); fsckAllTrips();
+            g_disk.capacity = g_disk.used(); fsckAllTrips(LittleFS);
             auto originals = g_disk.files;
             WiFi.scanSsids = {WIFI_SSID}; WiFi.connectionStatus = WL_CONNECTED;
             for (int i = 0; i < 3; ++i) { netCycle(); g_millis += NET_RETRY_MAX_MS; }
@@ -1525,6 +1530,184 @@ int main(int argc, char** argv) {
         char nextPath[48]; makeTripPath(nextPath, sizeof(nextPath));
         CHECK(!g_disk.files.count(nextPath) && prefs.kv["tripno"] == savedPrefs.at("tripno") + 1,
               "Preferences retains the counter and the next trip cannot overwrite the previous one");
+    }
+
+    printf("T51 SD boot selects the card, with a separate flash backlog (#109)\n");
+    {
+        resetWorld(); SD.cardPresent = true;
+        g_sdDisk.capacity = 32ULL * 1024 * 1024 * 1024;
+        g_sdDisk.onMount = [] {
+            CHECK(PMU.bldo1 && PMU.bldo1Mv == 3300 && g_pinLevels[34] == HIGH,
+                  "SD mount sees BLDO1 enabled at 3.3 V and the IMU deselected");
+        };
+        g_delayHook = [](uint32_t ms) {
+            if (ms == SD_SETTLE_MS)
+                CHECK(PMU.bldo1 && PMU.bldo1Mv == 3300 && SD.begins == 0,
+                      "card supply settles before the first mount");
+        };
+        setup(); g_delayHook = nullptr; g_sdDisk.onMount = nullptr;
+        CHECK(gTripFS == &SD && gSdMounted && gFlashMounted && PMU.bldo1 && !PMU.aldo3,
+              "SD is selected for recording and flash remains mounted for draining");
+        CHECK(SD.spi == &gSdSpi && gSdSpi.host == HSPI && gSdSpi.sck == 36 &&
+              gSdSpi.mosi == 35 && gSdSpi.miso == 37 && SD.cs == 47 && SD.hz == 4000000,
+              "dedicated HSPI uses LilyGO pins at 4 MHz");
+        auto voltage = std::find(g_powerEvents.begin(), g_powerEvents.end(), "BLDO1.voltage");
+        auto enabled = std::find(g_powerEvents.begin(), g_powerEvents.end(), "BLDO1.on");
+        auto mounted = std::find(g_powerEvents.begin(), g_powerEvents.end(), "SD.begin");
+        CHECK(voltage < enabled && enabled < mounted && g_powerEvents.front() == "BLDO1.off",
+              "early rail off precedes voltage programming, enabling and mounting");
+        CHECK(!g_sdDisk.formatRequested && !g_sdDisk.formatAttempts && logHas("Trip storage: microSD"),
+              "boot identifies SD and never asks to format it");
+        CHECK(fsFreeBytes() == 32ULL * 1024 * 1024 * 1024,
+              "SD free space remains 64 bit above 4 GiB");
+        drive(15, 40); endTrip(false);
+        CHECK(g_disk.files.empty() && g_sdDisk.files.size() == 1 &&
+              wellFormedShape(g_sdDisk.files.begin()->second) && g_sdDisk.openHandles == 0,
+              "a complete trip is written only to SD and every batch handle closes");
+        g_disk.capacity = 0;
+        CHECK(roomForNewTrip(g_millis), "full flash cannot stop recording to an SD card with space");
+        g_sdDisk.capacity = g_sdDisk.used() + FS_START_FREE - 1;
+        CHECK(!roomForNewTrip(g_millis), "SD free-space guard uses the card, not flash");
+    }
+
+    printf("T52 missing, unmountable or unpowered SD falls back without erasing (#109)\n");
+    {
+        for (int fault = 0; fault < 5; ++fault) {
+            resetWorld(); SD.cardPresent = fault != 0;
+            g_sdDisk.failMount = fault == 1;
+            PMU.failSdVoltage = fault == 2; PMU.failSdEnable = fault == 3;
+            PMU.failSdDisable = fault == 4;
+            g_sdDisk.files["/keep.txt"] = "card evidence";
+            setup();
+            CHECK(gTripFS == &LittleFS && !gSdMounted && gFlashMounted &&
+                  logHas("microSD unavailable -- using internal flash"),
+                  "missing/mount/power failure logs the internal-flash fallback");
+            CHECK(!g_sdDisk.mounted && !g_sdDisk.formatRequested && !g_sdDisk.formatAttempts &&
+                  g_sdDisk.files.at("/keep.txt") == "card evidence",
+                  "fallback preserves the card and never formats it");
+            if (fault != 4) CHECK(!PMU.bldo1, "unused card supply is off after fallback");
+            if (fault >= 2) CHECK(SD.begins == 0, "power setup failure prevents any mount attempt");
+            drive(15, 40); endTrip(false);
+            CHECK(g_disk.files.size() == 1 && wellFormedShape(g_disk.files.begin()->second),
+                  "fallback still records a complete trip to flash");
+        }
+        resetWorld(); SD.cardPresent = true; g_disk.failMount = true;
+        g_disk.files["/trips/keep.gpx"] = "flash evidence";
+        setup();
+        CHECK(gTripFS == &SD && gSdMounted && !gFlashMounted && logHas("Setup complete") &&
+              logHas("unavailable -- preserved for recovery") && g_disk.formatAttempts == 0,
+              "damaged optional flash is preserved while usable SD keeps recording");
+    }
+
+    printf("T53 both queues drain with filesystem identity, even for matching names (#109)\n");
+    {
+        resetWorld(); SD.cardPresent = true; setup();
+        drive(15, 40);
+        std::string active = gTripPath;
+        const std::string flashTrip = std::string(GPX_PROLOGUE) +
+            "<trkpt lat=\"1\" lon=\"2\"></trkpt>\n" + GPX_EPILOGUE;
+        g_disk.files[active] = flashTrip;
+        CHECK(hasPending(), "flash backlog is pending even when its name matches the active SD trip");
+        CHECK(uploadPending() && g_httpRequests == 1 && g_disk.files.empty() &&
+              g_sdDisk.files.count(active) && gState == ACTIVE,
+              "drains matching flash name while preserving the active SD trip");
+        endTrip(false);
+        g_disk.files[active] = flashTrip;
+        const std::string sdTrip = g_sdDisk.files.at(active);
+        int before = g_httpRequests;
+        CHECK(uploadPending() && g_httpRequests == before + 2 &&
+              g_disk.files.empty() && g_sdDisk.files.empty() && !hasPending(),
+              "both finalized queues drain and delete from their own medium");
+        CHECK(g_httpBodies.size() == 3 && g_httpBodies[1] == sdTrip && g_httpBodies[2] == flashTrip,
+              "SD uploads first, flash second, each from the correct medium");
+        // A per-store batch prevents a large SD queue starving flash.
+        for (int i = 0; i < 20; ++i)
+            g_sdDisk.files["/trips/queued" + std::to_string(i) + ".gpx"] = flashTrip;
+        g_disk.files["/trips/old.gpx"] = flashTrip;
+        before = g_httpRequests;
+        CHECK(uploadPending() && g_httpRequests == before + 17 &&
+              g_sdDisk.files.size() == 4 && g_disk.files.empty(),
+              "one cycle sends 16 SD trips and still drains the old flash backlog");
+        CHECK(g_sdDisk.openHandles == 0 && g_disk.openHandles == 0,
+              "queue scans and uploads close all file and directory handles");
+    }
+
+    printf("T54 SD is closed and unmounted before PMU shutdown (#109)\n");
+    {
+        resetWorld(); SD.cardPresent = true; setup(); drive(15, 40); PMU.vbusIn = false;
+        PMU.onShutdown = [] {
+            CHECK(g_sdDisk.openHandles == 0 && g_disk.openHandles == 0 &&
+                  !g_sdDisk.mounted && !g_disk.mounted && g_lockDepth == 1 && gNetHold,
+                  "shutdown sees no open handles, both stores unmounted and mutex/hold retained");
+            CHECK(wellFormedShape(g_sdDisk.files.begin()->second),
+                  "SD trip finalized before shutdown cuts power");
+            CHECK(PMU.bldo1, "BLDO1 stays enabled until PMU shutdown cuts the rails");
+        };
+        try { powerOffForVbus(); } catch (const PoweredOff&) {}
+        auto ended = std::find(g_powerEvents.begin(), g_powerEvents.end(), "SD.end");
+        auto shutdown = std::find(g_powerEvents.begin(), g_powerEvents.end(), "PMU.shutdown");
+        CHECK(ended < shutdown && PMU.shutdownCalls == 1, "SD.end precedes PMU.shutdown");
+    }
+
+    printf("T55 cancelled/failed SD shutdown remounts the same stores (#109)\n");
+    {
+        for (bool failedShutdown : {false, true}) {
+            resetWorld(); SD.cardPresent = true; setup(); drive(15, 40); PMU.vbusIn = false;
+            g_disk.files["/trips/old.gpx"] = "preserved flash backlog";
+            PMU.failShutdown = failedShutdown;
+            if (!failedShutdown) g_sdDisk.onUnmount = [] { PMU.vbusIn = true; };
+            int mounts = SD.begins;
+            powerOffForVbus();
+            CHECK(SD.begins == mounts + 1 && gTripFS == &SD && gSdMounted && gFlashMounted &&
+                  g_sdDisk.mounted && g_disk.mounted && g_lockDepth == 0 && !gNetHold && !gNetAbort,
+                  "recovery remounts SD and flash, then releases storage and networking");
+            CHECK(!g_sdDisk.formatRequested && !g_disk.formatRequested &&
+                  g_disk.files.at("/trips/old.gpx") == "preserved flash backlog",
+                  "recovery does not format or discard either queue");
+            CHECK(PMU.shutdownCalls == (failedShutdown ? 1 : 0),
+                  "late VBUS return cancels shutdown; a returned shutdown call recovers");
+            PMU.vbusIn = true; gVbusLost = false;
+            drive(15, 40); endTrip(false);
+            CHECK(g_sdDisk.files.size() == 2 && g_sdDisk.openHandles == 0,
+                  "the next trip still records to SD after recovery");
+        }
+        for (bool failFlash : {false, true}) {
+            resetWorld(); SD.cardPresent = true; setup(); drive(15, 40); PMU.vbusIn = false;
+            g_sdDisk.onUnmount = [] { PMU.vbusIn = true; };
+            if (failFlash) g_disk.failMount = true;
+            else SD.cardPresent = false;
+            try { powerOffForVbus(); } catch (const Restarted&) {}
+            CHECK(g_restarts == 1 && g_lockDepth == 1 && gNetHold && gTripFS == &SD &&
+                  !g_sdDisk.formatRequested && !g_disk.formatRequested,
+                  "failed remount restarts with mutex held and never switches stores underneath logging");
+        }
+    }
+
+    printf("T56 FAT repair, interrupted replacement and both boot-time queues (#109)\n");
+    {
+        const std::string path = "/trips/repair.gpx";
+        const std::string partial = std::string(GPX_PROLOGUE) +
+            "<trkpt lat=\"1\" lon=\"2\"></trkpt>\n<trkpt lat=";
+        resetWorld(); SD.cardPresent = true;
+        g_sdDisk.files[path] = partial; g_disk.files[path] = partial;
+        setup();
+        CHECK(wellFormedShape(g_sdDisk.files.at(path)) && wellFormedShape(g_disk.files.at(path)) &&
+              !g_sdDisk.files.count(path + ".fix"),
+              "boot repairs SD and flash, including FAT rename over an existing destination");
+        g_sdDisk.files[path] = partial; g_sdDisk.failRenames = 1;
+        fsckAllTrips(SD);
+        CHECK(!g_sdDisk.files.count(path) && g_sdDisk.files.count(path + ".fix") &&
+              wellFormedShape(g_sdDisk.files.at(path + ".fix")),
+              "failure after original removal retains the complete closed repair copy");
+        fsckAllTrips(SD);
+        CHECK(wellFormedShape(g_sdDisk.files.at(path)) && !g_sdDisk.files.count(path + ".fix"),
+              "the next boot recovers an orphan FAT repair without losing trackpoints");
+        g_sdDisk.files[path] = partial; g_sdDisk.failRemoves = 1;
+        fsckAllTrips(SD);
+        CHECK(g_sdDisk.files.at(path) == partial && g_sdDisk.files.count(path + ".fix"),
+              "failed FAT removal keeps the original and the verified repair");
+        fsckAllTrips(SD);
+        CHECK(wellFormedShape(g_sdDisk.files.at(path)), "a verified repair publishes on the next retry");
     }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);

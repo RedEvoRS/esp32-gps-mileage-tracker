@@ -7,12 +7,13 @@
 >
 > **The Supreme port is in progress.** All four stages run on the Supreme:
 > start with [T-Beam Supreme bring-up](#t-beam-supreme-bring-up). Stage 4,
-> the trip logger, still stores trips in the internal LittleFS partition
-> (about 6 hours of driving between uploads) until microSD support lands.
-> Much of the rest of this README, including most of the Stage 4 section,
-> still describes the retired T-Beam V1.2 with NEO-M8N GPS. Read
-> [Stage 4 on the Supreme](#stage-4-on-the-supreme) for what differs.
-> SD-card formatting will be documented with the port.
+> the trip logger, stores trips on the [microSD card](#microsd-card) and
+> falls back to the internal LittleFS partition (about 6 hours of driving)
+> when no card mounts. **The microSD support is written but not yet
+> bench-tested.** Much of the rest of this README, including most of the
+> Stage 4 section, still describes the retired T-Beam V1.2 with NEO-M8N
+> GPS. Read [Stage 4 on the Supreme](#stage-4-on-the-supreme) for what
+> differs.
 
 The firmware is organized into progressive stages that let you verify
 each hardware subsystem before building the full mileage tracker.
@@ -119,6 +120,44 @@ board.
 - Opening the serial port can restart the board, so startup messages may
   appear twice.
 
+### microSD card
+
+The trip logger writes trips to a microSD card in the Supreme's slot.
+**Not yet bench-tested:** the card's pins come from LilyGO's source, and
+Stage 2's `d` key is the first check to run when a card is fitted.
+
+- **Format: FAT32.** The firmware can't read exFAT, which is what most
+  cards of 64 GB and up ship with. Use a microSDHC card of 32 GB or less;
+  this project uses a SanDisk 32 GB Max Endurance. These come formatted
+  FAT32. On Windows, the card's **Properties** show the file system. If it
+  says exFAT or NTFS, reformat it as FAT32 (this erases the card).
+- **Fake cards** report a size they don't have and silently lose anything
+  written past their real capacity, which here means lost trips. A full
+  write-and-verify check with `f3` (Linux/WSL) or H2testw (Windows) takes
+  about an hour for 32 GB and is worth doing once.
+- **Only insert or remove the card with the board switched off.** The slot
+  has no card-detect switch, and the firmware picks its trip storage once,
+  at boot.
+- **The firmware never formats the card.** A card that won't mount is left
+  untouched, and trips go to internal flash instead.
+- **At boot** the log says which storage it chose:
+  - `Trip storage: microSD (29.72 GiB free); internal flash queue mounted.`
+    Trips go to the card.
+  - `WARNING: no microSD card or mount failed -- check power/wiring and FAT32 (exFAT unsupported); card never formatted.`
+    followed by
+    `WARNING: microSD unavailable -- using internal flash (2.30 MiB free).`
+    No usable card: trips go to the internal partition, which holds about
+    6 hours of driving.
+- **Uploads** come from both places: trips on the card, and any left in
+  internal flash from a boot without a card. Each is deleted only after
+  the server accepts it.
+- **Power cuts:** FAT copes with a sudden power loss worse than LittleFS
+  does. The 18650 is what lets the logger close its files and unmount the
+  card cleanly after the car's USB power goes away, so keep it fitted.
+- **Very long trips:** with no partition size to stop it, a trip that never
+  ends could grow past the server's 16 MiB upload limit. Splitting trips on
+  the device is still to be done (issue #110).
+
 ### Supreme pin and power reference
 
 Measured with Stages 1–3 unless marked.
@@ -133,7 +172,8 @@ Measured with Stages 1–3 unless marked.
 | GPS PPS | GPIO 6 | One pulse per second once the GPS has a fix |
 | GPS power | ALDO4, 3.3 V | |
 | LoRa power | ALDO3 | Keep it off. It comes up **on** after a power-on by USB |
-| SD card power | BLDO1 | Comes up at 1.8 V: set 3.3 V before use. SD pins per LilyGO (not yet checked): SPI 35/36/37, CS 47 |
+| SD card power | BLDO1 | Comes up at 1.8 V: set 3.3 V before switching it on |
+| SD card bus | SPI MOSI 35 / SCK 36 / MISO 37, CS 47 | From LilyGO's source; Stage 2's `d` key checks it. The IMU shares the bus: hold its CS (GPIO 34) high |
 | GPS backup supply | The 18650 directly | Not the PMU's VBACKUP output, which can stay off |
 
 **Rails at power-up (AXP2101 defaults):** DCDC1 3.3 V on (this powers the
@@ -322,8 +362,15 @@ Prints every rail as it found them at boot, then switches ALDO3 (LoRa) off
 (it stops if it can't) and ALDO4 (GPS) on. It scans both I2C buses
 (expect 0x34 and 0x51 on `Wire1`, 0x3C and 0x77 on `Wire`) and repeats the
 power status every 5 s. Keys: `h` help, `p` status, `i` scan again, `o`
-sensor rails on/off, `s` then `Y` to power the board off. Unplug and
-replug USB to switch it back on.
+sensor rails on/off, `d` microSD check, `s` then `Y` to power the board
+off. Unplug and replug USB to switch it back on.
+
+The `d` key powers the card at 3.3 V, mounts it, prints its type and size,
+writes, reads back and deletes a small test file, then unmounts it and
+switches its power off. It never formats the card. Expect
+`SD write/read-back: PASS; delete: PASS`. `no SD card responding` means no
+card, or a power or wiring fault. `card responds but mount failed` usually
+means the card isn't FAT32.
 
 If "AXP2101 not found" appears straight after the board was restarted
 from the PC, restart it once more. A restart in the middle of a PMU read
@@ -373,6 +420,10 @@ The rest of this section was written for the V1.2. On the Supreme
   flash once for the first Stage 4 upload (Arduino IDE: **Tools → Erase All
   Flash Before Sketch Upload → Enabled** for that one upload, then set it
   back to Disabled so later uploads keep your trips).
+- **Storage:** trips go to the [microSD card](#microsd-card) when one
+  mounts at boot, and to the internal LittleFS partition otherwise (not yet
+  bench-tested with a card). Trip storage in internal flash is still set up
+  as described under First flash, because it's the fallback.
 - **Pins and power** are the Supreme's: see the
   [Supreme pin and power reference](#supreme-pin-and-power-reference), not
   the V1.2 pin table further down. At boot the logger switches the LoRa
@@ -393,6 +444,7 @@ The rest of this section was written for the V1.2. On the Supreme
   LoRa rail (ALDO3) verified off; SD rail (BLDO1) off; VBACKUP off.
   PMU power-on source 0x04, power-off source 0x02.
   PMU ready, MAX-M10S GPS rail (ALDO4) on at 3.3 V, charge to 4.1 V. VBUS present.
+  Trip storage: microSD (29.72 GiB free); internal flash queue mounted.
   GPS: waiting for checksum-valid NMEA (up to 3 s).
   Setup complete. Logging trips.
   GPS ready: checksum-valid NMEA received.

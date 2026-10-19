@@ -36,7 +36,10 @@ using std::min;
 #define FALLING 0
 inline std::map<int, int> g_pinModes, g_pinLevels;
 inline void pinMode(int pin, int mode) { g_pinModes[pin] = mode; }
-inline void digitalWrite(int pin, int level) { g_pinLevels[pin] = level; }
+inline void digitalWrite(int pin, int level) {
+    // ESP32 core 3.x ignores digitalWrite before pinMode registers a GPIO.
+    if (g_pinModes.count(pin)) g_pinLevels[pin] = level;
+}
 inline int digitalPinToInterrupt(int p) { return p; }
 inline void attachInterrupt(int, void (*)(), int) {}
 
@@ -147,6 +150,8 @@ struct FakeDisk {
     bool invalidateDirectoryOnMutation = false;
     unsigned directoryRevision = 0;
     int openDirectories = 0;
+    int openHandles = 0;
+    bool renameOverwrites = true;
     int mutationsWithDirectoryOpen = 0;
     bool fullPathNames = false;  // core 2.x File::name() compatibility
     void mutatedDirectory() {
@@ -172,6 +177,8 @@ extern FakeDisk g_disk;
 #define FILE_APPEND "a"
 
 struct FileImpl {
+    FakeDisk* disk;
+    explicit FileImpl(FakeDisk& d) : disk(&d) { disk->openHandles++; }
     std::string path;
     bool isDir = false, writable = false;
     std::string pending;              // stdio buffer
@@ -179,16 +186,16 @@ struct FileImpl {
     std::vector<std::string> dirNames;
     size_t dirIdx = 0;
     unsigned directoryRevision = 0;
-    ~FileImpl() { if (isDir) g_disk.openDirectories--; }
+    ~FileImpl() { disk->openHandles--; if (isDir) disk->openDirectories--; }
 
     bool commitPending() {
         if (pending.empty()) return true;
-        g_disk.flushCount++;
-        if (g_disk.flushesBeforeFail > 0) g_disk.flushesBeforeFail--;
-        else if (g_disk.failFlushes > 0) { g_disk.failFlushes--; return false; }
-        auto it = g_disk.files.find(path);
-        if (it == g_disk.files.end()) return false;
-        size_t room = g_disk.capacity > g_disk.used() ? g_disk.capacity - g_disk.used() : 0;
+        disk->flushCount++;
+        if (disk->flushesBeforeFail > 0) disk->flushesBeforeFail--;
+        else if (disk->failFlushes > 0) { disk->failFlushes--; return false; }
+        auto it = disk->files.find(path);
+        if (it == disk->files.end()) return false;
+        size_t room = disk->capacity > disk->used() ? disk->capacity - disk->used() : 0;
         size_t n = std::min(room, pending.size());
         it->second.append(pending, 0, n);
         pending.erase(0, n);
@@ -204,18 +211,18 @@ public:
     explicit operator bool() const { return (bool)p; }
     bool isDirectory() const { return p && p->isDir; }
     const char* name() const {
-        if (g_disk.fullPathNames) return p->path.c_str();
+        if (p->disk->fullPathNames) return p->path.c_str();
         static std::string n; n = p->path.substr(p->path.rfind('/') + 1); return n.c_str();
     }
     File openNextFile() {
         if (!p || !p->isDir || p->dirIdx >= p->dirNames.size()) return File();
-        if (g_disk.invalidateDirectoryOnMutation &&
-            p->directoryRevision != g_disk.directoryRevision) return File();
-        auto f = std::make_shared<FileImpl>();
+        if (p->disk->invalidateDirectoryOnMutation &&
+            p->directoryRevision != p->disk->directoryRevision) return File();
+        auto f = std::make_shared<FileImpl>(*p->disk);
         f->path = p->dirNames[p->dirIdx++];
         return File(f);
     }
-    const std::string& data() const { static std::string e; auto it = g_disk.files.find(p->path); return it == g_disk.files.end() ? e : it->second; }
+    const std::string& data() const { static std::string e; auto it = p->disk->files.find(p->path); return it == p->disk->files.end() ? e : it->second; }
     size_t size() const { return data().size(); }
     size_t write(uint8_t c) override { return write(&c, 1); }
     size_t write(const uint8_t* b, size_t n) {
@@ -230,8 +237,8 @@ public:
     int available() override { return (int)(size() - p->pos); }
     int read() override { return p->pos < size() ? (uint8_t)data()[p->pos++] : -1; }
     int read(uint8_t* b, size_t n) {
-        if (g_disk.onRead) g_disk.onRead();
-        if (p->path == g_disk.failReadPath && p->pos >= g_disk.failReadAfter) return 0;
+        if (p->disk->onRead) p->disk->onRead();
+        if (p->path == p->disk->failReadPath && p->pos >= p->disk->failReadAfter) return 0;
         size_t k = std::min(n, size() - std::min(size(), p->pos));
         memcpy(b, data().data() + p->pos, k); p->pos += k; return (int)k;
     }
@@ -239,7 +246,59 @@ public:
     int peek() override { return p->pos < size() ? (uint8_t)data()[p->pos] : -1; }
 };
 
-struct LittleFSStub {
+namespace fs {
+struct FS {
+    FakeDisk& g_disk;
+    std::set<std::string> dirs;
+    explicit FS(FakeDisk& disk) : g_disk(disk) {}
+    bool exists(const char* path) {
+        std::string pre = std::string(path) + "/";
+        if (g_disk.files.count(path)) return true;
+        for (auto& kv : g_disk.files) if (kv.first.rfind(pre, 0) == 0) return true;
+        return dirs.count(path) > 0;
+    }
+    bool mkdir(const char* p) { dirs.insert(p); return true; }
+    File open(const char* path, const char* mode = "r") {
+        if (path == g_disk.failOpenPath) return File();
+        if (g_disk.failNextOpens > 0) { g_disk.failNextOpens--; return File(); }
+        std::string ps(path);
+        if (dirs.count(ps) || std::any_of(g_disk.files.begin(), g_disk.files.end(),
+                [&](const auto& entry) { return entry.first.rfind(ps + "/", 0) == 0; })) {
+            auto d = std::make_shared<FileImpl>(g_disk); d->path = ps; d->isDir = true;
+            g_disk.openDirectories++;
+            d->directoryRevision = g_disk.directoryRevision;
+            std::string pre = ps + "/";
+            for (auto& kv : g_disk.files) if (kv.first.rfind(pre, 0) == 0) d->dirNames.push_back(kv.first);
+            return File(d);
+        }
+        auto f = std::make_shared<FileImpl>(g_disk); f->path = ps;
+        if (mode[0] == 'r') { if (!g_disk.files.count(ps)) return File(); }
+        else {
+            f->writable = true;
+            if (!g_disk.files.count(ps)) g_disk.mutatedDirectory();
+            if (mode[0] == 'w') g_disk.files[ps] = "";
+            else if (!g_disk.files.count(ps)) g_disk.files[ps] = "";
+        }
+        return File(f);
+    }
+    File open(const String& p, const char* m = "r") { return open(p.c_str(), m); }
+    bool remove(const char* p) {
+        g_disk.removeCount++;
+        if (g_disk.failRemoves > 0) { g_disk.failRemoves--; return false; }
+        if (!g_disk.files.erase(p)) return false;
+        g_disk.mutatedDirectory(); return true;
+    }
+    bool rename(const char* a, const char* b) {
+        if (g_disk.failRenames > 0) { g_disk.failRenames--; return false; }
+        if (!g_disk.renameOverwrites && g_disk.files.count(b)) return false;
+        auto it = g_disk.files.find(a); if (it == g_disk.files.end()) return false;
+        g_disk.mutatedDirectory();
+        g_disk.files[b] = it->second; g_disk.files.erase(a); return true;
+    }
+};
+}
+struct LittleFSStub : fs::FS {
+    LittleFSStub() : FS(::g_disk) {}
     bool begin(bool formatOnFail = false, const char* = "/littlefs", uint8_t = 10,
                const char* partitionLabel = "spiffs") {
         g_disk.mountAttempts++;
@@ -260,53 +319,49 @@ struct LittleFSStub {
         return true;
     }
     void end() { g_disk.mounted = false; if (g_disk.onUnmount) g_disk.onUnmount(); }
-    bool exists(const char* path) {
-        std::string pre = std::string(path) + "/";
-        if (g_disk.files.count(path)) return true;
-        for (auto& kv : g_disk.files) if (kv.first.rfind(pre, 0) == 0) return true;
-        return dirs.count(path) > 0;
-    }
-    bool mkdir(const char* p) { dirs.insert(p); return true; }
-    File open(const char* path, const char* mode = "r") {
-        if (path == g_disk.failOpenPath) return File();
-        if (g_disk.failNextOpens > 0) { g_disk.failNextOpens--; return File(); }
-        std::string ps(path);
-        if (dirs.count(ps)) {
-            auto d = std::make_shared<FileImpl>(); d->path = ps; d->isDir = true;
-            g_disk.openDirectories++;
-            d->directoryRevision = g_disk.directoryRevision;
-            std::string pre = ps + "/";
-            for (auto& kv : g_disk.files) if (kv.first.rfind(pre, 0) == 0) d->dirNames.push_back(kv.first);
-            return File(d);
-        }
-        auto f = std::make_shared<FileImpl>(); f->path = ps;
-        if (mode[0] == 'r') { if (!g_disk.files.count(ps)) return File(); }
-        else {
-            f->writable = true;
-            if (!g_disk.files.count(ps)) g_disk.mutatedDirectory();
-            if (mode[0] == 'w') g_disk.files[ps] = "";
-            else if (!g_disk.files.count(ps)) g_disk.files[ps] = "";
-        }
-        return File(f);
-    }
-    File open(const String& p, const char* m = "r") { return open(p.c_str(), m); }
-    bool remove(const char* p) {
-        g_disk.removeCount++;
-        if (g_disk.failRemoves > 0) { g_disk.failRemoves--; return false; }
-        if (!g_disk.files.erase(p)) return false;
-        g_disk.mutatedDirectory(); return true;
-    }
-    bool rename(const char* a, const char* b) {
-        if (g_disk.failRenames > 0) { g_disk.failRenames--; return false; }
-        auto it = g_disk.files.find(a); if (it == g_disk.files.end()) return false;
-        g_disk.mutatedDirectory();
-        g_disk.files[b] = it->second; g_disk.files.erase(a); return true;
-    }
     size_t usedBytes() { return g_disk.used(); }
     size_t totalBytes() { return g_disk.capacity; }
-    std::set<std::string> dirs;
 };
 extern LittleFSStub LittleFS;
+
+// Separate SD media, including FAT's refusal to rename over a destination.
+#define HSPI 1
+struct SPIClass {
+    int host, sck = -1, miso = -1, mosi = -1, cs = -1;
+    bool started = false;
+    explicit SPIClass(int h) : host(h) {}
+    bool begin(int s = -1, int i = -1, int o = -1, int c = -1) {
+        started = true; sck = s; miso = i; mosi = o; cs = c; return true;
+    }
+    void end() { started = false; }
+};
+constexpr uint8_t CARD_NONE = 0, CARD_SD = 2, CARD_SDHC = 3;
+inline FakeDisk g_sdDisk;
+inline std::vector<std::string> g_powerEvents;
+struct SDStub : fs::FS {
+    bool cardPresent = false;
+    int begins = 0, ends = 0;
+    int cs = -1, maxFiles = 0;
+    uint32_t hz = 0;
+    SPIClass* spi = nullptr;
+    SDStub() : FS(g_sdDisk) {}
+    bool begin(uint8_t pin, SPIClass& bus, uint32_t frequency, const char*, uint8_t max_files, bool format) {
+        begins++; g_disk.mountAttempts++; cs = pin; hz = frequency; spi = &bus; maxFiles = max_files;
+        g_disk.formatRequested |= format;
+        g_powerEvents.push_back("SD.begin");
+        if (g_disk.onMount) g_disk.onMount();
+        g_disk.mounted = cardPresent && !g_disk.failMount;
+        return g_disk.mounted;
+    }
+    void end() {
+        ends++; g_powerEvents.push_back("SD.end"); g_disk.mounted = false;
+        if (g_disk.onUnmount) g_disk.onUnmount();
+    }
+    uint8_t cardType() { return g_disk.mounted ? CARD_SDHC : CARD_NONE; }
+    uint64_t totalBytes() { return g_disk.capacity; }
+    uint64_t usedBytes() { return g_disk.used(); }
+};
+inline SDStub SD;
 
 // ---- Preferences ----------------------------------------------------------
 struct Preferences {
@@ -363,7 +418,8 @@ struct XPowersAXP2101 {
     void (*onShutdown)() = nullptr;
     bool aldo3 = true, aldo4 = false, bldo1 = true, vbackup = true;
     bool failRadioDisable = false, radioStuckOn = false;
-    int aldo4Mv = 0;
+    int aldo4Mv = 0, bldo1Mv = 1800;
+    bool failSdVoltage = false, failSdEnable = false, failSdDisable = false;
     TwoWire* bus = nullptr;
     std::vector<std::string> operations;
     bool begin(TwoWire& wire, int, int, int) { bus = &wire; operations.push_back("begin"); return true; }
@@ -375,7 +431,21 @@ struct XPowersAXP2101 {
     bool isEnableALDO3() { operations.push_back("isEnableALDO3"); return aldo3; }
     void setALDO4Voltage(int mv) { aldo4Mv = mv; }
     void enableALDO4() { aldo4 = true; } void disableALDO4() { aldo4 = false; }
-    void disableBLDO1() { bldo1 = false; }
+    bool disableBLDO1() {
+        g_powerEvents.push_back("BLDO1.off");
+        if (failSdDisable) return false;
+        bldo1 = false; return true;
+    }
+    bool setBLDO1Voltage(int mv) {
+        g_powerEvents.push_back("BLDO1.voltage");
+        if (failSdVoltage) return false;
+        bldo1Mv = mv; return true;
+    }
+    bool enableBLDO1() {
+        g_powerEvents.push_back("BLDO1.on");
+        if (failSdEnable) return false;
+        bldo1 = true; return true;
+    }
     void disableButtonBatteryCharge() { vbackup = false; }
     uint8_t getPowerOnSource() { return 0x04; }
     uint8_t getPowerOffSource() { return 0x02; }
@@ -396,6 +466,7 @@ struct XPowersAXP2101 {
     bool isPekeyLongPressIrq() { return longPressIrq; } bool isDropWarningLevel2Irq() { return criticalIrq; }
     bool isVbusIn() { return vbusIn; }
     void shutdown() {
+        g_powerEvents.push_back("PMU.shutdown");
         shutdownCalls++;
         if (onShutdown) onShutdown();
         if (!failShutdown) throw PoweredOff{};  // successful hardware power-off never resumes
@@ -476,6 +547,7 @@ struct WiFiClient {};
 inline int g_httpCode = 200;
 inline int g_httpRequests = 0;
 inline std::string g_httpLastBody;
+inline std::vector<std::string> g_httpBodies;
 inline void (*g_httpHook)() = nullptr;
 struct HTTPClient {
     void begin(WiFiClient&, const String&) {} void addHeader(const char*, const String&) {}
@@ -490,6 +562,7 @@ struct HTTPClient {
             if (n == 0) break;
             g_httpLastBody.append(buf, n);
         }
+        g_httpBodies.push_back(g_httpLastBody);
         if (g_httpLastBody.size() != size) return -3;   // HTTPC_ERROR_SEND_PAYLOAD_FAILED
         return g_httpCode;
     }

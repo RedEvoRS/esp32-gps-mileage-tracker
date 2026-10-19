@@ -5,6 +5,8 @@
 // and repeat #106's shutdown/VBUS power-on check.
 // What to expect: a boot snapshot, ALDO3 OFF, ALDO4 at 3.3 V, bus scans,
 // then status every 5 s. Keys: h help, p status, i scan, o sensors,
+// d checks SD power/mount/write/read/delete, then unmounts and powers off SD.
+// SD/IMU SPI pins below are from LilyGO, unverified until d passes on the bench.
 // s then uppercase Y within 10 s to shut down (any other key cancels).
 // Bench 2026-10-18: Wire1 SDA42/SCL41 = PMU 0x34 + PCF8563 RTC 0x51.
 // Wire SDA17/SCL18 = SH1106 OLED 0x3C + BME280 0x77; unexplained ACKs
@@ -43,14 +45,24 @@
 // 1991b1ed70915d4f246b841f99f6027166ea7330, examples/Factory/utilities.h
 // and LoRaBoards.cpp, T_BEAM_S3_SUPREME sections. Bench results above.
 // Unlike LilyGO's factory setup, never enable ALDO3 (LoRa) here, and
-// never configure/disable DCDC1 (ESP32), other core rails, or BLDO1 (SD).
+// never configure/disable DCDC1 (ESP32) or other core rails. BLDO1 (SD)
+// is held off after the snapshot except during the explicit d check.
 // =================================================================
 
 #include <Wire.h>
 #include <XPowersLib.h>
+#include <SPI.h>
+#include <SD.h>
+#include <ff.h>
+#include <diskio.h>
+#include <sd_diskio.h>
 
 static const int PMU_SDA = 42, PMU_SCL = 41, PMU_IRQ = 40;
 static const int SENSOR_SDA = 17, SENSOR_SCL = 18;
+static const int SD_MOSI = 35, SD_SCK = 36, SD_MISO = 37, SD_CS = 47, IMU_CS = 34;
+// Core SD default: ample for logging, conservative until the bus is bench-tested.
+static constexpr uint32_t SD_SPI_HZ = 4000000;
+SPIClass sdSpi(HSPI);  // independent of the radio's SPI instance
 XPowersAXP2101 PMU;
 bool shutdownPending = false;
 uint32_t confirmStarted = 0;
@@ -119,7 +131,77 @@ static void scanBoth() {
 static void printHelp() {
     Serial.println("Keys: h help | p rails/power | i scan both buses | o toggle ALDO1+ALDO2 sensors");
     Serial.println("      s arm shutdown, then uppercase Y within 10 s; any other key cancels");
-    Serial.println("ALDO3 is LoRa: held OFF. DCDC1/core rails and BLDO1/SD are left alone.");
+    Serial.println("      d SD check: BLDO1 3.3 V, mount, write/read/delete, unmount, BLDO1 OFF");
+    Serial.println("ALDO3 is LoRa: held OFF. DCDC1/core rails are left alone. SD requires FAT32.");
+}
+
+static void explainSdMountFailure() {
+    // SD.begin() releases its drive on failure, losing the card type. A
+    // read-only driver probe distinguishes a nonresponding card/bus from
+    // a responding card whose filesystem cannot mount. Never format here.
+    uint8_t drive = sdcard_init(SD_CS, &sdSpi, SD_SPI_HZ);
+    if (drive == 0xFF) {
+        Serial.println("ERROR: SD driver allocation failed; cannot probe card.");
+        return;
+    }
+    if (disk_initialize(drive) & STA_NOINIT) {
+        Serial.println("ERROR: no SD card responding -- insert a card, check BLDO1 3.3 V and SPI wiring.");
+    } else {
+        Serial.println("ERROR: card responds but mount failed -- wrong format, damaged filesystem or read error.");
+        Serial.println("Use FAT32 (microSDHC <=32 GB); exFAT on typical 64 GB+ cards is unsupported. Card preserved.");
+    }
+    sdcard_uninit(drive);
+}
+
+static void checkSd() {
+    Serial.println("SD check: LilyGO pins MOSI35/SCK36/MISO37/CS47, IMU CS34 HIGH, SPI 4 MHz.");
+    // The PMU powers up BLDO1 ON at 1.8 V. Disable first, set 3.3 V,
+    // then enable; never briefly enable the card at the default voltage.
+    bool powered = PMU.disableBLDO1() && PMU.setBLDO1Voltage(3300) && PMU.enableBLDO1();
+    if (powered) {
+        pinMode(IMU_CS, OUTPUT);
+        digitalWrite(IMU_CS, HIGH);
+        pinMode(SD_CS, OUTPUT);
+        digitalWrite(SD_CS, HIGH);
+        delay(250);  // supply/card settle time before SPI initialization
+        if (!sdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS)) {
+            Serial.println("ERROR: SD SPI bus initialization failed; mount skipped.");
+        } else if (!SD.begin(SD_CS, sdSpi, SD_SPI_HZ, "/sd", 5, false)) {
+            explainSdMountFailure();
+        } else if (SD.cardType() == CARD_NONE) {
+            Serial.println("ERROR: no SD card detected after mount.");
+        } else {
+            uint8_t type = SD.cardType();
+            Serial.printf("SD card type: %s; size: %llu bytes; total: %llu; used: %llu bytes\n",
+                          type == CARD_MMC ? "MMC" : type == CARD_SD ? "SDSC" : "SDHC/SDXC",
+                          (unsigned long long)SD.cardSize(), (unsigned long long)SD.totalBytes(),
+                          (unsigned long long)SD.usedBytes());
+            Serial.println("Filesystem: FAT (exact subtype unavailable through SD API; FAT32 recommended).");
+            const char* path = "/stage2-sd-check.txt";
+            const char payload[] = "Supreme SD write/read check\n";
+            if (SD.exists(path)) {
+                Serial.println("ERROR: test path already exists; preserved. Remove it on a PC before retrying.");
+            } else {
+                File f = SD.open(path, FILE_WRITE);
+                bool ok = f && f.write((const uint8_t*)payload, sizeof(payload) - 1) == sizeof(payload) - 1;
+                if (f) f.close();  // commit before opening the read-back handle
+                File readback = SD.open(path, FILE_READ);
+                char bytes[sizeof(payload)] = {0};
+                ok = ok && readback && readback.size() == sizeof(payload) - 1 &&
+                     readback.read((uint8_t*)bytes, sizeof(payload) - 1) == sizeof(payload) - 1 &&
+                     memcmp(bytes, payload, sizeof(payload) - 1) == 0;
+                if (readback) readback.close();
+                bool removed = SD.remove(path);
+                Serial.printf("SD write/read-back: %s; delete: %s\n", ok ? "PASS" : "FAIL", removed ? "PASS" : "FAIL");
+            }
+        }
+    } else {
+        Serial.println("ERROR: could not set/enable BLDO1 at 3.3 V; SD mount skipped.");
+    }
+    SD.end();
+    sdSpi.end();
+    bool off = PMU.disableBLDO1();
+    Serial.printf("SD check finished: unmounted; BLDO1 OFF: %s\n", off ? "OK" : "ERROR");
 }
 
 static void toggleSensors() {
@@ -167,6 +249,9 @@ void setup() {
         Serial.println("ERROR: cannot verify ALDO3 OFF. Attach LoRa antenna; stopping.");
         while (true) delay(1000);
     }
+    if (!PMU.disableBLDO1()) {
+        Serial.println("ERROR: could not disable BLDO1; SD check will retry before changing voltage.");
+    }
     ok = PMU.setALDO4Voltage(3300);
     ok &= PMU.enableALDO4();
     Serial.printf("ALDO3 OFF; ALDO4 GPS requested ON at 3300 mV: %s\n", ok ? "OK" : "ERROR");
@@ -207,6 +292,7 @@ void loop() {
             case 'p': printStatus(); break;
             case 'i': scanBoth(); break;
             case 'o': toggleSensors(); break;
+            case 'd': checkSd(); break;
             case 's':
                 Serial.println("Shutdown test: bench confirmed off for 15 s with USB connected; USB replug powered it on.");
                 Serial.println("Press uppercase Y within 10 s to confirm; any other key cancels.");
