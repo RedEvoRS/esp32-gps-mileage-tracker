@@ -56,6 +56,7 @@
 #include <ff.h>
 #include <diskio.h>
 #include <sd_diskio.h>
+#include "i2c_recovery.h"
 
 static const int PMU_SDA = 42, PMU_SCL = 41, PMU_IRQ = 40;
 static const int SENSOR_SDA = 17, SENSOR_SCL = 18;
@@ -124,7 +125,14 @@ static void scanBus(TwoWire& bus, const char* name) {
 }
 
 static void scanBoth() {
-    scanBus(Wire1, "Wire1 SDA42/SCL41 (PMU 0x34, PCF8563 RTC 0x51)");
+    // A failed recovery may have left Wire1 uninitialized. begin() also
+    // succeeds when the controller is already running; bound scan waits.
+    if (Wire1.begin(PMU_SDA, PMU_SCL)) {
+        Wire1.setTimeOut(50);
+        scanBus(Wire1, "Wire1 SDA42/SCL41 (PMU 0x34, PCF8563 RTC 0x51)");
+    } else {
+        Serial.println("Wire1 scan skipped: bus initialization failed.");
+    }
     scanBus(Wire, "Wire SDA17/SCL18 (SH1106 0x3C, BME280 0x77; harmless reserved ACKs 0x7C/0x7E)");
 }
 
@@ -229,11 +237,12 @@ void setup() {
     while (!Serial && millis() - started < 3000) delay(10);
     Serial.println("\nStage 2: Supreme PMU bring-up (no radio initialization)");
     Wire.begin(SENSOR_SDA, SENSOR_SCL);
-    Wire1.begin(PMU_SDA, PMU_SCL);
     Wire.setTimeOut(50);
-    Wire1.setTimeOut(50);
     pinMode(PMU_IRQ, INPUT);  // Observe only; GPIO40 cannot be an ext1 deep-sleep wake pin.
-    if (!PMU.begin(Wire1, AXP2101_SLAVE_ADDRESS, PMU_SDA, PMU_SCL)) {
+    PmuStartupResult pmuStartup;
+    bool pmuReady = beginPmuWithRecovery(Wire1, PMU, PMU_SDA, PMU_SCL, pmuStartup);
+    printPmuStartup(pmuStartup);
+    if (!pmuReady) {
         Serial.println("ERROR: AXP2101 not found at Wire1 42/41, 0x34. No rail changes made.");
         scanBoth();
         while (true) delay(1000);

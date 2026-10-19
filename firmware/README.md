@@ -374,9 +374,18 @@ switches its power off. It never formats the card. Expect
 card, or a power or wiring fault. `card responds but mount failed` usually
 means the card isn't FAT32.
 
-If "AXP2101 not found" appears straight after the board was restarted
-from the PC, restart it once more. A restart in the middle of a PMU read
-can leave the bus stuck (issue #145).
+An ESP32 reset during a PMU read can leave the battery-powered PMU holding
+the shared PMU/RTC I2C bus low. Stages 2, 3 and 4 now check that bus before
+startup. If needed, they send up to nine open-drain clocks (5 microseconds
+low/high), then a STOP condition. Each SCL release waits at most 1 ms for
+clock stretching; a line that stays low is reported as a failure.
+
+PMU startup gets up to three attempts, releasing `Wire1` and waiting 10 ms
+between attempts. Serial reports recovery results, clock counts and retries;
+Stage 4 prints these after its early LoRa rail safety check. If all attempts
+fail, the existing halt remains. Recovery is host-tested; repeatedly resetting
+during PMU reads still needs a bench check. Issue #151 tracks recording I2C
+recoveries and PMU startup retries in the diagnostics journal.
 
 ### Stage 3: GPS (`03_gps_test/`)
 

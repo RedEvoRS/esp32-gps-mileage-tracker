@@ -37,6 +37,14 @@ echo "== test_fs"
 "${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_fs.cpp" -o "$build/test_fs.exe"
 "$build/test_fs.exe" "$build/out" || status=1
 
+# Each sketch carries its own recovery header; exercise every copy.
+for sketch in 02_pmu_test 03_gps_test 04_trip_logger; do
+    echo "== test_i2c ($sketch)"
+    "${cxx[@]}" "${flags[@]}" -I"$here/../$sketch" "${incs[@]}" \
+        "$here/test_i2c.cpp" -o "$build/test_i2c_$sketch.exe"
+    "$build/test_i2c_$sketch.exe" || status=1
+done
+
 tinygps="${TINYGPS_DIR:-$HOME/Documents/Arduino/libraries/TinyGPSPlus/src}"
 echo "== test_gps"
 if [ -f "$tinygps/TinyGPS++.cpp" ]; then
