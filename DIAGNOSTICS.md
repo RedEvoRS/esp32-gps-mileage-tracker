@@ -51,6 +51,9 @@ numeric measurements and fixed enumerated values in context.
 - **#135:** shipped GELF export to the owner's external Graylog (not bundled).
 - **#136:** optional push to an external Loki (not bundled).
 - **#137:** installer questions choosing these outputs.
+- **#151:** E2007 catalog entry and retained Stage 4 PMU startup result with a
+  host-tested event helper. Journal emission depends on #122/#124; the failure
+  halt remains until #126, and OLED reporting remains with #127.
 
 Host tests prove catalog consistency and policy behavior. They do not prove bus
 wiring, power rails, charging safety, FAT power-cut recovery or road behavior.
@@ -89,8 +92,28 @@ Journal policy describes the producer behavior:
   occurrence. **5001 HOME_AP_ABSENT is counter-only.** Normal driving away from
   home must not flood the journal. The catalog still supplies its display text.
 
+**2007 PMU_STARTUP_RECOVERY** is a warning with `notify=false` and
+`journal=per_occurrence`. It records a boot needing PMU/RTC bus recovery or
+startup retries, including unsuccessful startup, as one `notice` with a null
+`episode_id`. A clean first-attempt boot produces no event. This is a historical
+fact, so it cannot appear in snapshot `active` or `observed` lists and cannot
+trigger ntfy. It remains visible in Device health history and event exports.
+Continuing PMU initialization failure belongs to **2001 PMU_INIT_FAILED**.
+
+Its bounded context is `clock_count` (0-27 completed recovery clocks summed
+across attempts, excluding STOP setup), `attempt_count` (1-3 startup attempts,
+including attempts that fail before a PMU probe), `recovery_state`
+(`not_needed|recovered|sda_stuck|scl_stuck` from the last completed recovery),
+`pmu_ready` and `wire_end_failed` (booleans). The final recovery state alone
+does not prove PMU readiness. Stage 4 retains the complete `PmuStartupResult`
+in RAM; `makePmuStartupEvent` prepares these fields without I/O. #122/#124 must
+emit the notice once the journal is available; no event is persisted yet.
+Failed startup still halts before storage, so reporting that path also needs
+#126's degraded loop. OLED failure reporting remains out of scope until #127.
+
 `notify` means eligible, not an instruction to send a notification immediately.
-Info codes, the high/low charge-guard warnings (2004/2005) and 3002 GPS_NO_FIX
+Info codes, 2007 PMU_STARTUP_RECOVERY, the high/low charge-guard warnings
+(2004/2005) and 3002 GPS_NO_FIX
 (normal in a garage or parking structure) are ineligible by
 default. The unreadable-temperature error 2006 is eligible. Error reset notices
 remain history; #120's fresh-current-fault rule does not alert on historical

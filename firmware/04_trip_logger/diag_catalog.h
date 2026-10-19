@@ -5,8 +5,8 @@
 #include <cstdint>
 
 namespace diagnostics {
-constexpr std::uint16_t kCatalogVersion = 1;
-constexpr char kCatalogDigest[] = "d908fd028755d8a1eee07f0ee130ad12291f21e201ddc13214bde24212c393e0";
+constexpr std::uint16_t kCatalogVersion = 2;
+constexpr char kCatalogDigest[] = "1f7bfdb3135fc7c92d17013d3c271d8514f5ffd692e81223ad85877dd2dcd3cb";
 enum class Severity : std::uint8_t { Info, Warning, Error, Critical };
 enum class Journal : std::uint8_t { PerOccurrence, Transitions, Counter };
 enum class Code : std::uint16_t {
@@ -24,6 +24,7 @@ enum class Code : std::uint16_t {
     CHARGE_HOT = 2004,
     CHARGE_COLD = 2005,
     CHARGE_TEMP_UNREADABLE = 2006,
+    PMU_STARTUP_RECOVERY = 2007,
     GPS_NO_DATA = 3001,
     GPS_NO_FIX = 3002,
     GPS_CONFIG_NACK = 3003,
@@ -80,6 +81,7 @@ constexpr CatalogEntry kCatalog[] = {
     {Code::CHARGE_HOT, "CHARGE_HOT", Severity::Warning, {"Charging paused", "Temperature high", ""}, 2, "Charging paused for high temperature", false, Journal::Transitions},
     {Code::CHARGE_COLD, "CHARGE_COLD", Severity::Warning, {"Charging paused", "Temperature low", ""}, 2, "Charging paused for low temperature", false, Journal::Transitions},
     {Code::CHARGE_TEMP_UNREADABLE, "CHARGE_TEMP_UNREADABLE", Severity::Error, {"Charge sensor failed", "", ""}, 1, "Charge temperature unavailable", true, Journal::Transitions},
+    {Code::PMU_STARTUP_RECOVERY, "PMU_STARTUP_RECOVERY", Severity::Warning, {"PMU startup recovery", "", ""}, 1, "PMU startup needed recovery or retries", false, Journal::PerOccurrence},
     {Code::GPS_NO_DATA, "GPS_NO_DATA", Severity::Error, {"GPS data missing", "", ""}, 1, "No GPS serial data", true, Journal::Transitions},
     {Code::GPS_NO_FIX, "GPS_NO_FIX", Severity::Warning, {"Waiting for GPS fix", "", ""}, 1, "GPS has no position fix", false, Journal::Transitions},
     {Code::GPS_CONFIG_NACK, "GPS_CONFIG_NACK", Severity::Warning, {"GPS config rejected", "", ""}, 1, "GPS rejected configuration", true, Journal::PerOccurrence},

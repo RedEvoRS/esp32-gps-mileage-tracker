@@ -19,7 +19,7 @@ from unittest import mock
 
 SERVER = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SERVER))
-from common.diagnostics import load_catalog
+from common.diagnostics import load_catalog, validate_request
 
 spec = importlib.util.spec_from_file_location("monitor_under_test", SERVER / "mileage-monitor/monitor.py")
 monitor = importlib.util.module_from_spec(spec)
@@ -679,6 +679,24 @@ class MonitorTests(unittest.TestCase):
         self.snapshot(active=(6999, 3002, 2004, 2005))
         self.tick()
         self.assertEqual(self.messages, [])
+
+    def test_pmu_startup_notice_does_not_alert_at_warning_threshold(self):
+        self.worker = self.make_monitor(min_severity="warning", hold_seconds=0)
+        self.snapshot(active=())
+        body = {"schema_version": 1, "checkin": {
+            "boot_id": BOOT, "status_sequence": self.revision, "uptime_ms": 100, "active": []},
+            "events": [{"schema_version": 1, "catalog_version": 2, "firmware_version": "test-1.0",
+                        "boot_id": BOOT, "boot_counter": 1, "sequence": 1, "code": 2007,
+                        "transition": "notice", "episode_id": None, "uptime_ms": 10,
+                        "utc_ms": None, "time_source": "unknown", "sync_age_ms": None,
+                        "context": {"clock_count": 4, "attempt_count": 2,
+                                    "recovery_state": "recovered", "pmu_ready": True,
+                                    "wire_end_failed": False}}]}
+        self.store.accept("tracker-1", validate_request(body))
+        self.tick(86400)
+        self.assertEqual(self.messages, [])
+        self.assertEqual(self.sql("SELECT code FROM events"), [(2007,)])
+        self.assertEqual(self.sql("SELECT code FROM device_conditions"), [])
 
     def test_code_unknown_to_new_catalog_cannot_generate_a_resolution(self):
         self.snapshot(active=(4003,))

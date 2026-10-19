@@ -33,6 +33,10 @@ echo "== test_diag_catalog"
 "${cxx[@]}" -std=c++14 -Wall -Wextra -pedantic "$here/test_diag_catalog.cpp" -o "$build/test_diag_catalog.exe"
 "$build/test_diag_catalog.exe" || status=1
 
+echo "== test_pmu_startup_event"
+"${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_pmu_startup_event.cpp" -o "$build/test_pmu_startup_event.exe"
+"$build/test_pmu_startup_event.exe" || status=1
+
 echo "== test_fs"
 "${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_fs.cpp" -o "$build/test_fs.exe"
 "$build/test_fs.exe" "$build/out" || status=1

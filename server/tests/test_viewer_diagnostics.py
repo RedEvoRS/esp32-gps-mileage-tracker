@@ -17,6 +17,7 @@ from unittest.mock import patch
 from werkzeug.security import generate_password_hash
 
 from test_round_trip import SERVER, load_service
+from common.diagnostics import validate_request
 
 
 BOOT = "00000000000000000000000000000001"
@@ -174,6 +175,27 @@ os._exit(0)
     def test_gpx_only_contact_has_no_snapshot(self):
         self.store.refresh_contact("tracker-1")
         self.assertIn("No health snapshot received", self.page())
+
+    def test_pmu_startup_notice_is_warning_history_without_a_condition(self):
+        self.fixture()
+        context = dict(clock_count=4, attempt_count=2, recovery_state="recovered",
+                       pmu_ready=True, wire_end_failed=False)
+        body = {"schema_version": 1, "checkin": {
+            "boot_id": BOOT, "status_sequence": 2, "uptime_ms": 1600, "active": []},
+            "events": [{"schema_version": 1, "catalog_version": 2, "firmware_version": "test-1.0",
+                        "boot_id": BOOT, "boot_counter": 1, "sequence": 2, "code": 2007,
+                        "transition": "notice", "episode_id": None, "uptime_ms": 100,
+                        "utc_ms": None, "time_source": "unknown", "sync_age_ms": None,
+                        "context": context}]}
+        self.store.accept("tracker-1", validate_request(body))
+        data = self.viewer.read_diagnostics(1, 2007, "warning")
+        self.assertEqual(len(data["events"]), 1)
+        self.assertEqual(data["events"][0]["context"], context)
+        for group in data["devices"][0]["groups"].values():
+            self.assertNotIn(2007, [row["code"] for row in group])
+        page = self.page("?code=2007&severity=warning")
+        for text in ("E2007", "PMU startup needed recovery or retries", "clock_count", "recovered", "notice"):
+            self.assertIn(text, page)
 
     def test_contact_and_snapshot_age_are_independent(self):
         self.fixture()
