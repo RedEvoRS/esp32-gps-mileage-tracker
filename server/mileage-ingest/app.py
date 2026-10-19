@@ -176,9 +176,9 @@ DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 
-# Enforce the size cap during request reading (Flask raises 413, answered
-# by payload_too_large()), rather than only after buffering the whole body
-# in memory. The explicit length check in the route remains as a backstop.
+# Reject an oversized Content-Length before buffering the body (Flask raises
+# 413, answered by payload_too_large()). For lengthless uploads, the route
+# reads at most cap + 1 bytes to detect overflow without truncating the GPX.
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 
 # Configure logging to go to stdout/stderr, which docker captures
@@ -726,8 +726,9 @@ def payload_too_large(_error):
 
     MAX_CONTENT_LENGTH makes Flask raise this from the Content-Length
     header, before upload_trip() reads any of the body, and Flask's own
-    413 page is HTML. Without a Content-Length it's raised partway through
-    the body instead, and there's no length to discard by.
+    413 page is HTML. Without a Content-Length, upload_trip() reads at most
+    cap + 1 bytes and explicitly aborts with 413 if the extra byte arrives;
+    there's no length to discard by.
     """
     _discard_body()
     return jsonify({"error": f"payload too large (limit {MAX_UPLOAD_BYTES} bytes)"}), 413
@@ -760,8 +761,16 @@ def upload_trip():
     # -----------------------------------------------------------------
     # Step 2: Read and parse the GPX body
     # -----------------------------------------------------------------
-    # Over MAX_CONTENT_LENGTH, get_data() raises 413 (payload_too_large).
-    raw = request.get_data(cache=False)
+    if request.content_length is None:
+        # Werkzeug otherwise truncates a terminated stream at the cap,
+        # hiding overflow. Allow one extra byte on this request only,
+        # before request.stream is first accessed and its limit is cached.
+        request.max_content_length = MAX_UPLOAD_BYTES + 1
+        raw = request.stream.read(MAX_UPLOAD_BYTES + 1)
+    else:
+        # Over MAX_CONTENT_LENGTH, get_data() raises 413 before reading,
+        # so payload_too_large() can still discard the entire unread body.
+        raw = request.get_data(cache=False)
     if not raw:
         return jsonify({"error": "empty request body"}), 400
     if len(raw) > MAX_UPLOAD_BYTES:

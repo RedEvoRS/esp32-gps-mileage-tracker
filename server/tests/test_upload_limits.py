@@ -84,6 +84,45 @@ class EarlyReplies(unittest.TestCase):
                                     content_length=len(payload), headers=headers)
         return response, stream.tell()
 
+    def post_chunked(self, payload):
+        """Gunicorn exposes dechunked bytes and marks the input terminated."""
+        stream = io.BytesIO(payload)
+        response = self.client.post(
+            "/upload", headers={"Authorization": f"Bearer {TOKEN}",
+                                "Transfer-Encoding": "chunked",
+                                "X-Trip-Id": f"chunked-{len(payload)}"},
+            environ_overrides={"wsgi.input": stream, "CONTENT_LENGTH": None,
+                               "wsgi.input_terminated": True})
+        return response, stream.tell()
+
+    def test_chunked_over_cap_gets_json_413(self):  # #116
+        payload = gpx(25)
+        self.assertGreater(len(payload), CAP)
+        response, read = self.post_chunked(payload)
+        self.assertEqual(response.status_code, 413, response.get_json())
+        self.assertEqual(response.get_json(), {
+            "error": f"payload too large (limit {CAP} bytes)"})
+        self.assertEqual(read, CAP + 1)
+        self.assertEqual(list(self.root.glob("*/*")), [])
+
+    def test_chunked_over_cap_whitespace_is_not_accepted(self):
+        # Truncating at the cap used to accept this valid GPX prefix.
+        payload = gpx(2).ljust(CAP + 1, b" ")
+        response, read = self.post_chunked(payload)
+        self.assertEqual(response.status_code, 413, response.get_json())
+        self.assertEqual(read, CAP + 1)
+        self.assertEqual(list(self.root.glob("*/*")), [])
+
+    def test_chunked_at_or_just_under_cap_is_accepted(self):
+        for size in (CAP - 1, CAP):
+            with self.subTest(size=size):
+                payload = gpx(2).ljust(size, b" ")
+                response, read = self.post_chunked(payload)
+                self.assertEqual(response.status_code, 200, response.get_json())
+                self.assertEqual(read, size)
+                stored = self.root / response.get_json()["stored_as"]
+                self.assertEqual(stored.read_bytes(), payload)
+
     def test_over_cap_gets_json_413(self):  # #10
         response, _ = self.post(gpx(20))
         self.assertEqual(response.status_code, 413)
@@ -97,12 +136,12 @@ class EarlyReplies(unittest.TestCase):
         self.assertEqual(read, len(payload))
 
     def test_401_reads_the_body_before_replying(self):  # #29
-        payload = gpx(2)
-        for token in ("wrong-token", None):
-            with self.subTest(token=token):
-                response, read = self.post(payload, token=token)
-                self.assertEqual(response.status_code, 401)
-                self.assertEqual(read, len(payload))
+        for payload in (gpx(2), gpx(20)):
+            for token in ("wrong-token", None):
+                with self.subTest(token=token, size=len(payload)):
+                    response, read = self.post(payload, token=token)
+                    self.assertEqual(response.status_code, 401)
+                    self.assertEqual(read, len(payload))
 
     def test_body_past_the_discard_limit_is_left_unread(self):  # #29
         with mock.patch.object(self.ing, "MAX_DISCARD_BYTES", CAP + 1):
@@ -117,6 +156,12 @@ class EarlyReplies(unittest.TestCase):
         response, read = self.post(payload)
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(read, len(payload))
+
+    def test_content_length_exactly_at_cap_is_accepted(self):
+        payload = gpx(2).ljust(CAP, b" ")
+        response, read = self.post(payload)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(read, CAP)
 
 
 class DefaultCap(unittest.TestCase):
