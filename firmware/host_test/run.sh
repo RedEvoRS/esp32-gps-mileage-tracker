@@ -37,6 +37,12 @@ echo "== test_pmu_startup_event"
 "${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_pmu_startup_event.cpp" -o "$build/test_pmu_startup_event.exe"
 "$build/test_pmu_startup_event.exe" || status=1
 
+echo "== test_event_log"
+"${cxx[@]}" -std=c++14 -O1 -UNDEBUG -Wall -Wextra -pedantic -pthread "${incs[@]}" \
+    "$here/test_event_log.cpp" "$here/../04_trip_logger/event_log.cpp" -o "$build/test_event_log.exe"
+"$build/test_event_log.exe" || status=1
+"${PYTHON:-python}" "$here/check_event_log_protocol.py" "$build/test_event_log.exe" || status=1
+
 echo "== test_fs"
 "${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_fs.cpp" -o "$build/test_fs.exe"
 "$build/test_fs.exe" "$build/out" || status=1

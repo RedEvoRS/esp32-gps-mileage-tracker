@@ -116,8 +116,9 @@ CI runs all of these on every PR:
   real SQLite, and local fake HTTP receivers for ntfy, GELF and Loki.
   `test_backup` needs bash and rsync, so it skips on Windows; run it in
   WSL (`wsl -d Ubuntu -- python3 -m unittest server/tests/test_backup.py`).
-- Firmware: `bash firmware/host_test/run.sh` (`test_fs`, and `test_gps`
-  against the real TinyGPSPlus). No host compiler on this PC: set
+- Firmware: `bash firmware/host_test/run.sh` (filesystem, I2C/PMU, diagnostics
+  journal/catalog, Python protocol bridge, and GPS against real TinyGPSPlus).
+  No host compiler on this PC: set
   `CXX="<venv python> -m ziglang c++"`.
 - Firmware compile: all four sketches for the Supreme (ESP32-S3), with
   pinned Arduino tools and libraries.
