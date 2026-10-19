@@ -53,10 +53,14 @@ int main() {
     assert(gsv.inView(15000) == 32);
     assert(gsv.inView(15001) == 0);  // other talkers expired independently
     assert(gsv.inView(25001) == -1);
+    // Isolate rollover from the earlier observations at timestamp zero.
+    TinyGPSPlus rolloverGps;
+    DebugGsv rolloverGsv(rolloverGps);
     g_millis = UINT32_MAX - 1000;
-    feed(gps, gsv, "GPGSV,1,1,04");
-    assert(gsv.inView(1000) == 4);   // millis rollover
-    assert(gsv.inView(15000) == -1);
+    feed(rolloverGps, rolloverGsv, "GPGSV,1,1,04");
+    assert(rolloverGsv.inView(1000) == 4);   // millis rollover
+    assert(rolloverGsv.inView(13999) == 4);  // exactly 15000 ms old
+    assert(rolloverGsv.inView(14000) == -1); // expires after 15000 ms
 
     DebugStatus s;
     s.state = "ACTIVE"; s.now = 754000; s.inView = 32; s.used = 12;
