@@ -110,6 +110,7 @@ names no issue numbers on purpose, because they go stale; keep it that way.
 CI runs all of these on every PR:
 - PII: `python tools/check_pii.py` (add `--commits origin/main..HEAD`
   before pushing) and `python -m unittest discover -s tools`.
+  The scanner checks positions and new commit dates; commit with TZ=UTC.
 - Server: `python -m unittest discover -s server/tests` and
   `node server/tests/test_viewer_map.js`. Needs the service requirements
   installed. Monitor needs no additional dependencies and uses fake time,
@@ -284,10 +285,10 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   everything from its private period too, so docs, examples, tests,
   commit messages, issues and PRs use placeholders (`<user>`, `<host>`,
   `<username>`, `~\Documents\...`), never a real name, account path,
-  email, SSID/MAC, home coordinates, or a photo with EXIF. Commit with the
-  GitHub noreply email. `tools/check_pii.py` enforces this in CI for files
-  and commits (not issue or PR text); names come from the `PII_DENYLIST`
-  secret or a gitignored `.pii-denylist`
+  email, SSID/MAC, real coordinates, or a photo with EXIF. Use the
+  GitHub noreply email and commit with TZ=UTC. `tools/check_pii.py` enforces
+  this in CI for files and commits (not issue or PR text); names come from
+  the `PII_DENYLIST` secret or a gitignored `.pii-denylist`
 - Change the repo's visibility. The owner decides when it goes public
 - Bring commits over from the private archive repo: no merge, cherry-pick,
   or adding it as a remote. Its history carries a personal email and
