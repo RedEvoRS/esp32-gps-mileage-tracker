@@ -82,8 +82,9 @@ static int logCount(const char* frag) {
     return n;
 }
 
-// One fix per second at `mps`, heading north. Like buildFix(), a fix has
-// UTC only once gClockSet says the clock is synchronized.
+// One synthetic fix per second at `mps`, heading north. In this FSM-only
+// harness gClockSet models whether the RMC supplied a valid epoch; the real
+// parser's independence from the system clock is checked by test_gps.
 static void drive(float mps, int seconds) {
     for (int i = 0; i < seconds; ++i) {
         g_millis += 1000; g_epochMs += 1000;
@@ -118,7 +119,7 @@ static std::vector<std::string> times(const std::string& d) {
         v.push_back(d.substr(p + 6, d.find("</time>", p) - p - 6));
     return v;
 }
-static std::string iso(uint64_t ms) { char b[24]; isoFromEpochMs(ms, b, sizeof b); return b; }
+static std::string iso(uint64_t ms) { char b[25]; isoFromEpochMs(ms, b, sizeof b); return b; }
 static bool logHas(const char* frag) {
     for (auto& l : Serial.log) if (l.find(frag) != std::string::npos) return true; return false;
 }
@@ -937,7 +938,7 @@ int main(int argc, char** argv) {
             dump("T34");
         }
 
-        // UTC from the GPS mid-trip: the buffered points are back-dated.
+        // Valid RMC epochs mid-trip cannot back-date earlier untimed points.
         resetWorld();
         gClockSet = false;
         g_epochBaseMs = 0;
@@ -949,9 +950,9 @@ int main(int argc, char** argv) {
         endTrip(false);
         auto v = tripFiles();
         auto t = v.size() == 1 ? times(g_disk.files[v[0]]) : std::vector<std::string>();
-        bool exact = t.size() == 40;
-        for (size_t i = 0; exact && i < t.size(); ++i) exact = t[i] == iso(first + i * 1000);
-        CHECK(exact, "GPS UTC mid-trip: every point timed, the buffered ones back-dated exactly");
+        bool exact = t.size() == 20;
+        for (size_t i = 0; exact && i < t.size(); ++i) exact = t[i] == iso(first + (i + 20) * 1000);
+        CHECK(exact, "RMC UTC mid-trip: only fixes carrying their own epoch get times");
 
         // NTP syncs the clock (core 0), and the trip ends before another fix.
         resetWorld();
@@ -964,9 +965,7 @@ int main(int argc, char** argv) {
         endTrip(false);
         v = tripFiles();
         t = v.size() == 1 ? times(g_disk.files[v[0]]) : std::vector<std::string>();
-        exact = t.size() == 20;
-        for (size_t i = 0; exact && i < t.size(); ++i) exact = t[i] == iso(first + i * 1000);
-        CHECK(exact, "NTP before the trip closes: buffered points back-dated exactly");
+        CHECK(t.empty(), "NTP before the trip closes cannot invent epochs for buffered points");
         g_epochBaseMs = clock0;
     }
 
@@ -1231,18 +1230,18 @@ int main(int argc, char** argv) {
         resetWorld();
         gClockSet = false;
         drive(15, 300);
-        const uint64_t firstTimed = g_epochMs - 89000;
+        const uint64_t firstTimed = g_epochMs + 1000;
         g_epochBaseMs = g_epochMs - g_millis;
         gClockSet = true;
         drive(15, 30); endTrip(false);
         const std::string& d = g_disk.files.begin()->second;
         const auto ts = times(d);
-        bool exact = ts.size() == 120;
+        bool exact = ts.size() == 30;
         for (size_t i = 0; exact && i < ts.size(); ++i) exact = ts[i] == iso(firstTimed + i * 1000);
         CHECK(wellFormedShape(d) && count(d, "<trkpt ") == 330 && exact,
-              "late UTC back-dates the 90 buffered fixes and times new ones exactly");
-        CHECK(count(d.substr(0, d.find("<time>")), "<trkpt ") == 211,
-              "the first 210 points stay untimed and precede the timed tail");
+              "late RMC UTC times only new fixes, preserving every earlier untimed point");
+        CHECK(count(d.substr(0, d.find("<time>")), "<trkpt ") == 301,
+              "the first 300 points stay untimed and precede the timed tail");
         dump("T42_late_utc");
 
         resetWorld();
@@ -1325,8 +1324,8 @@ int main(int argc, char** argv) {
                   count(d.substr(0, first), "<trkpt ") == prefix &&
                   count(d.substr(0, second), "<trkpt ") == prefix + 31,
                   "segment starts appear at the first post-gap fixes after ring wrap");
-            CHECK(lateUtc ? times(d).size() == 100 : times(d).empty(),
-                  "late UTC back-dates only the buffered tail without moving segment boundaries");
+            CHECK(lateUtc ? times(d).size() == 10 : times(d).empty(),
+                  "late RMC UTC times only new fixes without moving segment boundaries");
         }
         // UTC arriving while the marked fix is still buffered uses flushPending,
         // rather than the spill path exercised above.
@@ -1337,7 +1336,7 @@ int main(int argc, char** argv) {
         g_epochBaseMs = g_epochMs - g_millis; gClockSet = true;
         drive(15, 10); endTrip(false);
         const std::string& d = g_disk.files.begin()->second;
-        CHECK(count(d, "<trkpt ") == 31 && times(d).size() == 31 &&
+        CHECK(count(d, "<trkpt ") == 31 && times(d).size() == 10 &&
               count(d.substr(0, d.find("</trkseg><trkseg>")), "<trkpt ") == 20,
               "late-UTC flush places a still-buffered segment marker on its own fix");
     }

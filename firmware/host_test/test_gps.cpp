@@ -75,6 +75,12 @@ static std::vector<std::string> sentences(const Epoch& e, bool ggaFirst = false)
 
 static double gLat = 37.0, gLon = -122.0;
 static int gT = 0;
+// Reuse the harness's invented position; clock fields are independent of it.
+static std::string rmc(const std::string& time, const std::string& date,
+                       const std::string& talker = "GNRMC") {
+    return nmea(talker + "," + time + ",A," + coord(gLat, true) + "," +
+                coord(gLon, false) + ",29.158,0.00," + date + ",,,A");
+}
 static std::string navPvt(uint32_t tow, uint32_t sAcc, uint32_t hAcc = 2000,
                           uint8_t fixType = 3, uint8_t flags = 1, int32_t speed = 15000);
 
@@ -961,6 +967,76 @@ int main(int argc, char** argv) {
         CHECK(gTripMeters > meters + 14 && gTripMeters < meters + 16,
               "distance resumes only on the step after the confirming fix");
         endTrip(false); dump("G32");
+    }
+
+    printf("G33 RMC epochs survive variable processing delays and clock drift\n");
+    {
+        resetWorld(); run(15, 12);
+        g_epochBaseMs += 20000; // drift, with GPS clock sync still rate limited
+        const uint32_t arrivals[] = {12000, 14050, 14100, 15000, 17050, 17100};
+        for (int i = 0; i < 6; ++i) {
+            auto ss = sentences({12 + i, gLat, gLon, 15, true});
+            // A GSV burst ahead of RMC models delayed processing at 9600 baud.
+            g_millis = arrivals[i];
+            GPSSerial.rx += ss[4] + ss[5] + ss[6] + ss[0]; loop();
+        }
+        endTrip(false);
+        auto pts = trkpts(g_disk.files.begin()->second);
+        bool exact = pts.size() == 18;
+        for (size_t i = 0; i < pts.size(); ++i) {
+            char want[32]; snprintf(want, sizeof want, "2026-04-14T14:30:%02uZ", unsigned(i));
+            exact &= field(pts[i], "time") == want;
+        }
+        CHECK(exact, "every 1 Hz point has exact 1 s epoch steps despite a delayed GSV burst and RTC drift");
+        dump("G33");
+    }
+
+    printf("G34 same-sentence dates, midnight rollover and fractional formatting\n");
+    for (const char* talker : {"GNRMC", "GPRMC"}) {
+        resetWorld(); run(15, 12);
+        g_millis += 1000; GPSSerial.rx += rmc("235959.99", "140426", talker); loop();
+        // A new GGA time must not mix with the previous RMC date.
+        g_millis += 1000;
+        GPSSerial.rx += nmea("GNGGA,000000.55," + coord(gLat, true) + "," + coord(gLon, false) +
+                            ",1,09,0.90,12.5,M,-30.0,M,,"); loop();
+        GPSSerial.rx += rmc("000000.00", "150426", talker); loop();
+        for (const char* t : {"000001.01", "000002.10", "000003.25", "000004.99", "000005"}) {
+            g_millis += 1000; GPSSerial.rx += rmc(t, "150426", talker); loop();
+        }
+        endTrip(false);
+        auto pts = trkpts(g_disk.files.begin()->second);
+        const char* expected[] = {"2026-04-14T23:59:59.990Z", "2026-04-15T00:00:00Z",
+            "2026-04-15T00:00:01.010Z", "2026-04-15T00:00:02.100Z",
+            "2026-04-15T00:00:03.250Z", "2026-04-15T00:00:04.990Z", "2026-04-15T00:00:05Z"};
+        bool exact = pts.size() == 19;
+        for (size_t i = 0; i < 7 && 12 + i < pts.size(); ++i)
+            exact &= field(pts[12 + i], "time") == expected[i];
+        CHECK(exact, "GN/GP RMC uses its matching date, whole seconds or three fractional digits including leading zeros");
+        dump(talker);
+    }
+
+    printf("G35 invalid RMC date/time stays untimed even with a synchronized clock\n");
+    for (const char* talker : {"GNRMC", "GPRMC"}) {
+        resetWorld(); run(15, 12);
+        const std::pair<const char*, const char*> invalid[] = {
+            {"143012.00", ""}, {"", "140426"}, {"", ""}, {"bad", "140426"},
+            {"250000.00", "140426"}, {"143015.00", "000026"},
+            {"143016.", "140426"}, {"143016.xy", "140426"}};
+        for (const auto& fields : invalid) {
+            g_millis += 1000;
+            GPSSerial.rx += rmc(fields.first, fields.second, talker); loop();
+            CHECK(gClockSet && !gLastFix.hasUtc, "cached date/time or system UTC cannot supply an invalid RMC epoch");
+        }
+        // Flushing on the next valid epoch must not retroactively time them.
+        g_millis += 1000; GPSSerial.rx += rmc("143020.50", "140426", talker); loop();
+        g_millis += 1000; GPSSerial.rx += rmc("", "", talker); loop();
+        endTrip(false); // flush the remaining untimed tail with system UTC set
+        auto pts = trkpts(g_disk.files.begin()->second);
+        bool exact = pts.size() == 22;
+        for (size_t i = 12; i < pts.size(); ++i)
+            exact &= field(pts[i], "time") == (i == 20 ? "2026-04-14T14:30:20.500Z" : "");
+        CHECK(exact, "both timed-fix flush and trip-end flush preserve missing times and point order");
+        dump((std::string("G35_") + talker).c_str());
     }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);

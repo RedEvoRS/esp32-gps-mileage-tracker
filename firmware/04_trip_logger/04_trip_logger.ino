@@ -21,9 +21,9 @@
 //      goes away), finalize the current trip cleanly and keep the file
 //      for the next time we're home.
 //
-// Time comes from the GPS (UTC). There is no battery-backed wall clock,
-// so until the first fix we buffer points by millis() and back-date them
-// once UTC arrives. Fresh GPS time corrects the system clock every minute.
+// Trackpoint UTC comes from each position's own RMC date/time, including
+// centiseconds; missing RMC epochs stay untimed even after a clock sync.
+// Fresh GPS time independently corrects the system clock every minute.
 //
 // Required libraries (U8g2 is only needed with DISPLAY_DEBUG):
 //   XPowersLib (lewisxhe), TinyGPSPlus (Mikal Hart). WiFi, HTTPClient,
@@ -264,7 +264,7 @@ static bool gLatestSpeedTrusted = false;
 #define FS_LOCK()   xSemaphoreTake(gFsMutex, portMAX_DELAY)
 #define FS_UNLOCK() xSemaphoreGive(gFsMutex)
 
-// A single GPS fix, with both a monotonic and (once known) a UTC stamp.
+// A single GPS fix, with monotonic receipt time and its own RMC UTC epoch.
 struct Fix {
     double   lat, lon;
     float    speedMps, hdop;
@@ -395,12 +395,20 @@ static uint64_t nowEpochMs() {
     return (uint64_t)tv.tv_sec * 1000ULL + tv.tv_usec / 1000;
 }
 
-// Format epoch milliseconds as ISO 8601 UTC, e.g. 2026-04-14T14:30:15Z.
+// ISO 8601 UTC: whole seconds stay compact; retain nonzero milliseconds.
 static void isoFromEpochMs(uint64_t ms, char* out, size_t n) {
     time_t secs = (time_t)(ms / 1000);
     struct tm tmv;
     gmtime_r(&secs, &tmv);
-    if (n && strftime(out, n, "%Y-%m-%dT%H:%M:%SZ", &tmv) == 0) out[0] = 0;
+    char seconds[20];
+    if (strftime(seconds, sizeof(seconds), "%Y-%m-%dT%H:%M:%S", &tmv) == 0) {
+        if (n) out[0] = 0;
+        return;
+    }
+    unsigned fraction = ms % 1000;
+    int written = fraction ? snprintf(out, n, "%s.%03uZ", seconds, fraction) :
+                             snprintf(out, n, "%sZ", seconds);
+    if (n && (written < 0 || size_t(written) >= n)) out[0] = 0;
 }
 
 // Convert a UTC struct tm to a Unix epoch. The newlib that ships with
@@ -442,7 +450,10 @@ static bool validRmcClockFields(TinyGPSCustom& time, TinyGPSCustom& date) {
 // Called at each checksum-valid sentence, before another sentence can mix a
 // new GGA time with an older RMC date (especially at midnight). Reading year()
 // consumes date.isUpdated(), even while correction is rate limited.
-static void setClockFromGps() {
+// Also capture this sentence's epoch before the rate-limited clock sync
+// consumes date/time's updated flags. Never add receipt age to a trackpoint.
+static void setClockFromGps(uint64_t* rmcUtcMs = nullptr) {
+    if (rmcUtcMs) *rmcUtcMs = 0;
     if (!gps.date.isUpdated()) return;
     // TinyGPSPlus renews cached date/time even when an RMC field is empty.
     // Check the sentence's raw fields before trusting its parsed values.
@@ -457,13 +468,15 @@ static void setClockFromGps() {
     tmv.tm_hour = gps.time.hour();
     tmv.tm_min  = gps.time.minute();
     tmv.tm_sec  = gps.time.second();
-    unsigned subsecondMs = gps.time.centisecond() * 10 + gps.time.age();
+    unsigned rmcFractionMs = gps.time.centisecond() * 10;
+    unsigned subsecondMs = rmcFractionMs + gps.time.age();
     if (!fresh || tmv.tm_year < 124 || tmv.tm_mon < 0 || tmv.tm_mon > 11 ||
         tmv.tm_mday < 1 || tmv.tm_mday > 31 || tmv.tm_hour > 23 ||
         tmv.tm_min > 59 || tmv.tm_sec > 59) return;
+    time_t t = timegmUtc(&tmv);
+    if (rmcUtcMs) *rmcUtcMs = uint64_t(t) * 1000 + rmcFractionMs;
     uint32_t now = millis();
     if (gGpsClockSet && now - gLastGpsSyncMs < GPS_CLOCK_SYNC_MS) return;
-    time_t t = timegmUtc(&tmv);
     struct timeval tv = { .tv_sec = t + subsecondMs / 1000,
                           .tv_usec = (long)(subsecondMs % 1000) * 1000 };
     if (settimeofday(&tv, nullptr) != 0) return;
@@ -530,7 +543,7 @@ static void makeTripPath(char* out, size_t n) {
 static void appendTrkpt(FileWriter& w, const Fix& fx) {
     char timeEl[40] = "";
     if (fx.hasUtc) {
-        char iso[24];
+        char iso[25];
         isoFromEpochMs(fx.utcMs, iso, sizeof(iso));
         snprintf(timeEl, sizeof(timeEl), "<time>%s</time>", iso);
     }
@@ -555,22 +568,12 @@ static void pushPending(const Fix& fx) {
     gPendCount++;
 }
 
-// Write all buffered fixes to the open trip file, back-dating each from
-// the now-known UTC and its monotonic stamp. Called once, the first time
-// UTC becomes available during an active trip -- or when a trip that never
-// got UTC is closed. Those points get no time at all: until a source has
-// synchronized it, the system clock reads 1970 or a date carried over deep
-// sleep, and a made-up date can file the miles under the wrong day or year.
+// Write buffered fixes in order, preserving their original timing status.
+// A missing/invalid RMC epoch stays untimed even after GPS or NTP sets the
+// system clock: receipt delays cannot reconstruct the position's epoch.
 static void flushPending(FileWriter& w) {
-    // Read the flag before the clock: core 0 sets the clock from NTP first,
-    // then the flag.
-    bool trusted = gClockSet.load();
-    uint64_t utcNow = nowEpochMs();
-    uint32_t monoNow = millis();
     for (size_t i = 0; i < gPendCount; ++i) {
-        Fix p = gPend[(gPendHead + i) % PENDING_CAPACITY];
-        p.hasUtc = trusted;
-        p.utcMs  = trusted ? utcNow - (uint64_t)(monoNow - p.monoMs) : 0;
+        const Fix& p = gPend[(gPendHead + i) % PENDING_CAPACITY];
         appendTrkpt(w, p);
     }
     gPendCount = gPendHead = 0;
@@ -580,8 +583,8 @@ static void flushPending(FileWriter& w) {
 // Trip lifecycle
 // =================================================================
 // Reserve the pending tail, one more point (including a segment break),
-// and the closing tags. A point is at most 255 bytes, even when back-dated
-// with UTC. Checking after each fix leaves the complete file below 8 MiB.
+// and the closing tags. A point is at most 255 bytes, including fractional
+// UTC. Checking after each fix leaves the complete file below 8 MiB.
 static bool tripShouldSplit(size_t bytes, size_t pendingCount) {
     return bytes + (pendingCount + 1) * (TRKPT_LINE_BYTES - 1) +
            strlen(GPX_EPILOGUE) >= TRIP_SPLIT_BYTES;
@@ -651,8 +654,8 @@ static bool beginTrip(const Fix& fx) {
         w.put(GPX_PROLOGUE);
         // Write the fixes captured during ARMING (includes the current
         // fix, pushed by the FSM before calling us) so the first ~10 s
-        // of the drive is in the file. Pre-UTC fixes go to the pending
-        // buffer and are back-dated when UTC arrives, same as any other.
+        // of the drive is in the file. Fixes without RMC UTC go to the
+        // pending buffer and retain their untimed status when flushed.
         for (size_t i = 0; i < gArmCount; ++i) {
             const Fix& p = gArmBuf[(gArmHead + i) % 16];
             if (p.hasUtc) {
@@ -701,8 +704,8 @@ static bool beginTrip(const Fix& fx) {
 
 // Append a point to the active trip, buffering instead if UTC isn't
 // available yet. If the buffer is full, commit its oldest point untimed
-// before accepting this one. Once UTC arrives, back-date the buffered tail;
-// points already committed without times stay untimed.
+// before accepting this one. A timed RMC flushes the buffered untimed tail
+// first; points without their own RMC epoch always stay untimed.
 // Returns false if the write didn't reach flash; the caller must end the
 // trip, since a partial line may now sit at the tail of the file.
 static bool writeOrBufferTrkpt(const Fix& fx) {
@@ -776,7 +779,7 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
                 FileWriter w(f);
                 // Flush any still-buffered (never-got-UTC) points before
                 // closing, so a trip that never got UTC isn't lost. They're
-                // written without times unless the clock is now trusted.
+                // written without times regardless of the system clock.
                 if (gPendCount > 0) flushPending(w);
                 w.put(GPX_EPILOGUE);
                 ok = w.commit();
@@ -1878,7 +1881,7 @@ static bool rmcFixArrived() {
 // =================================================================
 // Build a Fix from the current TinyGPSPlus state
 // =================================================================
-static bool buildFix(Fix& fx) {
+static bool buildFix(Fix& fx, uint64_t rmcUtcMs) {
     if (!gps.location.isValid()) return false;
     fx.lat       = gps.location.lat();
     fx.lon       = gps.location.lng();
@@ -1887,8 +1890,8 @@ static bool buildFix(Fix& fx) {
     gLatestSpeedTrusted = fx.speedTrusted;
     fx.hdop      = gps.hdop.isValid() ? gps.hdop.hdop() : 99.9f;
     fx.monoMs    = millis();
-    fx.hasUtc    = gClockSet.load();
-    fx.utcMs     = fx.hasUtc ? nowEpochMs() : 0;
+    fx.hasUtc    = rmcUtcMs != 0;
+    fx.utcMs     = rmcUtcMs;
     return true;
 }
 
@@ -1904,10 +1907,11 @@ static void receiveGpsNmea(uint8_t c) {
 #if DISPLAY_DEBUG
     gDebugGsv.update(millis());
 #endif
-    setClockFromGps();
+    uint64_t rmcUtcMs = 0;
+    setClockFromGps(&rmcUtcMs);
     if (rmcFixArrived()) {
         Fix fx;
-        if (buildFix(fx)) {
+        if (buildFix(fx, rmcUtcMs)) {
             if (gHaveLastFix && (fx.monoMs - gLastFix.monoMs) > SEG_GAP_MS) {
                 if (gState == ACTIVE || gState == COOLDOWN) {
                     fx.newSegment = true;
