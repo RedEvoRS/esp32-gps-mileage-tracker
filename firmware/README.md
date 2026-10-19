@@ -655,13 +655,19 @@ How it behaves once flashed:
   the 3 minutes parked at the end) or 0.1 mi are discarded as noise.
   Speed must also pass the GPS receiver's accuracy check: a checksum-valid
   NAV-PVT received within 1.5 s, with `gnssFixOK`, a 3D or combined fix,
-  and `sAcc` at most 0.5 m/s when starting, or 1.0 m/s during a trip.
+  and `sAcc` at most 0.5 m/s plus `hAcc` at most 5 m when starting,
+  or 1.0 m/s plus 10 m during a trip.
   These are first guesses to calibrate from indoor and drive logs. The
   arrival window tolerates either message order at 1 Hz, so the latest
   sample may belong to the previous epoch; it does not change GPX times.
   Rejected speeds count as stopped: arming resets, or an active trip enters
   its normal three-minute cooldown. Rejected points enter neither GPX nor
-  the distance total, and distance never bridges across them. A gap over
+  the distance total, and distance never bridges across them. Leaving
+  cooldown requires three consecutive trusted fixes above 2 mph; any other
+  fix resets that count, while the original three-minute deadline keeps
+  running. Trusted cooldown fixes still enter GPX but add no distance or
+  moving duration. The third moving fix resumes ACTIVE and establishes a
+  new distance baseline, without bridging across cooldown. A gap over
   five seconds between accepted points starts a new track segment. The
   separate five-minute watchdog still ends a trip if all fixes disappear.
   Fallback is disabled until boot GPS configuration finishes, whether it

@@ -97,6 +97,9 @@ static constexpr uint32_t COOL_MS         = 180UL * 1000;    // sustain to end
 // First guesses: calibrate from drive/indoor logs; err low on mileage.
 static constexpr float    SPEED_ACC_ARM_MPS = 0.5f;
 static constexpr float    SPEED_ACC_TRIP_MPS = 1.0f;
+static constexpr float    HACC_ARM_M      = 5.0f;
+static constexpr float    HACC_TRIP_M     = 10.0f;
+static constexpr unsigned RESUME_FIXES    = 3; // consecutive trusted moving fixes
 // Arrival-time association, allowing either UBX/NMEA ordering at 1 Hz.
 static constexpr uint32_t NAV_PVT_FRESH_MS = 1500;
 static constexpr uint32_t NAV_PVT_FALLBACK_MS = 10000;
@@ -314,6 +317,7 @@ static size_t gPendHead = 0, gPendCount = 0;
 enum TripState { IDLE, ARMING, ACTIVE, COOLDOWN, FINALIZING };
 static TripState gState = IDLE;
 static uint32_t  gArmT0 = 0, gCoolT0 = 0, gTripT0 = 0;
+static unsigned  gResumeFixes = 0;
 static uint32_t  gLastMoveMs = 0;       // the active trip's last moving fix
 static uint32_t  gFsCheckT0 = 0;        // last free-space check during a trip
 static uint32_t  gFullWarnT0 = 0;       // last "storage full" log line
@@ -344,9 +348,10 @@ static void serviceGpsSpeedFallback() {
 static bool gpsSpeedTrusted(bool starting) {
     if (gSpeedFallback) return true;
     float limit = starting ? SPEED_ACC_ARM_MPS : SPEED_ACC_TRIP_MPS;
+    float hAccLimit = starting ? HACC_ARM_M : HACC_TRIP_M;
     return gNavPvt.seen && uint32_t(millis() - gNavPvt.receivedMs) <= NAV_PVT_FRESH_MS &&
            (gNavPvt.flags & 1) && (gNavPvt.fixType == 3 || gNavPvt.fixType == 4) &&
-           gNavPvt.sAccMmps <= limit * 1000.0f;
+           gNavPvt.sAccMmps <= limit * 1000.0f && gNavPvt.hAccMm <= hAccLimit * 1000.0f;
 }
 
 static void armBufReset() { gArmHead = gArmCount = 0; }
@@ -807,12 +812,10 @@ static void tripFsmOnFix(const Fix& fx) {
     const uint32_t now = fx.monoMs;
     const float speed = fx.speedTrusted ? fx.speedMps : 0.0f;
 
-    // Distance + max speed accumulate whenever we're recording. The
-    // speed gate stops GPS jitter from adding phantom meters while
-    // stationary (3 min parked in COOLDOWN scatters tens of meters);
-    // erring low is the IRS-safe direction. The same gate marks the last
-    // moving fix, where endTrip() measures the trip's duration to.
-    if ((gState == ACTIVE || gState == COOLDOWN) && speed > END_MPS) {
+    // Only ACTIVE movement adds distance. COOLDOWN noise must neither add
+    // meters nor extend the last moving time used by endTrip(). Resuming
+    // establishes a new distance baseline at the confirming fix, erring low.
+    if (gState == ACTIVE && speed > END_MPS) {
         if (gHaveLastFix && gDistanceContinuous)
             gTripMeters += haversineM(gLastFix.lat, gLastFix.lon, fx.lat, fx.lon);
         gLastMoveMs = now;
@@ -848,14 +851,17 @@ static void tripFsmOnFix(const Fix& fx) {
         break;
     case ACTIVE:
         if ((fx.speedTrusted && !writeOrBufferTrkpt(fx)) || tripStorageLow(now)) { gState = FINALIZING; break; }
-        if (speed <= END_MPS) { gState = COOLDOWN; gCoolT0 = now; }
+        if (speed <= END_MPS) { gState = COOLDOWN; gCoolT0 = now; gResumeFixes = 0; }
         break;
     case COOLDOWN:
         if ((fx.speedTrusted && !writeOrBufferTrkpt(fx)) || tripStorageLow(now)) { gState = FINALIZING; break; }
-        if (speed > END_MPS) {
-            gState = ACTIVE;
-        } else if (now - gCoolT0 >= COOL_MS) {
+        gResumeFixes = speed > END_MPS ? gResumeFixes + 1 : 0;
+        // Keep the original deadline while collecting evidence of movement.
+        if (now - gCoolT0 >= COOL_MS) {
             gState = FINALIZING;
+        } else if (gResumeFixes >= RESUME_FIXES) {
+            gState = ACTIVE;
+            gLastMoveMs = now;
         }
         break;
     case FINALIZING:
@@ -896,7 +902,7 @@ static void tripFsmOnFix(const Fix& fx) {
         gLastFix = fx;
         gHaveLastFix = true;
     }
-    gDistanceContinuous = fx.speedTrusted;
+    gDistanceContinuous = fx.speedTrusted && gState == ACTIVE;
     gLastFixMonoMs = now;
 }
 
