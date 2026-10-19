@@ -183,9 +183,9 @@ retried. JSON lines use only current catalog fields and bounded context, with
 Importable panel and LogQL alert examples are in `grafana/`; see
 DEPLOY_DEBIAN.md Step 11f.
 
-Consistent DB backups/restores, including monitor state, remain #129. The
-existing trip backup does not include either optional named volume. Full
-policy and schema details are in [DIAGNOSTICS.md](../DIAGNOSTICS.md).
+Backups include consistent diagnostics and monitor-state database snapshots.
+The optional ntfy volume (users, tokens and cached messages) needs a separate
+backup. Full policy and schema details are in [DIAGNOSTICS.md](../DIAGNOSTICS.md).
 
 ## First-Time Setup
 
@@ -494,19 +494,54 @@ annotations persist in the `viewer-db` volume.
 
 ## Backup
 
-Two things need backing up: the trip files in `./data`, and the viewer's
-annotations database in the `viewer-db` volume. The database is the one
-that matters most. It holds the business/personal tags and purposes, and
-it can't be rebuilt from the trips.
+Back up the trip files in `./data` and the viewer's `annotations.db` in the
+`viewer-db` volume. Annotations hold the business/personal tags, purposes and
+destinations; they cannot be rebuilt from the trips. Backups also preserve
+`data/diagnostics/events.db` (device history and current health) and, when its
+`monitor-state` volume exists, `/state/monitor.db` (alert delivery state and
+export cursors).
 
-`backup/backup.sh` handles both. Run daily by the systemd timer in
-`backup/`, it takes a consistent SQLite snapshot (never a copy of the
-live file), copies `data/` under ingest's upload lock, keeps dated,
-checksummed snapshots locally, and rsyncs them to another machine,
-then reads the copy there back to verify it. `backup/restore.sh check`
-is the restore test: it pulls the newest off-host snapshot and checks
-every file and the database without touching anything live.
-`backup/restore.sh restore` puts a snapshot back.
+`backup/backup.sh` runs daily through the systemd timer in `backup/`. It uses
+SQLite's backup API and checks each database's integrity. A throwaway viewer
+container reads annotations and diagnostics (its `/data` mount is read-only);
+a throwaway monitor container reads monitor state, even if the monitor service
+is stopped. A missing diagnostics DB means no diagnostics yet. An absent
+monitor volume or missing monitor DB is recorded and skipped. Discovery reads
+the project name from `docker compose config --format json`, then lists volumes
+with both `com.docker.compose.project=<project>` and
+`com.docker.compose.volume=monitor-state` labels. This honors project overrides
+and custom volume names without recent Compose flags. Config and parser errors
+are suppressed to keep service credentials out of logs. If discovery fails or
+returns an ambiguous result, one warning is logged, `INFO` records
+`monitor=unknown`, and trips, annotations and diagnostics are still backed up.
+No monitor helper is run for an absent or unknown volume during backup, and no
+optional service is enabled by a backup.
+
+The script copies trip files under ingest's upload lock, excluding the live
+`diagnostics/events.db` and all its SQLite sidecars (`-journal`, `-wal`, `-shm`).
+Database snapshots sit beside `annotations.db` as `events.db` and `monitor.db`,
+when present. All database files are covered by `SHA256SUMS`; `INFO` records
+annotation/event counts and monitor status. The script keeps dated local
+snapshots, rsyncs them to another machine, and verifies that copy byte for byte.
+Each SQLite snapshot is consistent individually; the databases and trip files
+are captured in sequence, rather than in one shared transaction.
+
+`backup/restore.sh check` fetches the newest off-host snapshot, verifies every
+file and database, and reports annotation/event counts and monitor state tables
+without changing live data. `backup/restore.sh restore` runs those checks,
+requires `RESTORE` confirmation (or `--yes`), stops ingest, viewer and any
+installed monitor, and saves current databases and replaced trip files under
+`pre-restore-<time>/` before restoring. Database writes use the owning service's
+throwaway container; an already running monitor is restarted afterward. On a
+replacement server, a saved monitor DB can populate its volume without enabling
+the monitor. Older snapshots still restore trips and annotations: missing new
+DB snapshots are reported and current databases are left unchanged. Any old
+live diagnostics copy under `data/` is excluded from restore too.
+
+If monitor discovery fails during restore, the script warns and restores trips,
+annotations and diagnostics, leaving the monitor service and its database alone.
+To recover monitor state separately, fix discovery and rerun the restore, or
+follow the manual monitor recovery procedure in `DEPLOY_DEBIAN.md` Step 10.
 
 The timer runs as the server login, while ingest writes private trip files
 as UID 1000. Use a UID 1000 login with this setup; giving `data/` to UID
@@ -543,8 +578,8 @@ See [DIAGNOSTICS.md](../DIAGNOSTICS.md) for the full protocol and ordering rules
 `X-Device-Id` headers on successful GPX uploads refresh contact, even before
 firmware sends diagnostics. Missing/invalid headers create no diagnostic device;
 GPX creator is never used to guess one. Diagnostics failures do not fail GPX.
-The viewer's `/device-health` page shipped in #119; consistent SQLite backups remain
-#129 (`backup.sh` currently rsyncs the live data directory).
+The viewer's `/device-health` page shipped in #119. The backup procedure above
+preserves diagnostics through SQLite snapshots rather than copying the live file.
 
 Build both images from this directory with `docker compose build`. Both service
 Dockerfiles use this directory as their context and include `common/`, including
