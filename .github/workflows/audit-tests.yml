@@ -71,7 +71,7 @@ jobs:
 
   firmware-compile:
     # One runner shares the toolchain and core build cache across all sketches.
-    # This checks compilation; the V1.2 sketches still need their Supreme port.
+    # Compilation only; OLED/SD/power behavior still needs hardware validation.
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -79,6 +79,7 @@ jobs:
       ESP32_CORE_VERSION: '3.3.11'
       XPOWERS_VERSION: '0.3.3'
       TINYGPS_VERSION: '1.0.3'
+      U8G2_VERSION: '2.36.18'
       ESP32_INDEX_URL: https://espressif.github.io/arduino-esp32/package_esp32_index.json
       FQBN: esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled
     steps:
@@ -96,14 +97,14 @@ jobs:
           path: |
             ~/.arduino15
             ~/Arduino/libraries
-          key: ${{ runner.os }}-${{ runner.arch }}-arduino-v1-cli-${{ env.ARDUINO_CLI_VERSION }}-esp32-${{ env.ESP32_CORE_VERSION }}-xpowers-${{ env.XPOWERS_VERSION }}-tinygps-${{ env.TINYGPS_VERSION }}
+          key: ${{ runner.os }}-${{ runner.arch }}-arduino-v1-cli-${{ env.ARDUINO_CLI_VERSION }}-esp32-${{ env.ESP32_CORE_VERSION }}-xpowers-${{ env.XPOWERS_VERSION }}-tinygps-${{ env.TINYGPS_VERSION }}-u8g2-${{ env.U8G2_VERSION }}
       - name: Install pinned core and libraries
         if: steps.arduino-cache.outputs.cache-hit != 'true'
         run: |
           arduino-cli core update-index --additional-urls "$ESP32_INDEX_URL"
           arduino-cli core install "esp32:esp32@$ESP32_CORE_VERSION" --additional-urls "$ESP32_INDEX_URL"
           arduino-cli lib update-index
-          arduino-cli lib install "XPowersLib@$XPOWERS_VERSION" "TinyGPSPlus@$TINYGPS_VERSION"
+          arduino-cli lib install "XPowersLib@$XPOWERS_VERSION" "TinyGPSPlus@$TINYGPS_VERSION" "U8g2@$U8G2_VERSION"
       - name: Compile all four sketches
         shell: bash
         run: |
@@ -140,6 +141,11 @@ jobs:
             fi
             arduino-cli compile --fqbn "$FQBN" --warnings default --jobs 2 \
               "${size_args[@]}" "firmware/$sketch"
+            if [ "$sketch" = 04_trip_logger ]; then
+              arduino-cli compile --fqbn "$FQBN" --warnings default --jobs 2 \
+                "${size_args[@]}" --build-property 'compiler.cpp.extra_flags=-DDISPLAY_DEBUG=0' \
+                "firmware/$sketch"
+            fi
             echo "::endgroup::"
           done
 

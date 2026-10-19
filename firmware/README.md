@@ -285,6 +285,7 @@ picking the version from each one's version list:
 
 1. **XPowersLib** by lewisxhe, version **0.3.3** — for the AXP2101 power manager
 2. **TinyGPSPlus** by Mikal Hart, version **1.0.3** — for NMEA GPS parsing
+3. **U8g2** by olikraus, version **2.36.18** — for Stage 4's debug OLED page
 
 Those are the versions the trip logger is tested with. The Library Manager
 installs the newest unless you pick one.
@@ -451,6 +452,26 @@ The rest of this section was written for the V1.2. On the Supreme
   configuration for a few seconds, so the logger retries in the
   background. Expect `GPS configured on attempt 2 (… ms after config
   start)` about 10 s after power-up.
+- **Debug screen:** `DISPLAY_DEBUG` defaults to `1` in the Stage 4 sketch.
+  Its dim SH1106 page refreshes about once a second: state/uptime;
+  satellites in view (`V`) and used (`U`); fix/HDOP/age; speed in mph;
+  current trip minutes/miles; recording store and queued complete trips (`Q`);
+  WiFi state and last upload result/age; battery percent/voltage, USB (`U`)
+  and charging (`C`, 1 = yes). Unknown or stale values show `--`. The queue
+  covers both mounted stores, cached by the network task about every 30 s
+  and after an upload batch; a just-ended trip can take one cycle to appear.
+  GSV is enabled every fifth GPS epoch (about 5 s at 1 Hz) to leave room on
+  the 9600-baud link. Counters use the latest GP/GL/GA/GB (or legacy BD)/GQ
+  talker totals and expire after 15 s. Multipart GSV totals are not added
+  repeatedly. Actual talkers/signal groups still need checking on the board.
+  This status page does not implement the later diagnostics error adapter.
+  Set `DISPLAY_DEBUG` to `0`, or compile with
+  `--build-property 'compiler.cpp.extra_flags=-DDISPLAY_DEBUG=0'`, for the
+  previous behavior: no OLED/Wire initialization and GSV silenced. Debug
+  mode uses Wire SDA17/SCL18 at 400 kHz, never the PMU's Wire1 or new rail
+  settings. A missing OLED or I2C error logs once and disables it for this
+  boot. The page shifts horizontally each minute and turns off before PMU
+  power-off; OLED supply, appearance, bus timing and current need bench checks.
 - **Expected boot log:**
 
   ```text
@@ -462,7 +483,7 @@ The rest of this section was written for the V1.2. On the Supreme
   GPS: waiting for checksum-valid NMEA (up to 3 s).
   Setup complete. Logging trips.
   GPS ready: checksum-valid NMEA received.
-  GPS configured on attempt 2 (9874 ms after config start): RMC+GGA only, automotive model.
+  GPS configured on attempt 2 (9874 ms after config start): RMC+GGA, GSV every 5 epochs, automotive model.
   ```
 
 Before flashing:

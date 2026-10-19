@@ -25,9 +25,14 @@ else
     exit 2
 fi
 
-flags=(-std=gnu++20 -O1 -w)
+flags=(-std=gnu++20 -O1 -w -DDISPLAY_DEBUG=0)
 incs=(-I"$here/stubs" -I"$here/../04_trip_logger" -I"$build/include")
 status=0
+
+echo "== test_debug_display (bus fault injection)"
+"${cxx[@]}" "${flags[@]}" -I"$here/display_stubs" -I"$here/../04_trip_logger" \
+    "$here/test_debug_display.cpp" -o "$build/test_debug_display.exe"
+"$build/test_debug_display.exe" || status=1
 
 echo "== test_diag_catalog"
 "${cxx[@]}" -std=c++14 -Wall -Wextra -pedantic "$here/test_diag_catalog.cpp" -o "$build/test_diag_catalog.exe"
@@ -62,6 +67,20 @@ if [ -f "$tinygps/TinyGPS++.cpp" ]; then
     "${cxx[@]}" "${flags[@]}" -DARDUINO=100 -I"$tinygps" "${incs[@]}" \
         "$here/test_gps.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_gps.exe"
     "$build/test_gps.exe" "$build/out" || status=1
+    echo "== test_gps (DISPLAY_DEBUG=1, real parser, stub OLED)"
+    "${cxx[@]}" "${flags[@]}" -UDISPLAY_DEBUG -DDISPLAY_DEBUG=1 -DARDUINO=100 \
+        -I"$tinygps" "${incs[@]}" -I"$here/display_stubs" \
+        "$here/test_gps.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_gps_debug.exe"
+    mkdir -p "$build/out-debug"
+    "$build/test_gps_debug.exe" "$build/out-debug" || status=1
+    # Identical synthetic drives must produce byte-identical GPX in both modes.
+    for file in "$build/out-debug/"*.gpx; do
+        cmp "$file" "$build/out/$(basename "$file")" || status=1
+    done
+    echo "== test_debug_status (formatting and real GSV parser)"
+    "${cxx[@]}" "${flags[@]}" -DARDUINO=100 -I"$tinygps" "${incs[@]}" \
+        "$here/test_debug_status.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_debug_status.exe"
+    "$build/test_debug_status.exe" || status=1
 else
     echo "SKIPPED: TinyGPSPlus not found (set TINYGPS_DIR to its src/ folder)"
 fi
