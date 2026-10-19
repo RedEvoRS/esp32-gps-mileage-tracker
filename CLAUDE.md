@@ -262,6 +262,12 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   monitor delivery/export state (`monitor.db`, when its volume exists). Viewer
   helpers read annotations and diagnostics; the monitor helper reads its volume.
   Missing diagnostics/monitor databases are normal and recorded in `INFO`.
+  Monitor discovery uses Compose config's project name and Docker's Compose
+  project/volume labels, without recent config flags or logging credentials.
+  Discovery errors warn once and record `monitor=unknown`; backup continues
+  with trips, annotations and events. Backup never runs a monitor helper for
+  an absent/unknown volume. Restore skips monitor state and service actions
+  when discovery is unknown; manual recovery is in DEPLOY_DEBIAN Step 10.
   Live events.db and SQLite sidecars are excluded from data rsync; DB snapshots
   sit beside annotations.db and are covered by `SHA256SUMS`. Each DB is coherent
   individually, not a shared transaction across services. Restore validates all

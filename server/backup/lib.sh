@@ -67,27 +67,40 @@ monitor_python() {
     compose run --rm --no-deps -T mileage-monitor python -c "$script" "$@"
 }
 
-# Resolve the actual Compose volume name (including project-name overrides).
-# Listing volumes must succeed: a Docker error is not an absent monitor.
-# Do not run a monitor helper until its volume exists; `run` would create it.
+# Use Compose's resolved project name and volume labels, not a guessed volume
+# name or recent config flags. JSON stays in the pipe; discard command/parser
+# errors because config/env_file diagnostics can contain service credentials.
+# Unknown discovery must never abort a backup or be mistaken for absence.
+# Backup must not run a monitor helper until its volume exists: run creates it.
 find_monitor_volume() {
-    local volume volumes
-    # Leave service credentials uninterpolated and do not read env_file values
-    # into this report: the viewer only needs the generated volume name.
-    volume=$(compose --profile monitor config --format json --no-interpolate --no-env-resolution | viewer_python '
-import json, sys
-name = json.load(sys.stdin)["volumes"]["monitor-state"]["name"]
-if not name or "$" in name:
-    sys.exit("monitor-state volume name must be resolved without service credentials")
+    local project volumes
+    MONITOR_PRESENT=unknown
+    MONITOR_DISCOVERY_ERROR=
+    if ! project=$({ compose config --format json | viewer_python '
+import json, re, sys
+name = json.load(sys.stdin)["name"]
+if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name):
+    sys.exit(1)
 print(name)
-') || die "could not resolve the monitor-state volume"
-    read -r -a DOCKER <<< "${MILEAGE_DOCKER:-docker}"
-    volumes=$("${DOCKER[@]}" volume ls --format '{{.Name}}') \
-        || die "could not list Docker volumes"
-    MONITOR_PRESENT=no
-    if grep -Fxq -- "$volume" <<< "$volumes"; then
-        MONITOR_PRESENT=yes
+'; } 2>/dev/null); then
+        MONITOR_DISCOVERY_ERROR="Compose project config failed or returned an invalid name"
+        return 0
     fi
+    read -r -a DOCKER <<< "${MILEAGE_DOCKER:-docker}"
+    if ! volumes=$("${DOCKER[@]}" volume ls \
+            --filter "label=com.docker.compose.project=$project" \
+            --filter 'label=com.docker.compose.volume=monitor-state' \
+            --format '{{.Name}}' 2>/dev/null); then
+        MONITOR_DISCOVERY_ERROR="Docker volume listing failed"
+        return 0
+    fi
+    if [[ -n $volumes && ! $volumes =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
+        MONITOR_DISCOVERY_ERROR="Docker volume listing returned an ambiguous or invalid result"
+        return 0
+    fi
+    MONITOR_PRESENT=no
+    [[ -z $volumes ]] || MONITOR_PRESENT=yes
+    return 0
 }
 
 # Sets SNAPSHOT_REPORT to the checked container report, or 'missing'.

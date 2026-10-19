@@ -30,13 +30,23 @@ FAKE_COMPOSE = textwrap.dedent("""\
         args = args[2:]
     state = os.environ["FAKE_STATE_DIR"]
     if args[0] == "config":
-        assert "--no-interpolate" in args and "--no-env-resolution" in args
-        print(json.dumps({"volumes": {"monitor-state": {"name": "test_monitor-state"}}}))
-    elif args[:2] == ["volume", "ls"]:
-        if os.environ.get("FAKE_MONITOR") == "yes":
-            print("test_monitor-state")
-        if os.environ.get("FAKE_VOLUME_ERROR") == "yes":
+        assert args == ["config", "--format", "json"], args
+        if os.environ.get("FAKE_CONFIG_ERROR") == "yes":
+            print("private-config-sentinel", file=sys.stderr)
             sys.exit(1)
+        print(os.environ.get("FAKE_CONFIG_RESULT", json.dumps({
+            "name": os.environ.get("FAKE_PROJECT", "test"),
+            "services": {"example": {"environment": {"TOKEN": "private-config-sentinel"}}}})))
+    elif args[:2] == ["volume", "ls"]:
+        assert args == ["volume", "ls", "--filter",
+                        "label=com.docker.compose.project=" + os.environ.get("FAKE_PROJECT", "test"),
+                        "--filter", "label=com.docker.compose.volume=monitor-state",
+                        "--format", "{{.Name}}"], args
+        if os.environ.get("FAKE_VOLUME_ERROR") == "yes":
+            print("private-volume-sentinel", file=sys.stderr)
+            sys.exit(1)
+        if os.environ.get("FAKE_MONITOR") == "yes":
+            print(os.environ.get("FAKE_VOLUME_RESULT", "custom-monitor-volume"))
     elif args[0] == "ps":
         if os.environ.get("FAKE_MONITOR_RUNNING", "yes") == "yes":
             print("monitor-container")
@@ -398,12 +408,112 @@ class BackupScripts(unittest.TestCase):
         self.assertIn("monitor=missing", (self.backups / "latest/INFO").read_text())
         self.assertFalse((self.monitor_dir / "monitor.db").exists())
 
-    def test_docker_volume_failure_is_not_treated_as_uninstalled_monitor(self):
+    def assert_complete_backup_with_unknown_monitor(self):
+        result = self.run_script("backup.sh")
+        self.assertEqual(result.stderr.count("WARNING:"), 1, result.stderr)
+        self.assertIn("could not determine whether the monitor is installed", result.stderr)
+        self.assertIn("skipping monitor.db", result.stderr)
+        self.assertNotIn("private-config-sentinel", result.stdout + result.stderr)
+        self.assertNotIn("private-volume-sentinel", result.stdout + result.stderr)
+        self.assertNotIn("-T mileage-monitor", self.compose_log.read_text())
+        self.assertTrue((self.backups / "last-success").exists())
+        name = os.readlink(self.backups / "latest").split("/")[-1]
+        for root in (self.backups, self.remote):
+            snap = root / "snapshots" / name
+            self.assertIn("monitor=unknown", (snap / "INFO").read_text())
+            self.assertFalse((snap / "monitor.db").exists())
+            self.assertEqual((snap / "data/2026-10/2026-10-01T15-00-00.gpx").read_text(),
+                             "first.gpx")
+            for kind, table in (("annotations", "annotations"), ("events", "events")):
+                with sqlite3.connect(snap / f"{kind}.db") as conn:
+                    self.assertEqual(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone(), (1,))
+                conn.close()
+            subprocess.run(["sha256sum", "--quiet", "-c", "SHA256SUMS"], cwd=snap, check=True)
+
+    def test_compose_config_failure_still_backs_up_without_monitor(self):
+        self.add_events()
+        self.env["FAKE_CONFIG_ERROR"] = "yes"
+        self.assert_complete_backup_with_unknown_monitor()
+
+    def test_docker_volume_failure_still_backs_up_with_unknown_monitor(self):
+        self.add_events()
+        self.add_monitor()
         self.env["FAKE_VOLUME_ERROR"] = "yes"
-        result = self.run_script("backup.sh", check=False)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("could not list Docker volumes", result.stderr)
-        self.assertFalse((self.backups / "last-success").exists())
+        self.assert_complete_backup_with_unknown_monitor()
+
+    def test_invalid_config_or_ambiguous_volumes_are_unknown(self):
+        self.add_events()
+        self.add_monitor()
+        cases = (("FAKE_CONFIG_RESULT", "invalid JSON private-config-sentinel"),
+                 ("FAKE_CONFIG_RESULT", '{}'),
+                 ("FAKE_CONFIG_RESULT", '{"name": "${UNRESOLVED}"}'),
+                 ("FAKE_VOLUME_RESULT", "first-volume\nsecond-volume"))
+        for key, value in cases:
+            with self.subTest(value=value):
+                self.env[key] = value
+                self.assert_complete_backup_with_unknown_monitor()
+                del self.env[key]
+
+    def test_discovery_status_change_is_recorded_even_when_files_are_unchanged(self):
+        self.add_events()
+        self.run_script("backup.sh")
+        self.env["FAKE_CONFIG_ERROR"] = "yes"
+        self.assert_complete_backup_with_unknown_monitor()
+        self.assertEqual(len(self.snapshots()), 2)
+
+    def test_project_override_and_custom_volume_name_use_compose_labels(self):
+        self.add_monitor()
+        self.env["FAKE_PROJECT"] = "custom-project_2"
+        result = self.run_script("backup.sh")
+        self.assertIn("monitor=snapshotted", (self.backups / "latest/INFO").read_text())
+        self.assertIn("label=com.docker.compose.project=custom-project_2", self.compose_log.read_text())
+        self.assertNotIn("private-config-sentinel", result.stdout + result.stderr)
+
+    def assert_restore_with_unknown_monitor(self, error):
+        events = self.add_events()
+        monitor = self.add_monitor()
+        self.run_script("backup.sh")
+        for path, table in ((events, "events"), (monitor, "episodes")):
+            with sqlite3.connect(path) as conn:
+                conn.execute(f"INSERT INTO {table} VALUES (2)")
+            conn.close()
+        with sqlite3.connect(self.db_dir / "annotations.db") as conn:
+            conn.execute("UPDATE annotations SET purpose_note = 'changed'")
+        conn.close()
+        self.add_trip("2026-10/2026-10-01T15-00-00", "changed")
+        before = monitor.read_bytes()
+        self.compose_log.write_text("")
+        self.env[error] = "yes"
+        self.env["COMPOSE_PROFILES"] = "monitor"
+        result = self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertEqual(result.stderr.count("WARNING:"), 1, result.stderr)
+        self.assertIn("skipping monitor.db", result.stderr)
+        self.assertIn("To restore it by hand", result.stderr)
+        self.assertIn("SQLite's backup API", result.stderr)
+        self.assertNotIn("private-config-sentinel", result.stdout + result.stderr)
+        self.assertNotIn("private-volume-sentinel", result.stdout + result.stderr)
+        self.assertNotIn("mileage-monitor", self.compose_log.read_text())
+        self.assertEqual(before, monitor.read_bytes())
+        with sqlite3.connect(events) as conn:
+            self.assertEqual(conn.execute("SELECT * FROM events").fetchall(), [(1,)])
+        conn.close()
+        with sqlite3.connect(self.db_dir / "annotations.db") as conn:
+            self.assertEqual(conn.execute("SELECT purpose_note FROM annotations").fetchone(),
+                             ("client visit",))
+        conn.close()
+        self.assertEqual((self.data / "2026-10/2026-10-01T15-00-00.gpx").read_text(), "first.gpx")
+        [pre] = list(self.backups.glob("pre-restore-*"))
+        self.assertFalse((pre / "monitor.db").exists())
+        for kind in ("annotations", "events"):
+            self.assertTrue((pre / f"{kind}.db").exists())
+        self.assertEqual(self.compose_log.read_text().splitlines()[-1],
+                         "up -d mileage-ingest mileage-viewer")
+
+    def test_restore_config_failure_restores_everything_except_monitor(self):
+        self.assert_restore_with_unknown_monitor("FAKE_CONFIG_ERROR")
+
+    def test_restore_volume_failure_restores_everything_except_monitor(self):
+        self.assert_restore_with_unknown_monitor("FAKE_VOLUME_ERROR")
 
     def test_restore_new_databases_stops_writers_and_saves_current_state(self):
         events = self.add_events()

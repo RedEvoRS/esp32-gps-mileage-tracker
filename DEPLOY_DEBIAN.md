@@ -582,8 +582,15 @@ off-host destination. Each run:
   annotations and diagnostics, using its read-only data mount; the monitor's
   helper reads its own volume. A missing events DB is normal. If no monitor
   volume exists, or it has no DB yet, that is recorded and skipped without
-  enabling the monitor. Snapshots are taken in sequence, so they do not share
-  one transaction across databases.
+  enabling the monitor. Discovery uses the project name from
+  `docker compose config --format json` and Docker's Compose project/volume
+  labels (`com.docker.compose.project` and `com.docker.compose.volume`), rather
+  than guessing names or requiring newer Compose flags. Config/parser errors
+  are suppressed to protect service credentials. Any discovery error or
+  ambiguous result logs one warning and records `monitor=unknown` in `INFO`;
+  trips, annotations and diagnostics still back up. No monitor helper is run
+  unless its volume is known to exist. Snapshots are taken in sequence, so
+  they do not share one transaction across databases.
 - copies `data/` while holding ingest's upload lock, so it never catches
   a trip with its GPX written and its summary not. The live
   `diagnostics/events.db` and its SQLite sidecars are excluded from rsync.
@@ -743,6 +750,23 @@ the viewer and monitor helpers write their own databases. It starts the default
 services again and restarts the monitor if it was running. A saved monitor DB
 can create the volume on a replacement server without enabling notifications.
 It never deletes trip files that aren't in the snapshot.
+
+If monitor discovery fails, restore warns, skips `monitor.db`, and leaves the
+monitor service running or stopped as it was, while restoring trips, annotations
+and diagnostics. Fix discovery and rerun the restore to include monitor state.
+Alternatively, to restore **only monitor state by hand**, first run
+`backup/restore.sh check <snapshot>` and keep the checked `monitor.db` from that
+snapshot. In the server directory, note whether
+`docker compose --profile monitor ps --status running --quiet mileage-monitor`
+reports a running monitor, then stop it with
+`docker compose --profile monitor stop mileage-monitor`. Save its current
+`/state/monitor.db` using SQLite's backup API before replacing anything. With the
+writer stopped, use a throwaway `mileage-monitor` container and SQLite's backup
+API to copy the checked snapshot into `/state/monitor.db`, then run
+`PRAGMA integrity_check` on the restored DB. Start it with
+`docker compose --profile monitor start mileage-monitor` only if it was running
+before. Do not copy a live SQLite file or its sidecars. Losing monitor state can
+replay alerts/exports; it does not lose trips or annotations.
 
 Old snapshots without `events.db` or `monitor.db` still restore trips and
 annotations. The script clearly reports missing DB snapshots and leaves the

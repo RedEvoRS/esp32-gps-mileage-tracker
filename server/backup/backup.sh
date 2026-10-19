@@ -67,6 +67,9 @@ if [[ $MONITOR_PRESENT == yes ]]; then
     snapshot_db monitor_python /state/monitor.db "$work/monitor.db" yes
     monitor=missing
     [[ $SNAPSHOT_REPORT == missing ]] || monitor=snapshotted
+elif [[ $MONITOR_PRESENT == unknown ]]; then
+    monitor=unknown
+    log "WARNING: could not determine whether the monitor is installed ($MONITOR_DISCOVERY_ERROR); skipping monitor.db"
 else
     log "Monitor is not installed; skipping monitor.db"
 fi
@@ -88,7 +91,9 @@ trips=$(find "$work/data" -type f -name '*.gpx' | wc -l)
 (cd "$work" && find . -type f ! -name SHA256SUMS -print0 \
     | LC_ALL=C sort -z | xargs -0 -r sha256sum) > "$work/SHA256SUMS"
 
-if [[ -n $prev ]] && cmp -s "$work/SHA256SUMS" "$SNAPSHOTS/$prev/SHA256SUMS"; then
+# Preserve changes in discovery status even if the database/file bytes match.
+if [[ -n $prev ]] && cmp -s "$work/SHA256SUMS" "$SNAPSHOTS/$prev/SHA256SUMS" \
+        && grep -Fxq "monitor=$monitor" "$SNAPSHOTS/$prev/INFO"; then
     log "Nothing changed since $prev; keeping that snapshot"
     rm -rf "$work"
     current=$prev

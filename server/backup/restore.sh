@@ -88,7 +88,13 @@ fetch_and_check() {
 }
 
 start_services() {
-    compose up -d >&2 || return
+    if [[ ${MONITOR_PRESENT:-unknown} == unknown ]]; then
+        # COMPOSE_PROFILES may enable monitor by default; leave it untouched
+        # when discovery failed, including during error cleanup.
+        compose up -d mileage-ingest mileage-viewer >&2 || return
+    else
+        compose up -d >&2 || return
+    fi
     if [[ ${monitor_running:-no} == yes ]]; then
         compose --profile monitor start mileage-monitor >&2 || return
     fi
@@ -145,6 +151,10 @@ if [[ $MONITOR_PRESENT == yes ]]; then
     running=$(compose --profile monitor ps --status running --quiet mileage-monitor) \
         || die "could not inspect monitor service state"
     [[ -z $running ]] || monitor_running=yes
+elif [[ $MONITOR_PRESENT == unknown ]]; then
+    log "WARNING: could not determine whether the monitor is installed ($MONITOR_DISCOVERY_ERROR); skipping monitor.db and leaving the monitor running state unchanged." \
+        "To restore it by hand, fix discovery and rerun this restore, or stop mileage-monitor, save its current /state/monitor.db," \
+        "restore the checked snapshot monitor.db with SQLite's backup API, then start it only if previously running (DEPLOY_DEBIAN.md Step 10)."
 fi
 
 log "Stopping the services"
@@ -169,7 +179,7 @@ if [[ -f $scratch/snapshot/events.db ]]; then
     log "Restoring the diagnostics database"
     ingest_python "$PY_CHECK_RESTORE" events /data/diagnostics/events.db < "$scratch/snapshot/events.db" >&2
 fi
-if [[ -f $scratch/snapshot/monitor.db ]]; then
+if [[ $MONITOR_PRESENT != unknown && -f $scratch/snapshot/monitor.db ]]; then
     # This may create the volume on a replacement server, without starting
     # the monitor or enabling notifications. Its image supplies UID ownership.
     log "Restoring the monitor database"

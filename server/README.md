@@ -506,8 +506,16 @@ SQLite's backup API and checks each database's integrity. A throwaway viewer
 container reads annotations and diagnostics (its `/data` mount is read-only);
 a throwaway monitor container reads monitor state, even if the monitor service
 is stopped. A missing diagnostics DB means no diagnostics yet. An absent
-monitor volume or missing monitor DB is recorded and skipped. No optional
-service is enabled by a backup.
+monitor volume or missing monitor DB is recorded and skipped. Discovery reads
+the project name from `docker compose config --format json`, then lists volumes
+with both `com.docker.compose.project=<project>` and
+`com.docker.compose.volume=monitor-state` labels. This honors project overrides
+and custom volume names without recent Compose flags. Config and parser errors
+are suppressed to keep service credentials out of logs. If discovery fails or
+returns an ambiguous result, one warning is logged, `INFO` records
+`monitor=unknown`, and trips, annotations and diagnostics are still backed up.
+No monitor helper is run for an absent or unknown volume during backup, and no
+optional service is enabled by a backup.
 
 The script copies trip files under ingest's upload lock, excluding the live
 `diagnostics/events.db` and all its SQLite sidecars (`-journal`, `-wal`, `-shm`).
@@ -529,6 +537,11 @@ replacement server, a saved monitor DB can populate its volume without enabling
 the monitor. Older snapshots still restore trips and annotations: missing new
 DB snapshots are reported and current databases are left unchanged. Any old
 live diagnostics copy under `data/` is excluded from restore too.
+
+If monitor discovery fails during restore, the script warns and restores trips,
+annotations and diagnostics, leaving the monitor service and its database alone.
+To recover monitor state separately, fix discovery and rerun the restore, or
+follow the manual monitor recovery procedure in `DEPLOY_DEBIAN.md` Step 10.
 
 The timer runs as the server login, while ingest writes private trip files
 as UID 1000. Use a UID 1000 login with this setup; giving `data/` to UID
