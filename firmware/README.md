@@ -452,6 +452,8 @@ The rest of this section was written for the V1.2. On the Supreme
   configuration for a few seconds, so the logger retries in the
   background. Expect `GPS configured on attempt 2 (… ms after config
   start)` about 10 s after power-up.
+  Both builds also request UBX NAV-PVT once per navigation epoch (1 Hz)
+  to check the receiver's speed accuracy before recording movement.
 - **Debug screen:** for road testing, the OLED shows a status page that
   redraws about once a second. Example:
 
@@ -472,8 +474,11 @@ The rest of this section was written for the V1.2. On the Supreme
 
   Things to know:
   - It's switched by `DISPLAY_DEBUG` at the top of the sketch (default `1`).
-    Set it to `0` for the old behaviour: screen untouched, no extra GPS
-    messages.
+    Set it to `0` to leave the screen untouched and disable GSV/MON-RF
+    diagnostics. NAV-PVT speed accuracy gating stays enabled in both builds.
+  - A question mark, such as `Speed 3.3? mph`, means the displayed speed
+    failed the accuracy check; it cannot start or extend a trip and the
+    point is omitted from the GPX.
   - `R` counts satellites actually **heard**: GSV entries with a positive
     C/N0 (signal strength), counted once even if several signals name the
     same satellite. The receiver's predicted "in view" total can stay high
@@ -489,6 +494,8 @@ The rest of this section was written for the V1.2. On the Supreme
     CW jamming indicator (0-255), noise per ms, AGC, antenna status/power,
     heard satellites (including how many reach 30 dBHz and the strongest
     C/N0), satellites used, HDOP and RMC fix status (`A` valid, `V` invalid).
+    It also shows the latest fresh NAV-PVT `sAcc` (speed accuracy, m/s,
+    two decimals) and `hAcc` (horizontal accuracy, metres, one decimal).
     It contains no coordinates. MON-RF polling starts after boot GPS
     configuration succeeds or gives up; each line reports the preceding
     poll's reply without waiting for it. A missing/invalid reply shows
@@ -646,6 +653,24 @@ How it behaves once flashed:
   10 s and ends after you're below 2 mph for 3 minutes (stop-and-go
   traffic won't split a drive). Trips shorter than ~30 s (not counting
   the 3 minutes parked at the end) or 0.1 mi are discarded as noise.
+  Speed must also pass the GPS receiver's accuracy check: a checksum-valid
+  NAV-PVT received within 1.5 s, with `gnssFixOK`, a 3D or combined fix,
+  and `sAcc` at most 0.5 m/s when starting, or 1.0 m/s during a trip.
+  These are first guesses to calibrate from indoor and drive logs. The
+  arrival window tolerates either message order at 1 Hz, so the latest
+  sample may belong to the previous epoch; it does not change GPX times.
+  Rejected speeds count as stopped: arming resets, or an active trip enters
+  its normal three-minute cooldown. Rejected points enter neither GPX nor
+  the distance total, and distance never bridges across them. A gap over
+  five seconds between accepted points starts a new track segment. The
+  separate five-minute watchdog still ends a trip if all fixes disappear.
+  Fallback is disabled until boot GPS configuration finishes, whether it
+  succeeds or gives up after five attempts. Until then, speeds without
+  fresh, accurate NAV-PVT stay untrusted. If NAV-PVT is absent for more
+  than ten seconds after configuration ends (or since the last NAV-PVT), one
+  `WARNING:` announces fallback to the previous RMC-only behavior. A single
+  return message announces restored accuracy gating. Fallback can still
+  record false movement: check the warning during the hardware shakedown.
 - **Power-cut recovery:** once the clock is set, each GPS point is written
   to a `.gpx` file and the file is closed immediately to limit data loss.
   Points waiting for the clock are still in memory and can be lost on a

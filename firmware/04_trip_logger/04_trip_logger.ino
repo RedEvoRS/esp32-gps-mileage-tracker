@@ -94,6 +94,12 @@ static constexpr float    START_MPS       = 2.235f;          // 5 mph
 static constexpr float    END_MPS         = 0.894f;          // 2 mph
 static constexpr uint32_t ARM_MS          = 10UL  * 1000;    // sustain to start
 static constexpr uint32_t COOL_MS         = 180UL * 1000;    // sustain to end
+// First guesses: calibrate from drive/indoor logs; err low on mileage.
+static constexpr float    SPEED_ACC_ARM_MPS = 0.5f;
+static constexpr float    SPEED_ACC_TRIP_MPS = 1.0f;
+// Arrival-time association, allowing either UBX/NMEA ordering at 1 Hz.
+static constexpr uint32_t NAV_PVT_FRESH_MS = 1500;
+static constexpr uint32_t NAV_PVT_FALLBACK_MS = 10000;
 static constexpr float    MIN_TRIP_METERS = 160.0f;          // ~0.1 mi
 static constexpr uint32_t MIN_TRIP_MS     = 30UL  * 1000;
 static constexpr size_t   TRIP_SPLIT_BYTES = 8 * 1024 * 1024; // half the server cap
@@ -228,20 +234,29 @@ struct GpsConfig {
 };
 static GpsConfig gGpsConfig;
 
-// Demultiplex UBX packets before feeding NMEA to TinyGPSPlus. Debug builds
-// retain bounded MON-RF payloads; other builds keep only the ACK/NAK echo.
+// Demultiplex UBX before TinyGPSPlus. Both builds retain NAV-PVT and ACKs;
+// the same bounded buffer also accommodates the debug MON-RF path.
 struct GpsUbxRx {
     uint32_t pos = 0, since = 0;
     uint16_t len = 0;
     uint8_t cls = 0, id = 0, a = 0, b = 0;
-#if DISPLAY_DEBUG
     uint8_t payload[256] = {};
-#else
-    uint8_t payload[2] = {};
-#endif
     bool checksumA = false;
 };
 static GpsUbxRx gGpsUbxRx;
+
+// Coordinate-free subset of NAV-PVT (SPG 5.10, UBX-21035062 R03, 3.15.11).
+// valid describes UTC, not speed quality: speed uses fixType/gnssFixOK/sAcc.
+struct GpsNavPvt {
+    bool seen = false;
+    uint32_t receivedMs = 0, iTow = 0, hAccMm = 0, sAccMmps = 0;
+    int32_t gSpeedMmps = 0;
+    uint8_t valid = 0, fixType = 0, flags = 0, numSv = 0;
+};
+static GpsNavPvt gNavPvt;
+static uint32_t gNavPvtWaitMs = 0;
+static bool gSpeedFallback = false;
+static bool gLatestSpeedTrusted = false;
 
 #define FS_LOCK()   xSemaphoreTake(gFsMutex, portMAX_DELAY)
 #define FS_UNLOCK() xSemaphoreGive(gFsMutex)
@@ -252,6 +267,7 @@ struct Fix {
     float    speedMps, hdop;
     bool     hasUtc;
     bool     newSegment = false;  // travels with this fix through both buffers
+    bool     speedTrusted = true;
     uint64_t utcMs;
     uint32_t monoMs;
 };
@@ -312,6 +328,27 @@ static size_t    gTripBytes = 0;        // committed prologue + trackpoint bytes
 static Fix    gArmBuf[16];
 static size_t gArmHead = 0, gArmCount = 0;
 
+static void serviceGpsSpeedFallback() {
+    // NAV-PVT is not expected until boot configuration finishes (or gives up).
+    if (gGpsConfig.state != GPS_CONFIG_DONE) return;
+    bool fallback = uint32_t(millis() - (gNavPvt.seen ? gNavPvt.receivedMs : gNavPvtWaitMs)) >
+                    NAV_PVT_FALLBACK_MS;
+    if (fallback != gSpeedFallback) {
+        Serial.println(fallback ?
+            "WARNING: GPS NAV-PVT unavailable for 10 s -- trusting RMC speed (fallback)." :
+            "GPS NAV-PVT returned -- speed accuracy gating restored.");
+        gSpeedFallback = fallback;
+    }
+}
+
+static bool gpsSpeedTrusted(bool starting) {
+    if (gSpeedFallback) return true;
+    float limit = starting ? SPEED_ACC_ARM_MPS : SPEED_ACC_TRIP_MPS;
+    return gNavPvt.seen && uint32_t(millis() - gNavPvt.receivedMs) <= NAV_PVT_FRESH_MS &&
+           (gNavPvt.flags & 1) && (gNavPvt.fixType == 3 || gNavPvt.fixType == 4) &&
+           gNavPvt.sAccMmps <= limit * 1000.0f;
+}
+
 static void armBufReset() { gArmHead = gArmCount = 0; }
 
 static void armBufPush(const Fix& fx) {
@@ -324,6 +361,8 @@ static char      gTripPath[48] = {0};   // active file, "" when none
 static bool      gTripWriteFailed = false;  // a write to gTripPath didn't land
 static bool      gHaveLastFix = false;
 static Fix       gLastFix;
+static bool      gDistanceContinuous = true; // never bridge across a rejected point
+// Every valid RMC, including rejected speed: separate from last accepted point.
 static uint32_t  gLastFixMonoMs = 0;
 
 #if DISPLAY_DEBUG
@@ -766,28 +805,29 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
 // The five-state machine, driven once per fix.
 static void tripFsmOnFix(const Fix& fx) {
     const uint32_t now = fx.monoMs;
+    const float speed = fx.speedTrusted ? fx.speedMps : 0.0f;
 
     // Distance + max speed accumulate whenever we're recording. The
     // speed gate stops GPS jitter from adding phantom meters while
     // stationary (3 min parked in COOLDOWN scatters tens of meters);
     // erring low is the IRS-safe direction. The same gate marks the last
     // moving fix, where endTrip() measures the trip's duration to.
-    if ((gState == ACTIVE || gState == COOLDOWN) && fx.speedMps > END_MPS) {
-        if (gHaveLastFix)
+    if ((gState == ACTIVE || gState == COOLDOWN) && speed > END_MPS) {
+        if (gHaveLastFix && gDistanceContinuous)
             gTripMeters += haversineM(gLastFix.lat, gLastFix.lon, fx.lat, fx.lon);
         gLastMoveMs = now;
     }
-    if (fx.speedMps > gMaxSpeedMps) gMaxSpeedMps = fx.speedMps;
+    if (speed > gMaxSpeedMps) gMaxSpeedMps = speed;
 
     switch (gState) {
     case IDLE:
-        if (fx.speedMps >= START_MPS) {
+        if (speed >= START_MPS) {
             gState = ARMING; gArmT0 = now;
             armBufReset(); armBufPush(fx);
         }
         break;
     case ARMING:
-        if (fx.speedMps < START_MPS) {
+        if (speed < START_MPS) {
             gState = IDLE;
             armBufReset();
         } else {
@@ -807,12 +847,12 @@ static void tripFsmOnFix(const Fix& fx) {
         }
         break;
     case ACTIVE:
-        if (!writeOrBufferTrkpt(fx) || tripStorageLow(now)) { gState = FINALIZING; break; }
-        if (fx.speedMps <= END_MPS) { gState = COOLDOWN; gCoolT0 = now; }
+        if ((fx.speedTrusted && !writeOrBufferTrkpt(fx)) || tripStorageLow(now)) { gState = FINALIZING; break; }
+        if (speed <= END_MPS) { gState = COOLDOWN; gCoolT0 = now; }
         break;
     case COOLDOWN:
-        if (!writeOrBufferTrkpt(fx) || tripStorageLow(now)) { gState = FINALIZING; break; }
-        if (fx.speedMps > END_MPS) {
+        if ((fx.speedTrusted && !writeOrBufferTrkpt(fx)) || tripStorageLow(now)) { gState = FINALIZING; break; }
+        if (speed > END_MPS) {
             gState = ACTIVE;
         } else if (now - gCoolT0 >= COOL_MS) {
             gState = FINALIZING;
@@ -823,7 +863,7 @@ static void tripFsmOnFix(const Fix& fx) {
     }
 
     TripState resumeState = gState;
-    bool split = (gState == ACTIVE || gState == COOLDOWN) &&
+    bool split = fx.speedTrusted && (gState == ACTIVE || gState == COOLDOWN) &&
                  tripShouldSplit(gTripBytes, gPendCount);
     if (split) {
         Serial.printf("Trip split at %u bytes: %s\n", (unsigned)gTripBytes, gTripPath);
@@ -852,8 +892,11 @@ static void tripFsmOnFix(const Fix& fx) {
         }
     }
 
-    gLastFix = fx;
-    gHaveLastFix = true;
+    if (fx.speedTrusted) {
+        gLastFix = fx;
+        gHaveLastFix = true;
+    }
+    gDistanceContinuous = fx.speedTrusted;
     gLastFixMonoMs = now;
 }
 
@@ -1716,12 +1759,16 @@ static void sendGpsConfigCommand() {
         if (p[1] == 0x03) p[2] = 5;
 #endif
         ubxSend(0x06, 0x01, p, sizeof(p));
-    } else {
+    } else if (gGpsConfig.command == 4) {
         // UBX-CFG-NAV5: apply only dynamic model "automotive" (4).
         uint8_t nav5[36] = {0};
         nav5[0] = 0x01;
         nav5[2] = 4;
         ubxSend(0x06, 0x24, nav5, sizeof(nav5));
+    } else {
+        // Legacy CFG-MSG current-port rate: NAV-PVT every 1 Hz epoch.
+        const uint8_t p[3] = {0x01, 0x07, 1};
+        ubxSend(0x06, 0x01, p, sizeof(p));
     }
     gGpsConfig.sends++;
     gGpsConfig.ack = -1;
@@ -1733,6 +1780,7 @@ static void gpsConfigAttemptFailed() {
     gGpsConfig.since = millis();
     if (gGpsConfig.attempts >= GPS_CONFIG_ATTEMPTS) {
         gGpsConfig.state = GPS_CONFIG_DONE;
+        gNavPvtWaitMs = millis();
         Serial.printf("WARNING: GPS not configured after %u attempts -- continuing with current receiver settings.\n",
                       (unsigned)GPS_CONFIG_ATTEMPTS);
     } else {
@@ -1777,13 +1825,14 @@ static void serviceGpsConfiguration() {
     }
     if (gGpsConfig.state != GPS_WAIT_ACK) return;
     if (gGpsConfig.ack == 1) {
-        if (++gGpsConfig.command == 5) {
+        if (++gGpsConfig.command == 6) {
             gGpsConfig.state = GPS_CONFIG_DONE;
+            gNavPvtWaitMs = millis();
             Serial.printf("GPS configured on attempt %u (%lu ms after config start): "
 #if DISPLAY_DEBUG
-                          "RMC+GGA, GSV every 5 epochs, automotive model.\n",
+                          "RMC+GGA+NAV-PVT, GSV every 5 epochs, automotive model.\n",
 #else
-                          "RMC+GGA only, automotive model.\n",
+                          "RMC+GGA+NAV-PVT, automotive model.\n",
 #endif
                           (unsigned)gGpsConfig.attempts,
                           (unsigned long)(millis() - gGpsConfig.started));
@@ -1828,6 +1877,8 @@ static bool buildFix(Fix& fx) {
     fx.lat       = gps.location.lat();
     fx.lon       = gps.location.lng();
     fx.speedMps  = gps.speed.isValid() ? gps.speed.mps() : 0.0f;
+    fx.speedTrusted = gpsSpeedTrusted(gState == IDLE || gState == ARMING);
+    gLatestSpeedTrusted = fx.speedTrusted;
     fx.hdop      = gps.hdop.isValid() ? gps.hdop.hdop() : 99.9f;
     fx.monoMs    = millis();
     fx.hasUtc    = gClockSet.load();
@@ -1851,7 +1902,7 @@ static void receiveGpsNmea(uint8_t c) {
     if (rmcFixArrived()) {
         Fix fx;
         if (buildFix(fx)) {
-            if (gHaveLastFix && (fx.monoMs - gLastFixMonoMs) > SEG_GAP_MS) {
+            if (gHaveLastFix && (fx.monoMs - gLastFix.monoMs) > SEG_GAP_MS) {
                 if (gState == ACTIVE || gState == COOLDOWN) {
                     fx.newSegment = true;
                 } else if (gState == ARMING) {
@@ -1889,19 +1940,38 @@ static void receiveGpsByte(uint8_t c) {
         else if (rx.pos == 3) rx.id = c;
         else if (rx.pos == 4) rx.len = c;
         else if (rx.pos == 5) rx.len |= (uint16_t)c << 8;
-        else if (rx.pos - 6 < sizeof rx.payload) rx.payload[rx.pos - 6] = c;
+        else if (rx.pos - 6 < sizeof rx.payload) {
+            size_t offset = rx.pos - 6;
+            // Checksum the original bytes above, but never retain NAV-PVT
+            // longitude/latitude (offsets 24..31), even in the receive buffer.
+            bool coordinate = rx.cls == 0x01 && rx.id == 0x07 && offset >= 24 && offset < 32;
+            rx.payload[offset] = coordinate ? 0 : c;
+        }
         rx.pos++;
         if (rx.len > 256) rx = GpsUbxRx();
     } else if (rx.pos == (uint32_t)rx.len + 6) {
         rx.checksumA = (c == rx.a);
         rx.pos++;
     } else {
-        uint8_t expectedId = gGpsConfig.command < 4 ? 0x01 : 0x24;
+        uint8_t expectedId = gGpsConfig.command == 4 ? 0x24 : 0x01;
         if (rx.checksumA && c == rx.b && rx.cls == 0x05 && rx.len == 2 &&
             (rx.id == 0x01 || rx.id == 0x00) && rx.payload[0] == 0x06 &&
             rx.payload[1] == expectedId && gGpsConfig.state == GPS_WAIT_ACK &&
             gGpsConfig.ack < 0) {
             gGpsConfig.ack = rx.id == 0x01 ? 1 : 0;
+        }
+        if (rx.checksumA && c == rx.b && rx.cls == 0x01 && rx.id == 0x07 && rx.len == 92) {
+            // Explicit little-endian reads avoid alignment and host-endian assumptions.
+            const auto u4 = [&rx](size_t off) -> uint32_t {
+                return uint32_t(rx.payload[off]) | uint32_t(rx.payload[off + 1]) << 8 |
+                       uint32_t(rx.payload[off + 2]) << 16 | uint32_t(rx.payload[off + 3]) << 24;
+            };
+            gNavPvt.seen = true; gNavPvt.receivedMs = millis();
+            gNavPvt.iTow = u4(0); gNavPvt.valid = rx.payload[11];
+            gNavPvt.fixType = rx.payload[20]; gNavPvt.flags = rx.payload[21];
+            gNavPvt.numSv = rx.payload[23]; gNavPvt.hAccMm = u4(40);
+            gNavPvt.gSpeedMmps = (int32_t)u4(60); gNavPvt.sAccMmps = u4(68);
+            serviceGpsSpeedFallback();
         }
 #if DISPLAY_DEBUG
         if (rx.checksumA && c == rx.b && rx.cls == 0x0A && rx.id == 0x38 &&
@@ -2041,6 +2111,11 @@ static void serviceDebugRf() {
         char line[DEBUG_RF_LINE_BYTES];
         formatDebugRf(gDebugRf, gDebugGsv.signal(now), debugSatellitesUsed(),
                       debugHdop(), fix, line, sizeof line);
+        size_t n = strlen(line);
+        if (gNavPvt.seen && uint32_t(now - gNavPvt.receivedMs) <= NAV_PVT_FRESH_MS)
+            snprintf(line + n, sizeof line - n, " | sAcc %.2f m/s hAcc %.1f m",
+                     gNavPvt.sAccMmps / 1000.0, gNavPvt.hAccMm / 1000.0);
+        else snprintf(line + n, sizeof line - n, " | sAcc -- m/s hAcc -- m");
         Serial.println(line);
     }
     // First poll starts after config succeeds OR gives up. Each later poll
@@ -2064,6 +2139,7 @@ static void serviceDebugDisplay() {
     s.fix = gDebugRmcValid && s.fixAgeMs <= 2500;
     s.hdop = debugHdop();
     if (s.fix && gps.speed.isValid() && gps.speed.age() <= 2500) s.mph = gps.speed.mph();
+    s.speedTrusted = gLatestSpeedTrusted;
     s.trip = gTripPath[0] != 0;
     s.tripMs = now - gTripT0;
     s.tripMiles = gTripMeters / 1609.344;
@@ -2191,6 +2267,7 @@ void setup() {
 void loop() {
     // Core 1: one UART reader routes NMEA/fixes and checksum-checked UBX
     // ACKs. Configuration deadlines never block receive or trip processing.
+    serviceGpsSpeedFallback();
     while (GPSSerial.available() > 0) {
         receiveGpsByte((uint8_t)GPSSerial.read());
     }

@@ -99,6 +99,10 @@ int main() {
         puts(lines[i]);
     }
     bounded(s);
+    s.speedTrusted = false;
+    formatDebugStatus(s, lines);
+    assert(!strcmp(lines[3], "Speed 42.3? mph"));
+    bounded(s);
     bounded(DebugStatus{});
     for (const char* state : {"IDLE", "ARMING", "ACTIVE", "COOLDOWN", "FINALIZING"}) {
         for (DebugWifi wifi : {DebugWifi::Off, DebugWifi::Scan, DebugWifi::Join, DebugWifi::On}) {
@@ -112,6 +116,7 @@ int main() {
                     bounded(s);
                     formatDebugStatus(s, lines);
                     assert(lines[1][strlen(lines[1]) - 1] == '%');
+                    assert(!strcmp(lines[3], "Speed 999.9? mph"));
                 }
             }
         }

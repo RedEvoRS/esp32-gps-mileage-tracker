@@ -172,7 +172,12 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 
 - Trip files are **GPX 1.0** at ~119 B/point (1.0 allows `<speed>` and
   `<hdop>` directly on `<trkpt>`)
-- Trip detection: start >5 mph for 10s; end <2 mph for 3 min
+- Trip detection: start >5 mph for 10s; end <2 mph for 3 min. NAV-PVT
+  speed accuracy must be <=0.5 m/s to start, <=1.0 m/s during a trip;
+  rejected points count as stopped and are not recorded. Fallback is disabled
+  until boot GPS configuration succeeds or gives up after five attempts;
+  after >10s without NAV-PVT from config end or the last NAV-PVT, warn once
+  and fall back to RMC-only speed
 - FreeRTOS: networking on core 0, GPS on core 1
 - Five-state FSM for trip lifecycle
 
