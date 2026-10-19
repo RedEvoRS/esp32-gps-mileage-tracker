@@ -24,7 +24,7 @@ static inline bool parseDebugMonRf(const uint8_t* payload, size_t len, DebugRf& 
     return true;
 }
 
-static constexpr size_t DEBUG_RF_LINE_BYTES = 192;
+static constexpr size_t DEBUG_RF_LINE_BYTES = 256;
 static inline void formatDebugRf(const DebugRf& rf, const DebugSignal& signal,
                                  int usedCount, float dilution, char fix,
                                  char* out, size_t n) {

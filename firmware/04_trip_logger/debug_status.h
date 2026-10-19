@@ -18,6 +18,7 @@ struct DebugStatus {
     uint32_t now = 0;
     int heard = -1, used = -1, agcPct = -1;
     bool fix = false;
+    bool speedTrusted = true;
     float hdop = -1, mph = -1;
     uint32_t fixAgeMs = UINT32_MAX;
     bool trip = false;
@@ -57,7 +58,8 @@ static inline void formatDebugStatus(const DebugStatus& s, char lines[8][22]) {
     else snprintf(hdop, sizeof hdop, "%.1f", s.hdop < 99.9f ? s.hdop : 99.9f);
     snprintf(lines[2], 22, "FIX %s H%s %ss", s.fix ? "OK" : "NO", hdop, age);
     if (!isfinite(s.mph) || s.mph < 0) snprintf(lines[3], 22, "Speed -- mph");
-    else snprintf(lines[3], 22, "Speed %.1f mph", s.mph < 999.9f ? s.mph : 999.9f);
+    else snprintf(lines[3], 22, "Speed %.1f%s mph", s.mph < 999.9f ? s.mph : 999.9f,
+                  s.speedTrusted ? "" : "?");
     if (s.trip) {
         unsigned minutes = debugBound(s.tripMs / 60000, 999);
         double miles = isfinite(s.tripMiles) && s.tripMiles > 0 ? s.tripMiles : 0;
