@@ -43,7 +43,12 @@ There are two suites:
   sent at boot, including ACK, NAK and a silent receiver. Clock regressions
   cover carried RTC drift, real SNTP completion versus timeout, GPS correction
   after SNTP and every minute, stale GPS dates and midnight sentence ordering,
-  empty RMC date/time fields, fractional seconds, and GPS arriving during an SNTP wait. The SNTP transport
+  empty RMC date/time fields, fractional seconds, and GPS arriving during an SNTP wait.
+  Trackpoint regressions verify same-RMC UTC epochs across processing delays,
+  clock drift and midnight, compact whole-second / three-digit fractional
+  formatting, and missing times for invalid RMC fields even after clock sync.
+  Buffered untimed fixes stay untimed when flushed. Both debug builds must
+  produce byte-identical GPX. The SNTP transport
   is simulated; these tests do not prove live network or multicore behavior.
   It looks for the
   library in the Arduino IDE's default folder, or wherever `TINYGPS_DIR`

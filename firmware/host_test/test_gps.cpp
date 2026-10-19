@@ -75,12 +75,19 @@ static std::vector<std::string> sentences(const Epoch& e, bool ggaFirst = false)
 
 static double gLat = 37.0, gLon = -122.0;
 static int gT = 0;
-static std::string navPvt(uint32_t tow, uint32_t sAcc, uint32_t hAcc = 12345,
+// Reuse the harness's invented position; clock fields are independent of it.
+static std::string rmc(const std::string& time, const std::string& date,
+                       const std::string& talker = "GNRMC") {
+    return nmea(talker + "," + time + ",A," + coord(gLat, true) + "," +
+                coord(gLon, false) + ",29.158,0.00," + date + ",,,A");
+}
+static std::string navPvt(uint32_t tow, uint32_t sAcc, uint32_t hAcc = 2000,
                           uint8_t fixType = 3, uint8_t flags = 1, int32_t speed = 15000);
 
 // Deliver each sentence as the UART would: ~70 ms apart, loop() between.
 static void run(float mps, int seconds, bool fix = true, bool ggaFirst = false,
-                int pvtSAcc = -1, bool pvtAfter = false, uint8_t fixType = 3, uint8_t flags = 1) {
+                int pvtSAcc = -1, bool pvtAfter = false, uint8_t fixType = 3, uint8_t flags = 1,
+                uint32_t pvtHAcc = 2000) {
     for (int i = 0; i < seconds; ++i, ++gT) {
         if (fix) gLat += mps / 111320.0;
         auto ss = sentences({gT, gLat, gLon, mps, fix}, ggaFirst);
@@ -88,7 +95,7 @@ static void run(float mps, int seconds, bool fix = true, bool ggaFirst = false,
             uint32_t at = (uint32_t)gT * 1000 + (uint32_t)k * 70;
             if (g_millis < at) g_millis = at;
             if (pvtSAcc >= 0 && k == (pvtAfter ? ss.size() - 1 : 0))
-                GPSSerial.rx += navPvt(gT * 1000, pvtSAcc, 12345, fixType, flags, int32_t(mps * 1000));
+                GPSSerial.rx += navPvt(gT * 1000, pvtSAcc, pvtHAcc, fixType, flags, int32_t(mps * 1000));
             GPSSerial.rx += ss[k];
             loop();
         }
@@ -127,7 +134,7 @@ static void resetWorld() {
     gGpsConfig.state = GPS_CONFIG_DONE;
     gNavPvtWaitMs = uint32_t(0 - NAV_PVT_FALLBACK_MS - 1);
     gDistanceContinuous = true;
-    gState = IDLE; gTripPath[0] = 0; gTripWriteFailed = false;
+    gState = IDLE; gResumeFixes = 0; gTripPath[0] = 0; gTripWriteFailed = false;
     gPendCount = gPendHead = 0; armBufReset(); gHaveLastFix = false;
     gClockSet = false; gVbusLost = false;
     gGpsClockSet = false; gLastGpsSyncMs = 0;
@@ -713,8 +720,8 @@ int main(int argc, char** argv) {
               "bad checksum or wrong payload length cannot replace or refresh PVT");
         GPSSerial.rx += packet.substr(0, 40); loop();
         g_millis += 501; run(15, 1);
-        CHECK(gState == ARMING && gps.passedChecksum() > 0,
-              "truncated PVT times out without swallowing later NMEA");
+        CHECK(gState == IDLE && gps.passedChecksum() > 0,
+              "truncated PVT does not swallow NMEA or replace the previous excessive hAcc");
         CHECK(logCount("QSRT") == 0 && logCount("abcd") == 0 &&
               logCount("37.000") == 0 && logCount("-122") == 0 && logCount("lat=") == 0 && logCount("lon=") == 0,
               "serial output never contains NAV-PVT sentinels or NMEA coordinates");
@@ -792,14 +799,14 @@ int main(int argc, char** argv) {
     {
         resetWorld(); run(15, 60, true, false, 100);
         double meters = gTripMeters;
-        run(20, 2, true, false, 2500); run(15, 1, true, false, 100);
+        run(20, 2, true, false, 2500); run(15, 3, true, false, 100);
         CHECK(gState == ACTIVE && gTripMeters == meters,
-              "even a short rejected stretch cannot add a bridge distance on resumption");
-        run(20, 7, true, false, 2500); run(15, 2, true, false, 100); endTrip(false);
+              "three fixes confirm resumption without bridging the rejected stretch or cooldown");
+        run(20, 7, true, false, 2500); run(15, 4, true, false, 100); endTrip(false);
         const auto& d = g_disk.files.begin()->second;
         size_t split = d.find("</trkseg><trkseg>");
-        CHECK(trkpts(d).size() == 63 && split != std::string::npos &&
-              trkpts(d.substr(0, split)).size() == 61 &&
+        CHECK(trkpts(d).size() == 67 && split != std::string::npos &&
+              trkpts(d.substr(0, split)).size() == 63 &&
               d.find("</trkseg><trkseg>", split + 1) == std::string::npos,
               "only trusted points enter GPX and the first one after >5 s skipped starts a segment");
         CHECK(gTripMeters > meters + 14 && gTripMeters < meters + 16,
@@ -883,7 +890,7 @@ int main(int argc, char** argv) {
     printf("G29 coordinate-free accuracy diagnostics and rejected speed marker\n");
     {
         resetWorld(); gGpsConfig.state = GPS_CONFIG_DONE;
-        run(4.65f, 31, true, false, 2500);
+        run(4.65f, 31, true, false, 2500, false, 3, 1, 12345);
         CHECK(logCount("sAcc 2.50 m/s hAcc 12.3 m") == 1 && logCount("37.000") == 0 && logCount("-122") == 0,
               "30 s GPS RF line includes only speed/horizontal accuracy, never position");
         DebugStatus s; s.mph = 3.3; s.speedTrusted = gLatestSpeedTrusted;
@@ -896,6 +903,141 @@ int main(int argc, char** argv) {
         CHECK(logCount("sAcc -- m/s hAcc -- m") == 1, "missing/stale PVT reports unknown accuracy");
     }
 #endif
+
+    printf("G30 horizontal accuracy boundaries and indoor noise\n");
+    {
+        resetWorld(); gNavPvtWaitMs = 0;
+        for (uint32_t hAcc : {7500u, 9900u, 11400u, 21000u, 21400u})
+            run(4.65f, 20, true, false, 290, false, 3, 1, hAcc);
+        CHECK(gState == IDLE && !gArmCount && tripFiles().empty(),
+              "indoor hAcc cannot arm despite good sAcc and sustained false speeds above 5 mph");
+        GPSSerial.rx += navPvt(0, 500, 5000); loop();
+        CHECK(gpsSpeedTrusted(true), "arming accepts exactly 5.0 m hAcc and 0.5 m/s sAcc");
+        GPSSerial.rx += navPvt(0, 100, 5001); loop();
+        CHECK(!gpsSpeedTrusted(true) && gpsSpeedTrusted(false), "5.001 m fails only the arming hAcc gate");
+        GPSSerial.rx += navPvt(0, 1000, 10000); loop();
+        CHECK(gpsSpeedTrusted(false), "trip accepts exactly 10.0 m hAcc and 1.0 m/s sAcc");
+        GPSSerial.rx += navPvt(0, 100, 10001); loop();
+        CHECK(!gpsSpeedTrusted(false), "trip rejects 10.001 m hAcc even with good sAcc");
+        run(15, 5, true, false, 100);
+        CHECK(gState == ARMING, "open-sky hAcc starts arming");
+        run(15, 1, true, false, 100, false, 3, 1, 5001);
+        CHECK(gState == IDLE && !gArmCount, "hAcc rejection resets an existing arming window");
+    }
+
+    printf("G31 garage noise cannot extend cooldown or add distance/duration\n");
+    {
+        resetWorld(); run(15, 60, true, false, 100);
+        const auto path = std::string(gTripPath);
+        const auto lastMove = gLastMoveMs;
+        const double meters = gTripMeters;
+        run(0, 1, true, false, 100);
+        const auto coolT0 = gCoolT0;
+        // Two trusted noisy fixes every ten seconds never confirm movement.
+        for (int i = 0; i < 18; ++i) {
+            run(1.4f, 2, true, false, 400, false, 3, 1, 9000);
+            run(0, 8, true, false, 400, false, 3, 1, 9000);
+        }
+        CHECK(gState == IDLE && gLastFixMonoMs - coolT0 == COOL_MS &&
+              gCoolT0 == coolT0 && gTripMeters == meters && gLastMoveMs == lastMove,
+              "garage noise finalizes at the original three-minute deadline with unchanged distance/duration");
+        CHECK(trkpts(g_disk.files[path]).size() == 241 && g_disk.files[path].find("</gpx>") != std::string::npos,
+              "all trusted cooldown fixes including noisy ones are still written");
+        dump("G31");
+    }
+
+    printf("G32 exactly three consecutive moving fixes resume with a fresh baseline\n");
+    {
+        resetWorld(); run(15, 60, true, false, 100); run(0, 1, true, false, 100);
+        const auto coolT0 = gCoolT0, lastMove = gLastMoveMs;
+        const double meters = gTripMeters;
+        run(15, 2, true, false, 100);
+        CHECK(gState == COOLDOWN && gResumeFixes == 2 && gTripMeters == meters && gLastMoveMs == lastMove,
+              "two moving fixes leave cooldown, distance and duration unchanged");
+        run(15, 1, true, false, 100, false, 3, 1, 10001);
+        CHECK(gResumeFixes == 0 && gCoolT0 == coolT0, "untrusted moving fix resets count but never deadline");
+        run(15, 2, true, false, 100); run(0, 1, true, false, 100);
+        CHECK(gResumeFixes == 0 && gCoolT0 == coolT0, "trusted stopped fix also resets count");
+        run(15, 2, true, false, 100);
+        CHECK(gState == COOLDOWN, "a new pair is still insufficient");
+        run(15, 1, true, false, 100);
+        CHECK(gState == ACTIVE && gResumeFixes == RESUME_FIXES && gTripMeters == meters &&
+              gLastMoveMs == gLastFixMonoMs, "exactly the third fix resumes and sets last moving time without a distance bridge");
+        run(15, 1, true, false, 100);
+        CHECK(gTripMeters > meters + 14 && gTripMeters < meters + 16,
+              "distance resumes only on the step after the confirming fix");
+        endTrip(false); dump("G32");
+    }
+
+    printf("G33 RMC epochs survive variable processing delays and clock drift\n");
+    {
+        resetWorld(); run(15, 12);
+        g_epochBaseMs += 20000; // drift, with GPS clock sync still rate limited
+        const uint32_t arrivals[] = {12000, 14050, 14100, 15000, 17050, 17100};
+        for (int i = 0; i < 6; ++i) {
+            auto ss = sentences({12 + i, gLat, gLon, 15, true});
+            // A GSV burst ahead of RMC models delayed processing at 9600 baud.
+            g_millis = arrivals[i];
+            GPSSerial.rx += ss[4] + ss[5] + ss[6] + ss[0]; loop();
+        }
+        endTrip(false);
+        auto pts = trkpts(g_disk.files.begin()->second);
+        bool exact = pts.size() == 18;
+        for (size_t i = 0; i < pts.size(); ++i) {
+            char want[32]; snprintf(want, sizeof want, "2026-04-14T14:30:%02uZ", unsigned(i));
+            exact &= field(pts[i], "time") == want;
+        }
+        CHECK(exact, "every 1 Hz point has exact 1 s epoch steps despite a delayed GSV burst and RTC drift");
+        dump("G33");
+    }
+
+    printf("G34 same-sentence dates, midnight rollover and fractional formatting\n");
+    for (const char* talker : {"GNRMC", "GPRMC"}) {
+        resetWorld(); run(15, 12);
+        g_millis += 1000; GPSSerial.rx += rmc("235959.99", "140426", talker); loop();
+        // A new GGA time must not mix with the previous RMC date.
+        g_millis += 1000;
+        GPSSerial.rx += nmea("GNGGA,000000.55," + coord(gLat, true) + "," + coord(gLon, false) +
+                            ",1,09,0.90,12.5,M,-30.0,M,,"); loop();
+        GPSSerial.rx += rmc("000000.00", "150426", talker); loop();
+        for (const char* t : {"000001.01", "000002.10", "000003.25", "000004.99", "000005"}) {
+            g_millis += 1000; GPSSerial.rx += rmc(t, "150426", talker); loop();
+        }
+        endTrip(false);
+        auto pts = trkpts(g_disk.files.begin()->second);
+        const char* expected[] = {"2026-04-14T23:59:59.990Z", "2026-04-15T00:00:00Z",
+            "2026-04-15T00:00:01.010Z", "2026-04-15T00:00:02.100Z",
+            "2026-04-15T00:00:03.250Z", "2026-04-15T00:00:04.990Z", "2026-04-15T00:00:05Z"};
+        bool exact = pts.size() == 19;
+        for (size_t i = 0; i < 7 && 12 + i < pts.size(); ++i)
+            exact &= field(pts[12 + i], "time") == expected[i];
+        CHECK(exact, "GN/GP RMC uses its matching date, whole seconds or three fractional digits including leading zeros");
+        dump(talker);
+    }
+
+    printf("G35 invalid RMC date/time stays untimed even with a synchronized clock\n");
+    for (const char* talker : {"GNRMC", "GPRMC"}) {
+        resetWorld(); run(15, 12);
+        const std::pair<const char*, const char*> invalid[] = {
+            {"143012.00", ""}, {"", "140426"}, {"", ""}, {"bad", "140426"},
+            {"250000.00", "140426"}, {"143015.00", "000026"},
+            {"143016.", "140426"}, {"143016.xy", "140426"}};
+        for (const auto& fields : invalid) {
+            g_millis += 1000;
+            GPSSerial.rx += rmc(fields.first, fields.second, talker); loop();
+            CHECK(gClockSet && !gLastFix.hasUtc, "cached date/time or system UTC cannot supply an invalid RMC epoch");
+        }
+        // Flushing on the next valid epoch must not retroactively time them.
+        g_millis += 1000; GPSSerial.rx += rmc("143020.50", "140426", talker); loop();
+        g_millis += 1000; GPSSerial.rx += rmc("", "", talker); loop();
+        endTrip(false); // flush the remaining untimed tail with system UTC set
+        auto pts = trkpts(g_disk.files.begin()->second);
+        bool exact = pts.size() == 22;
+        for (size_t i = 12; i < pts.size(); ++i)
+            exact &= field(pts[i], "time") == (i == 20 ? "2026-04-14T14:30:20.500Z" : "");
+        CHECK(exact, "both timed-fix flush and trip-end flush preserve missing times and point order");
+        dump((std::string("G35_") + talker).c_str());
+    }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
     return g_fail ? 1 : 0;

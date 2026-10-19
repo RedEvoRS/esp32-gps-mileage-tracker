@@ -62,6 +62,28 @@ class UploadSafety(unittest.TestCase):
         gpx = self.root / response.get_json()["stored_as"]
         return gpx, gpx.with_suffix(".json")
 
+    def test_rmc_whole_and_fractional_epochs_across_midnight(self):
+        # Invented stationary coordinates; only the timestamp format matters.
+        epochs = ["2026-04-14T23:59:59.990Z", "2026-04-15T00:00:00Z",
+                  "2026-04-15T00:00:01.010Z", "2026-04-15T00:00:02.250Z"]
+        track = "".join(
+            '<trkpt lat="0" lon="0"><time>' + epoch
+            + '</time><speed>10</speed><hdop>1</hdop></trkpt>' for epoch in epochs)
+        payload = ('<gpx version="1.0" xmlns="http://www.topografix.com/GPX/1/0">'
+                   '<trk><trkseg>' + track + '</trkseg></trk></gpx>').encode()
+        parsed = self.ing.parse_gpx(payload)["segments"][0]
+        times = [point["time"] for point in parsed]
+        self.assertEqual([t.isoformat() for t in times], [
+            "2026-04-14T23:59:59.990000+00:00", "2026-04-15T00:00:00+00:00",
+            "2026-04-15T00:00:01.010000+00:00", "2026-04-15T00:00:02.250000+00:00"])
+        for index, step in enumerate([0.01, 1.01, 1.24]):
+            self.assertAlmostEqual((times[index + 1] - times[index]).total_seconds(), step)
+        response = self.upload(payload)
+        self.assertEqual(response.status_code, 200)
+        gpx, summary = self.saved_pair(response)
+        self.assertEqual(gpx.read_bytes(), payload)
+        self.assertEqual(json.loads(summary.read_bytes())["timing_status"], "complete")
+
     def test_identical_retry_preserves_original_record(self):
         response = self.upload()
         self.assertEqual(response.status_code, 200)

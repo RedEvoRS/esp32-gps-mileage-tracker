@@ -302,7 +302,7 @@ Complete schema-valid example with three track points:
 
 **Tool support for TrackPointExtension v2 speed/course** varies and is worth understanding when picking a reference viewer: **GPXSee reads it and graphs it** (also re-derives speed from geometry if missing); **Strava and Garmin Connect read it** on upload; **OsmAnd honors it**; **gpx.studio reads extensions but generally re-derives speed from position+time**; **Google Earth ignores `<extensions>` entirely** but still renders the track from lat/lon/time; **QGIS's default GPX provider ignores extensions** — use OGR GPX driver or parse manually if you need speed in QGIS. The track itself will always render everywhere because lat/lon/ele/time are in core elements.
 
-`<time>` uses `xsd:dateTime` and must have a timezone designator. **`2026-04-22T14:30:15Z` is valid and correct**; fractional seconds (`.250Z`) are optional and only useful if you log at >1 Hz. **Always emit UTC with `Z`**, never local time. The GPX developer's manual is explicit: "Date and time are in Universal Coordinated Time (UTC), not local time!"
+`<time>` uses `xsd:dateTime` and must have a timezone designator. **`2026-04-22T14:30:15Z` is valid and correct**; fractional seconds (`.250Z`) preserve the RMC epoch when its centiseconds are nonzero, including at 1 Hz. **Always emit UTC with `Z`**, never local time. The GPX developer's manual is explicit: "Date and time are in Universal Coordinated Time (UTC), not local time!"
 
 **File-writing strategy on-device.** Write the prologue (XML decl + `<gpx>` open tag + `<metadata>` + `<trk>` open + `<trkseg>` open) at file creation, append `<trkpt>…</trkpt>` lines as the trip progresses (closing each trkpt on the same line keeps parseability even if power is cut mid-trip), and append the epilogue (`</trkseg></trk></gpx>`) only at trip end. If the epilogue never gets written (hard crash), **most tools tolerate unclosed tags** and you can run an on-boot "fsck" pass that reads the last file, trims any truncated trkpt, and appends the missing closing tags. This is a far better failure mode than batching everything in RAM.
 
@@ -353,22 +353,20 @@ void tripFsmOnFix(const Fix& f) {
 
 On a VBUS-loss IRQ from §3, set a `volatile bool vbusLost` flag and in `loop()` force `endTrip(false)` (do not discard micro-trips — a genuine short trip that ended in a power cut is still data you want to keep) and transition to IDLE before deep-sleeping.
 
-**The GPS-has-no-UTC-yet edge case is handled with a RAM ring buffer.** At 1 Hz with ~90-byte records, 90 seconds of buffer fits in about 4 KB. Store each pending fix with its **monotonic `millis()` timestamp**, not a placeholder UTC; when UTC first becomes available, compute each pending fix's absolute time as `utcNow − (monoNow − monoI)`. This preserves sub-second ordering and is robust to burst flushes:
+**Current implementation: trackpoint times belong to the RMC epoch.** Each
+fix captures the validated UTC date/time from the same RMC sentence as its
+position, using TinyGPSPlus centiseconds. Whole seconds use `...SSZ`;
+nonzero centiseconds use three fractional digits (`...SS.sssZ`). A delayed
+UART drain or a system-clock correction cannot shift that epoch. GGA time
+must never be combined with an earlier RMC date at midnight.
 
-```cpp
-struct Pending { double lat, lon; float ele, speed, course, hdop; uint8_t sat; uint32_t monoMs; };
-static Pending pend[90]; static size_t pHead = 0, pCount = 0;
-void flushPending(uint64_t utcMsNow, uint32_t monoMsNow) {
-  for (size_t i = 0; i < pCount; ++i) {
-    const Pending& p = pend[(pHead + i) % 90];
-    uint64_t tMs = utcMsNow - (monoMsNow - p.monoMs);
-    writeTrkptWithUtcMs(p, tMs);
-  }
-  pCount = pHead = 0;
-}
-```
-
-`writeOrBufferTrkpt(f)` checks `hasUtc`: if false, push; if true, flush pending first (once), then write `f` directly. **Persist last-known UTC to NVS periodically** (every 60 s, rate-limited for flash wear) so after reboot the device has a coarse monotonic→UTC mapping even before GPS reacquires. For the pathological "entire short trip happened without ever getting UTC" case, hold `FINALIZING` open for up to 60 s past cooldown waiting for UTC; if still nothing, write the file with best-known-epoch-anchored times plus a `<trk><desc>NO_UTC_SYNTHETIC_TIME</desc></trk>` marker so a post-processor can repair it. Don't discard — speed/distance are independent of absolute time and mileage is still recoverable.
+A fix with missing or invalid RMC date/time has no `<time>`, even if GPS or
+NTP has synchronized the system clock. The 90-point pending ring retains
+untimed fixes in order, spills older ones untimed when full, and flushes
+its remaining untimed tail before a timed fix or at trip end. It never
+reconstructs epochs from receipt time. This supersedes the original brief's
+proposal to back-date buffered points or fabricate coarse UTC. System-clock
+synchronization, header time and local filenames remain independent.
 
 **GPS fix loss mid-trip (tunnel, garage): start a new `<trkseg>` inside the same `<trk>`.** The GPX 1.1 spec says this explicitly: *"To represent a single GPS track where GPS reception was lost, or the GPS receiver was turned off, start a new Track Segment for each continuous span of track data."* Garmin devices do this; OsmAnd does this; OpenTracks does this. The alternative — writing into the same trkseg — causes viewers to draw a straight line across the tunnel, distorting both distance and speed in downstream tools. Detection heuristic: any one of (RMC validity 'V' for >3 s, gap >5 s between valid fixes, HDOP >10 with sats <4) arms a "needs new segment" flag; on the next valid fix, emit `</trkseg><trkseg>` before the next trkpt. Do not close the file or `<trk>`.
 
@@ -386,6 +384,6 @@ Two other references worth skimming. **kizniche/ttgo-tbeam-ttn-tracker** has the
 
 ## Consolidated checklist and closing thoughts
 
-The firmware that emerges from this research has three concurrent loops: **Arduino `loop()` on core 1** does nothing but drain `Serial1` into TinyGPSPlus, run `tripFsmOnFix()` when a full fix arrives, poll the AXP2101 IRQ flag, and post completed-file events to a queue. **A pinned task on core 0** pulls from that queue and runs the scan → BSSID match → connect → HTTPS stream-POST → delete state machine, blocking freely without affecting GPS. **An interrupt on GPIO 35** sets a flag when VBUS disappears, and `loop()` responds by forcing `tripFsmOnFix` into FINALIZING, closing LittleFS, and deep-sleeping with ext1 wake on the same pin. Every trkpt `file.close()`s after writing — you lose at most the single in-flight record on a hard crash. GPX is written in schema order with Garmin TrackPointExtension v2 for speed and course. New `<trkseg>` on fix-loss, RAM ring buffer until UTC arrives, median-smoothed stop detection, 30 s / 0.1 mi micro-trip filter on normal ends.
+The firmware that emerges from this research has three concurrent loops: **Arduino `loop()` on core 1** does nothing but drain `Serial1` into TinyGPSPlus, run `tripFsmOnFix()` when a full fix arrives, poll the AXP2101 IRQ flag, and post completed-file events to a queue. **A pinned task on core 0** pulls from that queue and runs the scan → BSSID match → connect → HTTPS stream-POST → delete state machine, blocking freely without affecting GPS. **An interrupt on GPIO 35** sets a flag when VBUS disappears, and `loop()` responds by forcing `tripFsmOnFix` into FINALIZING, closing LittleFS, and deep-sleeping with ext1 wake on the same pin. Every trkpt `file.close()`s after writing — you lose at most the single in-flight record on a hard crash. GPX is written in schema order with Garmin TrackPointExtension v2 for speed and course. New `<trkseg>` on fix-loss, per-RMC UTC epochs with an untimed pending ring, median-smoothed stop detection, 30 s / 0.1 mi micro-trip filter on normal ends.
 
 The mental model to hold: **you are not racing the battery — it will outlast you by hours — but you must be paranoid about flash commits**. That is the deep reason to pay the 10–20 ms close-every-record cost and not try to be clever about flush-only batching. The rest is just careful state machines and correct XML.

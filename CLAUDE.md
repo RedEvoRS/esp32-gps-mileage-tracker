@@ -171,9 +171,16 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 ### Firmware (both boards)
 
 - Trip files are **GPX 1.0** at ~119 B/point (1.0 allows `<speed>` and
-  `<hdop>` directly on `<trkpt>`)
+  `<hdop>` directly on `<trkpt>`). Trackpoint UTC uses the same RMC's date
+  and time, with `.sssZ` for nonzero centiseconds or whole seconds otherwise;
+  invalid/missing RMC epochs stay untimed, including buffered points after
+  a system-clock sync
 - Trip detection: start >5 mph for 10s; end <2 mph for 3 min. NAV-PVT
-  speed accuracy must be <=0.5 m/s to start, <=1.0 m/s during a trip;
+  speed/horizontal accuracy must be <=0.5 m/s / 5 m to start,
+  <=1.0 m/s / 10 m during a trip (first guesses for drive-log calibration);
+  cooldown resumes after 3 consecutive trusted fixes >2 mph, keeping its
+  original deadline until then. Cooldown adds no distance or moving duration;
+  the confirming fix starts a new distance baseline without a bridge;
   rejected points count as stopped and are not recorded. Fallback is disabled
   until boot GPS configuration succeeds or gives up after five attempts;
   after >10s without NAV-PVT from config end or the last NAV-PVT, warn once
