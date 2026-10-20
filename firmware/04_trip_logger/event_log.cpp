@@ -495,6 +495,7 @@ void EventLog::service(size_t maxRecords) {
         if (!lossReported_[i]) {
             uint64_t reported = std::min<uint64_t>(store.meta.pending, INT32_MAX);
             EventInput input; input.code = static_cast<uint16_t>(Code::EVENTS_DROPPED);
+            stamp(input);
             input.contextCount = 2;
             input.context[0] = EventContext::integer("count", static_cast<int64_t>(reported));
             input.context[1] = EventContext::enumeration("backend", i == 0 ? "sd" : "littlefs");

@@ -96,6 +96,10 @@ public:
     // Any task, NOT ISR/panic: one try-lock, bounded encoding, no filesystem or
     // waiting. On contention/full the drop counter advances. id is optional.
     Submit submit(const EventInput& input, EventIdentity* id = nullptr);
+    // Installed before tasks start; immutable for this boot. Used at creation,
+    // including internal loss notices, never when replaying journaled frames.
+    void setTimeProvider(void (*provider)(EventInput&)) { timeProvider_ = provider; }
+    void stamp(EventInput& input) const { if (timeProvider_) timeProvider_(input); }
 
     // Single consumer only, with FS_LOCK held (also nextBatch/ack/revision).
     // M=min(maxRecords,16) queue records plus one coalesced loss notice: at most
@@ -143,6 +147,7 @@ public:
     static void segmentPath(char* out, uint32_t id, bool ready);
 
 private:
+    void (*timeProvider_)(EventInput&) = nullptr;
     static constexpr size_t kMaxSegments = 512, kMetaBytes = 80;
     struct Frame { char data[kFrameBytes + 1] = {}; uint16_t size = 0; bool loss = false; };
     struct Segment { uint32_t id = 0, size = 0; bool ready = false, clean = false; };

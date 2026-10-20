@@ -32,6 +32,10 @@ flags=("${assert_flags[@]}" -std=gnu++20 -O1 -w -DDISPLAY_DEBUG=0 -DJOURNAL_HOST
 incs=(-I"$here/stubs" -I"$here/../04_trip_logger" -I"$build/include")
 status=0
 
+echo "== test_rtc (pure calendar and clock confidence)"
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -O1 "${incs[@]}" "$here/test_rtc.cpp" -o "$build/test_rtc.exe"
+"$build/test_rtc.exe" || status=1
+
 echo "== test_debug_display (bus fault injection)"
 "${cxx[@]}" "${flags[@]}" -I"$here/display_stubs" -I"$here/../04_trip_logger" \
     "$here/test_debug_display.cpp" -o "$build/test_debug_display.exe"
@@ -100,6 +104,12 @@ if [ -f "$tinygps/TinyGPS++.cpp" ]; then
         cmp "$file" "$build/out/$(basename "$file")" || status=1
     done
     for display in 0 1; do
+        echo "== test_rtc_runtime (DISPLAY_DEBUG=$display, real runtime paths)"
+        "${cxx[@]}" "${flags[@]}" -UDISPLAY_DEBUG -DDISPLAY_DEBUG="$display" -DARDUINO=100 \
+            -I"$tinygps" "${incs[@]}" -I"$here/display_stubs" "$here/test_rtc_runtime.cpp" \
+            "$here/../04_trip_logger/event_log.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_rtc_runtime_$display.exe"
+        "$build/test_rtc_runtime_$display.exe" || status=1
+        "${PYTHON:-python}" "$here/check_rtc_protocol.py" "$build/test_rtc_runtime_$display.exe" || status=1
         echo "== test_fault_hooks (DISPLAY_DEBUG=$display, real runtime paths)"
         "${cxx[@]}" "${flags[@]}" -UDISPLAY_DEBUG -DDISPLAY_DEBUG="$display" -DARDUINO=100 \
             -I"$tinygps" "${incs[@]}" -I"$here/display_stubs" "$here/test_fault_hooks.cpp" \

@@ -53,7 +53,8 @@ numeric measurements and fixed enumerated values in context.
 - **#126:** degraded service loop, **after Supreme port #107/#109**. Replaces
   permanent halts on storage/PMU failure with bounded reporting and retries.
 - **#127:** SH1106 hardware adapter on the Supreme, following #123 and the port.
-- **#128:** PCF8563 clock integration on the Supreme and time-confidence tests.
+- **#128:** implemented diagnostics-only PCF8563 boot timestamps, bounded
+  GPS/SNTP RTC setting and clock-confidence/runtime tests; retention needs bench testing.
 - **#129:** consistent diagnostics database and monitor-state backups/restores.
 - **#130:** induced-fault, power-cut, backlog and display shakedown on hardware.
 - **#134:** Prometheus `/metrics` for the owner's external Grafana (not bundled).
@@ -563,7 +564,8 @@ Core 1 enqueues E1000 BOOT with `esp_reset_reason()` mapped to
 reasons map to `other`. Watchdog, brownout and panic also enqueue their existing
 E1003, E1004 and E1005 notices. `makePmuStartupEvent(gPmuStartup)` adds E2007
 only after recovery/retries or another non-clean startup result. All notices
-have null episodes and unknown wall time. A clean first-attempt PMU boot adds
+have null episodes and use the same clock-confidence provider as runtime events.
+A valid boot RTC can timestamp them before GPS/SNTP. A clean first-attempt PMU boot adds
 no E2007. Failed PMU/storage startup still halts before journal initialization;
 reporting those paths needs #126. Debug builds print one journal boot line with
 the active backend and physical unacknowledged valid-frame/segment counts;
@@ -601,8 +603,20 @@ not a guarantee that every transient failure survives queue exhaustion.
 
 Healthy observations mark condition slots observed without producing events.
 Unmeasured fields are omitted instead of guessed or clamped. Hook timestamps use
-monotonic `millis()` and unknown wall time until clock confidence/age is integrated;
-they do not claim a retained RTC is synchronized. The upload worker copies each
+monotonic `millis()` plus the diagnostics clock-confidence provider. After a
+trusted system-clock set this boot, events use system UTC and `gps` or `sntp`
+(the most recent setter), with age since that sync. Otherwise a validated boot
+RTC supplies `rtc` UTC, advanced by elapsed uptime; its age is elapsed time since
+the last successful RTC write stored in NVS, or null if unavailable/future.
+Without either source, UTC and age are null and the source is `unknown`.
+The provider uses independent single-writer seqlocks made of 32-bit atomics;
+readers make at most two attempts and use unknown time on concurrent publication,
+without waiting, I2C, NVS or 64-bit atomic locks. Core 1 extends unsigned tick
+differences each loop so elapsed time and sync age survive `millis()` wraps.
+Boot/reset/PMU notices, both cores' runtime faults, upload/rejection faults and
+the journal's internal loss notices all use this provider when built. Stored
+events are never restamped. The RTC never sets the system clock, `gClockSet`
+or GPX times; E3006 still requires GPS/SNTP this boot. The upload worker copies each
 task's atomically published observed/active slots and accepted episode identities, plus core 0's saturating E5001 counter.
 A version check rejects a concurrent publication without waiting. Native 32-bit
 atomics avoid a 64-bit atomic lock in the producer. An active condition whose
@@ -622,6 +636,8 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E3004 | Final config readiness/ACK timeout after five attempts | One give-up notice; final NAK uses only E3003 | `message_class=6`, `message_id=138` |
 | E3005 | Active/cooldown trip has no valid RMC fix for 30 s; any valid RMC counts, trusted or not, so weak accuracy while parked in cooldown does not cause an alert | Next valid RMC fix, even after the five-minute finalize; ending the trip alone is not recovery | `elapsed_ms` |
 | E3006 | Trusted system clock `gClockSet` still false after 120 s | Successful GPS/SNTP clock sync; untimed GPX points retain their original status | none |
+| E3007 | RTC has no ACK, or its initial boot register read fails | Verified RTC setting after trusted GPS/SNTP time; at most three attempts per boot, at least a minute apart after failures | none |
+| E3008 | Readable RTC has STOP/VL, invalid BCD/calendar, unsupported year, or a later read/write/verification failure | Verified RTC setting from GPS/SNTP clears the condition; normal transition/repeat policy | `reason=stopped\|invalid_date\|out_of_range\|read_failed` on failure |
 | E4001 | SD did not mount, trip logging uses LittleFS | Observed SD mount; current boot does not hot-switch backends | none |
 | E4004 | Guarded trip free space <64 KiB start reserve | >=64 KiB | `backend`, `free_bytes` |
 | E4005 | Guarded trip free space <24 KiB stop reserve | >=24 KiB | `backend`, `free_bytes` |
@@ -668,7 +684,7 @@ margin follows #6. Static builders avoid event-sized stack frames; compiler stac
 reports and the build sizes supplement, but do not replace, the real-upload bench
 measurement. Part A's observed 7,556 free bytes was a no-upload measurement.
 
-Startup halts E1001/E1002/E2001/E4002/E4003 remain #126; RTC E3007/E3008 are #128;
+Startup halts E1001/E1002/E2001/E4002/E4003 remain #126; RTC E3007/E3008 are implemented by #128;
 E5010 and diagnostic uploads/snapshots are implemented by #125. Error-code OLED
 pages are #127 and antenna detection is #164. All requested meaningful Stage 4 runtime
 codes above are wired, including E3006's existing trusted-clock state.
@@ -885,10 +901,22 @@ and on the bench**, not pin changes for the existing T-Beam V1.2 sketch:
 - Supreme ALDO3 is LoRa, ALDO4 is GPS. This differs from the V1.2's measured
   GPS rail; copying these assignments into that sketch would be wrong.
 
-#128 validates the RTC stopped/invalid-time flags and date fields before use.
+#128 reads Control_1 and the seven time registers once at boot, on core 1 after
+PMU bus recovery/startup. STOP or seconds VL means `stopped` (expected after
+power loss), before BCD/calendar validation including leap days. The century
+bit selects 19xx (set) or 20xx (clear); only 2026 through 2099 is accepted.
 RTC time is lower-confidence holdover, not evidence of a recent GPS/SNTP sync.
-When trusted time becomes available, set the RTC and track sync age where
-known. Never rewrite older journal records' timestamps after synchronizing;
+Once trusted time arrives, core 1 checks drift once: an invalid RTC or an offset
+of at least two whole seconds schedules a write in the first 100 ms of a UTC
+second, without waiting in the loop. All seven time registers are written in
+one burst (VL cleared, 24-hour, 20xx), STOP is cleared, then registers are read
+back and validated. Only one successful setting is allowed per boot; failures
+have at most three total attempts spaced by at least a minute. The successful
+write epoch is saved once in `diag/rtc_set` NVS for next boot's age. Both cores
+can publish trusted clock syncs, but only core 1 touches Wire1 or RTC NVS.
+Coordinate-free serial lines report boot validity/last-set age and verified
+settings. Retention across `PMU.shutdown()` remains unverified on hardware.
+Never rewrite older journal records' timestamps after synchronizing;
 uptime and receipt time preserve their original meaning. #130 validates these
 behaviors plus degraded storage, reset reporting, motion suppression, deep
 sleep, upload interruption, backlog drain and notification recovery on hardware.

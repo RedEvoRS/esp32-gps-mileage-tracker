@@ -69,6 +69,7 @@
 #include "diag_upload.h"
 #include "journal_platform.h"
 #include "runtime_faults.h"
+#include "rtc_runtime.h"
 
 #ifndef DISPLAY_DEBUG
 #define DISPLAY_DEBUG 1
@@ -208,6 +209,8 @@ volatile bool     gVbusLost   = false;
 volatile bool     gPmuIrqFlag = false;
 // Shared by core 0 (SNTP) and core 1 (GPS/fix construction).
 std::atomic<bool> gClockSet{false};  // a source has synchronized UTC this boot
+static diagnostics::DiagnosticClock gDiagnosticClock;
+static diagnostics::RtcRuntime gRtc;
 // Power-off/upload handshake (issue #3). Core 0 raises gNetBusy before it reads
 // gNetHold; core 1 sets gNetHold before it reads gNetBusy. With seq_cst
 // atomics at least one side sees the other, so once core 1 reads gNetBusy
@@ -297,7 +300,7 @@ static bool gJournalStarted = false; // under FS_LOCK; core-0 consumer only
 static bool gJournalBootReported = false;
 // Single writer per array/builder. Only EventLog's try-lock crosses cores.
 static diagnostics::RuntimeFaults::Condition gLoopConditions[] = {
-    {2002}, {2003}, {2004}, {2005}, {2006}, {3001}, {3002}, {3005}, {3006},
+    {2002}, {2003}, {2004}, {2005}, {2006}, {3001}, {3002}, {3005}, {3006}, {3007}, {3008},
     {4001}, {4004}, {4005}, {4006}, {6001}
 };
 static diagnostics::RuntimeFaults::Condition gNetConditions[] = {
@@ -535,6 +538,30 @@ static uint64_t nowEpochMs() {
     return (uint64_t)tv.tv_sec * 1000ULL + tv.tv_usec / 1000;
 }
 
+static void stampDiagnosticTime(diagnostics::EventInput& event) {
+    uint32_t now = millis();
+    event.uptimeMs = now;
+    bool trusted = gClockSet.load();
+    gDiagnosticClock.fill(event, now, trusted, trusted ? nowEpochMs() : 0);
+}
+
+// Core 1 only. Both cores' event builders read atomic publications, with no I2C.
+static void rtcConditions() {
+    if (!gJournalReady || !gRtc.begun()) return;
+    gLoopFaults.event(3007, millis()).condition(gRtc.unavailable());
+    bool invalid = gRtc.invalid();
+    gLoopFaults.event(3008, millis());
+    if (invalid) gLoopFaults.enumeration("reason", diagnostics::rtc::reason(gRtc.invalidReason()));
+    gLoopFaults.condition(invalid);
+}
+
+static void serviceRtc() {
+    if (xPortGetCoreID() != 1) return;
+    gDiagnosticClock.tick(millis());
+    gRtc.service(Wire1, gDiagnosticClock, gClockSet.load(), nowEpochMs(), gDiagnosticClock.latestSource());
+    rtcConditions();
+}
+
 // ISO 8601 UTC: whole seconds stay compact; retain nonzero milliseconds.
 static void isoFromEpochMs(uint64_t ms, char* out, size_t n) {
     time_t secs = (time_t)(ms / 1000);
@@ -620,6 +647,7 @@ static void setClockFromGps(uint64_t* rmcUtcMs = nullptr) {
     struct timeval tv = { .tv_sec = t + subsecondMs / 1000,
                           .tv_usec = (long)(subsecondMs % 1000) * 1000 };
     if (settimeofday(&tv, nullptr) != 0) return;
+    gDiagnosticClock.trusted(diagnostics::EventTimeSource::Gps, now);
     gClockSet.store(true);
     gGpsClockSet = true;
     gLastGpsSyncMs = now;
@@ -1679,6 +1707,7 @@ static void trySntp() {
     uint32_t start = millis();
     while (!gClockSet.load() && !gNetAbort.load() && millis() - start < 5000) {
         if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+            gDiagnosticClock.trusted(diagnostics::EventTimeSource::Sntp, millis());
             gClockSet.store(true);
             Serial.println("System clock set from NTP.");
             break;
@@ -2552,6 +2581,7 @@ void setup() {
     // #25 owns the measured current decision. Never touch DCDC1 (ESP32).
 
     Serial.begin(115200);
+    gRtc.begin(Wire1, gDiagnosticClock);
     delay(1000);
     Serial.println("\n=== Stage 4: Trip Logger ===");
     printPmuStartup(gPmuStartup);
@@ -2613,7 +2643,9 @@ void setup() {
                                          gFlashMounted ? &gFlashJournalFs : nullptr, diagnostics::uploadJournalConfig());
     gJournalBoot = diagnostics::newJournalBoot();
     gJournalReady = gJournal.begin(gJournalBoot.id, gJournalBoot.counter, "stage4-diag-upload");
+    gJournal.setTimeProvider(stampDiagnosticTime);
     if (gJournalReady) diagnostics::submitJournalBoot(gJournal, esp_reset_reason(), gPmuStartup, millis());
+    rtcConditions();
     if (gJournalReady) {
         gLoopFaults.event(4001, millis()).condition(!gSdMounted);
         storageConditions(storageFreeBytes(*gTripFS), millis());
@@ -2648,6 +2680,7 @@ void setup() {
 }
 
 void loop() {
+    serviceRtc();
     // Core 1: one UART reader routes NMEA/fixes and checksum-checked UBX
     // ACKs. Configuration deadlines never block receive or trip processing.
     serviceGpsSpeedFallback();

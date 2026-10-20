@@ -20,8 +20,7 @@ public:
     RuntimeFaults& event(uint16_t code, uint32_t now) {
         input_.code = code; input_.uptimeMs = now;
         input_.contextCount = 0; input_.episodeSequence = 0;
-        // Runtime hooks deliberately use unknown UTC until #128 supplies clock
-        // confidence/age. They never substitute uptime or a stale RTC for UTC.
+        log_.stamp(input_);
         return *this;
     }
     RuntimeFaults& integer(const char* key, int64_t n) {
