@@ -831,9 +831,40 @@ See the [hook list](../DIAGNOSTICS.md#stage-4-runtime-fault-hooks-124-part-b)
 for exact thresholds, context fields and recovery semantics. Events and producer
 state are bounded; a full/contended queue can lose records and counts those drops.
 Both cores have static builders, so no event-sized buffer is added to their stacks.
-Diagnostic uploads/current snapshots (#125), degraded startup (#126) and OLED
-error-code pages (#127) remain future work. The counter is retained in RAM for
-the future check-in worker; it is not sent yet. PMU/storage failure still halts
+After GPX batches, the existing network task sends diagnostics to
+`POST /v1/device-events` using the same server, bearer token and `DEVICE_ID`.
+Each request carries at most 64 events and a current snapshot, including E5001's
+counter, within 32 KiB. Old history keeps its original boot identity. Trips win
+before each request; hold/abort and an absolute ten-second transport deadline
+stop a drain. Exact validated 2xx acknowledgments are required before journal
+reclamation. Failures have separate 60-second-to-one-hour backoff from GPX;
+401 starts at one hour. Rejected batches narrow before a singleton can enter
+the bounded inspection slot, with durable loss accounting. Heartbeats use an
+existing awake opportunity after 24 hours without successful server contact;
+a new boot with unknown contact age checks in conservatively. They never wake
+the board.
+
+**Enable snapshot delivery deliberately:** read this device's current
+`devices.status_sequence` in the ingest diagnostics database (zero only for a
+verified new identity), then uncomment/set `DIAGNOSTICS_STATUS_HIGH_WATER` and
+`DIAGNOSTICS_ENROLLMENT_ID` in private `secrets.h`. The enrollment ID must be
+positive and greater than any previously used on this board. NVS consumes it
+before restoring the SD allocator; a failed enrollment requires a higher ID.
+Existing SD metadata works on later boots without those defines. Never reuse
+a fresh-identity zero after changing/corrupting cards: inspect the server again.
+Without an enrolled writable SD revision authority, events remain local and
+GPX still uploads. See [revision enrollment and recovery](../DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
+for the complete procedure and snapshot-conflict recovery.
+
+The batch, 32 KiB request, 6 KiB snapshot and 8 KiB reply buffers are static
+DRAM, alongside atomically published task observations. The network stack
+remains 12 KiB. On the ESP32-S3 build, the batch is 35,280 bytes and these
+buffers plus the two observation arrays total 85,458 bytes of static DRAM.
+Compiler frames are 432 bytes for the HTTP wrapper, 672 for `nextBatch`, 240
+for acknowledgment and 1,088 for singleton isolation, before callees. These
+figures supplement, but do not replace, the real-upload watermark measurements
+below. Degraded startup (#126) and OLED error-code pages
+(#127) remain future work. PMU/storage failure still halts
 before journal startup. SD/FAT
 power-cut safety and operation latency still need hardware validation.
 See [DIAGNOSTICS.md](../DIAGNOSTICS.md#eventlog-module-122-implementation)
@@ -849,7 +880,8 @@ to build or use the tracker.
 The network task reserves 12,288 bytes, matching the Stage 4 brief. This is
 a conservative starting point; it has **not** been sized from board measurements.
 Serial diagnostics report the task's lifetime minimum free stack at startup,
-after each HTTP upload (including failures), and after each network cycle.
+after each GPX HTTP upload (including failures), and after each network cycle.
+Diagnostic requests sample the watermark silently between batches.
 ESP-IDF reports this watermark in **bytes**; do not multiply it by four.
 See [Espressif's stack measurement guidance](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/performance/ram-usage.html).
 

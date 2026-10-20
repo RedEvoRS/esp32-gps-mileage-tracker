@@ -203,8 +203,16 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   16 MiB journal quota; LittleFS has a 64 KiB reserve included in trip
   free-space checks; both failing leaves a bounded volatile RAM queue.
   Journal writes use checked mounted VFS sync/close, never format media,
-  and seal on core 0 before PMU unmount/power-off. Diagnostic uploads,
-  current snapshots, degraded startup and OLED error-code pages remain
+  and seal on core 0 before PMU unmount/power-off. After GPX batches,
+  diagnostic uploads use exact validated acks, static
+  request buffers, a ten-second deadline and independent retry state. Current
+  snapshots include observed/active conditions and AP-absence counts; the SD-only
+  snapshot revision authority needs explicit one-use enrollment in secrets.h
+  against the server high-water (see DIAGNOSTICS.md). Missing revision authority
+  retains diagnostics locally without blocking GPX. Rejected singleton records
+  use a reserved bounded inspection slot and durable loss accounting. Heartbeats
+  use existing awake opportunities after 24 hours without contact (first boot
+  contact age is unknown). Degraded startup and OLED error-code pages remain
   integration work; host tests do not establish storage timing or durability
 - Five-state FSM for trip lifecycle
 

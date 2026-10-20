@@ -328,6 +328,32 @@ static void quotaAndRetention() {
     config.littleFsBlock = 0; EventLog invalid(nullptr, nullptr, config);
     assert(!invalid.begin(boot1, 1, "test-1"));
 }
+static void rejectedIsolation() {
+    MemoryFs sd; sd.allocationUnit = 32768;
+    EventLog::Config config; config.reserveRejected = true; config.sdQuota = 4 * 32768;
+    EventLog log(&sd, nullptr, config); assert(log.begin(boot1, 1, "test-1"));
+    add(log, 3);
+    assert(log.nextBatch(batch, 1) && batch.count == 1);
+    auto id = batch.ids[0];
+    sd.readOnly = true;
+    assert(!log.isolateRejected(batch)); sd.readOnly = false;
+    assert(log.nextBatch(batch, 1) && batch.ids[0].sequence == id.sequence);
+    sd.tearPath = "rejected"; sd.tear = 20;
+    assert(!log.isolateRejected(batch));
+    assert(log.nextBatch(batch, 1) && batch.ids[0].sequence == id.sequence);
+    sd.tearPath = "ack-"; sd.tear = 20;
+    assert(!log.isolateRejected(batch));
+    assert(log.nextBatch(batch, 1) && batch.ids[0].sequence == id.sequence);
+    assert(log.isolateRejected(batch));
+    assert(log.stats().dropped == 1 && log.stats().pendingLoss == 1);
+    assert(sd.peakAllocated <= config.sdQuota && sd.files["/diag/rejected"].size() <= kFrameBytes);
+    EventLog reopened(&sd, nullptr, config); assert(reopened.begin(boot2, 2, "test-2"));
+    assert(reopened.nextBatch(batch, 1) && batch.ids[0].sequence == id.sequence + 1);
+    assert(reopened.stats().dropped == 1);
+    assert(reopened.isolateRejected(batch)); // bounded replacement, no second file
+    assert(reopened.stats().dropped == 2 && sd.peakAllocated <= config.sdQuota);
+    std::cout << "EventLog: bounded reserved isolation, torn archive/cursor, exact loss and reboot passed\n";
+}
 static void countersAndRevisions() {
     MemoryFs sd; auto log = logger(&sd);
     uint64_t revision = 123;
@@ -408,7 +434,7 @@ int main(int argc, char** argv) {
     std::cerr << "acks\n"; ackRecovery();
     std::cerr << "overflow\n"; overflowAndFailure();
     std::cerr << "fallback\n"; fallbackAndFsFailures();
-    std::cerr << "quota\n"; quotaAndRetention();
+    std::cerr << "quota\n"; quotaAndRetention(); rejectedIsolation();
     std::cerr << "counters\n"; countersAndRevisions();
     std::cerr << "validation\n"; validationAndConcurrency();
     std::cout << "EventLog: identity, recovery, faults, quota, fallback, protocol and concurrency passed\n";

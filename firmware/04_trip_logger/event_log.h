@@ -65,10 +65,11 @@ public:
         uint32_t littleFsQuota = kLittleFsJournalReserve;
         uint32_t segmentBytes = kJournalSegmentBytes;
         uint32_t sdCluster = 32768, littleFsBlock = 4096; // actual allocation units
+        bool reserveRejected = false; // transport's one-frame inspection slot
     };
     struct Batch {
         // Caller owns storage: static DRAM or PSRAM on ESP32-S3, never a task
-        // stack (about 35 KiB). JSON array only; #125 adds check-in.
+        // stack (about 35 KiB). JSON array only; the worker adds check-in.
         char events[64][kEventBytes + 1] = {};
         EventIdentity ids[64];
         size_t count = 0, bytes = 2;
@@ -116,6 +117,10 @@ public:
     // Pass the complete server accepted-ID list; exact set required. No partial
     // acceptance. False leaves data retryable; true means durable metadata.
     bool acknowledge(const Batch& batch, const EventIdentity* accepted, size_t count);
+    // Only after a server-rejected singleton AND a successful identical empty
+    // snapshot probe. Keep one checked frame per store for inspection; replacing
+    // it is bounded loss, counted durably with the cursor (never server ack).
+    bool isolateRejected(const Batch& singleton);
     Stats stats();
     // Single consumer, under FS_LOCK. Startup inventory counts physical valid
     // unacknowledged frames (duplicates after uncertain I/O may be counted).
@@ -132,6 +137,7 @@ public:
     // durably writes one 80-byte slot; no writes per producer scan/event.
     bool restoreStatusSequence(uint64_t highWater);
     bool allocateStatusSequence(uint64_t& sequence);
+    bool suspendStatusSequence(); // explicit recovery required after snapshot conflict
 
     static uint32_t crc32(const void* data, size_t size);
     static void segmentPath(char* out, uint32_t id, bool ready);

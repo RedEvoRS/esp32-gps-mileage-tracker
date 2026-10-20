@@ -613,7 +613,34 @@ struct Restarted {};
 inline int g_restarts = 0;
 struct ESPStub { void restart() { g_restarts++; throw Restarted{}; } };
 inline ESPStub ESP;
-struct WiFiClient {};
+inline uint32_t g_httpConnectMs = 0, g_httpWriteMs = 0, g_httpHeaderMs = 0, g_httpByteMs = 0;
+inline std::vector<uint32_t> g_httpConnectTimeouts, g_httpReadTimeouts;
+struct WiFiClient : Stream {
+    std::string response; size_t position = 0;
+    uint32_t timeout = 5000, nextByte = 0; bool open = true;
+    virtual int connect(const char*, uint16_t, int32_t budget) {
+        g_httpConnectTimeouts.push_back(budget);
+        g_millis += std::min(g_httpConnectMs, uint32_t(budget));
+        return g_httpConnectMs < uint32_t(budget);
+    }
+    void setTimeout(uint32_t ms) { timeout = ms; }
+    virtual uint8_t connected() { return open; }
+    void stop() { open = false; }
+    int available() override { return position < response.size() && int32_t(g_millis - nextByte) >= 0 ? 1 : 0; }
+    int read() override {
+        if (!available()) return -1;
+        nextByte = g_millis + g_httpByteMs; return uint8_t(response[position++]);
+    }
+    virtual int read(uint8_t* out, size_t size) {
+        if (!size || !available()) return 0; *out = read(); return 1;
+    }
+    int peek() override { return available() ? uint8_t(response[position]) : -1; }
+    size_t write(uint8_t) override { return 1; }
+    virtual size_t write(const uint8_t*, size_t size) {
+        g_millis += std::min(g_httpWriteMs, timeout);
+        return g_httpWriteMs < timeout ? size : 0;
+    }
+};
 // HTTP: the response code is set by the test; each request's body is read
 // through the sketch's stream exactly as HTTPClient would, and recorded.
 // g_httpHook, if set, runs once the request starts, standing in for the
@@ -624,11 +651,28 @@ inline int g_httpRequests = 0;
 inline std::string g_httpLastBody;
 inline std::vector<std::string> g_httpBodies;
 inline void (*g_httpHook)() = nullptr;
+inline std::function<void()> g_httpResponseHook;
+inline std::string g_httpResponse;
+inline bool g_httpAutoAck = true;
+inline int g_httpDeclaredSize = -2;
+inline std::vector<std::string> g_httpUrls;
+inline std::vector<std::map<std::string, std::string>> g_httpHeaders;
 struct HTTPClient {
-    void begin(WiFiClient&, const String&) {} void addHeader(const char*, const String&) {}
+    WiFiClient* client = nullptr; std::string url;
+    uint32_t connectTimeout = 5000, readTimeout = 5000;
+    std::map<std::string, std::string> headers;
+    void begin(WiFiClient& c, const String& u) { client = &c; url = u.c_str(); }
+    void addHeader(const char* key, const String& value) { headers[key] = value.c_str(); }
+    void setReuse(bool) {}
+    void setConnectTimeout(uint32_t ms) { connectTimeout = ms; }
+    void setTimeout(uint16_t ms) { readTimeout = ms; g_httpReadTimeouts.push_back(ms); }
+    int getSize() { return g_httpDeclaredSize == -2 ? int(client->response.size()) : g_httpDeclaredSize; }
+    WiFiClient* getStreamPtr() { return client; }
     int sendRequest(const char*, Stream* s, size_t size) {
         g_httpRequests++;
         g_httpLastBody.clear();
+        bool events = url.find("/v1/device-events") != std::string::npos;
+        if (events && !client->connect("test.invalid", 8090, connectTimeout)) return -1;
         if (g_httpHook) g_httpHook();
         char buf[1436];
         while (g_httpLastBody.size() < size && s->available() > 0) {
@@ -638,7 +682,30 @@ struct HTTPClient {
             g_httpLastBody.append(buf, n);
         }
         g_httpBodies.push_back(g_httpLastBody);
+        g_httpUrls.push_back(url); g_httpHeaders.push_back(headers);
         if (g_httpLastBody.size() != size) return -3;   // HTTPC_ERROR_SEND_PAYLOAD_FAILED
+        if (events) {
+            if (client->write(reinterpret_cast<const uint8_t*>(g_httpLastBody.data()), size) != size) return -3;
+            uint32_t headerStart = g_millis;
+            while (g_millis - headerStart < g_httpHeaderMs && client->connected()) g_millis++;
+            if (!client->connected()) return -1;
+            if (g_httpResponseHook) g_httpResponseHook();
+            client->response = g_httpResponse;
+            if (g_httpAutoAck) {
+                client->response = "{\"accepted\":[";
+                size_t pos = g_httpLastBody.find("\"events\":[") + 10; bool comma = false;
+                while ((pos = g_httpLastBody.find("\"boot_id\":\"", pos)) != std::string::npos) {
+                    std::string boot = g_httpLastBody.substr(pos + 11, 32);
+                    size_t seq = g_httpLastBody.find("\"sequence\":", pos) + 11, end = seq;
+                    while (g_httpLastBody[end] >= '0' && g_httpLastBody[end] <= '9') ++end;
+                    client->response += std::string(comma ? "," : "") + "{\"boot_id\":\"" + boot +
+                        "\",\"sequence\":" + g_httpLastBody.substr(seq, end - seq) + "}";
+                    comma = true; pos = end;
+                }
+                client->response += "]}";
+            }
+            client->position = 0; client->nextByte = g_millis + g_httpByteMs;
+        }
         return g_httpCode;
     }
     void end() {}

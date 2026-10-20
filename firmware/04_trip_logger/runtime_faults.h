@@ -38,6 +38,22 @@ public:
         Condition* slot = nullptr;
         for (size_t i = 0; i < count_; ++i) if (slots_[i].code == input_.code) { slot = &slots_[i]; break; }
         if (!slot) return;
+        // Publish only atomic values across cores. A reader never copies the
+        // producer's mutable Condition or EventInput while it is being changed.
+        struct Publish {
+            RuntimeFaults& owner; Condition& slot; size_t index;
+            ~Publish() {
+                uint64_t value = 0;
+                if (slot.observed && (!slot.desired || slot.episode))
+                    value = (uint64_t(1) << 63) | (slot.desired ? slot.episode : 0);
+                if (owner.published_[index].low.load(std::memory_order_relaxed) == uint32_t(value) &&
+                    owner.published_[index].high.load(std::memory_order_relaxed) == uint32_t(value >> 32)) return;
+                owner.revision_.fetch_add(1, std::memory_order_acq_rel);
+                owner.published_[index].low.store(uint32_t(value), std::memory_order_release);
+                owner.published_[index].high.store(uint32_t(value >> 32), std::memory_order_release);
+                owner.revision_.fetch_add(1, std::memory_order_release);
+            }
+        } publish{*this, *slot, size_t(slot - slots_)};
         auto& s = *slot;
         bool changed = !s.observed || s.desired != active;
         s.observed = true; s.desired = active;
@@ -60,15 +76,37 @@ public:
             s.acceptedMs = now;
         }
     }
-    // #125 may copy these task-owned values at a coherent handoff for check-in.
+    // The check-in worker reads this counter on its owning network task.
     // Never journal E5001, including at overflow (saturate at protocol maximum).
     void homeApAbsent() { if (homeApMisses_ < kMaxEventInteger) ++homeApMisses_; }
     uint64_t homeApMisses() const { return homeApMisses_; }
+    struct Observation { uint16_t code; uint64_t episode; bool observed; };
+    // One bounded attempt, no waits. Omit an active condition whose raise has
+    // never been accepted: there is no valid episode identity to transmit yet.
+    unsigned publicationRevision() const { return revision_.load(std::memory_order_acquire); }
+    bool snapshot(Observation* out, size_t capacity, size_t& count, unsigned* capturedRevision = nullptr) const {
+        if (count_ > capacity || count_ > 64) return false;
+        unsigned revision = revision_.load(std::memory_order_acquire);
+        if (revision & 1) return false;
+        for (size_t i = 0; i < count_; ++i) {
+            uint64_t value = published_[i].low.load(std::memory_order_acquire);
+            value |= uint64_t(published_[i].high.load(std::memory_order_acquire)) << 32;
+            out[i] = {slots_[i].code, value & kMaxEventInteger, bool(value >> 63)};
+        }
+        count = count_;
+        if (revision != revision_.load(std::memory_order_acquire)) return false;
+        if (capturedRevision) *capturedRevision = revision;
+        return true;
+    }
 private:
     EventLog& log_;
     Condition* slots_;
     size_t count_;
     EventInput input_;
     uint64_t homeApMisses_ = 0;
+    std::atomic<unsigned> revision_{0};
+    // ESP32-S3 has native 32-bit atomics; avoid libatomic's 64-bit lock path.
+    struct AtomicObservation { std::atomic<uint32_t> low{0}, high{0}; };
+    AtomicObservation published_[64];
 };
 } // namespace diagnostics
