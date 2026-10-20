@@ -1,14 +1,16 @@
 # Mileage Tracker Server
 
-This folder is the server half of the GPS mileage tracker. Once the target
-board firmware is ready, it will upload each finished trip here over your
-home WiFi, and you can review, tag and export the trips in a web page. The
-[top-level README](../README.md) explains the current hardware target and
-which parts of the project can be set up now.
+This folder is the server half of the GPS mileage tracker. It accepts
+finished trips as GPX files over home WiFi, and lets you review, tag and
+export them in a web page. The [top-level README](../README.md) explains
+the complete setup.
 
-The current hardware target is the LilyGO T-Beam Supreme with MAX-M10S
-GPS. Its firmware port is pending, but the server accepts GPX uploads
-independently of the board model, so the server can be set up ahead of it.
+The board is the LilyGO T-Beam Supreme with MAX-M10S GPS and microSD trip
+storage. The server accepts GPX uploads from any board, independently of
+its model. It is deployed, and Stage 4 has recorded real drives on the
+card, but uploading from the board to the deployed server has not been
+tested end to end.
+<!-- TODO(first upload): Record the date and scope of the first successful Supreme-to-deployed-server upload, including confirmation in the viewer. -->
 
 It runs as two default Docker containers, with two optional services, all
 defined in `docker-compose.yml`:
