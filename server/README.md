@@ -315,6 +315,9 @@ audit, and export your trips. It's defined in the same
 `docker-compose.yml` and starts alongside ingest with
 `BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build`.
 
+The viewer follows your OS colour scheme; the Theme button on each page cycles
+Auto, Light and Dark and remembers the choice in this browser.
+
 Open it at:
 
     http://<server>:8091/

@@ -825,57 +825,153 @@ app.jinja_env.globals.update(
 # Templates
 # ---------------------------------------------------------------------
 
-BASE_CSS = """
-  body { font-family: system-ui, sans-serif; margin: 0; color: #1a1a1a; }
-  header { background: #1864ab; color: #fff; padding: 14px 22px;
+THEME_HEAD = """
+<script id="theme-init">
+  (function () {
+    var root = document.documentElement;
+    var mode;
+    try { mode = localStorage.getItem('viewer-theme'); } catch (e) {}
+    if (mode === 'light' || mode === 'dark') root.dataset.theme = mode;
+    document.addEventListener('DOMContentLoaded', function () {
+      var button = document.querySelector('[data-theme-toggle]');
+      function label() {
+        var current = root.dataset.theme || 'auto';
+        button.textContent = 'Theme: ' + current[0].toUpperCase() + current.slice(1);
+      }
+      label();
+      button.addEventListener('click', function () {
+        var next = {auto: 'light', light: 'dark', dark: 'auto'}[root.dataset.theme || 'auto'];
+        try {
+          if (next === 'auto') localStorage.removeItem('viewer-theme');
+          else localStorage.setItem('viewer-theme', next);
+        } catch (e) { next = 'auto'; }
+        if (next === 'auto') delete root.dataset.theme;
+        else root.dataset.theme = next;
+        label();
+      });
+    });
+  }());
+</script>
+"""
+
+THEME_BUTTON = '<button type="button" class="theme-toggle" data-theme-toggle>Theme: Auto</button>'
+
+# Reuse the dark palette for OS preference and the explicit override.
+DARK_THEME_CSS = """
+    --page-bg: #15191e; --text: #e9ecef; --header-bg: #123b60;
+    --header-button-text: #fff;
+    --table-head-bg: #252c34; --border: #414b57; --row-hover-bg: #20262d;
+    --tag-bg: #343e49; --business-bg: #183d25; --business-text: #b2f2bb;
+    --personal-bg: #173952; --personal-text: #a5d8ff;
+    --other-bg: #493916; --other-text: #ffe69c; --muted: #adb5bd;
+    --warn-bg: #421e24; --warn-text: #ffc9c9; --warn-border: #88434e;
+    --button-bg: #1864ab; --secondary-bg: #495057;
+    --input-bg: #20262d; --input-text: #e9ecef; --input-border: #66717e;
+    --login-bg: #15191e; --card-bg: #20262d; --heading: #a5d8ff;
+    --card-shadow: rgba(0,0,0,.35); --login-input-border: #66717e;
+    --map-bg: #20262d; --map-border: #414b57;
+    --tile-filter: invert(1) hue-rotate(180deg) brightness(.95) contrast(.9);
+    --map-control-bg: #252c34; --map-control-text: #e9ecef;
+    --map-control-hover: #343e49; --map-control-disabled: #adb5bd;
+    --map-control-border: #66717e; --attribution-bg: rgba(32,38,45,.95);
+    --attribution-text: #e9ecef; --map-link: #a5d8ff;
+"""
+
+THEME_CSS = """
+  :root {
+    color-scheme: light dark;
+    --page-bg: #fff; --text: #1a1a1a; --header-bg: #1864ab; --header-text: #fff;
+    --header-button-bg: rgba(255,255,255,.15); --header-button-text: #070707;
+    --header-button-border: rgba(255,255,255,.45); --header-button-hover: rgba(255,255,255,.28);
+    --table-head-bg: #f1f3f5; --border: #e0e0e0; --row-hover-bg: #f8f9fa;
+    --tag-bg: transparent; --business-bg: #d3f9d8; --business-text: #277c38;
+    --personal-bg: #e7f5ff; --personal-text: #1971c2;
+    --other-bg: #fff3bf; --other-text: #ac5900; --muted: #6c747c;
+    --warn-bg: #fff5f5; --warn-text: #c92a2a; --warn-border: #ffc9c9;
+    --button-bg: #1864ab; --button-text: #fff; --secondary-bg: #495057;
+    --input-bg: #fff; --input-text: #000; --input-border: #767676;
+    --login-bg: #f1f3f5; --card-bg: #fff; --heading: #1864ab;
+    --card-shadow: rgba(0,0,0,.10); --login-input-border: #ced4da;
+    --map-bg: #ddd; --map-border: #ced4da; --tile-filter: none;
+    --map-control-bg: #fff; --map-control-text: #000; --map-control-hover: #f4f4f4;
+    --map-control-disabled: #707070; --map-control-border: #ccc;
+    --attribution-bg: rgba(255,255,255,.8); --attribution-text: #333; --map-link: #005d83;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+""" + DARK_THEME_CSS + """
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+""" + DARK_THEME_CSS + """
+  }
+  :root[data-theme="light"] { color-scheme: light; }
+"""
+
+BASE_CSS = THEME_CSS + """
+  body { font-family: system-ui, sans-serif; margin: 0; color: var(--text); background: var(--page-bg); }
+  header { background: var(--header-bg); color: var(--header-text); padding: 14px 22px;
            display: flex; align-items: center; justify-content: space-between; }
-  header a { color: #fff; text-decoration: none; font-weight: 600; }
+  header a { color: var(--header-text); text-decoration: none; font-weight: 600; }
+  .header-actions { display: flex; gap: 8px; align-items: center; }
   header form.logout { margin: 0; }
-  header form.logout button { background: rgba(255,255,255,.15); color: #fff;
-           border: 1px solid rgba(255,255,255,.45); padding: 5px 12px;
+  header form.logout button, header .theme-toggle {
+           background: var(--header-button-bg); color: var(--header-button-text);
+           border: 1px solid var(--header-button-border); padding: 5px 12px;
            border-radius: 5px; font-size: 13px; cursor: pointer; }
-  header form.logout button:hover { background: rgba(255,255,255,.28); }
+  header form.logout button:hover, header .theme-toggle:hover { background: var(--header-button-hover); }
   .wrap { padding: 22px; }
   table { border-collapse: collapse; width: 100%; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #e0e0e0; }
-  th { background: #f1f3f5; font-size: 13px; text-transform: uppercase; letter-spacing: .03em; }
-  tr:hover td { background: #f8f9fa; }
-  .tag { font-size: 12px; padding: 2px 8px; border-radius: 10px; }
-  .business { background: #d3f9d8; color: #2b8a3e; }
-  .personal { background: #e7f5ff; color: #1971c2; }
-  .other    { background: #fff3bf; color: #e67700; }
-  .muted { color: #868e96; }
-  .warn { background: #fff5f5; color: #c92a2a; border: 1px solid #ffc9c9;
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { background: var(--table-head-bg); font-size: 13px; text-transform: uppercase; letter-spacing: .03em; }
+  tr:hover td { background: var(--row-hover-bg); }
+  .tag { background: var(--tag-bg); font-size: 12px; padding: 2px 8px; border-radius: 10px; }
+  .business { background: var(--business-bg); color: var(--business-text); }
+  .personal { background: var(--personal-bg); color: var(--personal-text); }
+  .other    { background: var(--other-bg); color: var(--other-text); }
+  .muted { color: var(--muted); }
+  .warn { background: var(--warn-bg); color: var(--warn-text); border: 1px solid var(--warn-border);
           padding: 10px 14px; border-radius: 6px; margin-bottom: 16px; font-size: 14px; }
   .warn ul { margin: 6px 0 0; padding-left: 20px; }
-  .btn { display: inline-block; background: #1864ab; color: #fff; padding: 8px 14px;
+  .btn { display: inline-block; background: var(--button-bg); color: var(--button-text); padding: 8px 14px;
          border-radius: 6px; text-decoration: none; border: none; cursor: pointer; font-size: 14px; }
-  .btn.secondary { background: #495057; }
+  .btn.secondary { background: var(--secondary-bg); }
   .toolbar { margin-bottom: 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   .stats { display: flex; gap: 26px; flex-wrap: wrap; margin: 12px 0; }
   .stat b { display: block; font-size: 22px; }
-  .stat span { color: #868e96; font-size: 13px; }
-  #map { height: 460px; border: 1px solid #ced4da; border-radius: 8px; }
+  .stat span { color: var(--muted); font-size: 13px; }
+  #map { height: 460px; border: 1px solid var(--map-border); border-radius: 8px; background: var(--map-bg); }
+  .leaflet-tile-pane { filter: var(--tile-filter); }
+  .leaflet-bar a { background: var(--map-control-bg); color: var(--map-control-text);
+                   border-bottom-color: var(--map-control-border); }
+  .leaflet-bar a:hover, .leaflet-bar a:focus { background: var(--map-control-hover); }
+  .leaflet-bar a.leaflet-disabled { background: var(--map-control-hover); color: var(--map-control-disabled); }
+  .leaflet-container .leaflet-control-attribution { background: var(--attribution-bg); color: var(--attribution-text); }
+  .leaflet-control-attribution a { color: var(--map-link); }
   form.annotate { margin-top: 18px; max-width: 520px; }
   label { display: block; margin: 10px 0 4px; font-weight: 600; font-size: 14px; }
-  select, textarea, input[type=text] { width: 100%; padding: 8px; font-size: 14px; box-sizing: border-box; }
+  select, textarea, input[type=text] { width: 100%; padding: 8px; font-size: 14px; box-sizing: border-box;
+      background: var(--input-bg); color: var(--input-text); border-color: var(--input-border); }
 """
 
 LOGIN_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Sign in · Mileage Tracker</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-  body { font-family: system-ui, sans-serif; background: #f1f3f5; margin: 0;
+""" + THEME_HEAD + """<style>""" + THEME_CSS + """
+  body { font-family: system-ui, sans-serif; background: var(--login-bg); color: var(--input-text); margin: 0;
          display: flex; min-height: 100vh; align-items: center; justify-content: center; }
-  .card { background: #fff; padding: 30px 32px; border-radius: 10px; width: 320px;
-          box-shadow: 0 2px 14px rgba(0,0,0,.10); }
-  h1 { font-size: 19px; margin: 0 0 20px; color: #1864ab; }
+  .card { background: var(--card-bg); padding: 30px 32px; border-radius: 10px; width: 320px;
+          box-shadow: 0 2px 14px var(--card-shadow); }
+  h1 { font-size: 19px; margin: 0 0 20px; color: var(--heading); }
   label { display: block; font-size: 13px; font-weight: 600; margin: 12px 0 4px; }
   input { width: 100%; padding: 9px; font-size: 14px; box-sizing: border-box;
-          border: 1px solid #ced4da; border-radius: 5px; }
-  button { width: 100%; margin-top: 20px; background: #1864ab; color: #fff; border: none;
+          border: 1px solid var(--login-input-border); border-radius: 5px;
+          background: var(--input-bg); color: var(--input-text); }
+  button { width: 100%; margin-top: 20px; background: var(--button-bg); color: var(--button-text); border: none;
            padding: 10px; border-radius: 6px; font-size: 15px; cursor: pointer; }
-  .err { background: #fff5f5; color: #c92a2a; border: 1px solid #ffc9c9;
+  .theme-toggle { width: auto; padding: 5px 10px; font-size: 13px; }
+  .err { background: var(--warn-bg); color: var(--warn-text); border: 1px solid var(--warn-border);
          padding: 9px 11px; border-radius: 5px; font-size: 13px; margin-bottom: 4px; }
 </style></head><body>
   <div class="card">
@@ -890,19 +986,23 @@ LOGIN_HTML = """
              autocomplete="current-password" required>
       <button type="submit">Sign in</button>
     </form>
+    """ + THEME_BUTTON + """
   </div>
 </body></html>
 """
 
 LIST_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Mileage Trips</title>
-<style>""" + BASE_CSS + """</style></head><body>
+""" + THEME_HEAD + """<style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index') }}">🚗 Mileage Tracker</a>
   <a href="{{ url_for('device_health') }}">Device health</a>
-  <form class="logout" method="post" action="{{ url_for('logout') }}">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <button type="submit">Log out</button>
-  </form>
+  <div class="header-actions">
+    """ + THEME_BUTTON + """
+    <form class="logout" method="post" action="{{ url_for('logout') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit">Log out</button>
+    </form>
+  </div>
 </header>
 <div class="wrap">
   {% if unreadable %}
@@ -962,14 +1062,18 @@ LIST_HTML = """
 
 TRIP_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Trip {{ t.id }}</title>
+""" + THEME_HEAD + """
 <link rel="stylesheet" href="{{ url_for('static', filename='leaflet.css') }}">
 <style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index', year=year or '') }}">← {{ year or 'All' }} trips</a>
   <a href="{{ url_for('device_health') }}">Device health</a>
-  <form class="logout" method="post" action="{{ url_for('logout') }}">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <button type="submit">Log out</button>
-  </form>
+  <div class="header-actions">
+    """ + THEME_BUTTON + """
+    <form class="logout" method="post" action="{{ url_for('logout') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit">Log out</button>
+    </form>
+  </div>
 </header>
 <div class="wrap">
   <h2>{{ fmt_trip_date(t) }}</h2>
@@ -1051,17 +1155,20 @@ TRIP_HTML = """
 DEVICE_HEALTH_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Device health</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<style>""" + BASE_CSS + """
+""" + THEME_HEAD + """<style>""" + BASE_CSS + """
   .health-table { overflow-x: auto; }
   .health-table td { vertical-align: top; overflow-wrap: anywhere; }
   .oled { white-space: pre-wrap; }
-  .condition { border-bottom: 1px solid #e0e0e0; padding: 8px 0; }
+  .condition { border-bottom: 1px solid var(--border); padding: 8px 0; }
 </style></head><body>
 <header><a href="{{ url_for('index') }}">← Trips</a><span>Device health</span>
-  <form class="logout" method="post" action="{{ url_for('logout') }}">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <button type="submit">Log out</button>
-  </form>
+  <div class="header-actions">
+    """ + THEME_BUTTON + """
+    <form class="logout" method="post" action="{{ url_for('logout') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit">Log out</button>
+    </form>
+  </div>
 </header><main class="wrap"><h1>Device health</h1>
 {% if state == 'absent' %}
   <p>No diagnostics yet. No device diagnostics or identified trip contact has arrived.</p>
