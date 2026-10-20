@@ -9,11 +9,12 @@ Deploys both services from `server/`:
 | `ntfy` | 8092 | Topic token | Optional self-hosted phone notifications |
 | `mileage-monitor` | 8093 | Bearer token when enabled | Optional Prometheus `/metrics` endpoint in the `monitor` profile |
 
-This is the server half of the project. The top-level `README.md` gives
-the server setup and the current board target. The target is now a T-Beam
-Supreme with MAX-M10S GPS and a SanDisk 32 GB Max Endurance microSD card,
-but the firmware port is pending. Step 8 below is retained for the retired
-V1.2 only; do not flash those instructions to a Supreme.
+This is the server half of the project. The [top-level README](README.md)
+gives the complete setup. The board is the T-Beam Supreme with MAX-M10S
+GPS and a SanDisk 32 GB Max Endurance microSD card. Step 8 covers its
+`secrets.h`, flashing and one-time diagnostics enrollment. The retired
+T-Beam V1.2's last firmware and instructions are on the frozen
+[`tbeam-v1.2` branch](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/tree/tbeam-v1.2).
 
 Assumes: Debian 12/13, a non-root user with sudo, SSH reachable.
 Placeholders: `<user>` = your Debian login, `<host>` = server IP or hostname.
@@ -495,15 +496,11 @@ the tracker is published. Use the LAN IP for any curl tests from here on.
 
 ---
 
-## Step 8 — Point the legacy V1.2 firmware at it (reference only)
-
-> The board target is the T-Beam Supreme with MAX-M10S GPS and microSD
-> storage, but its firmware port is not available yet. The `secrets.h`,
-> flashing, and storage instructions in this step apply only to the retired
-> T-Beam V1.2. Do not use them for the Supreme.
+## Step 8 — Point the firmware at it
 
 **On your computer**, create the firmware's settings file from the
-example. If you are still in the server's SSH session, type `exit` first:
+example. If you are still in the server's SSH session, type `exit` first.
+If `secrets.h` already exists, edit it instead of overwriting it with the example.
 
 ```bash
 cd "<path to your copy of the repo>/firmware"
@@ -514,8 +511,8 @@ cp secrets.h.example 04_trip_logger/secrets.h
 PowerShell accepts `cp`.) It has to sit in the sketch folder,
 `04_trip_logger/`, next to the `.ino`; that's the only place the build
 looks for it. Fill in WiFi SSID/password, the server host/IP, port
-`8090`, and the `INGEST_AUTH_TOKEN` from Step 4a — it must match
-byte-for-byte. Put only the IP address or hostname in `SERVER_HOST`, with
+`8090`, and set `AUTH_TOKEN` to the `INGEST_AUTH_TOKEN` from Step 4a — it
+must match byte-for-byte. Put only the IP address or hostname in `SERVER_HOST`, with
 no `http://`, port or `/upload`. `install.sh` prints the server lines ready
 to paste. The WiFi has to be 2.4 GHz, and hidden networks won't work.
 
@@ -525,14 +522,79 @@ to paste. The WiFi has to be 2.4 GHz, and hidden networks won't work.
 
 `secrets.h` is gitignored. Keep it that way.
 
-For a retired V1.2 board only, flash `firmware/04_trip_logger`, check it
-works and put it in the car. The top-level README covers those legacy steps
-under "Setting it up", steps 3 to 5:
-the Arduino IDE setup (ESP32 core 3.3.11, XPowersLib 0.3.3, TinyGPSPlus
-1.0.3), the rest of the WiFi requirements, and the **one-time storage setup
-a new, empty board may need on its first flash**. For a board that has
-already recorded trips, use the firmware guide's storage recovery steps
-instead of formatting after a mount error.
+Build and flash `firmware/04_trip_logger` for the **T-Beam Supreme**,
+using **ESP32S3 Dev Module**, ESP32 core **3.3.11**, and the libraries and
+board settings in the [full flashing walkthrough](README.md#3-flash-the-firmware).
+The equivalent arduino-cli board identifier (FQBN) is:
+
+```text
+esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled
+```
+
+Fit a **FAT32 microSD card** with the board switched off. Stage 4 records
+there when it mounts, otherwise it uses internal LittleFS. Its bundled
+`partitions.csv` overrides the Arduino IDE's Partition Scheme menu.
+The **first Stage 4 upload** needs **Erase All Flash Before Sketch Upload →
+Enabled** once to clear factory data, then **Disabled** for later uploads;
+see [First flash on a new board](firmware/README.md#first-flash-on-a-new-board).
+Later uploads with erase disabled keep trips on the card and in internal
+flash and preserve NVS (the board's settings memory, including trip
+numbering and the diagnostic boot counter). Erase-all wipes NVS and
+internal trips, so back up existing data before using it again.
+
+### One-time diagnostics enrollment
+
+Before the first boot with diagnostics enrollment enabled, read the
+server's saved snapshot revision for this `DEVICE_ID`. A snapshot describes
+the board's current conditions; the server accepts a newer revision so an
+old upload cannot replace newer state. **Run this command on the server**,
+replacing `<DEVICE_ID>` with the value in your `secrets.h`:
+
+```bash
+cd ~/mileage-tracker
+docker compose exec -T mileage-viewer python -c "import os,sqlite3,sys;p='/data/diagnostics/events.db';r=sqlite3.connect('file:'+p+'?mode=ro',uri=True).execute('SELECT status_sequence FROM devices WHERE device_id=?',(sys.argv[1],)).fetchone() if os.path.exists(p) else None;print((r and r[0]) or 0)" <DEVICE_ID>
+```
+
+This uses the viewer container because it mounts `data/` read-only, so the
+command cannot write to ingest's database. It also opens SQLite with
+`mode=ro`. It prints `0` if `events.db` does not exist yet or the device
+has no row. If it reports an error, fix that error before proceeding;
+do not substitute zero for an unreadable database.
+
+**Back on your computer**, set these in `firmware/04_trip_logger/secrets.h`
+before flashing, replacing `<printed>` with the number from the command:
+
+```cpp
+#define DIAGNOSTICS_ENROLLMENT_ID 1ULL
+#define DIAGNOSTICS_STATUS_HIGH_WATER <printed>ULL
+```
+
+`1ULL` is only for a board that has never used an enrollment ID. The ID
+must be positive and **greater than every ID previously used on this
+board**; use a higher value if needed. `ULL` marks an unsigned long long
+integer in C++. The firmware consumes the ID in NVS before restoring the
+snapshot revision on the SD card, so even a failed attempt needs a higher ID.
+
+After the **first successful diagnostics upload**, check the viewer's
+**Device health** page for the board's contact and a current snapshot.
+Then remove both defines and reflash with erase **Disabled**. Existing SD
+revision metadata is used on later boots. Re-enrollment after lost or
+replaced metadata needs a higher ID and a fresh server read. Erase-all
+also clears the consumed ID (`diag/enroll`); leaving the defines in the
+firmware then re-enrolls from the compiled-in, possibly stale high-water.
+See [snapshot revision enrollment and recovery](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery).
+
+The expected trip-upload result is `HTTP 200 (deleted)` in the Serial
+Monitor and the trip appearing in the viewer. Those are checks to perform:
+the server is deployed and real drives have been recorded on SD, but
+uploading from the board has not yet been tested end to end.
+<!-- TODO(first upload): Record the successful test date, the observed GPX acceptance and local deletion, and the Device health contact/snapshot result; distinguish any still-untested diagnostics or storage path. -->
+
+Then follow [README step 4: Check it works](README.md#4-check-it-works)
+and [step 5: Put it in the car](README.md#5-put-it-in-the-car). If storage
+fails on a board that has already logged trips, use the firmware guide's
+[storage recovery steps](firmware/README.md#if-the-trip-storage-wont-mount-later)
+to preserve the data before considering an erase.
 
 ---
 
@@ -1286,9 +1348,9 @@ was flashed: the server's IP (check the DHCP reservation), the token in
 in, so update `secrets.h` and reflash (Step 8). The top-level README's
 "Check it works" section says how to read the board's Serial Monitor
 output. Trips recorded meanwhile wait on the board, but once its storage
-fills (about 5 to 6 hours of driving on the legacy V1.2 LittleFS partition)
-it stops recording. That estimate does not describe the Supreme microSD
-target.
+fills it stops recording. On the microSD card it can hold far more
+than any realistic gap between uploads; without a usable card, internal
+flash fallback holds about 5–6 hours of driving, then recording stops.
 
 **Compose says `INGEST_AUTH_TOKEN` is unset** — `.env` must sit next to
 `docker-compose.yml` in `~/mileage-tracker/`, not inside `mileage-ingest/`.
