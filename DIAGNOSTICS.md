@@ -1,14 +1,17 @@
 # Device diagnostics framework
 
-This is the reference for issues #117 through #130. It describes the complete
-planned framework, including features that are not implemented yet. **#117 adds
-the shared catalog, protocol validation, generated C++ header, tests and this
-document; #118 adds the ingest endpoint, storage and GPX contact refresh;
-#119 adds the viewer's Device health page; #120/#121 add the optional server
-monitor, ntfy deployment and silence policy.**
-Firmware diagnostics follow in later issues.
-Existing firmware and server behavior remains described in
-[README.md](README.md) and [DEPLOY_DEBIAN.md](DEPLOY_DEBIAN.md).
+This is the reference for the diagnostics framework (issues #117 through
+#130 and the later items in the delivery map below). Both halves are
+implemented: the Stage 4 firmware journals error codes, shows them on the
+production screen and uploads them after trips; the server stores them,
+shows them on the viewer's Device health page and can optionally notify or
+export them. What remains is hardware acceptance on the T-Beam Supreme
+(#130 and the shakedown issues).
+<!-- TODO(first upload): once the board's first diagnostics upload to the
+deployed server succeeds, say so here with the date. -->
+Until then, delivery from the board to a deployed server is implemented and
+host-tested but not yet confirmed end to end. Setup steps are in
+[README.md](README.md) and [DEPLOY_DEBIAN.md](DEPLOY_DEBIAN.md) Step 8.
 
 The tracker normally runs unattended in a car. A serial console cannot explain
 last week's missed trip. Diagnostics therefore have two separate parts:
