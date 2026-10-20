@@ -172,7 +172,9 @@ jobs:
     # systemd. Then reruns it, has it repair a mangled config, restarts
     # Docker and checks again, and makes sure --check notices a broken
     # install.
-    runs-on: ubuntu-latest
+    # Match Docker 29 and its containerd image store, installed from Docker's
+    # Debian repo by DEPLOY_DEBIAN.md, so CI exercises the real server setup.
+    runs-on: ubuntu-26.04
     timeout-minutes: 25
     env:
       PASSWORD: correct-horse-battery
@@ -246,8 +248,10 @@ jobs:
           systemctl is-enabled "mileage-backup@$TEST_USER.timer"
       - name: Run it again; it keeps everything
         run: |
+          before=$(docker inspect -f '{{.State.StartedAt}}' mileage-ingest mileage-viewer)
           sudo -u "$TEST_USER" -H env INSTALL_KEEP_LOGIN=y INSTALL_KEEP_OUTPUTS=y INSTALL_VIEWER_PASSWORD="$PASSWORD" \
             bash "$INSTALLER" < /dev/null
+          test "$before" = "$(docker inspect -f '{{.State.StartedAt}}' mileage-ingest mileage-viewer)"
       - name: A re-run with nothing to fix doesn't ask for sudo
         # With a password-only sudo rule and no terminal, any sudo prompt
         # stops the run, so this only passes if it never asks (#22).

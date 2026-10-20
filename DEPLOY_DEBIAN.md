@@ -90,7 +90,7 @@ If `id -u` is **not** 1000, see the note in Step 3.
 Run this section **on the server**, in the SSH session from Step 0.
 
 Debian's repos ship an old/renamed Docker. Use Docker's official repo so you
-get `docker compose` (v2 plugin), not the deprecated `docker-compose`.
+get the `docker compose` plugin (v2 or newer), not the deprecated `docker-compose`.
 
 ```bash
 sudo apt update && sudo apt upgrade -y
@@ -125,7 +125,7 @@ Reconnect and verify:
 ```bash
 ssh <user>@<host>
 docker run --rm hello-world
-docker compose version      # expect v2.x
+docker compose version      # expect v2 or newer
 ```
 
 ---
@@ -313,8 +313,15 @@ workers, which is why it's configured rather than generated at startup.
 
 ```bash
 cd ~/mileage-tracker
-docker compose up -d --build
+BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
 ```
+
+Use `BUILDX_NO_DEFAULT_ATTESTATIONS=1` for every manual build or rebuild
+(including `docker compose build`). It disables default provenance attestations,
+which otherwise change image IDs on Docker 29's containerd store even when
+every layer is cached, causing needless container recreation. `install.sh`
+sets it automatically, including for monitor builds. This also works with
+Compose 2.38, which does not support the `build.provenance` setting.
 
 First build pulls `python:3.12-slim` and compiles wheels; a minute or two is
 normal. Then:
@@ -950,7 +957,7 @@ MONITOR_ENV_FILE=./monitor.env
 ```
 
 ```bash
-docker compose --profile monitor up -d --build mileage-monitor
+BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --profile monitor up -d --build mileage-monitor
 docker compose logs --tail 30 mileage-monitor
 ```
 
@@ -1135,7 +1142,7 @@ history, screenshots and Git. In the existing `.env`, select that file with
 `MONITOR_ENV_FILE=./monitor.env`. Apply the settings:
 
 ```bash
-docker compose --profile monitor up -d --build mileage-monitor
+BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --profile monitor up -d --build mileage-monitor
 docker compose logs --tail 30 mileage-monitor
 ```
 
@@ -1205,7 +1212,7 @@ credentials in the URL or commit them. In `.env`, select the private file with
 
 ```bash
 cd ~/mileage-tracker
-docker compose --profile monitor up -d --build mileage-monitor
+BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --profile monitor up -d --build mileage-monitor
 docker compose logs --tail 30 mileage-monitor
 ```
 
@@ -1372,5 +1379,5 @@ the host-side port mapping in `docker-compose.yml`.
 
 ```bash
 cd ~/mileage-tracker
-docker compose up -d --build
+BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
 ```
