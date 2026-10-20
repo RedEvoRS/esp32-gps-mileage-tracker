@@ -859,7 +859,6 @@ THEME_BUTTON = '<button type="button" class="theme-toggle" data-theme-toggle>The
 # Reuse the dark palette for OS preference and the explicit override.
 DARK_THEME_CSS = """
     --page-bg: #15191e; --text: #e9ecef; --header-bg: #123b60;
-    --header-button-text: #fff;
     --table-head-bg: #252c34; --border: #414b57; --row-hover-bg: #20262d;
     --tag-bg: #343e49; --business-bg: #183d25; --business-text: #b2f2bb;
     --personal-bg: #173952; --personal-text: #a5d8ff;
@@ -881,8 +880,8 @@ THEME_CSS = """
   :root {
     color-scheme: light dark;
     --page-bg: #fff; --text: #1a1a1a; --header-bg: #1864ab; --header-text: #fff;
-    --header-button-bg: rgba(255,255,255,.15); --header-button-text: #070707;
-    --header-button-border: rgba(255,255,255,.45); --header-button-hover: rgba(255,255,255,.28);
+    --header-button-bg: rgba(0,0,0,.18); --header-button-text: #fff;
+    --header-button-border: rgba(255,255,255,.55); --header-button-hover: rgba(0,0,0,.30);
     --table-head-bg: #f1f3f5; --border: #e0e0e0; --row-hover-bg: #f8f9fa;
     --tag-bg: transparent; --business-bg: #d3f9d8; --business-text: #277c38;
     --personal-bg: #e7f5ff; --personal-text: #1971c2;
@@ -952,7 +951,8 @@ BASE_CSS = THEME_CSS + """
   form.annotate { margin-top: 18px; max-width: 520px; }
   label { display: block; margin: 10px 0 4px; font-weight: 600; font-size: 14px; }
   select, textarea, input[type=text] { width: 100%; padding: 8px; font-size: 14px; box-sizing: border-box;
-      background: var(--input-bg); color: var(--input-text); border-color: var(--input-border); }
+      background: var(--input-bg); color: var(--input-text);
+      border: 1px solid var(--input-border); border-radius: 4px; }
 """
 
 LOGIN_HTML = """
@@ -970,7 +970,10 @@ LOGIN_HTML = """
           background: var(--input-bg); color: var(--input-text); }
   button { width: 100%; margin-top: 20px; background: var(--button-bg); color: var(--button-text); border: none;
            padding: 10px; border-radius: 6px; font-size: 15px; cursor: pointer; }
-  .theme-toggle { width: auto; padding: 5px 10px; font-size: 13px; }
+  .theme-toggle { width: auto; margin-top: 14px; padding: 5px 10px; font-size: 13px;
+                  background: transparent; color: var(--muted);
+                  border: 1px solid var(--login-input-border); border-radius: 6px; }
+  .theme-toggle:hover { background: var(--row-hover-bg); border-color: var(--muted); }
   .err { background: var(--warn-bg); color: var(--warn-text); border: 1px solid var(--warn-border);
          padding: 9px 11px; border-radius: 5px; font-size: 13px; margin-bottom: 4px; }
 </style></head><body>

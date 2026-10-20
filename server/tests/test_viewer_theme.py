@@ -117,6 +117,7 @@ class ViewerThemeTests(unittest.TestCase):
 
         light = properties(self.viewer.THEME_CSS.split("@media")[0])
         dark = {**light, **properties(self.viewer.DARK_THEME_CSS)}
+        self.assertEqual(rgb(light["header-button-text"]), [1, 1, 1])
         for mode, palette in (("light", light), ("dark", dark)):
             def background(name, under):
                 value = palette[name]
@@ -130,7 +131,7 @@ class ViewerThemeTests(unittest.TestCase):
             pairs = [
                 ("text", bg) for bg in ("page-bg", "table-head-bg", "row-hover-bg", "card-bg", "tag-bg")
             ] + [
-                ("muted", bg) for bg in ("page-bg", "row-hover-bg")
+                ("muted", bg) for bg in ("page-bg", "row-hover-bg", "card-bg")
             ] + [
                 ("header-text", "header-bg"),
                 ("button-text", "button-bg"), ("button-text", "secondary-bg"),
@@ -146,12 +147,18 @@ class ViewerThemeTests(unittest.TestCase):
             ]
             for fg, bg in pairs:
                 with self.subTest(mode=mode, foreground=fg, background=bg):
+                    # Header button normal/hover overlays must be composited over
+                    # each theme's blue header before measuring white text.
                     under = rgb(palette["header-bg"] if bg.startswith("header-button") else palette["page-bg"])
                     # Use the worst tile under the translucent attribution.
                     if bg == "attribution-bg":
                         under = [0, 0, 0] if mode == "light" else [1, 1, 1]
                     values = sorted((luminance(rgb(palette[fg])), luminance(background(bg, under))))
                     self.assertGreaterEqual((values[1] + .05) / (values[0] + .05), 4.5)
+
+            with self.subTest(mode=mode, foreground="input-border", background="page-bg"):
+                values = sorted(luminance(rgb(palette[name])) for name in ("input-border", "page-bg"))
+                self.assertGreaterEqual((values[1] + .05) / (values[0] + .05), 3)
 
 
 if __name__ == "__main__":
