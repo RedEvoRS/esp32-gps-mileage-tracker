@@ -497,12 +497,25 @@ struct XPowersAXP2101 {
     std::function<void(uint8_t)> onRegisterRead;
     bool vbusNotIn = false; // STATUS2 bit 3, independently test library semantics
     bool failChargeDisable = false, failChargeEnable = false, failChargeRead = false;
+    int writeRegister(uint8_t reg, uint8_t value) {
+        operations.push_back("writeRegister");
+        assert(reg == 0x50 || reg == 0x30); // debug TS setup only
+        registerReadOverride[reg] = value;
+        return 0;
+    }
     int readRegister(uint8_t reg) {
         operations.push_back("readRegister");
         unsigned call = ++registerReadCalls[reg];
         if (onRegisterRead) onRegisterRead(reg);
         if (failRegisterReadAt.count(reg) && failRegisterReadAt[reg] == call) return -1;
         if (registerReadOverride.count(reg)) return registerReadOverride[reg];
+        if (reg == 0x50) return 0x10; // XPowersLib init: external TS, bias off
+        if (reg == 0x30) return 0x1d; // existing non-TS ADC channels
+        if (reg == 0x36) return 0x04;
+        if (reg == 0x37) return 0x00;
+        if (reg == 0xa4) return batteryPercent;
+        if (reg == 0x34) return batteryMv >> 8;
+        if (reg == 0x35) return batteryMv & 0xff;
         if (reg == XPOWERS_AXP2101_STATUS1) return (vbusIn ? 0x20 : 0) | (batteryConnected ? 0x08 : 0);
         if (reg == XPOWERS_AXP2101_STATUS2) return vbusNotIn ? 0x08 : 0;
         if (reg == XPOWERS_AXP2101_LDO_ONOFF_CTRL0) return aldo3 ? 0x04 : 0;

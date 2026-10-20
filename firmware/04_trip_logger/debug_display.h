@@ -11,6 +11,7 @@ static constexpr uint8_t DEBUG_OLED_CONTRAST = 255;  // SH1106 maximum
 
 static U8G2_SH1106_128X64_NONAME_F_HW_I2C gDebugOled(U8G2_R0, U8X8_PIN_NONE);
 static bool gDebugDisplayReady = false, gDebugDisplayFailed = false;
+static bool gDebugWireReady = false; // also permits BME280 when only OLED is absent
 static uint32_t gDebugDrawMs = 0;
 
 // U8g2's stock Arduino callback ignores endTransmission errors. Latch the
@@ -49,7 +50,8 @@ static void debugDisplayCheck() {
 static void beginDebugDisplay() {
     gDebugDisplayReady = true;  // also makes an init failure log exactly once
     Wire.setTimeOut(10);
-    if (!Wire.begin(17, 18, 400000)) gDebugDisplayFailed = true;
+    gDebugWireReady = Wire.begin(17, 18, 400000);
+    if (!gDebugWireReady) gDebugDisplayFailed = true;
     if (!gDebugDisplayFailed) {
         Wire.beginTransmission(0x3C);
         if (Wire.endTransmission() != 0) gDebugDisplayFailed = true;
