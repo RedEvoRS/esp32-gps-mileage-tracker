@@ -41,7 +41,7 @@ numeric measurements and fixed enumerated values in context.
   snapshot revision allocator. Part A of #124 now supplies its mounted-storage
   adapters, boot identity/counter and boot notices in Stage 4.
 - **#123:** implemented pure header-only DisplayModel, bounded episode queue,
-  catalog rendering and host policy tests for the production screen.
+  structured card content and host policy tests for the production screen.
 - **#124 part A:** implemented mounted-filesystem adapters, fresh boot identity/
   NVS boot counter, cooperative core-0 service, LittleFS trip reserve, shutdown
   sealing and boot/reset notices. **Part B is implemented:** runtime fault hooks
@@ -106,7 +106,7 @@ Journal policy describes the producer behavior:
   boot/reset history, configuration failures and recovery/loss reports.
 - `counter`: increment a boot-local check-in counter instead of journaling each
   occurrence. **5001 HOME_AP_ABSENT is counter-only.** Normal driving away from
-  home must not flood the journal. The catalog still supplies its display text.
+  home must not flood the journal. The catalog retains its OLED-text metadata.
 
 **2007 PMU_STARTUP_RECOVERY** is a warning with `notify=false` and
 `journal=per_occurrence`. It records a boot needing PMU/RTC bus recovery or
@@ -136,12 +136,12 @@ remain history; #120's fresh-current-fault rule does not alert on historical
 notices by themselves. Silence code 7001 is derived by the server monitor;
 the protocol rejects 7xxx codes from devices so one cannot forge it.
 
-OLED text is printable ASCII, at most **three lines of 21 characters**. The
-SH1106 adapter uses U8g2 `u8g2_font_5x8_tf`, a fixed 5-pixel-advance font
-with 8-pixel rows at scale 1 on a 128x64 screen: 21 characters occupy 105 pixels. An `E4005` heading uses one additional 8-pixel
-line; there are at most eight rows. The adapter must select that font explicitly;
-larger or proportional fonts do not satisfy these bounds. Never scroll or
-shrink text to work around a catalog violation. The C++ table includes code,
+Catalog OLED text is printable ASCII, at most **three lines of 21 characters**.
+These remain catalog validation rules in **catalog v4**; production cards do
+not render the `oled` field. The historical compact-text geometry is U8g2
+`u8g2_font_5x8_tf`, with 5-pixel advances and 8-pixel rows: 21 characters
+occupy 105 pixels. Never scroll or shrink text to work around a catalog
+violation. The C++ table includes code,
 symbol, severity, OLED lines, title, notify and journal policy; longer recovery
 and context definitions stay in the JSON for the server.
 
@@ -951,14 +951,18 @@ DisplayModel (`display_model.h`) is pure, header-only C++ policy; only the
 SH1106 adapter touches hardware. **Owner decisions, 2026-10-20:** keep
 `DISPLAY_DEBUG=1` as the default, with its road-tested debug page unchanged;
 implement the production screen now behind `DISPLAY_DEBUG=0`.
+After a production build was flashed on **2026-10-20**, the owner confirmed
+the screen worked well and requested much larger text filling the panel,
+with descriptions removed. Round 2 changes only card content and fonts;
+the timing, motion, queue, POWER, shutdown and E6001 policies below are unchanged.
 
 - **Debug on:** the existing continuously lit bench/shakedown page: FSM,
   satellites heard/used, GPS AGC, fix/HDOP, storage, queues, network and battery.
 - **Debug off (production):** off by default using SH1106 power save, with
   steady cards lasting 10 seconds. No flashing, scrolling or always-on content.
   The adapter uses maximum SH1106 contrast (255), per #166: the panel is about
-  100 nits and lights only briefly. Current and visual readability still need
-  bench checks. An always-on design would need a separate burn-in policy.
+  100 nits and lights only briefly. Current and the revised large-font layout
+  still need bench checks. An always-on design would need a separate burn-in policy.
 
 Production cards show **satellites heard**, from fresh
 `DebugGsv::signal(now).heard`: unique GSV entries with C/N0 > 0, or `--` when
@@ -990,12 +994,13 @@ Production policy:
   a user request can replace the current card and holds its full 10 seconds
   before queued errors resume. Routine cards blank if motion
   stops being Parked. Card text is captured when shown and stays steady.
-- StatusCard: `Sats heard: N` or `--`, then `No active faults` or active
-  warning-and-above codes, most severe first (code order breaks ties). The
-  first code has its exact generated catalog OLED lines; further codes use
-  compact `Also:` rows and a `+N more` suffix when needed. Duplicate active
-  codes from the two upload targets appear once in status. ErrorCard: `E####`
-  plus that code's generated OLED lines. Unknown codes show only `E####`.
+- StatusCard: `Sats: N` or `Sats: --`, then `OK` when no faults are active,
+  otherwise only active warning-and-above `E####` codes, most severe first
+  (code order breaks ties). Duplicate active codes from the two upload
+  targets appear once. Up to four codes fit; if more are active, the final
+  slot shows `+N` for all omitted codes (three visible codes, up to `+61`).
+  There is no `Also:` label or catalog OLED description. ErrorCard shows
+  only one large centred `E####`, including for unknown codes.
 - Core 1 copies the same atomic observed/active/accepted-episode snapshots as
   the upload worker, from loop, trip-network and event-network producers.
   Each source is read once without waits or new cross-core locks. A concurrent
@@ -1017,6 +1022,55 @@ one accepted raise and the existing bounded diagnostic repeat policy. It never
 retries hardware initialization or blocks recording, uploads or power handling.
 A disconnected panel cannot be commanded asleep after the bus has failed.
 The screen is a brief aid; the server history remains the durable fault record.
+
+### Production fonts and pixel layout
+
+U8g2 **2.36.18** supplies all three `_tr` fonts, including upper/lower case,
+digits, `:`, `+`, `-` and `OK`. `display_font_metrics.h` records actual bitmap
+bounds, offsets and advances decoded from the installed `u8g2_fonts.c` by
+`firmware/host_test/check_display_fonts.py`. The model contains structured
+content; the pure `production_display_layout.h` computes positions from
+these metrics, and the adapter draws using baseline coordinates.
+
+The 128x64 panel keeps at least **2 pixels of margin** on every edge.
+Coordinates below use exclusive right/bottom bounds; baselines are U8g2
+draw coordinates. Horizontal centring uses actual ink bounds, including
+glyph offsets, rather than nominal font sizes or character counts.
+
+- **Sats: `u8g2_font_logisoso26_tr`.** `Sats: 99` advances 123 pixels;
+  its ink is 119x27. Origin `(2,29)` gives ink x=4..122, y=2..28.
+  The `3` glyph extends one pixel below baseline, so `Sats: 33` occupies
+  y=2..29. Digits advance 17, `S` 17, `a` 19, `t` 10, `s` 16,
+  colon 10 and space 17 pixels. `Sats: --` advances 121 pixels and fits.
+  The next logisoso size, 28, has 125 pixels of ink for `Sats: 99`,
+  exceeding the 124-pixel inner width. Heard counts above 99 retain their
+  numeric value using the smaller `helvB14_tr` font when needed.
+- **No faults or one code:** the lower line also uses `logisoso26_tr`,
+  baseline 61, centred across the panel. `OK` has 34-pixel advance and
+  30x26 ink at origin `(47,61)` (ink x=49..78, y=35..60).
+  `E9999` advances 85 pixels with 81x26 ink; digit `3` can extend to y=61.
+- **Multiple codes: `u8g2_font_helvB14_tr`.** Two 62-pixel cells per row
+  start at x=2 and x=64, with at most two rows (four slots). `E9999`
+  advances 53 pixels and has 50x14 ink (`E` advances 13; digits 10).
+  With three/four tokens, baselines are 46 and 62, placing ink at
+  y=32..45 and y=48..61. For `E9999`, draw origins are x=6 and x=68,
+  placing ink at x=8..57 and x=70..119. With only two tokens, baseline
+  55 centres the single row in the lower area. `+99` advances 31 pixels,
+  with 29x13 ink; all `+N` values through two digits fit a full slot.
+  Font 18 in the same bold Helvetica family cannot fit two codes per row.
+- **Error: `u8g2_font_logisoso38_tr`.** `E9999` advances 121 pixels
+  (`E` 25; digits 24) with 116x38 ink. Origin `(3,51)` centres it at
+  x=6..121, y=13..50. Codes containing `3` have 39-pixel ink height;
+  vertical centring accounts for this. The next size, 42, has 129-pixel
+  ink width for `E9999`, exceeding the inner width.
+
+Host tests exhaust all four-digit error values and status-code layouts,
+satellite values 0..99, stale GSV, unknown codes, all 1..64 active-code
+counts, and two-digit overflow strings. They check panel margins, glyph
+coverage, row/column separation and adapter font/coordinate selection.
+When U8g2 is installed, the host runner also compares the committed metrics
+with the actual library (set `U8G2_DIR` for a nonstandard installation).
+Catalog OLED-text rules and catalog v4 remain unchanged.
 
 The following are **Supreme port targets to verify against the board revision
 and on the bench**, not pin changes for the existing T-Beam V1.2 sketch:

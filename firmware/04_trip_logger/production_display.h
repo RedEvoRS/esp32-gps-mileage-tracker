@@ -2,7 +2,8 @@
 #pragma once
 #include <U8g2lib.h>
 #include <Wire.h>
-#include "display_model.h"
+#include <cstring>
+#include "production_display_layout.h"
 
 static constexpr uint8_t PRODUCTION_OLED_CONTRAST = 255;  // SH1106 maximum
 
@@ -63,8 +64,7 @@ static void beginProductionDisplay() {
         gProductionOled.initDisplay();
         gProductionOled.setPowerSave(1);
         gProductionOled.setContrast(PRODUCTION_OLED_CONTRAST);
-        gProductionOled.setFont(u8g2_font_5x8_tf);  // 21 chars = 105 px; 8 rows
-        gProductionOled.setFontPosTop();
+        gProductionOled.setFontPosBaseline();
     }
     productionDisplayCheck();
 }
@@ -80,12 +80,24 @@ static void drawProductionDisplay(const display::Output& out) {
     if (!gProductionDisplayReady) return;
     if (gProductionHaveOutput && out.powered == gProductionLastOutput.powered &&
         out.card == gProductionLastOutput.card &&
-        std::memcmp(out.lines, gProductionLastOutput.lines, sizeof out.lines) == 0) return;
+        out.heard == gProductionLastOutput.heard &&
+        out.errorCode == gProductionLastOutput.errorCode &&
+        out.codeCount == gProductionLastOutput.codeCount &&
+        std::memcmp(out.codes, gProductionLastOutput.codes, sizeof out.codes) == 0) return;
     bool wasPowered = gProductionHaveOutput && gProductionLastOutput.powered;
     gProductionLastOutput = out; gProductionHaveOutput = true;
     if (out.powered) {
         gProductionOled.clearBuffer();
-        for (unsigned row = 0; row < 8; ++row) gProductionOled.drawStr(0, row * 8, out.lines[row]);
+        const auto pixels = display::layout(out);
+        for (unsigned i = 0; i < pixels.count; ++i) {
+            const auto& text = pixels.text[i];
+            switch (text.font) {
+            case display::Font::Sats: gProductionOled.setFont(u8g2_font_logisoso26_tr); break;
+            case display::Font::Codes: gProductionOled.setFont(u8g2_font_helvB14_tr); break;
+            case display::Font::Error: gProductionOled.setFont(u8g2_font_logisoso38_tr); break;
+            }
+            gProductionOled.drawStr(text.x, text.baseline, text.value);
+        }
         gProductionOled.sendBuffer();
         // Upload the new pixels before waking: no stale-card flash.
         if (!wasPowered) productionDisplayPowerSave(false);

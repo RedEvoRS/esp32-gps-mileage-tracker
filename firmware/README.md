@@ -287,7 +287,7 @@ picking the version from each one's version list:
 
 1. **XPowersLib** by lewisxhe, version **0.3.3** — for the AXP2101 power manager
 2. **TinyGPSPlus** by Mikal Hart, version **1.0.3** — for NMEA GPS parsing
-3. **U8g2** by olikraus, version **2.36.18** — for Stage 4's debug OLED page
+3. **U8g2** by olikraus, version **2.36.18** — for Stage 4's debug and production OLED pages
 
 Those are the versions the trip logger is tested with. The Library Manager
 installs the newest unless you pick one.
@@ -540,16 +540,30 @@ The rest of this section was written for the V1.2. On the Supreme
   - It's switched by `DISPLAY_DEBUG` at the top of the sketch (default `1`).
     Set `DISPLAY_DEBUG` to `0` at the top of the sketch to build the production
     screen and disable the `GPS RF:` serial line. It sleeps by default, briefly
-    showing satellites **heard** (or `--` when stale) and active catalog fault
-    codes/text at the first parked opportunity after boot or a trip. New
+    showing `Sats: N` for satellites **heard** (`Sats: --` when stale),
+    then `OK` or only active warning-and-above `E####` codes at the first
+    parked opportunity after boot or a trip. Codes are severity ordered and
+    deduplicated. Four fit in a two-by-two grid; with more faults, three codes
+    and `+N` show how many were omitted. Error cards show only a centred code.
+    Production does not render catalog OLED text; catalog v4 and its text
+    validation rules are unchanged. New
     ERROR/CRITICAL episodes show once even while moving; unresolved faults
     remind at the next parked opportunity. Cards last 10 seconds at maximum
     contrast, then SH1106 power save turns the panel off. A short press of
     **POWER** shows a status card in any motion state. Long press keeps its
     existing clean power-off behavior on battery and is ignored on USB.
     GSV/MON-RF antenna checking and NAV-PVT speed accuracy gating stay enabled
-    in both builds. Production visual/current acceptance still needs the bench;
-    full policy and motion definitions are in `DIAGNOSTICS.md`.
+    in both builds. On **2026-10-20**, the owner saw the working production
+    screen on hardware and requested much larger text filling the panel,
+    without descriptions. The revised layout uses U8g2 `logisoso26_tr`
+    for sats/OK/a single status code, `helvB14_tr` for multiple status codes,
+    and `logisoso38_tr` for error cards. Real font data gives `Sats: 99`
+    a 123-pixel advance (119x27 ink), status-grid `E9999` 53 pixels
+    (50x14 ink), and error `E9999` 121 pixels (116x38 ink).
+    It keeps two-pixel panel margins and separated rows; `+N` fits through
+    two digits. Full metrics, pixel positions and unchanged policy are in
+    [DIAGNOSTICS.md](../DIAGNOSTICS.md#production-fonts-and-pixel-layout).
+    The revised font layout and current consumption still need bench acceptance.
   - A question mark, such as `Speed 3.3? mph`, means the displayed speed
     failed the accuracy check; it cannot start or extend a trip and the
     point is omitted from the GPX.

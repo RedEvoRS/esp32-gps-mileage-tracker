@@ -50,12 +50,19 @@ echo "== test_debug_display (bus fault injection)"
     "$here/test_debug_display.cpp" -o "$build/test_debug_display.exe"
 "$build/test_debug_display.exe" || status=1
 
-for test in test_display_model test_production_display; do
+for test in test_display_model test_production_display_layout test_production_display; do
     echo "== $test"
     "${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -pedantic \
         -I"$here/display_stubs" -I"$here/../04_trip_logger" "$here/$test.cpp" -o "$build/$test.exe"
     "$build/$test.exe" || status=1
 done
+
+u8g2="${U8G2_DIR:-$HOME/Documents/Arduino/libraries/U8g2}"
+if [ -f "$u8g2/src/clib/u8g2_fonts.c" ]; then
+    "${PYTHON:-python}" "$here/check_display_fonts.py" "$u8g2" || status=1
+else
+    echo "SKIPPED: installed-font comparison (set U8G2_DIR); layout tests use extracted metrics"
+fi
 
 echo "== test_diag_catalog"
 "${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -pedantic "$here/test_diag_catalog.cpp" -o "$build/test_diag_catalog.exe"

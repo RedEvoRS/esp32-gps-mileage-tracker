@@ -1,15 +1,8 @@
 #include "display_model.h"
 #include <cassert>
 #include <cstdio>
-#include <cstring>
 using namespace display;
 static unsigned cases = 0;
-static void bounded(const Output& out) {
-    for (const auto& line : out.lines) {
-        assert(std::strlen(line) <= 21);
-        for (char ch : line) { if (!ch) break; assert(ch >= 32 && ch <= 126); }
-    }
-}
 int main() {
     DisplayModel model; DisplayModel::Input in;
     in.boot = true;
@@ -30,7 +23,7 @@ int main() {
     model = DisplayModel{}; in = {}; in.motion = Motion::Moving;
     in.conditions = critical; in.count = 1;
     assert(model.update(in).card == Card::ErrorCard);
-    assert(!std::strcmp(model.update(in).lines[0], "E4003"));
+    assert(model.update(in).errorCode == 4003);
     in.now = 10000; assert(!model.update(in).powered);
     in.now = 900000; assert(!model.update(in).powered); ++cases;
     critical[0].episode = 2; assert(model.update(in).powered); ++cases;
@@ -40,14 +33,13 @@ int main() {
     assert(!model.update(in).powered);
     in.motion = Motion::Parked;
     assert(model.update(in).card == Card::StatusCard);
-    assert(!std::strcmp(model.update(in).lines[1], "E3002")); ++cases;
+    assert(model.update(in).codes[0] == 3002); ++cases;
 
     Condition errors[] = {{4003, 4, 0}, {4002, 5, 0}, {5004, 6, 1}};
     model = DisplayModel{}; in = {}; in.motion = Motion::Moving; in.conditions = errors; in.count = 3;
     for (unsigned i = 0; i < 3; ++i) {
         in.now = i * 10000;
-        char code[22]; codeLine(code, errors[i].code);
-        assert(!std::strcmp(model.update(in).lines[0], code));
+        assert(model.update(in).errorCode == errors[i].code);
     }
     in.now = 30000; assert(!model.update(in).powered); ++cases;
     // An explicit status request owns its full interval even with errors queued.
@@ -56,7 +48,7 @@ int main() {
     assert(model.update(in).card == Card::StatusCard);
     in.userRequest = false; in.now = 10099;
     assert(model.update(in).card == Card::StatusCard);
-    in.now = 10100; assert(!std::strcmp(model.update(in).lines[0], "E4002"));
+    in.now = 10100; assert(model.update(in).errorCode == 4002);
     in.now = 20100; model.update(in); in.now = 30100; assert(!model.update(in).powered); ++cases;
     in.count = 0; model.update(in); // clear does not discard identity history
     in.count = 3; assert(!model.update(in).powered); ++cases;
@@ -82,25 +74,25 @@ int main() {
     assert(motion(false, true, false, true, 0, .894f) == Motion::Parked);
     assert(motion(false, false, true, false, 0, .894f) == Motion::Moving); ++cases;
 
-    // Every generated line is copied exactly; unknown codes have no extra text.
+    // Structured content contains codes only, with no catalog OLED descriptions.
     for (const auto& entry : diagnostics::kCatalog) {
-        auto card = errorCard(uint16_t(entry.code)); bounded(card);
-        for (unsigned i = 0; i < entry.oled_line_count; ++i)
-            assert(!std::strcmp(card.lines[i+1], entry.oled[i]));
-        Condition c{uint16_t(entry.code), 1, 0}; bounded(statusCard(255, &c, 1));
+        auto card = errorCard(uint16_t(entry.code));
+        assert(card.errorCode == uint16_t(entry.code) && !card.codeCount);
     }
-    auto card = errorCard(6999); bounded(card);
-    assert(!std::strcmp(card.lines[0], "E6999") && !card.lines[1][0]); ++cases;
+    auto card = errorCard(6999);
+    assert(card.errorCode == 6999 && !card.codeCount); ++cases;
+    card = statusCard(12, nullptr, 0);
+    assert(card.heard == 12 && !card.codeCount && !card.errorCode); ++cases;
     Condition many[64];
     for (unsigned i = 0; i < 64; ++i) many[i] = {uint16_t(6100+i), i+1, 0};
-    card = statusCard(-1, many, 64); bounded(card);
-    assert(!std::strcmp(card.lines[0], "Sats heard: --"));
-    assert(std::strstr(card.lines[7], "+52 more")); ++cases;
+    card = statusCard(-1, many, 64);
+    assert(card.heard == -1 && card.codeCount == 64);
+    for (unsigned i = 0; i < 64; ++i) assert(card.codes[i] == 6100+i);
+    ++cases;
     Condition sorted[] = {{3002, 1, 0}, {4003, 2, 0}, {4003, 3, 1}, {1000, 4, 0}};
-    card = statusCard(7, sorted, 4); bounded(card);
-    assert(!std::strcmp(card.lines[0], "Sats heard: 7"));
-    assert(!std::strcmp(card.lines[1], "E4003"));
-    assert(!std::strcmp(card.lines[4], "Also: E3002")); ++cases;
+    card = statusCard(7, sorted, 4);
+    assert(card.heard == 7 && card.codeCount == 2);
+    assert(card.codes[0] == 4003 && card.codes[1] == 3002); ++cases;
 
     // Queue exhaustion drops excess episodes once; unchanged snapshots cannot
     // create a never-ending carousel. Both sources' same-code episodes count.

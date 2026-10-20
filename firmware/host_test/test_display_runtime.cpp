@@ -32,9 +32,9 @@ int main() {
     gLoopFaults.event(4003, g_millis).condition(true);
     gNetFaults.event(5004, g_millis).enumeration("target", "trip").integer("http_status", 401).condition(true);
     serviceProductionDisplay();
-    assert(!std::strcmp(gProductionLastOutput.lines[0], "E4003"));
+    assert(gProductionLastOutput.errorCode == 4003);
     g_millis += 10000; serviceProductionDisplay();
-    assert(!std::strcmp(gProductionLastOutput.lines[0], "E5004"));
+    assert(gProductionLastOutput.errorCode == 5004);
     g_millis += 10000; serviceProductionDisplay(); assert(!gProductionLastOutput.powered);
     // The trip-network snapshot is read on core 1 as well as core-1 faults.
     assert(gDisplayConditionCounts[1] && gDisplayConditions[1][3].episode);

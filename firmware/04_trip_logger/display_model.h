@@ -2,8 +2,6 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
-#include <cstdio>
-#include <cstring>
 #include "diag_catalog.h"
 
 namespace display {
@@ -26,31 +24,26 @@ struct Output {
     Card card = Card::Blank;
     bool powered = false;
     uint32_t until = 0;
-    char lines[8][22] = {};
+    int heard = -1;
+    uint16_t codes[64] = {}; // unique, severity-ordered active warnings and above
+    size_t codeCount = 0;
+    uint16_t errorCode = 0;
 };
 inline unsigned rank(uint16_t code) {
     auto entry = diagnostics::find(code);
     // Unknown active codes remain visible, with no invented catalog text.
     return entry ? unsigned(entry->severity) : unsigned(diagnostics::Severity::Warning);
 }
-inline void codeLine(char* out, uint16_t code) { std::snprintf(out, 22, "E%04u", unsigned(code)); }
-inline unsigned faultLines(Output& out, unsigned row, uint16_t code) {
-    codeLine(out.lines[row++], code);
-    if (auto entry = diagnostics::find(code))
-        for (unsigned i = 0; i < entry->oled_line_count; ++i)
-            std::snprintf(out.lines[row++], 22, "%s", entry->oled[i]);
-    return row;
-}
 inline Output errorCard(uint16_t code) {
     Output out; out.card = Card::ErrorCard; out.powered = true;
-    faultLines(out, 0, code);
+    out.errorCode = code;
     return out;
 }
 inline Output statusCard(int heard, const Condition* conditions, size_t count) {
     Output out; out.card = Card::StatusCard; out.powered = true;
-    if (heard < 0) std::snprintf(out.lines[0], 22, "Sats heard: --");
-    else std::snprintf(out.lines[0], 22, "Sats heard: %d", heard);
-    uint16_t codes[64]; size_t used = 0;
+    out.heard = heard;
+    auto& codes = out.codes;
+    auto& used = out.codeCount;
     for (size_t i = 0; i < count && used < 64; ++i) {
         if (!conditions[i].episode || rank(conditions[i].code) < unsigned(diagnostics::Severity::Warning)) continue;
         bool duplicate = false;
@@ -65,27 +58,6 @@ inline Output statusCard(int heard, const Condition* conditions, size_t count) {
             codes[j] = codes[j-1]; --j;
         }
         codes[j] = code;
-    }
-    if (!used) { std::snprintf(out.lines[1], 22, "No active faults"); return out; }
-    unsigned row = faultLines(out, 1, codes[0]);
-    size_t next = 1;
-    while (next < used && row < 8) {
-        std::snprintf(out.lines[row], 22, "Also:");
-        // Two codes leave room for a third compact token or the overflow suffix.
-        for (unsigned n = 0; n < 2 && next < used; ++n, ++next) {
-            size_t len = std::strlen(out.lines[row]);
-            std::snprintf(out.lines[row] + len, 22 - len, " E%04u", unsigned(codes[next]));
-        }
-        if (row == 7 && next < used) {
-            // Put the overflow count on the final row; roll back one code if needed.
-            char suffix[16]; std::snprintf(suffix, sizeof suffix, " +%u more", unsigned(used-next));
-            if (std::strlen(out.lines[row]) + std::strlen(suffix) > 21) {
-                --next; out.lines[row][11] = 0;
-                std::snprintf(suffix, sizeof suffix, " +%u more", unsigned(used-next));
-            }
-            std::strcat(out.lines[row], suffix);
-        }
-        ++row;
     }
     return out;
 }
