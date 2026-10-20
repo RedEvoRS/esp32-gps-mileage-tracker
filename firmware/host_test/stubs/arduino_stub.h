@@ -482,10 +482,22 @@ extern TwoWire Wire, Wire1;
 // interrupt flags, then raise gPmuIrqFlag as the IRQ pin would.
 struct PoweredOff {};
 constexpr uint8_t XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL = 0x18;
+constexpr uint8_t XPOWERS_AXP2101_STATUS1 = 0x00;
+constexpr uint8_t XPOWERS_AXP2101_STATUS2 = 0x01;
+constexpr uint8_t XPOWERS_AXP2101_LDO_ONOFF_CTRL0 = 0x90;
 struct XPowersAXP2101 {
+    // Per-register one-based call injection, independent of other PMU reads.
+    std::map<uint8_t, unsigned> registerReadCalls;
+    std::map<uint8_t, unsigned> failRegisterReadAt;
+    bool vbusNotIn = false; // STATUS2 bit 3, independently test library semantics
     bool failChargeDisable = false, failChargeRead = false;
     int readRegister(uint8_t reg) {
         operations.push_back("readRegister");
+        unsigned call = ++registerReadCalls[reg];
+        if (failRegisterReadAt.count(reg) && failRegisterReadAt[reg] == call) return -1;
+        if (reg == XPOWERS_AXP2101_STATUS1) return (vbusIn ? 0x20 : 0) | (batteryConnected ? 0x08 : 0);
+        if (reg == XPOWERS_AXP2101_STATUS2) return vbusNotIn ? 0x08 : 0;
+        if (reg == XPOWERS_AXP2101_LDO_ONOFF_CTRL0) return aldo3 ? 0x04 : 0;
         assert(reg == XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL);
         return failChargeRead ? -1 : chargeEnabled ? 0x02 : 0;
     }

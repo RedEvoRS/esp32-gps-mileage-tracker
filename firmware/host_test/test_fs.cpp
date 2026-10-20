@@ -51,6 +51,7 @@ static void resetWorld() {
     PMU = XPowersAXP2101(); gPmuIrqFlag = false;
     Wire = TwoWire(); Wire1 = TwoWire(); g_pinModes.clear(); g_pinLevels.clear();
     gVbusLost = false; gVbusOffPending = false;
+    gVbusRetry = VbusRetry::None; gVbusRetryMs = gVbusOffReadMs = 0;
     g_httpCode = 200; g_httpRequests = 0; g_httpLastBody.clear(); g_httpHook = nullptr;
     g_httpBodies.clear();
     gChargePaused = false; gChargeApplied = false; gChargeCheckT0 = 0;
@@ -1423,7 +1424,7 @@ int main(int argc, char** argv) {
                   Wire.begins == (DISPLAY_DEBUG && !failMutex ? 1 : 0),
                   "PMU uses only Wire1 on SDA 42 / SCL 41");
             CHECK(std::vector<std::string>(PMU.operations.begin(), PMU.operations.begin() + 3) ==
-                  std::vector<std::string>({"begin", "disableALDO3", "isEnableALDO3"}),
+                  std::vector<std::string>({"begin", "disableALDO3", "readRegister"}),
                   "radio disable and readback are the first operations after PMU.begin");
             CHECK(logHas("power-on source 0x04, power-off source 0x02"), "boot logs PMU power sources");
             if (!failMutex) {

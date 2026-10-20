@@ -466,7 +466,10 @@ The rest of this section was written for the V1.2. On the Supreme
 - **Parking:** after the car's USB power has been gone 10 s and the board
   has idled on battery for 10 minutes (the upload window), it **switches
   itself off completely**, not into deep sleep. Power returning to the USB
-  port switches it back on. The boot log shows
+  port switches it back on. Unreadable USB-power state keeps the board awake
+  and is retried; it never confirms car-off or authorizes power-off. Persistent
+  read failures on battery leave the PMU's hardware under-voltage cutoff as
+  the final protection. The boot log shows
   `PMU power-on source 0x04, power-off source 0x02` when that worked.
 - **POWER button:** on the Supreme a long press of POWER doesn't put the
   board into deep sleep, as the V1.2 text under Normal operation says. Hold
@@ -475,7 +478,9 @@ The rest of this section was written for the V1.2. On the Supreme
   trip, stops the network task, seals the diagnostics journal, unmounts
   storage and switches the board off completely. **With USB power
   plugged in, the press is ignored** and the Serial Monitor shows
-  `VBUS present -- staying awake instead of powering off.` That's
+  `VBUS present -- staying awake instead of powering off.` An unreadable
+  USB-power state also keeps it awake, with
+  `VBUS state unreadable -- staying awake instead of powering off.` That's
   deliberate: USB power switches the board on only at the moment it
   arrives, so a board switched off with USB still in would stay off, and
   in the car nothing would switch it back on until the USB power was cut

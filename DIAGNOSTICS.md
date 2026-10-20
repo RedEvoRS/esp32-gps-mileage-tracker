@@ -743,6 +743,12 @@ unchanged; degraded probes explicitly disable that provisioning.
   through the final VBUS check and PMU shutdown. A returning/failed shutdown
   restores degraded service without claiming recording or remounting an absent
   store.
+  VBUS decisions require successful STATUS1/STATUS2 reads: unknown never
+  confirms car-off or authorizes shutdown. Pending car-off confirmation retries
+  at most once per second; unknown boot/recovery seeds assume USB present and
+  retry once per second in normal and no-storage loops. Persistent failures on
+  battery keep the board awake until hardware under-voltage cutoff.
+
 - **Power chip absent (A) or untrusted LoRa-rail state (B):** no ordinary PMU
   power, charge, IRQ or measurement service is allowed. In B only, charging is
   disabled exactly once, best effort. A single raw-register
@@ -751,7 +757,9 @@ unchanged; degraded probes explicitly disable that provisioning.
   Apart from that exception, only scheduled normal startup probes are allowed:
   bounded `beginPmuWithRecovery()`, plus ALDO3 disable/verify in B after a
   successful begin. A begin success restarts A; B requires verified ALDO3 off
-  before restart. LittleFS alone is mounted without provisioning, solely for
+  before restart. Verification requires a successful disable and a successful
+  raw ALDO3 enable-bit read showing off; an unreadable result remains untrusted.
+  LittleFS alone is mounted without provisioning, solely for
   diagnostic BOOT, retained E2007 and E2001 `PMU_INIT_FAILED`. If it fails,
   diagnostics stay in RAM. SD, GPS and networking never start. The board stays
   awake retrying, as with the former halt; software cannot promise charge
