@@ -127,7 +127,7 @@ static void resetWorld() {
     gDebugDisplayReady = gDebugDisplayFailed = false;
     gDebugWireReady = gDebugTempEnabled = gDebugTempPending = false;
     gDebugTempDie = NAN; gDebugTempDieMs = gDebugTempLogMs = 0;
-    gDebugTempPower = {}; gDebugTempTs = {}; gDebugTempBme = {};
+    gDebugTempTs = {}; gDebugTempBme = {};
     gDebugNet = DebugNetwork{};
 #else
     gProductionDisplayReady = gProductionDisplayFailed = gProductionDisplayBegun = false;

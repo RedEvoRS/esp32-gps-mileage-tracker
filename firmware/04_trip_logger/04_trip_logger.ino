@@ -82,7 +82,6 @@
 static float gDebugTempDie = NAN;
 static uint32_t gDebugTempDieMs = 0, gDebugTempLogMs = 0;
 static bool gDebugTempEnabled = false, gDebugTempPending = false;
-static debug_temperature::Power gDebugTempPower;
 static debug_temperature::TsSetup gDebugTempTs;
 static bme280_temp::Sensor gDebugTempBme;
 #else
@@ -2709,17 +2708,14 @@ static void serviceDebugTemperature() {
         int low = PMU.readRegister(0x37);
         raw = debug_temperature::tsRaw(high, low);
     }
-    // Usually reuse the OLED's preceding 1 Hz sample. If the OLED is absent
-    // or disabled after a bus error, still collect power once per Temp: line.
-    if (!gDebugTempPower.sampled || uint32_t(now - gDebugTempPower.sampledMs) > 1500)
-        gDebugTempPower = debug_temperature::samplePower(PMU, now);
-    const auto& p = gDebugTempPower;
-    char die[16] = "--", estimate[16] = "--", ts[16] = "--", tsRaw[8] = "--";
+    const auto p = debug_temperature::samplePower(PMU, now);
+    char die[40] = "-- C", estimate[16] = "--", ts[16] = "--", tsRaw[8] = "--";
     char bme[16] = "--", volts[16] = "--", percent[8] = "--";
-    // A missed/delayed guard tick is unavailable, never an old temperature
-    // labeled fresh. Ordinary loop order refreshes the guard before this log.
-    if (gChargeChecked && uint32_t(now - gDebugTempDieMs) <= 1000 && std::isfinite(gDebugTempDie)) {
-        snprintf(die, sizeof die, "%.1f", gDebugTempDie);
+    // Independent 30 s schedules can drift. Reuse the latest guard sample
+    // through one guard interval plus 5 s, and report its age explicitly.
+    uint32_t dieAgeMs = uint32_t(now - gDebugTempDieMs);
+    if (gChargeChecked && dieAgeMs <= CHG_CHECK_MS + 5000 && std::isfinite(gDebugTempDie)) {
+        snprintf(die, sizeof die, "%.1f C (%lu s)", gDebugTempDie, (unsigned long)(dieAgeMs / 1000));
         snprintf(estimate, sizeof estimate, "%.1f", gDebugTempDie - DIE_OFFSET_C);
     }
     if (raw >= 0) {
@@ -2729,10 +2725,9 @@ static void serviceDebugTemperature() {
     if (bmeOk) snprintf(bme, sizeof bme, "%.2f", centiC / 100.0);
     if (p.millivolts >= 0) snprintf(volts, sizeof volts, "%.2f", p.millivolts / 1000.0);
     if (p.percent >= 0) snprintf(percent, sizeof percent, "%d", p.percent);
-    const char* charging = p.status2 < 0 || (p.status2 & 0x60) == 0x60 ? "--" :
-                           (p.status2 & 0x60) == 0x20 ? "on" : "off";
+    const char* charging = p.status2 < 0 ? "--" : debug_temperature::isCharging(p.status2) ? "on" : "off";
     auto vbus = pmu_read::vbusState(p.status1, p.status2);
-    Serial.printf("Temp: die %s C, guard_est %s C, TS %s V, TS_raw %s, BME280 %s C, "
+    Serial.printf("Temp: die %s, guard_est %s C, TS %s V, TS_raw %s, BME280 %s C, "
                   "chg %s, phase %s, batt %s V, pct %s, VBUS %s\n",
                   die, estimate, ts, tsRaw, bme, charging, debug_temperature::phase(p.status2),
                   volts, percent, vbus == VbusState::Unknown ? "--" : vbus == VbusState::Present ? "1" : "0");
@@ -2761,13 +2756,10 @@ static void serviceDebugDisplay() {
     s.net = gDebugNet;
     portEXIT_CRITICAL(&gDebugNetMux);
     s.now = millis();  // snapshot upload time cannot be newer than this clock read
-    // One checked snapshot replaces repeated getter reads of STATUS1/STATUS2,
-    // and feeds Temp: without a second battery/power poll in the usual case.
-    gDebugTempPower = debug_temperature::samplePower(PMU, s.now);
-    s.batteryPct = gDebugTempPower.percent;
-    s.batteryV = gDebugTempPower.millivolts < 0 ? NAN : gDebugTempPower.millivolts / 1000.0f;
-    s.usb = pmu_read::vbusState(gDebugTempPower.status1, gDebugTempPower.status2) == VbusState::Present;
-    s.charging = gDebugTempPower.status2 >= 0 && (gDebugTempPower.status2 & 0x60) == 0x20;
+    s.batteryPct = PMU.getBatteryPercent();
+    s.batteryV = PMU.getBattVoltage() / 1000.0f;
+    s.usb = vbusState() == VbusState::Present; // unknown is display-only false
+    s.charging = PMU.isCharging();
     drawDebugDisplay(s);
 }
 #endif

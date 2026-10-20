@@ -60,9 +60,9 @@ int main() {
     auto starts = bmeTransactions;
     g_millis += 4; serviceDebugTemperature(); REQUIRE(bmeTransactions == starts && tempLine().empty());
     ++g_millis; serviceDebugTemperature();
-    REQUIRE(tempLine() == "Temp: die 30.0 C, guard_est 21.0 C, TS 0.512 V, TS_raw 1024, BME280 25.08 C, chg on, phase cc, batt 4.02 V, pct 85, VBUS 1\n");
+    REQUIRE(tempLine() == "Temp: die 30.0 C (0 s), guard_est 21.0 C, TS 0.512 V, TS_raw 1024, BME280 25.08 C, chg on, phase cc, batt 4.02 V, pct 85, VBUS 1\n");
     REQUIRE(unsigned(std::count(PMU.operations.begin(),PMU.operations.end(),"getTemperature")) == dieCalls);
-    REQUIRE(PMU.registerReadCalls[0x00] == reads[0x00] && PMU.registerReadCalls[0xa4] == reads[0xa4]);
+    REQUIRE(PMU.registerReadCalls[0x00] == reads[0x00] + 1 && PMU.registerReadCalls[0xa4] == reads[0xa4] + 1);
     auto n = Serial.log.size();
     for (unsigned i=0;i<100;++i) serviceDebugTemperature();
     REQUIRE(Serial.log.size() == n);
@@ -90,15 +90,44 @@ int main() {
     prepare(); gDebugTempTs.ready = false;
     before = PMU.registerReadCalls[0x36]; tick();
     REQUIRE(PMU.registerReadCalls[0x36] == before && tempLine().find("TS -- V") != std::string::npos);
-    // A guard sample older than the explicit freshness window stays unavailable.
+    // Independent schedules: the logger loses another 100 ms per cycle.
+    // Two hours of separate guard/log iterations grow the phase beyond 1 s
+    // without ever causing a second die read or blanking the latest sample.
+    prepare();
+    for (unsigned cycle = 1; cycle <= 240; ++cycle) {
+        g_millis = gChargeCheckT0 + CHG_CHECK_MS; serviceChargeTemp();
+        dieCalls = std::count(PMU.operations.begin(),PMU.operations.end(),"getTemperature");
+        g_millis = gDebugTempLogMs + 30100; serviceDebugTemperature();
+        g_millis += 5; serviceDebugTemperature();
+        auto age = (g_millis - gDebugTempDieMs) / 1000;
+        REQUIRE(tempLine().find("die 30.0 C (" + std::to_string(age) + " s), guard_est 21.0 C") != std::string::npos);
+        REQUIRE(unsigned(std::count(PMU.operations.begin(),PMU.operations.end(),"getTemperature")) == dieCalls);
+    }
+    REQUIRE(g_millis - gDebugTempDieMs > 1000);
+    // Boundary, stale sample, and never-sampled guard. BME finishing time is
+    // part of the freshness check, rather than the start of its conversion.
+    for (uint32_t age : {35000u,35001u}) {
+        prepare();
+        g_millis = gDebugTempDieMs + age - 5; serviceDebugTemperature();
+        g_millis += 5; serviceDebugTemperature();
+        REQUIRE(tempLine().find(age == 35000 ? "die 30.0 C (35 s), guard_est 21.0 C" :
+                                              "die -- C, guard_est -- C") != std::string::npos);
+    }
+    prepare(); gChargeChecked = false;
     g_millis = gDebugTempLogMs + 30000; serviceDebugTemperature();
     g_millis += 5; serviceDebugTemperature();
     REQUIRE(tempLine().find("die -- C, guard_est -- C") != std::string::npos);
+    // Bit 7 must not turn the 101 upper-bit pattern into charging; reserved
+    // direction 11 follows XPowersLib's successful-read "off" behavior.
+    for (int status : {0x22,0xa2,0x62}) {
+        prepare(); PMU.registerReadOverride[0x01] = status; tick();
+        REQUIRE(tempLine().find(status == 0x22 ? "chg on, phase cc" : "chg off, phase cc") != std::string::npos);
+    }
     prepare(); g_millis = UINT32_MAX - 100; gDebugTempLogMs = gChargeCheckT0 = g_millis; tick();
     REQUIRE(tempLine().find("die 30.0 C") != std::string::npos);
     prepare(); gDegraded.begin(startup::Mode::NoStorage,g_millis);
     operations = PMU.operations.size(); starts = bmeTransactions;
     g_millis += 30000; serviceDebugTemperature();
     REQUIRE(PMU.operations.size() == operations && bmeTransactions == starts && tempLine().empty());
-    std::printf("PASS temperature runtime: %u checks (cadence, reuse, missing devices, freshness, degraded)\n",checks);
+    std::printf("PASS temperature runtime: %u checks (cadence, guard reuse, phase drift, stale/unknown samples, charge decode, degraded)\n",checks);
 }

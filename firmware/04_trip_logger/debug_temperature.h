@@ -44,8 +44,8 @@ struct Power {
 template<class Pmu> Power samplePower(Pmu& pmu, uint32_t now) {
     Power p;
     p.sampled = true; p.sampledMs = now;
-    // Share these checked values with the existing 1 Hz OLED reads. Unlike
-    // bool/unsigned getters, failed reads remain unknown in the serial log.
+    // One checked snapshot per Temp: line. Unlike bool/unsigned getters,
+    // failed reads remain unknown in the serial log.
     p.status2 = pmu.readRegister(0x01);
     p.status1 = pmu.readRegister(0x00);
     if (p.status1 >= 0 && (p.status1 & 0x08)) {
@@ -54,11 +54,18 @@ template<class Pmu> Power samplePower(Pmu& pmu, uint32_t now) {
         int high = pmu.readRegister(0x34);
         int low = pmu.readRegister(0x35);
         if (high >= 0 && low >= 0) {
-            int raw = ((high & 0x3F) << 8) | low;
-            if (raw > 0 && raw < 0x2000) p.millivolts = raw;
+            // V1.4 REG34 lists [13:8], but Table 6-5 ends at 0x1FFF.
+            // Match XPowersLib 0.3.3 getBattVoltage()'s H5L8 mask where
+            // those descriptions conflict. TS keeps its separate H6L8 read.
+            p.millivolts = ((high & 0x1F) << 8) | low;
         }
     }
     return p;
+}
+inline bool isCharging(int status) {
+    // V1.4 REG01[6:5] is current direction; bit 7 defaults to zero with
+    // no description. Match XPowersLib 0.3.3's full upper-bit comparison.
+    return status >= 0 && (status >> 5) == 0x01;
 }
 inline const char* phase(int status) {
     if (status < 0) return "--";

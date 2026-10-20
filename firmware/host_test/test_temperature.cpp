@@ -5,6 +5,7 @@
 #include <map>
 #include <vector>
 #include <utility>
+#include <string>
 
 static unsigned checks = 0;
 #define REQUIRE(c) do { ++checks; if (!(c)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); std::exit(1); } } while (0)
@@ -138,10 +139,29 @@ int main() {
     REQUIRE(std::abs(debug_temperature::tsVolts(8191) - 4.0955) < 0.000001);
     REQUIRE(debug_temperature::tsRaw(-1,0) == -1 && debug_temperature::tsRaw(0,-1) == -1);
     REQUIRE(debug_temperature::tsRaw(0x20,0) == -1 && debug_temperature::tsRaw(0x3f,0xff) == -1);
+    REQUIRE(debug_temperature::tsRaw(0xc4,0) == 1024); // both REG36 control bits excluded
+    REQUIRE(debug_temperature::tsRaw(0xa0,0) == -1); // sentinel survives control-bit masking
     REQUIRE(std::isnan(debug_temperature::tsVolts(-1)) && std::isnan(debug_temperature::tsVolts(8192)));
     Pmu p;
     auto power = debug_temperature::samplePower(p,42);
     REQUIRE(power.sampled && power.sampledMs == 42 && power.millivolts == 4020 && power.percent == 85);
+    for (int high : {0x0f,0x2f,0x4f,0x6f,0x8f,0xaf,0xcf,0xef}) {
+        Pmu q; q.regs[0x34] = high;
+        REQUIRE(debug_temperature::samplePower(q,43).millivolts == 4020);
+    }
+    for (int raw : {0,1,8191}) {
+        Pmu q; q.regs[0x34] = raw >> 8; q.regs[0x35] = raw & 255;
+        REQUIRE(debug_temperature::samplePower(q,43).millivolts == raw);
+    }
+    Pmu absent; absent.regs[0x00] = 0;
+    REQUIRE(debug_temperature::samplePower(absent,43).millivolts == -1);
+    const char* phases[] = {"trickle","pre","cc","cv","done","stop","--","--"};
+    for (int status = 0; status < 256; ++status) {
+        REQUIRE(debug_temperature::isCharging(status) == ((status >> 5) == 1));
+        REQUIRE(std::string(debug_temperature::phase(status)) == phases[status & 7]);
+    }
+    REQUIRE(!debug_temperature::isCharging(-1));
+    REQUIRE(std::string(debug_temperature::phase(-1)) == "--");
     for (uint8_t reg : {0x00,0x01,0xa4,0x34,0x35}) {
         Pmu q; q.regs[reg] = -1;
         auto bad = debug_temperature::samplePower(q,43);
