@@ -224,14 +224,17 @@ static constexpr uint32_t GPS_READY_MS = 3000;
 // NMEA can start before UBX input is ready. Five attempts spaced 8 s after
 // each failure put the last attempt at least 32 s after configuration starts.
 static constexpr uint32_t GPS_CONFIG_RETRY_MS = 8000;
-static constexpr uint32_t GPS_ACK_MS = 300;
+// 9600 baud, 8N1 = 960 bytes/s. A ~1 KB GSV burst alone takes ~1.1 s;
+// allow 2 s for that backlog plus default NMEA, NAV-PVT (~100 B/s) and ACK.
+// Do not resend while that window is open (bench backlog described in #177).
+static constexpr uint32_t GPS_ACK_MS = 2000;
 static constexpr uint8_t GPS_CONFIG_ATTEMPTS = 5;
 static constexpr uint8_t GPS_COMMAND_SENDS = 3;
 enum GpsConfigState { GPS_CONFIG_OFF, GPS_WAIT_READY, GPS_WAIT_ACK, GPS_RETRY, GPS_CONFIG_DONE };
 struct GpsConfig {
     GpsConfigState state = GPS_CONFIG_OFF;
     uint32_t since = 0, started = 0;
-    uint8_t attempts = 0, command = 0, sends = 0;
+    uint8_t attempts = 0, sends = 0, sendGeneration = 0;
     int8_t ack = -1;
     bool readyLogged = false, retryLogged = false;
 };
@@ -243,6 +246,7 @@ struct GpsUbxRx {
     uint32_t pos = 0, since = 0;
     uint16_t len = 0;
     uint8_t cls = 0, id = 0, a = 0, b = 0;
+    uint8_t configGeneration = 0;
     uint8_t payload[256] = {};
     bool checksumA = false;
 };
@@ -1735,9 +1739,9 @@ static void networkTask(void*) {
 // =================================================================
 // GPS receiver configuration (u-blox UBX protocol, started at boot)
 // =================================================================
-// The MAX-M10S (SPG 5.10) ACKed these legacy messages on 2026-10-18.
-// Keep the legacy ACK/retry protocol until #108 handles VALSET separately.
-// Re-send at every boot rather than rely on retained receiver settings.
+// Apply one RAM-only VALSET at every boot rather than rely on retained
+// settings. One ACK covers the whole configuration, so late CFG-MSG ACKs
+// cannot be mistaken for replies to a different setting.
 
 // Frame: B5 62 | class id | length (LE16) | payload | Fletcher-8 checksum
 // over class..payload.
@@ -1752,34 +1756,34 @@ static void ubxSend(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t le
     GPSSerial.write(b);
 }
 
-// Send one message and arm its deadline. Only one frame (at most 44 bytes)
+// Send one message and arm its deadline. Only one frame (52 bytes)
 // is written per call; there is no flush or ACK wait.
 static void sendGpsConfigCommand() {
-    // UBX-CFG-MSG (3-byte form: rate on the current port) = 0 for the NMEA
-    // sentences TinyGPSPlus ignores: GLL, GSA, GSV, VTG. RMC and GGA stay --
-    // GGA carries altitude, HDOP and satellite count.
-    static const uint8_t kSilence[] = { 0x01, 0x02, 0x03, 0x05 };
-    if (gGpsConfig.command < sizeof(kSilence)) {
-        uint8_t p[3] = { 0xF0, kSilence[gGpsConfig.command], 0 };
+    // u-blox M10 SPG 5.10 Interface description, UBX-21035062 R03:
+    // 3.10.5.1: version 0, RAM layer only, two reserved zero bytes.
+    // 4.9.11 / Table 19: UART1 message keys below, all U1 (one byte).
+    // 4.9.12 / Tables 20, 23: DYNMODEL is E1 (one byte), AUTOMOT = 4.
+    // 4.2 / 4.5: U1/E1 values occupy one byte, keys are little-endian U4,
+    // no padding. No BBR/flash writes or navigation-rate changes.
+    static const uint8_t p[] = {
+        0x00, 0x01, 0x00, 0x00,
+        0xCA, 0x00, 0x91, 0x20, 0,  // CFG-MSGOUT-NMEA_ID_GLL_UART1
+        0xC0, 0x00, 0x91, 0x20, 0,  // CFG-MSGOUT-NMEA_ID_GSA_UART1
+        0xB1, 0x00, 0x91, 0x20, 0,  // CFG-MSGOUT-NMEA_ID_VTG_UART1
+        0xC5, 0x00, 0x91, 0x20,     // CFG-MSGOUT-NMEA_ID_GSV_UART1
 #if DISPLAY_DEBUG
-        // GSV every fifth 1 Hz epoch: multi-constellation bursts can be
-        // ~1 KB; spreading them over 5 s leaves 9600-baud headroom for
-        // RMC+GGA and ACKs. The UART buffer is 2048 B. No VALSET changes.
-        if (p[1] == 0x03) p[2] = 5;
+        5,  // ~1 KB bursts every fifth epoch leave 9600-baud headroom
+#else
+        0,
 #endif
-        ubxSend(0x06, 0x01, p, sizeof(p));
-    } else if (gGpsConfig.command == 4) {
-        // UBX-CFG-NAV5: apply only dynamic model "automotive" (4).
-        uint8_t nav5[36] = {0};
-        nav5[0] = 0x01;
-        nav5[2] = 4;
-        ubxSend(0x06, 0x24, nav5, sizeof(nav5));
-    } else {
-        // Legacy CFG-MSG current-port rate: NAV-PVT every 1 Hz epoch.
-        const uint8_t p[3] = {0x01, 0x07, 1};
-        ubxSend(0x06, 0x01, p, sizeof(p));
-    }
+        0xAC, 0x00, 0x91, 0x20, 1,  // CFG-MSGOUT-NMEA_ID_RMC_UART1
+        0xBB, 0x00, 0x91, 0x20, 1,  // CFG-MSGOUT-NMEA_ID_GGA_UART1
+        0x07, 0x00, 0x91, 0x20, 1,  // CFG-MSGOUT-UBX_NAV_PVT_UART1
+        0x21, 0x00, 0x11, 0x20, 4,  // CFG-NAVSPG-DYNMODEL
+    };
+    ubxSend(0x06, 0x8A, p, sizeof(p));
     gGpsConfig.sends++;
+    gGpsConfig.sendGeneration++;
     gGpsConfig.ack = -1;
     gGpsConfig.since = millis();
     gGpsConfig.state = GPS_WAIT_ACK;
@@ -1814,7 +1818,7 @@ static void serviceGpsConfiguration() {
     if (gGpsConfig.state == GPS_RETRY) {
         if (millis() - gGpsConfig.since < GPS_CONFIG_RETRY_MS) return;
         gGpsConfig.attempts++;
-        gGpsConfig.command = gGpsConfig.sends = 0;
+        gGpsConfig.sends = 0;
         gGpsConfig.since = millis();
         gGpsConfig.state = GPS_WAIT_READY;
     }
@@ -1834,23 +1838,18 @@ static void serviceGpsConfiguration() {
     }
     if (gGpsConfig.state != GPS_WAIT_ACK) return;
     if (gGpsConfig.ack == 1) {
-        if (++gGpsConfig.command == 6) {
-            gGpsConfig.state = GPS_CONFIG_DONE;
-            gNavPvtWaitMs = millis();
-            Serial.printf("GPS configured on attempt %u (%lu ms after config start): "
+        gGpsConfig.state = GPS_CONFIG_DONE;
+        gNavPvtWaitMs = millis();
+        Serial.printf("GPS configured on attempt %u (%lu ms after config start): "
 #if DISPLAY_DEBUG
-                          "RMC+GGA+NAV-PVT, GSV every 5 epochs, automotive model.\n",
+                      "RMC+GGA+NAV-PVT, GSV every 5 epochs, automotive model.\n",
 #else
-                          "RMC+GGA+NAV-PVT, automotive model.\n",
+                      "RMC+GGA+NAV-PVT, automotive model.\n",
 #endif
-                          (unsigned)gGpsConfig.attempts,
-                          (unsigned long)(millis() - gGpsConfig.started));
-        } else {
-            gGpsConfig.sends = 0;
-            sendGpsConfigCommand();
-        }
+                      (unsigned)gGpsConfig.attempts,
+                      (unsigned long)(millis() - gGpsConfig.started));
     } else if (gGpsConfig.ack == 0) {
-        gpsConfigAttemptFailed();  // NAK: retry the entire set later
+        gpsConfigAttemptFailed();  // NAK: retry the same VALSET later
     } else if (millis() - gGpsConfig.since >= GPS_ACK_MS) {
         if (gGpsConfig.sends < GPS_COMMAND_SENDS) sendGpsConfigCommand();
         else gpsConfigAttemptFailed();
@@ -1931,7 +1930,10 @@ static void receiveGpsByte(uint8_t c) {
     // are 10 bytes; bound other packets to 256 payload bytes / 500 ms.
     if (rx.pos && millis() - rx.since >= 500) rx = GpsUbxRx();
     if (rx.pos == 0) {
-        if (c == 0xB5) { rx.pos = 1; rx.since = millis(); }
+        if (c == 0xB5) {
+            rx.pos = 1; rx.since = millis();
+            rx.configGeneration = gGpsConfig.state == GPS_WAIT_ACK ? gGpsConfig.sendGeneration : 0;
+        }
         else receiveGpsNmea(c);
         return;
     }
@@ -1939,7 +1941,10 @@ static void receiveGpsByte(uint8_t c) {
         if (c == 0x62) rx.pos++;
         else {
             rx = GpsUbxRx();
-            if (c == 0xB5) { rx.pos = 1; rx.since = millis(); }
+            if (c == 0xB5) {
+                rx.pos = 1; rx.since = millis();
+                rx.configGeneration = gGpsConfig.state == GPS_WAIT_ACK ? gGpsConfig.sendGeneration : 0;
+            }
             else receiveGpsNmea(c);
         }
         return;
@@ -1963,10 +1968,15 @@ static void receiveGpsByte(uint8_t c) {
         rx.checksumA = (c == rx.a);
         rx.pos++;
     } else {
-        uint8_t expectedId = gGpsConfig.command == 4 ? 0x24 : 0x01;
+        // Ignore replies outside the current send window, including frames
+        // started in backoff or before a resend. UBX ACK carries no attempt
+        // ID: a whole delayed ACK arriving after a later identical send is
+        // indistinguishable, but still acknowledges the same settings.
         if (rx.checksumA && c == rx.b && rx.cls == 0x05 && rx.len == 2 &&
             (rx.id == 0x01 || rx.id == 0x00) && rx.payload[0] == 0x06 &&
-            rx.payload[1] == expectedId && gGpsConfig.state == GPS_WAIT_ACK &&
+            rx.payload[1] == 0x8A && gGpsConfig.state == GPS_WAIT_ACK &&
+            rx.configGeneration == gGpsConfig.sendGeneration &&
+            millis() - gGpsConfig.since < GPS_ACK_MS &&
             gGpsConfig.ack < 0) {
             gGpsConfig.ack = rx.id == 0x01 ? 1 : 0;
         }

@@ -405,9 +405,9 @@ where you are.
 
 Keys: `g` signal strength of every satellite heard plus the antenna/RF
 status, `4` GPS power off/on (time a hot start), `v` GPS firmware version,
-`u` the legacy UBX config Stage 4 sends, `e` GPS_EN, `b` VBACKUP, `3` LoRa
-rail (needs the antenna attached and a confirmation), `r` raw NMEA, `h`
-help.
+`u` a legacy UBX config test (Stage 4 uses VALSET instead), `e` GPS_EN,
+`b` VBACKUP, `3` LoRa rail (needs the antenna attached and a confirmation),
+`r` raw NMEA, `h` help.
 
 What good looks like outdoors: a cold start in about 33 s, a hot start in
 about 2 s, and `g` showing 19 or more satellites heard at 40+ dBHz with
@@ -448,12 +448,34 @@ The rest of this section was written for the V1.2. On the Supreme
   itself off completely**, not into deep sleep. Power returning to the USB
   port switches it back on. The boot log shows
   `PMU power-on source 0x04, power-off source 0x02` when that worked.
-- **GPS settings:** after a cold power-up the MAX-M10S ignores
-  configuration for a few seconds, so the logger retries in the
-  background. Expect `GPS configured on attempt 2 (… ms after config
-  start)` about 10 s after power-up.
-  Both builds also request UBX NAV-PVT once per navigation epoch (1 Hz)
-  to check the receiver's speed accuracy before recording movement.
+- **GPS settings:** Stage 4 sends one UBX-CFG-VALSET (`06 8A`) at every
+  boot to the receiver's RAM layer, without saving to battery-backed RAM
+  or flash. It explicitly enables UART1 RMC, GGA and NAV-PVT at rate 1;
+  disables GLL, GSA and VTG; disables GSV in normal builds (rate 5 with
+  `DISPLAY_DEBUG=1`); and selects the automotive dynamic model. The
+  navigation rate stays at the default 1 Hz. GGA supplies altitude, HDOP
+  and satellite count; NAV-PVT supplies speed/horizontal accuracy used
+  before recording movement.
+  The key IDs and one-byte values come from the [M10 SPG 5.10 interface
+  description (UBX-21035062 R03)](https://content.u-blox.com/sites/default/files/u-blox-M10-SPG-5.10_InterfaceDescription_UBX-21035062.pdf),
+  sections 3.10.5.1, 4.9.11 and 4.9.12. The bench receiver still ACKs
+  legacy CFG-MSG and CFG-NAV5, but VALSET is the future-proof interface.
+  After a cold power-up the MAX-M10S can emit NMEA before accepting UBX.
+  The logger waits for checksum-valid NMEA (up to 3 s per attempt), then
+  configures in the background while continuing to parse fixes. Each send
+  waits 2 s for an ACK: at 9600 baud (8N1, about 960 bytes/s), a ~1 KB GSV
+  burst takes ~1.1 s, with more time needed for other queued NMEA,
+  NAV-PVT (~100 bytes/s), and the ACK. Nothing is resent within that window.
+  Silence permits up to three sends per attempt; a NAK ends that attempt.
+  Failed attempts wait 8 s before retrying, up to five attempts. Success
+  logs `GPS configured on attempt N (... ms after config start)`; final
+  failure warns and continues with current settings, without a legacy
+  command fallback. The ten-second NAV-PVT fallback wait starts at success
+  or final failure (see [normal operation](#normal-operation)). Replies during
+  backoff, after the ACK deadline, or begun before the current send are
+  ignored. ACKs have no attempt ID: a complete old reply first arriving
+  after another identical VALSET send cannot be distinguished, but it
+  acknowledges the same complete set of settings.
 - **Debug screen:** for road testing, the OLED shows a status page that
   redraws about once a second. Example:
 
@@ -522,7 +544,7 @@ The rest of this section was written for the V1.2. On the Supreme
   disappear, even if the receiver still predicts satellites in view. Check
   that both show `--` when their input is stale, and record the RF line
   during a fix loss on the next drive. These checks still need the board.
-- **Expected boot log:**
+- **Expected boot log** (illustrative; attempt count and timing vary):
 
   ```text
   === Stage 4: Trip Logger ===
@@ -533,7 +555,7 @@ The rest of this section was written for the V1.2. On the Supreme
   GPS: waiting for checksum-valid NMEA (up to 3 s).
   Setup complete. Logging trips.
   GPS ready: checksum-valid NMEA received.
-  GPS configured on attempt 2 (9874 ms after config start): RMC+GGA, GSV every 5 epochs, automotive model.
+  GPS configured on attempt 1 (1500 ms after config start): RMC+GGA+NAV-PVT, GSV every 5 epochs, automotive model.
   ```
 
 Before flashing:

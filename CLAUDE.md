@@ -136,10 +136,16 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 - PMU (0x34) and PCF8563 RTC (0x51) share `Wire1`, SDA 42 / SCL 41. OLED and
   BME280 are on `Wire`, SDA 17 / SCL 18
 - GPS: MAX-M10S, firmware SPG 5.10, 9600 baud on RX 9 / TX 8, GPS_EN GPIO 7
-  driven HIGH (low/high made no difference). It still ACKs the legacy UBX
-  CFG-MSG and CFG-NAV5; UBX-CFG-VALSET is the future-proof interface. After
-  a cold power-up it sends NMEA before it accepts UBX (config took ~10 s),
-  so Stage 4 retries its config in the background
+  driven HIGH (low/high made no difference). Bench tests showed that SPG
+  5.10 still ACKs legacy CFG-MSG/CFG-NAV5. Stage 4 now uses the future-proof
+  UBX-CFG-VALSET interface: one RAM-only message at every boot explicitly
+  sets UART1 RMC+GGA+NAV-PVT to rate 1, GLL/GSA/VTG off, GSV off (rate 5
+  with DISPLAY_DEBUG), and the automotive model. Navigation stays at the
+  default 1 Hz. After checksum-valid NMEA proves readiness, each send gets
+  a 2 s ACK window for the busy 9600-baud UART; up to three sends per
+  attempt and five attempts with 8 s backoff run in the normal loop.
+  After success or final failure, the NAV-PVT fallback wait starts. There
+  is no legacy fallback; failure warns and keeps current receiver settings
 - GPS backup RAM is fed from the 18650, not the PMU's VBACKUP (leave
   VBACKUP off): hot start 2 s, cold 33 s. The board powers an active antenna
 - PMU interrupt is GPIO 40, which isn't an RTC GPIO on the ESP32-S3, so it
