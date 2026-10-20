@@ -241,6 +241,7 @@ uint64_t EventLog::allocated(const Store& store, uint32_t bytes) const {
 bool EventLog::inventory(Store& store) {
     store.count = 0;
     uint64_t reserved = 2 * allocated(store, kMetaBytes);
+    if (config_.reserveRejected) reserved += allocated(store, kFrameBytes);
     if (reserved > UINT32_MAX) return false;
     store.used = static_cast<uint32_t>(reserved); // reserve both slots even when absent
     store.metaSizes[0] = store.metaSizes[1] = kMetaBytes;
@@ -264,6 +265,8 @@ bool EventLog::inventory(Store& store) {
             continue;
         }
         uint64_t bytes = allocated(store, entry.size);
+        if (config_.reserveRejected && !std::strcmp(entry.name, "rejected"))
+            bytes -= std::min(bytes, allocated(store, kFrameBytes));
         if (bytes > UINT32_MAX - store.used) return false;
         store.used += static_cast<uint32_t>(bytes);
         size_t length = std::strlen(entry.name);
@@ -605,6 +608,43 @@ bool EventLog::acknowledge(const Batch& batch, const EventIdentity* accepted, si
     }
     issued_ = 0; return true;
 }
+bool EventLog::isolateRejected(const Batch& batch) {
+    if (!issued_ || batch.ticket != issued_ || batch.count != 1 || issuedCount_ != 1 ||
+        !sameId(batch.ids[0], issuedIds_[0])) return false;
+    // A volatile head cannot atomically move with a persistent loss cursor.
+    // Let normal service migrate it to media before narrowing/retrying again.
+    if (issuedBackend_ == Backend::Ram) return false;
+    Frame frame;
+    size_t bytes = std::strlen(batch.events[0]);
+    if (bytes > kEventBytes) return false;
+    std::memcpy(frame.data, batch.events[0], bytes);
+    std::snprintf(frame.data + bytes, sizeof(frame.data) - bytes, "\t%08x\n",
+                  unsigned(crc32(frame.data, bytes)));
+    frame.size = bytes + 10;
+    bool retained = false;
+    for (auto& store : stores_) {
+        if (!load(store)) continue;
+        // Stage 4 reserves this allocation even before the inspection file
+        // exists. Standalone callers without that reserve need free space.
+        if (uint64_t(store.used) + (config_.reserveRejected ? 0 : allocated(store, frame.size)) > store.quota) continue;
+        if (!store.fs->write("/diag/rejected", frame.data, frame.size, false)) {
+            store.loaded = false; continue;
+        }
+        Frame verify;
+        retained = store.fs->read("/diag/rejected", 0, verify.data, frame.size) &&
+                   !std::memcmp(frame.data, verify.data, frame.size);
+        store.loaded = false;
+        if (retained) break;
+    }
+    if (!retained) return false; // never discard without checked inspection copy
+    // acknowledge() commits loss and cursor together, using its existing
+    // read-back verification. This is explicit discarded delivery, not success.
+    uint64_t corrupt = issuedCorrupt_;
+    issuedCorrupt_ = sum(corrupt, 1);
+    bool ok = acknowledge(batch, batch.ids, 1);
+    if (!ok) issuedCorrupt_ = corrupt;
+    return ok;
+}
 EventLog::Stats EventLog::stats() {
     Stats result; result.backend = backend_; result.storageFailures = failures_;
     result.dropped = ramPending_; result.pendingLoss = ramPending_;
@@ -670,5 +710,11 @@ bool EventLog::allocateStatusSequence(uint64_t& sequence) {
     Meta next = store.meta; ++next.revision;
     if (!save(store, next)) return false;
     sequence = next.revision; return true;
+}
+bool EventLog::suspendStatusSequence() {
+    auto& store = stores_[0];
+    if (!begun_ || !load(store)) return false;
+    Meta next = store.meta; next.revisionReady = false;
+    return save(store, next);
 }
 } // namespace diagnostics

@@ -46,8 +46,10 @@ numeric measurements and fixed enumerated values in context.
   sealing and boot/reset notices. **Part B is implemented:** runtime fault hooks
   and their host transition/protocol tests (see the hook list below).
   Supreme storage timing, power-cut and road acceptance remain hardware work.
-- **#125:** diagnostics upload worker, current snapshots, revision enrollment/
-  recovery, complete ack verification, trip priority and independent retries.
+- **#125:** implemented core-0 diagnostics upload worker, current snapshots,
+  explicit revision enrollment/recovery, complete ack verification, bounded
+  rejection isolation, trip priority and independent retries. SD revision
+  enrollment is required before the first diagnostic request (see below).
 - **#126:** degraded service loop, **after Supreme port #107/#109**. Replaces
   permanent halts on storage/PMU failure with bounded reporting and retries.
 - **#127:** SH1106 hardware adapter on the Supreme, following #123 and the port.
@@ -159,9 +161,9 @@ CI checks exact header bytes, and tests verify JSON/header version agreement.
 
 The endpoint is `POST /v1/device-events` on ingest port 8090. It uses
 the existing bearer token and an `X-Device-Id` header. Firmware already defines
-`DEVICE_ID` in `secrets.h` and sends it on GPX uploads; diagnostics uploads follow
-in #125. The public example is a non-personal identifier such
-as `tracker-1`. Header identity is validated separately and is not repeated in
+`DEVICE_ID` in `secrets.h` and sends it on GPX uploads; diagnostics uploads use
+the same identity and token. The public example is a non-personal identifier
+such as `tracker-1`. Header identity is validated separately and is not repeated in
 every record. It is a label, not authentication or a secret. In practice there
 is one tracker, but retaining the label prevents future data collisions.
 
@@ -296,8 +298,8 @@ Persisting the revision once per new check-in has an NVS wear and recovery cost;
 do not write it for every scan or event. EventLog's allocator uses one durable
 80-byte SD metadata slot write per newly allocated revision, with no allocation
 on scans/events. This is an operation count verified by host tests, not an NVS
-wear measurement. #125 must establish its actual check-in rate and recovery
-policy before relying on it; any future NVS adapter needs its own wear review.
+wear measurement. The #125 worker defines its check-in rate and explicit
+recovery policy below; any future NVS adapter needs its own wear review.
 After allocator rollback/failure the
 device may still upload events and GPX, but snapshots cannot advance until the
 revision exceeds the server high-water mark. Recovery must explicitly restore
@@ -400,9 +402,9 @@ remounting media; do not reuse cached state for a different card.
 - `nextBatch` exports up to 64 unchanged protocol-v1 JSON events and their
   IDs, oldest segment first on SD, then LittleFS, then RAM. Cross-backend order
   is not event-time order. The default 30 KiB events-array budget leaves room
-  for #125's current check-in; #125 must still enforce the full 32 KiB request.
+  for the current check-in; the worker also enforces the full 32 KiB request.
   Re-reads preserve exact JSON, including original timestamps and identity.
-  On the Windows host ABI, `sizeof(EventLog)` is **25,112 bytes** and
+  On the Windows host ABI, `sizeof(EventLog)` is **25,120 bytes** and
   `sizeof(EventLog::Batch)` is **35,288 bytes**; the host test prints both.
   ABI/alignment can differ on the ESP32-S3. #124 must place both objects in
   **static DRAM or PSRAM**, never on a task stack. Only one batch ticket is
@@ -500,8 +502,11 @@ and the two metadata slots (each slot is reserved before creation). Configure
 `Config::littleFsBlock` to the LittleFS block size (default **4 KiB**); zero is
 rejected. Nonempty files consume at least one unit. LittleFS's **64 KiB includes
 both rounded metadata slots**, leaving at most **56 KiB** for segment allocation
-with the defaults, so its segment rolls early. The limits bound allocated file
-data with the correct units; media exhaustion or I/O errors still trigger
+without transport isolation. Stage 4 enables `Config::reserveRejected`, reserving
+one additional allocation unit for `/diag/rejected` before any segment writes:
+**52 KiB** remains on LittleFS, and one FAT cluster is reserved on SD.
+LittleFS segments roll early to fit the remaining allocation. The limits bound
+allocated file data with the correct units; media exhaustion or I/O errors still trigger
 fallback. Part A of #124 protects the exported `kLittleFsJournalReserve` in
 LittleFS trip free-space checks, including boot
 capacity reporting and the start/stop guards. It subtracts
@@ -531,8 +536,8 @@ notices, lock contention and shutdown. Direct production VFS tests check sync,
 close and enumeration errors. None of these establishes SD/FAT power-cut safety.
 #124 part A wires boot producers (including the retained PMU startup helper) and storage;
 #125 wires transport, status snapshots and durable isolation for rejected events;
-#126 wires bounded degraded startup/retry behavior. Uploads, snapshots and the
-degraded loop do not run in Stage 4 yet.
+#126 wires bounded degraded startup/retry behavior. Uploads and snapshots now
+run after explicit enrollment; the degraded startup loop remains future work.
 
 ### Stage 4 boot and shutdown plumbing (#124 part A)
 
@@ -597,9 +602,11 @@ not a guarantee that every transient failure survives queue exhaustion.
 Healthy observations mark condition slots observed without producing events.
 Unmeasured fields are omitted instead of guessed or clamped. Hook timestamps use
 monotonic `millis()` and unknown wall time until clock confidence/age is integrated;
-they do not claim a retained RTC is synchronized. No check-ins or events uploads
-are added here. #125 must coherently copy each task's observed/active slots,
-accepted episode identities and saturating E5001 counter into its snapshot.
+they do not claim a retained RTC is synchronized. The upload worker copies each
+task's atomically published observed/active slots and accepted episode identities, plus core 0's saturating E5001 counter.
+A version check rejects a concurrent publication without waiting. Native 32-bit
+atomics avoid a 64-bit atomic lock in the producer. An active condition whose
+raise has not been accepted remains unknown until it has a valid episode ID.
 
 | Code | Trigger | Recovery / policy | Context |
 |---|---|---|---|
@@ -662,8 +669,8 @@ reports and the build sizes supplement, but do not replace, the real-upload benc
 measurement. Part A's observed 7,556 free bytes was a no-upload measurement.
 
 Startup halts E1001/E1002/E2001/E4002/E4003 remain #126; RTC E3007/E3008 are #128;
-E5010, diagnostic upload and snapshots remain #125. Error-code OLED pages are
-#127 and antenna detection is #164. All requested meaningful Stage 4 runtime
+E5010 and diagnostic uploads/snapshots are implemented by #125. Error-code OLED
+pages are #127 and antenna detection is #164. All requested meaningful Stage 4 runtime
 codes above are wired, including E3006's existing trusted-clock state.
 
 #126 keeps a bounded service loop alive if PMU/storage initialization fails: show or
@@ -671,20 +678,178 @@ upload failures when possible and retry safely, without claiming trips are
 recorded when no backend works. Unknown PMU state must not enable unsafe charge
 or rail operations. Display failure never changes the logging lifecycle.
 
-## Trip-first upload scheduling (#125)
+## Trip-first upload scheduling (#125, implemented)
 
-After a trip upload batch, drain diagnostic batches of up to **64 records**
-within the **32 KiB complete-request cap**. Continue until the queue is empty,
-a trip becomes eligible, `gNetHold`/`gNetAbort` is set, or about **10 seconds
-total** have elapsed. Check these stop conditions between batches and bound
-connection/read timeouts by the remaining budget. A 10-second loop around a
-long blocking socket call would not enforce this rule. Recheck trip eligibility
-before each batch so a backlog cannot starve recording or trips. Send a current
-snapshot alongside old journal records; their boot IDs need not match.
+`diag_worker.h` runs on the existing core-0 network task, after each GPX batch
+on that connection. It uses `hasPending()` before snapshot preparation and
+before **every** diagnostics request, including rejection probes. Eligibility
+still means complete, non-active `.gpx` on either mounted store; incomplete,
+`.tmp` and `.bad` files do not consume the queue limit. If another GPX becomes
+eligible, diagnostics return so the next network cycle can upload it.
 
-#125 adds a heartbeat if no contact has occurred for 24 hours, using an existing
-awake/network opportunity. Do not wake a parked car solely for a heartbeat.
-Being parked away from WiFi can legitimately trigger the optional silence alert.
+EventLog exports unchanged records in batches of at most **64**, with at most
+30 KiB for the events array. The worker subtracts the actual snapshot/envelope
+size from the **32 KiB complete-body cap** and checks the finished body again.
+Old records keep their original boot IDs, sequences, UTC and JSON, alongside
+a snapshot of this boot. The snapshot includes boot identity/counter, extended
+awake uptime, active episodes, observed codes, backend, dropped count and the
+boot-local E5001 counter. Unobserved conditions stay unknown. Duplicate network
+codes across trip/events targets merge into one active condition when either
+target is unhealthy; clearing one target does not clear the other. The optional
+`pending_events` count is omitted to avoid a full journal scan per upload.
+
+One newly persisted revision is allocated per drain opportunity (normally no
+more than one per 30-second awake network tick). All batches and probes during
+that opportunity reuse **identical snapshot bytes**, for at most ten seconds.
+The next opportunity captures new observations and allocates another revision;
+there are no snapshot allocations per scan, producer event or idle service slice.
+Observed/active changes also request a new check-in on the next normal awake
+network tick, even after their journal events have drained. Successful upload
+recovery therefore cannot leave an active fault snapshot stranded until the
+24-hour heartbeat. Unchanged observations do not mark a snapshot dirty.
+Each allocation is one 80-byte SD metadata slot write/read-back, in addition to
+normal journal ack/segment/loss metadata. This rate still needs FAT wear and
+power-cut acceptance; it is not an NVS endurance claim.
+
+Stop when the queue is empty, a trip becomes eligible, `gNetHold`/`gNetAbort`
+is set, or **10 seconds total** elapse. `diag_http.h` retains HTTPClient for
+headers/auth and HTTP framing, but its `DeadlineClient` enforces an absolute
+wall-clock deadline through all socket operations. Hostnames use one bounded
+asynchronous lwIP DNS lookup (static callback storage survives a timeout),
+connect uses the remaining time, and writes use nonblocking `send` with deadline
+checks instead of NetworkClient's independent select/retry waits. Header reads,
+slow trickles and ack-body reads share the deadline. HTTPClient can add its
+short fixed retry/yield overhead at the boundary; no long call gets a fresh
+10-second allowance. Filesystem/VFS operation latency remains a hardware
+acceptance item; diagnostic I/O uses a zero-wait mutex and the existing
+per-operation trip-demand gate, releasing the mutex before networking.
+
+### Acknowledgments, rejection and independent backoff
+
+Only a 2xx with a completely parsed, bounded acknowledgment matching the exact
+sent ID set can advance EventLog's durable cursor. The parser accepts either
+ID/key order, rejects duplicates, extra/missing IDs, malformed integers/JSON,
+unknown fields and trailing bytes, and never logs a response body. A reply must
+have a Content-Length of at most 8192 bytes (the ingest endpoint supplies it).
+Unsupported/chunked, oversize, incomplete or invalid replies retain the batch
+and raise E5010 with `parse|missing_ids|unexpected_ids|duplicate_ids`. Failed
+local ack persistence also retains retryability; an ambiguous response retries
+the original IDs, relying on ingest deduplication.
+
+Event failures use separate RuntimeFaults slots from GPX: E5003 transport,
+E5004 401, E5005 413, E5006 400, E5007 409, E5008 5xx and E5009 other positive
+status, with `target=events`. A complete valid reply clears only events-target
+failures/E5010. Transitions/repeats retain the existing 15-minute/60-second
+producer limits. The worker stops on its first failure, so it cannot drain an
+unbounded chain of its own fault events.
+
+Diagnostics retries start at **60 seconds**, double to **one hour**, and start
+at one hour for 401. AP/join failures on diagnostics-only cycles use that same
+independent backoff. GPX attempts, successes and failures never change it;
+diagnostic outcomes never change GPX retry timing. Eligible GPX always wins,
+even when its previous attempt failed. An absent placeholder server therefore
+causes bounded radio attempts, no diagnostic response logging and no growing
+request/response allocation.
+
+413 halves both the next event-count and event-byte limits, down to one event
+and a 1024-byte array budget; a singleton still rejected as too large is retained
+with backoff. 400/409 halve the count until a singleton is isolated. A singleton
+rejection first sends **the identical snapshot with an empty events array**.
+Only a valid 2xx/empty ack on that probe proves the offending item is the event.
+A rejected probe retains all records; a snapshot 409 suspends SD revision
+allocation and requires explicit revision recovery.
+
+`EventLog::isolateRejected` only accepts its outstanding singleton ticket.
+It writes and reads back one CRC-protected `/diag/rejected` inspection frame,
+then commits the discard cursor and one dropped/pending-loss increment together.
+Both backend quotas reserve that one frame's allocation unit before writes;
+replacing the inspection slot stays bounded. Loss is reported even while the
+last rejected frame remains available for inspection. A torn archive or cursor
+write retains retryability, never advances a valid multi-record batch and never
+counts an HTTP rejection as successful delivery. RAM heads stay queued until
+normal journal service persists them, so isolation never claims a volatile
+cursor/count was durable. No trip is removed to make quarantine space.
+
+### Snapshot revision enrollment and recovery
+
+The existing EventLog revision authority is **SD only**. There is no HTTP
+high-water discovery endpoint. Before first use, an operator must inspect
+`devices.status_sequence` in the ingest diagnostics database for the exact
+`DEVICE_ID` (a missing row/null revision means zero). In private `secrets.h`,
+set `DIAGNOSTICS_STATUS_HIGH_WATER` to that value and choose a positive
+`DIAGNOSTICS_ENROLLMENT_ID` greater than any used on this board. The commented
+example shows `0ULL`/`1ULL` for a verified fresh identity only.
+
+Core 0 consumes and verifies the enrollment ID in `diag/enroll` NVS **before**
+calling `restoreStatusSequence(highWater)` under the journal mutex. This writes
+NVS once per explicit enrollment, not once per check-in. Normal boots allocate
+from the existing SD metadata even if those defines are removed. A failed
+attempt consumes the token: retry with a higher ID after checking the server
+and storage. Reusing firmware after metadata loss cannot silently enroll at
+zero. Never reset the server high-water or assume a replacement SD is new
+identity enrollment. After a confirmed snapshot conflict, restore with a new
+enrollment ID and verified high-water; reboot to clear the in-memory block.
+
+With SD absent, unenrolled, corrupt or unable to persist a revision, diagnostic
+requests remain suspended and back off; GPX remains available. Protocol v1
+requires a check-in, so an events-only request cannot bypass this constraint.
+LittleFS/RAM journaling still works within its existing durability limits. A
+future alternate durable revision authority needs explicit migration design;
+the worker never switches authorities automatically.
+
+### Opportunistic heartbeat and memory
+
+A GPX 200 or fully validated diagnostic 2xx records successful server contact.
+After **24 hours** without it, an empty-event check-in can use the existing
+awake network task opportunity. No wake timer or extra task is added. The timer
+extends `millis()` across wrap while awake. Contact age is unknown after a
+power-cycle, so the first awake network opportunity conservatively checks in;
+sleep duration is not invented from boot uptime. Normal journal upload also
+refreshes contact. The server continues to measure its own contact receipt time.
+
+The batch (35,280 bytes on ESP32-S3), request (32,769), snapshot (6,144),
+reply (8,193), and two observation arrays (1,536 each) share one **85,464-byte
+PSRAM workspace**, including alignment padding. Setup allocates it once with
+`heap_caps_malloc(..., MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)`, before starting the
+network task; it is never freed or retried. There is no internal-heap fallback.
+Absent PSRAM or allocation failure prints exactly one `WARNING:` and disables
+diagnostics upload for that boot. Local journaling and GPX uploads continue.
+No existing catalog code fits this failure, so it does not fabricate an event.
+
+Small worker controls, the journal, producer builders and cross-core atomic
+publications stay in internal RAM. Only setup and the core-0 worker access the
+PSRAM workspace: the PMU ISR only latches its internal flag, DNS callbacks use
+their separate internal storage, and observation copies use atomics without a
+cache-disabled critical section. Journal flash I/O uses internal frame/metadata
+scratch; the workspace is not passed to flash drivers or ISR/DMA callbacks.
+ESP-IDF's normal flash guard suspends task execution on both cores while caches
+are disabled. No application cache-disabled path accesses this workspace.
+
+HTTPClient's small objects and bounded parser/socket scratch remain on the
+existing **12 KiB** network stack; no large upload buffer goes there. Debug
+builds print free internal heap, its largest free block and free PSRAM at boot
+and once after the first diagnostics HTTP attempt (including failure). These
+are measurement hooks for #6; actual real-upload heap/stack measurements remain
+open, including comparison with the previously observed **7468 free bytes with
+no upload**. No host test establishes ESP32 heap/stack headroom, SD latency or
+power-cut safety.
+
+Supreme/core 3.3.11 compile results with PSRAM enabled: static RAM falls from
+193,804 to **108,356 bytes** with `DISPLAY_DEBUG=1`, and from 169,836 to
+**84,388 bytes** with `DISPLAY_DEBUG=0` (85,448 bytes recovered in each build).
+Both are 2,736 bytes above the pre-upload-worker baselines of 105,620/81,652
+bytes; the remaining internal state includes the atomic publications and
+upload fault producer. These are link-time sizes, not live heap measurements.
+
+The host suite drives the actual worker/netCycle with fake WiFi/HTTP/filesystems,
+including count/body boundaries, current/old boot snapshots, trip/hold/abort and
+slow-response deadlines, exact acks, every error class, independent retries,
+heartbeat, revision loss and durable isolation. PSRAM stubs cover successful
+one-time allocation, missing PSRAM and allocation failure: one warning, no
+diagnostics-driven radio activity, continued journaling and successful GPX
+uploads. Every complete generated test
+request passes the real `common.diagnostics.parse_request` validator and real
+Flask ingest test-client commit plus duplicate replay, without opening sockets.
 
 ## Display policy and Supreme hardware (#123/#127/#128/#130)
 
@@ -949,7 +1114,7 @@ device label and catalog recovery hint (silence adds whole days without contact)
 No context, device clock, location, links or credentials are included. Configure
 booleans and bounded numeric values as described in the deployment settings;
 default silence is exactly seven days with an inclusive threshold. Firmware
-heartbeat integration remains #125, and consistent state backups remain #129.
+heartbeat integration is implemented by #125, and consistent state backups remain #129.
 Installer test uploads omit `X-Device-Id` so a routine `--check` does not enroll
 an ever-watched synthetic device; their unique `X-Trip-Id` still owns cleanup.
 

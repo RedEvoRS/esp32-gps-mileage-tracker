@@ -66,6 +66,7 @@
 #include "journal_fs.h"
 #include "journal_boot.h"
 #include "journal_sd_geometry.h"
+#include "diag_upload.h"
 #include "journal_platform.h"
 #include "runtime_faults.h"
 
@@ -282,12 +283,14 @@ static std::atomic<uint32_t> gFsDemand{0};
 
 static std::atomic<bool> gJournalSealRequested{false}, gJournalSealDone{false}, gJournalSealOk{false};
 static bool gJournalSealing = false; // core-0 only, while holding the mutex
+static bool gEventIoBudget = false; // core-0 only, cooperative VFS deadline
+static uint32_t gEventIoStarted = 0;
 static bool journalMayRun();
 static JournalPlatformIo gSdJournalIo("/sd"), gFlashJournalIo("/littlefs");
 static diagnostics::MountedJournalFs<JournalPlatformIo> gSdJournalFs(gSdJournalIo, gSdMounted, journalMayRun);
 static diagnostics::MountedJournalFs<JournalPlatformIo> gFlashJournalFs(gFlashJournalIo, gFlashMounted, journalMayRun);
-// Static storage, never the 12 KiB network task stack. No upload Batch in part A.
-static diagnostics::EventLog gJournal(nullptr, nullptr);
+// Static storage, never the 12 KiB network task stack.
+static diagnostics::EventLog gJournal(nullptr, nullptr, diagnostics::uploadJournalConfig());
 static diagnostics::JournalBoot gJournalBoot;
 static bool gJournalReady = false; // set once on core 1 before task creation
 static bool gJournalStarted = false; // under FS_LOCK; core-0 consumer only
@@ -302,6 +305,13 @@ static diagnostics::RuntimeFaults::Condition gNetConditions[] = {
 };
 static diagnostics::RuntimeFaults gLoopFaults(gJournal, gLoopConditions, sizeof(gLoopConditions) / sizeof(gLoopConditions[0]));
 static diagnostics::RuntimeFaults gNetFaults(gJournal, gNetConditions, sizeof(gNetConditions) / sizeof(gNetConditions[0]));
+static diagnostics::RuntimeFaults::Condition gEventConditions[] = {
+    {5003}, {5004}, {5005}, {5006}, {5007}, {5008}, {5009}, {5010}
+};
+static diagnostics::RuntimeFaults gEventFaults(gJournal, gEventConditions, sizeof(gEventConditions) / sizeof(gEventConditions[0]));
+static uint32_t gContactTick = 0;
+static uint64_t gContactUptime = 0, gLastContact = 0;
+static bool gContactKnown = false;
 static uint32_t gGpsDiagStartMs = 0, gLastNmeaMs = 0, gIdleFixWaitMs = 0;
 static uint32_t gStorageDiagMs = 0, gBatteryDiagMs = 0;
 static bool gBatteryDiagChecked = false;
@@ -381,6 +391,16 @@ static size_t    gTripBytes = 0;        // committed prologue + trackpoint bytes
 static Fix    gArmBuf[16];
 static size_t gArmHead = 0, gArmCount = 0;
 
+static uint64_t contactUptime() {
+    uint32_t now = millis();
+    gContactUptime += uint32_t(now - gContactTick); gContactTick = now;
+    return gContactUptime;
+}
+static void serverContact() { gLastContact = contactUptime(); gContactKnown = true; }
+static bool heartbeatDue() {
+    return !gContactKnown || contactUptime() - gLastContact >= diagnostics::kHeartbeatMs;
+}
+
 static const char* tripBackend(fs::FS& storage) { return &storage == &SD ? "sd" : "littlefs"; }
 
 static void tripWriteResult(fs::FS& storage, bool ok, const char* operation) {
@@ -404,7 +424,8 @@ static void storageConditions(uint64_t freeB, uint32_t now) {
 }
 
 static bool journalMayRun() {
-    return gFsDemand.load() == 0 && (gJournalSealing || !gNetHold.load());
+    return gFsDemand.load() == 0 && (gJournalSealing || !gNetHold.load()) &&
+           (!gEventIoBudget || (!gNetAbort.load() && uint32_t(millis() - gEventIoStarted) < diagnostics::kDrainMs));
 }
 
 static void serviceJournal() {
@@ -1757,6 +1778,7 @@ static bool uploadFile(fs::FS& storage, const char* path) {
     uint32_t t0 = millis();
     int code = http.sendRequest("POST", &body, sz);
     http.end();
+    if (code == 200) serverContact();
     uploadDiagnostics(code);
     float secs = (millis() - t0) / 1000.0f;
     reportNetworkStack("after HTTP upload");
@@ -1870,6 +1892,8 @@ static bool hasPending() {
     return (gSdMounted && hasPending(SD)) || (gFlashMounted && hasPending(LittleFS));
 }
 
+#include "diag_worker.h"
+
 #if DISPLAY_DEBUG
 // Only the network task scans: once per ~30 s cycle, and again after an
 // upload batch. gNetBusy protects unmount; per-entry FS locking lets GPS
@@ -1916,6 +1940,7 @@ static void refreshDebugPending() {
 // WiFi or the filesystem, and is raised before gNetHold is read (see the
 // handshake note at the globals).
 static void netCycle() {
+    contactUptime(); // extend millis across wrap while the awake task ticks
     gNetBusy.store(true);
     if (!gNetHold.load()) {
 #if DISPLAY_DEBUG
@@ -1930,9 +1955,10 @@ static void netCycle() {
             gNetBusy.store(false);
             return;
         }
-        if (!pending) {
-            gNetRetryMs = 0;
-        } else if (gNetRetryMs == 0 || millis() - gNetLastAttemptMs >= gNetRetryMs) {
+        if (!pending) gNetRetryMs = 0;
+        bool tripDue = pending && (gNetRetryMs == 0 || millis() - gNetLastAttemptMs >= gNetRetryMs);
+        bool diagnosticsDue = !pending && eventsDue();
+        if (tripDue || diagnosticsDue) {
             bool uploaded = false;
             const char* miss = nullptr;
             int joinStatus = -1;
@@ -1953,11 +1979,12 @@ static void netCycle() {
                 debugWifi(DebugWifi::On);
 #endif
                 trySntp();
-                uploaded = uploadPending();
+                if (tripDue) uploaded = uploadPending();
+                drainEvents(tripDue);
 #if DISPLAY_DEBUG
                 refreshDebugPending();
 #endif
-                if (!uploaded) miss = "no trip uploaded";
+                if (tripDue && !uploaded) miss = "no trip uploaded";
             }
             WiFi.disconnect(true);
             WiFi.mode(WIFI_OFF);
@@ -1966,10 +1993,13 @@ static void netCycle() {
 #endif
             // Back off AP misses, failed joins, and server failures alike.
             // Seeing the AP alone must not undo a server-failure backoff.
-            gNetRetryMs = uploaded ? NET_TICK_MS :
-                min((gNetRetryMs ? gNetRetryMs : NET_TICK_MS) * 2, NET_RETRY_MAX_MS);
-            gNetLastAttemptMs = millis();  // wait after the attempt finishes
-            if (miss) {
+            if (diagnosticsDue && (!homeFound || joinStatus >= 0)) gEventRetry.failed(millis(), -1);
+            if (tripDue) {
+                gNetRetryMs = uploaded ? NET_TICK_MS :
+                    min((gNetRetryMs ? gNetRetryMs : NET_TICK_MS) * 2, NET_RETRY_MAX_MS);
+                gNetLastAttemptMs = millis(); // diagnostics never changes GPX retry
+            }
+            if (miss && tripDue) {
                 if (joinStatus >= 0) {
                     Serial.printf("Network: %s \"%s\" (status %d) -- next try in %lu s.\n",
                                   miss, WIFI_SSID, joinStatus, (unsigned long)(gNetRetryMs / 1000));
@@ -2576,9 +2606,9 @@ void setup() {
     prefs.begin("mileage", false);
     gJournal.~EventLog();
     new (&gJournal) diagnostics::EventLog(gSdMounted ? &gSdJournalFs : nullptr,
-                                         gFlashMounted ? &gFlashJournalFs : nullptr);
+                                         gFlashMounted ? &gFlashJournalFs : nullptr, diagnostics::uploadJournalConfig());
     gJournalBoot = diagnostics::newJournalBoot();
-    gJournalReady = gJournal.begin(gJournalBoot.id, gJournalBoot.counter, "stage4-diag-b");
+    gJournalReady = gJournal.begin(gJournalBoot.id, gJournalBoot.counter, "stage4-diag-upload");
     if (gJournalReady) diagnostics::submitJournalBoot(gJournal, esp_reset_reason(), gPmuStartup, millis());
     if (gJournalReady) {
         gLoopFaults.event(4001, millis()).condition(!gSdMounted);
@@ -2600,11 +2630,15 @@ void setup() {
 #if DISPLAY_DEBUG
     beginDebugDisplay();
 #endif
+    initEventUpload();
     // --- Networking task on core 0; GPS/FSM stay on core 1 (loop) ---
     if (xTaskCreatePinnedToCore(networkTask, "net", NET_STACK_BYTES,
                                nullptr, 1, nullptr, 0) != pdPASS) {
         Serial.println("ERROR: network task creation failed; trips remain queued for a later boot.");
     }
+#if DISPLAY_DEBUG
+    reportEventHeap();
+#endif
 
     Serial.println("Setup complete. Logging trips.");
 }

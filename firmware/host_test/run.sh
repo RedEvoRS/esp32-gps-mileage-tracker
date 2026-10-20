@@ -66,6 +66,14 @@ echo "== test_journal_vfs (checked mounted VFS operations)"
 vfs_root="$(mktemp -d -t diag-vfs-XXXXXX)"
 "$build/test_journal_vfs.exe" "$vfs_root" || status=1
 
+echo "== test_event_upload (production worker, protocol and local ingest)"
+"${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_event_upload.cpp" \
+    "$here/../04_trip_logger/event_log.cpp" -o "$build/test_event_upload.exe"
+"$build/test_event_upload.exe" || status=1
+"$build/test_event_upload.exe" --no-psram || status=1
+"$build/test_event_upload.exe" --alloc-failure || status=1
+"${PYTHON:-python}" "$here/check_event_upload_protocol.py" "$build/test_event_upload.exe" || status=1
+
 # Each sketch carries its own recovery header; exercise every copy.
 for sketch in 02_pmu_test 03_gps_test 04_trip_logger; do
     echo "== test_i2c ($sketch)"
@@ -104,6 +112,14 @@ if [ -f "$tinygps/TinyGPS++.cpp" ]; then
         -I"$tinygps" "${incs[@]}" -I"$here/display_stubs" "$here/test_journal.cpp" \
         "$here/../04_trip_logger/event_log.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_journal_debug.exe"
     "$build/test_journal_debug.exe" || status=1
+    echo "== test_event_upload (DISPLAY_DEBUG=1)"
+    "${cxx[@]}" "${flags[@]}" -UDISPLAY_DEBUG -DDISPLAY_DEBUG=1 -DARDUINO=100 \
+        -I"$tinygps" "${incs[@]}" -I"$here/display_stubs" "$here/test_event_upload.cpp" \
+        "$here/../04_trip_logger/event_log.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_event_upload_debug.exe"
+    "$build/test_event_upload_debug.exe" || status=1
+    "$build/test_event_upload_debug.exe" --no-psram || status=1
+    "$build/test_event_upload_debug.exe" --alloc-failure || status=1
+    "${PYTHON:-python}" "$here/check_event_upload_protocol.py" "$build/test_event_upload_debug.exe" || status=1
     echo "== test_debug_status (formatting and real GSV parser)"
     "${cxx[@]}" "${flags[@]}" -DARDUINO=100 -I"$tinygps" "${incs[@]}" \
         "$here/test_debug_status.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_debug_status.exe"
