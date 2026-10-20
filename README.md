@@ -114,11 +114,12 @@ The target hardware:
 - **The GPS antenna**, attached to the socket marked **GPS**. The board
   powers an active antenna, so an external active antenna works too.
 - **The 915 MHz LoRa antenna** (see the warning below).
-<!-- TODO(enclosure): name and credit the published Supreme case once the
-owner supplies its link. -->
-- An enclosure. Mine is a PETG print of a published T-Beam Supreme case;
-  PETG copes with a hot car better than PLA. A case made for the older
-  T-Beam V1.2 doesn't fit the Supreme.
+<!-- TODO(enclosure): link the owner's published remix here, and credit
+the original Supreme case it's based on (name, author, link, licence). If
+the original is CC BY-SA, the remix must carry the same licence. -->
+- An enclosure. Mine is a heavily modified remix of a published T-Beam
+  Supreme case, printed in PETG, which copes with a hot car better than
+  PLA. A case made for the older T-Beam V1.2 doesn't fit the Supreme.
 
 The LoRa radio isn't used by this project, but the Supreme may arrive with
 factory firmware that transmits. Attach the correct 915 MHz LoRa antenna
