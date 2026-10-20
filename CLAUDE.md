@@ -222,7 +222,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   use a reserved bounded inspection slot and durable loss accounting. Heartbeats
   use existing awake opportunities after 24 hours without contact (first boot
   contact age is unknown). Bounded degraded startup retries restart on recovery;
-  OLED error-code pages remain integration work; host tests do not establish
+  Production OLED cards use the verified PMU IRQ batch for short POWER
+  presses outside degraded mode; debug builds do not enable that IRQ.
+  Host tests do not establish
   storage timing or durability
 - Five-state FSM for trip lifecycle
 

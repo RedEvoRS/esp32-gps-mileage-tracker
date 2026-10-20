@@ -21,8 +21,11 @@ static void world() {
     gJournalReady = gJournalStarted = gJournalSealing = gJournalBootReported = false;
     gJournalSealRequested = gJournalSealDone = gJournalSealOk = false;
     gEventIoBudget = false; g_taskDelayHook = nullptr;
-    gChargeApplied = gChargePaused = gBatteryDiagChecked = false;
+    gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0;
+    gBatteryDiagChecked = false;
     gVbusOffPending = gPmuIrqFlag = false;
+    gVbusRetry = VbusRetry::None; gVbusRetryMs = gVbusOffReadMs = 0;
+    gPmuIrqRetry = false; gPmuIrqReadMs = 0; gBatteryThresholds = -1;
     for (auto& slot : gLoopConditions) { auto code = slot.code; slot = {}; slot.code = code; }
     gLoopFaults.~RuntimeFaults();
     new (&gLoopFaults) RuntimeFaults(gJournal, gLoopConditions, sizeof(gLoopConditions)/sizeof(gLoopConditions[0]));
@@ -85,7 +88,119 @@ static void onlyPmuCalls(std::initializer_list<const char*> allowed) {
         assert(found);
     }
 }
+static void failNextRead(uint8_t reg, unsigned offset = 1) {
+    PMU.failRegisterReadAt[reg] = PMU.registerReadCalls[reg] + offset;
+}
+static void assertAwakeRecovery() {
+    assert(PMU.shutdownCalls == 0 && g_lockDepth == 0 && !gNetHold && !gNetAbort);
+    assert(!gVbusOffPending && g_disk.mounted && gFlashMounted);
+    assert(!gJournalSealRequested && !gJournalSealDone);
+}
 int main() {
+    // Exhaust all successful byte values against XPowersLib's bit semantics.
+    for (int raw = 0; raw <= 255; ++raw) {
+        assert(pmu_read::aldo3State(raw) == ((raw & 4) ? Aldo3State::On : Aldo3State::Off));
+        for (int second = 0; second <= 255; ++second)
+            assert(pmu_read::vbusState(raw, second) ==
+                   (!(second & 8) && (raw & 32) ? VbusState::Present : VbusState::Absent));
+        assert(pmu_read::vbusState(-1, raw) == VbusState::Unknown);
+        assert(pmu_read::vbusState(raw, -1) == VbusState::Unknown);
+    }
+    assert(pmu_read::aldo3State(-1) == Aldo3State::Unknown);
+    assert(pmu_read::vbusState(-1, -1) == VbusState::Unknown);
+
+    // Disable succeeds, but neither boot nor a degraded retry may accept a
+    // failed independent verification. A later real clear read can recover.
+    world(); failNextRead(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
+    setup();
+    assert(!PMU.aldo3 && gDegraded.mode() == Mode::PmuUntrusted);
+    assert(!logCount("LoRa rail (ALDO3) verified off"));
+    assert(PMU.operations[0] == "begin" && PMU.operations[1] == "disableALDO3" &&
+           PMU.operations[2] == "readRegister");
+    failNextRead(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
+    g_millis += 60000; loop();
+    assert(g_restarts == 0 && gDegraded.mode() == Mode::PmuUntrusted && gDegraded.waitMs() == 120000);
+    assert(!logCount("initialization retry succeeded") && !logCount("LoRa rail (ALDO3) verified off"));
+    g_millis += 120000; restartOnLoop(); ++cases;
+
+    for (uint8_t reg : {XPOWERS_AXP2101_STATUS1, XPOWERS_AXP2101_STATUS2}) {
+        // Both entry and final checks reject unknown even if USB is really
+        // present. The final case simulates USB returning without an IRQ.
+        world(); setup();
+        gVbusLost = gVbusOffPending = true; gNetHold = true;
+        failNextRead(reg); powerOffForVbus();
+        assertAwakeRecovery(); assert(!gVbusLost && gVbusRetry == VbusRetry::Seed);
+        assert(logCount(VBUS_UNREADABLE) == 1); ++cases;
+
+        world(); setup(); PMU.vbusIn = false; gVbusLost = true;
+        failNextRead(reg, 2);
+        g_disk.onUnmount = [] { PMU.vbusIn = true; };
+        powerOffForVbus();
+        assertAwakeRecovery(); assert(!gVbusLost && gVbusRetry == VbusRetry::None);
+        assert(logCount(VBUS_UNREADABLE) == 1); ++cases;
+
+        // Returning shutdown exercises recovery seed independently of the
+        // successful absent entry and final reads.
+        world(); setup(); PMU.vbusIn = false; PMU.failShutdown = true;
+        failNextRead(reg, 3); powerOffForVbus();
+        assert(PMU.shutdownCalls == 1 && !gVbusLost && gVbusRetry == VbusRetry::Seed);
+        assert(!gNetHold && !gNetAbort && !gVbusOffPending && g_disk.mounted && g_lockDepth == 0);
+        auto reads = PMU.registerReadCalls[reg];
+        serviceVbusRecheck(); assert(PMU.registerReadCalls[reg] == reads);
+        g_millis += VBUS_RETRY_MS; serviceVbusRecheck();
+        assert(gVbusLost && gVbusRetry == VbusRetry::None); ++cases;
+
+        // Boot seed assumes USB on an unreadable result; a bounded loop
+        // retry corrects battery-only startup, including no-storage mode.
+        for (bool degraded : {false, true}) {
+            world(); PMU.vbusIn = false; g_disk.failMount = degraded;
+            failNextRead(reg); setup();
+            assert(!gVbusLost && gVbusRetry == VbusRetry::Seed);
+            reads = PMU.registerReadCalls[reg];
+            for (unsigned i = 0; i < 20; ++i) serviceVbusRecheck();
+            // No-storage startup has a one-second ADC delay after the seed;
+            // service can already be due there, but never reads tightly.
+            assert(PMU.registerReadCalls[reg] <= reads + 1);
+            g_millis += VBUS_RETRY_MS; loop();
+            assert(gVbusLost && gVbusRetry == VbusRetry::None);
+            ++cases;
+        }
+
+        // An unreadable confirmation preserves a real in-progress trip.
+        world(); setup(); ackGps(); run(15, 40, true, false, 100);
+        assert(gTripPath[0]); auto path = std::string(gTripPath);
+        PMU.vbusIn = false; PMU.removeIrq = true; gPmuIrqFlag = true; pollPmu();
+        g_millis += VBUS_OFF_CONFIRM_MS; failNextRead(reg); confirmVbusOff();
+        assert(gVbusOffPending && !gVbusLost && path == gTripPath);
+        assert(!logCount("car off: finalizing"));
+        reads = PMU.registerReadCalls[reg];
+        for (unsigned i = 0; i < 20; ++i) confirmVbusOff();
+        assert(PMU.registerReadCalls[reg] == reads);
+        g_millis += VBUS_RETRY_MS; confirmVbusOff();
+        assert(!gVbusOffPending && gVbusLost && !gTripPath[0]);
+        assert(logCount("car off: finalizing") == 1); ++cases;
+
+        // Lost IRQ-level observation is retried without inventing REMOVE.
+        world(); setup(); PMU.vbusIn = false;
+        PMU.removeIrq = true; gPmuIrqFlag = true; failNextRead(reg); pollPmu();
+        assert(!gVbusLost && !gVbusOffPending && gVbusRetry == VbusRetry::Change);
+        reads = PMU.registerReadCalls[reg]; serviceVbusRecheck();
+        assert(PMU.registerReadCalls[reg] == reads);
+        g_millis += VBUS_RETRY_MS; serviceVbusRecheck();
+        assert(gVbusOffPending && !gVbusLost);
+        g_millis += VBUS_OFF_CONFIRM_MS; confirmVbusOff(); assert(gVbusLost); ++cases;
+    }
+
+    // Retry arithmetic remains bounded across millis rollover, and repeated
+    // failures keep the safe seed until a real absent observation succeeds.
+    world(); setup(); PMU.vbusIn = false; g_millis = UINT32_MAX - 499;
+    failNextRead(XPOWERS_AXP2101_STATUS1); seedVbusState();
+    g_millis += 999; auto reads = PMU.registerReadCalls;
+    serviceVbusRecheck(); assert(PMU.registerReadCalls == reads && !gVbusLost);
+    ++g_millis; failNextRead(XPOWERS_AXP2101_STATUS1); serviceVbusRecheck();
+    assert(!gVbusLost && gVbusRetry == VbusRetry::Seed);
+    g_millis += 1000; serviceVbusRecheck(); assert(gVbusLost); ++cases;
+
     bootD();
     auto all = rows();
     assert(contains(all, 1000) && contains(all, 4001) && contains(all, 4002) && contains(all, 4003));
@@ -178,7 +293,7 @@ int main() {
         PMU.failChargeDisable = chargeResult == 1; PMU.failChargeRead = chargeResult == 2;
         setup(); assert(gDegraded.mode() == Mode::PmuUntrusted);
         bootMessagesAfterUsbWait();
-        assert(std::count(PMU.operations.begin(), PMU.operations.end(), "readRegister") == 1);
+        assert(std::count(PMU.operations.begin(), PMU.operations.end(), "readRegister") == (writeFails ? 1 : 2));
         const char* expected = chargeResult == 0 ? "read-back shows charging disabled" :
             chargeResult == 1 ? "read-back still shows charging enabled" : "charger read-back failed, state unknown";
         bool printed = false;

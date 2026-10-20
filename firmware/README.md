@@ -466,7 +466,10 @@ The rest of this section was written for the V1.2. On the Supreme
 - **Parking:** after the car's USB power has been gone 10 s and the board
   has idled on battery for 10 minutes (the upload window), it **switches
   itself off completely**, not into deep sleep. Power returning to the USB
-  port switches it back on. The boot log shows
+  port switches it back on. Unreadable USB-power state keeps the board awake
+  and is retried; it never confirms car-off or authorizes power-off. Persistent
+  read failures on battery leave the PMU's hardware under-voltage cutoff as
+  the final protection. The boot log shows
   `PMU power-on source 0x04, power-off source 0x02` when that worked.
 - **POWER button:** on the Supreme a long press of POWER doesn't put the
   board into deep sleep, as the V1.2 text under Normal operation says. Hold
@@ -475,7 +478,9 @@ The rest of this section was written for the V1.2. On the Supreme
   trip, stops the network task, seals the diagnostics journal, unmounts
   storage and switches the board off completely. **With USB power
   plugged in, the press is ignored** and the Serial Monitor shows
-  `VBUS present -- staying awake instead of powering off.` That's
+  `VBUS present -- staying awake instead of powering off.` An unreadable
+  USB-power state also keeps it awake, with
+  `VBUS state unreadable -- staying awake instead of powering off.` That's
   deliberate: USB power switches the board on only at the moment it
   arrives, so a board switched off with USB still in would stay off, and
   in the car nothing would switch it back on until the USB power was cut
@@ -545,12 +550,14 @@ The rest of this section was written for the V1.2. On the Supreme
     parked opportunity after boot or a trip. Codes are severity ordered and
     deduplicated. Four fit in a two-by-two grid; with more faults, three codes
     and `+N` show how many were omitted. Error cards show only a centred code.
-    Production does not render catalog OLED text; catalog v4 and its text
-    validation rules are unchanged. New
+    Production does not render catalog OLED text; catalog v5's text
+    validation rules still apply. New
     ERROR/CRITICAL episodes show once even while moving; unresolved faults
     remind at the next parked opportunity. Cards last 10 seconds at maximum
     contrast, then SH1106 power save turns the panel off. A short press of
-    **POWER** shows a status card in any motion state. Long press keeps its
+    **POWER** shows a status card in any motion state after a verified PMU
+    INTSTS1..3 batch, outside degraded mode. Only production enables the
+    short-key IRQ in the shared enabled/batch mask. Long press keeps its
     existing clean power-off behavior on battery and is ignored on USB.
     GSV/MON-RF antenna checking and NAV-PVT speed accuracy gating stay enabled
     in both builds. On **2026-10-20**, the owner saw the working production
@@ -819,6 +826,9 @@ How it behaves once flashed:
   reported by the AXP2101 power-management chip. Its temperature is an
   indirect estimate, not a measurement of the battery cell or a guarantee
   of safe charging in a hot car. Logging continues while charging is paused.
+  The guard verifies every charger on/off command with a checked register read
+  and retries unconfirmed commands every 30 s; E2008 means three attempts failed
+  to confirm the requested state, so charging may still be on or remain off.
 - **Storage full:** below 64 KB free it won't start a trip, and below
   24 KB it ends the one in progress. An upload frees the space.
 - **No display:** the firmware doesn't use a screen or a status LED. The

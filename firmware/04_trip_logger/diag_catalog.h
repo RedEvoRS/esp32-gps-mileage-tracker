@@ -5,8 +5,8 @@
 #include <cstdint>
 
 namespace diagnostics {
-constexpr std::uint16_t kCatalogVersion = 4;
-constexpr char kCatalogDigest[] = "6454b5e2c5958a8552ef5a04864cbae2ac0d02998f5fc78d514b8bfec533fb93";
+constexpr std::uint16_t kCatalogVersion = 5;
+constexpr char kCatalogDigest[] = "061911d5a8a96724f2ef5aa9dd9938cc7419812145eadc9bf293d089434cca5c";
 enum class Severity : std::uint8_t { Info, Warning, Error, Critical };
 enum class Journal : std::uint8_t { PerOccurrence, Transitions, Counter };
 enum class Code : std::uint16_t {
@@ -25,6 +25,7 @@ enum class Code : std::uint16_t {
     CHARGE_COLD = 2005,
     CHARGE_TEMP_UNREADABLE = 2006,
     PMU_STARTUP_RECOVERY = 2007,
+    CHARGE_CONTROL_FAILED = 2008,
     GPS_NO_DATA = 3001,
     GPS_NO_FIX = 3002,
     GPS_CONFIG_NACK = 3003,
@@ -79,10 +80,11 @@ constexpr CatalogEntry kCatalog[] = {
     {Code::PMU_INIT_FAILED, "PMU_INIT_FAILED", Severity::Critical, {"Power control failed", "", ""}, 1, "Power management initialization failed", true, Journal::Transitions},
     {Code::BATTERY_LOW, "BATTERY_LOW", Severity::Warning, {"Battery low", "", ""}, 1, "Battery charge is low", true, Journal::Transitions},
     {Code::BATTERY_CRITICAL, "BATTERY_CRITICAL", Severity::Error, {"Battery very low", "", ""}, 1, "Battery charge is critical", true, Journal::Transitions},
-    {Code::CHARGE_HOT, "CHARGE_HOT", Severity::Warning, {"Charging paused", "Temperature high", ""}, 2, "Charging paused for high temperature", false, Journal::Transitions},
-    {Code::CHARGE_COLD, "CHARGE_COLD", Severity::Warning, {"Charging paused", "Temperature low", ""}, 2, "Charging paused for low temperature", false, Journal::Transitions},
+    {Code::CHARGE_HOT, "CHARGE_HOT", Severity::Warning, {"Charge pause needed", "Temperature high", ""}, 2, "Charging pause required for high temperature", false, Journal::Transitions},
+    {Code::CHARGE_COLD, "CHARGE_COLD", Severity::Warning, {"Charge pause needed", "Temperature low", ""}, 2, "Charging pause required for low temperature", false, Journal::Transitions},
     {Code::CHARGE_TEMP_UNREADABLE, "CHARGE_TEMP_UNREADABLE", Severity::Error, {"Charge sensor failed", "", ""}, 1, "Charge temperature unavailable", true, Journal::Transitions},
     {Code::PMU_STARTUP_RECOVERY, "PMU_STARTUP_RECOVERY", Severity::Warning, {"PMU startup recovery", "", ""}, 1, "PMU startup needed recovery or retries", false, Journal::PerOccurrence},
+    {Code::CHARGE_CONTROL_FAILED, "CHARGE_CONTROL_FAILED", Severity::Error, {"Charge control fail", "", ""}, 1, "Charger command could not be confirmed", true, Journal::Transitions},
     {Code::GPS_NO_DATA, "GPS_NO_DATA", Severity::Error, {"GPS data missing", "", ""}, 1, "No GPS serial data", true, Journal::Transitions},
     {Code::GPS_NO_FIX, "GPS_NO_FIX", Severity::Warning, {"Waiting for GPS fix", "", ""}, 1, "GPS has no position fix", false, Journal::Transitions},
     {Code::GPS_CONFIG_NACK, "GPS_CONFIG_NACK", Severity::Warning, {"GPS config rejected", "", ""}, 1, "GPS rejected configuration", true, Journal::PerOccurrence},

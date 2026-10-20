@@ -22,7 +22,7 @@ static void faultWorld() {
     gLoopFaults.~RuntimeFaults(); new (&gLoopFaults) RuntimeFaults(gJournal, gLoopConditions, sizeof(gLoopConditions)/sizeof(gLoopConditions[0]));
     gNetFaults.~RuntimeFaults(); new (&gNetFaults) RuntimeFaults(gJournal, gNetConditions, sizeof(gNetConditions)/sizeof(gNetConditions[0]));
     gBatteryDiagChecked = false; gStorageDiagMs = g_millis;
-    gChargeApplied = gChargePaused = false; gChargeCheckT0 = 0;
+    gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0; gChargeCheckT0 = 0;
     gJoinFailures = gTransportFailures = 0;
     gClockSet = true; gNetAbort = gNetHold = gNetBusy = false;
     gPmuIrqFlag = false; PMU = XPowersAXP2101(); WiFi = WiFiStub();
@@ -277,6 +277,14 @@ int main(int argc, char**) {
         PMU.dieC = !bad ? 30.0f : c == 2004 ? CHG_HOT_PAUSE_C : c == 2005 ? CHG_COLD_PAUSE_C : NAN;
         gChargeCheckT0 = g_millis - CHG_CHECK_MS; serviceChargeTemp();
     }, c == 2004 ? "\"temperature_mc\":54000" : c == 2005 ? "\"temperature_mc\":9000" : "\"context\":{}");
+    cycle(2008, [](bool bad) {
+        PMU.failChargeRead = bad;
+        if (bad) gChargeState = pmu_read::ChargeState::Unconfirmed;
+        for (unsigned i = 0; i < CHG_FAILURE_LIMIT; ++i) {
+            gChargeCheckT0 = g_millis - CHG_CHECK_MS;
+            serviceChargeTemp();
+        }
+    });
     // Guard hysteresis and changing reasons without charger resume.
     faultWorld(); PMU.dieC = CHG_HOT_PAUSE_C; serviceChargeTemp(); one(2004, "raise");
     PMU.dieC = CHG_HOT_RESUME_C + 1; g_millis += CHG_CHECK_MS; serviceChargeTemp(); assert(take().empty());

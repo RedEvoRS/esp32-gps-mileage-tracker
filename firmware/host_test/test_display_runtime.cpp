@@ -5,10 +5,12 @@ static unsigned cases = 0;
 int main() {
     faultWorld(); setupPmuIrq();
     assert(bool(PMU.enabledIrqs & XPOWERS_AXP2101_PKEY_SHORT_IRQ) == !DISPLAY_DEBUG);
-    PMU.shortPressIrq = true; gPmuIrqFlag = true; pollPmu();
-#if DISPLAY_DEBUG
+    assert(PMU.enabledIrqs == PMU_ENABLED_IRQS);
+    // INTSTS2 bit 3 is the real short-key latch; no private library cache.
+    PMU.registerReadOverride[XPOWERS_AXP2101_INTSTS2] = 0x08;
+    gPmuIrqFlag = true; pollPmu();
     assert(std::find(PMU.operations.begin(), PMU.operations.end(), "isPekeyShortPressIrq") == PMU.operations.end());
-#else
+#if !DISPLAY_DEBUG
     assert(gDisplayUserRequest);
     gState = ACTIVE; serviceProductionDisplay();
     assert(gProductionLastOutput.card == display::Card::Blank); // adapter wasn't initialized
@@ -17,6 +19,46 @@ int main() {
     assert(gProductionLastOutput.card == display::Card::StatusCard);
 #endif
     ++cases;
+    // Any unreadable INTSTS byte invalidates the entire synthetic all-flags
+    // batch. No card, shutdown, power observation, journal event or clear.
+    for (uint8_t failed : {XPOWERS_AXP2101_INTSTS1, XPOWERS_AXP2101_INTSTS2, XPOWERS_AXP2101_INTSTS3}) {
+        faultWorld(); setupPmuIrq(); PMU.operations.clear();
+        for (uint8_t reg : {XPOWERS_AXP2101_INTSTS1, XPOWERS_AXP2101_INTSTS2, XPOWERS_AXP2101_INTSTS3})
+            PMU.registerReadOverride[reg] = 0xff;
+        PMU.failRegisterReadAt[failed] = PMU.registerReadCalls[failed] + 1;
+        gPmuIrqFlag = true; pollPmu();
+        assert(gPmuIrqRetry && !PMU.shutdownCalls && !gVbusOffPending && !gVbusLost && take().empty());
+        assert(std::find(PMU.operations.begin(), PMU.operations.end(), "clearIrqStatus") == PMU.operations.end());
+#if !DISPLAY_DEBUG
+        assert(!gDisplayUserRequest);
+#endif
+        ++cases;
+    }
+    // A known short key must not request a production card while degraded.
+    faultWorld(); gDegraded.begin(startup::Mode::NoStorage, g_millis);
+    PMU.registerReadOverride[XPOWERS_AXP2101_INTSTS2] = 0x08;
+    gPmuIrqFlag = true; pollPmu();
+#if !DISPLAY_DEBUG
+    assert(!gDisplayUserRequest);
+#endif
+    gDegraded = startup::DegradedPolicy(); ++cases;
+    // Long-key INTSTS2 bit 2 keeps its USB-ignore/battery-shutdown meaning.
+    for (bool usb : {true, false}) {
+        faultWorld(); PMU.vbusIn = usb;
+        PMU.registerReadOverride[XPOWERS_AXP2101_INTSTS2] = 0x04;
+        gPmuIrqFlag = true;
+        bool off = false;
+        try { pollPmu(); } catch (const PoweredOff&) { off = true; }
+        assert(off == !usb && PMU.shutdownCalls == (usb ? 0 : 1));
+#if !DISPLAY_DEBUG
+        assert(!gDisplayUserRequest);
+#endif
+        ++cases;
+    }
+    // Successful battery shutdown leaves the filesystem mutex held forever;
+    // the stub throws instead of removing power. Reset that simulated boot.
+    g_lockDepth = 0;
+    gJournalSealRequested = gJournalSealDone = false;
 #if !DISPLAY_DEBUG
     faultWorld(); beginProductionDisplay();
     diagnosticFix(1000, 100, 0); serviceProductionDisplay();
