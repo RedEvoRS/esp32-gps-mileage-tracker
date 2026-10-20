@@ -78,8 +78,8 @@ the bench.
 
 The firmware runs from the car's USB port, with an 18650 battery as backup.
 When the car's port goes dead, it closes out the trip and keeps running on
-battery for 10 more minutes to upload over home WiFi. Then it switches
-itself off completely, and power coming back to the USB port switches it on
+battery for 10 more minutes to upload over home WiFi (longer if an upload
+is still running). Then it switches itself off completely, and power coming back to the USB port switches it on
 again when you next start the car.
 
 The server adds up distance point to point, with a few corrections. Wobble
@@ -114,12 +114,12 @@ The target hardware:
 - **The GPS antenna**, attached to the socket marked **GPS**. The board
   powers an active antenna, so an external active antenna works too.
 - **The 915 MHz LoRa antenna** (see the warning below).
-<!-- TODO(enclosure): link the owner's published remix here, and credit
-the original Supreme case it's based on (name, author, link, licence). If
-the original is CC BY-SA, the remix must carry the same licence. -->
 - An enclosure. Mine is a heavily modified remix of a published T-Beam
   Supreme case, printed in PETG, which copes with a hot car better than
   PLA. A case made for the older T-Beam V1.2 doesn't fit the Supreme.
+  <!-- TODO(enclosure): link the owner's published remix here, and credit
+  the original Supreme case it's based on (name, author, link, licence).
+  If the original is CC BY-SA, the remix must carry the same licence. -->
 
 The LoRa radio isn't used by this project, but the Supreme may arrive with
 factory firmware that transmits. Attach the correct 915 MHz LoRa antenna
@@ -283,9 +283,11 @@ router; the comments in `secrets.h` explain it. `secrets.h` is in
 > what was in `secrets.h` when you flashed it. If the server's address
 > changes, the token is regenerated, or your WiFi name or password changes
 > (a new router, say), the board can't upload any more. Trips just stop
-> showing up in the viewer; a refused or failed upload also shows as an
-> `E5xxx` error code on the everyday screen after you park, but a WiFi
-> name the board can't find doesn't. Fix `secrets.h` and flash again. Trips recorded
+> showing up in the viewer. On the everyday screen, a refused upload (a
+> wrong token, say) shows as an `E5xxx` error code; WiFi or connection
+> trouble only shows if you short-press **POWER** after parking; and a
+> WiFi name the board can't find never shows. The Serial Monitor explains
+> each failure. Fix `secrets.h` and flash again. Trips recorded
 > in the meantime wait on the board and upload once it can reach the
 > server.
 
@@ -311,9 +313,13 @@ the `//` from the two `DIAGNOSTICS_` lines and set them:
 #define DIAGNOSTICS_STATUS_HIGH_WATER <the number it printed>ULL
 ```
 
-The board uses an enrollment ID once and remembers it, so after the first
-diagnostics upload has succeeded (the viewer's **Device health** page lists
-the board), **delete those two lines again** and flash once more. Left in,
+Diagnostics uploads need the microSD card: that's where the board keeps
+its count. The board uses an enrollment ID once and remembers it, even if
+the attempt fails. Once the first diagnostics upload has succeeded, the
+viewer's **Device health** page shows a status snapshot from the board.
+Just seeing the board listed there isn't enough, because a trip upload on
+its own lists it. Then **delete those two lines again** and flash once
+more, with erase disabled. Left in,
 they'd enroll the board again from a stale number if its memory were ever
 erased (see *Erase All Flash* below). To enroll again later, after a new
 card for example, read the number again and use a higher ID, `2ULL` and
@@ -329,9 +335,10 @@ next start.
 `#define DISPLAY_DEBUG 1` gives a status page that's always on and redraws
 every second: satellites, speed, the trip so far, storage and WiFi. It's
 for testing, so use it for your first drives. `0` gives the everyday
-screen: blank, except for a brief card with the satellite count and `OK`
-or error codes such as `E3009` after you park, or when you short-press
-**POWER**. [firmware/README.md](firmware/README.md#the-screen) says what
+screen: normally blank. After boot or a trip, and whenever you
+short-press **POWER**, it shows a brief card with the satellite count and
+`OK`, or any active warning and error codes such as `E3009`. A new serious
+error also shows once by itself, even while driving. [firmware/README.md](firmware/README.md#the-screen) says what
 each shows. The everyday screen hasn't been road-tested yet.
 
 **Flash it.** Open `firmware/04_trip_logger/04_trip_logger.ino`, check the
@@ -371,8 +378,8 @@ Serial Monitor can itself restart the board, so messages may show twice.
 Do this before a test drive, not during a trip.
 
 1. After flashing, look for these lines:
-   - `Trip storage: microSD (29.72 GiB free); internal flash queue mounted.`
-     Trips go to the card. If it says `WARNING: microSD unavailable -- using
+   - `Trip storage: microSD (... GiB free); internal flash queue mounted.`
+     Trips go to the card (the free-space figure depends on your card). If it says `WARNING: microSD unavailable -- using
      internal flash`, the card didn't mount: switch off, check it's FAT32 and
      seated, and switch on again.
    - `Setup complete. Logging trips.`
@@ -450,8 +457,8 @@ laptop and watch the Serial Monitor.
   standing where the car parks, is a quick test.
 - **Switching off and on.** The board switches on by itself when the car's
   USB port comes on. Once that power has been gone for 10 seconds, it ends
-  the trip, stays on battery for 10 minutes to upload, then switches itself
-  off completely. Unplugged from USB, on your desk say, it does the same:
+  the trip, stays on battery for 10 minutes to upload (up to 16 minutes more
+  if an upload is still running), then switches itself off completely. Unplugged from USB, on your desk say, it does the same:
   10 minutes, then off. It hasn't died; plug USB back in, or press
   **POWER** for about a second, to switch it on. On battery, holding
   **POWER** for a second or two (let go well before 6 s) switches it off
