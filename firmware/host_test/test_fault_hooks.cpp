@@ -87,8 +87,107 @@ static void runtimeHealthy() {
 }
 static void feed(const std::string& bytes) { for (uint8_t c : bytes) receiveGpsByte(c); }
 
+// Reuse the real GPS harness's wire builders and placeholder position. A fresh
+// NAV-PVT precedes each status-A RMC so accuracy, rather than stale data, gates it.
+static void diagnosticFix(uint32_t at, uint32_t hAcc, float mps = 0, bool withPvt = true) {
+    g_millis = at;
+    serviceGpsSpeedFallback();
+    if (withPvt) feed(navPvt(at, 100, hAcc, 3, 1, int32_t(mps * 1000)));
+    auto ss = sentences({int(at / 1000), gLat, gLon, mps, true});
+    feed(ss[0] + ss[2]); // RMC plus GGA (measured satellites)
+    serviceRuntimeDiagnostics();
+}
+
+static void gpsFixGapRegressions() {
+    for (bool hadTrustedFix : {false, true}) {
+        faultWorld();
+        uint32_t anchor = gGpsDiagStartMs;
+        if (hadTrustedFix) {
+            diagnosticFix(anchor + 5000, 2000);
+            assert(gHaveLastFix && gLatestSpeedTrusted);
+            anchor = gLastFix.monoMs;
+        }
+        assert(take().empty());
+        // 6 m passes the trip limit but fails the stricter 5 m start limit.
+        for (uint32_t gap = 1000; gap < 120000; gap += 1000) {
+            diagnosticFix(anchor + gap, 6000);
+            assert(gState == IDLE && !gSpeedFallback && !gLatestSpeedTrusted);
+            assert(gHaveLastFix == hadTrustedFix && gLastFixMonoMs == anchor + gap);
+            if (hadTrustedFix) assert(gLastFix.monoMs == anchor);
+            assert(take().empty());
+        }
+        diagnosticFix(anchor + 119999, 6000); assert(take().empty());
+        diagnosticFix(anchor + 120000, 6000);
+        auto rows = codeRows(take(), 3002);
+        if (rows.size() != 1)
+            std::fprintf(stderr, "E3002 idle regression: prior trusted fix=%d, expected one raise at 120000 ms, got %zu\n", hadTrustedFix, rows.size());
+        assert((rows.size() == 1 && "E3002 must raise 120 s after the last trusted fix, including after a first trusted fix"));
+        has(rows[0], "\"transition\":\"raise\"");
+        has(rows[0], "\"elapsed_ms\":120000");
+        has(rows[0], "\"satellites\":9");
+        auto raised = rows[0];
+        diagnosticFix(anchor + 120001, 2000);
+        assert(gHaveLastFix && gLatestSpeedTrusted && gState == IDLE);
+        assert(episode(one(3002, "clear")) == episode(raised));
+        if (!exportJson) std::printf("GPS diagnostic regression passed: untrusted idle fixes %s first trusted fix; trusted recovery.\n",
+                                    hadTrustedFix ? "after" : "before");
+    }
+
+    faultWorld(); run(15, 40, true, false, 100);
+    assert(gState == ACTIVE && gHaveLastFix); assert(take().empty());
+    const uint32_t trusted = gLastFix.monoMs;
+    // Status-A fixes too inaccurate even for a trip must still prevent E3005
+    // and allow the parked cooldown to finish before the five-minute watchdog.
+    for (uint32_t gap = 1000; gap <= COOL_MS + 1000; gap += 1000) {
+        diagnosticFix(trusted + gap, 10001);
+        assert(!gSpeedFallback && !gLatestSpeedTrusted && gLastFix.monoMs == trusted);
+        assert(gLastFixMonoMs == trusted + gap);
+        assert(gState == (gap <= COOL_MS ? COOLDOWN : IDLE));
+        assert(take().empty());
+    }
+    if (!exportJson) std::printf("GPS diagnostic regression passed: untrusted trip fixes prevent E3005 through cooldown.\n");
+
+    faultWorld(); run(15, 40, true, false, 100);
+    assert(gState == ACTIVE); assert(take().empty());
+    const uint32_t lastRmc = gLastFixMonoMs;
+    for (uint32_t gap : {29999u, 30000u}) {
+        g_millis = lastRmc + gap;
+        // GPS traffic continues, but no RMC positions arrive.
+        feed(navPvt(g_millis, 100, 10001) + nmea("GNTXT,01,01,02,ready"));
+        serviceRuntimeDiagnostics();
+        assert(gState == ACTIVE);
+        if (gap < 30000) assert(take().empty());
+    }
+    auto raised = one(3005, "raise"); has(raised, "\"elapsed_ms\":30000");
+    diagnosticFix(lastRmc + 30001, 10001);
+    assert(!gLatestSpeedTrusted && gState == COOLDOWN);
+    assert(episode(one(3005, "clear")) == episode(raised));
+    if (!exportJson) std::printf("GPS diagnostic regression passed: missing RMC raises E3005 at 30 s; untrusted RMC clears it.\n");
+
+    faultWorld();
+    const uint32_t start = gGpsDiagStartMs;
+    for (uint32_t gap = 1000; gap <= 120000; gap += 1000) {
+        diagnosticFix(start + gap, 0, 0, false);
+        assert(!gNavPvt.seen && gSpeedFallback && gLatestSpeedTrusted && gState == IDLE);
+        assert(gHaveLastFix && gLastFix.monoMs == start + gap);
+        assert(take().empty());
+    }
+    const uint32_t fallbackFix = gLastFix.monoMs;
+    for (uint32_t gap : {119999u, 120000u}) {
+        g_millis = fallbackFix + gap;
+        feed(nmea("GNTXT,01,01,02,ready")); serviceRuntimeDiagnostics();
+        if (gap < 120000) assert(take().empty());
+    }
+    raised = one(3002, "raise"); has(raised, "\"elapsed_ms\":120000");
+    diagnosticFix(fallbackFix + 120001, 0, 0, false);
+    assert(gSpeedFallback && gLatestSpeedTrusted);
+    assert(episode(one(3002, "clear")) == episode(raised));
+    if (!exportJson) std::printf("GPS diagnostic regression passed: RMC-only fallback retains E3002 timing and recovery.\n");
+}
+
 int main(int argc, char**) {
     exportJson = argc > 1;
+    gpsFixGapRegressions();
     cycle(1007, [](bool bad) { g_stackHighWaterBytes = bad ? 2047 : 2048; reportNetworkStack("test"); }, "\"free_bytes\":2047");
     for (int c : {2002, 2003}) cycle(c, [c](bool bad) {
         PMU.batteryPercent = bad ? (c == 2002 ? 15 : 5) : 85;

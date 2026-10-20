@@ -617,10 +617,10 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E2005 | Guard pauses cold (die <=9 C); remains cold while paused below 14 C | Finite die sample >=14 C or another measured pause reason | `temperature_mc` = measured PMU die, if in range |
 | E2006 | Non-finite charge-temperature sample | Finite sample; hot/cold conditions are not cleared by an unreadable sample | none |
 | E3001 | No checksum-valid NMEA for 10 s, starting at GPS configuration start | Next checksum-valid NMEA; noise/UBX/bad checksum do not recover it | `elapsed_ms` |
-| E3002 | No valid RMC position fix for 120 s while idle | Valid fix; acquisition grace starts again after leaving a trip | `elapsed_ms`, `satellites` when measured |
+| E3002 | No trusted fix (one meeting the NAV-PVT start accuracy limits, or any valid fix in RMC-only fallback) for 120 s while idle | Trusted fix; acquisition grace starts again after leaving a trip | `elapsed_ms`, `satellites` when measured |
 | E3003 | Matching checksum-checked VALSET NAK | One notice per rejected attempt, no active condition | `message_class=6`, `message_id=138` |
 | E3004 | Final config readiness/ACK timeout after five attempts | One give-up notice; final NAK uses only E3003 | `message_class=6`, `message_id=138` |
-| E3005 | Active/cooldown trip has no valid RMC fix for 30 s | Next valid RMC fix, even after the five-minute finalize; ending the trip alone is not recovery | `elapsed_ms` |
+| E3005 | Active/cooldown trip has no valid RMC fix for 30 s; any valid RMC counts, trusted or not, so weak accuracy while parked in cooldown does not cause an alert | Next valid RMC fix, even after the five-minute finalize; ending the trip alone is not recovery | `elapsed_ms` |
 | E3006 | Trusted system clock `gClockSet` still false after 120 s | Successful GPS/SNTP clock sync; untimed GPX points retain their original status | none |
 | E4001 | SD did not mount, trip logging uses LittleFS | Observed SD mount; current boot does not hot-switch backends | none |
 | E4004 | Guarded trip free space <64 KiB start reserve | >=64 KiB | `backend`, `free_bytes` |

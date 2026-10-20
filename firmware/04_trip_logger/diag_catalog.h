@@ -5,8 +5,8 @@
 #include <cstdint>
 
 namespace diagnostics {
-constexpr std::uint16_t kCatalogVersion = 2;
-constexpr char kCatalogDigest[] = "1f7bfdb3135fc7c92d17013d3c271d8514f5ffd692e81223ad85877dd2dcd3cb";
+constexpr std::uint16_t kCatalogVersion = 3;
+constexpr char kCatalogDigest[] = "0a1c02d50c538e8a4b65c0cfc68ea82126fade31957e2f4227f465113a4c009f";
 enum class Severity : std::uint8_t { Info, Warning, Error, Critical };
 enum class Journal : std::uint8_t { PerOccurrence, Transitions, Counter };
 enum class Code : std::uint16_t {
