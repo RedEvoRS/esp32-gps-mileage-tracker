@@ -9,11 +9,12 @@
 > start with [T-Beam Supreme bring-up](#t-beam-supreme-bring-up). Stage 4,
 > the trip logger, stores trips on the [microSD card](#microsd-card) and
 > falls back to the internal LittleFS partition (about 6 hours of driving)
-> when no card mounts. **The microSD support is written but not yet
-> bench-tested.** Much of the rest of this README, including most of the
-> Stage 4 section, still describes the retired T-Beam V1.2 with NEO-M8N
-> GPS. Read [Stage 4 on the Supreme](#stage-4-on-the-supreme) for what
-> differs.
+> when no card mounts. The microSD support was bench-checked on
+> 2026-10-18 and has recorded two real drives; uploading trips from the
+> card isn't tested yet, because that needs the deployed server. Much of
+> the rest of this README, including most of the Stage 4 section, still
+> describes the retired T-Beam V1.2 with NEO-M8N GPS. Read
+> [Stage 4 on the Supreme](#stage-4-on-the-supreme) for what differs.
 
 The firmware is organized into progressive stages that let you verify
 each hardware subsystem before building the full mileage tracker.
@@ -49,7 +50,7 @@ port on the right. The buttons sit along the bottom edge:
 | Button | Where | What it does |
 |---|---|---|
 | **RESET** | Left of the close pair near the middle | Restarts the ESP32 |
-| **POWER** | Right of that pair | Power key on the PMU: ~1 s switches the board on, ~6 s switches it off |
+| **POWER** | Right of that pair | Power key on the PMU: ~1 s switches the board on, ~6 s forces it off. Under Stage 4, a shorter long press on battery is a clean power-off (see [Stage 4 on the Supreme](#stage-4-on-the-supreme)) |
 | **BOOT** | On its own, further right | GPIO 0. Held while the board powers up, it selects download mode |
 
 ### Board settings
@@ -123,8 +124,9 @@ board.
 ### microSD card
 
 The trip logger writes trips to a microSD card in the Supreme's slot.
-**Not yet bench-tested:** the card's pins come from LilyGO's source, and
-Stage 2's `d` key is the first check to run when a card is fitted.
+The card's pins come from LilyGO's source. Stage 2's `d` key checked them
+on the bench on 2026-10-18, and it's the first check to run when you fit
+a card. Stage 4 has since recorded two real drives on the card.
 
 - **Format: FAT32.** The firmware can't read exFAT, which is what most
   cards of 64 GB and up ship with. Use a microSDHC card of 32 GB or less;
@@ -436,9 +438,9 @@ The rest of this section was written for the V1.2. On the Supreme
   Flash Before Sketch Upload → Enabled** for that one upload, then set it
   back to Disabled so later uploads keep your trips).
 - **Storage:** trips go to the [microSD card](#microsd-card) when one
-  mounts at boot, and to the internal LittleFS partition otherwise (not yet
-  bench-tested with a card). Trip storage in internal flash is still set up
-  as described under First flash, because it's the fallback.
+  mounts at boot, and to the internal LittleFS partition otherwise. Trip
+  storage in internal flash is still set up as described under First
+  flash, because it's the fallback.
 - **Pins and power** are the Supreme's: see the
   [Supreme pin and power reference](#supreme-pin-and-power-reference), not
   the V1.2 pin table further down. At boot the logger switches the LoRa
@@ -448,6 +450,23 @@ The rest of this section was written for the V1.2. On the Supreme
   itself off completely**, not into deep sleep. Power returning to the USB
   port switches it back on. The boot log shows
   `PMU power-on source 0x04, power-off source 0x02` when that worked.
+- **POWER button:** on the Supreme a long press of POWER doesn't put the
+  board into deep sleep, as the V1.2 text under Normal operation says. Hold
+  it for a second or two and let go well before 6 s. On battery, the logger
+  then switches off cleanly, the same way as Parking: it finalizes any
+  trip, stops the network task, seals the diagnostics journal, unmounts
+  storage and switches the board off completely. **With USB power
+  plugged in, the press is ignored** and the Serial Monitor shows
+  `VBUS present -- staying awake instead of powering off.` That's
+  deliberate: USB power switches the board on only at the moment it
+  arrives, so a board switched off with USB still in would stay off, and
+  in the car nothing would switch it back on until the USB power was cut
+  and restored. Unplug USB first if you want to switch it off. To switch
+  it back on, press POWER for about 1 s or plug in USB power. Holding
+  POWER for 6 s is the power chip's own hard power-off: the firmware
+  closes nothing first, so an open trip is repaired at the next boot
+  instead of being closed, and diagnostics not yet written to the journal
+  are lost. Use it only if the board stops responding.
 - **GPS settings:** Stage 4 sends one UBX-CFG-VALSET (`06 8A`) at every
   boot to the receiver's RAM layer, without saving to battery-backed RAM
   or flash. It explicitly enables UART1 RMC, GGA and NAV-PVT at rate 1;

@@ -21,9 +21,12 @@ Supreme on `main`.
 **Port in progress:** Stages 1–3 and the trip logger (Stage 4) run on the
 Supreme: pins, rails, PMU power-off and USB wake were bench-checked
 2026-10-18. Stage 4 stores trips on the microSD card, with the internal
-2.375 MB LittleFS partition as fallback; the SD support is not yet
-bench-tested, and the rest of the port (label `supreme-port`) is open. Don't assume a Supreme pin, rail or peripheral works
-until its port issue is closed and it's verified on the bench.
+2.375 MB LittleFS partition as fallback. The card was bench-checked
+2026-10-18, and by 2026-10-20 two real drives were recorded on it and read
+back on a PC; uploading from it is untested until the server is deployed.
+The rest of the port (label `supreme-port`) is open. Don't assume a
+Supreme pin, rail or peripheral works until its port issue is closed and
+it's verified on the bench.
 
 ## Architecture
 
@@ -151,9 +154,10 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 - PMU interrupt is GPIO 40, which isn't an RTC GPIO on the ESP32-S3, so it
   can't wake deep sleep. Wake instead: `PMU.shutdown()` powers the board
   off, and the next USB power insert powers it on (not while USB stays in)
-- microSD (pins from LilyGO's source, not yet bench-checked; Stage 2 `d`
-  checks them): FAT32 only (exFAT unsupported), powered from BLDO1, SPI
-  MOSI 35 / SCK 36 / MISO 37, CS 47, IMU CS 34 held high. BLDO1 powers up
+- microSD (pins from LilyGO's source, checked by Stage 2 `d`; Stage 4 has
+  recorded real drives on the card): FAT32 only (exFAT unsupported),
+  powered from BLDO1, SPI MOSI 35 / SCK 36 / MISO 37, CS 47, IMU CS 34
+  held high. BLDO1 powers up
   ON at 1.8 V: switch it off, set 3.3 V, then enable. Stage 4 picks its
   trip store once at boot, never formats the card, falls back to LittleFS,
   uploads from both stores, and unmounts both before `PMU.shutdown()`
@@ -204,8 +208,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   free-space checks; both failing leaves a bounded volatile RAM queue.
   Journal writes use checked mounted VFS sync/close, never format media,
   and seal on core 0 before PMU unmount/power-off. After GPX batches,
-  diagnostic uploads use exact validated acks, static
-  request buffers, a ten-second deadline and independent retry state. Current
+  diagnostic uploads use exact validated acks, request buffers allocated
+  once per boot in PSRAM (if that fails, uploads are off and the journal
+  stays local), a ten-second deadline and independent retry state. Current
   snapshots include observed/active conditions and AP-absence counts; the SD-only
   snapshot revision authority needs explicit one-use enrollment in secrets.h
   against the server high-water (see DIAGNOSTICS.md). Missing revision authority
