@@ -223,7 +223,12 @@ Step 1).
 
 5. Build and start both services:
 
-       docker compose up -d --build
+       BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
+
+   Set `BUILDX_NO_DEFAULT_ATTESTATIONS=1` on every manual build/rebuild so
+   cached builds keep stable image IDs on Docker 29 and leave unchanged
+   containers running. `install.sh` sets it automatically; this works with
+   Compose 2.38 as well as newer versions.
 
 6. Verify the service is responding:
 
@@ -280,7 +285,7 @@ Stop the service entirely:
 
 Update to newer dependency versions (after editing requirements.txt):
 
-    docker compose up -d --build
+    BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
 
 ## Inspecting Your Trip Data
 
@@ -308,7 +313,7 @@ gpx.studio, Google Earth, OsmAnd, or QGIS.
 A second service, `mileage-viewer`, gives you a web page to browse,
 audit, and export your trips. It's defined in the same
 `docker-compose.yml` and starts alongside ingest with
-`docker compose up -d --build`.
+`BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build`.
 
 Open it at:
 
@@ -399,7 +404,7 @@ from `.env`, so the viewer never holds a copy of the ingest token):
 Generate the password hash — you're prompted for the password, it isn't
 echoed, and the plaintext is never written anywhere:
 
-    docker compose build mileage-viewer
+    BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose build mileage-viewer
     docker compose run --rm --no-deps mileage-viewer python -c \
       "from getpass import getpass; \
        from werkzeug.security import generate_password_hash as g; \
@@ -581,7 +586,8 @@ GPX creator is never used to guess one. Diagnostics failures do not fail GPX.
 The viewer's `/device-health` page shipped in #119. The backup procedure above
 preserves diagnostics through SQLite snapshots rather than copying the live file.
 
-Build both images from this directory with `docker compose build`. Both service
+Build both images from this directory with
+`BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose build`. Both service
 Dockerfiles use this directory as their context and include `common/`, including
 `catalog.json`. Copy the whole `server/` tree and its `.dockerignore` when
 installing; the allowlist keeps `.env`, `viewer.env`, data and backups out of

@@ -244,7 +244,16 @@ need_sudo() {
     SUDO_KEEPALIVE=$!
 }
 
-compose() { "${DOCKER[@]}" compose "$@"; }
+# Default provenance changes image IDs on Docker's containerd store even for
+# cached builds. Compose 2.38 lacks build.provenance; set this after any sudo
+# hop so first installs and re-runs both keep unchanged images stable.
+compose() {
+    if (( ${#AS_ME[@]} )); then
+        "${AS_ME[@]}" env BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose "$@"
+    else
+        BUILDX_NO_DEFAULT_ATTESTATIONS=1 "${DOCKER[@]}" compose "$@"
+    fi
+}
 
 container_state() {
     "${DOCKER[@]}" inspect -f '{{.State.Status}}' "$1" 2> /dev/null || echo missing
