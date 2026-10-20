@@ -74,7 +74,7 @@ for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resol
         sys.path.insert(0, str(import_root))
 
 from common.diagnostics import CatalogError, load_catalog
-from geocoding import Geocoder, LookupError
+from geocoding import Geocoder, GeocodeError
 
 try:
     DIAGNOSTICS_CATALOG = load_catalog()
@@ -939,7 +939,7 @@ BASE_CSS = THEME_CSS + """
   .btn { display: inline-block; background: var(--button-bg); color: var(--button-text); padding: 8px 14px;
          border-radius: 6px; text-decoration: none; border: none; cursor: pointer; font-size: 14px; }
   .btn.secondary { background: var(--secondary-bg); }
-  button.btn:disabled { opacity: .65; cursor: default; }
+  button.btn:disabled, button.btn[aria-disabled="true"] { opacity: .65; cursor: default; }
   .endpoint-place { margin: 16px 0; overflow-wrap: anywhere; }
   .toolbar { margin-bottom: 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   .stats { display: flex; gap: 26px; flex-wrap: wrap; margin: 12px 0; }
@@ -1115,8 +1115,8 @@ TRIP_HTML = """
     {% for endpoint, title in [('start', 'Start'), ('end', 'End')] %}
     <div class="endpoint-place" data-endpoint="{{ endpoint }}">
       <b>{{ title }}</b>
-      <p data-place-label role="status">{% if places.get(endpoint) is none %}Not looked up yet.{% elif places[endpoint] %}{{ places[endpoint] }}{% else %}No mapped address found.{% endif %}</p>
       {% if endpoint in places %}
+      <p data-place-label role="status">{% if places[endpoint] is none %}Not looked up yet.{% elif places[endpoint] %}{{ places[endpoint] }}{% else %}No mapped address found.{% endif %}</p>
       <form data-place-lookup method="post" action="{{ url_for('lookup_place', ym=t.ym, trip_id=t.id) }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="endpoint" value="{{ endpoint }}">
@@ -1431,7 +1431,7 @@ def lookup_place(ym, trip_id):
         return jsonify(error="This recording has no valid endpoint to look up."), 422
     try:
         label = GEOCODER.lookup(endpoints[f"{endpoint}_latitude"], endpoints[f"{endpoint}_longitude"])
-    except LookupError as exc:
+    except GeocodeError as exc:
         return jsonify(error=str(exc)), exc.status
     return jsonify(label=label)
 

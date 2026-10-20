@@ -9,7 +9,11 @@ async function run() {
   const useEnd = { disabled: true, addEventListener(type, callback) { this.click = callback; } };
   const labels = { start: { textContent: 'Not looked up yet.' }, end: { textContent: 'Not looked up yet.' } };
   const forms = ['start', 'end'].map(endpoint => {
-    const button = { disabled: false };
+    const button = {
+      disabled: false, attributes: {},
+      setAttribute(name, value) { this.attributes[name] = value; },
+      removeAttribute(name) { delete this.attributes[name]; },
+    };
     return {
       action: '/trip/2026-10/sample/lookup-place',
       addEventListener(type, callback) { this.submit = callback; },
@@ -41,7 +45,8 @@ async function run() {
   assert.equal(calls[0].options.method, 'POST');
   assert.equal(calls[0].options.credentials, 'same-origin');
   assert.equal(calls[0].options.body.form, forms[1], 'CSRF form is sent unchanged');
-  assert.ok(forms.every(form => form.querySelector().disabled));
+  assert.ok(forms.every(form => !form.querySelector().disabled), 'focused buttons remain enabled');
+  assert.ok(forms.every(form => form.querySelector().attributes['aria-disabled'] === 'true'));
   await submit(forms[0]);
   assert.equal(calls.length, 1, 'double clicks and other endpoint cannot overlap');
   const hostile = '<img src=x onerror=alert(1)>';
@@ -51,6 +56,7 @@ async function run() {
   assert.equal(destination.value, 'Unsaved manual edit', 'lookup cannot overwrite edits');
   assert.equal(useEnd.disabled, false);
   assert.ok(forms.every(form => !form.querySelector().disabled));
+  assert.ok(forms.every(form => !('aria-disabled' in form.querySelector().attributes)));
   useEnd.click();
   assert.equal(destination.value, hostile);
   assert.equal(destination.focused, true);

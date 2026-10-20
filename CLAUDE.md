@@ -63,7 +63,7 @@ server/
   monitor.env.example    Disabled defaults; private monitor.env selected via MONITOR_ENV_FILE
   install.sh             First-time install with checks; --check re-verifies
   mileage-ingest/        Flask ingest (app.py), diagnostics SQLite (diag_store.py), Dockerfile
-  mileage-viewer/        Flask trip viewer/export + Device health (app.py, static/)
+  mileage-viewer/        Flask trip viewer/export + Device health (app.py, geocoding.py, static/)
   mileage-monitor/       Stdlib monitor.py, gelf.py, prometheus.py, loki.py; own state volume
   grafana/               Importable Prometheus scrape config, dashboard, alert examples
   ntfy/server.yml        Optional self-hosted ntfy; deny-all access, ntfy-state volume
@@ -257,7 +257,11 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   diagnostics failure never changes their response. See `DIAGNOSTICS.md` for
   schema/unknown-condition semantics.
 - Viewer port: 8091, session login (LAN-only), reads `./data` read-only, owns
-  `annotations.db` (SQLite) in the `viewer-db` volume. `/device-health` reads
+  `annotations.db` (SQLite) in the `viewer-db` volume. Optional `geocoding.py`
+  sends a selected endpoint to an explicitly configured provider only on an
+  authenticated, CSRF-protected click and caches suggestions in that database.
+  No lookup on page views, exports or uploads; never use public OSMF Nominatim.
+  `/device-health` reads
   diagnostics schema v1 via `mode=ro` with a 2 s busy timeout, shows contact and
   snapshot ages, active/unknown/clear conditions and 50-event history pages with
   code/severity filters. Severity/text come from the current startup catalog,

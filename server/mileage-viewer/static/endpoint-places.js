@@ -13,7 +13,7 @@
     busy = true;
     const container = form.closest('[data-endpoint]');
     const label = container.querySelector('[data-place-label]');
-    forms.forEach(item => { item.querySelector('button').disabled = true; });
+    forms.forEach(item => { item.querySelector('button').setAttribute('aria-disabled', 'true'); });
     label.textContent = 'Looking up place…';
     try {
       const response = await fetch(form.action, {
@@ -34,7 +34,7 @@
       label.textContent = 'Address lookup failed. Check your session and try again.';
     } finally {
       busy = false;
-      forms.forEach(item => { item.querySelector('button').disabled = false; });
+      forms.forEach(item => { item.querySelector('button').removeAttribute('aria-disabled'); });
     }
   }));
   if (useEnd) useEnd.addEventListener('click', () => {

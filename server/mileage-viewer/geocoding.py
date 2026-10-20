@@ -14,7 +14,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
-class LookupError(Exception):
+class GeocodeError(Exception):
     """A safe, fixed message suitable for display; never an upstream error."""
 
     def __init__(self, message, status=503, cooldown=300):
@@ -33,6 +33,7 @@ class Geocoder:
     MAX_LABEL = 1000
     INTERVAL = 1.1
     LEASE = 60
+    RESPONSE_BUDGET = 10
 
     def __init__(self, db_path):
         self.db_path = db_path
@@ -85,7 +86,7 @@ class Geocoder:
                 and isinstance(longitude, (float, int)) and not isinstance(longitude, bool)
                 and math.isfinite(latitude) and math.isfinite(longitude)
                 and -90 <= latitude <= 90 and -180 <= longitude <= 180):
-            raise LookupError("This recording has no valid endpoint to look up.", 422)
+            raise GeocodeError("This recording has no valid endpoint to look up.", 422)
         # Exact numeric positions; no rounding that could select a neighbour.
         raw = f"{self.url}\n{float(latitude)!r}\n{float(longitude)!r}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -100,7 +101,7 @@ class Geocoder:
 
     def lookup(self, latitude, longitude):
         if not self.enabled:
-            raise LookupError("Address lookup is not configured.", 503)
+            raise GeocodeError("Address lookup is not configured.", 503)
         key = self.key(latitude, longitude)
         token = os.urandom(16).hex()
         # A short transaction reserves the provider across all workers. Never
@@ -115,7 +116,7 @@ class Geocoder:
             gate = conn.execute("SELECT next_allowed FROM geocode_gate WHERE singleton = 1").fetchone()
             now = time.time()
             if gate and now < gate[0]:
-                raise LookupError("Address lookup is busy or cooling down. Try again later.", 429)
+                raise GeocodeError("Address lookup is busy or cooling down. Try again later.", 429)
             conn.execute(
                 "INSERT OR REPLACE INTO geocode_gate VALUES (1, ?, ?)", (now + self.LEASE, token)
             )
@@ -128,7 +129,7 @@ class Geocoder:
                     (key, label, time.time()),
                 )
             return label
-        except LookupError as exc:
+        except GeocodeError as exc:
             # Back off on all provider failures, including rate limits, rather
             # than letting repeated clicks or another worker hammer a failure.
             cooldown = exc.cooldown
@@ -148,6 +149,7 @@ class Geocoder:
         req = Request(self.url + "?" + query, headers={
             "User-Agent": self.user_agent, "Accept": "application/json",
         })
+        deadline = time.monotonic() + self.RESPONSE_BUDGET
         try:
             try:
                 response = self.opener.open(req, timeout=5)
@@ -157,11 +159,23 @@ class Geocoder:
                 if exc.code != 404:
                     delay = self._retry_delay(exc.headers.get("Retry-After", ""))
                     exc.close()
-                    raise LookupError("The address provider is unavailable. Try again later.",
+                    raise GeocodeError("The address provider is unavailable. Try again later.",
                                       cooldown=delay) from None
                 response = exc
             with response:
-                raw = response.read(self.MAX_RESPONSE + 1)
+                raw = bytearray()
+                while True:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("response deadline")
+                    # read1 returns available bytes instead of waiting for a
+                    # complete buffer. Slow-drip bodies cannot postpone the
+                    # deadline check until all 64 KiB have arrived.
+                    chunk = response.read1(min(8192, self.MAX_RESPONSE + 1 - len(raw)))
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("response deadline")
+                    raw.extend(chunk)
+                    if not chunk or len(raw) > self.MAX_RESPONSE:
+                        break
             if len(raw) > self.MAX_RESPONSE:
                 raise ValueError("oversized")
             data = json.loads(raw)
@@ -179,7 +193,7 @@ class Geocoder:
                 raise ValueError("invalid label")
             return label.strip()
         except (OSError, URLError, HTTPException, ValueError, UnicodeError, RecursionError):
-            raise LookupError("The address provider is unavailable. Try again later.") from None
+            raise GeocodeError("The address provider is unavailable. Try again later.") from None
 
     @staticmethod
     def _retry_delay(value):

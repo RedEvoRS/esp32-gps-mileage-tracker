@@ -11,6 +11,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
@@ -28,6 +29,7 @@ class EndpointPlaceTests(unittest.TestCase):
         cls.received = []
         cls.status = 200
         cls.body = b'{"display_name":"Invented workshop, Example Road"}'
+        cls.drip = 0
         cls.entered = threading.Event()
         cls.release = threading.Event()
         cls.release.set()
@@ -44,7 +46,16 @@ class EndpointPlaceTests(unittest.TestCase):
                 if cls.status == 429:
                     self.send_header("Retry-After", "3600")
                 self.end_headers()
-                self.wfile.write(cls.body)
+                try:
+                    if cls.drip:
+                        for byte in cls.body:
+                            self.wfile.write(bytes([byte]))
+                            self.wfile.flush()
+                            time.sleep(cls.drip)
+                    else:
+                        self.wfile.write(cls.body)
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass
 
             def log_message(self, *args):
                 pass
@@ -85,6 +96,7 @@ class EndpointPlaceTests(unittest.TestCase):
         cls = type(self)
         cls.received.clear()
         cls.status = 200
+        cls.drip = 0
         cls.body = b'{"display_name":"Invented workshop, Example Road"}'
         cls.entered.clear()
         cls.release.set()
@@ -154,6 +166,10 @@ class EndpointPlaceTests(unittest.TestCase):
                      "<!DOCTYPE gpx [<!ENTITY x 'x'>]><gpx/>"):
             self.gpx_path.write_text(text)
             self.assertEqual(self.post().status_code, 422)
+            html = self.client.get("/trip/2026-10/sample").get_data(as_text=True)
+            self.assertIn("No valid recorded endpoint is available.", html)
+            self.assertNotIn("Not looked up yet.", html)
+            self.assertNotIn("data-place-label", html)
         self.assertEqual(self.received, [])
 
     def test_no_match_cached_and_bad_responses_fail_without_leaking(self):
@@ -197,7 +213,7 @@ class EndpointPlaceTests(unittest.TestCase):
         self.reset_gate()
         cls.status = 429
         with patch("geocoding.time.time", return_value=10000):
-            with self.assertRaises(self.viewer.LookupError) as error:
+            with self.assertRaises(self.viewer.GeocodeError) as error:
                 self.viewer.GEOCODER.lookup(1, 3)
             self.assertEqual(error.exception.status, 503)
         with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn:
@@ -267,6 +283,20 @@ class EndpointPlaceTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError) as error:
                     self.viewer.Geocoder(self.viewer.DB_PATH)
                 self.assertNotIn(value, str(error.exception))
+
+
+    def test_slow_drip_body_hits_deadline_and_is_not_cached(self):
+        type(self).drip = .03
+        started = time.monotonic()
+        with patch.object(self.viewer.GEOCODER, "RESPONSE_BUDGET", .25):
+            response = self.post()
+        elapsed = time.monotonic() - started
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json, {"error": "The address provider is unavailable. Try again later."})
+        self.assertGreaterEqual(elapsed, .25)
+        self.assertLess(elapsed, 1.5)
+        self.assertIsNone(self.viewer.GEOCODER.cached(2, 4))
+        self.assertEqual(self.post().status_code, 429)
 
 
 if __name__ == "__main__":
