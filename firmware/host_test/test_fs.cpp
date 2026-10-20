@@ -28,6 +28,9 @@ static std::string g_outDir;
 static double gLat = 37.0, gLon = -122.0;
 
 static void resetWorld() {
+    gFsDemand = 0; gJournalReady = gJournalStarted = false;
+    gJournalSealing = gJournalBootReported = false; gJournalSealRequested = gJournalSealDone = gJournalSealOk = false;
+    gJournal.~EventLog(); new (&gJournal) diagnostics::EventLog(&gSdJournalFs, &gFlashJournalFs);
     g_disk = FakeDisk();
     g_sdDisk = FakeDisk(); g_sdDisk.mounted = false; g_sdDisk.renameOverwrites = false;
     SD.dirs.clear(); SD.cardPresent = false; SD.begins = SD.ends = 0;

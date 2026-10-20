@@ -386,8 +386,8 @@ between attempts. Serial reports recovery results, clock counts and retries;
 Stage 4 prints these after its early LoRa rail safety check. If all attempts
 fail, the existing halt remains. Recovery is host-tested; repeatedly resetting
 during PMU reads still needs a bench check. Stage 4 retains the boot result
-and has a host-tested helper for E2007 PMU_STARTUP_RECOVERY (#151). Recording
-that notice still needs the diagnostics journal and fault hooks (#122/#124);
+and has a host-tested helper for E2007 PMU_STARTUP_RECOVERY (#151). Stage 4
+now queues that notice in its diagnostic journal after storage startup;
 failed-startup reporting also needs the degraded loop (#126). OLED reporting
 remains with #127.
 
@@ -801,10 +801,30 @@ testing remains necessary to verify the flash driver's behavior.
 
 Stage 4 carries a board-independent `event_log.h` / `event_log.cpp` module with
 a fixed producer queue, CRC-protected rolling segments, durable acknowledgment
-metadata, SD/LittleFS/RAM fallback and host fault tests. It is not instantiated
-by the sketch yet, so it adds no runtime writes or tasks. The mounted-filesystem
-adapters, producer/service hooks, trip-space reserve and upload worker remain
-integration work. See [DIAGNOSTICS.md](../DIAGNOSTICS.md#eventlog-module-122-implementation)
+metadata, SD/LittleFS/RAM fallback and host fault tests. Stage 4 now uses it
+for boot history: E1000 records the reset reason, E1003/E1004/E1005 add
+watchdog/brownout/panic history, and E2007 records PMU recovery or startup
+retries. Clean PMU startup produces no E2007. Unknown reset reasons use `other`.
+Every boot gets a fresh random identity and one verified NVS boot-counter
+increment; NVS failure leaves a fresh identity with an unavailable counter.
+
+The journal uses flat `/diag/seg-00000001.open` files, sealed as `.ready`,
+with a 16 MiB SD quota. If SD cannot accept a record, it tries mounted
+LittleFS within a 64 KiB reserve, then retains the bounded RAM queue. The
+LittleFS trip start/stop guards protect the unused part of that reserve;
+existing diagnostic allocation is already counted as used space. No trip is
+deleted to make journal space, and diagnostics never mount or format media.
+RAM records are lost on reset or power-off.
+
+The existing core-0 network task drains one record per service slice, yielding
+the filesystem lock to trip writes and uploads. It also handles shutdown
+drain/sealing before the existing storage unmounts. Debug builds print one
+boot line naming the active backend and unacknowledged record/segment counts;
+an incomplete inventory is labeled. There is no extra task. Diagnostic uploads,
+other subsystem fault hooks, degraded startup and OLED error codes remain
+future work. PMU/storage failure still halts before journal startup. SD/FAT
+power-cut safety and operation latency still need hardware validation.
+See [DIAGNOSTICS.md](../DIAGNOSTICS.md#eventlog-module-122-implementation)
 for the API, on-disk format, quota and recovery rules. Run
 `bash firmware/host_test/run.sh` for fault tests and the exported-event check
 against the server's stdlib protocol validator.

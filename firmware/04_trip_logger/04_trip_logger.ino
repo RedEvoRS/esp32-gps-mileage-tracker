@@ -58,9 +58,14 @@
 #include <esp_sntp.h>
 #include <esp_partition.h>
 #include <atomic>
+#include <new>
 
 #include "secrets.h"
 #include "pmu_startup_event.h"
+#include "journal_fs.h"
+#include "journal_boot.h"
+#include "journal_sd_geometry.h"
+#include "journal_platform.h"
 
 #ifndef DISPLAY_DEBUG
 #define DISPLAY_DEBUG 1
@@ -265,8 +270,25 @@ static uint32_t gNavPvtWaitMs = 0;
 static bool gSpeedFallback = false;
 static bool gLatestSpeedTrusted = false;
 
-#define FS_LOCK()   xSemaphoreTake(gFsMutex, portMAX_DELAY)
-#define FS_UNLOCK() xSemaphoreGive(gFsMutex)
+// Announce demand BEFORE waiting: journal recovery checks it between VFS
+// operations, then releases the mutex. Trip/upload callers keep their existing
+// blocking lock semantics; the diagnostic consumer never waits for this lock.
+static std::atomic<uint32_t> gFsDemand{0};
+#define FS_LOCK()   do { gFsDemand.fetch_add(1); xSemaphoreTake(gFsMutex, portMAX_DELAY); } while (0)
+#define FS_UNLOCK() do { xSemaphoreGive(gFsMutex); gFsDemand.fetch_sub(1); } while (0)
+
+static std::atomic<bool> gJournalSealRequested{false}, gJournalSealDone{false}, gJournalSealOk{false};
+static bool gJournalSealing = false; // core-0 only, while holding the mutex
+static bool journalMayRun();
+static JournalPlatformIo gSdJournalIo("/sd"), gFlashJournalIo("/littlefs");
+static diagnostics::MountedJournalFs<JournalPlatformIo> gSdJournalFs(gSdJournalIo, gSdMounted, journalMayRun);
+static diagnostics::MountedJournalFs<JournalPlatformIo> gFlashJournalFs(gFlashJournalIo, gFlashMounted, journalMayRun);
+// Static storage, never the 12 KiB network task stack. No upload Batch in part A.
+static diagnostics::EventLog gJournal(nullptr, nullptr);
+static diagnostics::JournalBoot gJournalBoot;
+static bool gJournalReady = false; // set once on core 1 before task creation
+static bool gJournalStarted = false; // under FS_LOCK; core-0 consumer only
+static bool gJournalBootReported = false;
 
 // A single GPS fix, with monotonic receipt time and its own RMC UTC epoch.
 struct Fix {
@@ -335,6 +357,54 @@ static size_t    gTripBytes = 0;        // committed prologue + trackpoint bytes
 // comfortable headroom. Ring: oldest overwritten on overflow.
 static Fix    gArmBuf[16];
 static size_t gArmHead = 0, gArmCount = 0;
+
+static bool journalMayRun() {
+    return gFsDemand.load() == 0 && (gJournalSealing || !gNetHold.load());
+}
+
+static void serviceJournal() {
+    if (!gJournalReady) return;
+    bool sealing = gJournalSealRequested.load() && !gJournalSealDone.load();
+    if ((!sealing && !journalMayRun()) || xSemaphoreTake(gFsMutex, 0) != pdPASS) return;
+    gJournalSealing = sealing;
+    if (!journalMayRun()) { gJournalSealing = false; xSemaphoreGive(gFsMutex); return; }
+    if (!gJournalStarted) {
+        uint32_t cluster = gSdMounted ? diagnostics::journalSdCluster(SD, journalMayRun) : 0;
+        // A trip arriving during geometry probing gets the lock next. Retry
+        // initialization later instead of permanently disabling a healthy SD.
+        if (!journalMayRun()) { gJournalSealing = false; xSemaphoreGive(gFsMutex); return; }
+        gJournal.setSdAllocationUnit(cluster);
+        gJournalStarted = true;
+        // Boot recovery runs on core 0, with the same cooperative adapter gate.
+        gJournal.service(1);
+#if DISPLAY_DEBUG
+        if (!gJournalBootReported) {
+            auto backlog = gJournal.backlog();
+            backlog.complete = backlog.complete && journalMayRun();
+            auto stats = gJournal.stats();
+            const char* backend = stats.backend == diagnostics::EventLog::Backend::Sd ? "sd" :
+                                  stats.backend == diagnostics::EventLog::Backend::LittleFs ? "littlefs" : "ram";
+            Serial.printf("Journal: %s, %llu unacknowledged records, %u segments%s; boot counter %s.\n",
+                          backend, (unsigned long long)backlog.records, (unsigned)backlog.segments,
+                          backlog.complete ? "" : " (inventory incomplete)",
+                          gJournalBoot.counterPersisted ? "persisted" : "unavailable");
+            gJournalBootReported = true;
+        }
+#endif
+    } else {
+        gJournal.service(1);
+    }
+    if (sealing) {
+        gJournalSealOk.store(gJournal.seal());
+        gJournalSealDone.store(true);
+    }
+    // A cancelled metadata read must not remain cached as "missing metadata".
+    // EventLog's bool read API also uses false for an absent/torn slot. Reload
+    // both stores after any cooperative cancellation before later appends.
+    if (!journalMayRun()) gJournal.invalidateStorage();
+    gJournalSealing = false;
+    xSemaphoreGive(gFsMutex);
+}
 
 static void serviceGpsSpeedFallback() {
     // NAV-PVT is not expected until boot configuration finishes (or gives up).
@@ -599,7 +669,10 @@ static bool tripShouldSplit(size_t bytes, size_t pendingCount) {
 static uint64_t storageFreeBytes(fs::FS& storage) {
     uint64_t total = &storage == &SD ? SD.totalBytes() : LittleFS.totalBytes();
     uint64_t used = &storage == &SD ? SD.usedBytes() : LittleFS.usedBytes();
-    return used < total ? total - used : 0;
+    uint64_t free = used < total ? total - used : 0;
+    if (&storage == &LittleFS)
+        free = diagnostics::tripFreeWithJournal(free, gFlashJournalFs.allocatedBytes(4096));
+    return free;
 }
 
 // Takes the FS lock; callers must not hold it.
@@ -1189,6 +1262,17 @@ static void powerOffForVbus() {
     Serial.println("Preparing PMU power-off (battery critical / idle).");
     if (gTripPath[0]) endTrip(/*discardIfMicro=*/false);
     stopNetworkTask();
+    // The core-0 consumer closes each append itself; ask it to drain and seal
+    // before unmount. A stuck network task cannot delay power safety forever.
+    if (gJournalReady) {
+        gJournalSealDone.store(false);
+        gJournalSealRequested.store(true);
+        uint32_t journalWait = millis();
+        while (!gJournalSealDone.load() && millis() - journalWait < NET_ABORT_MS)
+            vTaskDelay(pdMS_TO_TICKS(20));
+        if (!gJournalSealDone.load() || !gJournalSealOk.load())
+            Serial.println("Journal: shutdown drain/seal incomplete; RAM records may be lost.");
+    }
     // Keep the lock through power-off, so even a network task
     // that never stopped can't reach the filesystem once it's unmounted.
     FS_LOCK();
@@ -1234,6 +1318,10 @@ static void powerOffForVbus() {
         ESP.restart();
         return;
     }
+    gJournal.invalidateStorage(); // same boot/queue, reload metadata after remount
+    gJournalStarted = false; // recheck FAT allocation geometry on core 0
+    gJournalSealRequested.store(false);
+    gJournalSealDone.store(false);
     FS_UNLOCK();
     gVbusLost = !PMU.isVbusIn();   // also catches a missed INSERT interrupt
 #if DISPLAY_DEBUG
@@ -1731,8 +1819,15 @@ static void netCycle() {
 static void networkTask(void*) {
     reportNetworkStack("task start");
     for (;;) {
+        serviceJournal(); // one record, zero-wait lock, releases before networking
         netCycle();
-        vTaskDelay(pdMS_TO_TICKS(NET_TICK_MS));
+        // Preserve the network cadence while allowing shutdown handoff and
+        // bounded journal slices during the old 30-second idle delay.
+        uint32_t idleStart = millis();
+        while (millis() - idleStart < NET_TICK_MS) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            serviceJournal();
+        }
     }
 }
 
@@ -2259,6 +2354,12 @@ void setup() {
         while (1) { delay(1000); serviceChargeTemp(); }
     }
     prefs.begin("mileage", false);
+    gJournal.~EventLog();
+    new (&gJournal) diagnostics::EventLog(gSdMounted ? &gSdJournalFs : nullptr,
+                                         gFlashMounted ? &gFlashJournalFs : nullptr);
+    gJournalBoot = diagnostics::newJournalBoot();
+    gJournalReady = gJournal.begin(gJournalBoot.id, gJournalBoot.counter, "stage4-diag-a");
+    if (gJournalReady) diagnostics::submitJournalBoot(gJournal, esp_reset_reason(), gPmuStartup, millis());
     if (gSdMounted) fsckAllTrips(SD);
     if (gFlashMounted) fsckAllTrips(LittleFS);
 

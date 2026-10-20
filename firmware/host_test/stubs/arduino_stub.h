@@ -377,15 +377,30 @@ struct SDStub : fs::FS {
     uint8_t cardType() { return g_disk.mounted ? CARD_SDHC : CARD_NONE; }
     uint64_t totalBytes() { return g_disk.capacity; }
     uint64_t usedBytes() { return g_disk.used(); }
+    bool readRAW(uint8_t* data, uint32_t sector) {
+        if (sector || !g_disk.mounted) return false;
+        memset(data, 0, 512); data[11] = 0; data[12] = 2; data[13] = 64;
+        data[14] = 32; data[16] = 2; data[510] = 0x55; data[511] = 0xaa;
+        return true;
+    }
 };
 inline SDStub SD;
 
 // ---- Preferences ----------------------------------------------------------
 struct Preferences {
     std::map<std::string, uint32_t> kv;
-    bool begin(const char*, bool) { return true; }
+    bool begin(const char*, bool) { return !failBegin; }
     uint32_t getUInt(const char* k, uint32_t d) { auto it = kv.find(k); return it == kv.end() ? d : it->second; }
     void putUInt(const char* k, uint32_t v) { kv[k] = v; }
+    inline static std::map<std::string, uint64_t> durable64;
+    inline static bool failWrite64 = false, failRead64 = false, failBegin = false;
+    bool isKey(const char* k) { return durable64.count(k) || kv.count(k); }
+    uint64_t getULong64(const char* k, uint64_t d) { return !failRead64 && durable64.count(k) ? durable64[k] : d; }
+    size_t putULong64(const char* k, uint64_t v) {
+        if (failWrite64) return 0;
+        durable64[k] = v; return sizeof(v);
+    }
+    void end() {}
 };
 
 // ---- FreeRTOS -------------------------------------------------------------
@@ -399,7 +414,8 @@ inline void portEXIT_CRITICAL(portMUX_TYPE*) {}
 inline bool g_failMutexCreate = false;
 inline SemaphoreHandle_t xSemaphoreCreateMutex() { return g_failMutexCreate ? nullptr : (void*)1; }
 extern int g_lockDepth;
-inline int xSemaphoreTake(SemaphoreHandle_t, uint32_t) {
+inline int xSemaphoreTake(SemaphoreHandle_t, uint32_t wait) {
+    if (!wait && g_lockDepth) return 0;
     if (g_lockDepth != 0) { fprintf(stderr, "FATAL: re-entrant FS_LOCK (would deadlock)\n"); exit(3); }
     g_lockDepth++; return 1;
 }

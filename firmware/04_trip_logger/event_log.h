@@ -89,6 +89,9 @@ public:
     // wake, NVS boot counter and public build label. Never reuse a boot ID with
     // a reset sequence; retry history is read directly from stored frames.
     bool begin(const char* bootId, uint64_t bootCounter, const char* firmwareVersion);
+    // Integration sets actual mounted FAT geometry before the first consumer
+    // call. Zero disables SD for this boot; queued producer records are kept.
+    bool setSdAllocationUnit(uint32_t bytes);
     // Any task, NOT ISR/panic: one try-lock, bounded encoding, no filesystem or
     // waiting. On contention/full the drop counter advances. id is optional.
     Submit submit(const EventInput& input, EventIdentity* id = nullptr);
@@ -114,6 +117,14 @@ public:
     // acceptance. False leaves data retryable; true means durable metadata.
     bool acknowledge(const Batch& batch, const EventIdentity* accepted, size_t count);
     Stats stats();
+    // Single consumer, under FS_LOCK. Startup inventory counts physical valid
+    // unacknowledged frames (duplicates after uncertain I/O may be counted).
+    struct Backlog { uint64_t records = 0; size_t segments = 0; bool complete = true; };
+    Backlog backlog();
+    // Drain a bounded queue and seal open segments before unmount. False means
+    // some RAM records or a failed seal remain; never claim them durable.
+    bool seal();
+    void invalidateStorage(); // after remount: keep boot/queue, reload all caches
 
     // Fixed SD authority, never switch to flash/RAM for snapshot revisions.
     // Enrollment/recovery must explicitly supply >= server high-water. Missing

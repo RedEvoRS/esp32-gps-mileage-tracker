@@ -1,0 +1,108 @@
+// Exercise the production mounted VFS implementation, including error returns
+// Arduino File hides. Windows shims only adapt POSIX spelling/binary mode.
+#include "event_log.h"
+#include <cassert>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <filesystem>
+#ifdef _WIN32
+#include <io.h>
+#include <direct.h>
+#endif
+static bool failSync = false, failClose = false, failList = false;
+static int checkedSync(int fd) {
+    if (failSync) { errno = EIO; return -1; }
+#ifdef _WIN32
+    return ::_commit(fd);
+#else
+    return ::fsync(fd);
+#endif
+}
+static int checkedClose(int fd) {
+    int result = ::close(fd);
+    if (failClose) { errno = EIO; return -1; }
+    return result;
+}
+static dirent* checkedReadDir(DIR* dir) {
+    if (failList) { errno = EIO; return nullptr; }
+    return ::readdir(dir);
+}
+static int checkedMkdir(const char* path, int mode) {
+#ifdef _WIN32
+    return ::_mkdir(path);
+#else
+    return ::mkdir(path, mode);
+#endif
+}
+static int checkedOpen(const char* path, int flags, int mode = 0) {
+#ifdef _WIN32
+    return ::open(path, flags | _O_BINARY, mode);
+#else
+    return ::open(path, flags, mode);
+#endif
+}
+#define fsync checkedSync
+#define close checkedClose
+#define readdir checkedReadDir
+#define mkdir checkedMkdir
+#define open checkedOpen
+#include "journal_vfs.h"
+#undef fsync
+#undef close
+#undef readdir
+#undef mkdir
+#undef open
+#include "journal_fs.h"
+
+int main(int argc, char** argv) {
+    assert(argc == 2);
+    std::filesystem::path root = std::filesystem::absolute(argv[1]);
+    std::filesystem::create_directories(root);
+    std::string mount = root.generic_string();
+    diagnostics::JournalVfs io(mount.c_str());
+    bool mounted = true;
+    diagnostics::MountedJournalFs<diagnostics::JournalVfs> adapter(io, mounted, nullptr);
+    using Result = diagnostics::EventLogFs::Result;
+    assert(adapter.begin());
+    diagnostics::EventLogFs::Entry entry;
+    assert(adapter.list(0, entry) == Result::End);
+    const char bytes[] = "one\ntwo\n";
+    assert(adapter.write("/diag/seg-00000001.open", bytes, sizeof(bytes)-1, false));
+    assert(adapter.write("/diag/seg-00000001.open", "tail", 4, true));
+    char buffer[16] = {};
+    assert(adapter.read("/diag/seg-00000001.open", 4, buffer, 4));
+    assert(!std::memcmp(buffer, "two\n", 4));
+    assert(!adapter.read("/diag/seg-00000001.open", 0, buffer, 16));
+    assert(adapter.list(0, entry) == Result::Ok && entry.size == sizeof(bytes)-1+4);
+    assert(!std::strcmp(entry.name, "seg-00000001.open"));
+    assert(adapter.rename("/diag/seg-00000001.open", "/diag/seg-00000001.ready"));
+    assert(adapter.write("/diag/seg-00000002.open", "keep", 4, false));
+    assert(!adapter.rename("/diag/seg-00000002.open", "/diag/seg-00000001.ready"));
+    failSync = true;
+    assert(!adapter.write("/diag/ack-0", "test", 4, false));
+    failSync = false; failClose = true;
+    assert(!adapter.write("/diag/ack-0", "test", 4, false));
+    assert(!adapter.read("/diag/ack-0", 0, buffer, 4));
+    failClose = false; failList = true;
+    assert(adapter.list(0, entry) == Result::Error);
+    failList = false;
+    assert(!adapter.write("/trips/unuploaded.gpx", "bad", 3, false));
+    assert(!adapter.remove("/diag/../trip"));
+    assert(!adapter.rename("/diag/ack-0", "/trips/trip"));
+    mounted = false; assert(!adapter.begin()); mounted = true;
+    for (const char* name : {"seg-00000001.ready", "seg-00000002.open", "ack-0"}) {
+        std::string path = std::string("/diag/") + name; assert(adapter.remove(path.c_str()));
+    }
+    assert(adapter.list(0, entry) == Result::End);
+    std::filesystem::create_directory(root / "diag" / "unexpected");
+    assert(adapter.list(0, entry) == Result::Error);
+    std::filesystem::remove(root / "diag" / "unexpected");
+    std::filesystem::remove(root / "diag");
+    std::filesystem::remove(root);
+    std::puts("Journal production VFS round trip, sync/close/list errors and path isolation passed");
+}
