@@ -1,11 +1,41 @@
 // Included after trip eligibility helpers. One core-0 consumer, with the same
 // zero-wait FS discipline as journal maintenance. No network while holding FS.
 #include "diag_http.h"
-static diagnostics::EventLog::Batch gEventBatch;
+#include <esp_heap_caps.h>
+
+// One boot-only allocation, exclusively owned by the core-0 worker after
+// setup. Never fall back to internal RAM, allocate on a task stack, or retry
+// after failure. Producers and their cross-core atomic publications stay in
+// internal RAM. No ISR/cache-disabled callback may access this workspace.
+struct EventUploadBuffers {
+    diagnostics::EventLog::Batch batch;
+    char request[diagnostics::kRequestBytes + 1];
+    char snapshot[6144], ack[diagnostics::kAckBytes + 1];
+    diagnostics::RuntimeFaults::Observation observations[64], copy[64];
+};
+static EventUploadBuffers* gEventBuffers = nullptr;
+static bool gEventAllocationAttempted = false;
+static void initEventUpload() {
+    if (gEventAllocationAttempted) return;
+    gEventAllocationAttempted = true;
+    void* memory = heap_caps_malloc(sizeof(EventUploadBuffers), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (memory) gEventBuffers = new (memory) EventUploadBuffers{}; // lifetime is the whole boot
+    else Serial.println("WARNING: diagnostics upload disabled: PSRAM allocation failed; journaling locally.");
+    // No catalog code describes PSRAM/workspace allocation failure. Do not
+    // misreport it as NET_TASK_FAILED or NET_STACK_LOW; the GPX task still runs.
+}
+
+#if DISPLAY_DEBUG
+static void reportEventHeap() {
+    constexpr uint32_t internal = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    Serial.printf("Heap: internal %lu free (largest %lu), PSRAM %lu free\n",
+                  (unsigned long)heap_caps_get_free_size(internal),
+                  (unsigned long)heap_caps_get_largest_free_block(internal),
+                  (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+static bool gEventHeapReported = false; // worker-owned, one post-attempt line
+#endif
 static diagnostics::UploadRetry gEventRetry;
-static char gEventRequest[diagnostics::kRequestBytes + 1];
-static char gEventSnapshot[6144], gEventAck[diagnostics::kAckBytes + 1];
-static diagnostics::RuntimeFaults::Observation gEventObservations[64], gEventCopy[64];
 static size_t gEventObservationCount = 0;
 static uint8_t gEventTransportFailures = 0;
 static bool gEnrollmentChecked = false;
@@ -52,16 +82,16 @@ static void eventHttpFault(int status, const char* ackError = nullptr) {
 
 static bool appendObservations(const diagnostics::RuntimeFaults& faults, unsigned& revision) {
     size_t count = 0;
-    if (!faults.snapshot(gEventCopy, 64, count, &revision)) return false;
+    if (!faults.snapshot(gEventBuffers->copy, 64, count, &revision)) return false;
     for (size_t i = 0; i < count; ++i) {
-        auto observation = gEventCopy[i];
+        auto observation = gEventBuffers->copy[i];
         if (!observation.observed) continue;
         size_t j = 0;
-        for (; j < gEventObservationCount; ++j) if (gEventObservations[j].code == observation.code) break;
+        for (; j < gEventObservationCount; ++j) if (gEventBuffers->observations[j].code == observation.code) break;
         if (j == gEventObservationCount) {
             if (j == 64) return false;
-            gEventObservations[gEventObservationCount++] = observation;
-        } else if (observation.episode) gEventObservations[j] = observation;
+            gEventBuffers->observations[gEventObservationCount++] = observation;
+        } else if (observation.episode) gEventBuffers->observations[j] = observation;
     }
     return true;
 }
@@ -86,7 +116,7 @@ static void enrollEventRevision() {
 }
 
 static bool eventSnapshot() {
-    if (gEventRevisionBlocked) return false;
+    if (!gEventBuffers || gEventRevisionBlocked) return false;
     gEventObservationCount = 0;
     if (!appendObservations(gLoopFaults, gEventCapturedVersions[0]) ||
         !appendObservations(gNetFaults, gEventCapturedVersions[1]) ||
@@ -98,7 +128,7 @@ static bool eventSnapshot() {
     auto stats = gJournal.stats();
     eventUnlock();
     if (!allocated) return false;
-    diagnostics::JsonWriter json{gEventSnapshot, sizeof(gEventSnapshot)};
+    diagnostics::JsonWriter json{gEventBuffers->snapshot, sizeof(gEventBuffers->snapshot)};
     json.add("{\"boot_id\":\"%s\",\"status_sequence\":%llu,\"uptime_ms\":%llu,"
              "\"boot_counter\":%llu,\"storage_backend\":\"%s\",\"dropped_events\":%llu,\"active\":[",
              gJournalBoot.id, (unsigned long long)revision, (unsigned long long)contactUptime(),
@@ -108,21 +138,21 @@ static bool eventSnapshot() {
              (unsigned long long)stats.dropped);
     bool comma = false;
     for (size_t i = 0; i < gEventObservationCount; ++i) {
-        auto& s = gEventObservations[i];
+        auto& s = gEventBuffers->observations[i];
         if (!s.episode) continue;
         json.add("%s{\"code\":%u,\"episode_id\":\"%s:%llu\"}", comma ? "," : "", s.code,
                  gJournalBoot.id, (unsigned long long)s.episode); comma = true;
     }
     json.add("],\"observed\":[");
     for (size_t i = 0; i < gEventObservationCount; ++i)
-        json.add("%s%u", i ? "," : "", gEventObservations[i].code);
+        json.add("%s%u", i ? "," : "", gEventBuffers->observations[i].code);
     json.add("],\"counters\":{\"5001\":%llu}}", (unsigned long long)gNetFaults.homeApMisses());
     return json.ok;
 }
 static size_t eventBody(size_t count) {
-    diagnostics::JsonWriter json{gEventRequest, sizeof(gEventRequest)};
-    json.add("{\"schema_version\":1,\"checkin\":%s,\"events\":[", gEventSnapshot);
-    for (size_t i = 0; i < count; ++i) json.add("%s%s", i ? "," : "", gEventBatch.events[i]);
+    diagnostics::JsonWriter json{gEventBuffers->request, sizeof(gEventBuffers->request)};
+    json.add("{\"schema_version\":1,\"checkin\":%s,\"events\":[", gEventBuffers->snapshot);
+    for (size_t i = 0; i < count; ++i) json.add("%s%s", i ? "," : "", gEventBuffers->batch.events[i]);
     json.add("]}");
     return json.ok && json.size <= diagnostics::kRequestBytes ? json.size : 0;
 }
@@ -134,10 +164,10 @@ public:
         if (gNetHold.load() || gNetAbort.load() || uint32_t(millis() - started_) >= diagnostics::kDrainMs) return -1;
         return int(size_ - pos_);
     }
-    int read() override { return pos_ < size_ ? uint8_t(gEventRequest[pos_++]) : -1; }
-    int peek() override { return pos_ < size_ ? uint8_t(gEventRequest[pos_]) : -1; }
+    int read() override { return pos_ < size_ ? uint8_t(gEventBuffers->request[pos_++]) : -1; }
+    int peek() override { return pos_ < size_ ? uint8_t(gEventBuffers->request[pos_]) : -1; }
     size_t readBytes(char* out, size_t size) override {
-        size = min(size, size_ - pos_); std::memcpy(out, gEventRequest + pos_, size); pos_ += size; return size;
+        size = min(size, size_ - pos_); std::memcpy(out, gEventBuffers->request + pos_, size); pos_ += size; return size;
     }
     size_t write(uint8_t) override { return 0; }
 };
@@ -169,12 +199,12 @@ static int postEvents(uint32_t started, size_t count, const char*& ackError) {
             auto* stream = http.getStreamPtr();
             while (stream && read < size_t(size) && eventTimeLeft(started)) {
                 if (stream->available()) {
-                    int c = stream->read(); if (c >= 0) gEventAck[read++] = char(c);
+                    int c = stream->read(); if (c >= 0) gEventBuffers->ack[read++] = char(c);
                 } else if (!stream->connected()) break;
                 else vTaskDelay(pdMS_TO_TICKS(1));
             }
             ackError = read == size_t(size) && eventTimeLeft(started) ?
-                diagnostics::AckParser(gEventAck, read).parse(gEventBatch, count) : "parse";
+                diagnostics::AckParser(gEventBuffers->ack, read).parse(gEventBuffers->batch, count) : "parse";
         }
     }
     http.end();
@@ -183,7 +213,7 @@ static int postEvents(uint32_t started, size_t count, const char*& ackError) {
 }
 
 static void drainEvents(bool afterTrips = false) {
-    if (!gJournalReady || !gEventRetry.ready(millis())) return;
+    if (!gEventBuffers || !gJournalReady || !gEventRetry.ready(millis())) return;
     uint32_t started = millis();
     struct IoBudget {
         explicit IoBudget(uint32_t now) { gEventIoStarted = now; gEventIoBudget = true; }
@@ -197,41 +227,44 @@ static void drainEvents(bool afterTrips = false) {
     if (!eventSnapshot()) { gEventRetry.failed(millis(), -1); return; }
     while (eventTimeLeft(started) && !hasPending()) {
         if (!eventLock()) return;
-        size_t snapshotBytes = std::strlen(gEventSnapshot) + 64;
+        size_t snapshotBytes = std::strlen(gEventBuffers->snapshot) + 64;
         size_t budget = min(gEventRetry.eventBytes, diagnostics::kRequestBytes - snapshotBytes);
-        bool ready = gJournal.nextBatch(gEventBatch, gEventRetry.maxEvents, budget);
+        bool ready = gJournal.nextBatch(gEventBuffers->batch, gEventRetry.maxEvents, budget);
         eventUnlock();
         if (!ready) { gEventRetry.failed(millis(), -1); return; }
-        if (!gEventBatch.count && (sent || (!afterTrips && !heartbeatDue() && !eventSnapshotChanged()))) return;
+        if (!gEventBuffers->batch.count && (sent || (!afterTrips && !heartbeatDue() && !eventSnapshotChanged()))) return;
         // Eligibility may have changed during journal I/O; never count a trip
         // before checking completeness and the active-path exclusion (#56).
         if (!eventTimeLeft(started) || hasPending()) return;
         const char* ackError = nullptr;
-        int code = postEvents(started, gEventBatch.count, ackError);
+        int code = postEvents(started, gEventBuffers->batch.count, ackError);
+#if DISPLAY_DEBUG
+        if (!gEventHeapReported) { gEventHeapReported = true; reportEventHeap(); }
+#endif
         eventHttpFault(code, ackError);
         bool success = code >= 200 && code < 300 && !ackError;
         if (success) {
             serverContact();
             eventSnapshotAccepted();
-            if (gEventBatch.count) {
+            if (gEventBuffers->batch.count) {
                 if (!eventLock()) return;
-                bool acked = gJournal.acknowledge(gEventBatch, gEventBatch.ids, gEventBatch.count);
+                bool acked = gJournal.acknowledge(gEventBuffers->batch, gEventBuffers->batch.ids, gEventBuffers->batch.count);
                 eventUnlock();
                 if (!acked) { gEventRetry.failed(millis(), -1); return; }
             }
             gEventRetry.succeeded(); sent = true;
-            if (!gEventBatch.count) return;
+            if (!gEventBuffers->batch.count) return;
         } else {
             // A valid empty request with these exact snapshot bytes proves a
             // singleton rejection belongs to the event, not its check-in.
-            if ((code == 400 || code == 409) && gEventBatch.count == 1 &&
+            if ((code == 400 || code == 409) && gEventBuffers->batch.count == 1 &&
                 eventTimeLeft(started) && !hasPending()) {
                 const char* probeError = nullptr;
                 int probe = postEvents(started, 0, probeError);
                 if (probe >= 200 && probe < 300 && !probeError) {
                     serverContact();
                     eventSnapshotAccepted();
-                    if (eventLock()) { gJournal.isolateRejected(gEventBatch); eventUnlock(); }
+                    if (eventLock()) { gJournal.isolateRejected(gEventBuffers->batch); eventUnlock(); }
                 } else {
                     eventHttpFault(probe, probeError);
                     if (probe == 409) {
@@ -240,7 +273,7 @@ static void drainEvents(bool afterTrips = false) {
                     }
                 }
             }
-            if (code == 409 && !gEventBatch.count) {
+            if (code == 409 && !gEventBuffers->batch.count) {
                 gEventRevisionBlocked = true;
                 if (eventLock()) { gJournal.suspendStatusSequence(); eventUnlock(); }
             }
@@ -253,10 +286,10 @@ static void drainEvents(bool afterTrips = false) {
 // Peek only, no revision write or queue mutation. Radio retry is independent of
 // GPX. Empty heartbeats use existing awake task ticks; no wake timer is added.
 static bool eventsDue() {
-    if (!gJournalReady || !gEventRetry.ready(millis())) return false;
+    if (!gEventBuffers || !gJournalReady || !gEventRetry.ready(millis())) return false;
     if (heartbeatDue() || eventSnapshotChanged()) return true;
     if (!eventLock()) return false;
-    bool ready = gJournal.nextBatch(gEventBatch, 1) && gEventBatch.count;
+    bool ready = gJournal.nextBatch(gEventBuffers->batch, 1) && gEventBuffers->batch.count;
     eventUnlock();
     return ready;
 }

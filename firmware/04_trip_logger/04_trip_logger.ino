@@ -2630,11 +2630,15 @@ void setup() {
 #if DISPLAY_DEBUG
     beginDebugDisplay();
 #endif
+    initEventUpload();
     // --- Networking task on core 0; GPS/FSM stay on core 1 (loop) ---
     if (xTaskCreatePinnedToCore(networkTask, "net", NET_STACK_BYTES,
                                nullptr, 1, nullptr, 0) != pdPASS) {
         Serial.println("ERROR: network task creation failed; trips remain queued for a later boot.");
     }
+#if DISPLAY_DEBUG
+    reportEventHeap();
+#endif
 
     Serial.println("Setup complete. Logging trips.");
 }

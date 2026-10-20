@@ -67,6 +67,8 @@ flash driver, the GPS, or the power behaviour.
 ### Diagnostics delivery
 
 `test_event_upload.cpp` exercises the production core-0 worker and netCycle:
+PSRAM-only boot allocation and reuse, missing PSRAM/allocation failure with one
+warning, continued local journaling and GPX delivery, plus debug heap reports;
 64-record/32 KiB envelopes, atomic snapshots and E5001, old-boot history,
 trip/hold/abort stops, slow connect/write/header/trickle deadlines and rollover,
 every HTTP/ack failure, independent retries, heartbeat, one-use enrollment and

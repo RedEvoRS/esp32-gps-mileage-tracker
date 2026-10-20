@@ -70,6 +70,8 @@ echo "== test_event_upload (production worker, protocol and local ingest)"
 "${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_event_upload.cpp" \
     "$here/../04_trip_logger/event_log.cpp" -o "$build/test_event_upload.exe"
 "$build/test_event_upload.exe" || status=1
+"$build/test_event_upload.exe" --no-psram || status=1
+"$build/test_event_upload.exe" --alloc-failure || status=1
 "${PYTHON:-python}" "$here/check_event_upload_protocol.py" "$build/test_event_upload.exe" || status=1
 
 # Each sketch carries its own recovery header; exercise every copy.
@@ -115,6 +117,8 @@ if [ -f "$tinygps/TinyGPS++.cpp" ]; then
         -I"$tinygps" "${incs[@]}" -I"$here/display_stubs" "$here/test_event_upload.cpp" \
         "$here/../04_trip_logger/event_log.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_event_upload_debug.exe"
     "$build/test_event_upload_debug.exe" || status=1
+    "$build/test_event_upload_debug.exe" --no-psram || status=1
+    "$build/test_event_upload_debug.exe" --alloc-failure || status=1
     "${PYTHON:-python}" "$here/check_event_upload_protocol.py" "$build/test_event_upload_debug.exe" || status=1
     echo "== test_debug_status (formatting and real GSV parser)"
     "${cxx[@]}" "${flags[@]}" -DARDUINO=100 -I"$tinygps" "${incs[@]}" \

@@ -62,8 +62,53 @@ static size_t eventCount(const std::string& body) {
     while ((pos = body.find("\"schema_version\":1", pos)) != std::string::npos) { ++count; ++pos; }
     return count;
 }
-int main(int argc, char**) {
+static size_t logLines(const char* text) {
+    return std::count_if(Serial.log.begin(), Serial.log.end(), [text](const std::string& line) {
+        return line.find(text) != std::string::npos;
+    });
+}
+static void allocationFailure(bool missing) {
+    uploadWorld();
+    g_psramAvailable = !missing; g_psramAllocationFails = !missing;
+    initEventUpload();
+    assert(!gEventBuffers && gEventAllocationAttempted && g_psramAllocations == 1);
+    assert(logLines("WARNING: diagnostics upload disabled:") == 1);
+    // A later heap recovery must not retry or produce a warning storm.
+    g_psramAvailable = true; g_psramAllocationFails = false;
+    initEventUpload(); initEventUpload();
+    assert(g_psramAllocations == 1 && !gEventBuffers);
+    records(3);
+    assert(backlog().records == 3 && !eventsDue() && !eventSnapshot());
+    unsigned scans = WiFi.scans;
+    for (unsigned i = 0; i < 10; ++i) { drainEvents(); netCycle(); }
+    assert(g_httpRequests == 0 && WiFi.scans == scans && backlog().records == 3);
+    assert(logLines("WARNING: diagnostics upload disabled:") == 1);
+    trip(); netCycle();
+    assert(!hasPending() && g_httpRequests == 1);
+    assert(g_httpUrls[0].find("/v1/device-events") == std::string::npos);
+    assert(backlog().records >= 3 && g_psramAllocations == 1);
+    // Journal service still accepts and persists new events after GPX upload.
+    records(1); assert(readBatch() && batch.ids[0].sequence == 1);
+    assert(logLines("WARNING: diagnostics upload disabled:") == 1);
+    std::puts("PSRAM failure: one allocation/warning, local journal retained, diagnostics/radio disabled, GPX uploads passed");
+}
+int main(int argc, char** argv) {
+    if (argc > 1 && (!std::strcmp(argv[1], "--no-psram") || !std::strcmp(argv[1], "--alloc-failure"))) {
+        allocationFailure(!std::strcmp(argv[1], "--no-psram")); return 0;
+    }
+    initEventUpload();
+    assert(gEventBuffers && g_psramAllocations == 1);
+    assert(g_psramAllocationBytes == sizeof(EventUploadBuffers));
+    assert(g_psramAllocationCaps == (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    initEventUpload(); assert(g_psramAllocations == 1);
+#if DISPLAY_DEBUG
+    reportEventHeap();
+    assert(logLines("Heap: internal 123456 free (largest 65536), PSRAM 8123456 free") == 1);
+#endif
     uploadWorld(); records(130); drainEvents();
+#if DISPLAY_DEBUG
+    assert(gEventHeapReported && logLines("Heap:") == 1);
+#endif
     assert(g_httpBodies.size() == 3 && eventCount(g_httpBodies[0]) == 64 &&
            eventCount(g_httpBodies[1]) == 64 && eventCount(g_httpBodies[2]) == 2);
     assert(backlog().records == 0);
@@ -80,9 +125,9 @@ int main(int argc, char**) {
     gNetFaults.event(5008, millis()).enumeration("target", "trip").integer("http_status", 503).condition(true);
     gEventFaults.event(5008, millis()).enumeration("target", "events").integer("http_status", 503).condition(true);
     assert(eventSnapshot());
-    assert(std::strstr(gEventSnapshot, "\"5001\":5"));
-    assert(std::strstr(gEventSnapshot, "\"active\":[{"));
-    assert(std::strstr(gEventSnapshot, "\"observed\":["));
+    assert(std::strstr(gEventBuffers->snapshot, "\"5001\":5"));
+    assert(std::strstr(gEventBuffers->snapshot, "\"active\":[{"));
+    assert(std::strstr(gEventBuffers->snapshot, "\"observed\":["));
     assert(eventLock()); gJournal.service(16); eventUnlock(); drainEvents();
     assert(g_httpBodies[0].find("\"code\":5008") != std::string::npos);
     std::puts("Event upload: atomic task snapshots, active/observed merge and E5001 counter passed");
@@ -93,16 +138,16 @@ int main(int argc, char**) {
     uploadWorld(); records(64);
     for (auto& slot : gLoopConditions) gLoopFaults.event(slot.code, millis()).condition(true);
     assert(eventSnapshot()); assert(eventLock());
-    assert(gJournal.nextBatch(gEventBatch)); eventUnlock();
-    for (size_t i = 0; i < gEventBatch.count; ++i) {
-        size_t size = std::strlen(gEventBatch.events[i]);
-        std::memset(gEventBatch.events[i] + size, ' ', kEventBytes - size);
-        gEventBatch.events[i][kEventBytes] = 0;
+    assert(gJournal.nextBatch(gEventBuffers->batch)); eventUnlock();
+    for (size_t i = 0; i < gEventBuffers->batch.count; ++i) {
+        size_t size = std::strlen(gEventBuffers->batch.events[i]);
+        std::memset(gEventBuffers->batch.events[i] + size, ' ', kEventBytes - size);
+        gEventBuffers->batch.events[i][kEventBytes] = 0;
     }
     assert(eventBody(64) == 0); // <=64 events alone does not guarantee 32 KiB
     size_t fit = 64; while (!eventBody(fit)) --fit;
     assert(fit < 64 && eventBody(fit) <= kRequestBytes);
-    requests.emplace_back(gEventRequest);
+    requests.emplace_back(gEventBuffers->request);
     uploadWorld(); records(20); gEventRetry.eventBytes = 1024; drainEvents();
     assert(eventCount(g_httpBodies[0]) < 20 && backlog().records == 0);
     std::puts("Event upload: full 502-byte records, envelope overflow refusal and byte-limited batching passed");
@@ -143,7 +188,7 @@ int main(int argc, char**) {
         uint32_t start = millis(); drainEvents();
         // The envelope exists even when connect times out before the stub can
         // record a wire request. Validate that complete generated body too.
-        if (slow == 0) requests.emplace_back(gEventRequest);
+        if (slow == 0) requests.emplace_back(gEventBuffers->request);
         assert(millis() - start <= kDrainMs);
         assert(backlog().records >= 66);
         assert(g_httpConnectTimeouts[0] <= kDrainMs);
@@ -191,8 +236,8 @@ int main(int argc, char**) {
     }
     uploadWorld(); records(2); g_httpResponseHook = [] {
         g_httpAutoAck = false;
-        g_httpResponse = "{\"accepted\":[{\"boot_id\":\"" + std::string(gEventBatch.ids[0].bootId) +
-            "\",\"sequence\":1},{\"boot_id\":\"" + std::string(gEventBatch.ids[0].bootId) + "\",\"sequence\":1}]}";
+        g_httpResponse = "{\"accepted\":[{\"boot_id\":\"" + std::string(gEventBuffers->batch.ids[0].bootId) +
+            "\",\"sequence\":1},{\"boot_id\":\"" + std::string(gEventBuffers->batch.ids[0].bootId) + "\",\"sequence\":1}]}";
     };
     drainEvents(); assert(eventCondition(5010).episode);
     for (int size : {-1, 8193}) {
@@ -203,7 +248,7 @@ int main(int argc, char**) {
     uploadWorld(); records(2); g_httpCode = 201;
     g_httpResponseHook = [] {
         g_httpAutoAck = false;
-        std::string boot = gEventBatch.ids[0].bootId;
+        std::string boot = gEventBuffers->batch.ids[0].bootId;
         g_httpResponse = "{ \"accepted\" : [{\"sequence\":2,\"boot_id\":\"" + boot +
             "\"},{\"sequence\":1,\"boot_id\":\"" + boot + "\"}] }";
     };
@@ -263,7 +308,13 @@ int main(int argc, char**) {
     trip(); gNetRetryMs = 0; netCycle(); assert(!hasPending());
     std::puts("Event upload: explicit revision enrollment, rollback fail-closed and GPX independence passed");
     collect();
+#if DISPLAY_DEBUG
+    assert(gEventHeapReported && logLines("Heap:") == 0); // no repeated post-attempt reports
+#endif
+    assert(g_psramAllocations == 1); // all drains/retries reused the boot allocation
     if (argc > 1) for (const auto& body : requests) std::printf("REQUEST %s\n", body.c_str());
-    std::printf("Event upload: %zu complete firmware requests; static Batch=%zu request=%zu snapshot=%zu ack=%zu bytes\n",
-        requests.size(), sizeof(gEventBatch), sizeof(gEventRequest), sizeof(gEventSnapshot), sizeof(gEventAck));
+    std::printf("Event upload: %zu complete firmware requests; PSRAM Batch=%zu request=%zu snapshot=%zu ack=%zu bytes\n",
+        requests.size(), sizeof(gEventBuffers->batch), sizeof(gEventBuffers->request), sizeof(gEventBuffers->snapshot), sizeof(gEventBuffers->ack));
+    std::printf("PSRAM observations=%zu copy=%zu workspace=%zu bytes (host ABI)\n",
+        sizeof(gEventBuffers->observations), sizeof(gEventBuffers->copy), sizeof(EventUploadBuffers));
 }

@@ -807,18 +807,47 @@ power-cycle, so the first awake network opportunity conservatively checks in;
 sleep duration is not invented from boot uptime. Normal journal upload also
 refreshes contact. The server continues to measure its own contact receipt time.
 
-The batch (~35 KiB host ABI), 32 KiB request, 6 KiB snapshot, 8 KiB reply and
-observation arrays live in static DRAM. HTTPClient's ordinary small objects and
-bounded parser/socket scratch remain on the existing **12 KiB** network stack;
-no request, snapshot or batch goes there. Compiler stack reports and both
-Supreme build sizes accompany this change; real-upload watermark measurements
-remain #6, including the previously observed **7468 free bytes with no upload**.
-No host test establishes ESP32 stack headroom, SD latency or power-cut safety.
+The batch (35,280 bytes on ESP32-S3), request (32,769), snapshot (6,144),
+reply (8,193), and two observation arrays (1,536 each) share one **85,464-byte
+PSRAM workspace**, including alignment padding. Setup allocates it once with
+`heap_caps_malloc(..., MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)`, before starting the
+network task; it is never freed or retried. There is no internal-heap fallback.
+Absent PSRAM or allocation failure prints exactly one `WARNING:` and disables
+diagnostics upload for that boot. Local journaling and GPX uploads continue.
+No existing catalog code fits this failure, so it does not fabricate an event.
+
+Small worker controls, the journal, producer builders and cross-core atomic
+publications stay in internal RAM. Only setup and the core-0 worker access the
+PSRAM workspace: the PMU ISR only latches its internal flag, DNS callbacks use
+their separate internal storage, and observation copies use atomics without a
+cache-disabled critical section. Journal flash I/O uses internal frame/metadata
+scratch; the workspace is not passed to flash drivers or ISR/DMA callbacks.
+ESP-IDF's normal flash guard suspends task execution on both cores while caches
+are disabled. No application cache-disabled path accesses this workspace.
+
+HTTPClient's small objects and bounded parser/socket scratch remain on the
+existing **12 KiB** network stack; no large upload buffer goes there. Debug
+builds print free internal heap, its largest free block and free PSRAM at boot
+and once after the first diagnostics HTTP attempt (including failure). These
+are measurement hooks for #6; actual real-upload heap/stack measurements remain
+open, including comparison with the previously observed **7468 free bytes with
+no upload**. No host test establishes ESP32 heap/stack headroom, SD latency or
+power-cut safety.
+
+Supreme/core 3.3.11 compile results with PSRAM enabled: static RAM falls from
+193,804 to **108,356 bytes** with `DISPLAY_DEBUG=1`, and from 169,836 to
+**84,388 bytes** with `DISPLAY_DEBUG=0` (85,448 bytes recovered in each build).
+Both are 2,736 bytes above the pre-upload-worker baselines of 105,620/81,652
+bytes; the remaining internal state includes the atomic publications and
+upload fault producer. These are link-time sizes, not live heap measurements.
 
 The host suite drives the actual worker/netCycle with fake WiFi/HTTP/filesystems,
 including count/body boundaries, current/old boot snapshots, trip/hold/abort and
 slow-response deadlines, exact acks, every error class, independent retries,
-heartbeat, revision loss and durable isolation. Every complete generated test
+heartbeat, revision loss and durable isolation. PSRAM stubs cover successful
+one-time allocation, missing PSRAM and allocation failure: one warning, no
+diagnostics-driven radio activity, continued journaling and successful GPX
+uploads. Every complete generated test
 request passes the real `common.diagnostics.parse_request` validator and real
 Flask ingest test-client commit plus duplicate replay, without opening sockets.
 
