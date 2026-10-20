@@ -1,5 +1,5 @@
 {
-  "catalog_version": 4,
+  "catalog_version": 5,
   "codes": [
     {
       "code": 1000,
@@ -191,11 +191,11 @@
       "symbol": "CHARGE_HOT",
       "severity": "warning",
       "oled": [
-        "Charging paused",
+        "Charge pause needed",
         "Temperature high"
       ],
-      "title": "Charging paused for high temperature",
-      "explanation": "The charge guard paused charging because its temperature estimate is too high. This is not a calibrated cell-temperature measurement.",
+      "title": "Charging pause required for high temperature",
+      "explanation": "The charge guard requires charging to pause because its temperature estimate is too high. This is not a calibrated cell-temperature measurement or confirmation that charging stopped. CHARGE_CONTROL_FAILED reports persistent failures to confirm charger commands.",
       "recovery": "Let the device cool and check its placement. Charging resumes only when the guard permits it.",
       "context": {
         "temperature_mc": {
@@ -212,11 +212,11 @@
       "symbol": "CHARGE_COLD",
       "severity": "warning",
       "oled": [
-        "Charging paused",
+        "Charge pause needed",
         "Temperature low"
       ],
-      "title": "Charging paused for low temperature",
-      "explanation": "The charge guard paused charging because its temperature estimate is too low.",
+      "title": "Charging pause required for low temperature",
+      "explanation": "The charge guard requires charging to pause because its temperature estimate is too low. This is not a calibrated cell-temperature measurement or confirmation that charging stopped. CHARGE_CONTROL_FAILED reports persistent failures to confirm charger commands.",
       "recovery": "Move the device into a suitable temperature range and wait for the guard to permit charging.",
       "context": {
         "temperature_mc": {
@@ -281,6 +281,20 @@
       },
       "notify": false,
       "journal": "per_occurrence"
+    },
+    {
+      "code": 2008,
+      "symbol": "CHARGE_CONTROL_FAILED",
+      "severity": "error",
+      "oled": [
+        "Charge control fail"
+      ],
+      "title": "Charger command could not be confirmed",
+      "explanation": "The battery charger did not confirm the requested on or off state after three attempts, 30 seconds apart. Charging may still be enabled when the temperature guard needs it paused, or may stay off when charging is permitted.",
+      "recovery": "Disconnect USB power if the device is too hot or cold. Let it reach a suitable temperature, then inspect power-management hardware and the I2C connection. The device retries every 30 seconds and clears this error only after confirming the requested charger state. Do not bypass the temperature guard.",
+      "context": {},
+      "notify": true,
+      "journal": "transitions"
     },
     {
       "code": 3001,

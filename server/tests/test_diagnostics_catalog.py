@@ -27,6 +27,7 @@ PUBLISHED_CATALOGS = {
     2: "1f7bfdb3135fc7c92d17013d3c271d8514f5ffd692e81223ad85877dd2dcd3cb",
     3: "0a1c02d50c538e8a4b65c0cfc68ea82126fade31957e2f4227f465113a4c009f",
     4: "6454b5e2c5958a8552ef5a04864cbae2ac0d02998f5fc78d514b8bfec533fb93",
+    5: "061911d5a8a96724f2ef5aa9dd9938cc7419812145eadc9bf293d089434cca5c",
 }
 
 
@@ -52,7 +53,7 @@ class CatalogTests(unittest.TestCase):
 
     def test_catalog_unique_codes_and_symbols(self):
         rows = self.catalog["codes"]
-        self.assertEqual(len(rows), 46)
+        self.assertEqual(len(rows), 47)
         self.assertEqual(len({r["code"] for r in rows}), len(rows))
         self.assertEqual(len({r["symbol"] for r in rows}), len(rows))
 
@@ -116,6 +117,17 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(row["severity"], "warning")
         self.assertFalse(row["notify"])
         self.assertEqual(row["journal"], "per_occurrence")
+
+    def test_charge_control_failure_and_pause_wording(self):
+        rows = {row["code"]: row for row in self.catalog["codes"]}
+        self.assertEqual(self.catalog["catalog_version"], 5)
+        self.assertEqual(rows[2008]["symbol"], "CHARGE_CONTROL_FAILED")
+        self.assertEqual(rows[2008]["severity"], "error")
+        self.assertTrue(rows[2008]["notify"])
+        self.assertEqual(rows[2008]["journal"], "transitions")
+        self.assertEqual(rows[2008]["context"], {})
+        for code in (2004, 2005):
+            self.assertEqual(rows[code]["oled"][0], "Charge pause needed")
 
     def test_loader_fails_on_invalid_and_duplicate_json(self):
         with tempfile.TemporaryDirectory() as tmp:

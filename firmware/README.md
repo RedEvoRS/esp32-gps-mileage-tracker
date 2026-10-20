@@ -801,6 +801,9 @@ How it behaves once flashed:
   reported by the AXP2101 power-management chip. Its temperature is an
   indirect estimate, not a measurement of the battery cell or a guarantee
   of safe charging in a hot car. Logging continues while charging is paused.
+  The guard verifies every charger on/off command with a checked register read
+  and retries unconfirmed commands every 30 s; E2008 means three attempts failed
+  to confirm the requested state, so charging may still be on or remain off.
 - **Storage full:** below 64 KB free it won't start a trip, and below
   24 KB it ends the one in progress. An upload frees the space.
 - **No display:** the firmware doesn't use a screen or a status LED. The

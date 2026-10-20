@@ -52,9 +52,10 @@ static void resetWorld() {
     Wire = TwoWire(); Wire1 = TwoWire(); g_pinModes.clear(); g_pinLevels.clear();
     gVbusLost = false; gVbusOffPending = false;
     gVbusRetry = VbusRetry::None; gVbusRetryMs = gVbusOffReadMs = 0;
+    gPmuIrqRetry = false; gPmuIrqReadMs = 0; gBatteryThresholds = -1;
     g_httpCode = 200; g_httpRequests = 0; g_httpLastBody.clear(); g_httpHook = nullptr;
     g_httpBodies.clear();
-    gChargePaused = false; gChargeApplied = false; gChargeCheckT0 = 0;
+    gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0; gChargeCheckT0 = 0;
     gNetBusy = false; gNetHold = false; gNetAbort = false;
     gNetLastAttemptMs = 0; gNetRetryMs = 0; gNetRetryNow = false; WiFi = WiFiStub();
     g_failMutexCreate = false; g_taskCreates = 0; g_restarts = 0;

@@ -160,6 +160,13 @@ records intentional evolution and catches edits without a version bump; it is
 not a substitute for reviewing that existing code meanings have not been reused.
 CI checks exact header bytes, and tests verify JSON/header version agreement.
 
+Catalog v5 adds **2008 CHARGE_CONTROL_FAILED**, an error with `notify=true`
+and `journal=transitions`. It reports three consecutive charger command/read-back
+failures, with attempts 30 seconds apart, and clears only on a confirmed intended
+state. Its context is empty. E2004/E2005 now say a temperature-driven pause is
+required, rather than claiming the charger stopped; E2008 reports persistent
+failure to confirm that command. Earlier published fingerprints are retained.
+
 ## Protocol v1 (#117 contract, #118 and #125 integration)
 
 The endpoint is `POST /v1/device-events` on ingest port 8090. It uses
@@ -628,11 +635,12 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 |---|---|---|---|
 | E1007 | Network lifetime minimum free stack **<2048 bytes** | Watermark >=2048; normally latches for the boot because a lifetime minimum never increases | `free_bytes` |
 | E2001 | PMU initialization failed or LoRa ALDO3 could not be verified off at startup | Only a normal boot after successful PMU initialization and rail verification observes healthy; retry success restarts, never clears in degraded mode | none |
-| E2002 | AXP2101 level-1 IRQ or battery percentage <= configured low warning | Valid connected battery percentage above that threshold | `battery_mv`, if in catalog range |
-| E2003 | AXP2101 level-2 IRQ (before existing shutdown), or percentage <= configured critical level | Valid connected battery percentage above critical | `battery_mv`, if in range |
-| E2004 | Existing charge guard pauses hot (die >=54 C); remains hot while paused above 47 C | Finite die sample <=47 C or another measured pause reason | `temperature_mc` = measured PMU die, if in range |
-| E2005 | Guard pauses cold (die <=9 C); remains cold while paused below 14 C | Finite die sample >=14 C or another measured pause reason | `temperature_mc` = measured PMU die, if in range |
+| E2002 | Verified AXP2101 level-1 IRQ or battery percentage <= successfully read configured low warning | Valid connected battery percentage above that threshold; failed threshold reads neither raise nor clear | `battery_mv`, if in catalog range |
+| E2003 | Verified AXP2101 level-2 IRQ (before existing shutdown), or percentage <= successfully read configured critical level | Valid connected battery percentage above critical; failed threshold reads neither raise nor clear | `battery_mv`, if in range |
+| E2004 | Guard requires a hot pause (die >=54 C); keeps requesting it above 47 C | Finite die sample <=47 C or another measured pause reason; describes required pause even if control is unconfirmed | `temperature_mc` = measured PMU die, if in range |
+| E2005 | Guard requires a cold pause (die <=9 C); keeps requesting it below 14 C | Finite die sample >=14 C or another measured pause reason; describes required pause even if control is unconfirmed | `temperature_mc` = measured PMU die, if in range |
 | E2006 | Non-finite charge-temperature sample | Finite sample; hot/cold conditions are not cleared by an unreadable sample | none |
+| E2008 | Three consecutive charger command/read-back failures, 30 s apart | Checked 0x18 bit 1 read matches the intended charger state | none |
 | E3001 | No checksum-valid NMEA for 10 s, starting at GPS configuration start | Next checksum-valid NMEA; noise/UBX/bad checksum do not recover it | `elapsed_ms` |
 | E3002 | No trusted fix (one meeting the NAV-PVT start accuracy limits, or any valid fix in RMC-only fallback) for 120 s while idle | Trusted fix; acquisition grace starts again after leaving a trip | `elapsed_ms`, `satellites` when measured |
 | E3003 | Matching checksum-checked VALSET NAK | One notice per rejected attempt, no active condition | `message_class=6`, `message_id=138` |
@@ -667,8 +675,27 @@ raw level-1 nibble, so the configured warning percentage is that value plus five
 level 2 returns the configured percentage directly. Connected-battery sampling
 runs every 30 s, with immediate IRQ observations. The catalog's voltage wording
 is generic; `battery_mv` is a measurement, not the threshold used by this PMU.
+Both thresholds come from one checked LOW_BAT_WARN_SET read. Stage 4 never writes
+them, so the first successful value is cached for the boot; earlier failures are
+unmeasured and retried at the sampling cadence.
+
+IRQ batches require all three INTSTS1..3 raw reads to succeed. Any failed byte
+makes the entire batch unknown: no flag action (including power-off, battery
+alerts, VBUS handling or a short-press card) and no status clear. The pending
+retry survives without another falling edge and runs at most every 100 ms,
+including if more edges arrive while reads fail. Successful batches use the
+XPowersLib bit positions and the same enabled mask as IRQ setup, then clear as
+before. A future short-press display hook must use this verified batch too.
+
 The charge guard uses its existing die proxy and hysteresis; diagnostic context
-never presents that die reading as a measured cell temperature.
+never presents that die reading as a measured cell temperature. Each enable/disable
+command in the normal temperature guard is followed by a checked CHARGE_GAUGE_WDT_CTRL (0x18)
+bit-1 read. State is confirmed paused, confirmed charging or unconfirmed. A
+mismatch or read failure leaves it unconfirmed, retains pause-request hysteresis
+and retries at the 30 s temperature cadence. Only a matching read-back logs a
+confirmed pause/resume. E2008 stays active until confirmation; the first two
+unconfirmed attempts cannot manufacture recovery. The degraded PMU-untrusted
+mode retains its separate one-time best-effort disable/read-back policy.
 
 E3009 checks for a loose or damaged active-antenna cable. On one Supreme/MAX-M10S
 and one antenna (2026-10-19), unplugging raised AGC to about 79% after a minute
