@@ -443,7 +443,9 @@ The rest of this section was written for the V1.2. On the Supreme
   sync, never GPX times. The `RTC:` boot line reports whether its clock is
   usable and, when known, how long ago it was set. `invalid (stopped/VL)` is
   normal after the battery was removed; trusted GPS/SNTP time repairs it with
-  one verified setting per boot. Retention across PMU power-off needs bench testing.
+  one verified setting per boot. It keeps counting while the board is
+  switched off (checked on the bench, 2026-10-20) and runs about 10 s/day
+  slow, so a reset corrects it only when it's off by 2 s or more.
 - **Build** with the [Supreme board settings](#board-settings), not the
   V1.2 ones in [step 4](#4-configure-board-settings). Stage 4's
   `partitions.csv` still applies.
