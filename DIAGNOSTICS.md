@@ -54,7 +54,8 @@ numeric measurements and fixed enumerated values in context.
   trip-storage startup failures, with local journaling and restart on recovery.
 - **#127:** SH1106 hardware adapter on the Supreme, following #123 and the port.
 - **#128:** implemented diagnostics-only PCF8563 boot timestamps, bounded
-  GPS/SNTP RTC setting and clock-confidence/runtime tests; retention needs bench testing.
+  GPS/SNTP RTC setting and clock-confidence/runtime tests; the RTC keeps time
+  across PMU power-off (bench, 2026-10-20).
 - **#129:** consistent diagnostics database and monitor-state backups/restores.
 - **#130:** induced-fault, power-cut, backlog and display shakedown on hardware.
 - **#134:** Prometheus `/metrics` for the owner's external Grafana (not bundled).
@@ -997,7 +998,11 @@ have at most three total attempts spaced by at least a minute. The successful
 write epoch is saved once in `diag/rtc_set` NVS for next boot's age. Both cores
 can publish trusted clock syncs, but only core 1 touches Wire1 or RTC NVS.
 Coordinate-free serial lines report boot validity/last-set age and verified
-settings. Retention across `PMU.shutdown()` remains unverified on hardware.
+settings. On the bench (2026-10-20) the RTC kept counting through
+`PMU.shutdown()`: it still held the factory firmware's setting, valid and 24 s
+off, after several power-offs since 2026-10-18. Once set from GPS it drifted
+2 s in 4.9 h (about 10 s/day). The PCF8563 has no offset register, so the
+once-per-boot correction is the only adjustment.
 Never rewrite older journal records' timestamps after synchronizing;
 uptime and receipt time preserve their original meaning. #130 validates these
 behaviors plus degraded storage, reset reporting, motion suppression, deep
