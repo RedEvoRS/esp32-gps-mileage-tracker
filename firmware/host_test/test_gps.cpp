@@ -138,6 +138,8 @@ static void resetWorld() {
     gState = IDLE; gResumeFixes = 0; gTripPath[0] = 0; gTripWriteFailed = false;
     gPendCount = gPendHead = 0; armBufReset(); gHaveLastFix = false;
     gClockSet = false; gVbusLost = false;
+    gDiagnosticClock.~DiagnosticClock(); new (&gDiagnosticClock) diagnostics::DiagnosticClock;
+    gRtc = diagnostics::RtcRuntime();
     gGpsClockSet = false; gLastGpsSyncMs = 0;
     g_sntpStatus = SNTP_SYNC_STATUS_RESET;
     g_sntpCompleteAfterPolls = -1; g_sntpStopCalls = g_sntpPolls = 0;

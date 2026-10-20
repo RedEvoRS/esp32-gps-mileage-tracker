@@ -427,12 +427,19 @@ inline int xTaskCreatePinnedToCore(void (*)(void*), const char*, int, void*, int
 }
 inline unsigned g_stackHighWaterBytes = 4096;
 inline unsigned uxTaskGetStackHighWaterMark(void*) { return g_stackHighWaterBytes; }
+inline int g_currentCore = 1;
+inline int xPortGetCoreID() { return g_currentCore; }
 inline void (*g_taskDelayHook)(uint32_t ms) = nullptr;
 inline void vTaskDelay(uint32_t ms) { g_millis += ms; if (g_taskDelayHook) g_taskDelayHook(ms); }
 #define pdMS_TO_TICKS(x) (x)
 
 // ---- hardware odds and ends (compile-only) ----------------------------------
 struct TwoWire {
+    uint8_t address = 0, cursor = 0;
+    std::vector<uint8_t> tx, rx;
+    size_t rxAt = 0;
+    inline static std::function<uint8_t(TwoWire&, bool)> transaction;
+    inline static std::function<size_t(TwoWire&, size_t)> request;
     int sda = -1, scl = -1, begins = 0, ends = 0, failBegins = 0;
     bool started = false, failEnd = false;
     uint16_t timeout = 0;
@@ -450,9 +457,14 @@ struct TwoWire {
         started = false; return true;
     }
     void setTimeOut(uint16_t ms) { timeout = ms; }
-    void beginTransmission(uint8_t) {}
-    size_t write(const uint8_t*, size_t n) { return n; }
-    uint8_t endTransmission() { return 0; }
+    void beginTransmission(uint8_t addr) { address = addr; tx.clear(); }
+    size_t write(uint8_t value) { tx.push_back(value); return 1; }
+    size_t write(const uint8_t* bytes, size_t n) { tx.insert(tx.end(), bytes, bytes + n); return n; }
+    uint8_t endTransmission(bool stop = true) { return transaction ? transaction(*this, stop) : 0; }
+    size_t requestFrom(uint8_t addr, size_t n) {
+        address = addr; rx.clear(); rxAt = 0; return request ? request(*this, n) : 0;
+    }
+    int read() { return rxAt < rx.size() ? rx[rxAt++] : -1; }
 };
 extern TwoWire Wire, Wire1;
 #define AXP2101_SLAVE_ADDRESS 0x34

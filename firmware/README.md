@@ -427,6 +427,11 @@ logging to LittleFS, and WiFi upload to your home server.
 The rest of this section was written for the V1.2. On the Supreme
 (bench-tested 2026-10-18), these things differ:
 
+- **RTC:** the PCF8563 supplies diagnostic event timestamps before GPS/SNTP
+  sync, never GPX times. The `RTC:` boot line reports whether its clock is
+  usable and, when known, how long ago it was set. `invalid (stopped/VL)` is
+  normal after the battery was removed; trusted GPS/SNTP time repairs it with
+  one verified setting per boot. Retention across PMU power-off needs bench testing.
 - **Build** with the [Supreme board settings](#board-settings), not the
   V1.2 ones in [step 4](#4-configure-board-settings). Stage 4's
   `partitions.csv` still applies.

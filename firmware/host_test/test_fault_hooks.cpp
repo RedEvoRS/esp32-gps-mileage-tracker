@@ -262,6 +262,7 @@ static void gpsFixGapRegressions() {
     if (!exportJson) std::printf("GPS diagnostic regression passed: RMC-only fallback retains E3002 timing and recovery.\n");
 }
 
+#ifndef FAULT_HOOKS_HELPERS_ONLY
 int main(int argc, char**) {
     exportJson = argc > 1;
     gpsAntennaRegressions();
@@ -453,3 +454,4 @@ int main(int argc, char**) {
     if (exportJson) for (const auto& row : exported) std::printf("EVENT %s\n", row.c_str());
     std::printf("Runtime hook transitions, fields, counter, overflow and happy drive passed (DISPLAY_DEBUG=%d).\n", DISPLAY_DEBUG);
 }
+#endif

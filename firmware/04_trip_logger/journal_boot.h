@@ -47,6 +47,7 @@ inline const char* journalResetReason(esp_reset_reason_t reason) {
 inline void submitJournalBoot(EventLog& log, esp_reset_reason_t reason,
                               const PmuStartupResult& pmu, uint64_t uptime) {
     EventInput event; event.uptimeMs = uptime;
+    log.stamp(event);
     event.code = static_cast<uint16_t>(Code::BOOT);
     event.contextCount = 1;
     const char* reset = journalResetReason(reason);
@@ -55,6 +56,7 @@ inline void submitJournalBoot(EventLog& log, esp_reset_reason_t reason,
     // All boots retain E1000's reason. Error reset notices also carry their
     // existing severity-specific history code, with no active episode.
     event = EventInput(); event.uptimeMs = uptime;
+    log.stamp(event);
     if (!std::strcmp(reset, "watchdog")) event.code = static_cast<uint16_t>(Code::WATCHDOG_RESET);
     else if (reason == ESP_RST_BROWNOUT) event.code = static_cast<uint16_t>(Code::BROWNOUT_RESET);
     else if (reason == ESP_RST_PANIC) event.code = static_cast<uint16_t>(Code::PANIC_RESET);
@@ -63,6 +65,7 @@ inline void submitJournalBoot(EventLog& log, esp_reset_reason_t reason,
     PmuStartupEvent startup;
     if (!makePmuStartupEvent(pmu, startup)) return;
     event = EventInput(); event.code = static_cast<uint16_t>(startup.code); event.uptimeMs = uptime;
+    log.stamp(event);
     event.contextCount = 5;
     event.context[0] = EventContext::integer("clock_count", startup.clockCount);
     event.context[1] = EventContext::integer("attempt_count", startup.attemptCount);
