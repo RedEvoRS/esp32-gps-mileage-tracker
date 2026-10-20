@@ -59,6 +59,7 @@
 #include <esp_partition.h>
 #include <atomic>
 #include <new>
+#include <cmath>
 
 #include "secrets.h"
 #include "pmu_startup_event.h"
@@ -66,6 +67,7 @@
 #include "journal_boot.h"
 #include "journal_sd_geometry.h"
 #include "journal_platform.h"
+#include "runtime_faults.h"
 
 #ifndef DISPLAY_DEBUG
 #define DISPLAY_DEBUG 1
@@ -144,7 +146,8 @@ static constexpr uint32_t NET_RETRY_MAX_MS = 5UL * 60 * 1000;
 // Restore the brief's conservative allocation until measured on hardware.
 // ESP-IDF task stack sizes and high-water marks are in bytes, not words.
 static constexpr uint32_t NET_STACK_BYTES = 12288;
-static constexpr uint32_t NET_STACK_WARN_BYTES = 1024;
+// #6: 2 KiB leaves warning room before HTTP/journal calls exhaust the stack.
+static constexpr uint32_t NET_STACK_WARN_BYTES = 2048;
 
 // Storage layout.
 static const char* TRIP_DIR = "/trips";
@@ -289,6 +292,26 @@ static diagnostics::JournalBoot gJournalBoot;
 static bool gJournalReady = false; // set once on core 1 before task creation
 static bool gJournalStarted = false; // under FS_LOCK; core-0 consumer only
 static bool gJournalBootReported = false;
+// Single writer per array/builder. Only EventLog's try-lock crosses cores.
+static diagnostics::RuntimeFaults::Condition gLoopConditions[] = {
+    {2002}, {2003}, {2004}, {2005}, {2006}, {3001}, {3002}, {3005}, {3006},
+    {4001}, {4004}, {4005}, {4006}, {6001}
+};
+static diagnostics::RuntimeFaults::Condition gNetConditions[] = {
+    {1007}, {5002}, {5003}, {5004}, {5005}, {5006}, {5007}, {5008}, {5009}
+};
+static diagnostics::RuntimeFaults gLoopFaults(gJournal, gLoopConditions, sizeof(gLoopConditions) / sizeof(gLoopConditions[0]));
+static diagnostics::RuntimeFaults gNetFaults(gJournal, gNetConditions, sizeof(gNetConditions) / sizeof(gNetConditions[0]));
+static uint32_t gGpsDiagStartMs = 0, gLastNmeaMs = 0, gIdleFixWaitMs = 0;
+static uint32_t gStorageDiagMs = 0, gBatteryDiagMs = 0;
+static bool gBatteryDiagChecked = false;
+static uint8_t gJoinFailures = 0, gTransportFailures = 0;
+
+struct TripRecovery {
+    const char* reason = "read";
+    bool repaired = false, pointsKnown = false;
+    uint32_t points = 0;
+};
 
 // A single GPS fix, with monotonic receipt time and its own RMC UTC epoch.
 struct Fix {
@@ -357,6 +380,28 @@ static size_t    gTripBytes = 0;        // committed prologue + trackpoint bytes
 // comfortable headroom. Ring: oldest overwritten on overflow.
 static Fix    gArmBuf[16];
 static size_t gArmHead = 0, gArmCount = 0;
+
+static const char* tripBackend(fs::FS& storage) { return &storage == &SD ? "sd" : "littlefs"; }
+
+static void tripWriteResult(fs::FS& storage, bool ok, const char* operation) {
+    if (gJournalReady) gLoopFaults.event(4006, millis()).enumeration("backend", tripBackend(storage))
+        .enumeration("operation", operation).condition(!ok);
+}
+
+static void batteryCondition(uint16_t code, bool active, uint32_t now) {
+    gLoopFaults.event(code, now);
+    unsigned mv = PMU.getBattVoltage();
+    if (mv <= 6000) gLoopFaults.integer("battery_mv", mv);
+    gLoopFaults.condition(active);
+}
+
+static void storageConditions(uint64_t freeB, uint32_t now) {
+    if (!gJournalReady) return;
+    gLoopFaults.event(4004, now).enumeration("backend", tripBackend(*gTripFS))
+        .integer("free_bytes", freeB).condition(freeB < FS_START_FREE);
+    gLoopFaults.event(4005, now).enumeration("backend", tripBackend(*gTripFS))
+        .integer("free_bytes", freeB).condition(freeB < FS_STOP_FREE);
+}
 
 static bool journalMayRun() {
     return gFsDemand.load() == 0 && (gJournalSealing || !gNetHold.load());
@@ -687,6 +732,7 @@ static uint64_t fsFreeBytes() {
 // driving) when there isn't, since otherwise the miles vanish silently.
 static bool roomForNewTrip(uint32_t now) {
     uint64_t freeB = fsFreeBytes();
+    storageConditions(freeB, now);
     if (freeB >= FS_START_FREE) return true;
     if (!gFullWarned || now - gFullWarnT0 >= 60000) {
         Serial.printf("ERROR: trip storage full (%llu bytes free) -- NOT recording. "
@@ -703,6 +749,7 @@ static bool tripStorageLow(uint32_t now) {
     if (now - gFsCheckT0 < FS_CHECK_MS) return false;
     gFsCheckT0 = now;
     uint64_t freeB = fsFreeBytes();
+    storageConditions(freeB, now);
     if (freeB >= FS_STOP_FREE) return false;
     Serial.printf("ERROR: trip storage nearly full (%llu bytes free) -- ending trip.\n",
                   (unsigned long long)freeB);
@@ -726,6 +773,7 @@ static bool beginTrip(const Fix& fx) {
     makeTripPath(gTripPath, sizeof(gTripPath));
     bool ok = false;
     File f = storage.open(gTripPath, FILE_WRITE);
+    const char* operation = f ? "write" : "open";
     if (f) {
         FileWriter w(f);
         w.put(GPX_PROLOGUE);
@@ -756,6 +804,7 @@ static bool beginTrip(const Fix& fx) {
     }
     FS_UNLOCK();
 
+    tripWriteResult(storage, ok, operation);
     if (!ok) {
         gPendCount = gPendHead = 0;
         armBufReset();
@@ -795,6 +844,7 @@ static bool writeOrBufferTrkpt(const Fix& fx) {
     FS_LOCK();
     bool ok = false;
     File f = storage.open(gTripPath, FILE_APPEND);
+    const char* operation = f ? "write" : "open";
     // FILE_APPEND creates a missing file. A real trip file always holds at
     // least the prologue, so an empty one means ours is gone -- never write
     // points into a file with no <gpx> header.
@@ -812,6 +862,7 @@ static bool writeOrBufferTrkpt(const Fix& fx) {
     if (f) f.close();   // close() as well as the commit's fsync
     FS_UNLOCK();
 
+    tripWriteResult(storage, ok, operation);
     if (ok && !fx.hasUtc) {
         gPendHead = (gPendHead + 1) % PENDING_CAPACITY;
         gPendCount--;
@@ -862,13 +913,17 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
                 ok = w.commit();
             }
             if (f) f.close();
+            tripWriteResult(storage, ok, "close");
         }
         // A failed write may have left a partial line at the tail. Don't
         // append after it: trim back to the last complete point and close
         // the document there. If even that fails (e.g. no room for the
         // repair copy) the file stays incomplete -- never uploaded -- and
         // the boot-time fsck retries it.
-        if (!ok) ok = repairIfNeeded(storage, gTripPath);
+        if (!ok) {
+            ok = repairIfNeeded(storage, gTripPath);
+            tripWriteResult(storage, ok, "close");
+        }
 
         if (ok) {
             Serial.printf("Trip finalized: %s (%.2f mi)\n",
@@ -990,7 +1045,8 @@ static void tripFsmOnFix(const Fix& fx) {
 // Boot-time fsck: repair any trip file left unclosed by a power cut,
 // then leave it in place for the network task to upload.
 // =================================================================
-static long findLastTrkptEnd(File& f) {
+static long findLastTrkptEnd(File& f, uint32_t* points = nullptr) {
+    if (points) *points = 0;
     const char* tok = "</trkpt>";
     const int   tl  = 8;
     uint8_t buf[256];
@@ -1013,6 +1069,7 @@ static long findLastTrkptEnd(File& f) {
         for (int i = 0; i + tl <= rl; ++i) {
             if (memcmp(region + i, tok, tl) == 0) {
                 last = pos - carryLen + i + tl;
+                if (points && *points < INT32_MAX) ++*points;
             }
         }
         carryLen = min(tl - 1, rl);
@@ -1023,23 +1080,27 @@ static long findLastTrkptEnd(File& f) {
 }
 
 // Compare only verified bytes; a short read must never authorize cleanup.
-static bool sameFilePrefix(File& a, File& b, size_t bytes) {
-    if (!a.seek(0) || !b.seek(0)) return false;
+static bool sameFilePrefix(File& a, File& b, size_t bytes, bool* readFailed = nullptr) {
+    if (!a.seek(0) || !b.seek(0)) { if (readFailed) *readFailed = true; return false; }
     uint8_t ab[128], bb[128];
     while (bytes) {
         size_t n = min(bytes, sizeof(ab));
-        if (a.read(ab, n) != (int)n || b.read(bb, n) != (int)n ||
-            memcmp(ab, bb, n) != 0) return false;
+        if (a.read(ab, n) != (int)n || b.read(bb, n) != (int)n) {
+            if (readFailed) *readFailed = true;
+            return false;
+        }
+        if (memcmp(ab, bb, n) != 0) return false;
         bytes -= n;
     }
     return true;
 }
 
-static bool fileMatchesText(File& f, const char* text, size_t bytes) {
+static bool fileMatchesText(File& f, const char* text, size_t bytes, bool* readFailed = nullptr) {
     uint8_t buf[128];
     while (bytes) {
         size_t n = min(bytes, sizeof(buf));
-        if (f.read(buf, n) != (int)n || memcmp(buf, text, n) != 0) return false;
+        if (f.read(buf, n) != (int)n) { if (readFailed) *readFailed = true; return false; }
+        if (memcmp(buf, text, n) != 0) return false;
         text += n;
         bytes -= n;
     }
@@ -1059,11 +1120,12 @@ static bool publishRepair(fs::FS& storage, const char* tmp, const char* path) {
 // Deal with previous repair attempts before FILE_WRITE can truncate them.
 // Called under the same FS lock as repairIfNeeded. Ambiguous copies are
 // retained for inspection; only proven redundant bytes may be discarded.
-static bool recoverRepairCopy(fs::FS& storage, const char* path) {
+static bool recoverRepairCopy(fs::FS& storage, const char* path, TripRecovery& result) {
     String tmp = String(path) + ".fix";
     if (!storage.exists(tmp.c_str())) return true;
     if (storage.exists((String(path) + ".bad").c_str())) {
         Serial.printf("fsck: retained %s (quarantine collision)\n", tmp.c_str());
+        result.reason = "parse";
         return false;
     }
     File copy = storage.open(tmp.c_str(), FILE_READ);
@@ -1073,28 +1135,36 @@ static bool recoverRepairCopy(fs::FS& storage, const char* path) {
         // only copy. Rename without copying, then use normal repair below.
         // An incomplete/unknown header or no complete point is not safe to
         // feed to the normal garbage-removal path, so preserve those bytes.
-        bool recoverable = fileMatchesText(copy, GPX_PROLOGUE, strlen(GPX_PROLOGUE)) &&
-                           findLastTrkptEnd(copy) > (long)strlen(GPX_PROLOGUE);
+        bool readFailed = false;
+        bool header = copy.size() >= strlen(GPX_PROLOGUE) &&
+                      fileMatchesText(copy, GPX_PROLOGUE, strlen(GPX_PROLOGUE), &readFailed);
+        long end = header ? findLastTrkptEnd(copy, &result.points) : -1;
+        bool recoverable = header && end > (long)strlen(GPX_PROLOGUE);
         copy.close();
         if (recoverable && storage.rename(tmp.c_str(), path)) {
             Serial.printf("fsck: recovered orphan %s\n", path);
+            result.repaired = result.pointsKnown = true;
             return true;
         }
         Serial.printf("fsck: retained orphan %s\n", tmp.c_str());
+        result.reason = recoverable ? "rename" : readFailed || end == -2 ? "read" : "parse";
         return false;
     }
 
     File original = storage.open(path, FILE_READ);
     if (!original) { copy.close(); return false; }
     const size_t copySize = copy.size();
-    bool redundant = copySize <= original.size() && sameFilePrefix(original, copy, copySize);
+    bool readFailed = false;
+    bool redundant = copySize <= original.size() && sameFilePrefix(original, copy, copySize, &readFailed);
     bool finishedRepair = false;
     if (!redundant) {
-        long end = findLastTrkptEnd(original);
+        long end = findLastTrkptEnd(original, &result.points);
+        if (end == -2) readFailed = true;
+        else result.pointsKnown = true;
         size_t suffixSize = 1 + strlen(GPX_EPILOGUE);
         if (end > 0 && copySize > (size_t)end && copySize <= (size_t)end + suffixSize &&
-            sameFilePrefix(original, copy, end) && copy.read() == '\n' &&
-            fileMatchesText(copy, GPX_EPILOGUE, copySize - end - 1)) {
+            sameFilePrefix(original, copy, end, &readFailed) && copy.read() == '\n' &&
+            fileMatchesText(copy, GPX_EPILOGUE, copySize - end - 1, &readFailed)) {
             redundant = true;
             finishedRepair = copySize == (size_t)end + suffixSize;
         }
@@ -1103,17 +1173,22 @@ static bool recoverRepairCopy(fs::FS& storage, const char* path) {
     copy.close();
     if (!redundant) {
         Serial.printf("fsck: retained %s (differs from original)\n", tmp.c_str());
+        result.reason = readFailed ? "read" : "parse";
         return false;
     }
     // A complete verified repair can be published even with no free space.
     // Failed publication retains at least the verified copy for a later boot.
-    return finishedRepair ? publishRepair(storage, tmp.c_str(), path) : storage.remove(tmp.c_str());
+    result.reason = finishedRepair ? "rename" : "write";
+    bool ok = finishedRepair ? publishRepair(storage, tmp.c_str(), path) : storage.remove(tmp.c_str());
+    if (ok && finishedRepair) result.repaired = true;
+    return ok;
 }
 
 // Returns true if the file is complete afterwards (or was removed as empty),
 // false if it had to be left as it was.
-static bool repairIfNeeded(fs::FS& storage, const char* path) {
-    if (!recoverRepairCopy(storage, path)) return false;
+static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result) {
+    if (!recoverRepairCopy(storage, path, result)) return false;
+    result.reason = "read";
     File f = storage.open(path, FILE_READ);
     if (!f) return false;
     size_t sz = f.size();
@@ -1125,23 +1200,25 @@ static bool repairIfNeeded(fs::FS& storage, const char* path) {
         f.seek(sz - back);
         char tail[17];
         int n = f.read((uint8_t*)tail, back);
+        if (n != (int)back) { f.close(); return false; }
         tail[n] = 0;
         if (strstr(tail, "</gpx>")) complete = true;
     }
     if (complete) { f.close(); return true; }
 
-    long end = findLastTrkptEnd(f);
+    long end = findLastTrkptEnd(f, &result.points);
     if (end == -2) { f.close(); return false; }
     if (end <= 0) {
         f.close();
-        storage.remove(path);
+        result.reason = "write";
+        if (!storage.remove(path)) return false;
         Serial.printf("fsck: removed empty/garbage %s\n", path);
         return true;
     }
 
     String tmp = String(path) + ".fix";
     File out = storage.open(tmp.c_str(), FILE_WRITE);
-    if (!out) { f.close(); return false; }
+    if (!out) { f.close(); result.reason = "write"; return false; }
     FileWriter w(out);
     f.seek(0);
     long remaining = end;
@@ -1161,6 +1238,7 @@ static bool repairIfNeeded(fs::FS& storage, const char* path) {
     out.close();
     f.close();
     if (!ok) {
+        result.reason = remaining ? "read" : "write";
         storage.remove(tmp.c_str());
         Serial.printf("fsck: could not repair %s (write failed)\n", path);
         return false;
@@ -1168,11 +1246,25 @@ static bool repairIfNeeded(fs::FS& storage, const char* path) {
     // Publish only after both handles are closed and the repair is verified.
     // A surviving .fix is discovered on the next boot, including on FAT.
     if (!publishRepair(storage, tmp.c_str(), path)) {
+        result.reason = "rename";
         Serial.printf("fsck: could not replace %s (rename failed)\n", path);
         return false;
     }
     Serial.printf("fsck: repaired %s\n", path);
+    result.repaired = result.pointsKnown = true;
     return true;
+}
+
+static bool repairIfNeeded(fs::FS& storage, const char* path) {
+    TripRecovery result;
+    bool ok = repairTrip(storage, path, result);
+    if (gJournalReady && (!ok || result.repaired)) {
+        gLoopFaults.event(ok ? 4010 : 4007, millis()).enumeration("backend", tripBackend(storage));
+        if (!ok) gLoopFaults.enumeration("reason", result.reason);
+        else if (result.pointsKnown) gLoopFaults.integer("points", result.points);
+        gLoopFaults.notice();
+    }
+    return ok;
 }
 
 static String tripEntryPath(const File& entry) {
@@ -1186,6 +1278,13 @@ static void fsckAllTrips(fs::FS& storage) {
     FS_LOCK();
     std::vector<String> paths;
     File dir = storage.open(TRIP_DIR);
+    if (!dir || !dir.isDirectory()) {
+        if (gJournalReady) gLoopFaults.event(4007, millis()).enumeration("backend", tripBackend(storage))
+            .enumeration("reason", "read").notice();
+        if (dir) dir.close();
+        FS_UNLOCK();
+        return;
+    }
     if (dir && dir.isDirectory()) {
         File e = dir.openNextFile();
         while (e) {
@@ -1220,6 +1319,7 @@ static void setupPmuIrq() {
     PMU.enableIRQ(XPOWERS_AXP2101_VBUS_REMOVE_IRQ |
                   XPOWERS_AXP2101_VBUS_INSERT_IRQ |
                   XPOWERS_AXP2101_PKEY_LONG_IRQ   |
+                  XPOWERS_AXP2101_WARNING_LEVEL1_IRQ |
                   XPOWERS_AXP2101_WARNING_LEVEL2_IRQ);
 }
 
@@ -1355,9 +1455,32 @@ static void pollPmu() {
         }
     }
     if (PMU.isPekeyLongPressIrq())    powerOffForVbus();
+    // Observe hardware's existing low/critical policy before shutdown. Never
+    // submit from the ISR (it only latches gPmuIrqFlag).
+    if (gJournalReady) {
+        if (PMU.isDropWarningLevel1Irq())
+            batteryCondition(2002, true, millis());
+        if (PMU.isDropWarningLevel2Irq())
+            batteryCondition(2003, true, millis());
+    }
     if (PMU.isDropWarningLevel2Irq()) powerOffForVbus();
 
     PMU.clearIrqStatus();   // write-1-to-clear, or the line never re-fires
+}
+
+static void serviceBatteryDiagnostics() {
+    uint32_t now = millis();
+    if (!gJournalReady || (gBatteryDiagChecked && uint32_t(now - gBatteryDiagMs) < 30000)) return;
+    gBatteryDiagChecked = true; gBatteryDiagMs = now;
+    if (!PMU.isBatteryConnect()) return; // unavailable measurement is not recovery
+    int percent = PMU.getBatteryPercent();
+    if (percent < 0 || percent > 100) return;
+    // The existing shutdown is AXP2101's SOC level-2 IRQ, not a firmware
+    // voltage cutoff. XPowersLib 0.3.3 returns the raw level-1 nibble: +5%.
+    unsigned low = PMU.getLowBatWarnThreshold() + 5;
+    unsigned critical = PMU.getLowBatShutdownThreshold();
+    batteryCondition(2002, unsigned(percent) <= low, now);
+    batteryCondition(2003, unsigned(percent) <= critical, now);
 }
 
 // -----------------------------------------------------------------
@@ -1400,6 +1523,21 @@ static void serviceChargeTemp() {
         why = die >= CHG_HOT_PAUSE_C ? "too hot" : "too cold";
     }
 
+    if (gJournalReady) {
+        // Follow the guard's hysteresis, including a changed pause reason while
+        // the charger stays off. Context is measured die temperature, not an
+        // invented cell measurement. Unreadable samples carry no temperature.
+        bool unreadable = !std::isfinite(die);
+        if (!unreadable) {
+            for (uint16_t code : {2004, 2005}) {
+                gLoopFaults.event(code, now);
+                if (die >= -50 && die <= 150) gLoopFaults.integer("temperature_mc", int(die * 1000));
+                gLoopFaults.condition(pause && (code == 2004 ? die > CHG_HOT_RESUME_C : die < CHG_COLD_RESUME_C));
+            }
+        }
+        gLoopFaults.event(2006, now).condition(unreadable);
+    }
+
     // The first check sets the charger explicitly either way: the PMU keeps
     // its state across ESP32 resets, so a pause from before a reset must
     // not stick.
@@ -1435,13 +1573,19 @@ static void confirmVbusOff() {
 // =================================================================
 // Networking task (core 0): upload finished trips when parked at home
 // =================================================================
+static void observeNetworkStack(unsigned remaining) {
+    if (gJournalReady) gNetFaults.event(1007, millis()).integer("free_bytes", min(remaining, 1048576u))
+        .condition(remaining < NET_STACK_WARN_BYTES);
+}
+
 static void reportNetworkStack(const char* phase) {
     // The watermark remembers the deepest call, including HTTP internals
     // that have already returned. Call only from the network task itself.
     unsigned remaining = (unsigned)uxTaskGetStackHighWaterMark(nullptr);
+    observeNetworkStack(remaining);
     Serial.printf("Net stack (%s): minimum free %u / %u bytes%s\n",
                   phase, remaining, (unsigned)NET_STACK_BYTES,
-                  remaining <= NET_STACK_WARN_BYTES ? " -- WARNING: low headroom" : "");
+                  remaining < NET_STACK_WARN_BYTES ? " -- WARNING: low headroom" : "");
 }
 
 static bool homeApInRange() {
@@ -1458,6 +1602,8 @@ static bool homeApInRange() {
     // Also release an empty/failed scan, and never keep pointers into its
     // results (including BSSID) after this call.
     WiFi.scanDelete();
+    // A failed/aborted scan has not observed absence. No per-scan events.
+    if (gJournalReady && !found && n >= 0 && !gNetAbort.load()) gNetFaults.homeApAbsent();
     return found;
 }
 
@@ -1473,7 +1619,31 @@ static bool connectWifi() {
     while (WiFi.status() != WL_CONNECTED && !gNetAbort.load() && millis() - t0 < 15000) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    return WiFi.status() == WL_CONNECTED;
+    bool joined = WiFi.status() == WL_CONNECTED;
+    if (gJournalReady && !gNetAbort.load()) {
+        gJoinFailures = joined ? 0 : min(unsigned(gJoinFailures) + 1, 255u);
+        gNetFaults.event(5002, millis()).integer("attempts", gJoinFailures).condition(!joined);
+    }
+    return joined;
+}
+
+static void uploadDiagnostics(int status) {
+    if (!gJournalReady || gNetAbort.load()) return; // planned shutdown is not a transport fault
+    uint16_t code = status <= 0 ? 5003 : status == 401 ? 5004 : status == 413 ? 5005 :
+                    status == 400 ? 5006 : status == 409 ? 5007 :
+                    status >= 500 && status <= 599 ? 5008 : 5009;
+    if (status <= 0) gTransportFailures = min(unsigned(gTransportFailures) + 1, 255u);
+    if (status == 200) gTransportFailures = 0;
+    for (uint16_t c = 5003; c <= 5009; ++c) {
+        // A different error class is not evidence of recovery. Keep each
+        // episode until an actual HTTP 200, with context from that observation.
+        if (status != 200 && c != code) continue;
+        gNetFaults.event(c, millis()).enumeration("target", "trip");
+        if (c == 5003) gNetFaults.integer("attempts", gTransportFailures);
+        else if (status >= 100 && status <= 599) gNetFaults.integer("http_status", status);
+        // A non-HTTP positive library result has no valid status measurement.
+        gNetFaults.condition(status != 200);
+    }
 }
 
 // Opportunistic SNTP while already connected. A plausible RTC date is not
@@ -1587,6 +1757,7 @@ static bool uploadFile(fs::FS& storage, const char* path) {
     uint32_t t0 = millis();
     int code = http.sendRequest("POST", &body, sz);
     http.end();
+    uploadDiagnostics(code);
     float secs = (millis() - t0) / 1000.0f;
     reportNetworkStack("after HTTP upload");
 
@@ -1820,6 +1991,9 @@ static void networkTask(void*) {
     reportNetworkStack("task start");
     for (;;) {
         serviceJournal(); // one record, zero-wait lock, releases before networking
+        // Check after maintenance even with no trips/AP to trigger netCycle's
+        // existing log points. No serial output or per-slice scan is needed.
+        observeNetworkStack((unsigned)uxTaskGetStackHighWaterMark(nullptr));
         netCycle();
         // Preserve the network cadence while allowing shutdown handoff and
         // bounded journal slices during the old 30-second idle delay.
@@ -1887,6 +2061,10 @@ static void sendGpsConfigCommand() {
 static void gpsConfigAttemptFailed() {
     gGpsConfig.since = millis();
     if (gGpsConfig.attempts >= GPS_CONFIG_ATTEMPTS) {
+        // One give-up notice, not one per send/deadline. NAKs are separately
+        // per-occurrence E3003; a final NAK is not also a timeout.
+        if (gJournalReady && gGpsConfig.ack != 0)
+            gLoopFaults.event(3004, millis()).integer("message_class", 0x06).integer("message_id", 0x8A).notice();
         gGpsConfig.state = GPS_CONFIG_DONE;
         gNavPvtWaitMs = millis();
         Serial.printf("WARNING: GPS not configured after %u attempts -- continuing with current receiver settings.\n",
@@ -1906,6 +2084,7 @@ static void configureGps() {
     gGpsConfig.attempts = 1;
     gGpsConfig.since = millis();
     gGpsConfig.started = gGpsConfig.since;
+    gGpsDiagStartMs = gLastNmeaMs = gIdleFixWaitMs = gGpsConfig.since;
     Serial.println("GPS: waiting for checksum-valid NMEA (up to 3 s).");
 }
 
@@ -1944,6 +2123,8 @@ static void serviceGpsConfiguration() {
                       (unsigned)gGpsConfig.attempts,
                       (unsigned long)(millis() - gGpsConfig.started));
     } else if (gGpsConfig.ack == 0) {
+        if (gJournalReady)
+            gLoopFaults.event(3003, millis()).integer("message_class", 0x06).integer("message_id", 0x8A).notice();
         gpsConfigAttemptFailed();  // NAK: retry the same VALSET later
     } else if (millis() - gGpsConfig.since >= GPS_ACK_MS) {
         if (gGpsConfig.sends < GPS_COMMAND_SENDS) sendGpsConfigCommand();
@@ -1998,6 +2179,7 @@ static void receiveGpsNmea(uint8_t c) {
     gDebugGsv.encode((char)c);
 #endif
     if (!gps.encode((char)c)) return;
+    gLastNmeaMs = millis(); // only checksum-valid NMEA, never UBX/noise bytes
 #if DISPLAY_DEBUG
     gDebugGsv.update(millis());
 #endif
@@ -2006,6 +2188,9 @@ static void receiveGpsNmea(uint8_t c) {
     if (rmcFixArrived()) {
         Fix fx;
         if (buildFix(fx, rmcUtcMs)) {
+            if (gJournalReady) {
+                gLoopFaults.event(3005, fx.monoMs).integer("elapsed_ms", 0).condition(false);
+            }
             if (gHaveLastFix && (fx.monoMs - gLastFix.monoMs) > SEG_GAP_MS) {
                 if (gState == ACTIVE || gState == COOLDOWN) {
                     fx.newSegment = true;
@@ -2017,6 +2202,41 @@ static void receiveGpsNmea(uint8_t c) {
             tripFsmOnFix(fx);
         }
     }
+}
+
+static void serviceRuntimeDiagnostics() {
+    if (!gJournalReady) return;
+    uint32_t now = millis();
+    // Ten seconds of silence is well beyond normal 1 Hz output. Give a cold
+    // acquisition two minutes while idle; a trip gap gets thirty seconds.
+    uint32_t nmeaGap = now - gLastNmeaMs;
+    gLoopFaults.event(3001, now).integer("elapsed_ms", nmeaGap).condition(nmeaGap >= 10000);
+    bool recording = gState == ACTIVE || gState == COOLDOWN;
+    uint32_t fixGap = now - (gHaveLastFix ? gLastFixMonoMs : gGpsDiagStartMs);
+    if (gState != IDLE) gIdleFixWaitMs = now;
+    uint32_t idleGap = min(fixGap, uint32_t(now - gIdleFixWaitMs));
+    gLoopFaults.event(3002, now).integer("elapsed_ms", idleGap);
+    if (gps.satellites.isValid()) gLoopFaults.integer("satellites", min(gps.satellites.value(), uint32_t(255)));
+    gLoopFaults.condition(gState == IDLE && idleGap >= 120000);
+    // Finalizing does not establish GPS recovery. A resumed valid RMC clears
+    // E3005 in receiveGpsNmea(), including after the five-minute watchdog.
+    if (recording && fixGap >= 30000)
+        gLoopFaults.event(3005, now).integer("elapsed_ms", fixGap).condition(true);
+    // UTC_UNAVAILABLE describes the existing trusted system-clock state, with
+    // a two-minute boot allowance for GPS/SNTP. Untimed GPX points are separate.
+    gLoopFaults.event(3006, now).condition(!gClockSet.load() && uint32_t(now - gGpsDiagStartMs) >= 120000);
+    gLoopFaults.event(4001, now).condition(!gSdMounted);
+    // Check idle storage too, so a successful core-0 upload can be observed as
+    // recovery on core 1 without sharing producer state across tasks.
+    if (uint32_t(now - gStorageDiagMs) >= FS_CHECK_MS) {
+        gStorageDiagMs = now;
+        storageConditions(fsFreeBytes(), now);
+    }
+    serviceBatteryDiagnostics();
+#if DISPLAY_DEBUG
+    // debug_display.h latches failure and disables the OLED for this boot.
+    gLoopFaults.event(6001, now).condition(gDebugDisplayFailed);
+#endif
 }
 
 static void receiveGpsByte(uint8_t c) {
@@ -2358,8 +2578,12 @@ void setup() {
     new (&gJournal) diagnostics::EventLog(gSdMounted ? &gSdJournalFs : nullptr,
                                          gFlashMounted ? &gFlashJournalFs : nullptr);
     gJournalBoot = diagnostics::newJournalBoot();
-    gJournalReady = gJournal.begin(gJournalBoot.id, gJournalBoot.counter, "stage4-diag-a");
+    gJournalReady = gJournal.begin(gJournalBoot.id, gJournalBoot.counter, "stage4-diag-b");
     if (gJournalReady) diagnostics::submitJournalBoot(gJournal, esp_reset_reason(), gPmuStartup, millis());
+    if (gJournalReady) {
+        gLoopFaults.event(4001, millis()).condition(!gSdMounted);
+        storageConditions(storageFreeBytes(*gTripFS), millis());
+    }
     if (gSdMounted) fsckAllTrips(SD);
     if (gFlashMounted) fsckAllTrips(LittleFS);
 
@@ -2396,6 +2620,7 @@ void loop() {
 #if DISPLAY_DEBUG
     serviceDebugRf();
 #endif
+    serviceRuntimeDiagnostics(); // before fix-loss finalization and PMU shutdown
 
     // Fix-loss watchdog: a recording trip with no valid fix at all for
     // FIX_LOSS_END_MS (parked indoors, antenna failure) is finalized so
