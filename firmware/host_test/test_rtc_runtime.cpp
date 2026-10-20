@@ -45,7 +45,24 @@ static void rtcWorld(bool valid = true) {
         return count;
     };
 }
-static void beginRtc() { gRtc.begin(Wire1,gDiagnosticClock); rtcConditions(); }
+static void beginRtc() {
+    size_t before = Serial.log.size();
+    gRtc.begin(Wire1,gDiagnosticClock);
+    assert(Serial.log.size() == before);
+    gRtc.printBootStatus();
+    rtcConditions();
+}
+static void expectBootStatus(const std::string& expected) {
+    Serial.log.clear();
+    gRtc.printBootStatus(); assert(Serial.log.empty()); // no read, no message
+    gRtc.begin(Wire1,gDiagnosticClock); assert(Serial.log.empty());
+    unsigned before = transactions;
+    gRtc.printBootStatus();
+    assert(transactions == before); // deferred printing uses the saved boot read
+    std::string actual;
+    for (const auto& part : Serial.log) actual += part;
+    assert(actual == expected); // println's stub stores text without its newline
+}
 static void setTrusted(uint32_t seconds, unsigned fraction = 0) {
     timeval tv{seconds, long(fraction)*1000}; settimeofday(&tv,nullptr);
     gDiagnosticClock.trusted(EventTimeSource::Gps,millis()); gClockSet = true;
@@ -56,9 +73,24 @@ static bool rtcLog(const char* needle) {
 }
 int main(int argc, char**) {
     exportJson = argc > 1;
+    rtcWorld();
+    expectBootStatus("RTC: valid 2026-04-14T16:30:00Z (last set unknown)");
+    rtcWorld(); Preferences::durable64["rtc_set"] = fakeEpoch - 3600;
+    expectBootStatus("RTC: valid 2026-04-14T16:30:00Z (last set 1.0 h ago)");
+    for (bool vl : {true,false}) {
+        rtcWorld();
+        if (vl) rtcRegisters[2] |= 0x80;
+        else rtcRegisters[0] = 0x20;
+        expectBootStatus("RTC: invalid (stopped/VL), will set from GPS/SNTP\n");
+    }
+    for (bool missing : {true,false}) {
+        rtcWorld(); present = !missing; failRead = !missing;
+        expectBootStatus("RTC: not responding");
+    }
     rtcWorld(); Preferences::durable64["rtc_set"] = fakeEpoch - 3600;
     // The actual sketch setup includes PMU recovery, boot read and boot event.
     setup();
+    assert(!Serial.log.empty() && Serial.log[0] == "\n=== Stage 4: Trip Logger ===");
     // Setup selected mounted journal adapters; the real consumer uses FS_LOCK.
     assert(xSemaphoreTake(gFsMutex,0));
     auto boot = take(); auto rows = codeRows(boot,1000);
@@ -194,5 +226,5 @@ int main(int argc, char**) {
         gLoopFaults.event(3003,millis()).notice(); has(take()[0],"\"sync_age_ms\":null");
     }
     if (exportJson) for (auto& row : exported) std::printf("EVENT %s\n",row.c_str());
-    std::printf("RTC runtime: 19 scenario groups passed (DISPLAY_DEBUG=%d)\n",DISPLAY_DEBUG);
+    std::printf("RTC runtime: 20 scenario groups passed (DISPLAY_DEBUG=%d)\n",DISPLAY_DEBUG);
 }

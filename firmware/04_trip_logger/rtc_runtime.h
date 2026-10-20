@@ -16,6 +16,9 @@ class RtcRuntime {
     bool unavailable_ = false, invalid_ = false;
     rtc::Status invalidReason_ = rtc::Status::ReadFailed;
     rtc::Status status_ = rtc::Status::Unavailable;
+    rtc::Status bootStatus_ = rtc::Status::Unavailable;
+    uint32_t bootSeconds_ = 0;
+    int64_t bootAgeMs_ = -1;
     void observe(rtc::Status status) {
         status_ = status;
         // Loss of communication cannot clear an earlier invalid-time episode,
@@ -59,6 +62,7 @@ public:
         begun_ = true;
         uint32_t seconds = 0;
         observe(read(wire, seconds, true));
+        bootStatus_ = status_; bootSeconds_ = seconds;
         repair_ = status_ != rtc::Status::Valid;
         uint32_t now = millis(); clock.tick(now);
         if (status_ == rtc::Status::Valid) {
@@ -70,16 +74,24 @@ public:
                 settings.end();
             }
             clock.rtcAnchor(seconds, now, age);
-            auto d = rtc::fromUtc(seconds);
+            bootAgeMs_ = age;
+        } else {
+            clock.invalidateRtc();
+        }
+    }
+    // Keep the early boot read, but report it after USB has had time to attach.
+    void printBootStatus() const {
+        if (!begun_) return;
+        if (bootStatus_ == rtc::Status::Valid) {
+            auto d = rtc::fromUtc(bootSeconds_);
             Serial.printf("RTC: valid %04u-%02u-%02uT%02u:%02u:%02uZ", d.year, d.month, d.day, d.hour, d.minute, d.second);
-            if (age >= 0) Serial.printf(" (last set %.1f h ago)", double(age) / 3600000);
+            if (bootAgeMs_ >= 0) Serial.printf(" (last set %.1f h ago)", double(bootAgeMs_) / 3600000);
             else Serial.printf(" (last set unknown)");
             Serial.println();
         } else {
-            clock.invalidateRtc();
-            if (status_ == rtc::Status::Unavailable) Serial.println("RTC: not responding");
+            if (bootStatus_ == rtc::Status::Unavailable) Serial.println("RTC: not responding");
             else Serial.printf("RTC: invalid (%s), will set from GPS/SNTP\n",
-                               status_ == rtc::Status::Stopped ? "stopped/VL" : rtc::reason(status_));
+                               bootStatus_ == rtc::Status::Stopped ? "stopped/VL" : rtc::reason(bootStatus_));
         }
     }
     bool begun() const { return begun_; }

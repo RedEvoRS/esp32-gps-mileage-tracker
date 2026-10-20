@@ -2593,6 +2593,7 @@ void setup() {
     delay(1000);
     Serial.println("\n=== Stage 4: Trip Logger ===");
     printPmuStartup(gPmuStartup);
+    gRtc.printBootStatus();
     Serial.println("LoRa rail (ALDO3) verified off; SD rail (BLDO1) off; VBACKUP off.");
     Serial.printf("PMU power-on source 0x%02X, power-off source 0x%02X.\n",
                   (unsigned)PMU.getPowerOnSource(), (unsigned)PMU.getPowerOffSource());
