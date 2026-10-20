@@ -820,9 +820,21 @@ The existing core-0 network task drains one record per service slice, yielding
 the filesystem lock to trip writes and uploads. It also handles shutdown
 drain/sealing before the existing storage unmounts. Debug builds print one
 boot line naming the active backend and unacknowledged record/segment counts;
-an incomplete inventory is labeled. There is no extra task. Diagnostic uploads,
-other subsystem fault hooks, degraded startup and OLED error codes remain
-future work. PMU/storage failure still halts before journal startup. SD/FAT
+an incomplete inventory is labeled. There is no extra task. Runtime hooks now
+cover GPS data/fix loss and VALSET failures, unavailable UTC, the PMU's existing
+battery warning levels, charge-guard pause/recovery, SD fallback, recording
+space and trip-write failures, boot trip recovery, WiFi joins, upload status
+classes, low network stack and debug OLED I2C failure. Conditions raise once,
+repeat at most every 15 minutes and clear on observed recovery; ordinary driving
+away from home increments E5001's boot-local counter without a journal event.
+See the [hook list](../DIAGNOSTICS.md#stage-4-runtime-fault-hooks-124-part-b)
+for exact thresholds, context fields and recovery semantics. Events and producer
+state are bounded; a full/contended queue can lose records and counts those drops.
+Both cores have static builders, so no event-sized buffer is added to their stacks.
+Diagnostic uploads/current snapshots (#125), degraded startup (#126) and OLED
+error-code pages (#127) remain future work. The counter is retained in RAM for
+the future check-in worker; it is not sent yet. PMU/storage failure still halts
+before journal startup. SD/FAT
 power-cut safety and operation latency still need hardware validation.
 See [DIAGNOSTICS.md](../DIAGNOSTICS.md#eventlog-module-122-implementation)
 for the API, on-disk format, quota and recovery rules. Run
@@ -849,7 +861,10 @@ upload times, and lowest `Net stack ... minimum free` value. Each `Upload`
 line prints the file's size and how long it took. Size over time is the
 link speed. The server's worker timeout (900 s) allows a full 8 MiB trip
 piece at 10 kB/s (~839 s), with a margin for handling it. A warning at
-1,024 bytes or less means the allocation needs review; absence of a warning
+less than 2,048 bytes raises E1007 and means the allocation needs review; this
+margin follows #6 and leaves room to investigate before exhausting the stack.
+The lifetime watermark cannot increase, so E1007 normally remains active until
+reboot (the next boot starts unknown). Absence of a warning
 is not proof that every path has been exercised. Keep issue #6 open until these measurements are
 recorded and the final allocation is justified. Host tests check diagnostics
 only and cannot measure ESP32 stack use.

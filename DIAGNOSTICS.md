@@ -43,7 +43,8 @@ numeric measurements and fixed enumerated values in context.
 - **#123:** pure DisplayModel and host tests for display policy.
 - **#124 part A:** implemented mounted-filesystem adapters, fresh boot identity/
   NVS boot counter, cooperative core-0 service, LittleFS trip reserve, shutdown
-  sealing and boot/reset notices. **Part B remains:** subsystem fault hooks.
+  sealing and boot/reset notices. **Part B is implemented:** runtime fault hooks
+  and their host transition/protocol tests (see the hook list below).
   Supreme storage timing, power-cut and road acceptance remain hardware work.
 - **#125:** diagnostics upload worker, current snapshots, revision enrollment/
   recovery, complete ack verification, trip priority and independent retries.
@@ -574,10 +575,98 @@ caches while retaining the boot identity and RAM queue. RAM-only history is lost
 on reset/power-off. Hardware tests must measure individual VFS operation latency
 and trip-write delay, plus induced failures during sealing and remount.
 
-Part B of #124 still wires PMU, charge guard, GPS/config/time, storage,
-trip recovery, networking, display and reset paths to these codes. Thresholds
-belong with the actual subsystem policy, not hard-coded catalog text. #126
-keeps a bounded service loop alive if PMU/storage initialization fails: show or
+### Stage 4 runtime fault hooks (#124 part B)
+
+`runtime_faults.h` holds fixed condition slots and one static event builder per
+owning task. Core 1 owns GPS, power, trip storage/recovery and display hooks;
+core 0 owns WiFi/HTTP/stack and the AP-absence counter. The builders only call
+EventLog's bounded, nonblocking `submit`, never filesystem APIs or ISRs. Journal
+adapter/service errors do not enter these hooks; E4008/E4009 remain EventLog's
+own policy. The trip/FS operations being measured keep their existing locks.
+
+Continuing conditions emit one accepted `raise`, no hot-loop records, at most
+one `repeat` per **15 minutes**, and one accepted `clear` on measured recovery.
+All records in an episode retain the accepted raise identity. Failed submissions
+retry no faster than **60 seconds** while the observation stays unchanged;
+a physical state change may attempt immediately. A rejected raise does not
+create an episode. A rejected clear retains the episode until a later observation
+can queue it. Full/contention drops are counted by EventLog; notices are best
+effort and never retried as invented new occurrences. This is bounded reporting,
+not a guarantee that every transient failure survives queue exhaustion.
+
+Healthy observations mark condition slots observed without producing events.
+Unmeasured fields are omitted instead of guessed or clamped. Hook timestamps use
+monotonic `millis()` and unknown wall time until clock confidence/age is integrated;
+they do not claim a retained RTC is synchronized. No check-ins or events uploads
+are added here. #125 must coherently copy each task's observed/active slots,
+accepted episode identities and saturating E5001 counter into its snapshot.
+
+| Code | Trigger | Recovery / policy | Context |
+|---|---|---|---|
+| E1007 | Network lifetime minimum free stack **<2048 bytes** | Watermark >=2048; normally latches for the boot because a lifetime minimum never increases | `free_bytes` |
+| E2002 | AXP2101 level-1 IRQ or battery percentage <= configured low warning | Valid connected battery percentage above that threshold | `battery_mv`, if in catalog range |
+| E2003 | AXP2101 level-2 IRQ (before existing shutdown), or percentage <= configured critical level | Valid connected battery percentage above critical | `battery_mv`, if in range |
+| E2004 | Existing charge guard pauses hot (die >=54 C); remains hot while paused above 47 C | Finite die sample <=47 C or another measured pause reason | `temperature_mc` = measured PMU die, if in range |
+| E2005 | Guard pauses cold (die <=9 C); remains cold while paused below 14 C | Finite die sample >=14 C or another measured pause reason | `temperature_mc` = measured PMU die, if in range |
+| E2006 | Non-finite charge-temperature sample | Finite sample; hot/cold conditions are not cleared by an unreadable sample | none |
+| E3001 | No checksum-valid NMEA for 10 s, starting at GPS configuration start | Next checksum-valid NMEA; noise/UBX/bad checksum do not recover it | `elapsed_ms` |
+| E3002 | No valid RMC position fix for 120 s while idle | Valid fix; acquisition grace starts again after leaving a trip | `elapsed_ms`, `satellites` when measured |
+| E3003 | Matching checksum-checked VALSET NAK | One notice per rejected attempt, no active condition | `message_class=6`, `message_id=138` |
+| E3004 | Final config readiness/ACK timeout after five attempts | One give-up notice; final NAK uses only E3003 | `message_class=6`, `message_id=138` |
+| E3005 | Active/cooldown trip has no valid RMC fix for 30 s | Next valid RMC fix, even after the five-minute finalize; ending the trip alone is not recovery | `elapsed_ms` |
+| E3006 | Trusted system clock `gClockSet` still false after 120 s | Successful GPS/SNTP clock sync; untimed GPX points retain their original status | none |
+| E4001 | SD did not mount, trip logging uses LittleFS | Observed SD mount; current boot does not hot-switch backends | none |
+| E4004 | Guarded trip free space <64 KiB start reserve | >=64 KiB | `backend`, `free_bytes` |
+| E4005 | Guarded trip free space <24 KiB stop reserve | >=24 KiB | `backend`, `free_bytes` |
+| E4006 | Trip create/open, point commit or finalization fails | Next verified trip create/write/finalize or successful repair | `backend`, `operation=open\|write\|close` |
+| E4007 | Boot fsck directory/read, ambiguous repair, write or publish fails; also runtime repair failure | Per-occurrence notice; no clear | `backend`, `reason=read\|parse\|write\|rename` |
+| E4010 | Actual repaired trip, published verified repair or recovered orphan | Per-occurrence notice; complete untouched files and garbage cleanup stay silent | `backend`, `points` when counted |
+| E5001 | Completed successful scan does not see the configured AP | **Counter only**, boot-local, saturates at 2^63-1; failed/aborted scans do not increment | none; future check-in counter |
+| E5002 | Completed 15 s WiFi join attempt fails | Next successful join; AP absence is not recovery | `attempts` (saturates at 255, resets on join) |
+| E5003 | Trip HTTP result <=0 | Next HTTP 200 trip upload | `attempts` (transport failures since success, saturates at 255), `target=trip` |
+| E5004 | HTTP 401 | Next HTTP 200 trip upload | `http_status`, `target=trip` |
+| E5005 | HTTP 413 | Next HTTP 200 trip upload | `http_status`, `target=trip` |
+| E5006 | HTTP 400 | Next HTTP 200 trip upload | `http_status`, `target=trip` |
+| E5007 | HTTP 409 | Next HTTP 200 trip upload | `http_status`, `target=trip` |
+| E5008 | HTTP 500-599 | Next HTTP 200 trip upload | `http_status`, `target=trip` |
+| E5009 | Other positive HTTP result except 200 | Next HTTP 200 trip upload | `http_status` when 100-599, `target=trip` |
+| E6001 | Debug OLED adapter latches I2C/init failure | Adapter healthy; current adapter disables display for the rest of the boot | none; DISPLAY_DEBUG=1 only |
+
+Battery diagnostics use the **existing hardware SOC thresholds**, without adding
+a new voltage cutoff or changing shutdown policy. XPowersLib 0.3.3 returns the
+raw level-1 nibble, so the configured warning percentage is that value plus five;
+level 2 returns the configured percentage directly. Connected-battery sampling
+runs every 30 s, with immediate IRQ observations. The catalog's voltage wording
+is generic; `battery_mv` is a measurement, not the threshold used by this PMU.
+The charge guard uses its existing die proxy and hysteresis; diagnostic context
+never presents that die reading as a measured cell temperature.
+
+Storage space is checked at boot, on admission, during trips and every 30 s while
+idle so uploads can produce observed recovery on core 1. LittleFS free space
+already excludes the unused journal reserve. Below 64 KiB a new trip is refused;
+below 24 KiB a running trip is finalized. These hooks do not read or modify
+EventLog's own storage failure path. Arduino's void close cannot independently
+report close errors; E4006 `close` means the verified finalization commit failed.
+HTTP error classes stay active across different errors and clear only on 200.
+Existing quarantine/retry behavior is unchanged; intentional network aborts do
+not generate transport/join faults.
+
+Host tests exercise each hook's transitions and context through production paths,
+the notice policies, checksum/readiness deadlines, charge hysteresis, queue-full
+retry/episode handling, rollover, the counter without scan events and a normal
+real-parser drive/upload with only E1000. Both DISPLAY_DEBUG modes run, and actual
+exports pass the server protocol validator. They cannot measure the network task's
+watermark or storage latency. The 12 KiB allocation is unchanged; the 2 KiB warning
+margin follows #6. Static builders avoid event-sized stack frames; compiler stack
+reports and the build sizes supplement, but do not replace, the real-upload bench
+measurement. Part A's observed 7,556 free bytes was a no-upload measurement.
+
+Startup halts E1001/E1002/E2001/E4002/E4003 remain #126; RTC E3007/E3008 are #128;
+E5010, diagnostic upload and snapshots remain #125. Error-code OLED pages are
+#127 and antenna detection is #164. All requested meaningful Stage 4 runtime
+codes above are wired, including E3006's existing trusted-clock state.
+
+#126 keeps a bounded service loop alive if PMU/storage initialization fails: show or
 upload failures when possible and retry safely, without claiming trips are
 recorded when no backend works. Unknown PMU state must not enable unsafe charge
 or rail operations. Display failure never changes the logging lifecycle.

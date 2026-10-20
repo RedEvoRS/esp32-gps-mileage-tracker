@@ -462,13 +462,18 @@ extern TwoWire Wire, Wire1;
 #define XPOWERS_AXP2101_PKEY_LONG_IRQ 4
 #define XPOWERS_AXP2101_PKEY_SHORT_IRQ 8
 #define XPOWERS_AXP2101_WARNING_LEVEL2_IRQ 16
+#define XPOWERS_AXP2101_WARNING_LEVEL1_IRQ 32
 #define XPOWERS_AXP2101_CHG_VOL_4V1 2
 // PMU: tests set vbusIn (the USB power level) and the latched VBUS
 // interrupt flags, then raise gPmuIrqFlag as the IRQ pin would.
 struct PoweredOff {};
 struct XPowersAXP2101 {
     bool vbusIn = true, removeIrq = false, insertIrq = false;
-    bool longPressIrq = false, criticalIrq = false;
+    bool longPressIrq = false, criticalIrq = false, lowIrq = false;
+    bool batteryConnected = true;
+    int batteryPercent = 85;
+    uint16_t batteryMv = 4020;
+    uint8_t lowWarnNibble = 10, criticalPercent = 5;
     bool failShutdown = false;
     int shutdownCalls = 0;
     void (*onShutdown)() = nullptr;
@@ -523,13 +528,17 @@ struct XPowersAXP2101 {
     void enableBattDetection() {} void enableBattVoltageMeasure() {}
     void enableVbusVoltageMeasure() {} void enableSystemVoltageMeasure() {}
     void disableIRQ(uint32_t) {} void enableIRQ(uint32_t) {}
-    void clearIrqStatus() { removeIrq = insertIrq = longPressIrq = criticalIrq = false; }
+    void clearIrqStatus() { removeIrq = insertIrq = longPressIrq = criticalIrq = lowIrq = false; }
     uint32_t getIrqStatus() { return 0; }
     bool isVbusRemoveIrq() { return removeIrq; } bool isVbusInsertIrq() { return insertIrq; }
     bool isPekeyLongPressIrq() { return longPressIrq; } bool isDropWarningLevel2Irq() { return criticalIrq; }
+    bool isDropWarningLevel1Irq() { return lowIrq; }
+    bool isBatteryConnect() { return batteryConnected; }
+    uint8_t getLowBatWarnThreshold() { return lowWarnNibble; }
+    uint8_t getLowBatShutdownThreshold() { return criticalPercent; }
     bool isVbusIn() { return vbusIn; }
-    int getBatteryPercent() { return 85; }
-    uint16_t getBattVoltage() { return 4020; }
+    int getBatteryPercent() { return batteryPercent; }
+    uint16_t getBattVoltage() { return batteryMv; }
     bool isCharging() { return chargeEnabled && vbusIn; }
     void shutdown() {
         g_powerEvents.push_back("PMU.shutdown");
