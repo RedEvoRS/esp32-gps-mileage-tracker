@@ -63,6 +63,7 @@
 
 #include "secrets.h"
 #include "pmu_startup_event.h"
+#include "pmu_read_state.h"
 #include "journal_fs.h"
 #include "journal_boot.h"
 #include "degraded_policy.h"
@@ -1402,14 +1403,70 @@ static constexpr uint32_t VBUS_OFF_CONFIRM_MS = 10UL * 1000;
 static bool     gVbusOffPending = false;
 static uint32_t gVbusOffT0 = 0;
 
+using pmu_read::Aldo3State;
+using pmu_read::VbusState;
+
+static pmu_read::Aldo3State aldo3State() {
+    return pmu_read::aldo3State(PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0));
+}
+
+static pmu_read::VbusState vbusState() {
+    // Read both even when STATUS2 alone would short-circuit isVbusIn().
+    // Either failed read makes the whole observation unknown.
+    int status2 = PMU.readRegister(XPOWERS_AXP2101_STATUS2);
+    int status1 = PMU.readRegister(XPOWERS_AXP2101_STATUS1);
+    return pmu_read::vbusState(status1, status2);
+}
+
+static constexpr uint32_t VBUS_RETRY_MS = 1000;
+enum class VbusRetry { None, Seed, Change };
+static VbusRetry gVbusRetry = VbusRetry::None;
+static uint32_t gVbusRetryMs = 0;
+static uint32_t gVbusOffReadMs = 0;
+
+static void seedVbusState() {
+    VbusState state = vbusState();
+    gVbusLost = state == VbusState::Absent;
+    gVbusRetry = state == VbusState::Unknown ? VbusRetry::Seed : VbusRetry::None;
+    gVbusRetryMs = millis();
+}
+
+static void observeVbusChange(pmu_read::VbusState state) {
+    gVbusRetry = state == VbusState::Unknown ? VbusRetry::Change : VbusRetry::None;
+    gVbusRetryMs = millis();
+    if (state == VbusState::Present) {
+        if (gVbusOffPending) Serial.println("VBUS dipped and came back -- ignored.");
+        else if (gVbusLost) Serial.println("VBUS inserted -- back on USB power.");
+        gVbusOffPending = false;
+        gVbusLost = false;
+    } else if (state == VbusState::Absent && !gVbusOffPending && !gVbusLost) {
+        Serial.println("VBUS removed -- confirming before ending the trip.");
+        gVbusOffPending = true;
+        gVbusOffT0 = gVbusOffReadMs = millis();
+    }
+}
+
+static void serviceVbusRecheck() {
+    if (gVbusRetry == VbusRetry::None || uint32_t(millis() - gVbusRetryMs) < VBUS_RETRY_MS) return;
+    if (gVbusRetry == VbusRetry::Seed) seedVbusState();
+    else observeVbusChange(vbusState());
+}
+
+static const char* const VBUS_UNREADABLE =
+    "VBUS state unreadable -- staying awake instead of powering off.";
+
 static bool mountSdStorage();
 
 static void powerOffForVbus() {
     // AXP2101 powers on on a VBUS INSERT EDGE, not its steady level. Never
     // shut down on USB, even for a power-key or low-battery interrupt: the
     // board would stay off until USB was unplugged and replugged (#106).
-    if (PMU.isVbusIn()) {
-        Serial.println("VBUS present -- staying awake instead of powering off.");
+    VbusState entryVbus = vbusState();
+    if (entryVbus != VbusState::Absent) {
+        Serial.println(entryVbus == VbusState::Unknown ? VBUS_UNREADABLE :
+                       "VBUS present -- staying awake instead of powering off.");
+        gVbusRetry = entryVbus == VbusState::Unknown ? VbusRetry::Seed : VbusRetry::None;
+        gVbusRetryMs = millis();
         gVbusLost = false;
         gVbusOffPending = false;
         gIdleSince = millis();
@@ -1447,7 +1504,8 @@ static void powerOffForVbus() {
     // Leave rails and awake IRQs alone so a cancelled shutdown can resume.
     // GPS backup RAM is supplied directly by the 18650, not VBACKUP.
     Serial.println("PMU power-off: storage closed; checking VBUS before shutdown.");
-    if (!PMU.isVbusIn()) {
+    VbusState finalVbus = vbusState();
+    if (finalVbus == VbusState::Absent) {
         // Last possible level check: no log, delay or other work before
         // shutdown. A VBUS edge between this read and the PMU's I2C
         // shutdown write remains a race; software cannot make them atomic.
@@ -1460,7 +1518,8 @@ static void powerOffForVbus() {
             "ERROR: PMU.shutdown() did not power off -- resuming logging." :
             "ERROR: PMU.shutdown() did not power off -- resuming degraded service.");
     } else {
-        Serial.println("VBUS returned -- PMU power-off cancelled.");
+        Serial.println(finalVbus == VbusState::Unknown ? VBUS_UNREADABLE :
+                       "VBUS returned -- PMU power-off cancelled.");
     }
 
     // An upload that outlived the abort timeout may still own a File from
@@ -1486,7 +1545,7 @@ static void powerOffForVbus() {
     gJournalSealRequested.store(false);
     gJournalSealDone.store(false);
     FS_UNLOCK();
-    gVbusLost = !PMU.isVbusIn();   // also catches a missed INSERT interrupt
+    seedVbusState();   // also catches a missed INSERT interrupt; unknown stays awake
 #if DISPLAY_DEBUG
     debugDisplayPowerSave(false);
 #endif
@@ -1508,16 +1567,7 @@ static void pollPmu() {
     // level: a short dip can latch REMOVE and INSERT in the same batch,
     // and the flags don't say which came last.
     if (PMU.isVbusRemoveIrq() || PMU.isVbusInsertIrq()) {
-        if (PMU.isVbusIn()) {
-            if (gVbusOffPending) Serial.println("VBUS dipped and came back -- ignored.");
-            else if (gVbusLost)  Serial.println("VBUS inserted -- back on USB power.");
-            gVbusOffPending = false;
-            gVbusLost = false;
-        } else if (!gVbusOffPending && !gVbusLost) {
-            Serial.println("VBUS removed -- confirming before ending the trip.");
-            gVbusOffPending = true;
-            gVbusOffT0 = millis();
-        }
+        observeVbusChange(vbusState());
     }
     if (PMU.isPekeyLongPressIrq())    powerOffForVbus();
     // Observe hardware's existing low/critical policy before shutdown. Never
@@ -1627,9 +1677,13 @@ static void serviceChargeTemp() {
 // next time we're home. Re-reads the level in case an INSERT interrupt was
 // missed. Keeps a genuine short trip (discardIfMicro=false).
 static void confirmVbusOff() {
-    if (!gVbusOffPending || millis() - gVbusOffT0 < VBUS_OFF_CONFIRM_MS) return;
+    if (!gVbusOffPending || millis() - gVbusOffT0 < VBUS_OFF_CONFIRM_MS ||
+        uint32_t(millis() - gVbusOffReadMs) < VBUS_RETRY_MS) return;
+    gVbusOffReadMs = millis();
+    VbusState state = vbusState();
+    if (state == VbusState::Unknown) return; // pending; one read attempt per second
     gVbusOffPending = false;
-    if (PMU.isVbusIn()) return;
+    if (state == VbusState::Present) return;
     Serial.println("VBUS off for 10 s -- car off: finalizing trip, staying awake.");
     gVbusLost = true;
     if (gTripPath[0]) endTrip(/*discardIfMicro=*/false);
@@ -2566,7 +2620,7 @@ static void serviceDebugDisplay() {
     s.now = millis();  // snapshot upload time cannot be newer than this clock read
     s.batteryPct = PMU.getBatteryPercent();
     s.batteryV = PMU.getBattVoltage() / 1000.0f;
-    s.usb = PMU.isVbusIn();
+    s.usb = vbusState() == VbusState::Present; // unknown is display-only false
     s.charging = PMU.isCharging();
     drawDebugDisplay(s);
 }
@@ -2632,6 +2686,7 @@ static void degradedLoop() {
     const Mode mode = gDegraded.mode();
     if (mode == Mode::NoStorage) {
         pollPmu();
+        serviceVbusRecheck();
         confirmVbusOff();
         serviceChargeTemp();
         serviceBatteryDiagnostics();
@@ -2658,7 +2713,7 @@ static void degradedLoop() {
             if (Wire1.end()) {
                 recovered = beginPmuWithRecovery(Wire1, PMU, I2C_SDA, I2C_SCL, retry);
                 if (recovered && mode == Mode::PmuUntrusted)
-                    recovered = PMU.disableALDO3() && !PMU.isEnableALDO3();
+                    recovered = PMU.disableALDO3() && aldo3State() == Aldo3State::Off;
             }
         }
         if (gDegraded.retryResult(millis(), recovered)) {
@@ -2677,7 +2732,7 @@ void setup() {
     // and verify it as the first PMU operation after bounded bus recovery
     // and initialization, BEFORE Serial, storage or GPS setup can block.
     bool pmuReady = beginPmuWithRecovery(Wire1, PMU, I2C_SDA, I2C_SCL, gPmuStartup);
-    bool radioOff = pmuReady && PMU.disableALDO3() && !PMU.isEnableALDO3();
+    bool radioOff = pmuReady && PMU.disableALDO3() && aldo3State() == Aldo3State::Off;
     startup::Mode powerMode = startup::selectMode(pmuReady, radioOff, true);
     if (powerMode != startup::Mode::Normal) {
         Serial.begin(115200);
@@ -2732,10 +2787,11 @@ void setup() {
     setupPmuIrq();
     // Seed VBUS state from hardware: a battery-only boot (e.g. wake via
     // power key away from the car) must still hit the idle power-off timer.
-    gVbusLost = !PMU.isVbusIn();
+    seedVbusState();
     gIdleSince = millis();
     Serial.printf("PMU ready, MAX-M10S GPS rail (ALDO4) on at 3.3 V, charge to %s. VBUS %s.\n",
                   PMU.getChargeTargetVoltage() == XPOWERS_AXP2101_CHG_VOL_4V1 ? "4.1 V" : "NOT 4.1 V",
+                  gVbusRetry == VbusRetry::Seed ? "unknown (assuming USB present)" :
                   gVbusLost ? "absent (on battery)" : "present");
 
     // --- Storage + boot-time repair ---
@@ -2813,6 +2869,7 @@ void loop() {
 
     // Service power events (VBUS loss/insert, key press, low battery).
     pollPmu();
+    serviceVbusRecheck();
     confirmVbusOff();
     serviceChargeTemp();
 
