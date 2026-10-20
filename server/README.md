@@ -452,9 +452,10 @@ and a five-minute cooldown on provider failure (longer `Retry-After` values are
 honoured up to seven days). There are no automatic retries,
 redirects, or ambient HTTP proxies. Responses have a 64 KiB size limit and a
 ten-second monotonic deadline checked between reads, with five-second socket
-timeouts. A single read can overrun the deadline by up to its socket timeout;
-DNS resolution and initial response headers are not covered by the read checks.
-Gunicorn's worker timeout is the final bound for a stalled resolver or headers.
+timeouts. A single read can overrun the deadline, particularly while parsing
+chunked response framing. DNS resolution and initial response headers are not
+covered by the read checks. Gunicorn's worker timeout is the final bound for a
+stalled request, including framing, resolver or header stalls.
 Busy/unavailable/no-match states leave the map,
 manual annotations and exports usable. Lookup is authenticated and CSRF-protected;
 upstream errors, response bodies, coordinates and URLs are not logged by lookup.

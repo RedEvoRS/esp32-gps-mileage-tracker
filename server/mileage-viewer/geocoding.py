@@ -120,9 +120,12 @@ class Geocoder:
             conn.execute(
                 "INSERT OR REPLACE INTO geocode_gate VALUES (1, ?, ?)", (now + self.LEASE, token)
             )
-        cooldown = self.INTERVAL
+        # Worker aborts (SystemExit/KeyboardInterrupt) still run finally. Treat
+        # any incomplete provider call as failure, including those abort paths.
+        cooldown = 300
         try:
             label = self._fetch(latitude, longitude)
+            cooldown = self.INTERVAL
             with closing(sqlite3.connect(self.db_path)) as conn, conn:
                 conn.execute(
                     "INSERT OR REPLACE INTO geocode_cache VALUES (?, ?, ?)",

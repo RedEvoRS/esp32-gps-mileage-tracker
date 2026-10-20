@@ -298,6 +298,18 @@ class EndpointPlaceTests(unittest.TestCase):
         self.assertIsNone(self.viewer.GEOCODER.cached(2, 4))
         self.assertEqual(self.post().status_code, 429)
 
+    def test_aborted_worker_retains_failure_cooldown(self):
+        for abort in (SystemExit, KeyboardInterrupt):
+            with self.subTest(abort=abort.__name__):
+                self.reset_gate()
+                with patch.object(self.viewer.GEOCODER, "_fetch", side_effect=abort), \
+                     patch("geocoding.time.time", return_value=10000):
+                    with self.assertRaises(abort):
+                        self.viewer.GEOCODER.lookup(2, 4)
+                with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn:
+                    self.assertEqual(conn.execute("SELECT next_allowed FROM geocode_gate").fetchone()[0], 10300)
+                self.assertIsNone(self.viewer.GEOCODER.cached(2, 4))
+
 
 if __name__ == "__main__":
     unittest.main()
