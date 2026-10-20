@@ -159,6 +159,12 @@ uint32_t EventLog::crc32(const void* bytes, size_t size) {
     }
     return ~crc;
 }
+bool EventLog::setSdAllocationUnit(uint32_t bytes) {
+    if (stores_[0].loaded || stores_[1].loaded) return false;
+    if (bytes) stores_[0].unit = bytes;
+    else stores_[0].fs = nullptr;
+    return true;
+}
 void EventLog::segmentPath(char* out, uint32_t id, bool ready) {
     std::snprintf(out, 40, "/diag/seg-%08lu.%s", static_cast<unsigned long>(id), ready ? "ready" : "open");
 }
@@ -611,6 +617,47 @@ EventLog::Stats EventLog::stats() {
         result.queued = count_; queueLock_.clear(std::memory_order_release);
     }
     return result;
+}
+EventLog::Backlog EventLog::backlog() {
+    Backlog result;
+    for (auto& store : stores_) {
+        if (!store.fs) continue;
+        if (!load(store)) { result.complete = false; continue; }
+        for (size_t i = 0; i < store.count; ++i) {
+            auto& segment = store.segments[i];
+            if (segment.id <= store.meta.discarded || acknowledged(store, segment)) continue;
+            ++result.segments;
+            uint32_t offset = segment.id == store.meta.ack.segment ? store.meta.ack.offset : 0;
+            while (offset < segment.size) {
+                Frame frame;
+                if (!readFrame(store, segment, offset, frame)) { result.complete = false; break; }
+                if (frame.size) ++result.records;
+            }
+        }
+    }
+    result.records += stats().queued;
+    return result;
+}
+bool EventLog::seal() {
+    service(kEventQueueSize);
+    bool ok = stats().queued == 0;
+    for (auto& store : stores_) {
+        if (!store.fs) continue;
+        if (!load(store)) { ok = false; continue; }
+        for (size_t i = 0; i < store.count; ++i) {
+            auto& segment = store.segments[i];
+            if (segment.ready) continue;
+            char from[40], to[40];
+            segmentPath(from, segment.id, false); segmentPath(to, segment.id, true);
+            if (!store.fs->rename(from, to)) { store.loaded = false; ok = false; break; }
+            segment.ready = true;
+        }
+    }
+    return ok;
+}
+void EventLog::invalidateStorage() {
+    for (auto& store : stores_) store.loaded = false;
+    issued_ = 0;
 }
 bool EventLog::restoreStatusSequence(uint64_t highWater) {
     auto& store = stores_[0];

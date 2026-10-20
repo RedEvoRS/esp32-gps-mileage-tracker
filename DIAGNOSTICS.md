@@ -38,12 +38,13 @@ numeric measurements and fixed enumerated values in context.
 - **#121:** shipped server-side device-silence detection; heartbeat integration is #125.
 - **#122:** implemented board-independent EventLog and host fault tests: bounded
   producer queue, CRC segments, durable acknowledgments/loss accounting and
-  snapshot revision allocator. Boot identity/counter are injected by the caller;
-  there are no runtime journal writes until #124 supplies the adapters/hooks.
+  snapshot revision allocator. Part A of #124 now supplies its mounted-storage
+  adapters, boot identity/counter and boot notices in Stage 4.
 - **#123:** pure DisplayModel and host tests for display policy.
-- **#124:** mounted-filesystem adapters, fresh boot identity/NVS boot counter,
-  service calls under FS_LOCK, LittleFS trip reserve, and firmware fault/reset
-  hooks, **after Supreme port #107/#109**.
+- **#124 part A:** implemented mounted-filesystem adapters, fresh boot identity/
+  NVS boot counter, cooperative core-0 service, LittleFS trip reserve, shutdown
+  sealing and boot/reset notices. **Part B remains:** subsystem fault hooks.
+  Supreme storage timing, power-cut and road acceptance remain hardware work.
 - **#125:** diagnostics upload worker, current snapshots, revision enrollment/
   recovery, complete ack verification, trip priority and independent retries.
 - **#126:** degraded service loop, **after Supreme port #107/#109**. Replaces
@@ -56,9 +57,9 @@ numeric measurements and fixed enumerated values in context.
 - **#135:** shipped GELF export to the owner's external Graylog (not bundled).
 - **#136:** optional push to an external Loki (not bundled).
 - **#137:** installer questions choosing these outputs.
-- **#151:** E2007 catalog entry and retained Stage 4 PMU startup result with a
-  host-tested event helper. Journal emission depends on #122/#124; the failure
-  halt remains until #126, and OLED reporting remains with #127.
+- **#151:** E2007 catalog entry, retained Stage 4 PMU startup result and boot
+  journal emission after successful startup are implemented. The failure halt
+  remains until #126, and OLED reporting remains with #127.
 
 Host tests prove catalog consistency and policy behavior. They do not prove bus
 wiring, power rails, charging safety, FAT power-cut recovery or road behavior.
@@ -112,7 +113,7 @@ including attempts that fail before a PMU probe), `recovery_state`
 `pmu_ready` and `wire_end_failed` (booleans). The final recovery state alone
 does not prove PMU readiness. Stage 4 retains the complete `PmuStartupResult`
 in RAM; `makePmuStartupEvent` prepares these fields without I/O. #122/#124 must
-emit the notice once the journal is available; no event is persisted yet.
+emit the notice once the journal is available; part A of #124 now does so.
 Failed startup still halts before storage, so reporting that path also needs
 #126's degraded loop. OLED failure reporting remains out of scope until #127.
 
@@ -364,11 +365,12 @@ power-cut test frame writes, sealing, acknowledgments and quota reclamation.
 ### EventLog module (#122 implementation)
 
 `firmware/04_trip_logger/event_log.h` and `.cpp` build as standard C++14 on the
-host and as sketch-folder sources on the ESP32-S3. Stage 4 does not instantiate
-them yet: no new task, producer hook, mount or SD write runs at boot. The
-`EventLogFs` interface is the integration boundary for mounted SD/LittleFS;
-#124 must implement it using durable close/sync and propagate open, read, write,
-close, rename and enumeration errors. Neither the module nor an adapter may
+host and as sketch-folder sources on the ESP32-S3. Stage 4 instantiates the
+journal in static DRAM and queues boot notices on core 1 without filesystem
+work. `journal_fs.h` adapts the mounted SD/LittleFS stores; `journal_vfs.h`
+uses their existing `/sd` and `/littlefs` VFS mounts. Direct checked VFS calls
+propagate open, exact read/write, fsync, close, rename and enumeration errors;
+Arduino's void `File::close()` would hide failures. Neither module nor adapter may
 format media or remove trips. EventLog exclusively owns `/diag` and caches its
 inventory, allocated bytes and validated open-tail sizes. Successful writes,
 renames and removals update that cache; failed/uncertain I/O invalidates it.
@@ -410,8 +412,18 @@ remounting media; do not reuse cached state for a different card.
   retryability; RAM acknowledgments remove only matching queue heads. #125
   still owns parsing/validating the HTTP acknowledgment and E5010 policy.
 
-For #124, start with `service(1)` on the **core-0 service task**, release FS_LOCK
-between calls and yield to pending GPS trip writes. Do not run journal recovery
+Stage 4 runs `service(1)` on the **existing core-0 network task**, with a
+zero-wait take of the same filesystem mutex used by FS_LOCK. It releases that
+mutex before networking and between journal calls. During the network task's
+existing 30-second idle interval it services in 100 ms slices; the network
+cadence stays unchanged. No extra task or task stack is allocated. Journal
+service waits until a blocking network cycle finishes, preserving trip-upload
+priority. Ordinary FS_LOCK callers announce demand before taking the mutex.
+The journal checks that demand before each adapter operation and each directory
+entry, abandoning recovery when a trip/upload needs storage. Its next slice
+reloads invalidated caches and retries retained identities. Consumer code must
+use this zero-wait consumer lock path, not announce itself as ordinary demand.
+Do not run journal recovery
 or eviction while the GPS task is waiting on a trip write for long. Measure the
 real adapter's latency before enabling it: operation counts bound work, not time.
 The work under one `service()` lock hold is bounded as follows:
@@ -489,10 +501,14 @@ rejected. Nonempty files consume at least one unit. LittleFS's **64 KiB includes
 both rounded metadata slots**, leaving at most **56 KiB** for segment allocation
 with the defaults, so its segment rolls early. The limits bound allocated file
 data with the correct units; media exhaustion or I/O errors still trigger
-fallback. The exported `kLittleFsJournalReserve` constant is available, but #124
-must subtract the
-reserve in trip free-space checks when activating diagnostics; today's trip
-behavior is unchanged.
+fallback. Part A of #124 protects the exported `kLittleFsJournalReserve` in
+LittleFS trip free-space checks, including boot
+capacity reporting and the start/stop guards. It subtracts
+`max(0, 65536 - existing_diag_allocation)` from physical free space: already
+allocated diagnostic bytes are already in filesystem usage. Failure to enumerate
+allocation conservatively keeps the entire reserve. This applies even while SD
+is healthy, so flash fallback has space available. Trip files, splitting,
+recovery and upload policy otherwise retain their existing behavior.
 
 `restoreStatusSequence(highWater)` explicitly enrolls/restores the **SD-only**
 revision authority after comparison with the server's high-water mark.
@@ -508,12 +524,57 @@ hardware testing.
 CRC damage, full/read-only media, overflow, retention, failures and exhaustion)
 and a stdlib Python bridge that feeds actual exported C++ events through
 `common.diagnostics.validate_request`, covering every catalog context field,
-integer endpoint and enum value. These tests do not validate an SD/FAT adapter.
-#124 wires producers (including the retained PMU startup helper) and storage;
+integer endpoint and enum value. Stage 4 integration tests also exercise the
+adapters against the trip harness's fake disks, reserve/quotas, NVS counter,
+notices, lock contention and shutdown. Direct production VFS tests check sync,
+close and enumeration errors. None of these establishes SD/FAT power-cut safety.
+#124 part A wires boot producers (including the retained PMU startup helper) and storage;
 #125 wires transport, status snapshots and durable isolation for rejected events;
-#126 wires bounded degraded startup/retry behavior. None runs in Stage 4 yet.
+#126 wires bounded degraded startup/retry behavior. Uploads, snapshots and the
+degraded loop do not run in Stage 4 yet.
 
-After the Supreme port, #124 wires PMU, charge guard, GPS/config/time, storage,
+### Stage 4 boot and shutdown plumbing (#124 part A)
+
+The boot-time trip-store selection is unchanged: SD when mounted, otherwise
+LittleFS, with no destination changes during a trip. Diagnostics try that boot's
+mounted SD first, then mounted LittleFS, then the existing 16-record RAM queue.
+An absent store is never mounted later just for diagnostics. SD allocation units
+come from its FAT boot sector (including an MBR primary partition); unreadable
+geometry disables SD journaling for this boot while leaving trip storage alone.
+Flash uses the ESP32 LittleFS 4096-byte allocation block. Segments, 16 MiB SD
+quota, 64 KiB flash quota and checksummed metadata use EventLog's format above.
+Adapters only access `/diag`; they never format media or remove trip files.
+
+`journal_boot.h` obtains a random 128-bit boot ID through `esp_fill_random` and
+increments `diag/boots` in NVS Preferences once per boot, verifying persistence.
+Failed NVS writes or exhaustion use counter zero with an unavailable status;
+the fresh random identity remains usable. The counter is diagnostic information,
+never the snapshot revision allocator or an ordering authority. No snapshot
+revision is enrolled or allocated by part A.
+
+Core 1 enqueues E1000 BOOT with `esp_reset_reason()` mapped to
+`power_on|deep_sleep|software|watchdog|brownout|panic|other`; unknown/new reset
+reasons map to `other`. Watchdog, brownout and panic also enqueue their existing
+E1003, E1004 and E1005 notices. `makePmuStartupEvent(gPmuStartup)` adds E2007
+only after recovery/retries or another non-clean startup result. All notices
+have null episodes and unknown wall time. A clean first-attempt PMU boot adds
+no E2007. Failed PMU/storage startup still halts before journal initialization;
+reporting those paths needs #126. Debug builds print one journal boot line with
+the active backend and physical unacknowledged valid-frame/segment counts;
+uncertain inventory is labeled incomplete. Ambiguous writes can retain duplicate
+IDs, so physical frame counts can exceed distinct event counts.
+
+Before PMU shutdown, core 1 ends the trip and stops networking, then asks the
+core-0 consumer to drain the bounded queue and seal open segments. The consumer
+closes each write before returning. Core 1 waits at most 15 seconds for this
+handoff, reports incomplete drain/sealing when necessary, and takes FS_LOCK
+through both unmounts and power-off. No diagnostic I/O can reach unmounted media.
+Cancelled/failed shutdown remounts the same stores and invalidates journal
+caches while retaining the boot identity and RAM queue. RAM-only history is lost
+on reset/power-off. Hardware tests must measure individual VFS operation latency
+and trip-write delay, plus induced failures during sealing and remount.
+
+Part B of #124 still wires PMU, charge guard, GPS/config/time, storage,
 trip recovery, networking, display and reset paths to these codes. Thresholds
 belong with the actual subsystem policy, not hard-coded catalog text. #126
 keeps a bounded service loop alive if PMU/storage initialization fails: show or

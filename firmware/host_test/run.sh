@@ -28,7 +28,7 @@ fi
 # Optimizing compilers (including zig c++) may define NDEBUG implicitly.
 # Apply these flags to EVERY build, including the C++14-only tests below.
 assert_flags=(-UNDEBUG -include "$here/assertions_enabled.h")
-flags=("${assert_flags[@]}" -std=gnu++20 -O1 -w -DDISPLAY_DEBUG=0)
+flags=("${assert_flags[@]}" -std=gnu++20 -O1 -w -DDISPLAY_DEBUG=0 -DJOURNAL_HOST_TEST)
 incs=(-I"$here/stubs" -I"$here/../04_trip_logger" -I"$build/include")
 status=0
 
@@ -52,8 +52,19 @@ echo "== test_event_log"
 "${PYTHON:-python}" "$here/check_event_log_protocol.py" "$build/test_event_log.exe" || status=1
 
 echo "== test_fs"
-"${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_fs.cpp" -o "$build/test_fs.exe"
+"${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_fs.cpp" "$here/../04_trip_logger/event_log.cpp" -o "$build/test_fs.exe"
 "$build/test_fs.exe" "$build/out" || status=1
+
+echo "== test_journal (Stage 4 mounted adapter/service integration)"
+"${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_journal.cpp" \
+    "$here/../04_trip_logger/event_log.cpp" -o "$build/test_journal.exe"
+"$build/test_journal.exe" || status=1
+
+echo "== test_journal_vfs (checked mounted VFS operations)"
+"${cxx[@]}" "${flags[@]}" -I"$here/../04_trip_logger" "$here/test_journal_vfs.cpp" \
+    -o "$build/test_journal_vfs.exe"
+vfs_root="$(mktemp -d -t diag-vfs-XXXXXX)"
+"$build/test_journal_vfs.exe" "$vfs_root" || status=1
 
 # Each sketch carries its own recovery header; exercise every copy.
 for sketch in 02_pmu_test 03_gps_test 04_trip_logger; do
@@ -68,18 +79,23 @@ echo "== test_gps"
 if [ -f "$tinygps/TinyGPS++.cpp" ]; then
     # Real library dir first, so <TinyGPSPlus.h> resolves to it, not the stub.
     "${cxx[@]}" "${flags[@]}" -DARDUINO=100 -I"$tinygps" "${incs[@]}" \
-        "$here/test_gps.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_gps.exe"
+        "$here/test_gps.cpp" "$here/../04_trip_logger/event_log.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_gps.exe"
     "$build/test_gps.exe" "$build/out" || status=1
     echo "== test_gps (DISPLAY_DEBUG=1, real parser, stub OLED)"
     "${cxx[@]}" "${flags[@]}" -UDISPLAY_DEBUG -DDISPLAY_DEBUG=1 -DARDUINO=100 \
         -I"$tinygps" "${incs[@]}" -I"$here/display_stubs" \
-        "$here/test_gps.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_gps_debug.exe"
+        "$here/test_gps.cpp" "$here/../04_trip_logger/event_log.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_gps_debug.exe"
     mkdir -p "$build/out-debug"
     "$build/test_gps_debug.exe" "$build/out-debug" || status=1
     # Identical synthetic drives must produce byte-identical GPX in both modes.
     for file in "$build/out-debug/"*.gpx; do
         cmp "$file" "$build/out/$(basename "$file")" || status=1
     done
+    echo "== test_journal (DISPLAY_DEBUG=1, boot reporting and remount)"
+    "${cxx[@]}" "${flags[@]}" -UDISPLAY_DEBUG -DDISPLAY_DEBUG=1 -DARDUINO=100 \
+        -I"$tinygps" "${incs[@]}" -I"$here/display_stubs" "$here/test_journal.cpp" \
+        "$here/../04_trip_logger/event_log.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_journal_debug.exe"
+    "$build/test_journal_debug.exe" || status=1
     echo "== test_debug_status (formatting and real GSV parser)"
     "${cxx[@]}" "${flags[@]}" -DARDUINO=100 -I"$tinygps" "${incs[@]}" \
         "$here/test_debug_status.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_debug_status.exe"

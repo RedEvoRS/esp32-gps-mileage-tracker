@@ -179,6 +179,16 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   after >10s without NAV-PVT from config end or the last NAV-PVT, warn once
   and fall back to RMC-only speed
 - FreeRTOS: networking on core 0, GPS on core 1
+- Stage 4 diagnostics: static EventLog, random boot identity and NVS boot
+  counter; boot/reset and retained PMU recovery notices only. The network
+  task services one queued record at a time using a zero-wait filesystem
+  lock and yields maintenance to trip/upload demand. Mounted SD has a
+  16 MiB journal quota; LittleFS has a 64 KiB reserve included in trip
+  free-space checks; both failing leaves a bounded volatile RAM queue.
+  Journal writes use checked mounted VFS sync/close, never format media,
+  and seal on core 0 before PMU unmount/power-off. Diagnostic uploads,
+  subsystem fault hooks, degraded startup and OLED error codes remain
+  integration work; host tests do not establish storage timing or durability
 - Five-state FSM for trip lifecycle
 
 ### Server
