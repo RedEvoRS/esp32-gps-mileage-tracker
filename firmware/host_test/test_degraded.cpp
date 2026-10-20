@@ -53,6 +53,10 @@ static RuntimeFaults::Observation observation(unsigned code) {
     assert(false); return {};
 }
 static void noTrips() {
+#if DISPLAY_DEBUG
+    assert(!gDebugTempEnabled);
+    assert(std::find(PMU.operations.begin(), PMU.operations.end(), "writeRegister") == PMU.operations.end());
+#endif
     assert(gState == IDLE && !gTripPath[0] && gArmCount == 0 && gPendCount == 0);
     for (auto* disk : {&g_disk, &g_sdDisk}) for (const auto& file : disk->files)
         assert(file.first.rfind("/trips/", 0) != 0);

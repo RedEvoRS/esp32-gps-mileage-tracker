@@ -626,7 +626,8 @@ How it behaves once flashed:
 - **Charging:** the firmware pauses charging at high or low temperatures
   reported by the AXP2101 power-management chip. Its temperature is an
   indirect estimate using a 9 °C die-temperature offset measured on the
-  retired V1.2; recalibration for the Supreme is still pending. It is not
+  retired V1.2; recalibration for the Supreme is still pending. Debug builds
+  log the readings it needs (the `Temp:` line under [The screen](#the-screen)). It is not
   a measurement of the battery cell or a guarantee of safe charging in a
   hot car. Logging continues while charging is paused.
   The guard verifies every charger on/off command with a checked register read
@@ -813,6 +814,17 @@ Things to know:
   `rf --`, and unknown or stale NMEA values show `--`. Antenna status
   and power may read `DONTKNOW` without an antenna supervisor; that
   alone does not mean the antenna failed.
+- Debug builds also print a `Temp:` line every 30 s: the guard's PMU die
+  temperature with sample age and its die-minus-9 C estimate (the retired
+  V1.2 calibration; samples older than 35 s show `--`),
+  TS voltage/raw ADC count, BME280 temperature, actual charging/phase,
+  battery voltage/percent and VBUS. Unavailable values show `--`. Compare
+  TS voltage across temperatures to identify whether the Supreme's TS
+  resistor is fixed (flat) or a thermistor (temperature-dependent); TS stays
+  independent of the charger, with a 50 uA measurement bias. BME280 uses
+  temperature-only forced mode on the OLED's core/bus; its ALDO1 supply
+  (also OLED/magnetometer) is left as found. These readings do not change
+  the guard's offset or thresholds. The line and probes are debug-only.
 - The screen can't stop logging. If it's missing or an I2C write fails,
   the serial log says `WARNING: debug OLED I2C failed` once and the
   screen stays off until the next boot.

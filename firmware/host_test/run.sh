@@ -32,6 +32,11 @@ flags=("${assert_flags[@]}" -std=gnu++20 -O1 -w -DDISPLAY_DEBUG="${DISPLAY_DEBUG
 incs=(-I"$here/stubs" -I"$here/../04_trip_logger" -I"$build/include" -I"$here/display_stubs")
 status=0
 
+echo "== test_temperature (Bosch compensation and checked debug probes)"
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -O1 -Wall -Wextra -pedantic \
+    "$here/test_temperature.cpp" -o "$build/test_temperature.exe"
+"$build/test_temperature.exe" || status=1
+
 echo "== test_degraded_policy"
 "${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -pedantic "$here/test_degraded_policy.cpp" -o "$build/test_degraded_policy.exe"
 "$build/test_degraded_policy.exe" || status=1
@@ -122,6 +127,11 @@ if [ -f "$tinygps/TinyGPS++.cpp" ]; then
         "$here/test_gps.cpp" "$here/../04_trip_logger/event_log.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_gps_debug.exe"
     mkdir -p "$build/out-debug"
     "$build/test_gps_debug.exe" "$build/out-debug" || status=1
+    echo "== test_temperature_runtime (DISPLAY_DEBUG=1, real sketch)"
+    "${cxx[@]}" "${flags[@]}" -UDISPLAY_DEBUG -DDISPLAY_DEBUG=1 -DARDUINO=100 \
+        -I"$tinygps" "${incs[@]}" "$here/test_temperature_runtime.cpp" \
+        "$here/../04_trip_logger/event_log.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_temperature_runtime.exe"
+    "$build/test_temperature_runtime.exe" || status=1
     # Identical synthetic drives must produce byte-identical GPX in both modes.
     for file in "$build/out-debug/"*.gpx; do
         cmp "$file" "$build/out/$(basename "$file")" || status=1

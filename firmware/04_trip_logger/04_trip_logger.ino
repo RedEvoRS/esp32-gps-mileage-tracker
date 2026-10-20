@@ -78,6 +78,12 @@
 #endif
 #if DISPLAY_DEBUG
 #include "debug_display.h"
+#include "debug_temperature.h"
+static float gDebugTempDie = NAN;
+static uint32_t gDebugTempDieMs = 0, gDebugTempLogMs = 0;
+static bool gDebugTempEnabled = false, gDebugTempPending = false;
+static debug_temperature::TsSetup gDebugTempTs;
+static bme280_temp::Sensor gDebugTempBme;
 #else
 #include "production_display.h"
 static display::DisplayModel gDisplayModel;
@@ -1640,14 +1646,15 @@ static void serviceBatteryDiagnostics() {
 // Battery charge temperature guard (audit N4)
 // -----------------------------------------------------------------
 // Li-ion must only be charged at roughly 0-45 C cell temperature, and a
-// parked car's cabin passes 60 C in summer. The T-Beam has no battery
-// thermistor (XPowersLib disables the TS pin), so the AXP2101's own die
-// temperature stands in. Measured on this board 2026-10-05: the die idles
+// parked car's cabin passes 60 C in summer. TS is excluded from charging
+// (the Supreme's Rt is unidentified), so the AXP2101's own die temperature
+// stands in. Measured on the retired V1.2 2026-10-05: the die idles
 // ~9 C above a 25.6 C room with nothing charging, and charge current heats
 // it a few degrees more within seconds. Hence the offset, and a 7 C gap
 // between pausing and resuming so the charger's own heat can't make it
 // toggle. Pausing charging never affects logging: on USB the PMU powers
 // the board directly; the battery just isn't topped up until it cools.
+// Supreme debug-only Temp: logs collect recalibration evidence; no tuning yet.
 static constexpr float    DIE_OFFSET_C      = 9.0f;
 static constexpr float    CHG_HOT_PAUSE_C   = 45.0f + DIE_OFFSET_C;   // battery ~45 C
 static constexpr float    CHG_HOT_RESUME_C  = 38.0f + DIE_OFFSET_C;   // battery ~38 C
@@ -1671,6 +1678,11 @@ static void serviceChargeTemp() {
     gChargeChecked = true;
 
     float die = PMU.getTemperature();
+#if DISPLAY_DEBUG
+    // Reuse this exact sample, including NAN on failure. No second PMU read.
+    gDebugTempDie = die;
+    gDebugTempDieMs = now;
+#endif
     bool pause;
     const char* why = "";
     if (!std::isfinite(die)) {
@@ -2657,6 +2669,70 @@ static void serviceDebugRf() {
 }
 
 #if DISPLAY_DEBUG
+static void beginDebugTemperature() {
+    // Only normal startup reaches here, after LoRa-off verification, storage,
+    // and the first guard check. PMU/Wire1 accesses (including RTC and IRQ
+    // batches) all run serially on core 1; the ISR only sets a flag. There is
+    // no PMU access from the networking task and no PMU mutex to acquire.
+    gDebugTempTs = debug_temperature::setupTs(PMU);
+    char control[8] = "--", adc[8] = "--";
+    if (gDebugTempTs.control >= 0) snprintf(control, sizeof control, "0x%02X", gDebugTempTs.control);
+    if (gDebugTempTs.adc >= 0) snprintf(adc, sizeof adc, "0x%02X", gDebugTempTs.adc);
+    Serial.printf("Temp setup: TS %s, REG50 %s, REG30 %s (target external input, 50 uA).\n",
+                  gDebugTempTs.ready ? "verified" : "unavailable", control, adc);
+    // ALDO1 supplies BME280 + OLED + magnetometer. Do not change any rail:
+    // Stage 4 leaves ALDO1 as found; an unpowered/missing sensor shows --.
+    gDebugTempEnabled = true;
+    gDebugTempPending = false;
+    gDebugTempLogMs = millis();
+}
+
+static void serviceDebugTemperature() {
+    if (!gDebugTempEnabled || gDegraded.mode() != startup::Mode::Normal) return;
+    uint32_t now = millis();
+    if (!gDebugTempPending) {
+        // Same rollover-safe 30 s scheduling pattern as serviceDebugRf().
+        if (uint32_t(now - gDebugTempLogMs) < 30000) return;
+        gDebugTempLogMs = now;
+        gDebugTempPending = true;
+        if (gDebugWireReady && gDebugTempBme.trigger(Wire, now)) return;
+    }
+    if (gDebugTempBme.waiting(now)) return;
+    int32_t centiC = 0;
+    bool bmeOk = gDebugWireReady && gDebugTempBme.finish(Wire, now, centiC);
+    gDebugTempPending = false;
+
+    int raw = -1;
+    if (gDebugTempTs.ready) {
+        int high = PMU.readRegister(0x36); // high first latches low (datasheet)
+        int low = PMU.readRegister(0x37);
+        raw = debug_temperature::tsRaw(high, low);
+    }
+    const auto p = debug_temperature::samplePower(PMU, now);
+    char die[40] = "-- C", estimate[16] = "--", ts[16] = "--", tsRaw[8] = "--";
+    char bme[16] = "--", volts[16] = "--", percent[8] = "--";
+    // Independent 30 s schedules can drift. Reuse the latest guard sample
+    // through one guard interval plus 5 s, and report its age explicitly.
+    uint32_t dieAgeMs = uint32_t(now - gDebugTempDieMs);
+    if (gChargeChecked && dieAgeMs <= CHG_CHECK_MS + 5000 && std::isfinite(gDebugTempDie)) {
+        snprintf(die, sizeof die, "%.1f C (%lu s)", gDebugTempDie, (unsigned long)(dieAgeMs / 1000));
+        snprintf(estimate, sizeof estimate, "%.1f", gDebugTempDie - DIE_OFFSET_C);
+    }
+    if (raw >= 0) {
+        snprintf(ts, sizeof ts, "%.3f", debug_temperature::tsVolts(raw));
+        snprintf(tsRaw, sizeof tsRaw, "%d", raw);
+    }
+    if (bmeOk) snprintf(bme, sizeof bme, "%.2f", centiC / 100.0);
+    if (p.millivolts >= 0) snprintf(volts, sizeof volts, "%.2f", p.millivolts / 1000.0);
+    if (p.percent >= 0) snprintf(percent, sizeof percent, "%d", p.percent);
+    const char* charging = p.status2 < 0 ? "--" : debug_temperature::isCharging(p.status2) ? "on" : "off";
+    auto vbus = pmu_read::vbusState(p.status1, p.status2);
+    Serial.printf("Temp: die %s, guard_est %s C, TS %s V, TS_raw %s, BME280 %s C, "
+                  "chg %s, phase %s, batt %s V, pct %s, VBUS %s\n",
+                  die, estimate, ts, tsRaw, bme, charging, debug_temperature::phase(p.status2),
+                  volts, percent, vbus == VbusState::Unknown ? "--" : vbus == VbusState::Present ? "1" : "0");
+}
+
 static void serviceDebugDisplay() {
     uint32_t now = millis();
     if (!gDebugDisplayReady || now - gDebugDrawMs < 1000) return;
@@ -2944,6 +3020,7 @@ void setup() {
 
 #if DISPLAY_DEBUG
     beginDebugDisplay();
+    beginDebugTemperature();
 #endif
     initEventUpload();
     // --- Networking task on core 0; GPS/FSM stay on core 1 (loop) ---
@@ -3008,6 +3085,7 @@ void loop() {
     }
 #if DISPLAY_DEBUG
     serviceDebugDisplay();
+    serviceDebugTemperature();
 #else
     serviceProductionDisplay();
 #endif
