@@ -471,12 +471,12 @@ struct TwoWire {
 extern TwoWire Wire, Wire1;
 #define AXP2101_SLAVE_ADDRESS 0x34
 #define XPOWERS_AXP2101_ALL_IRQ 0xffffffff
-#define XPOWERS_AXP2101_VBUS_REMOVE_IRQ 1
-#define XPOWERS_AXP2101_VBUS_INSERT_IRQ 2
-#define XPOWERS_AXP2101_PKEY_LONG_IRQ 4
-#define XPOWERS_AXP2101_PKEY_SHORT_IRQ 8
-#define XPOWERS_AXP2101_WARNING_LEVEL2_IRQ 16
-#define XPOWERS_AXP2101_WARNING_LEVEL1_IRQ 32
+#define XPOWERS_AXP2101_VBUS_REMOVE_IRQ (1u << 14)
+#define XPOWERS_AXP2101_VBUS_INSERT_IRQ (1u << 15)
+#define XPOWERS_AXP2101_PKEY_LONG_IRQ (1u << 10)
+#define XPOWERS_AXP2101_PKEY_SHORT_IRQ (1u << 11)
+#define XPOWERS_AXP2101_WARNING_LEVEL2_IRQ (1u << 7)
+#define XPOWERS_AXP2101_WARNING_LEVEL1_IRQ (1u << 6)
 #define XPOWERS_AXP2101_CHG_VOL_4V1 2
 // PMU: tests set vbusIn (the USB power level) and the latched VBUS
 // interrupt flags, then raise gPmuIrqFlag as the IRQ pin would.
@@ -485,24 +485,37 @@ constexpr uint8_t XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL = 0x18;
 constexpr uint8_t XPOWERS_AXP2101_STATUS1 = 0x00;
 constexpr uint8_t XPOWERS_AXP2101_STATUS2 = 0x01;
 constexpr uint8_t XPOWERS_AXP2101_LDO_ONOFF_CTRL0 = 0x90;
+constexpr uint8_t XPOWERS_AXP2101_INTSTS1 = 0x48;
+constexpr uint8_t XPOWERS_AXP2101_INTSTS2 = 0x49;
+constexpr uint8_t XPOWERS_AXP2101_INTSTS3 = 0x4A;
+constexpr uint8_t XPOWERS_AXP2101_LOW_BAT_WARN_SET = 0x1A;
 struct XPowersAXP2101 {
     // Per-register one-based call injection, independent of other PMU reads.
     std::map<uint8_t, unsigned> registerReadCalls;
     std::map<uint8_t, unsigned> failRegisterReadAt;
+    std::map<uint8_t, int> registerReadOverride;
+    std::function<void(uint8_t)> onRegisterRead;
     bool vbusNotIn = false; // STATUS2 bit 3, independently test library semantics
-    bool failChargeDisable = false, failChargeRead = false;
+    bool failChargeDisable = false, failChargeEnable = false, failChargeRead = false;
     int readRegister(uint8_t reg) {
         operations.push_back("readRegister");
         unsigned call = ++registerReadCalls[reg];
+        if (onRegisterRead) onRegisterRead(reg);
         if (failRegisterReadAt.count(reg) && failRegisterReadAt[reg] == call) return -1;
+        if (registerReadOverride.count(reg)) return registerReadOverride[reg];
         if (reg == XPOWERS_AXP2101_STATUS1) return (vbusIn ? 0x20 : 0) | (batteryConnected ? 0x08 : 0);
         if (reg == XPOWERS_AXP2101_STATUS2) return vbusNotIn ? 0x08 : 0;
         if (reg == XPOWERS_AXP2101_LDO_ONOFF_CTRL0) return aldo3 ? 0x04 : 0;
+        if (reg == XPOWERS_AXP2101_INTSTS1) return (lowIrq ? 0x40 : 0) | (criticalIrq ? 0x80 : 0);
+        if (reg == XPOWERS_AXP2101_INTSTS2) return (removeIrq ? 0x40 : 0) | (insertIrq ? 0x80 : 0) |
+            (longPressIrq ? 0x04 : 0) | (shortPressIrq ? 0x08 : 0);
+        if (reg == XPOWERS_AXP2101_INTSTS3) return 0;
+        if (reg == XPOWERS_AXP2101_LOW_BAT_WARN_SET) return (lowWarnNibble << 4) | criticalPercent;
         assert(reg == XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL);
         return failChargeRead ? -1 : chargeEnabled ? 0x02 : 0;
     }
     bool vbusIn = true, removeIrq = false, insertIrq = false;
-    bool longPressIrq = false, criticalIrq = false, lowIrq = false;
+    bool longPressIrq = false, shortPressIrq = false, criticalIrq = false, lowIrq = false;
     bool batteryConnected = true;
     int batteryPercent = 85;
     uint16_t batteryMv = 4020;
@@ -556,12 +569,12 @@ struct XPowersAXP2101 {
     float dieC = 30.0f; bool chargeEnabled = true;   // tests set dieC
     void enableTemperatureMeasure() { operations.push_back("enableTemperatureMeasure");}
     float getTemperature(uint16_t* = nullptr) { operations.push_back("getTemperature"); return dieC; }
-    void enableCellbatteryCharge() { operations.push_back("enableCellbatteryCharge"); chargeEnabled = true; }
+    void enableCellbatteryCharge() { operations.push_back("enableCellbatteryCharge"); if (!failChargeEnable) chargeEnabled = true; }
     void disableCellbatteryCharge() { operations.push_back("disableCellbatteryCharge"); if (!failChargeDisable) chargeEnabled = false; }
     void enableBattDetection() { operations.push_back("enableBattDetection");} void enableBattVoltageMeasure() { operations.push_back("enableBattVoltageMeasure");}
     void enableVbusVoltageMeasure() { operations.push_back("enableVbusVoltageMeasure");} void enableSystemVoltageMeasure() { operations.push_back("enableSystemVoltageMeasure");}
     void disableIRQ(uint32_t) { operations.push_back("disableIRQ");} void enableIRQ(uint32_t) { operations.push_back("enableIRQ");}
-    void clearIrqStatus() { operations.push_back("clearIrqStatus"); removeIrq = insertIrq = longPressIrq = criticalIrq = lowIrq = false; }
+    void clearIrqStatus() { operations.push_back("clearIrqStatus"); removeIrq = insertIrq = longPressIrq = shortPressIrq = criticalIrq = lowIrq = false; }
     uint32_t getIrqStatus() { operations.push_back("getIrqStatus"); return 0; }
     bool isVbusRemoveIrq() { operations.push_back("isVbusRemoveIrq"); return removeIrq; } bool isVbusInsertIrq() { operations.push_back("isVbusInsertIrq"); return insertIrq; }
     bool isPekeyLongPressIrq() { operations.push_back("isPekeyLongPressIrq"); return longPressIrq; } bool isDropWarningLevel2Irq() { operations.push_back("isDropWarningLevel2Irq"); return criticalIrq; }

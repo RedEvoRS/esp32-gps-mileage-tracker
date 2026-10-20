@@ -139,6 +139,7 @@ static void resetWorld() {
     gPendCount = gPendHead = 0; armBufReset(); gHaveLastFix = false;
     gClockSet = false; gVbusLost = false;
     gVbusRetry = VbusRetry::None; gVbusRetryMs = gVbusOffReadMs = 0;
+    gPmuIrqRetry = false; gPmuIrqReadMs = 0; gBatteryThresholds = -1;
     gDiagnosticClock.~DiagnosticClock(); new (&gDiagnosticClock) diagnostics::DiagnosticClock;
     gRtc = diagnostics::RtcRuntime();
     gGpsClockSet = false; gLastGpsSyncMs = 0;

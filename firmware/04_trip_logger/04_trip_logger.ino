@@ -310,7 +310,7 @@ static bool gJournalStarted = false; // under FS_LOCK; core-0 consumer only
 static bool gJournalBootReported = false;
 // Single writer per array/builder. Only EventLog's try-lock crosses cores.
 static diagnostics::RuntimeFaults::Condition gLoopConditions[] = {
-    {2001}, {2002}, {2003}, {2004}, {2005}, {2006}, {3001}, {3002}, {3005}, {3006}, {3007}, {3008}, {3009},
+    {2001}, {2002}, {2003}, {2004}, {2005}, {2006}, {2008}, {3001}, {3002}, {3005}, {3006}, {3007}, {3008}, {3009},
     {4001}, {4002}, {4003}, {4004}, {4005}, {4006}, {6001}
 };
 static diagnostics::RuntimeFaults::Condition gNetConditions[] = {
@@ -1370,16 +1370,21 @@ static void fsckAllTrips(fs::FS& storage) {
 // =================================================================
 void IRAM_ATTR onPmuIrq() { gPmuIrqFlag = true; }
 
+// One mask for both IRQ configuration and checked-batch interpretation.
+static constexpr uint32_t PMU_ENABLED_IRQS =
+    XPOWERS_AXP2101_VBUS_REMOVE_IRQ | XPOWERS_AXP2101_VBUS_INSERT_IRQ |
+    XPOWERS_AXP2101_PKEY_LONG_IRQ | XPOWERS_AXP2101_WARNING_LEVEL1_IRQ |
+    XPOWERS_AXP2101_WARNING_LEVEL2_IRQ;
+static constexpr uint32_t PMU_IRQ_RETRY_MS = 100;
+static bool gPmuIrqRetry = false;
+static uint32_t gPmuIrqReadMs = 0;
+
 static void setupPmuIrq() {
     pinMode(PMU_IRQ_PIN, INPUT);
     attachInterrupt(digitalPinToInterrupt(PMU_IRQ_PIN), onPmuIrq, FALLING);
     PMU.disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
     PMU.clearIrqStatus();
-    PMU.enableIRQ(XPOWERS_AXP2101_VBUS_REMOVE_IRQ |
-                  XPOWERS_AXP2101_VBUS_INSERT_IRQ |
-                  XPOWERS_AXP2101_PKEY_LONG_IRQ   |
-                  XPOWERS_AXP2101_WARNING_LEVEL1_IRQ |
-                  XPOWERS_AXP2101_WARNING_LEVEL2_IRQ);
+    PMU.enableIRQ(PMU_ENABLED_IRQS);
 }
 
 // Stop the network task before storage is unmounted (issue #3). It starts
@@ -1559,30 +1564,43 @@ static void powerOffForVbus() {
 }
 
 static void pollPmu() {
-    if (!gPmuIrqFlag) return;
+    if (!gPmuIrqFlag && !gPmuIrqRetry) return;
+    uint32_t now = millis();
+    if (gPmuIrqRetry && uint32_t(now - gPmuIrqReadMs) < PMU_IRQ_RETRY_MS) return;
+    // Consume only the pending edge before reading; an ISR during the reads
+    // can set it again. Failed batches retain a separate pending retry even
+    // though an asserted IRQ line cannot produce another falling edge.
     gPmuIrqFlag = false;
-    PMU.getIrqStatus();   // latch status registers before testing
+    gPmuIrqReadMs = now;
+    int first = PMU.readRegister(XPOWERS_AXP2101_INTSTS1);
+    int second = PMU.readRegister(XPOWERS_AXP2101_INTSTS2);
+    int third = PMU.readRegister(XPOWERS_AXP2101_INTSTS3);
+    const auto irq = pmu_read::irqBatch(first, second, third, PMU_ENABLED_IRQS);
+    gPmuIrqRetry = !irq.known;
+    if (!irq.known) return; // no actions or clears: real flags stay latched
 
     // Treat either VBUS interrupt as "power changed" and read the actual
     // level: a short dip can latch REMOVE and INSERT in the same batch,
     // and the flags don't say which came last.
-    if (PMU.isVbusRemoveIrq() || PMU.isVbusInsertIrq()) {
+    if (irq.has(XPOWERS_AXP2101_VBUS_REMOVE_IRQ) || irq.has(XPOWERS_AXP2101_VBUS_INSERT_IRQ)) {
         observeVbusChange(vbusState());
     }
-    if (PMU.isPekeyLongPressIrq())    powerOffForVbus();
+    if (irq.has(XPOWERS_AXP2101_PKEY_LONG_IRQ)) powerOffForVbus();
     // Observe hardware's existing low/critical policy before shutdown. Never
     // submit from the ISR (it only latches gPmuIrqFlag).
     if (gJournalReady) {
-        if (PMU.isDropWarningLevel1Irq())
+        if (irq.has(XPOWERS_AXP2101_WARNING_LEVEL1_IRQ))
             batteryCondition(2002, true, millis());
-        if (PMU.isDropWarningLevel2Irq())
+        if (irq.has(XPOWERS_AXP2101_WARNING_LEVEL2_IRQ))
             batteryCondition(2003, true, millis());
     }
-    if (PMU.isDropWarningLevel2Irq()) powerOffForVbus();
+    if (irq.has(XPOWERS_AXP2101_WARNING_LEVEL2_IRQ)) powerOffForVbus();
 
     PMU.clearIrqStatus();   // write-1-to-clear, or the line never re-fires
 }
 
+// Stage 4 never writes LOW_BAT_WARN_SET. Cache only a successful read.
+static int gBatteryThresholds = -1;
 static void serviceBatteryDiagnostics() {
     uint32_t now = millis();
     if (!gJournalReady || (gBatteryDiagChecked && uint32_t(now - gBatteryDiagMs) < 30000)) return;
@@ -1592,8 +1610,11 @@ static void serviceBatteryDiagnostics() {
     if (percent < 0 || percent > 100) return;
     // The existing shutdown is AXP2101's SOC level-2 IRQ, not a firmware
     // voltage cutoff. XPowersLib 0.3.3 returns the raw level-1 nibble: +5%.
-    unsigned low = PMU.getLowBatWarnThreshold() + 5;
-    unsigned critical = PMU.getLowBatShutdownThreshold();
+    if (gBatteryThresholds < 0)
+        gBatteryThresholds = PMU.readRegister(XPOWERS_AXP2101_LOW_BAT_WARN_SET);
+    if (gBatteryThresholds < 0) return; // unmeasured: neither raise nor clear
+    unsigned low = ((gBatteryThresholds >> 4) & 0x0F) + 5;
+    unsigned critical = gBatteryThresholds & 0x0F;
     batteryCondition(2002, unsigned(percent) <= low, now);
     batteryCondition(2003, unsigned(percent) <= critical, now);
 }
@@ -1616,32 +1637,66 @@ static constexpr float    CHG_HOT_RESUME_C  = 38.0f + DIE_OFFSET_C;   // battery
 static constexpr float    CHG_COLD_PAUSE_C  =  0.0f + DIE_OFFSET_C;   // battery ~0 C
 static constexpr float    CHG_COLD_RESUME_C =  5.0f + DIE_OFFSET_C;   // battery ~5 C
 static constexpr uint32_t CHG_CHECK_MS      = 30UL * 1000;
-static bool     gChargePaused  = false;
-static bool     gChargeApplied = false;   // has the guard set the charger yet?
+// The first temperature check must command/verify explicitly: the charger
+// keeps its state across ESP32 resets. Only matching read-back confirms it.
+static pmu_read::ChargeState gChargeState = pmu_read::ChargeState::Unconfirmed;
+static bool     gChargeChecked = false;
+static bool     gChargePauseRequested = false; // hysteresis follows intent, even on failure
+static uint8_t  gChargeFailures = 0;
+static constexpr uint8_t CHG_FAILURE_LIMIT = 3;
 static uint32_t gChargeCheckT0 = 0;
 
 static void serviceChargeTemp() {
     uint32_t now = millis();
-    if (gChargeApplied && now - gChargeCheckT0 < CHG_CHECK_MS) return;
+    if (gChargeChecked && uint32_t(now - gChargeCheckT0) < CHG_CHECK_MS) return;
     gChargeCheckT0 = now;
+    bool first = !gChargeChecked;
+    gChargeChecked = true;
 
     float die = PMU.getTemperature();
     bool pause;
     const char* why = "";
-    if (isnan(die)) {
+    if (!std::isfinite(die)) {
         pause = true;                        // can't tell: fail safe
         why = "temperature unreadable";
-    } else if (gChargeApplied && gChargePaused) {
+    } else if (gChargePauseRequested) {
         pause = !(die <= CHG_HOT_RESUME_C && die >= CHG_COLD_RESUME_C);
+        why = die > CHG_HOT_RESUME_C ? "too hot" : "too cold";
     } else {
         pause = die >= CHG_HOT_PAUSE_C || die <= CHG_COLD_PAUSE_C;
         why = die >= CHG_HOT_PAUSE_C ? "too hot" : "too cold";
     }
+    gChargePauseRequested = pause;
+
+    const auto intended = pause ? pmu_read::ChargeState::Paused : pmu_read::ChargeState::Charging;
+    if (gChargeState != intended) {
+        if (pause) PMU.disableCellbatteryCharge();
+        else PMU.enableCellbatteryCharge();
+        // The void XPowersLib commands discard their write result. A readable
+        // matching bit is the only evidence that the intended state took effect.
+        auto actual = pmu_read::chargeState(PMU.readRegister(XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL));
+        gChargeState = actual == intended ? intended : pmu_read::ChargeState::Unconfirmed;
+        if (gChargeState == pmu_read::ChargeState::Unconfirmed) {
+            if (gChargeFailures < CHG_FAILURE_LIMIT) ++gChargeFailures;
+            Serial.println("Charge control unconfirmed; retrying in 30 s.");
+        } else {
+            gChargeFailures = 0;
+            if (pause) {
+                Serial.printf("Charging paused: %s (die %.1f C, battery ~%.0f C)\n",
+                              why, die, die - DIE_OFFSET_C);
+            } else {
+                Serial.printf(first ? "Charge guard: die %.1f C (battery ~%.0f C), charging on.\n"
+                                    : "Charging resumed (die %.1f C, battery ~%.0f C)\n",
+                              die, die - DIE_OFFSET_C);
+            }
+        }
+    }
 
     if (gJournalReady) {
-        // Follow the guard's hysteresis, including a changed pause reason while
-        // the charger stays off. Context is measured die temperature, not an
-        // invented cell measurement. Unreadable samples carry no temperature.
+        // E2004/E2005 describe a required pause, not a confirmed charger state.
+        // Follow intent/hysteresis even if control is unconfirmed. Context is
+        // measured die temperature, not an invented cell measurement.
+        // Unreadable samples carry no temperature.
         bool unreadable = !std::isfinite(die);
         if (!unreadable) {
             for (uint16_t code : {2004, 2005}) {
@@ -1651,24 +1706,8 @@ static void serviceChargeTemp() {
             }
         }
         gLoopFaults.event(2006, now).condition(unreadable);
-    }
-
-    // The first check sets the charger explicitly either way: the PMU keeps
-    // its state across ESP32 resets, so a pause from before a reset must
-    // not stick.
-    if (gChargeApplied && pause == gChargePaused) return;
-    bool first = !gChargeApplied;
-    gChargeApplied = true;
-    gChargePaused = pause;
-    if (pause) {
-        PMU.disableCellbatteryCharge();
-        Serial.printf("Charging paused: %s (die %.1f C, battery ~%.0f C)\n",
-                      why, die, die - DIE_OFFSET_C);
-    } else {
-        PMU.enableCellbatteryCharge();
-        Serial.printf(first ? "Charge guard: die %.1f C (battery ~%.0f C), charging on.\n"
-                            : "Charging resumed (die %.1f C, battery ~%.0f C)\n",
-                      die, die - DIE_OFFSET_C);
+        if (gChargeState != pmu_read::ChargeState::Unconfirmed || gChargeFailures >= CHG_FAILURE_LIMIT)
+            gLoopFaults.event(2008, now).condition(gChargeFailures >= CHG_FAILURE_LIMIT);
     }
 }
 

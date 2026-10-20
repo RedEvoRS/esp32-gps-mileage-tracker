@@ -10,7 +10,7 @@ from common.diagnostics import validate_request
 result = subprocess.run([str(Path(sys.argv[1]).resolve()), "--export"],
                         capture_output=True, text=True, check=True)
 events = [json.loads(line[6:]) for line in result.stdout.splitlines() if line.startswith("EVENT ")]
-conditions = {1007, *range(2002, 2007), 3001, 3002, 3005, 3006, 3009,
+conditions = {1007, *range(2002, 2007), 2008, 3001, 3002, 3005, 3006, 3009,
               4001, 4004, 4005, 4006, *range(5002, 5010)}
 if "DISPLAY_DEBUG=1" in result.stdout:
     conditions.add(6001)
