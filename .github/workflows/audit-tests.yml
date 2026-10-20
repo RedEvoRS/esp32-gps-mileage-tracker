@@ -16,7 +16,7 @@ jobs:
     # Skipped on runs Dependabot starts: its PRs only bump versions, and
     # it can't read the secret anyway. Every push to main still scans.
     if: github.actor != 'dependabot[bot]'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -33,7 +33,7 @@ jobs:
         run: python tools/check_pii.py ${COMMITS:+--commits "$COMMITS"}
 
   server:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -52,7 +52,7 @@ jobs:
         run: node server/tests/test_viewer_map.js
 
   firmware-host:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -77,7 +77,7 @@ jobs:
   firmware-compile:
     # One runner shares the toolchain and core build cache across all sketches.
     # Compilation only; OLED/SD/power behavior still needs hardware validation.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 25
     env:
       # When updating the CLI version, update SHA-256 from that release's checksums file.
@@ -172,7 +172,7 @@ jobs:
     # systemd. Then reruns it, has it repair a mangled config, restarts
     # Docker and checks again, and makes sure --check notices a broken
     # install.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 25
     env:
       PASSWORD: correct-horse-battery
