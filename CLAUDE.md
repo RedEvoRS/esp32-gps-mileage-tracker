@@ -221,8 +221,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   retains diagnostics locally without blocking GPX. Rejected singleton records
   use a reserved bounded inspection slot and durable loss accounting. Heartbeats
   use existing awake opportunities after 24 hours without contact (first boot
-  contact age is unknown). Degraded startup and OLED error-code pages remain
-  integration work; host tests do not establish storage timing or durability
+  contact age is unknown). Bounded degraded startup retries restart on recovery;
+  OLED error-code pages remain integration work; host tests do not establish
+  storage timing or durability
 - Five-state FSM for trip lifecycle
 
 ### Server
