@@ -19,7 +19,7 @@ static unsigned calls(const char* operation) {
 static void chargeTick() { g_millis += CHG_CHECK_MS; serviceChargeTemp(); }
 
 int main() {
-    // Every byte/mask, including the disabled short key, follows XPowersLib's
+    // Every byte/mask, including the production-only short key, follows XPowersLib's
     // INTSTS byte order and configured enable mask. Unknown suppresses ALL bits.
     for (int byte = 0; byte <= 255; ++byte) {
         auto batch = pmu_read::irqBatch(byte, byte, byte, PMU_ENABLED_IRQS);

@@ -573,10 +573,12 @@ struct XPowersAXP2101 {
     void disableCellbatteryCharge() { operations.push_back("disableCellbatteryCharge"); if (!failChargeDisable) chargeEnabled = false; }
     void enableBattDetection() { operations.push_back("enableBattDetection");} void enableBattVoltageMeasure() { operations.push_back("enableBattVoltageMeasure");}
     void enableVbusVoltageMeasure() { operations.push_back("enableVbusVoltageMeasure");} void enableSystemVoltageMeasure() { operations.push_back("enableSystemVoltageMeasure");}
-    void disableIRQ(uint32_t) { operations.push_back("disableIRQ");} void enableIRQ(uint32_t) { operations.push_back("enableIRQ");}
-    void clearIrqStatus() { operations.push_back("clearIrqStatus"); removeIrq = insertIrq = longPressIrq = shortPressIrq = criticalIrq = lowIrq = false; }
+    uint32_t enabledIrqs = 0;
+    void disableIRQ(uint32_t) { operations.push_back("disableIRQ");} void enableIRQ(uint32_t mask) { enabledIrqs |= mask; operations.push_back("enableIRQ");}
+    void clearIrqStatus() { operations.push_back("clearIrqStatus"); removeIrq = insertIrq = shortPressIrq = longPressIrq = criticalIrq = lowIrq = false; }
     uint32_t getIrqStatus() { operations.push_back("getIrqStatus"); return 0; }
     bool isVbusRemoveIrq() { operations.push_back("isVbusRemoveIrq"); return removeIrq; } bool isVbusInsertIrq() { operations.push_back("isVbusInsertIrq"); return insertIrq; }
+    bool isPekeyShortPressIrq() { operations.push_back("isPekeyShortPressIrq"); return shortPressIrq; }
     bool isPekeyLongPressIrq() { operations.push_back("isPekeyLongPressIrq"); return longPressIrq; } bool isDropWarningLevel2Irq() { operations.push_back("isDropWarningLevel2Irq"); return criticalIrq; }
     bool isDropWarningLevel1Irq() { operations.push_back("isDropWarningLevel1Irq"); return lowIrq; }
     bool isBatteryConnect() { operations.push_back("isBatteryConnect"); return batteryConnected; }
