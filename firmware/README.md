@@ -427,6 +427,18 @@ logging to LittleFS, and WiFi upload to your home server.
 The rest of this section was written for the V1.2. On the Supreme
 (bench-tested 2026-10-18), these things differ:
 
+- **Startup failures:** `DEGRADED:` Serial lines mean trips are **not being
+  recorded**. Without SD or LittleFS, the board keeps the charge guard, power
+  key, low-battery shutdown and ten-minute battery idle power-off active. If
+  the power chip is absent or its LoRa rail cannot be verified off, it avoids
+  ordinary PMU control (one best-effort charge-disable attempt for an answered
+  but untrusted chip); only internal-flash diagnostics and retries remain.
+  Neither mode starts GPS processing or networking. Retries wait 60 seconds,
+  double up to ten minutes, and restart on recovery. Check the Serial reason,
+  SD seating/FAT32 and BLDO1 supply for storage failures; check board variant,
+  power and Wire1 SDA 42 / SCL 41 for PMU failures. Do not assume charge control
+  works in a PMU-failure mode. Restore the fault and verify a recorded test trip
+  before relying on the tracker; see [degraded startup details](../DIAGNOSTICS.md#degraded-startup-service-126).
 - **RTC:** the PCF8563 supplies diagnostic event timestamps before GPS/SNTP
   sync, never GPX times. The `RTC:` boot line reports whether its clock is
   usable and, when known, how long ago it was set. `invalid (stopped/VL)` is
@@ -438,7 +450,8 @@ The rest of this section was written for the V1.2. On the Supreme
 - **First flash:** trip storage is only set up on a fully erased partition
   (see [First flash on a new board](#first-flash-on-a-new-board)). The trip
   partition can still hold leftover data, from the factory firmware for
-  example, and startup then halts rather than format over it. So erase the
+  example. If neither store works, startup uses degraded service and preserves
+  the data. So erase the
   flash once for the first Stage 4 upload (Arduino IDE: **Tools → Erase All
   Flash Before Sketch Upload → Enabled** for that one upload, then set it
   back to Disabled so later uploads keep your trips).

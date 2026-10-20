@@ -28,6 +28,7 @@ static std::string g_outDir;
 static double gLat = 37.0, gLon = -122.0;
 
 static void resetWorld() {
+    gDegraded = startup::DegradedPolicy();
     gFsDemand = 0; gJournalReady = gJournalStarted = false;
     gJournalSealing = gJournalBootReported = false; gJournalSealRequested = gJournalSealDone = gJournalSealOk = false;
     gJournal.~EventLog(); new (&gJournal) diagnostics::EventLog(&gSdJournalFs, &gFlashJournalFs);
@@ -892,21 +893,16 @@ int main(int argc, char** argv) {
         PMU.chargeEnabled = true;                    // left on by the last boot
         PMU.dieC = 60;                               // parked in the sun
         g_disk.onMount = [] { g_chargeAtMount = PMU.chargeEnabled; };
-        g_haltSecs = 0;
-        g_delayHook = [](uint32_t ms) {
-            g_millis += ms;
-            if (!logHas("LittleFS mount failed")) return;   // setup()'s start-up delay
-            ++g_haltSecs;
-            if (g_haltSecs == 60)  { g_chargeWhileHot = PMU.chargeEnabled; PMU.dieC = 35; }   // AC on
-            if (g_haltSecs == 120) { g_chargeWhenCool = PMU.chargeEnabled; PMU.dieC = 60; }  // parked again
-            if (g_haltSecs == 180) throw Halted{};
-        };
-        try { setup(); } catch (const Halted&) {}
+        g_delayHook = [](uint32_t ms) { g_millis += ms; };
+        setup();
+        CHECK(gDegraded.mode() == startup::Mode::NoStorage, "storage failure enters degraded loop");
+        loopFor(60000); g_chargeWhileHot = PMU.chargeEnabled;
+        PMU.dieC = 35; loopFor(60000); g_chargeWhenCool = PMU.chargeEnabled;
+        PMU.dieC = 60; loopFor(60000);
         g_delayHook = nullptr;
-        CHECK(g_haltSecs == 180, "setup() halts on the mount error");
         CHECK(!g_chargeAtMount, "charging off before storage is touched");
-        CHECK(!g_chargeWhileHot, "hot: charging stays off while halted");
-        CHECK(g_chargeWhenCool, "cooled: the halted guard turns charging back on");
+        CHECK(!g_chargeWhileHot, "hot: charging stays off in degraded service");
+        CHECK(g_chargeWhenCool, "cooled: the degraded guard turns charging back on");
         CHECK(!PMU.chargeEnabled && logCount("too hot") == 2, "hot again: paused again");
         CHECK(!g_disk.formatRequested && g_disk.files["/trips/t000033.gpx"] == "irreplaceable trip",
               "queued trip neither formatted nor erased");
@@ -1026,6 +1022,7 @@ int main(int argc, char** argv) {
         drive(15, 40); endTrip(false);
         const std::string complete = g_disk.files.begin()->second;
         WiFi.scanDurationMs = 2000;
+        // Debug queue counting yields 1 ms per pending file before the due check.
         for (uint32_t wait : {60000U, 120000U, 240000U, 300000U, 300000U}) {
             int before = WiFi.scans;
             netCycle();
@@ -1034,7 +1031,7 @@ int main(int argc, char** argv) {
             CHECK(gNetLastAttemptMs == g_millis && !gNetBusy &&
                   WiFi.currentMode == WIFI_OFF && WiFi.scanDeletes == WiFi.scans,
                   "wait begins after the attempt; radio and busy flag cleared");
-            g_millis = gNetLastAttemptMs + wait - 1;
+            g_millis = gNetLastAttemptMs + wait - 1 - (DISPLAY_DEBUG ? 1 : 0);
             netCycle();
             CHECK(WiFi.scans == before + 1, "no scan before retry is due");
             ++g_millis;
@@ -1049,7 +1046,7 @@ int main(int argc, char** argv) {
         WiFi.scanSsids = {WIFI_SSID};
         uint32_t joinStart = g_millis;
         netCycle();
-        CHECK(WiFi.joins == 1 && g_millis - joinStart == 17000 && gNetRetryMs == NET_RETRY_MAX_MS,
+        CHECK(WiFi.joins == 1 && g_millis - joinStart == 17000 + (DISPLAY_DEBUG ? 1 : 0) && gNetRetryMs == NET_RETRY_MAX_MS,
               "seeing the AP but failing to join keeps the backoff");
         CHECK(gNetLastAttemptMs == g_millis, "join timeout does not consume the next retry wait");
         CHECK(logHas("Network: couldn't join home WiFi \"" WIFI_SSID "\" (status 0) -- next try in 300 s."),
@@ -1072,7 +1069,7 @@ int main(int argc, char** argv) {
         CHECK(logCount("Network: ") == misses, "a cycle that uploaded anything logs no miss");
         g_httpHook = nullptr;
         scans = WiFi.scans;
-        g_millis = gNetLastAttemptMs + NET_TICK_MS - 1; netCycle();
+        g_millis = gNetLastAttemptMs + NET_TICK_MS - 1 - (DISPLAY_DEBUG ? 1 : 0); netCycle();
         CHECK(WiFi.scans == scans, "success still waits the normal 30 s before another attempt");
         ++g_millis; netCycle();
         CHECK(g_httpRequests == 4 && gNetRetryMs == 60000, "a new failure grows from the reset wait");
@@ -1090,7 +1087,7 @@ int main(int argc, char** argv) {
         g_disk.files["/trips/t999999.gpx"] = complete;
         g_millis = UINT32_MAX - 1000;
         netCycle();
-        g_millis = gNetLastAttemptMs + gNetRetryMs - 1; netCycle();
+        g_millis = gNetLastAttemptMs + gNetRetryMs - 1 - (DISPLAY_DEBUG ? 1 : 0); netCycle();
         CHECK(WiFi.scans == 1, "wrapped clock: no early retry");
         ++g_millis; netCycle();
         CHECK(WiFi.scans == 2 && gNetRetryMs == 120000, "wrapped clock: retry when due");
@@ -1422,9 +1419,11 @@ int main(int argc, char** argv) {
                 g_delayHook = nullptr;
             };
             try { setup(); } catch (const Restarted&) {}
-            CHECK(PMU.bus == &Wire1 && Wire1.sda == 42 && Wire1.scl == 41 && Wire.begins == 0,
+            CHECK(PMU.bus == &Wire1 && Wire1.sda == 42 && Wire1.scl == 41 &&
+                  Wire.begins == (DISPLAY_DEBUG && !failMutex ? 1 : 0),
                   "PMU uses only Wire1 on SDA 42 / SCL 41");
-            CHECK(PMU.operations == std::vector<std::string>({"begin", "disableALDO3", "isEnableALDO3"}),
+            CHECK(std::vector<std::string>(PMU.operations.begin(), PMU.operations.begin() + 3) ==
+                  std::vector<std::string>({"begin", "disableALDO3", "isEnableALDO3"}),
                   "radio disable and readback are the first operations after PMU.begin");
             CHECK(logHas("power-on source 0x04, power-off source 0x02"), "boot logs PMU power sources");
             if (!failMutex) {
@@ -1439,12 +1438,11 @@ int main(int argc, char** argv) {
             resetWorld();
             PMU.failRadioDisable = writeFailed;
             PMU.radioStuckOn = !writeFailed;
-            g_delayHook = [](uint32_t) { throw Halted{}; };
-            try { setup(); } catch (const Halted&) {}
-            g_delayHook = nullptr;
+            setup();
             CHECK(logHas("ALDO3) could not be verified off") &&
-                  g_disk.mountAttempts == 0 && g_taskCreates == 0 && !PMU.aldo4,
-                  "failed radio write or readback halts before GPS, storage or workers");
+                  gDegraded.mode() == startup::Mode::PmuUntrusted &&
+                  g_disk.mountAttempts == 1 && g_taskCreates == 0 && !PMU.aldo4 && !PMU.chargeEnabled,
+                  "failed radio write or readback enters journal-only degraded mode with charging disabled");
         }
         resetWorld();
         PMU.failBegins = 2;
@@ -1462,13 +1460,12 @@ int main(int argc, char** argv) {
 
         resetWorld();
         PMU.failBegins = 3;
-        g_delayHook = [](uint32_t ms) { if (ms == 1000) throw Halted{}; };
-        try { setup(); } catch (const Halted&) {}
-        g_delayHook = nullptr;
+        setup();
         CHECK(PMU.beginCalls == 3 && Wire1.ends == 2 && logHas("attempt 3/3 failed") &&
-              logHas("AXP2101 not found. Halting.") && !PMU.aldo4 &&
-              g_disk.mountAttempts == 0 && g_taskCreates == 0,
-              "exhausted PMU retries report and enter the existing halt before other setup");
+              logHas("power chip not responding") && !PMU.aldo4 &&
+              gDegraded.mode() == startup::Mode::PmuMissing &&
+              g_disk.mountAttempts == 1 && g_taskCreates == 0,
+              "exhausted PMU retries enter flash-journal-only degraded mode");
     }
 
     printf("T48 power-off is cancelled on USB, including a late return without an IRQ (#106)\n");

@@ -50,8 +50,8 @@ numeric measurements and fixed enumerated values in context.
   explicit revision enrollment/recovery, complete ack verification, bounded
   rejection isolation, trip priority and independent retries. SD revision
   enrollment is required before the first diagnostic request (see below).
-- **#126:** degraded service loop, **after Supreme port #107/#109**. Replaces
-  permanent halts on storage/PMU failure with bounded reporting and retries.
+- **#126:** implemented bounded degraded service loops for PMU/LoRa-rail and
+  trip-storage startup failures, with local journaling and restart on recovery.
 - **#127:** SH1106 hardware adapter on the Supreme, following #123 and the port.
 - **#128:** implemented diagnostics-only PCF8563 boot timestamps, bounded
   GPS/SNTP RTC setting and clock-confidence/runtime tests; retention needs bench testing.
@@ -62,8 +62,8 @@ numeric measurements and fixed enumerated values in context.
 - **#136:** optional push to an external Loki (not bundled).
 - **#137:** installer questions choosing these outputs.
 - **#151:** E2007 catalog entry, retained Stage 4 PMU startup result and boot
-  journal emission after successful startup are implemented. The failure halt
-  remains until #126, and OLED reporting remains with #127.
+  journal emission in normal and degraded startup are implemented. OLED
+  reporting remains with #127.
 - **#164:** E3009 antenna warning uses MON-RF gain and fresh GSV strength in
   every build; the RF serial line and temporary OLED page stay debug-only.
 
@@ -120,8 +120,8 @@ including attempts that fail before a PMU probe), `recovery_state`
 does not prove PMU readiness. Stage 4 retains the complete `PmuStartupResult`
 in RAM; `makePmuStartupEvent` prepares these fields without I/O. #122/#124 must
 emit the notice once the journal is available; part A of #124 now does so.
-Failed startup still halts before storage, so reporting that path also needs
-#126's degraded loop. OLED failure reporting remains out of scope until #127.
+Failed PMU startup also journals the retained result in the degraded loop
+when LittleFS is usable (otherwise RAM). OLED failure reporting remains #127.
 
 `notify` means eligible, not an instruction to send a notification immediately.
 Info codes, 2007 PMU_STARTUP_RECOVERY, the high/low charge-guard warnings
@@ -539,8 +539,8 @@ notices, lock contention and shutdown. Direct production VFS tests check sync,
 close and enumeration errors. None of these establishes SD/FAT power-cut safety.
 #124 part A wires boot producers (including the retained PMU startup helper) and storage;
 #125 wires transport, status snapshots and durable isolation for rejected events;
-#126 wires bounded degraded startup/retry behavior. Uploads and snapshots now
-run after explicit enrollment; the degraded startup loop remains future work.
+#126 wires bounded degraded startup/retry behavior. Uploads and snapshots run
+after explicit enrollment on normal boots; degraded boots never start networking.
 
 ### Stage 4 boot and shutdown plumbing (#124 part A)
 
@@ -568,8 +568,8 @@ E1003, E1004 and E1005 notices. `makePmuStartupEvent(gPmuStartup)` adds E2007
 only after recovery/retries or another non-clean startup result. All notices
 have null episodes and use the same clock-confidence provider as runtime events.
 A valid boot RTC can timestamp them before GPS/SNTP. A clean first-attempt PMU boot adds
-no E2007. Failed PMU/storage startup still halts before journal initialization;
-reporting those paths needs #126. Debug builds print one journal boot line with
+no E2007. Failed PMU/storage startup now initializes the journal in degraded
+service as described below. Debug builds print one journal boot line with
 the active backend and physical unacknowledged valid-frame/segment counts;
 uncertain inventory is labeled incomplete. Ambiguous writes can retain duplicate
 IDs, so physical frame counts can exceed distinct event counts.
@@ -627,6 +627,7 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | Code | Trigger | Recovery / policy | Context |
 |---|---|---|---|
 | E1007 | Network lifetime minimum free stack **<2048 bytes** | Watermark >=2048; normally latches for the boot because a lifetime minimum never increases | `free_bytes` |
+| E2001 | PMU initialization failed or LoRa ALDO3 could not be verified off at startup | Only a normal boot after successful PMU initialization and rail verification observes healthy; retry success restarts, never clears in degraded mode | none |
 | E2002 | AXP2101 level-1 IRQ or battery percentage <= configured low warning | Valid connected battery percentage above that threshold | `battery_mv`, if in catalog range |
 | E2003 | AXP2101 level-2 IRQ (before existing shutdown), or percentage <= configured critical level | Valid connected battery percentage above critical | `battery_mv`, if in range |
 | E2004 | Existing charge guard pauses hot (die >=54 C); remains hot while paused above 47 C | Finite die sample <=47 C or another measured pause reason | `temperature_mc` = measured PMU die, if in range |
@@ -641,7 +642,9 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E3007 | RTC has no ACK, or its initial boot register read fails | Verified RTC setting after trusted GPS/SNTP time; at most three attempts per boot, at least a minute apart after failures | none |
 | E3008 | Readable RTC has STOP/VL, invalid BCD/calendar, unsupported year, or a later read/write/verification failure | Verified RTC setting from GPS/SNTP clears the condition; normal transition/repeat policy | `reason=stopped\|invalid_date\|out_of_range\|read_failed` on failure |
 | E3009 | At 30 s MON-RF boundaries, valid AGC >=70% and fresh GSV (a complete group within 15 s) with zero satellites >=30 dBHz, continuously for >=120 s from the first suspect sample | One valid AGC <=50% sample **or** fresh GSV with at least one satellite >=30 dBHz; missing/stale/intermediate evidence resets the hold and retains an active warning | `agc_pct` (0-100) when MON-RF valid; `max_cno` (0-99) when GSV fresh |
-| E4001 | SD did not mount, trip logging uses LittleFS | Observed SD mount; current boot does not hot-switch backends | none |
+| E4001 | SD did not mount, including when no trip store works | Observed SD mount; current boot does not hot-switch backends | none |
+| E4002 | LittleFS unavailable during no-storage degraded startup | RAM-only raise/repeat; retained as failed until restart discards the queue | none |
+| E4003 | Neither trip store is usable at startup | Only a normal boot with a mounted trip store observes healthy; successful degraded retry restarts without clearing | none |
 | E4004 | Guarded trip free space <64 KiB start reserve | >=64 KiB | `backend`, `free_bytes` |
 | E4005 | Guarded trip free space <24 KiB stop reserve | >=24 KiB | `backend`, `free_bytes` |
 | E4006 | Trip create/open, point commit or finalization fails | Next verified trip create/write/finalize or successful repair | `backend`, `operation=open\|write\|close` |
@@ -702,15 +705,68 @@ margin follows #6. Static builders avoid event-sized stack frames; compiler stac
 reports and the build sizes supplement, but do not replace, the real-upload bench
 measurement. Part A's observed 7,556 free bytes was a no-upload measurement.
 
-Startup halts E1001/E1002/E2001/E4002/E4003 remain #126; RTC E3007/E3008 are implemented by #128;
-E5010 and diagnostic uploads/snapshots are implemented by #125. Error-code OLED
-pages are #127; antenna detection is implemented by #164. All requested meaningful Stage 4 runtime
-codes above are wired, including E3006's existing trusted-clock state.
+E2001/E4002/E4003 degraded-startup hooks are implemented by #126. The existing
+FS-mutex allocation failure still restarts, and network-task creation failure
+remains non-fatal. RTC E3007/E3008 are implemented by #128; E5010 and diagnostic
+uploads/snapshots by #125. Error-code OLED pages remain #127; antenna detection
+is implemented by #164.
 
-#126 keeps a bounded service loop alive if PMU/storage initialization fails: show or
-upload failures when possible and retry safely, without claiming trips are
-recorded when no backend works. Unknown PMU state must not enable unsafe charge
-or rail operations. Display failure never changes the logging lifecycle.
+### Degraded startup service (#126)
+
+Every degraded boot prints `DEGRADED:` after the Stage 4 banner. These lines
+mean **no trips are being recorded**. A separate loop returns before GPS parsing,
+receiver configuration, the trip FSM, RTC service and display updates. No degraded
+mode starts the network task, WiFi, or diagnostic uploads. The OLED is not needed
+for this behavior; error pages remain #127.
+
+The first retry is after 60 seconds; failed retries wait 120, 240, 480, then
+600 seconds, capped at ten minutes forever. The next interval starts after the
+bounded initialization attempt finishes, using wrap-safe `millis()` subtraction.
+The loop yields between checks. Success requests `ESP.restart()` and runs all
+normal boot ordering again; it never resumes logging in place. Each degraded
+cycle lasts at least a minute, so a flapping fault cannot make a rapid restart
+loop. No degraded retry formats media, deletes trips, or runs trip repair.
+Normal first-boot provisioning of a proven fully erased flash partition is
+unchanged; degraded probes explicitly disable that provisioning.
+
+- **No usable trip storage (D), PMU healthy:** power/charge service remains
+  active: IRQ/VBUS confirmation, power key, low-battery level-2 shutdown,
+  temperature guard and the ten-minute battery idle power-off. GPS rail setup
+  remains as at boot, but GPS UART and processing never start. The journal has
+  no backends: BOOT, E4001/E4002 backend failures and E4003
+  `NO_RECORDING_STORAGE` use the bounded RAM queue. They cannot be uploaded
+  during this boot and are lost on restart or power-off. Storage retries use
+  the existing BLDO1-off / 3.3 V / enable ordering for SD and never format.
+  A successful mount is unmounted before restart. Shutdown safely handles no
+  trip, no network task and no mounted media: the loop services the bounded
+  journal seal itself, reports undurable RAM if necessary, then holds FS_LOCK
+  through the final VBUS check and PMU shutdown. A returning/failed shutdown
+  restores degraded service without claiming recording or remounting an absent
+  store.
+- **Power chip absent (A) or untrusted LoRa-rail state (B):** no ordinary PMU
+  power, charge, IRQ or measurement service is allowed. In B only, charging is
+  disabled exactly once, best effort. A single raw-register
+  read-back through XPowersLib distinguishes disabled, still enabled and an
+  unreadable/unknown state; Serial reports the result without promising safety.
+  Apart from that exception, only scheduled normal startup probes are allowed:
+  bounded `beginPmuWithRecovery()`, plus ALDO3 disable/verify in B after a
+  successful begin. A begin success restarts A; B requires verified ALDO3 off
+  before restart. LittleFS alone is mounted without provisioning, solely for
+  diagnostic BOOT, retained E2007 and E2001 `PMU_INIT_FAILED`. If it fails,
+  diagnostics stay in RAM. SD, GPS and networking never start. The board stays
+  awake retrying, as with the former halt; software cannot promise charge
+  control or power-off. The AXP2101 hardware under-voltage cutoff still protects
+  the cell. A later normal boot can drain those LittleFS journal segments even
+  with SD selected: EventLog enumerates both mounted backends for uploads.
+
+Core-1 conditions include 2001 and 4003. A normal boot explicitly observes 2001
+healthy after PMU initialization/rail verification, and 4003 healthy after a trip
+store mounts. These are silent `condition(false)` observations in the current
+snapshot, allowing the server monitor to resolve an earlier alert. Degraded
+boots raise their fault and never report either code clear, including after a
+successful retry. Reboot, omitted/unknown status and old journal records alone
+are not recovery. Networking stays off until a normal boot, so fault history
+persisted on LittleFS reaches the server only later; D's RAM history is lost.
 
 ## Trip-first upload scheduling (#125, implemented)
 

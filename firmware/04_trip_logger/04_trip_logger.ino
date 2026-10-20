@@ -65,6 +65,7 @@
 #include "pmu_startup_event.h"
 #include "journal_fs.h"
 #include "journal_boot.h"
+#include "degraded_policy.h"
 #include "journal_sd_geometry.h"
 #include "diag_upload.h"
 #include "journal_platform.h"
@@ -205,6 +206,8 @@ static portMUX_TYPE gDebugNetMux = portMUX_INITIALIZER_UNLOCKED;
 static DebugNetwork gDebugNet;
 #endif
 
+static startup::DegradedPolicy gDegraded;
+
 SemaphoreHandle_t gFsMutex;     // serializes ALL filesystem access
 SPIClass          gSdSpi(HSPI); // dedicated bus instance; radio is never initialized
 fs::FS*           gTripFS = &LittleFS;
@@ -306,8 +309,8 @@ static bool gJournalStarted = false; // under FS_LOCK; core-0 consumer only
 static bool gJournalBootReported = false;
 // Single writer per array/builder. Only EventLog's try-lock crosses cores.
 static diagnostics::RuntimeFaults::Condition gLoopConditions[] = {
-    {2002}, {2003}, {2004}, {2005}, {2006}, {3001}, {3002}, {3005}, {3006}, {3007}, {3008}, {3009},
-    {4001}, {4004}, {4005}, {4006}, {6001}
+    {2001}, {2002}, {2003}, {2004}, {2005}, {2006}, {3001}, {3002}, {3005}, {3006}, {3007}, {3008}, {3009},
+    {4001}, {4002}, {4003}, {4004}, {4005}, {4006}, {6001}
 };
 static diagnostics::RuntimeFaults::Condition gNetConditions[] = {
     {1007}, {5002}, {5003}, {5004}, {5005}, {5006}, {5007}, {5008}, {5009}
@@ -1423,8 +1426,11 @@ static void powerOffForVbus() {
         gJournalSealDone.store(false);
         gJournalSealRequested.store(true);
         uint32_t journalWait = millis();
-        while (!gJournalSealDone.load() && millis() - journalWait < NET_ABORT_MS)
+        while (!gJournalSealDone.load() && millis() - journalWait < NET_ABORT_MS) {
+            // Degraded startup has no core-0 task. It is the sole consumer.
+            if (gDegraded.mode() == startup::Mode::NoStorage) serviceJournal();
             vTaskDelay(pdMS_TO_TICKS(20));
+        }
         if (!gJournalSealDone.load() || !gJournalSealOk.load())
             Serial.println("Journal: shutdown drain/seal incomplete; RAM records may be lost.");
     }
@@ -1450,7 +1456,9 @@ static void powerOffForVbus() {
         // before treating a returning call as failure; don't spin or leave
         // the logger alive with storage unmounted if power stays on.
         vTaskDelay(pdMS_TO_TICKS(1000));
-        Serial.println("ERROR: PMU.shutdown() did not power off -- resuming logging.");
+        Serial.println(gDegraded.mode() == startup::Mode::Normal ?
+            "ERROR: PMU.shutdown() did not power off -- resuming logging." :
+            "ERROR: PMU.shutdown() did not power off -- resuming degraded service.");
     } else {
         Serial.println("VBUS returned -- PMU power-off cancelled.");
     }
@@ -1486,7 +1494,9 @@ static void powerOffForVbus() {
     gIdleSince = millis();        // failed power-off retries after the idle grace
     gNetAbort.store(false);
     gNetHold.store(false);
-    Serial.println("Power-off recovery complete; storage mounted, logging continues.");
+    Serial.println(gDegraded.mode() == startup::Mode::Normal ?
+        "Power-off recovery complete; storage mounted, logging continues." :
+        "Power-off recovery complete; degraded service continues, not recording trips.");
 }
 
 static void pollPmu() {
@@ -2414,11 +2424,11 @@ static bool tripPartitionIsErased() {
     return true;
 }
 
-static bool mountFlashStorage() {
+static bool mountFlashStorage(bool allowProvision = true) {
     // Mount failures alone never authorize erasure. Only a successful read
     // of EVERY byte as 0xFF proves that provisioning cannot lose queued data.
     if (LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL)) return true;
-    if (tripPartitionIsErased()) {
+    if (allowProvision && tripPartitionIsErased()) {
         Serial.println("LittleFS partition is fully erased; provisioning trip storage.");
         if (LittleFS.format() &&
             LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL)) return true;
@@ -2464,12 +2474,12 @@ static bool mountSdStorage() {
     return false;
 }
 
-static bool mountTripStorage() {
+static bool mountTripStorage(bool allowProvision = true) {
     gSdMounted = mountSdStorage();
     // Keep the existing preservation-first provisioning rule for flash.
     // If flash is damaged but SD works, record to SD and preserve flash
-    // for recovery; #126 owns degraded service when neither store works.
-    gFlashMounted = mountFlashStorage();
+    // for recovery; degraded service handles both stores being unavailable.
+    gFlashMounted = mountFlashStorage(allowProvision);
     if (gFlashMounted && !LittleFS.exists(TRIP_DIR)) {
         gFlashMounted = LittleFS.mkdir(TRIP_DIR);
         if (!gFlashMounted) LittleFS.end();
@@ -2483,7 +2493,7 @@ static bool mountTripStorage() {
         Serial.printf("WARNING: microSD unavailable -- using internal flash (%.2f MiB free).\n",
                       storageFreeBytes(LittleFS) / (1024.0 * 1024));
     } else {
-        Serial.println("ERROR: no usable trip storage; halting with charge guard active.");
+        Serial.println("ERROR: no usable trip storage; trips cannot be recorded.");
     }
     return gSdMounted || gFlashMounted;
 }
@@ -2562,21 +2572,119 @@ static void serviceDebugDisplay() {
 }
 #endif
 
+// Shared boot producers, including failed startup's retained E2007 notice.
+static void beginJournal() {
+    gJournal.~EventLog();
+    new (&gJournal) diagnostics::EventLog(gSdMounted ? &gSdJournalFs : nullptr,
+                                         gFlashMounted ? &gFlashJournalFs : nullptr, diagnostics::uploadJournalConfig());
+    gJournalBoot = diagnostics::newJournalBoot();
+    gJournalReady = gJournal.begin(gJournalBoot.id, gJournalBoot.counter, "stage4-diag-upload");
+    gJournal.setTimeProvider(stampDiagnosticTime);
+    if (gJournalReady) diagnostics::submitJournalBoot(gJournal, esp_reset_reason(), gPmuStartup, millis());
+}
+
+static bool createFsMutex() {
+    gFsMutex = xSemaphoreCreateMutex();
+    if (gFsMutex) return true;
+    Serial.println("ERROR: LittleFS mutex allocation failed. Restarting.");
+    delay(1000);
+    ESP.restart();
+    return false;
+}
+
+static void enterDegraded(startup::Mode mode) {
+    gDegraded.begin(mode, millis());
+    if (mode == startup::Mode::NoStorage) {
+        // No mounted store: boot and faults stay in the bounded RAM queue.
+        beginJournal();
+        gLoopFaults.event(4001, millis()).condition(true);
+        gLoopFaults.event(4002, millis()).condition(true);
+        gLoopFaults.event(4003, millis()).condition(true);
+        Serial.println("DEGRADED: no usable trip storage -- not recording trips. Power management and charge guard active. Retrying storage in 60 s.");
+        // Measurements have been enabled; allow the ADC its first conversion.
+        delay(1000);
+        serviceChargeTemp();
+    } else {
+        if (mode == startup::Mode::PmuUntrusted) {
+            // The only extra PMU write allowed with untrusted rail state.
+            PMU.disableCellbatteryCharge();
+            // Same register/bit used by XPowersLib's disable method. Read the
+            // raw result so an I2C failure cannot look like a cleared bit.
+            int charge = PMU.readRegister(XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL);
+            Serial.printf("DEGRADED: LoRa rail (ALDO3) could not be verified off. Charge-disable attempted once; %s.\n",
+                          charge < 0 ? "charger read-back failed, state unknown" :
+                          (charge & 0x02) ? "read-back still shows charging enabled" :
+                                            "read-back shows charging disabled");
+        }
+        if (!createFsMutex()) return;
+        // Internal flash only, journal only. Never provision/format or use SD.
+        gFlashMounted = LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL);
+        beginJournal();
+        gLoopFaults.event(2001, millis()).condition(true);
+        Serial.println(mode == startup::Mode::PmuMissing ?
+            "DEGRADED: power chip not responding -- not recording; no charge or rail control. Retrying in 60 s." :
+            "DEGRADED: power chip state untrusted -- not recording; no further charge or rail control. Retrying in 60 s.");
+    }
+}
+
+static void degradedLoop() {
+    using startup::Mode;
+    const Mode mode = gDegraded.mode();
+    if (mode == Mode::NoStorage) {
+        pollPmu();
+        confirmVbusOff();
+        serviceChargeTemp();
+        serviceBatteryDiagnostics();
+        if (!gVbusLost) gIdleSince = millis();
+        else if (uint32_t(millis() - gIdleSince) >= IDLE_BATT_SLEEP_MS) powerOffForVbus();
+        gLoopFaults.event(4001, millis()).condition(true);
+        gLoopFaults.event(4002, millis()).condition(true);
+        gLoopFaults.event(4003, millis()).condition(true);
+    } else {
+        gLoopFaults.event(2001, millis()).condition(true);
+    }
+    serviceJournal(); // single consumer; no network task in any degraded mode
+    if (gDegraded.retryDue(millis())) {
+        bool recovered = false;
+        if (mode == Mode::NoStorage) {
+            // No format, fsck, trip activity or journal migration on this probe.
+            recovered = mountTripStorage(false);
+            if (gSdMounted) { SD.end(); gSdSpi.end(); }
+            if (gFlashMounted) LittleFS.end();
+            gSdMounted = gFlashMounted = false;
+        } else {
+            PmuStartupResult retry;
+            // Release Wire1 before GPIO bus recovery on a later cycle.
+            if (Wire1.end()) {
+                recovered = beginPmuWithRecovery(Wire1, PMU, I2C_SDA, I2C_SCL, retry);
+                if (recovered && mode == Mode::PmuUntrusted)
+                    recovered = PMU.disableALDO3() && !PMU.isEnableALDO3();
+            }
+        }
+        if (gDegraded.retryResult(millis(), recovered)) {
+            Serial.println("DEGRADED: initialization retry succeeded; restarting into normal startup checks.");
+            ESP.restart();
+            return;
+        }
+        Serial.printf("DEGRADED: initialization still unavailable -- not recording trips. Retrying in %lu s.\n",
+                      (unsigned long)(gDegraded.waitMs() / 1000));
+    }
+    delay(20); // yield even without UART, display or network activity
+}
+
 void setup() {
     // VBUS-insert power-on brings the Supreme's LoRa rail up ON. Disable
     // and verify it as the first PMU operation after bounded bus recovery
     // and initialization, BEFORE Serial, storage or GPS setup can block.
-    if (!beginPmuWithRecovery(Wire1, PMU, I2C_SDA, I2C_SCL, gPmuStartup)) {
+    bool pmuReady = beginPmuWithRecovery(Wire1, PMU, I2C_SDA, I2C_SCL, gPmuStartup);
+    bool radioOff = pmuReady && PMU.disableALDO3() && !PMU.isEnableALDO3();
+    startup::Mode powerMode = startup::selectMode(pmuReady, radioOff, true);
+    if (powerMode != startup::Mode::Normal) {
         Serial.begin(115200);
+        Serial.println("\n=== Stage 4: Trip Logger ===");
         printPmuStartup(gPmuStartup);
-        Serial.println("ERROR: AXP2101 not found. Halting.");
-        while (1) delay(1000);
-    }
-    if (!PMU.disableALDO3() || PMU.isEnableALDO3()) {
-        Serial.begin(115200);
-        printPmuStartup(gPmuStartup);
-        Serial.println("ERROR: LoRa rail (ALDO3) could not be verified off. Halting.");
-        while (1) delay(1000);
+        enterDegraded(powerMode);
+        return;
     }
     // BLDO1 powers the SD slot but starts ON at 1.8 V. Disable it early;
     // mountSdStorage sets 3.3 V before enabling it, after safety setup.
@@ -2598,13 +2706,7 @@ void setup() {
     Serial.printf("PMU power-on source 0x%02X, power-off source 0x%02X.\n",
                   (unsigned)PMU.getPowerOnSource(), (unsigned)PMU.getPowerOffSource());
 
-    gFsMutex = xSemaphoreCreateMutex();
-    if (!gFsMutex) {
-        Serial.println("ERROR: LittleFS mutex allocation failed. Restarting.");
-        delay(1000);
-        ESP.restart();
-        return;
-    }
+    if (!createFsMutex()) return;
 
     // --- Supreme GPS: ALDO4 at 3.3 V, GPS_EN HIGH as in LilyGO's setup ---
     pinMode(GPS_EN_PIN, OUTPUT);
@@ -2635,27 +2737,22 @@ void setup() {
                   PMU.getChargeTargetVoltage() == XPOWERS_AXP2101_CHG_VOL_4V1 ? "4.1 V" : "NOT 4.1 V",
                   gVbusLost ? "absent (on battery)" : "present");
 
+    // --- Storage + boot-time repair ---
+    if (!mountTripStorage()) {
+        enterDegraded(startup::Mode::NoStorage);
+        return;
+    }
     // --- GPS UART. setRxBufferSize MUST precede begin(). ---
     GPSSerial.setRxBufferSize(2048);
     GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
-    // --- Storage + boot-time repair ---
-    if (!mountTripStorage()) {
-        // Halted, but maybe still on USB in a hot car: keep guarding the
-        // charger (off since the PMU setup). Delay first, so the temperature
-        // ADC has converted before the first reading.
-        while (1) { delay(1000); serviceChargeTemp(); }
-    }
     prefs.begin("mileage", false);
-    gJournal.~EventLog();
-    new (&gJournal) diagnostics::EventLog(gSdMounted ? &gSdJournalFs : nullptr,
-                                         gFlashMounted ? &gFlashJournalFs : nullptr, diagnostics::uploadJournalConfig());
-    gJournalBoot = diagnostics::newJournalBoot();
-    gJournalReady = gJournal.begin(gJournalBoot.id, gJournalBoot.counter, "stage4-diag-upload");
-    gJournal.setTimeProvider(stampDiagnosticTime);
-    if (gJournalReady) diagnostics::submitJournalBoot(gJournal, esp_reset_reason(), gPmuStartup, millis());
+    beginJournal();
     rtcConditions();
     if (gJournalReady) {
+        // Explicit healthy observations resolve prior degraded-boot alerts.
+        gLoopFaults.event(2001, millis()).condition(false);
+        gLoopFaults.event(4003, millis()).condition(false);
         gLoopFaults.event(4001, millis()).condition(!gSdMounted);
         storageConditions(storageFreeBytes(*gTripFS), millis());
     }
@@ -2689,6 +2786,10 @@ void setup() {
 }
 
 void loop() {
+    if (gDegraded.mode() != startup::Mode::Normal) {
+        degradedLoop();
+        return;
+    }
     serviceRtc();
     // Core 1: one UART reader routes NMEA/fixes and checksum-checked UBX
     // ACKs. Configuration deadlines never block receive or trip processing.

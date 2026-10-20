@@ -479,7 +479,14 @@ extern TwoWire Wire, Wire1;
 // PMU: tests set vbusIn (the USB power level) and the latched VBUS
 // interrupt flags, then raise gPmuIrqFlag as the IRQ pin would.
 struct PoweredOff {};
+constexpr uint8_t XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL = 0x18;
 struct XPowersAXP2101 {
+    bool failChargeDisable = false, failChargeRead = false;
+    int readRegister(uint8_t reg) {
+        operations.push_back("readRegister");
+        assert(reg == XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL);
+        return failChargeRead ? -1 : chargeEnabled ? 0x02 : 0;
+    }
     bool vbusIn = true, removeIrq = false, insertIrq = false;
     bool longPressIrq = false, criticalIrq = false, lowIrq = false;
     bool batteryConnected = true;
@@ -509,50 +516,50 @@ struct XPowersAXP2101 {
         return !failRadioDisable;
     }
     bool isEnableALDO3() { operations.push_back("isEnableALDO3"); return aldo3; }
-    void setALDO4Voltage(int mv) { aldo4Mv = mv; }
-    void enableALDO4() { aldo4 = true; } void disableALDO4() { aldo4 = false; }
-    bool disableBLDO1() {
+    void setALDO4Voltage(int mv) { operations.push_back("setALDO4Voltage"); aldo4Mv = mv; }
+    void enableALDO4() { operations.push_back("enableALDO4"); aldo4 = true; } void disableALDO4() { operations.push_back("disableALDO4"); aldo4 = false; }
+    bool disableBLDO1() { operations.push_back("disableBLDO1");
         g_powerEvents.push_back("BLDO1.off");
         if (failSdDisable) return false;
         bldo1 = false; return true;
     }
-    bool setBLDO1Voltage(int mv) {
+    bool setBLDO1Voltage(int mv) { operations.push_back("setBLDO1Voltage");
         g_powerEvents.push_back("BLDO1.voltage");
         if (failSdVoltage) return false;
         bldo1Mv = mv; return true;
     }
-    bool enableBLDO1() {
+    bool enableBLDO1() { operations.push_back("enableBLDO1");
         g_powerEvents.push_back("BLDO1.on");
         if (failSdEnable) return false;
         bldo1 = true; return true;
     }
-    void disableButtonBatteryCharge() { vbackup = false; }
-    uint8_t getPowerOnSource() { return 0x04; }
-    uint8_t getPowerOffSource() { return 0x02; }
+    void disableButtonBatteryCharge() { operations.push_back("disableButtonBatteryCharge"); vbackup = false; }
+    uint8_t getPowerOnSource() { operations.push_back("getPowerOnSource"); return 0x04; }
+    uint8_t getPowerOffSource() { operations.push_back("getPowerOffSource"); return 0x02; }
     uint8_t chgVol = 3;
-    bool setChargeTargetVoltage(uint8_t v) { chgVol = v; return true; }
-    uint8_t getChargeTargetVoltage() { return chgVol; }
+    bool setChargeTargetVoltage(uint8_t v) { operations.push_back("setChargeTargetVoltage"); chgVol = v; return true; }
+    uint8_t getChargeTargetVoltage() { operations.push_back("getChargeTargetVoltage"); return chgVol; }
     float dieC = 30.0f; bool chargeEnabled = true;   // tests set dieC
-    void enableTemperatureMeasure() {}
-    float getTemperature(uint16_t* = nullptr) { return dieC; }
-    void enableCellbatteryCharge() { chargeEnabled = true; }
-    void disableCellbatteryCharge() { chargeEnabled = false; }
-    void enableBattDetection() {} void enableBattVoltageMeasure() {}
-    void enableVbusVoltageMeasure() {} void enableSystemVoltageMeasure() {}
-    void disableIRQ(uint32_t) {} void enableIRQ(uint32_t) {}
-    void clearIrqStatus() { removeIrq = insertIrq = longPressIrq = criticalIrq = lowIrq = false; }
-    uint32_t getIrqStatus() { return 0; }
-    bool isVbusRemoveIrq() { return removeIrq; } bool isVbusInsertIrq() { return insertIrq; }
-    bool isPekeyLongPressIrq() { return longPressIrq; } bool isDropWarningLevel2Irq() { return criticalIrq; }
-    bool isDropWarningLevel1Irq() { return lowIrq; }
-    bool isBatteryConnect() { return batteryConnected; }
-    uint8_t getLowBatWarnThreshold() { return lowWarnNibble; }
-    uint8_t getLowBatShutdownThreshold() { return criticalPercent; }
-    bool isVbusIn() { return vbusIn; }
-    int getBatteryPercent() { return batteryPercent; }
-    uint16_t getBattVoltage() { return batteryMv; }
-    bool isCharging() { return chargeEnabled && vbusIn; }
-    void shutdown() {
+    void enableTemperatureMeasure() { operations.push_back("enableTemperatureMeasure");}
+    float getTemperature(uint16_t* = nullptr) { operations.push_back("getTemperature"); return dieC; }
+    void enableCellbatteryCharge() { operations.push_back("enableCellbatteryCharge"); chargeEnabled = true; }
+    void disableCellbatteryCharge() { operations.push_back("disableCellbatteryCharge"); if (!failChargeDisable) chargeEnabled = false; }
+    void enableBattDetection() { operations.push_back("enableBattDetection");} void enableBattVoltageMeasure() { operations.push_back("enableBattVoltageMeasure");}
+    void enableVbusVoltageMeasure() { operations.push_back("enableVbusVoltageMeasure");} void enableSystemVoltageMeasure() { operations.push_back("enableSystemVoltageMeasure");}
+    void disableIRQ(uint32_t) { operations.push_back("disableIRQ");} void enableIRQ(uint32_t) { operations.push_back("enableIRQ");}
+    void clearIrqStatus() { operations.push_back("clearIrqStatus"); removeIrq = insertIrq = longPressIrq = criticalIrq = lowIrq = false; }
+    uint32_t getIrqStatus() { operations.push_back("getIrqStatus"); return 0; }
+    bool isVbusRemoveIrq() { operations.push_back("isVbusRemoveIrq"); return removeIrq; } bool isVbusInsertIrq() { operations.push_back("isVbusInsertIrq"); return insertIrq; }
+    bool isPekeyLongPressIrq() { operations.push_back("isPekeyLongPressIrq"); return longPressIrq; } bool isDropWarningLevel2Irq() { operations.push_back("isDropWarningLevel2Irq"); return criticalIrq; }
+    bool isDropWarningLevel1Irq() { operations.push_back("isDropWarningLevel1Irq"); return lowIrq; }
+    bool isBatteryConnect() { operations.push_back("isBatteryConnect"); return batteryConnected; }
+    uint8_t getLowBatWarnThreshold() { operations.push_back("getLowBatWarnThreshold"); return lowWarnNibble; }
+    uint8_t getLowBatShutdownThreshold() { operations.push_back("getLowBatShutdownThreshold"); return criticalPercent; }
+    bool isVbusIn() { operations.push_back("isVbusIn"); return vbusIn; }
+    int getBatteryPercent() { operations.push_back("getBatteryPercent"); return batteryPercent; }
+    uint16_t getBattVoltage() { operations.push_back("getBattVoltage"); return batteryMv; }
+    bool isCharging() { operations.push_back("isCharging"); return chargeEnabled && vbusIn; }
+    void shutdown() { operations.push_back("shutdown");
         g_powerEvents.push_back("PMU.shutdown");
         shutdownCalls++;
         if (onShutdown) onShutdown();
