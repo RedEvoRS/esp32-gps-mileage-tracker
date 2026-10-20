@@ -136,10 +136,16 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 - PMU (0x34) and PCF8563 RTC (0x51) share `Wire1`, SDA 42 / SCL 41. OLED and
   BME280 are on `Wire`, SDA 17 / SCL 18
 - GPS: MAX-M10S, firmware SPG 5.10, 9600 baud on RX 9 / TX 8, GPS_EN GPIO 7
-  driven HIGH (low/high made no difference). It still ACKs the legacy UBX
-  CFG-MSG and CFG-NAV5; UBX-CFG-VALSET is the future-proof interface. After
-  a cold power-up it sends NMEA before it accepts UBX (config took ~10 s),
-  so Stage 4 retries its config in the background
+  driven HIGH (low/high made no difference). Bench tests showed that SPG
+  5.10 still ACKs legacy CFG-MSG/CFG-NAV5. Stage 4 now uses the future-proof
+  UBX-CFG-VALSET interface: one RAM-only message at every boot explicitly
+  sets UART1 RMC+GGA+NAV-PVT to rate 1, GLL/GSA/VTG off, GSV off (rate 5
+  with DISPLAY_DEBUG), and the automotive model. Navigation stays at the
+  default 1 Hz. After checksum-valid NMEA proves readiness, each send gets
+  a 2 s ACK window for the busy 9600-baud UART; up to three sends per
+  attempt and five attempts with 8 s backoff run in the normal loop.
+  After success or final failure, the NAV-PVT fallback wait starts. There
+  is no legacy fallback; failure warns and keeps current receiver settings
 - GPS backup RAM is fed from the 18650, not the PMU's VBACKUP (leave
   VBACKUP off): hot start 2 s, cold 33 s. The board powers an active antenna
 - PMU interrupt is GPIO 40, which isn't an RTC GPIO on the ESP32-S3, so it
@@ -171,9 +177,16 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 ### Firmware (both boards)
 
 - Trip files are **GPX 1.0** at ~119 B/point (1.0 allows `<speed>` and
-  `<hdop>` directly on `<trkpt>`)
+  `<hdop>` directly on `<trkpt>`). Trackpoint UTC uses the same RMC's date
+  and time, with `.sssZ` for nonzero centiseconds or whole seconds otherwise;
+  invalid/missing RMC epochs stay untimed, including buffered points after
+  a system-clock sync
 - Trip detection: start >5 mph for 10s; end <2 mph for 3 min. NAV-PVT
-  speed accuracy must be <=0.5 m/s to start, <=1.0 m/s during a trip;
+  speed/horizontal accuracy must be <=0.5 m/s / 5 m to start,
+  <=1.0 m/s / 10 m during a trip (first guesses for drive-log calibration);
+  cooldown resumes after 3 consecutive trusted fixes >2 mph, keeping its
+  original deadline until then. Cooldown adds no distance or moving duration;
+  the confirming fix starts a new distance baseline without a bridge;
   rejected points count as stopped and are not recorded. Fallback is disabled
   until boot GPS configuration succeeds or gives up after five attempts;
   after >10s without NAV-PVT from config end or the last NAV-PVT, warn once

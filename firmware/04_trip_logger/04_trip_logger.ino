@@ -21,9 +21,9 @@
 //      goes away), finalize the current trip cleanly and keep the file
 //      for the next time we're home.
 //
-// Time comes from the GPS (UTC). There is no battery-backed wall clock,
-// so until the first fix we buffer points by millis() and back-date them
-// once UTC arrives. Fresh GPS time corrects the system clock every minute.
+// Trackpoint UTC comes from each position's own RMC date/time, including
+// centiseconds; missing RMC epochs stay untimed even after a clock sync.
+// Fresh GPS time independently corrects the system clock every minute.
 //
 // Required libraries (U8g2 is only needed with DISPLAY_DEBUG):
 //   XPowersLib (lewisxhe), TinyGPSPlus (Mikal Hart). WiFi, HTTPClient,
@@ -102,6 +102,9 @@ static constexpr uint32_t COOL_MS         = 180UL * 1000;    // sustain to end
 // First guesses: calibrate from drive/indoor logs; err low on mileage.
 static constexpr float    SPEED_ACC_ARM_MPS = 0.5f;
 static constexpr float    SPEED_ACC_TRIP_MPS = 1.0f;
+static constexpr float    HACC_ARM_M      = 5.0f;
+static constexpr float    HACC_TRIP_M     = 10.0f;
+static constexpr unsigned RESUME_FIXES    = 3; // consecutive trusted moving fixes
 // Arrival-time association, allowing either UBX/NMEA ordering at 1 Hz.
 static constexpr uint32_t NAV_PVT_FRESH_MS = 1500;
 static constexpr uint32_t NAV_PVT_FALLBACK_MS = 10000;
@@ -226,14 +229,17 @@ static constexpr uint32_t GPS_READY_MS = 3000;
 // NMEA can start before UBX input is ready. Five attempts spaced 8 s after
 // each failure put the last attempt at least 32 s after configuration starts.
 static constexpr uint32_t GPS_CONFIG_RETRY_MS = 8000;
-static constexpr uint32_t GPS_ACK_MS = 300;
+// 9600 baud, 8N1 = 960 bytes/s. A ~1 KB GSV burst alone takes ~1.1 s;
+// allow 2 s for that backlog plus default NMEA, NAV-PVT (~100 B/s) and ACK.
+// Do not resend while that window is open (bench backlog described in #177).
+static constexpr uint32_t GPS_ACK_MS = 2000;
 static constexpr uint8_t GPS_CONFIG_ATTEMPTS = 5;
 static constexpr uint8_t GPS_COMMAND_SENDS = 3;
 enum GpsConfigState { GPS_CONFIG_OFF, GPS_WAIT_READY, GPS_WAIT_ACK, GPS_RETRY, GPS_CONFIG_DONE };
 struct GpsConfig {
     GpsConfigState state = GPS_CONFIG_OFF;
     uint32_t since = 0, started = 0;
-    uint8_t attempts = 0, command = 0, sends = 0;
+    uint8_t attempts = 0, sends = 0, sendGeneration = 0;
     int8_t ack = -1;
     bool readyLogged = false, retryLogged = false;
 };
@@ -245,6 +251,7 @@ struct GpsUbxRx {
     uint32_t pos = 0, since = 0;
     uint16_t len = 0;
     uint8_t cls = 0, id = 0, a = 0, b = 0;
+    uint8_t configGeneration = 0;
     uint8_t payload[256] = {};
     bool checksumA = false;
 };
@@ -283,7 +290,7 @@ static bool gJournalReady = false; // set once on core 1 before task creation
 static bool gJournalStarted = false; // under FS_LOCK; core-0 consumer only
 static bool gJournalBootReported = false;
 
-// A single GPS fix, with both a monotonic and (once known) a UTC stamp.
+// A single GPS fix, with monotonic receipt time and its own RMC UTC epoch.
 struct Fix {
     double   lat, lon;
     float    speedMps, hdop;
@@ -336,6 +343,7 @@ static size_t gPendHead = 0, gPendCount = 0;
 enum TripState { IDLE, ARMING, ACTIVE, COOLDOWN, FINALIZING };
 static TripState gState = IDLE;
 static uint32_t  gArmT0 = 0, gCoolT0 = 0, gTripT0 = 0;
+static unsigned  gResumeFixes = 0;
 static uint32_t  gLastMoveMs = 0;       // the active trip's last moving fix
 static uint32_t  gFsCheckT0 = 0;        // last free-space check during a trip
 static uint32_t  gFullWarnT0 = 0;       // last "storage full" log line
@@ -414,9 +422,10 @@ static void serviceGpsSpeedFallback() {
 static bool gpsSpeedTrusted(bool starting) {
     if (gSpeedFallback) return true;
     float limit = starting ? SPEED_ACC_ARM_MPS : SPEED_ACC_TRIP_MPS;
+    float hAccLimit = starting ? HACC_ARM_M : HACC_TRIP_M;
     return gNavPvt.seen && uint32_t(millis() - gNavPvt.receivedMs) <= NAV_PVT_FRESH_MS &&
            (gNavPvt.flags & 1) && (gNavPvt.fixType == 3 || gNavPvt.fixType == 4) &&
-           gNavPvt.sAccMmps <= limit * 1000.0f;
+           gNavPvt.sAccMmps <= limit * 1000.0f && gNavPvt.hAccMm <= hAccLimit * 1000.0f;
 }
 
 static void armBufReset() { gArmHead = gArmCount = 0; }
@@ -460,12 +469,20 @@ static uint64_t nowEpochMs() {
     return (uint64_t)tv.tv_sec * 1000ULL + tv.tv_usec / 1000;
 }
 
-// Format epoch milliseconds as ISO 8601 UTC, e.g. 2026-04-14T14:30:15Z.
+// ISO 8601 UTC: whole seconds stay compact; retain nonzero milliseconds.
 static void isoFromEpochMs(uint64_t ms, char* out, size_t n) {
     time_t secs = (time_t)(ms / 1000);
     struct tm tmv;
     gmtime_r(&secs, &tmv);
-    if (n && strftime(out, n, "%Y-%m-%dT%H:%M:%SZ", &tmv) == 0) out[0] = 0;
+    char seconds[20];
+    if (strftime(seconds, sizeof(seconds), "%Y-%m-%dT%H:%M:%S", &tmv) == 0) {
+        if (n) out[0] = 0;
+        return;
+    }
+    unsigned fraction = ms % 1000;
+    int written = fraction ? snprintf(out, n, "%s.%03uZ", seconds, fraction) :
+                             snprintf(out, n, "%sZ", seconds);
+    if (n && (written < 0 || size_t(written) >= n)) out[0] = 0;
 }
 
 // Convert a UTC struct tm to a Unix epoch. The newlib that ships with
@@ -507,7 +524,10 @@ static bool validRmcClockFields(TinyGPSCustom& time, TinyGPSCustom& date) {
 // Called at each checksum-valid sentence, before another sentence can mix a
 // new GGA time with an older RMC date (especially at midnight). Reading year()
 // consumes date.isUpdated(), even while correction is rate limited.
-static void setClockFromGps() {
+// Also capture this sentence's epoch before the rate-limited clock sync
+// consumes date/time's updated flags. Never add receipt age to a trackpoint.
+static void setClockFromGps(uint64_t* rmcUtcMs = nullptr) {
+    if (rmcUtcMs) *rmcUtcMs = 0;
     if (!gps.date.isUpdated()) return;
     // TinyGPSPlus renews cached date/time even when an RMC field is empty.
     // Check the sentence's raw fields before trusting its parsed values.
@@ -522,13 +542,15 @@ static void setClockFromGps() {
     tmv.tm_hour = gps.time.hour();
     tmv.tm_min  = gps.time.minute();
     tmv.tm_sec  = gps.time.second();
-    unsigned subsecondMs = gps.time.centisecond() * 10 + gps.time.age();
+    unsigned rmcFractionMs = gps.time.centisecond() * 10;
+    unsigned subsecondMs = rmcFractionMs + gps.time.age();
     if (!fresh || tmv.tm_year < 124 || tmv.tm_mon < 0 || tmv.tm_mon > 11 ||
         tmv.tm_mday < 1 || tmv.tm_mday > 31 || tmv.tm_hour > 23 ||
         tmv.tm_min > 59 || tmv.tm_sec > 59) return;
+    time_t t = timegmUtc(&tmv);
+    if (rmcUtcMs) *rmcUtcMs = uint64_t(t) * 1000 + rmcFractionMs;
     uint32_t now = millis();
     if (gGpsClockSet && now - gLastGpsSyncMs < GPS_CLOCK_SYNC_MS) return;
-    time_t t = timegmUtc(&tmv);
     struct timeval tv = { .tv_sec = t + subsecondMs / 1000,
                           .tv_usec = (long)(subsecondMs % 1000) * 1000 };
     if (settimeofday(&tv, nullptr) != 0) return;
@@ -595,7 +617,7 @@ static void makeTripPath(char* out, size_t n) {
 static void appendTrkpt(FileWriter& w, const Fix& fx) {
     char timeEl[40] = "";
     if (fx.hasUtc) {
-        char iso[24];
+        char iso[25];
         isoFromEpochMs(fx.utcMs, iso, sizeof(iso));
         snprintf(timeEl, sizeof(timeEl), "<time>%s</time>", iso);
     }
@@ -620,22 +642,12 @@ static void pushPending(const Fix& fx) {
     gPendCount++;
 }
 
-// Write all buffered fixes to the open trip file, back-dating each from
-// the now-known UTC and its monotonic stamp. Called once, the first time
-// UTC becomes available during an active trip -- or when a trip that never
-// got UTC is closed. Those points get no time at all: until a source has
-// synchronized it, the system clock reads 1970 or a date carried over deep
-// sleep, and a made-up date can file the miles under the wrong day or year.
+// Write buffered fixes in order, preserving their original timing status.
+// A missing/invalid RMC epoch stays untimed even after GPS or NTP sets the
+// system clock: receipt delays cannot reconstruct the position's epoch.
 static void flushPending(FileWriter& w) {
-    // Read the flag before the clock: core 0 sets the clock from NTP first,
-    // then the flag.
-    bool trusted = gClockSet.load();
-    uint64_t utcNow = nowEpochMs();
-    uint32_t monoNow = millis();
     for (size_t i = 0; i < gPendCount; ++i) {
-        Fix p = gPend[(gPendHead + i) % PENDING_CAPACITY];
-        p.hasUtc = trusted;
-        p.utcMs  = trusted ? utcNow - (uint64_t)(monoNow - p.monoMs) : 0;
+        const Fix& p = gPend[(gPendHead + i) % PENDING_CAPACITY];
         appendTrkpt(w, p);
     }
     gPendCount = gPendHead = 0;
@@ -645,8 +657,8 @@ static void flushPending(FileWriter& w) {
 // Trip lifecycle
 // =================================================================
 // Reserve the pending tail, one more point (including a segment break),
-// and the closing tags. A point is at most 255 bytes, even when back-dated
-// with UTC. Checking after each fix leaves the complete file below 8 MiB.
+// and the closing tags. A point is at most 255 bytes, including fractional
+// UTC. Checking after each fix leaves the complete file below 8 MiB.
 static bool tripShouldSplit(size_t bytes, size_t pendingCount) {
     return bytes + (pendingCount + 1) * (TRKPT_LINE_BYTES - 1) +
            strlen(GPX_EPILOGUE) >= TRIP_SPLIT_BYTES;
@@ -719,8 +731,8 @@ static bool beginTrip(const Fix& fx) {
         w.put(GPX_PROLOGUE);
         // Write the fixes captured during ARMING (includes the current
         // fix, pushed by the FSM before calling us) so the first ~10 s
-        // of the drive is in the file. Pre-UTC fixes go to the pending
-        // buffer and are back-dated when UTC arrives, same as any other.
+        // of the drive is in the file. Fixes without RMC UTC go to the
+        // pending buffer and retain their untimed status when flushed.
         for (size_t i = 0; i < gArmCount; ++i) {
             const Fix& p = gArmBuf[(gArmHead + i) % 16];
             if (p.hasUtc) {
@@ -769,8 +781,8 @@ static bool beginTrip(const Fix& fx) {
 
 // Append a point to the active trip, buffering instead if UTC isn't
 // available yet. If the buffer is full, commit its oldest point untimed
-// before accepting this one. Once UTC arrives, back-date the buffered tail;
-// points already committed without times stay untimed.
+// before accepting this one. A timed RMC flushes the buffered untimed tail
+// first; points without their own RMC epoch always stay untimed.
 // Returns false if the write didn't reach flash; the caller must end the
 // trip, since a partial line may now sit at the tail of the file.
 static bool writeOrBufferTrkpt(const Fix& fx) {
@@ -844,7 +856,7 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
                 FileWriter w(f);
                 // Flush any still-buffered (never-got-UTC) points before
                 // closing, so a trip that never got UTC isn't lost. They're
-                // written without times unless the clock is now trusted.
+                // written without times regardless of the system clock.
                 if (gPendCount > 0) flushPending(w);
                 w.put(GPX_EPILOGUE);
                 ok = w.commit();
@@ -880,12 +892,10 @@ static void tripFsmOnFix(const Fix& fx) {
     const uint32_t now = fx.monoMs;
     const float speed = fx.speedTrusted ? fx.speedMps : 0.0f;
 
-    // Distance + max speed accumulate whenever we're recording. The
-    // speed gate stops GPS jitter from adding phantom meters while
-    // stationary (3 min parked in COOLDOWN scatters tens of meters);
-    // erring low is the IRS-safe direction. The same gate marks the last
-    // moving fix, where endTrip() measures the trip's duration to.
-    if ((gState == ACTIVE || gState == COOLDOWN) && speed > END_MPS) {
+    // Only ACTIVE movement adds distance. COOLDOWN noise must neither add
+    // meters nor extend the last moving time used by endTrip(). Resuming
+    // establishes a new distance baseline at the confirming fix, erring low.
+    if (gState == ACTIVE && speed > END_MPS) {
         if (gHaveLastFix && gDistanceContinuous)
             gTripMeters += haversineM(gLastFix.lat, gLastFix.lon, fx.lat, fx.lon);
         gLastMoveMs = now;
@@ -921,14 +931,17 @@ static void tripFsmOnFix(const Fix& fx) {
         break;
     case ACTIVE:
         if ((fx.speedTrusted && !writeOrBufferTrkpt(fx)) || tripStorageLow(now)) { gState = FINALIZING; break; }
-        if (speed <= END_MPS) { gState = COOLDOWN; gCoolT0 = now; }
+        if (speed <= END_MPS) { gState = COOLDOWN; gCoolT0 = now; gResumeFixes = 0; }
         break;
     case COOLDOWN:
         if ((fx.speedTrusted && !writeOrBufferTrkpt(fx)) || tripStorageLow(now)) { gState = FINALIZING; break; }
-        if (speed > END_MPS) {
-            gState = ACTIVE;
-        } else if (now - gCoolT0 >= COOL_MS) {
+        gResumeFixes = speed > END_MPS ? gResumeFixes + 1 : 0;
+        // Keep the original deadline while collecting evidence of movement.
+        if (now - gCoolT0 >= COOL_MS) {
             gState = FINALIZING;
+        } else if (gResumeFixes >= RESUME_FIXES) {
+            gState = ACTIVE;
+            gLastMoveMs = now;
         }
         break;
     case FINALIZING:
@@ -969,7 +982,7 @@ static void tripFsmOnFix(const Fix& fx) {
         gLastFix = fx;
         gHaveLastFix = true;
     }
-    gDistanceContinuous = fx.speedTrusted;
+    gDistanceContinuous = fx.speedTrusted && gState == ACTIVE;
     gLastFixMonoMs = now;
 }
 
@@ -1821,9 +1834,9 @@ static void networkTask(void*) {
 // =================================================================
 // GPS receiver configuration (u-blox UBX protocol, started at boot)
 // =================================================================
-// The MAX-M10S (SPG 5.10) ACKed these legacy messages on 2026-10-18.
-// Keep the legacy ACK/retry protocol until #108 handles VALSET separately.
-// Re-send at every boot rather than rely on retained receiver settings.
+// Apply one RAM-only VALSET at every boot rather than rely on retained
+// settings. One ACK covers the whole configuration, so late CFG-MSG ACKs
+// cannot be mistaken for replies to a different setting.
 
 // Frame: B5 62 | class id | length (LE16) | payload | Fletcher-8 checksum
 // over class..payload.
@@ -1838,34 +1851,34 @@ static void ubxSend(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t le
     GPSSerial.write(b);
 }
 
-// Send one message and arm its deadline. Only one frame (at most 44 bytes)
+// Send one message and arm its deadline. Only one frame (52 bytes)
 // is written per call; there is no flush or ACK wait.
 static void sendGpsConfigCommand() {
-    // UBX-CFG-MSG (3-byte form: rate on the current port) = 0 for the NMEA
-    // sentences TinyGPSPlus ignores: GLL, GSA, GSV, VTG. RMC and GGA stay --
-    // GGA carries altitude, HDOP and satellite count.
-    static const uint8_t kSilence[] = { 0x01, 0x02, 0x03, 0x05 };
-    if (gGpsConfig.command < sizeof(kSilence)) {
-        uint8_t p[3] = { 0xF0, kSilence[gGpsConfig.command], 0 };
+    // u-blox M10 SPG 5.10 Interface description, UBX-21035062 R03:
+    // 3.10.5.1: version 0, RAM layer only, two reserved zero bytes.
+    // 4.9.11 / Table 19: UART1 message keys below, all U1 (one byte).
+    // 4.9.12 / Tables 20, 23: DYNMODEL is E1 (one byte), AUTOMOT = 4.
+    // 4.2 / 4.5: U1/E1 values occupy one byte, keys are little-endian U4,
+    // no padding. No BBR/flash writes or navigation-rate changes.
+    static const uint8_t p[] = {
+        0x00, 0x01, 0x00, 0x00,
+        0xCA, 0x00, 0x91, 0x20, 0,  // CFG-MSGOUT-NMEA_ID_GLL_UART1
+        0xC0, 0x00, 0x91, 0x20, 0,  // CFG-MSGOUT-NMEA_ID_GSA_UART1
+        0xB1, 0x00, 0x91, 0x20, 0,  // CFG-MSGOUT-NMEA_ID_VTG_UART1
+        0xC5, 0x00, 0x91, 0x20,     // CFG-MSGOUT-NMEA_ID_GSV_UART1
 #if DISPLAY_DEBUG
-        // GSV every fifth 1 Hz epoch: multi-constellation bursts can be
-        // ~1 KB; spreading them over 5 s leaves 9600-baud headroom for
-        // RMC+GGA and ACKs. The UART buffer is 2048 B. No VALSET changes.
-        if (p[1] == 0x03) p[2] = 5;
+        5,  // ~1 KB bursts every fifth epoch leave 9600-baud headroom
+#else
+        0,
 #endif
-        ubxSend(0x06, 0x01, p, sizeof(p));
-    } else if (gGpsConfig.command == 4) {
-        // UBX-CFG-NAV5: apply only dynamic model "automotive" (4).
-        uint8_t nav5[36] = {0};
-        nav5[0] = 0x01;
-        nav5[2] = 4;
-        ubxSend(0x06, 0x24, nav5, sizeof(nav5));
-    } else {
-        // Legacy CFG-MSG current-port rate: NAV-PVT every 1 Hz epoch.
-        const uint8_t p[3] = {0x01, 0x07, 1};
-        ubxSend(0x06, 0x01, p, sizeof(p));
-    }
+        0xAC, 0x00, 0x91, 0x20, 1,  // CFG-MSGOUT-NMEA_ID_RMC_UART1
+        0xBB, 0x00, 0x91, 0x20, 1,  // CFG-MSGOUT-NMEA_ID_GGA_UART1
+        0x07, 0x00, 0x91, 0x20, 1,  // CFG-MSGOUT-UBX_NAV_PVT_UART1
+        0x21, 0x00, 0x11, 0x20, 4,  // CFG-NAVSPG-DYNMODEL
+    };
+    ubxSend(0x06, 0x8A, p, sizeof(p));
     gGpsConfig.sends++;
+    gGpsConfig.sendGeneration++;
     gGpsConfig.ack = -1;
     gGpsConfig.since = millis();
     gGpsConfig.state = GPS_WAIT_ACK;
@@ -1900,7 +1913,7 @@ static void serviceGpsConfiguration() {
     if (gGpsConfig.state == GPS_RETRY) {
         if (millis() - gGpsConfig.since < GPS_CONFIG_RETRY_MS) return;
         gGpsConfig.attempts++;
-        gGpsConfig.command = gGpsConfig.sends = 0;
+        gGpsConfig.sends = 0;
         gGpsConfig.since = millis();
         gGpsConfig.state = GPS_WAIT_READY;
     }
@@ -1920,23 +1933,18 @@ static void serviceGpsConfiguration() {
     }
     if (gGpsConfig.state != GPS_WAIT_ACK) return;
     if (gGpsConfig.ack == 1) {
-        if (++gGpsConfig.command == 6) {
-            gGpsConfig.state = GPS_CONFIG_DONE;
-            gNavPvtWaitMs = millis();
-            Serial.printf("GPS configured on attempt %u (%lu ms after config start): "
+        gGpsConfig.state = GPS_CONFIG_DONE;
+        gNavPvtWaitMs = millis();
+        Serial.printf("GPS configured on attempt %u (%lu ms after config start): "
 #if DISPLAY_DEBUG
-                          "RMC+GGA+NAV-PVT, GSV every 5 epochs, automotive model.\n",
+                      "RMC+GGA+NAV-PVT, GSV every 5 epochs, automotive model.\n",
 #else
-                          "RMC+GGA+NAV-PVT, automotive model.\n",
+                      "RMC+GGA+NAV-PVT, automotive model.\n",
 #endif
-                          (unsigned)gGpsConfig.attempts,
-                          (unsigned long)(millis() - gGpsConfig.started));
-        } else {
-            gGpsConfig.sends = 0;
-            sendGpsConfigCommand();
-        }
+                      (unsigned)gGpsConfig.attempts,
+                      (unsigned long)(millis() - gGpsConfig.started));
     } else if (gGpsConfig.ack == 0) {
-        gpsConfigAttemptFailed();  // NAK: retry the entire set later
+        gpsConfigAttemptFailed();  // NAK: retry the same VALSET later
     } else if (millis() - gGpsConfig.since >= GPS_ACK_MS) {
         if (gGpsConfig.sends < GPS_COMMAND_SENDS) sendGpsConfigCommand();
         else gpsConfigAttemptFailed();
@@ -1967,7 +1975,7 @@ static bool rmcFixArrived() {
 // =================================================================
 // Build a Fix from the current TinyGPSPlus state
 // =================================================================
-static bool buildFix(Fix& fx) {
+static bool buildFix(Fix& fx, uint64_t rmcUtcMs) {
     if (!gps.location.isValid()) return false;
     fx.lat       = gps.location.lat();
     fx.lon       = gps.location.lng();
@@ -1976,8 +1984,8 @@ static bool buildFix(Fix& fx) {
     gLatestSpeedTrusted = fx.speedTrusted;
     fx.hdop      = gps.hdop.isValid() ? gps.hdop.hdop() : 99.9f;
     fx.monoMs    = millis();
-    fx.hasUtc    = gClockSet.load();
-    fx.utcMs     = fx.hasUtc ? nowEpochMs() : 0;
+    fx.hasUtc    = rmcUtcMs != 0;
+    fx.utcMs     = rmcUtcMs;
     return true;
 }
 
@@ -1993,10 +2001,11 @@ static void receiveGpsNmea(uint8_t c) {
 #if DISPLAY_DEBUG
     gDebugGsv.update(millis());
 #endif
-    setClockFromGps();
+    uint64_t rmcUtcMs = 0;
+    setClockFromGps(&rmcUtcMs);
     if (rmcFixArrived()) {
         Fix fx;
-        if (buildFix(fx)) {
+        if (buildFix(fx, rmcUtcMs)) {
             if (gHaveLastFix && (fx.monoMs - gLastFix.monoMs) > SEG_GAP_MS) {
                 if (gState == ACTIVE || gState == COOLDOWN) {
                     fx.newSegment = true;
@@ -2016,7 +2025,10 @@ static void receiveGpsByte(uint8_t c) {
     // are 10 bytes; bound other packets to 256 payload bytes / 500 ms.
     if (rx.pos && millis() - rx.since >= 500) rx = GpsUbxRx();
     if (rx.pos == 0) {
-        if (c == 0xB5) { rx.pos = 1; rx.since = millis(); }
+        if (c == 0xB5) {
+            rx.pos = 1; rx.since = millis();
+            rx.configGeneration = gGpsConfig.state == GPS_WAIT_ACK ? gGpsConfig.sendGeneration : 0;
+        }
         else receiveGpsNmea(c);
         return;
     }
@@ -2024,7 +2036,10 @@ static void receiveGpsByte(uint8_t c) {
         if (c == 0x62) rx.pos++;
         else {
             rx = GpsUbxRx();
-            if (c == 0xB5) { rx.pos = 1; rx.since = millis(); }
+            if (c == 0xB5) {
+                rx.pos = 1; rx.since = millis();
+                rx.configGeneration = gGpsConfig.state == GPS_WAIT_ACK ? gGpsConfig.sendGeneration : 0;
+            }
             else receiveGpsNmea(c);
         }
         return;
@@ -2048,10 +2063,15 @@ static void receiveGpsByte(uint8_t c) {
         rx.checksumA = (c == rx.a);
         rx.pos++;
     } else {
-        uint8_t expectedId = gGpsConfig.command == 4 ? 0x24 : 0x01;
+        // Ignore replies outside the current send window, including frames
+        // started in backoff or before a resend. UBX ACK carries no attempt
+        // ID: a whole delayed ACK arriving after a later identical send is
+        // indistinguishable, but still acknowledges the same settings.
         if (rx.checksumA && c == rx.b && rx.cls == 0x05 && rx.len == 2 &&
             (rx.id == 0x01 || rx.id == 0x00) && rx.payload[0] == 0x06 &&
-            rx.payload[1] == expectedId && gGpsConfig.state == GPS_WAIT_ACK &&
+            rx.payload[1] == 0x8A && gGpsConfig.state == GPS_WAIT_ACK &&
+            rx.configGeneration == gGpsConfig.sendGeneration &&
+            millis() - gGpsConfig.since < GPS_ACK_MS &&
             gGpsConfig.ack < 0) {
             gGpsConfig.ack = rx.id == 0x01 ? 1 : 0;
         }
