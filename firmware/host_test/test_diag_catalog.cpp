@@ -5,17 +5,20 @@
 #include <iostream>
 
 using namespace diagnostics;
-static_assert(kCatalogVersion == 3, "review the host fixture on catalog version changes");
+static_assert(kCatalogVersion == 4, "review the host fixture on catalog version changes");
 static_assert(static_cast<std::uint16_t>(Code::STORAGE_FULL) == 4005, "stable code");
 static_assert(find(4005)->severity == Severity::Critical, "constexpr lookup");
 static_assert(find(5001)->journal == Journal::Counter, "no event for each absent scan");
 static_assert(static_cast<std::uint16_t>(Code::PMU_STARTUP_RECOVERY) == 2007, "stable power code");
 static_assert(find(2007)->severity == Severity::Warning && !find(2007)->notify, "history without paging");
 static_assert(find(2007)->journal == Journal::PerOccurrence, "startup recovery is a notice");
+static_assert(static_cast<std::uint16_t>(Code::GPS_ANTENNA_SUSPECT) == 3009, "stable GPS code");
+static_assert(find(3009)->severity == Severity::Warning && find(3009)->notify, "antenna warning eligible");
+static_assert(find(3009)->journal == Journal::Transitions, "antenna condition");
 static_assert(find(7999) == nullptr, "unknown codes need a display fallback");
 
 int main() {
-    assert(kCatalogSize == 45);
+    assert(kCatalogSize == 46);
     for (std::size_t i = 0; i < kCatalogSize; ++i) {
         const auto& entry = kCatalog[i];
         assert(entry.oled_line_count >= 1 && entry.oled_line_count <= 3);
@@ -24,5 +27,5 @@ int main() {
             assert(std::strlen(entry.oled[line]) <= 21);
         }
     }
-    std::cout << "Diagnostic catalog: 45 entries passed\n";
+    std::cout << "Diagnostic catalog: 46 entries passed\n";
 }

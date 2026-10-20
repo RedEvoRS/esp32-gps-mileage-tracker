@@ -470,11 +470,16 @@ The rest of this section was written for the V1.2. On the Supreme
 - **GPS settings:** Stage 4 sends one UBX-CFG-VALSET (`06 8A`) at every
   boot to the receiver's RAM layer, without saving to battery-backed RAM
   or flash. It explicitly enables UART1 RMC, GGA and NAV-PVT at rate 1;
-  disables GLL, GSA and VTG; disables GSV in normal builds (rate 5 with
-  `DISPLAY_DEBUG=1`); and selects the automotive dynamic model. The
+  disables GLL, GSA and VTG; enables GSV every 5 epochs in all builds;
+  and selects the automotive dynamic model. The
   navigation rate stays at the default 1 Hz. GGA supplies altitude, HDOP
   and satellite count; NAV-PVT supplies speed/horizontal accuracy used
   before recording movement.
+  E3009 means high receiver gain and no usable-strength satellite persisted
+  for two minutes, suggesting a loose or damaged GPS antenna cable; check the
+  plug inside the case and the cable. It clears on lower gain or a strong
+  satellite, including after reconnecting indoors; the thresholds come from
+  one board and antenna, so the warning is a prompt to inspect them.
   The key IDs and one-byte values come from the [M10 SPG 5.10 interface
   description (UBX-21035062 R03)](https://content.u-blox.com/sites/default/files/u-blox-M10-SPG-5.10_InterfaceDescription_UBX-21035062.pdf),
   sections 3.10.5.1, 4.9.11 and 4.9.12. The bench receiver still ACKs
@@ -515,8 +520,9 @@ The rest of this section was written for the V1.2. On the Supreme
 
   Things to know:
   - It's switched by `DISPLAY_DEBUG` at the top of the sketch (default `1`).
-    Set it to `0` to leave the screen untouched and disable GSV/MON-RF
-    diagnostics. NAV-PVT speed accuracy gating stays enabled in both builds.
+    Set it to `0` to leave the screen untouched and disable the `GPS RF:`
+    serial line. GSV/MON-RF antenna checking and NAV-PVT speed accuracy gating
+    stay enabled in both builds.
   - A question mark, such as `Speed 3.3? mph`, means the displayed speed
     failed the accuracy check; it cannot start or extend a trip and the
     point is omitted from the GPX.

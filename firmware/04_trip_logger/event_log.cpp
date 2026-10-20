@@ -57,6 +57,7 @@ const Field fields[] = {
     NUMBER(3004, "message_class", 0, 255), NUMBER(3004, "message_id", 0, 255),
     NUMBER(3005, "elapsed_ms", 0, INT64_MAX),
     ENUM(3008, "reason", "stopped|invalid_date|out_of_range|read_failed"),
+    NUMBER(3009, "agc_pct", 0, 100), NUMBER(3009, "max_cno", 0, 99),
     BACKEND(4004), NUMBER(4004, "free_bytes", 0, INT64_MAX),
     BACKEND(4005), NUMBER(4005, "free_bytes", 0, INT64_MAX),
     BACKEND(4006), ENUM(4006, "operation", "open|write|close|rename"),

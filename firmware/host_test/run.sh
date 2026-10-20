@@ -32,6 +32,11 @@ flags=("${assert_flags[@]}" -std=gnu++20 -O1 -w -DDISPLAY_DEBUG=0 -DJOURNAL_HOST
 incs=(-I"$here/stubs" -I"$here/../04_trip_logger" -I"$build/include")
 status=0
 
+echo "== test_gps_antenna"
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -pedantic \
+    "$here/test_gps_antenna.cpp" -o "$build/test_gps_antenna.exe"
+"$build/test_gps_antenna.exe" || status=1
+
 echo "== test_debug_display (bus fault injection)"
 "${cxx[@]}" "${flags[@]}" -I"$here/display_stubs" -I"$here/../04_trip_logger" \
     "$here/test_debug_display.cpp" -o "$build/test_debug_display.exe"
