@@ -140,7 +140,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   BME280 are on `Wire`, SDA 17 / SCL 18
 - RTC: read once at boot for diagnostic event timestamps only, never GPX;
   set at most once per boot from GPS/SNTP with read-back verification.
-  Whether it keeps time across `PMU.shutdown()` is not yet bench-checked
+  It keeps time across `PMU.shutdown()` (bench, 2026-10-20) and drifts
+  about 10 s/day; the PCF8563 has no calibration register
 - GPS: MAX-M10S, firmware SPG 5.10, 9600 baud on RX 9 / TX 8, GPS_EN GPIO 7
   driven HIGH (low/high made no difference). Bench tests showed that SPG
   5.10 still ACKs legacy CFG-MSG/CFG-NAV5. Stage 4 now uses the future-proof
