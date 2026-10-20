@@ -202,7 +202,7 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 - Stage 4 diagnostics: static EventLog, random boot identity and NVS boot
   counter; boot/reset, retained PMU recovery and runtime fault hooks. GPS,
   battery/charge guard, trip storage/recovery, WiFi/HTTP, network stack and
-  debug OLED faults use the catalog policy, including an AGC/GSV antenna check
+  OLED faults use the catalog policy (production: brief heard-satellite/fault cards), including an AGC/GSV antenna check
   in all builds. Conditions raise/clear with
   15-minute repeats; AP absence is a boot-local counter, never a scan event.
   Per-core static producer builders keep event buffers off task stacks. The network

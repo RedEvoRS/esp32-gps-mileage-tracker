@@ -538,9 +538,18 @@ The rest of this section was written for the V1.2. On the Supreme
 
   Things to know:
   - It's switched by `DISPLAY_DEBUG` at the top of the sketch (default `1`).
-    Set it to `0` to leave the screen untouched and disable the `GPS RF:`
-    serial line. GSV/MON-RF antenna checking and NAV-PVT speed accuracy gating
-    stay enabled in both builds.
+    Set `DISPLAY_DEBUG` to `0` at the top of the sketch to build the production
+    screen and disable the `GPS RF:` serial line. It sleeps by default, briefly
+    showing satellites **heard** (or `--` when stale) and active catalog fault
+    codes/text at the first parked opportunity after boot or a trip. New
+    ERROR/CRITICAL episodes show once even while moving; unresolved faults
+    remind at the next parked opportunity. Cards last 10 seconds at maximum
+    contrast, then SH1106 power save turns the panel off. A short press of
+    **POWER** shows a status card in any motion state. Long press keeps its
+    existing clean power-off behavior on battery and is ignored on USB.
+    GSV/MON-RF antenna checking and NAV-PVT speed accuracy gating stay enabled
+    in both builds. Production visual/current acceptance still needs the bench;
+    full policy and motion definitions are in `DIAGNOSTICS.md`.
   - A question mark, such as `Speed 3.3? mph`, means the displayed speed
     failed the accuracy check; it cannot start or extend a trip and the
     point is omitted from the GPX.

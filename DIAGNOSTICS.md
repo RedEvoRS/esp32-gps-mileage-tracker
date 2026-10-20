@@ -40,7 +40,8 @@ numeric measurements and fixed enumerated values in context.
   producer queue, CRC segments, durable acknowledgments/loss accounting and
   snapshot revision allocator. Part A of #124 now supplies its mounted-storage
   adapters, boot identity/counter and boot notices in Stage 4.
-- **#123:** pure DisplayModel and host tests for display policy.
+- **#123:** implemented pure header-only DisplayModel, bounded episode queue,
+  catalog rendering and host policy tests for the production screen.
 - **#124 part A:** implemented mounted-filesystem adapters, fresh boot identity/
   NVS boot counter, cooperative core-0 service, LittleFS trip reserve, shutdown
   sealing and boot/reset notices. **Part B is implemented:** runtime fault hooks
@@ -52,7 +53,9 @@ numeric measurements and fixed enumerated values in context.
   enrollment is required before the first diagnostic request (see below).
 - **#126:** implemented bounded degraded service loops for PMU/LoRa-rail and
   trip-storage startup failures, with local journaling and restart on recovery.
-- **#127:** SH1106 hardware adapter on the Supreme, following #123 and the port.
+- **#127:** implemented production-only SH1106 adapter, power save, POWER
+  short-press status and latched E6001 transport failure; visual/current bench
+  acceptance remains hardware work.
 - **#128:** implemented diagnostics-only PCF8563 boot timestamps, bounded
   GPS/SNTP RTC setting and clock-confidence/runtime tests; retention needs bench testing.
 - **#129:** consistent diagnostics database and monitor-state backups/restores.
@@ -62,8 +65,9 @@ numeric measurements and fixed enumerated values in context.
 - **#136:** optional push to an external Loki (not bundled).
 - **#137:** installer questions choosing these outputs.
 - **#151:** E2007 catalog entry, retained Stage 4 PMU startup result and boot
-  journal emission in normal and degraded startup are implemented. OLED
-  reporting remains with #127.
+  journal emission in normal and degraded startup are implemented. This
+  one-off notice stays in journal/server history; production cards list active
+  conditions under #123/#127.
 - **#164:** E3009 antenna warning uses MON-RF gain and fresh GSV strength in
   every build; the RF serial line and temporary OLED page stay debug-only.
 
@@ -121,7 +125,7 @@ does not prove PMU readiness. Stage 4 retains the complete `PmuStartupResult`
 in RAM; `makePmuStartupEvent` prepares these fields without I/O. #122/#124 must
 emit the notice once the journal is available; part A of #124 now does so.
 Failed PMU startup also journals the retained result in the degraded loop
-when LittleFS is usable (otherwise RAM). OLED failure reporting remains #127.
+when LittleFS is usable (otherwise RAM). OLED failure reporting is implemented by #127.
 
 `notify` means eligible, not an instruction to send a notification immediately.
 Info codes, 2007 PMU_STARTUP_RECOVERY, the high/low charge-guard warnings
@@ -133,9 +137,9 @@ notices by themselves. Silence code 7001 is derived by the server monitor;
 the protocol rejects 7xxx codes from devices so one cannot forge it.
 
 OLED text is printable ASCII, at most **three lines of 21 characters**. The
-SH1106 adapter uses a fixed 6x8-pixel font at scale 1 on a 128x64 screen: 21
-characters occupy 126 pixels. An `E4005` heading uses one additional 8-pixel
-line, leaving room for margins. The adapter must select that font explicitly;
+SH1106 adapter uses U8g2 `u8g2_font_5x8_tf`, a fixed 5-pixel-advance font
+with 8-pixel rows at scale 1 on a 128x64 screen: 21 characters occupy 105 pixels. An `E4005` heading uses one additional 8-pixel
+line; there are at most eight rows. The adapter must select that font explicitly;
 larger or proportional fonts do not satisfy these bounds. Never scroll or
 shrink text to work around a catalog violation. The C++ table includes code,
 symbol, severity, OLED lines, title, notify and journal policy; longer recovery
@@ -659,7 +663,7 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E5007 | HTTP 409 | Next HTTP 200 trip upload | `http_status`, `target=trip` |
 | E5008 | HTTP 500-599 | Next HTTP 200 trip upload | `http_status`, `target=trip` |
 | E5009 | Other positive HTTP result except 200 | Next HTTP 200 trip upload | `http_status` when 100-599, `target=trip` |
-| E6001 | Debug OLED adapter latches I2C/init failure | Adapter healthy; current adapter disables display for the rest of the boot | none; DISPLAY_DEBUG=1 only |
+| E6001 | Either OLED adapter latches I2C/init failure | Adapter healthy; either adapter disables display for the rest of the boot | none; both DISPLAY_DEBUG modes |
 
 Battery diagnostics use the **existing hardware SOC thresholds**, without adding
 a new voltage cutoff or changing shutdown policy. XPowersLib 0.3.3 returns the
@@ -708,7 +712,7 @@ measurement. Part A's observed 7,556 free bytes was a no-upload measurement.
 E2001/E4002/E4003 degraded-startup hooks are implemented by #126. The existing
 FS-mutex allocation failure still restarts, and network-task creation failure
 remains non-fatal. RTC E3007/E3008 are implemented by #128; E5010 and diagnostic
-uploads/snapshots by #125. Error-code OLED pages remain #127; antenna detection
+uploads/snapshots by #125. Production error-code OLED pages are implemented by #127; antenna detection
 is implemented by #164.
 
 ### Degraded startup service (#126)
@@ -717,7 +721,7 @@ Every degraded boot prints `DEGRADED:` after the Stage 4 banner. These lines
 mean **no trips are being recorded**. A separate loop returns before GPS parsing,
 receiver configuration, the trip FSM, RTC service and display updates. No degraded
 mode starts the network task, WiFi, or diagnostic uploads. The OLED is not needed
-for this behavior; error pages remain #127.
+for this behavior; production error pages are implemented by #127.
 
 The first retry is after 60 seconds; failed retries wait 120, 240, 480, then
 600 seconds, capped at ten minutes forever. The next interval starts after the
@@ -943,33 +947,81 @@ Flask ingest test-client commit plus duplicate replay, without opening sockets.
 
 ## Display policy and Supreme hardware (#123/#127/#128/#130)
 
-DisplayModel is pure C++ policy; the SH1106 adapter alone touches hardware.
-**The screen design is provisional** (owner, 2026-10-16): it will get more
-thought once the board is in the car. For now there are two modes, chosen by
-a firmware build toggle, `DISPLAY_DEBUG` in the sketch (on for the first
-builds):
+DisplayModel (`display_model.h`) is pure, header-only C++ policy; only the
+SH1106 adapter touches hardware. **Owner decisions, 2026-10-20:** keep
+`DISPLAY_DEBUG=1` as the default, with its road-tested debug page unchanged;
+implement the production screen now behind `DISPLAY_DEBUG=0`.
 
-- **Debug on:** a status page for bench and shakedown work: FSM state,
-  satellites heard and used, GPS AGC, fix/HDOP, storage backend and free space,
-  pending trips/events, WiFi/upload result, battery. It is the only mode that
-  may stay lit, so it is for development, not everyday driving.
-- **Debug off:** minimal: the number of satellites in view, plus the error
-  policy below. Whether that count stays lit or blanks is part of the future
-  screen design; OLEDs burn in, so a static always-on display needs a
-  dim/shift/timeout rule before it ships.
+- **Debug on:** the existing continuously lit bench/shakedown page: FSM,
+  satellites heard/used, GPS AGC, fix/HDOP, storage, queues, network and battery.
+- **Debug off (production):** off by default using SH1106 power save, with
+  steady cards lasting 10 seconds. No flashing, scrolling or always-on content.
+  The adapter uses maximum SH1106 contrast (255), per #166: the panel is about
+  100 nits and lights only briefly. Current and visual readability still need
+  bench checks. An always-on design would need a separate burn-in policy.
 
-The error policy applies in both modes. While parked, briefly show boot, trip and upload status. While moving **or when
-motion is unknown**, suppress routine messages. Show each new ERROR/CRITICAL
-episode once at low brightness for about 10 seconds, then blank. No flashing or
-scrolling. Repeats do not keep it lit. Remind about unresolved conditions at the
-next parked opportunity/boot, and turn the display off before deep sleep. A
-failed adapter reports 6001 without blocking recording or retrying in a tight
-loop. The screen is a brief status aid, not a substitute for the server history.
+Production cards show **satellites heard**, from fresh
+`DebugGsv::signal(now).heard`: unique GSV entries with C/N0 > 0, or `--` when
+stale/unknown (15-second expiry). The predicted "in view" total includes
+satellites the receiver cannot hear; on road test 1 it stayed at 30 indoors
+with no fix. GSV already runs in both builds, so this adds no GPS traffic.
+
+Core 1 evaluates motion in `loop()`. VBUS absent (`gVbusLost`) means Parked,
+including while a trip is being finalized. Otherwise ARMING/ACTIVE/COOLDOWN,
+or a fresh trusted speed >= the 2 mph end threshold, means Moving. IDLE
+with a fresh trusted speed below that threshold means Parked. Anything else
+means Unknown. Speed/fix must be valid, at most 2.5 seconds old, and have
+passed the existing accuracy decision; a void RMC invalidates production
+motion trust immediately. FINALIZING alone is not evidence of motion.
+
+Production policy:
+
+- Boot queues one StatusCard for the first Parked opportunity; Moving and
+  Unknown suppress routine content. Finalization back to IDLE queues another
+  status card for Parked. Entering Parked with unresolved faults reminds once.
+- Every new accepted ERROR/CRITICAL condition episode queues one ErrorCard in
+  any motion state. Each gets 10 seconds, in observation order. Repeats cannot
+  extend or re-light it. The 64-entry queue drops excess new episodes once;
+  it never loops through unresolved faults. WARNING/INFO cannot wake a card.
+- A short POWER press explicitly requests a StatusCard in any motion state.
+  Only production enables `XPOWERS_AXP2101_PKEY_SHORT_IRQ` and reads
+  `isPekeyShortPressIrq()`. Long press keeps the existing clean battery
+  power-off/USB-ignore meaning. A new error preempts a routine status card;
+  a user request can replace the current card and holds its full 10 seconds
+  before queued errors resume. Routine cards blank if motion
+  stops being Parked. Card text is captured when shown and stays steady.
+- StatusCard: `Sats heard: N` or `--`, then `No active faults` or active
+  warning-and-above codes, most severe first (code order breaks ties). The
+  first code has its exact generated catalog OLED lines; further codes use
+  compact `Also:` rows and a `+N more` suffix when needed. Duplicate active
+  codes from the two upload targets appear once in status. ErrorCard: `E####`
+  plus that code's generated OLED lines. Unknown codes show only `E####`.
+- Core 1 copies the same atomic observed/active/accepted-episode snapshots as
+  the upload worker, from loop, trip-network and event-network producers.
+  Each source is read once without waits or new cross-core locks. A concurrent
+  publication retains that source's last complete snapshot. Episode tracking
+  includes source identity and survives clears; unknown/unaccepted raises
+  cannot invent display events. This is bounded snapshot observation, so a
+  condition raised and cleared entirely between reads can be missed.
+- Shutdown blanks the model and puts the panel in power save before the final
+  VBUS check/`PMU.shutdown()`. Cancelled/failed shutdown resumes blank until
+  a later display trigger. Production initialization uses `initDisplay()`
+  (which leaves SH1106 asleep), rather than `begin()` (which wakes it), before
+  degraded startup branches. Degraded loops never run display updates.
+
+The production adapter uses Wire SDA17/SCL18, 0x3C, 400 kHz and a 10 ms Wire
+timeout, with checked write lengths and transaction release on short writes.
+Initialization or transfer failure latches the adapter off for the boot and
+raises **E6001 DISPLAY_UNAVAILABLE** through the normal diagnostic hook, with
+one accepted raise and the existing bounded diagnostic repeat policy. It never
+retries hardware initialization or blocks recording, uploads or power handling.
+A disconnected panel cannot be commanded asleep after the bus has failed.
+The screen is a brief aid; the server history remains the durable fault record.
 
 The following are **Supreme port targets to verify against the board revision
 and on the bench**, not pin changes for the existing T-Beam V1.2 sketch:
 
-- SH1106 OLED, 128x64, on Wire SDA17/SCL18, address 0x3C (check 0x3D if absent).
+- SH1106 OLED, 128x64, on Wire SDA17/SCL18, address 0x3C (bench-confirmed with the debug adapter).
 - PCF8563 RTC, address 0x51 on the PMU bus Wire1 SDA42/SCL41.
 - SD MOSI35/SCK36/MISO37/CS47, powered by BLDO1; hold IMU CS34 high.
 - Supreme ALDO3 is LoRa, ALDO4 is GPS. This differs from the V1.2's measured

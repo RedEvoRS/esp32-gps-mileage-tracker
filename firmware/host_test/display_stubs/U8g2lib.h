@@ -23,6 +23,7 @@ struct U8G2_SH1106_128X64_NONAME_F_HW_I2C {
         }
     }
     void begin() { transfers(); }
+    void initDisplay() { transfers(); }
     void setI2CAddress(int) {}
     void setBusClock(int) {}
     void setContrast(int) { transfers(); }

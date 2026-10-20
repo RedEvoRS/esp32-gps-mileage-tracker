@@ -25,7 +25,7 @@
 // centiseconds; missing RMC epochs stay untimed even after a clock sync.
 // Fresh GPS time independently corrects the system clock every minute.
 //
-// Required libraries (U8g2 is only needed with DISPLAY_DEBUG):
+// Required libraries (U8g2 is needed in both display modes):
 //   XPowersLib (lewisxhe), TinyGPSPlus (Mikal Hart). WiFi, HTTPClient,
 //   SD, SPI, LittleFS, and Preferences ship with the ESP32 Arduino core.
 //   U8g2 2.36.18 (olikraus) drives the optional test-drive OLED page.
@@ -77,6 +77,10 @@
 #endif
 #if DISPLAY_DEBUG
 #include "debug_display.h"
+#else
+#include "production_display.h"
+static display::DisplayModel gDisplayModel;
+static bool gDisplayTripFinalized = false, gDisplayUserRequest = false;
 #endif
 #include "debug_gsv.h"
 #include "debug_rf.h"
@@ -997,6 +1001,9 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
     gPendCount = gPendHead = 0;
     gTripWriteFailed = false;
     gState = nextState;
+#if !DISPLAY_DEBUG
+    if (nextState == IDLE) gDisplayTripFinalized = true;
+#endif
     gNetRetryNow.store(true);   // after the file is closed and no longer active
 }
 
@@ -1377,6 +1384,9 @@ static void setupPmuIrq() {
     PMU.enableIRQ(XPOWERS_AXP2101_VBUS_REMOVE_IRQ |
                   XPOWERS_AXP2101_VBUS_INSERT_IRQ |
                   XPOWERS_AXP2101_PKEY_LONG_IRQ   |
+#if !DISPLAY_DEBUG
+                  XPOWERS_AXP2101_PKEY_SHORT_IRQ  |
+#endif
                   XPOWERS_AXP2101_WARNING_LEVEL1_IRQ |
                   XPOWERS_AXP2101_WARNING_LEVEL2_IRQ);
 }
@@ -1442,6 +1452,10 @@ static void powerOffForVbus() {
 #if DISPLAY_DEBUG
     // Before the final VBUS read, preserving its immediate shutdown write.
     debugDisplayPowerSave(true);
+#else
+    display::DisplayModel::Input displayOff; displayOff.shutdown = true;
+    drawProductionDisplay(gDisplayModel.update(displayOff));
+    productionDisplayPowerSave(true);
 #endif
     // PMU shutdown cuts all main rails, including SD BLDO1 and GPS ALDO4.
     // Leave rails and awake IRQs alone so a cancelled shutdown can resume.
@@ -1519,6 +1533,9 @@ static void pollPmu() {
             gVbusOffT0 = millis();
         }
     }
+#if !DISPLAY_DEBUG
+    if (gDegraded.mode() == startup::Mode::Normal && PMU.isPekeyShortPressIrq()) gDisplayUserRequest = true;
+#endif
     if (PMU.isPekeyLongPressIrq())    powerOffForVbus();
     // Observe hardware's existing low/critical policy before shutdown. Never
     // submit from the ISR (it only latches gPmuIrqFlag).
@@ -2208,6 +2225,8 @@ static bool rmcFixArrived() {
         fix |= valid;
 #if DISPLAY_DEBUG
         gDebugRmcValid = valid;
+#else
+        if (!valid) gLatestSpeedTrusted = false;
 #endif
     }
     if (gRmcStatusGP.isUpdated()) {
@@ -2215,6 +2234,8 @@ static bool rmcFixArrived() {
         fix |= valid;
 #if DISPLAY_DEBUG
         gDebugRmcValid = valid;
+#else
+        if (!valid) gLatestSpeedTrusted = false;
 #endif
     }
     return fix;
@@ -2312,6 +2333,8 @@ static void serviceRuntimeDiagnostics() {
 #if DISPLAY_DEBUG
     // debug_display.h latches failure and disables the OLED for this boot.
     gLoopFaults.event(6001, now).condition(gDebugDisplayFailed);
+#else
+    gLoopFaults.event(6001, now).condition(gProductionDisplayFailed);
 #endif
 }
 
@@ -2572,6 +2595,47 @@ static void serviceDebugDisplay() {
 }
 #endif
 
+#if !DISPLAY_DEBUG
+// Each source has its own accepted raise sequence and may share a code with
+// another source. Cache only complete atomic snapshots; contention never clears
+// a fault or invents another episode. These buffers belong solely to core 1.
+static display::Condition gDisplayConditions[3][64];
+static size_t gDisplayConditionCounts[3] = {};
+static diagnostics::RuntimeFaults::Observation gDisplayCopy[64];
+static display::Condition gDisplayMerged[64];
+static void serviceProductionDisplay() {
+    diagnostics::RuntimeFaults* sources[] = {&gLoopFaults, &gNetFaults, &gEventFaults};
+    size_t merged = 0;
+    for (unsigned source = 0; source < 3; ++source) {
+        size_t count = 0;
+        if (sources[source]->snapshot(gDisplayCopy, 64, count)) {
+            gDisplayConditionCounts[source] = count;
+            for (size_t i = 0; i < count; ++i)
+                gDisplayConditions[source][i] = {gDisplayCopy[i].code,
+                    gDisplayCopy[i].observed ? gDisplayCopy[i].episode : 0, uint8_t(source)};
+        }
+        for (size_t i = 0; i < gDisplayConditionCounts[source] && merged < 64; ++i)
+            gDisplayMerged[merged++] = gDisplayConditions[source][i];
+    }
+    uint32_t now = millis();
+    // Match the debug page's 2.5 s freshness bound, plus the fix's actual
+    // accuracy decision. Do not promote stale or invalid RMC speed at boot.
+    bool fresh = gHaveLastFix && uint32_t(now - gLastFixMonoMs) <= 2500 &&
+                 gLatestSpeedTrusted && gps.speed.isValid() && gps.speed.age() <= 2500 &&
+                 gps.location.isValid() && gps.location.age() <= 2500;
+    display::DisplayModel::Input input;
+    input.now = now;
+    input.motion = display::motion(gVbusLost, gState == IDLE,
+        gState == ARMING || gState == ACTIVE || gState == COOLDOWN,
+        fresh, gps.speed.mps(), END_MPS);
+    input.tripFinalized = gDisplayTripFinalized; gDisplayTripFinalized = false;
+    input.userRequest = gDisplayUserRequest; gDisplayUserRequest = false;
+    input.heard = gDebugGsv.signal(now).heard;
+    input.conditions = gDisplayMerged; input.count = merged;
+    drawProductionDisplay(gDisplayModel.update(input));
+}
+#endif
+
 // Shared boot producers, including failed startup's retained E2007 notice.
 static void beginJournal() {
     gJournal.~EventLog();
@@ -2594,6 +2658,11 @@ static bool createFsMutex() {
 
 static void enterDegraded(startup::Mode mode) {
     gDegraded.begin(mode, millis());
+#if !DISPLAY_DEBUG
+    // Setup initialized this independent Wire adapter asleep, even if the
+    // PMU or storage failed. No display service runs in the degraded loop.
+    productionDisplayPowerSave(true);
+#endif
     if (mode == startup::Mode::NoStorage) {
         // No mounted store: boot and faults stay in the bounded RAM queue.
         beginJournal();
@@ -2643,6 +2712,9 @@ static void degradedLoop() {
     } else {
         gLoopFaults.event(2001, millis()).condition(true);
     }
+#if !DISPLAY_DEBUG
+    gLoopFaults.event(6001, millis()).condition(gProductionDisplayFailed);
+#endif
     serviceJournal(); // single consumer; no network task in any degraded mode
     if (gDegraded.retryDue(millis())) {
         bool recovered = false;
@@ -2678,6 +2750,11 @@ void setup() {
     // and initialization, BEFORE Serial, storage or GPS setup can block.
     bool pmuReady = beginPmuWithRecovery(Wire1, PMU, I2C_SDA, I2C_SCL, gPmuStartup);
     bool radioOff = pmuReady && PMU.disableALDO3() && !PMU.isEnableALDO3();
+#if !DISPLAY_DEBUG
+    // SH1106 can retain its state across an ESP32 reset. Put it to sleep
+    // before either degraded startup branch; never touch the PMU's Wire1.
+    beginProductionDisplay();
+#endif
     startup::Mode powerMode = startup::selectMode(pmuReady, radioOff, true);
     if (powerMode != startup::Mode::Normal) {
         Serial.begin(115200);
@@ -2835,5 +2912,7 @@ void loop() {
     }
 #if DISPLAY_DEBUG
     serviceDebugDisplay();
+#else
+    serviceProductionDisplay();
 #endif
 }

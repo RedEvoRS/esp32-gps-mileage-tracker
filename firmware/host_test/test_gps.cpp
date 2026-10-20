@@ -126,6 +126,13 @@ static void resetWorld() {
     gDebugRmcValid = false;
     gDebugDisplayReady = gDebugDisplayFailed = false;
     gDebugNet = DebugNetwork{};
+#else
+    gProductionDisplayReady = gProductionDisplayFailed = gProductionDisplayBegun = false;
+    gProductionHaveOutput = false;
+    gProductionOled = U8G2_SH1106_128X64_NONAME_F_HW_I2C(U8G2_R0, U8X8_PIN_NONE);
+    gDisplayModel = display::DisplayModel();
+    gDisplayTripFinalized = gDisplayUserRequest = false;
+    for (auto& count : gDisplayConditionCounts) count = 0;
 #endif
     GPSSerial = HardwareSerial(1);
     gGpsConfig = GpsConfig(); gGpsUbxRx = GpsUbxRx();
