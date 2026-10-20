@@ -74,6 +74,7 @@ for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resol
         sys.path.insert(0, str(import_root))
 
 from common.diagnostics import CatalogError, load_catalog
+from geocoding import Geocoder, LookupError
 
 try:
     DIAGNOSTICS_CATALOG = load_catalog()
@@ -89,6 +90,7 @@ DIAGNOSTICS_PAGE_SIZE = 50
 # ---------------------------------------------------------------------
 DATA_ROOT = Path(os.environ.get("INGEST_DATA_ROOT", "/data"))
 DB_PATH = Path(os.environ.get("VIEWER_DB_PATH", "/db/annotations.db"))
+GEOCODER = Geocoder(DB_PATH)
 
 # --- Display timezone -----------------------------------------------
 # Trips are STORED in UTC (that's what the GPX carries and what the
@@ -220,6 +222,7 @@ def init_db():
         columns = {row[1] for row in conn.execute("PRAGMA table_info(annotations)")}
         if "destination" not in columns:
             conn.execute("ALTER TABLE annotations ADD COLUMN destination TEXT NOT NULL DEFAULT ''")
+        Geocoder.init_schema(conn)
         # Failed-login tracking. This lives in SQLite, not in a module
         # global, because gunicorn runs 2 workers -- an in-memory counter
         # would give an attacker MAX_FAILS attempts per worker and would
@@ -936,6 +939,8 @@ BASE_CSS = THEME_CSS + """
   .btn { display: inline-block; background: var(--button-bg); color: var(--button-text); padding: 8px 14px;
          border-radius: 6px; text-decoration: none; border: none; cursor: pointer; font-size: 14px; }
   .btn.secondary { background: var(--secondary-bg); }
+  button.btn:disabled { opacity: .65; cursor: default; }
+  .endpoint-place { margin: 16px 0; overflow-wrap: anywhere; }
   .toolbar { margin-bottom: 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   .stats { display: flex; gap: 26px; flex-wrap: wrap; margin: 12px 0; }
   .stat b { display: block; font-size: 22px; }
@@ -1100,6 +1105,35 @@ TRIP_HTML = """
   <p class="muted">GPX file missing — cannot draw the track.</p>
   {% endif %}
 
+  <section aria-labelledby="places-heading">
+    <h3 id="places-heading">Recorded endpoint places</h3>
+    <p class="muted">Suggestions describe nearby mapped objects, not verified businesses or
+      corrected parking locations. Check them before using them in a mileage record.</p>
+    {% if geocoder_enabled %}
+    <p>Each lookup sends only that endpoint's coordinates to the address provider configured
+      by your server administrator. Results are saved locally. Nothing is sent until you click.</p>
+    {% for endpoint, title in [('start', 'Start'), ('end', 'End')] %}
+    <div class="endpoint-place" data-endpoint="{{ endpoint }}">
+      <b>{{ title }}</b>
+      <p data-place-label role="status">{% if places.get(endpoint) is none %}Not looked up yet.{% elif places[endpoint] %}{{ places[endpoint] }}{% else %}No mapped address found.{% endif %}</p>
+      {% if endpoint in places %}
+      <form data-place-lookup method="post" action="{{ url_for('lookup_place', ym=t.ym, trip_id=t.id) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="endpoint" value="{{ endpoint }}">
+        <button class="btn" type="submit" disabled>Look up {{ endpoint }} place</button>
+      </form>
+      {% else %}<p class="muted">No valid recorded endpoint is available.</p>{% endif %}
+    </div>
+    {% endfor %}
+    <p class="muted">Address data: <a href="https://www.openstreetmap.org/copyright"
+      target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors (ODbL)</a>.</p>
+    <noscript>Enable JavaScript to look up places. You can still enter a destination below.</noscript>
+    {% else %}
+    <p class="muted">Address lookup is not configured. Ask your server administrator to set up
+      a supported address provider, or enter a destination below.</p>
+    {% endif %}
+  </section>
+
   <form class="annotate" method="post"
         action="{{ url_for('annotate', ym=t.ym, trip_id=t.id, year=year or '') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -1112,12 +1146,20 @@ TRIP_HTML = """
     </select>
     <label for="destination">Destination / place</label>
     <input type="text" name="destination" id="destination" value="{{ t.destination or '' }}">
+    {% if geocoder_enabled and 'end' in places %}
+    <button type="button" class="btn secondary" id="use-end-place"
+      {% if not places.get('end') %}disabled{% endif %}>Use end suggestion as destination</button>
+    <p class="muted">Using a suggestion replaces the destination field above. Click Save to keep it.</p>
+    {% endif %}
     <label for="purpose_note">Note (e.g. "Client visit — Acme Corp")</label>
     <textarea name="purpose_note" id="purpose_note" rows="3">{{ t.purpose_note or "" }}</textarea>
     <p><button class="btn" type="submit">Save</button></p>
   </form>
 </div>
 
+{% if geocoder_enabled %}
+<script src="{{ url_for('static', filename='endpoint-places.js') }}"></script>
+{% endif %}
 {% if t.has_gpx %}
 <script src="{{ url_for('static', filename='leaflet.js') }}"></script>
 <script src="{{ url_for('static', filename='gpx.js') }}"></script>
@@ -1362,7 +1404,36 @@ def trip_view(ym, trip_id):
         "destination": ann.get("destination", ""),
         "has_gpx": gpx_path.exists(),
     }
-    return render_template_string(TRIP_HTML, t=t, categories=CATEGORIES, year=year)
+    places = {}
+    if GEOCODER.enabled:
+        endpoints = track_endpoints(t)
+        for endpoint in ("start", "end"):
+            if f"{endpoint}_latitude" in endpoints:
+                places[endpoint] = GEOCODER.cached(
+                    endpoints[f"{endpoint}_latitude"], endpoints[f"{endpoint}_longitude"]
+                )
+    return render_template_string(TRIP_HTML, t=t, categories=CATEGORIES, year=year,
+                                  geocoder_enabled=GEOCODER.enabled, places=places)
+
+
+@app.route("/trip/<ym>/<trip_id>/lookup-place", methods=["POST"])
+def lookup_place(ym, trip_id):
+    # Coordinates and provider are always server-selected. This is not an
+    # arbitrary geocoding proxy, even for an authenticated browser.
+    gpx_path, _ = _safe_trip_paths(ym, trip_id)
+    if not gpx_path.exists():
+        abort(404)
+    endpoint = request.form.get("endpoint", "")
+    if endpoint not in ("start", "end"):
+        return jsonify(error="Choose the start or end endpoint."), 400
+    endpoints = track_endpoints({"ym": ym, "id": trip_id})
+    if f"{endpoint}_latitude" not in endpoints:
+        return jsonify(error="This recording has no valid endpoint to look up."), 422
+    try:
+        label = GEOCODER.lookup(endpoints[f"{endpoint}_latitude"], endpoints[f"{endpoint}_longitude"])
+    except LookupError as exc:
+        return jsonify(error=str(exc)), exc.status
+    return jsonify(label=label)
 
 
 @app.route("/gpx/<ym>/<trip_id>")

@@ -49,7 +49,9 @@ jobs:
       - name: Check generated diagnostics catalog
         run: python tools/generate_error_catalog.py --check
       - name: Check map parser integration
-        run: node server/tests/test_viewer_map.js
+        run: |
+          node server/tests/test_viewer_map.js
+          node server/tests/test_viewer_places.js
 
   firmware-host:
     runs-on: ubuntu-latest
