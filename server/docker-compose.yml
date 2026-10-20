@@ -17,7 +17,8 @@
 #      string and DISPLAY_TZ to your timezone (e.g. America/Chicago)
 #   3. Copy viewer.env.example to viewer.env and set the viewer login.
 #      Compose won't build or start anything until viewer.env exists.
-#   4. Run: docker compose up -d --build
+#   4. Run: BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
+#      Keeps cached image IDs stable; install.sh sets it automatically.
 #
 # After editing .env or viewer.env, run docker compose up -d again;
 # docker compose restart keeps the old values.

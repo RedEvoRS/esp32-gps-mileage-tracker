@@ -1,4 +1,5 @@
-// Optional MON-RF decoding and coordinate-free serial formatting, core 1 only.
+// MON-RF decoding feeds the antenna check in all builds, core 1 only.
+// Coordinate-free serial formatting is used only by the optional debug UI.
 #pragma once
 #include "debug_gsv.h"
 #include "debug_status.h"

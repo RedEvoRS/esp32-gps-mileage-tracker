@@ -26,6 +26,7 @@ PUBLISHED_CATALOGS = {
     1: "d908fd028755d8a1eee07f0ee130ad12291f21e201ddc13214bde24212c393e0",
     2: "1f7bfdb3135fc7c92d17013d3c271d8514f5ffd692e81223ad85877dd2dcd3cb",
     3: "0a1c02d50c538e8a4b65c0cfc68ea82126fade31957e2f4227f465113a4c009f",
+    4: "6454b5e2c5958a8552ef5a04864cbae2ac0d02998f5fc78d514b8bfec533fb93",
 }
 
 
@@ -51,7 +52,7 @@ class CatalogTests(unittest.TestCase):
 
     def test_catalog_unique_codes_and_symbols(self):
         rows = self.catalog["codes"]
-        self.assertEqual(len(rows), 45)
+        self.assertEqual(len(rows), 46)
         self.assertEqual(len({r["code"] for r in rows}), len(rows))
         self.assertEqual(len({r["symbol"] for r in rows}), len(rows))
 

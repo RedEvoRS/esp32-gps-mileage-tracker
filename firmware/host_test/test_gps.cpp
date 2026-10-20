@@ -119,9 +119,10 @@ static void resetWorld() {
     gRmcDateGN.begin(gps, "GNRMC", 9);
     gRmcTimeGP.begin(gps, "GPRMC", 1);
     gRmcDateGP.begin(gps, "GPRMC", 9);
-#if DISPLAY_DEBUG
+    gGpsAntenna = GpsAntenna(); gAntennaRf = DebugRf(); gAntennaSignal = DebugSignal();
     gDebugGsv = DebugGsv();
     gDebugRf = DebugRf(); gDebugRfPollMs = 0; gDebugRfStarted = false;
+#if DISPLAY_DEBUG
     gDebugRmcValid = false;
     gDebugDisplayReady = gDebugDisplayFailed = false;
     gDebugNet = DebugNetwork{};
@@ -196,7 +197,7 @@ static std::string valset() {
         0xCA, 0x00, 0x91, 0x20, 0,
         0xC0, 0x00, 0x91, 0x20, 0,
         0xB1, 0x00, 0x91, 0x20, 0,
-        0xC5, 0x00, 0x91, 0x20, DISPLAY_DEBUG ? 5 : 0,
+        0xC5, 0x00, 0x91, 0x20, 5,
         0xAC, 0x00, 0x91, 0x20, 1,
         0xBB, 0x00, 0x91, 0x20, 1,
         0x07, 0x00, 0x91, 0x20, 1,
@@ -260,11 +261,11 @@ int main(int argc, char** argv) {
         CHECK(gGpsConfig.state == GPS_CONFIG_DONE && gGpsConfig.sends == 1,
               "one VALSET is ACKed without needing a position fix");
         std::string want = valset();
-        if (DISPLAY_DEBUG) want += frame(0x0A, 0x38, {});
+        want += frame(0x0A, 0x38, {});
         CHECK(GPSSerial.tx == want && valset().size() == 52,
-              "exact VALSET frame: RAM layer, eight correctly sized keys, build-specific GSV rate and checksum");
+              "exact VALSET frame: RAM layer, eight correctly sized keys, GSV rate 5 in all builds and checksum");
         CHECK(g_millis <= 8 && logCount("GPS configured on attempt 1 (") == 1 &&
-              logCount("ms after config start") == 1,
+              logCount("ms after config start") == 1 && logCount("GSV every 5 epochs") == 1,
               "loop does not wait for ACKs and success is logged once");
     }
 
@@ -306,7 +307,7 @@ int main(int argc, char** argv) {
         g_millis = retryAt - 2; loop();
         CHECK(gGpsConfig.attempts == 1, "no retry before the eight-second spacing");
         g_millis = retryAt; gpsLoops();
-        CHECK(gGpsConfig.state == GPS_CONFIG_DONE && gGpsConfig.attempts == 2 && GPSSerial.tx.size() == 104 + (DISPLAY_DEBUG ? 8 : 0),
+        CHECK(gGpsConfig.state == GPS_CONFIG_DONE && gGpsConfig.attempts == 2 && GPSSerial.tx.size() == 104 + 8,
               "second attempt resends the same VALSET including NAV-PVT and succeeds");
         CHECK(logCount("retrying in background") == 1 && logCount("configured on attempt 2 (") == 1 &&
               logCount("ms after config start") == 1,
@@ -550,7 +551,7 @@ int main(int argc, char** argv) {
               "no-answer first attempt succeeds on a later loop attempt");
         std::string first = valset();
         CHECK(GPSSerial.tx.substr(0, first.size() * 3) == first + first + first &&
-              GPSSerial.tx.size() == 4 * 52 + (DISPLAY_DEBUG ? 8 : 0),
+              GPSSerial.tx.size() == 4 * 52 + 8,
               "silent attempt sends VALSET three times, then the next attempt resends the identical configuration");
         CHECK(logCount("retrying in background") == 1 && logCount("configured on attempt 2 (") == 1,
               "no per-send or per-attempt log spam");
@@ -631,16 +632,16 @@ int main(int argc, char** argv) {
         ++g_millis; serviceGpsSpeedFallback(); gpsLoops();
         CHECK(gSpeedFallback && gpsSpeedTrusted(true) && logCount("NAV-PVT unavailable") == 1,
               "more than ten seconds after giving up enters fallback with exactly one warning");
-        CHECK(GPSSerial.tx.size() == (response == 0 ? 0 : response == 1 ? 15 * 52 : 5 * 52) + (DISPLAY_DEBUG ? 8 : 0),
-              "config sends remain bounded; debug RF polling begins after giving up");
+        CHECK(GPSSerial.tx.size() == (response == 0 ? 0 : response == 1 ? 15 * 52 : 5 * 52) + 8,
+              "config sends remain bounded; RF polling begins after giving up in both builds");
         if (response) CHECK(lastSendMs - gGpsConfig.started >= 32000,
                             "even immediate NAKs keep attempts available at least 32 seconds after startup");
         size_t sent = GPSSerial.tx.size();
         g_millis += 60000; gpsLoops();
-        CHECK(GPSSerial.tx.size() == sent + (DISPLAY_DEBUG ? 8 : 0) && logCount("not configured after 5 attempts") == 1 &&
+        CHECK(GPSSerial.tx.size() == sent + 8 && logCount("not configured after 5 attempts") == 1 &&
               logCount("retrying in background") == 1 && logCount("GPS configured") == 0 &&
               logCount("NAV-PVT unavailable") == 1,
-              "config stays stopped and logs failure once while debug polling continues");
+              "config stays stopped and logs failure once while RF polling continues");
     }
 
     printf("G16 readiness can arrive after the first three-second timeout\n");
@@ -718,7 +719,6 @@ int main(int argc, char** argv) {
         CHECK(GPSSerial.tx.empty() && !logCount("GPS RF:"), "no RF traffic during boot config or ACK waits");
         gGpsConfig.state = GPS_CONFIG_DONE;
         loop();
-#if DISPLAY_DEBUG
         CHECK(GPSSerial.tx == frame(0x0A, 0x38, {}) && !logCount("GPS RF:"),
               "first empty MON-RF poll starts immediately after config, without waiting");
         uint32_t firstPoll = gDebugRfPollMs;
@@ -741,16 +741,16 @@ int main(int argc, char** argv) {
         GPSSerial.rx += sentences({30, 37, -122, 15, false})[0];
         loop();
         CHECK(GPSSerial.tx == frame(0x0A, 0x38, {}) + frame(0x0A, 0x38, {}) &&
-              logCount("GPS RF: jam ok cw 12 noise 85 agc 31% ant DONTKNOW pwr DONTKNOW") == 1 &&
-              logCount("fix V") == 1 && !gDebugRf.valid,
-              "one coordinate-free line uses the previous reply, then starts a fresh interval");
+              logCount("GPS RF: jam ok cw 12 noise 85 agc 31% ant DONTKNOW pwr DONTKNOW") == DISPLAY_DEBUG &&
+              logCount("fix V") == DISPLAY_DEBUG && !gDebugRf.valid,
+              "previous reply is consumed before the next poll; only debug logs a coordinate-free line");
         std::string bad = packet; bad.back() ^= 1;
         GPSSerial.rx += bad + frame(0x0A, 0x38, {0, 1, 0, 0}) +
                         frame(0x0A, 0x38, std::vector<uint8_t>(257, 0));
         loop();
         CHECK(!gDebugRf.valid, "bad checksum, wrong length and oversized packets cannot publish RF data");
         g_millis = gDebugRfPollMs + 30000; loop();
-        CHECK(logCount("GPS RF:") == 2 && logCount("GPS RF: rf --") == 1,
+        CHECK(logCount("GPS RF:") == 2 * DISPLAY_DEBUG && logCount("GPS RF: rf --") == DISPLAY_DEBUG,
               "a missing valid reply prints rf -- instead of reusing an old sample");
         GPSSerial.rx += packet.substr(0, 12); loop();
         g_millis += 501;
@@ -762,14 +762,10 @@ int main(int argc, char** argv) {
               "multiple RF blocks validate their full length and retain the first block");
         g_millis = UINT32_MAX - 1000; gDebugRfPollMs = g_millis;
         g_millis += 29999; serviceDebugRf();
-        CHECK(logCount("GPS RF:") == 2, "RF cadence does not fire early across millis rollover");
+        CHECK(logCount("GPS RF:") == 2 * DISPLAY_DEBUG && GPSSerial.tx.size() == 24, "RF cadence does not fire early across millis rollover");
         ++g_millis; serviceDebugRf();
-        CHECK(logCount("GPS RF:") == 3 && logCount("blocks 2") == 1,
+        CHECK(logCount("GPS RF:") == 3 * DISPLAY_DEBUG && logCount("blocks 2") == DISPLAY_DEBUG && GPSSerial.tx.size() == 32,
               "RF cadence survives rollover and reports an unexpected block count");
-#else
-        g_millis += 60000; loop();
-        CHECK(GPSSerial.tx.empty() && !logCount("GPS RF:"), "DISPLAY_DEBUG 0 sends and logs no RF diagnostics");
-#endif
     }
 
     printf("G20 NAV-PVT decoding, framing and privacy\n");

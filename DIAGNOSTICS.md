@@ -64,6 +64,8 @@ numeric measurements and fixed enumerated values in context.
 - **#151:** E2007 catalog entry, retained Stage 4 PMU startup result and boot
   journal emission after successful startup are implemented. The failure halt
   remains until #126, and OLED reporting remains with #127.
+- **#164:** E3009 antenna warning uses MON-RF gain and fresh GSV strength in
+  every build; the RF serial line and temporary OLED page stay debug-only.
 
 Host tests prove catalog consistency and policy behavior. They do not prove bus
 wiring, power rails, charging safety, FAT power-cut recovery or road behavior.
@@ -638,6 +640,7 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E3006 | Trusted system clock `gClockSet` still false after 120 s | Successful GPS/SNTP clock sync; untimed GPX points retain their original status | none |
 | E3007 | RTC has no ACK, or its initial boot register read fails | Verified RTC setting after trusted GPS/SNTP time; at most three attempts per boot, at least a minute apart after failures | none |
 | E3008 | Readable RTC has STOP/VL, invalid BCD/calendar, unsupported year, or a later read/write/verification failure | Verified RTC setting from GPS/SNTP clears the condition; normal transition/repeat policy | `reason=stopped\|invalid_date\|out_of_range\|read_failed` on failure |
+| E3009 | At 30 s MON-RF boundaries, valid AGC >=70% and fresh GSV (a complete group within 15 s) with zero satellites >=30 dBHz, continuously for >=120 s from the first suspect sample | One valid AGC <=50% sample **or** fresh GSV with at least one satellite >=30 dBHz; missing/stale/intermediate evidence resets the hold and retains an active warning | `agc_pct` (0-100) when MON-RF valid; `max_cno` (0-99) when GSV fresh |
 | E4001 | SD did not mount, trip logging uses LittleFS | Observed SD mount; current boot does not hot-switch backends | none |
 | E4004 | Guarded trip free space <64 KiB start reserve | >=64 KiB | `backend`, `free_bytes` |
 | E4005 | Guarded trip free space <24 KiB stop reserve | >=24 KiB | `backend`, `free_bytes` |
@@ -664,6 +667,21 @@ is generic; `battery_mv` is a measurement, not the threshold used by this PMU.
 The charge guard uses its existing die proxy and hysteresis; diagnostic context
 never presents that die reading as a measured cell temperature.
 
+E3009 checks for a loose or damaged active-antenna cable. On one Supreme/MAX-M10S
+and one antenna (2026-10-19), unplugging raised AGC to about 79% after a minute
+with no satellite >=30 dBHz; outdoors stayed near 29% with 22 strong satellites,
+and indoors stayed at 6-18% with 0-3 strong satellites. The thresholds are first
+guesses from that bench evidence, not a universal antenna test. Receiver fix
+status and MON-RF antenna status are not evidence: both can still look healthy
+with this board's plug disconnected. Check the GPS plug inside the case and cable.
+Low AGC alone clears even indoors with no strong satellites. Without either
+healthy signal, missing MON-RF, stale GSV or AGC 51-69% cannot raise or clear.
+The first poll follows GPS configuration success or give-up; each
+30 s boundary evaluates the previous reply and starts a new poll without waiting.
+Before a healthy sample or a completed suspect hold, E3009 is not observed in
+snapshots and produces no journal event. Once raised it stays active through
+missing evidence, with normal 15-minute repeats; only measured recovery clears.
+
 Storage space is checked at boot, on admission, during trips and every 30 s while
 idle so uploads can produce observed recovery on core 1. LittleFS free space
 already excludes the unused journal reserve. Below 64 KiB a new trip is refused;
@@ -686,7 +704,7 @@ measurement. Part A's observed 7,556 free bytes was a no-upload measurement.
 
 Startup halts E1001/E1002/E2001/E4002/E4003 remain #126; RTC E3007/E3008 are implemented by #128;
 E5010 and diagnostic uploads/snapshots are implemented by #125. Error-code OLED
-pages are #127 and antenna detection is #164. All requested meaningful Stage 4 runtime
+pages are #127; antenna detection is implemented by #164. All requested meaningful Stage 4 runtime
 codes above are wired, including E3006's existing trusted-clock state.
 
 #126 keeps a bounded service loop alive if PMU/storage initialization fails: show or

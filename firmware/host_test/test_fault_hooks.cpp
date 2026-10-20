@@ -98,6 +98,83 @@ static void diagnosticFix(uint32_t at, uint32_t hAcc, float mps = 0, bool withPv
     serviceRuntimeDiagnostics();
 }
 
+static RuntimeFaults::Observation antennaObservation() {
+    RuntimeFaults::Observation observations[64]; size_t count = 0;
+    assert(gLoopFaults.snapshot(observations, 64, count));
+    for (size_t i = 0; i < count; ++i) if (observations[i].code == 3009) return observations[i];
+    assert(false); return {};
+}
+
+// Wire-level MON-RF AGC uses the same integer percentage as the receiver path.
+// Four heard satellites cover the measured unplugged C/N0 range, 15-20.
+static void antennaInterval(int agc = 79, bool strong = false, bool fresh = true) {
+    if (agc >= 0) {
+        std::vector<uint8_t> p(28, 0); p[1] = 1;
+        unsigned raw = (unsigned(agc) * 8191 + 99) / 100;
+        p[18] = raw & 255; p[19] = raw >> 8;
+        feed(frame(0x0A, 0x38, p));
+    }
+    g_millis = gDebugRfPollMs + 30000;
+    if (fresh) feed(nmea(std::string("GPGSV,1,1,04,01,40,083,15,02,17,308,16,03,07,344,18,04,22,228,") +
+                         (strong ? "30,1" : "20,1")));
+    runtimeHealthy();
+    serviceDebugRf(); serviceRuntimeDiagnostics();
+    assert(!gDebugRf.valid); // prior reply consumed and next poll sent
+}
+
+static void gpsAntennaRegressions() {
+    for (bool strongRecovery : {false, true}) {
+        faultWorld();
+        gGpsConfig.state = GPS_WAIT_ACK;
+        serviceDebugRf(); assert(GPSSerial.tx.empty());
+        gGpsConfig.state = GPS_CONFIG_DONE;
+        serviceDebugRf(); // first poll, with no evidence yet
+        serviceRuntimeDiagnostics();
+        assert(!antennaObservation().observed && take().empty());
+        antennaInterval(-1, false, false);
+        assert(!antennaObservation().observed && take().empty());
+        // Suspect hold alone must not publish an observed healthy condition.
+        for (int i = 0; i < 4; ++i) {
+            antennaInterval(); assert(!antennaObservation().observed && take().empty());
+        }
+        // Missing reply breaks the run, and stale GSV breaks the next run.
+        antennaInterval(-1); assert(!antennaObservation().observed && take().empty());
+        antennaInterval(); assert(take().empty());
+        antennaInterval(79, false, false);
+        assert(!antennaObservation().observed && take().empty());
+        for (int i = 0; i < 4; ++i) { antennaInterval(); assert(take().empty()); }
+        uint32_t firstSuspect = gDebugRfPollMs - 90000;
+        // Neither another hot-loop call nor 119999 ms can raise early.
+        g_millis = firstSuspect + 119999; runtimeHealthy();
+        serviceDebugRf(); serviceRuntimeDiagnostics();
+        assert(!antennaObservation().observed && take().empty());
+        antennaInterval(); auto raised = one(3009, "raise");
+        assert(g_millis - firstSuspect == 120000);
+        has(raised, "\"agc_pct\":79"); has(raised, "\"max_cno\":20");
+        assert(antennaObservation().observed && antennaObservation().episode);
+        for (int i = 0; i < 10; ++i) serviceRuntimeDiagnostics();
+        assert(take().empty());
+        // No evidence keeps the episode active, including at repeat time.
+        antennaInterval(-1); assert(take().empty() && antennaObservation().episode);
+        antennaInterval(79, false, false); assert(take().empty());
+        antennaInterval(60); assert(take().empty());
+        g_millis = firstSuspect + 120000 + RuntimeFaults::kRepeatMs;
+        runtimeHealthy(); serviceDebugRf(); serviceRuntimeDiagnostics();
+        auto repeated = one(3009, "repeat");
+        has(repeated, "\"context\":{}"); // no fabricated RF/GSV measurements
+        assert(episode(raised) == episode(repeated));
+        // Low gain with zero strong satellites (indoors), or one strong
+        // satellite at high gain, clears immediately in the same episode.
+        antennaInterval(strongRecovery ? 79 : 29, strongRecovery);
+        auto cleared = one(3009, "clear");
+        assert(episode(raised) == episode(cleared));
+        has(cleared, strongRecovery ? "\"agc_pct\":79" : "\"agc_pct\":29");
+        assert(antennaObservation().observed && !antennaObservation().episode);
+        antennaInterval(-1, false, false); assert(take().empty());
+    }
+    if (!exportJson) std::printf("GPS antenna integration: 2 recovery episodes passed (DISPLAY_DEBUG=%d).\n", DISPLAY_DEBUG);
+}
+
 static void gpsFixGapRegressions() {
     for (bool hadTrustedFix : {false, true}) {
         faultWorld();
@@ -188,6 +265,7 @@ static void gpsFixGapRegressions() {
 #ifndef FAULT_HOOKS_HELPERS_ONLY
 int main(int argc, char**) {
     exportJson = argc > 1;
+    gpsAntennaRegressions();
     gpsFixGapRegressions();
     cycle(1007, [](bool bad) { g_stackHighWaterBytes = bad ? 2047 : 2048; reportNetworkStack("test"); }, "\"free_bytes\":2047");
     for (int c : {2002, 2003}) cycle(c, [c](bool bad) {

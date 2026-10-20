@@ -36,6 +36,11 @@ echo "== test_rtc (pure calendar and clock confidence)"
 "${cxx[@]}" "${assert_flags[@]}" -std=c++14 -O1 "${incs[@]}" "$here/test_rtc.cpp" -o "$build/test_rtc.exe"
 "$build/test_rtc.exe" || status=1
 
+echo "== test_gps_antenna"
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -pedantic \
+    "$here/test_gps_antenna.cpp" -o "$build/test_gps_antenna.exe"
+"$build/test_gps_antenna.exe" || status=1
+
 echo "== test_debug_display (bus fault injection)"
 "${cxx[@]}" "${flags[@]}" -I"$here/display_stubs" -I"$here/../04_trip_logger" \
     "$here/test_debug_display.cpp" -o "$build/test_debug_display.exe"
