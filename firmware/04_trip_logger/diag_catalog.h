@@ -5,8 +5,8 @@
 #include <cstdint>
 
 namespace diagnostics {
-constexpr std::uint16_t kCatalogVersion = 3;
-constexpr char kCatalogDigest[] = "0a1c02d50c538e8a4b65c0cfc68ea82126fade31957e2f4227f465113a4c009f";
+constexpr std::uint16_t kCatalogVersion = 4;
+constexpr char kCatalogDigest[] = "6454b5e2c5958a8552ef5a04864cbae2ac0d02998f5fc78d514b8bfec533fb93";
 enum class Severity : std::uint8_t { Info, Warning, Error, Critical };
 enum class Journal : std::uint8_t { PerOccurrence, Transitions, Counter };
 enum class Code : std::uint16_t {
@@ -33,6 +33,7 @@ enum class Code : std::uint16_t {
     UTC_UNAVAILABLE = 3006,
     RTC_UNAVAILABLE = 3007,
     RTC_TIME_INVALID = 3008,
+    GPS_ANTENNA_SUSPECT = 3009,
     SD_UNAVAILABLE = 4001,
     LITTLEFS_UNAVAILABLE = 4002,
     NO_RECORDING_STORAGE = 4003,
@@ -90,6 +91,7 @@ constexpr CatalogEntry kCatalog[] = {
     {Code::UTC_UNAVAILABLE, "UTC_UNAVAILABLE", Severity::Warning, {"Clock not set", "", ""}, 1, "Usable UTC time unavailable", true, Journal::Transitions},
     {Code::RTC_UNAVAILABLE, "RTC_UNAVAILABLE", Severity::Warning, {"RTC unavailable", "", ""}, 1, "Real-time clock unavailable", true, Journal::Transitions},
     {Code::RTC_TIME_INVALID, "RTC_TIME_INVALID", Severity::Warning, {"RTC time invalid", "", ""}, 1, "Real-time clock value invalid", true, Journal::Transitions},
+    {Code::GPS_ANTENNA_SUSPECT, "GPS_ANTENNA_SUSPECT", Severity::Warning, {"Check GPS antenna", "", ""}, 1, "GPS antenna may be disconnected", true, Journal::Transitions},
     {Code::SD_UNAVAILABLE, "SD_UNAVAILABLE", Severity::Warning, {"SD card unavailable", "", ""}, 1, "SD storage unavailable", true, Journal::Transitions},
     {Code::LITTLEFS_UNAVAILABLE, "LITTLEFS_UNAVAILABLE", Severity::Error, {"Flash unavailable", "", ""}, 1, "LittleFS storage unavailable", true, Journal::Transitions},
     {Code::NO_RECORDING_STORAGE, "NO_RECORDING_STORAGE", Severity::Critical, {"Cannot record trips", "No usable storage", ""}, 2, "No recording storage available", true, Journal::Transitions},

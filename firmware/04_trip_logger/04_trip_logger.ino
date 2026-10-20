@@ -75,9 +75,10 @@
 #endif
 #if DISPLAY_DEBUG
 #include "debug_display.h"
+#endif
 #include "debug_gsv.h"
 #include "debug_rf.h"
-#endif
+#include "gps_antenna.h"
 
 // -----------------------------------------------------------------
 // LilyGO T-Beam Supreme (ESP32-S3 + MAX-M10S), measured 2026-10-18
@@ -186,11 +187,16 @@ TinyGPSCustom  gRmcDateGN(gps, "GNRMC", 9);
 TinyGPSCustom  gRmcTimeGP(gps, "GPRMC", 1);
 TinyGPSCustom  gRmcDateGP(gps, "GPRMC", 9);
 
-#if DISPLAY_DEBUG
 static DebugGsv gDebugGsv;
 static DebugRf gDebugRf;
 static uint32_t gDebugRfPollMs = 0;
 static bool gDebugRfStarted = false;
+static GpsAntenna gGpsAntenna;
+// Last completed interval, retained for runtime hook retries/repeats after
+// the next poll invalidates gDebugRf. Unmeasured context stays omitted.
+static DebugRf gAntennaRf;
+static DebugSignal gAntennaSignal;
+#if DISPLAY_DEBUG
 static bool gDebugRmcValid = false;
 // Core 0 publishes a coherent network snapshot; core 1 only copies it.
 // Critical sections contain just scalar copies, never I/O or formatting.
@@ -250,7 +256,7 @@ struct GpsConfig {
 static GpsConfig gGpsConfig;
 
 // Demultiplex UBX before TinyGPSPlus. Both builds retain NAV-PVT and ACKs;
-// the same bounded buffer also accommodates the debug MON-RF path.
+// the same bounded buffer also accommodates MON-RF for the antenna check.
 struct GpsUbxRx {
     uint32_t pos = 0, since = 0;
     uint16_t len = 0;
@@ -297,7 +303,7 @@ static bool gJournalStarted = false; // under FS_LOCK; core-0 consumer only
 static bool gJournalBootReported = false;
 // Single writer per array/builder. Only EventLog's try-lock crosses cores.
 static diagnostics::RuntimeFaults::Condition gLoopConditions[] = {
-    {2002}, {2003}, {2004}, {2005}, {2006}, {3001}, {3002}, {3005}, {3006},
+    {2002}, {2003}, {2004}, {2005}, {2006}, {3001}, {3002}, {3005}, {3006}, {3009},
     {4001}, {4004}, {4005}, {4006}, {6001}
 };
 static diagnostics::RuntimeFaults::Condition gNetConditions[] = {
@@ -2070,11 +2076,7 @@ static void sendGpsConfigCommand() {
         0xC0, 0x00, 0x91, 0x20, 0,  // CFG-MSGOUT-NMEA_ID_GSA_UART1
         0xB1, 0x00, 0x91, 0x20, 0,  // CFG-MSGOUT-NMEA_ID_VTG_UART1
         0xC5, 0x00, 0x91, 0x20,     // CFG-MSGOUT-NMEA_ID_GSV_UART1
-#if DISPLAY_DEBUG
         5,  // ~1 KB bursts every fifth epoch leave 9600-baud headroom
-#else
-        0,
-#endif
         0xAC, 0x00, 0x91, 0x20, 1,  // CFG-MSGOUT-NMEA_ID_RMC_UART1
         0xBB, 0x00, 0x91, 0x20, 1,  // CFG-MSGOUT-NMEA_ID_GGA_UART1
         0x07, 0x00, 0x91, 0x20, 1,  // CFG-MSGOUT-UBX_NAV_PVT_UART1
@@ -2145,11 +2147,7 @@ static void serviceGpsConfiguration() {
         gGpsConfig.state = GPS_CONFIG_DONE;
         gNavPvtWaitMs = millis();
         Serial.printf("GPS configured on attempt %u (%lu ms after config start): "
-#if DISPLAY_DEBUG
                       "RMC+GGA+NAV-PVT, GSV every 5 epochs, automotive model.\n",
-#else
-                      "RMC+GGA+NAV-PVT, automotive model.\n",
-#endif
                       (unsigned)gGpsConfig.attempts,
                       (unsigned long)(millis() - gGpsConfig.started));
     } else if (gGpsConfig.ack == 0) {
@@ -2205,14 +2203,10 @@ static bool buildFix(Fix& fx, uint64_t rmcUtcMs) {
 // RMC carries position and speed together; GGA supplies the latest HDOP
 // but must not log a second point with the previous epoch's speed.
 static void receiveGpsNmea(uint8_t c) {
-#if DISPLAY_DEBUG
     gDebugGsv.encode((char)c);
-#endif
     if (!gps.encode((char)c)) return;
     gLastNmeaMs = millis(); // only checksum-valid NMEA, never UBX/noise bytes
-#if DISPLAY_DEBUG
     gDebugGsv.update(millis());
-#endif
     uint64_t rmcUtcMs = 0;
     setClockFromGps(&rmcUtcMs);
     if (rmcFixArrived()) {
@@ -2259,6 +2253,15 @@ static void serviceRuntimeDiagnostics() {
     // UTC_UNAVAILABLE describes the existing trusted system-clock state, with
     // a two-minute boot allowance for GPS/SNTP. Untimed GPX points are separate.
     gLoopFaults.event(3006, now).condition(!gClockSet.load() && uint32_t(now - gGpsDiagStartMs) >= 120000);
+    // Never manufacture a healthy observation at boot or during the hold.
+    // No-evidence samples retain the last measured verdict; RuntimeFaults
+    // supplies bounded retries/repeats and the original episode identity.
+    if (gGpsAntenna.observed()) {
+        gLoopFaults.event(3009, now);
+        if (gAntennaRf.valid) gLoopFaults.integer("agc_pct", gAntennaRf.agcPct);
+        if (gAntennaSignal.heard >= 0) gLoopFaults.integer("max_cno", gAntennaSignal.maxCno);
+        gLoopFaults.condition(gGpsAntenna.active());
+    }
     gLoopFaults.event(4001, now).condition(!gSdMounted);
     // Check idle storage too, so a successful core-0 upload can be observed as
     // recovery on core 1 without sharing producer state across tasks.
@@ -2342,11 +2345,9 @@ static void receiveGpsByte(uint8_t c) {
             gNavPvt.gSpeedMmps = (int32_t)u4(60); gNavPvt.sAccMmps = u4(68);
             serviceGpsSpeedFallback();
         }
-#if DISPLAY_DEBUG
         if (rx.checksumA && c == rx.b && rx.cls == 0x0A && rx.id == 0x38 &&
             gDebugRfStarted && gGpsConfig.state == GPS_CONFIG_DONE)
             parseDebugMonRf(rx.payload, rx.len, gDebugRf);
-#endif
         rx = GpsUbxRx();
     }
 }
@@ -2467,12 +2468,17 @@ static int debugSatellitesUsed() {
 static float debugHdop() {
     return gps.hdop.isValid() && gps.hdop.age() <= 2500 ? gps.hdop.hdop() : -1;
 }
+#endif
 
 static void serviceDebugRf() {
     if (gGpsConfig.state != GPS_CONFIG_DONE) return;
     uint32_t now = millis();
     if (gDebugRfStarted) {
         if (uint32_t(now - gDebugRfPollMs) < 30000) return;
+        gAntennaRf = gDebugRf;
+        gAntennaSignal = gDebugGsv.signal(now);
+        gGpsAntenna.update(now, gAntennaRf.valid, gAntennaRf.agcPct, gAntennaSignal);
+#if DISPLAY_DEBUG
         char fix = 0;
         if ((gRmcStatusGN.isValid() && gRmcStatusGN.age() <= 2500) ||
             (gRmcStatusGP.isValid() && gRmcStatusGP.age() <= 2500))
@@ -2486,14 +2492,16 @@ static void serviceDebugRf() {
                      gNavPvt.sAccMmps / 1000.0, gNavPvt.hAccMm / 1000.0);
         else snprintf(line + n, sizeof line - n, " | sAcc -- m/s hAcc -- m");
         Serial.println(line);
+#endif
     }
     // First poll starts after config succeeds OR gives up. Each later poll
-    // logs the previous interval's reply, then invalidates it. Never wait.
+    // evaluates the previous interval's reply, then invalidates it. Never wait.
     gDebugRfStarted = true; gDebugRfPollMs = now;
     gDebugRf.valid = false;
     ubxSend(0x0A, 0x38, nullptr, 0);
 }
 
+#if DISPLAY_DEBUG
 static void serviceDebugDisplay() {
     uint32_t now = millis();
     if (!gDebugDisplayReady || now - gDebugDrawMs < 1000) return;
@@ -2655,9 +2663,7 @@ void loop() {
         receiveGpsByte((uint8_t)GPSSerial.read());
     }
     serviceGpsConfiguration();
-#if DISPLAY_DEBUG
     serviceDebugRf();
-#endif
     serviceRuntimeDiagnostics(); // before fix-loss finalization and PMU shutdown
 
     // Fix-loss watchdog: a recording trip with no valid fix at all for

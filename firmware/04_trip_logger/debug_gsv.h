@@ -1,4 +1,5 @@
-// Optional, core-1-only GSV counters. Does not change fix or GPX construction.
+// Core-1-only GSV counters feed the antenna check in all builds and the
+// optional debug UI. Does not change fix or GPX construction.
 #pragma once
 #include <stdint.h>
 #include <string.h>

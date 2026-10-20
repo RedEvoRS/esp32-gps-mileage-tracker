@@ -1,5 +1,5 @@
 {
-  "catalog_version": 3,
+  "catalog_version": 4,
   "codes": [
     {
       "code": 1000,
@@ -444,6 +444,31 @@
             "out_of_range",
             "read_failed"
           ]
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
+    },
+    {
+      "code": 3009,
+      "symbol": "GPS_ANTENNA_SUSPECT",
+      "severity": "warning",
+      "oled": [
+        "Check GPS antenna"
+      ],
+      "title": "GPS antenna may be disconnected",
+      "explanation": "The receiver gain is near maximum and no satellite is heard at a usable strength, which is what a loose or damaged antenna cable looks like. Parked indoors looks different and should not raise this warning.",
+      "recovery": "Check the antenna plug inside the case and the cable. The warning clears once satellites are heard at usable strength or the receiver gain drops.",
+      "context": {
+        "agc_pct": {
+          "type": "integer",
+          "min": 0,
+          "max": 100
+        },
+        "max_cno": {
+          "type": "integer",
+          "min": 0,
+          "max": 99
         }
       },
       "notify": true,

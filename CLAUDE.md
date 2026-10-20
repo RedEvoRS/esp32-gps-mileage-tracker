@@ -142,8 +142,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   driven HIGH (low/high made no difference). Bench tests showed that SPG
   5.10 still ACKs legacy CFG-MSG/CFG-NAV5. Stage 4 now uses the future-proof
   UBX-CFG-VALSET interface: one RAM-only message at every boot explicitly
-  sets UART1 RMC+GGA+NAV-PVT to rate 1, GLL/GSA/VTG off, GSV off (rate 5
-  with DISPLAY_DEBUG), and the automotive model. Navigation stays at the
+  sets UART1 RMC+GGA+NAV-PVT to rate 1, GLL/GSA/VTG off, GSV to rate 5
+  in all builds, and the automotive model. Navigation stays at the
   default 1 Hz. After checksum-valid NMEA proves readiness, each send gets
   a 2 s ACK window for the busy 9600-baud UART; up to three sends per
   attempt and five attempts with 8 s backoff run in the normal loop.
@@ -199,7 +199,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 - Stage 4 diagnostics: static EventLog, random boot identity and NVS boot
   counter; boot/reset, retained PMU recovery and runtime fault hooks. GPS,
   battery/charge guard, trip storage/recovery, WiFi/HTTP, network stack and
-  debug OLED faults use the catalog policy. Conditions raise/clear with
+  debug OLED faults use the catalog policy, including an AGC/GSV antenna check
+  in all builds. Conditions raise/clear with
   15-minute repeats; AP absence is a boot-local counter, never a scan event.
   Per-core static producer builders keep event buffers off task stacks. The network
   task services one queued record at a time using a zero-wait filesystem
