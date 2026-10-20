@@ -4,6 +4,14 @@
 
 namespace startup {
 enum class Mode { Normal, PmuMissing, PmuUntrusted, NoStorage };
+inline const char* modeText(Mode mode) {
+    switch (mode) {
+        case Mode::PmuMissing: return "power chip not responding";
+        case Mode::PmuUntrusted: return "power chip state untrusted";
+        case Mode::NoStorage: return "no usable trip storage";
+        default: return "normal";
+    }
+}
 inline Mode selectMode(bool pmuReady, bool radioOff, bool storageReady) {
     return !pmuReady ? Mode::PmuMissing : !radioOff ? Mode::PmuUntrusted :
            !storageReady ? Mode::NoStorage : Mode::Normal;

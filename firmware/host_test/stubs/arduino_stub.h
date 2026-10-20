@@ -124,11 +124,13 @@ public:
 struct SerialStub {
     bool quiet = true;
     std::vector<std::string> log;
-    void begin(int) {}
-    void println(const char* m = "") { log.push_back(m); if (!quiet) puts(m); }
+    uint32_t beginMs = 0;
+    std::vector<uint32_t> logMs;
+    void begin(int) { beginMs = millis(); }
+    void println(const char* m = "") { logMs.push_back(millis()); log.push_back(m); if (!quiet) puts(m); }
     void printf(const char* fmt, ...) {
         char b[512]; va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
-        log.push_back(b); if (!quiet) fputs(b, stdout);
+        logMs.push_back(millis()); log.push_back(b); if (!quiet) fputs(b, stdout);
     }
 };
 extern SerialStub Serial;

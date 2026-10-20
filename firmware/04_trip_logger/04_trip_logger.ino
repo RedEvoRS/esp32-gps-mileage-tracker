@@ -2666,8 +2666,8 @@ static void degradedLoop() {
             ESP.restart();
             return;
         }
-        Serial.printf("DEGRADED: initialization still unavailable -- not recording trips. Retrying in %lu s.\n",
-                      (unsigned long)(gDegraded.waitMs() / 1000));
+        Serial.printf("DEGRADED (%s): retry failed -- not recording trips. Retrying in %lu s.\n",
+                      startup::modeText(mode), (unsigned long)(gDegraded.waitMs() / 1000));
     }
     delay(20); // yield even without UART, display or network activity
 }
@@ -2681,6 +2681,7 @@ void setup() {
     startup::Mode powerMode = startup::selectMode(pmuReady, radioOff, true);
     if (powerMode != startup::Mode::Normal) {
         Serial.begin(115200);
+        delay(1000); // Allow native USB to become ready before boot messages.
         Serial.println("\n=== Stage 4: Trip Logger ===");
         printPmuStartup(gPmuStartup);
         enterDegraded(powerMode);

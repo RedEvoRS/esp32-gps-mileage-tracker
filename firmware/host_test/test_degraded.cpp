@@ -10,6 +10,7 @@ static unsigned cases = 0;
 
 static void world() {
     resetWorld();
+    Serial.logMs.clear();
     gDegraded = startup::DegradedPolicy();
     PMU = XPowersAXP2101(); Wire = TwoWire(); Wire1 = TwoWire();
     g_pinModes.clear(); g_pinLevels.clear(); g_partition = PartitionStub();
@@ -59,9 +60,21 @@ static void restartOnLoop() {
     try { loop(); assert(false); } catch (const Restarted&) {}
     assert(g_restarts == before + 1);
 }
+static void bootMessagesAfterUsbWait() {
+    assert(!Serial.log.empty() && Serial.log.size() == Serial.logMs.size());
+    assert(Serial.log.front() == "\n=== Stage 4: Trip Logger ===");
+    assert(uint32_t(Serial.logMs.front() - Serial.beginMs) == 1000);
+    for (auto at : Serial.logMs) assert(uint32_t(at - Serial.beginMs) >= 1000);
+}
+static void retryMessage(const char* cause) {
+    const auto expected = std::string("DEGRADED (") + cause +
+        "): retry failed -- not recording trips. Retrying in 120 s.\n";
+    assert(std::count(Serial.log.begin(), Serial.log.end(), expected) == 1);
+}
 static void bootD() {
     world(); g_disk.failMount = true;
     setup(); assert(gDegraded.mode() == Mode::NoStorage);
+    bootMessagesAfterUsbWait();
     assert(!gSdMounted && !gFlashMounted && gJournalReady);
     noTrips();
 }
@@ -129,11 +142,13 @@ int main() {
     }
     bootD(); g_partition.bytes.assign(8192, 0xff);
     g_millis += 60000; loop(); assert(gDegraded.waitMs() == 120000 && !g_disk.formatAttempts);
+    retryMessage("no usable trip storage");
     auto attempts = g_disk.mountAttempts; loop(); assert(g_disk.mountAttempts == attempts); ++cases;
 
     for (bool flash : {false, true}) {
         world(); g_disk.failMount = !flash; PMU.failBegins = 100;
         setup(); assert(gDegraded.mode() == Mode::PmuMissing);
+        bootMessagesAfterUsbWait();
         auto attempts = PMU.beginCalls;
         for (unsigned i = 0; i < 5; ++i) loop();
         assert(PMU.beginCalls == attempts);
@@ -144,6 +159,7 @@ int main() {
         assert(!g_disk.formatAttempts && !SD.begins && !g_disk.files.count("/trips"));
         g_millis += 60000; loop();
         assert(PMU.beginCalls == attempts + 3 && gDegraded.waitMs() == 120000);
+        retryMessage("power chip not responding");
         attempts = PMU.beginCalls; loop(); assert(PMU.beginCalls == attempts);
         PMU.failBegins = 0; g_millis += 120000; restartOnLoop();
         onlyPmuCalls({"begin"}); noTrips(); ++cases;
@@ -152,6 +168,7 @@ int main() {
         world(); PMU.failRadioDisable = writeFails; PMU.radioStuckOn = !writeFails;
         PMU.failChargeDisable = chargeResult == 1; PMU.failChargeRead = chargeResult == 2;
         setup(); assert(gDegraded.mode() == Mode::PmuUntrusted);
+        bootMessagesAfterUsbWait();
         assert(std::count(PMU.operations.begin(), PMU.operations.end(), "readRegister") == 1);
         const char* expected = chargeResult == 0 ? "read-back shows charging disabled" :
             chargeResult == 1 ? "read-back still shows charging enabled" : "charger read-back failed, state unknown";
@@ -163,6 +180,7 @@ int main() {
         onlyPmuCalls({"begin", "disableALDO3", "isEnableALDO3", "disableCellbatteryCharge", "readRegister"});
         assert(contains(rows(), 2001)); noTrips();
         g_millis += 60000; loop(); assert(gDegraded.waitMs() == 120000);
+        retryMessage("power chip state untrusted");
         assert(std::count(PMU.operations.begin(), PMU.operations.end(), "disableCellbatteryCharge") == 1);
         PMU.failRadioDisable = PMU.radioStuckOn = false;
         g_millis += 120000; restartOnLoop();

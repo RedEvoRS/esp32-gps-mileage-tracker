@@ -1,10 +1,16 @@
 #include "../04_trip_logger/degraded_policy.h"
 #include <cassert>
 #include <cstdio>
+#include <cstring>
 #include <initializer_list>
 using namespace startup;
 int main() {
     unsigned cases = 0;
+    assert(std::strcmp(modeText(Mode::Normal), "normal") == 0);
+    assert(std::strcmp(modeText(Mode::PmuMissing), "power chip not responding") == 0);
+    assert(std::strcmp(modeText(Mode::PmuUntrusted), "power chip state untrusted") == 0);
+    assert(std::strcmp(modeText(Mode::NoStorage), "no usable trip storage") == 0);
+    cases += 4;
     for (bool pmu : {false, true}) for (bool radio : {false, true}) for (bool store : {false, true}) {
         assert(selectMode(pmu, radio, store) == (!pmu ? Mode::PmuMissing : !radio ?
             Mode::PmuUntrusted : !store ? Mode::NoStorage : Mode::Normal));
