@@ -599,6 +599,16 @@ The rest of this section was written for the V1.2. On the Supreme
     `rf --`, and unknown or stale NMEA values show `--`. Antenna status
     and power may read `DONTKNOW` without an antenna supervisor; that
     alone does not mean the antenna failed.
+  - Debug builds also print a `Temp:` line every 30 s: the guard's PMU die
+    temperature and its die-minus-9 C estimate (the retired V1.2 calibration),
+    TS voltage/raw ADC count, BME280 temperature, actual charging/phase,
+    battery voltage/percent and VBUS. Unavailable values show `--`. Compare
+    TS voltage across temperatures to identify whether the Supreme's TS
+    resistor is fixed (flat) or a thermistor (temperature-dependent); TS stays
+    independent of the charger, with a 50 uA measurement bias. BME280 uses
+    temperature-only forced mode on the OLED's core/bus; its ALDO1 supply
+    (also OLED/magnetometer) is left as found. These readings do not change
+    the guard's offset or thresholds. The line and probes are debug-only.
   - The screen can't stop logging. If it's missing or an I2C write fails,
     the serial log says `WARNING: debug OLED I2C failed` once and the
     screen stays off until the next boot.
