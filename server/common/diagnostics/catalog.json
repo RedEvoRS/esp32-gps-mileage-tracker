@@ -1,5 +1,5 @@
 {
-  "catalog_version": 2,
+  "catalog_version": 3,
   "codes": [
     {
       "code": 1000,
@@ -310,7 +310,7 @@
         "Waiting for GPS fix"
       ],
       "title": "GPS has no position fix",
-      "explanation": "GPS data is arriving but no acceptable position fix is available.",
+      "explanation": "GPS data is arriving but no position fix is accurate enough to start a trip.",
       "recovery": "Allow time with a clear sky view and check the antenna if the condition persists.",
       "context": {
         "elapsed_ms": {
@@ -385,7 +385,7 @@
         "GPS fix lost"
       ],
       "title": "Position fix lost during a trip",
-      "explanation": "A trip is active but acceptable GPS positions stopped. Distance across the gap may be underestimated.",
+      "explanation": "A trip is active but the GPS stopped reporting positions. Distance across the gap may be underestimated.",
       "recovery": "Restore sky view and inspect the antenna if recurring; review the trip gap later.",
       "context": {
         "elapsed_ms": {

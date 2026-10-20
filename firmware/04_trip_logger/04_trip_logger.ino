@@ -2237,21 +2237,25 @@ static void receiveGpsNmea(uint8_t c) {
 static void serviceRuntimeDiagnostics() {
     if (!gJournalReady) return;
     uint32_t now = millis();
-    // Ten seconds of silence is well beyond normal 1 Hz output. Give a cold
-    // acquisition two minutes while idle; a trip gap gets thirty seconds.
+    // Ten seconds of silence is well beyond normal 1 Hz output.
     uint32_t nmeaGap = now - gLastNmeaMs;
     gLoopFaults.event(3001, now).integer("elapsed_ms", nmeaGap).condition(nmeaGap >= 10000);
     bool recording = gState == ACTIVE || gState == COOLDOWN;
-    uint32_t fixGap = now - (gHaveLastFix ? gLastFixMonoMs : gGpsDiagStartMs);
+    // E3002 means no fix accurate enough to start a trip: count from the last
+    // trusted fix, or GPS config start, with a fresh idle acquisition grace.
+    uint32_t trustedFixGap = now - (gHaveLastFix ? gLastFix.monoMs : gGpsDiagStartMs);
     if (gState != IDLE) gIdleFixWaitMs = now;
-    uint32_t idleGap = min(fixGap, uint32_t(now - gIdleFixWaitMs));
+    uint32_t idleGap = min(trustedFixGap, uint32_t(now - gIdleFixWaitMs));
     gLoopFaults.event(3002, now).integer("elapsed_ms", idleGap);
     if (gps.satellites.isValid()) gLoopFaults.integer("satellites", min(gps.satellites.value(), uint32_t(255)));
     gLoopFaults.condition(gState == IDLE && idleGap >= 120000);
-    // Finalizing does not establish GPS recovery. A resumed valid RMC clears
-    // E3005 in receiveGpsNmea(), including after the five-minute watchdog.
-    if (recording && fixGap >= 30000)
-        gLoopFaults.event(3005, now).integer("elapsed_ms", fixGap).condition(true);
+    // E3005 means positions stopped: any valid RMC counts, trusted or not,
+    // so weak accuracy while parked in cooldown does not cause a trip alert.
+    // Finalizing does not establish recovery; receiveGpsNmea() clears E3005
+    // on a valid RMC, including after the five-minute watchdog.
+    uint32_t rmcFixGap = now - gLastFixMonoMs;
+    if (recording && rmcFixGap >= 30000)
+        gLoopFaults.event(3005, now).integer("elapsed_ms", rmcFixGap).condition(true);
     // UTC_UNAVAILABLE describes the existing trusted system-clock state, with
     // a two-minute boot allowance for GPS/SNTP. Untimed GPX points are separate.
     gLoopFaults.event(3006, now).condition(!gClockSet.load() && uint32_t(now - gGpsDiagStartMs) >= 120000);

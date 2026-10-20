@@ -5,7 +5,7 @@
 #include <iostream>
 
 using namespace diagnostics;
-static_assert(kCatalogVersion == 2, "review the host fixture on catalog version changes");
+static_assert(kCatalogVersion == 3, "review the host fixture on catalog version changes");
 static_assert(static_cast<std::uint16_t>(Code::STORAGE_FULL) == 4005, "stable code");
 static_assert(find(4005)->severity == Severity::Critical, "constexpr lookup");
 static_assert(find(5001)->journal == Journal::Counter, "no event for each absent scan");
