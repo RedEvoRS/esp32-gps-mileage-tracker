@@ -6,10 +6,10 @@ export them in a web page. The [top-level README](../README.md) explains
 the complete setup.
 
 The board is the LilyGO T-Beam Supreme with MAX-M10S GPS and microSD trip
-storage. The server accepts GPX uploads from any board, independently of
-its model. It is deployed, and Stage 4 has recorded real drives on the
-card, but uploading from the board to the deployed server has not been
-tested end to end.
+storage, though the server accepts GPX uploads from any board. The server
+has been installed with `install.sh` on a real Debian machine, and the
+board has recorded real drives on its card, but an upload from the board
+to an installed server hasn't been tested end to end yet.
 <!-- TODO(first upload): Record the date and scope of the first successful Supreme-to-deployed-server upload, including confirmation in the viewer. -->
 
 It runs as two default Docker containers, with two optional services, all

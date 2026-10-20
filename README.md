@@ -283,7 +283,9 @@ router; the comments in `secrets.h` explain it. `secrets.h` is in
 > what was in `secrets.h` when you flashed it. If the server's address
 > changes, the token is regenerated, or your WiFi name or password changes
 > (a new router, say), the board can't upload any more. Trips just stop
-> showing up in the viewer. Fix `secrets.h` and flash again. Trips recorded
+> showing up in the viewer; a refused or failed upload also shows as an
+> `E5xxx` error code on the everyday screen after you park, but a WiFi
+> name the board can't find doesn't. Fix `secrets.h` and flash again. Trips recorded
 > in the meantime wait on the board and upload once it can reach the
 > server.
 
