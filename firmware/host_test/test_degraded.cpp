@@ -7,6 +7,7 @@ using namespace diagnostics;
 using startup::Mode;
 static EventLog::Batch degradedBatch;
 static unsigned cases = 0;
+static std::vector<uint32_t> bootDelays;
 
 static void world() {
     resetWorld();
@@ -29,7 +30,8 @@ static void world() {
     for (auto& slot : gLoopConditions) { auto code = slot.code; slot = {}; slot.code = code; }
     gLoopFaults.~RuntimeFaults();
     new (&gLoopFaults) RuntimeFaults(gJournal, gLoopConditions, sizeof(gLoopConditions)/sizeof(gLoopConditions[0]));
-    g_delayHook = [](uint32_t ms) { g_millis += ms; };
+    bootDelays.clear();
+    g_delayHook = [](uint32_t ms) { bootDelays.push_back(ms); g_millis += ms; };
 }
 static std::vector<std::string> rows() {
     xSemaphoreTake(gFsMutex, portMAX_DELAY);
@@ -103,20 +105,81 @@ int main() {
     // Exhaust all successful byte values against XPowersLib's bit semantics.
     for (int raw = 0; raw <= 255; ++raw) {
         assert(pmu_read::aldo3State(raw) == ((raw & 4) ? Aldo3State::On : Aldo3State::Off));
-        for (int second = 0; second <= 255; ++second)
+        for (int second = 0; second <= 255; ++second) {
             assert(pmu_read::vbusState(raw, second) ==
                    (!(second & 8) && (raw & 32) ? VbusState::Present : VbusState::Absent));
+            assert(pmu_read::aldo1Ready(raw, second) == bool((raw & 1) && (second & 31) == 28));
+        }
+        assert(!pmu_read::aldo1Ready(-1, raw));
+        assert(!pmu_read::aldo1Ready(raw, -1));
         assert(pmu_read::vbusState(-1, raw) == VbusState::Unknown);
         assert(pmu_read::vbusState(raw, -1) == VbusState::Unknown);
     }
     assert(pmu_read::aldo3State(-1) == Aldo3State::Unknown);
     assert(pmu_read::vbusState(-1, -1) == VbusState::Unknown);
+    assert(!pmu_read::aldo1Ready(-1, -1));
+
+    // Cold boot changes 1.8 V to 3.3 V; a warm boot already at 3.3 V/on
+    // needs no settle delay. The first display bus operation sees all PMU
+    // writes and independent read-backs completed, after charging is paused.
+    for (bool enabled : {false, true}) for (int mv : {1800, 3300}) {
+        world(); PMU.aldo1 = enabled; PMU.aldo1Mv = mv;
+        bool displayBegan = false;
+        Wire.onBegin = [&] {
+            displayBegan = true;
+            const std::vector<std::string> expected = {
+                "begin", "disableALDO3", "readRegister", "disableCellbatteryCharge",
+                "enableBattDetection", "enableBattVoltageMeasure", "readRegister", "readRegister",
+                "setALDO1Voltage", "enableALDO1", "readRegister", "readRegister"
+            };
+            assert(PMU.operations == expected);
+            assert(!PMU.aldo3 && !PMU.chargeEnabled && PMU.aldo1 && PMU.aldo1Mv == 3300);
+            assert(Serial.log.empty());
+            assert(std::count(bootDelays.begin(), bootDelays.end(), 10) == (enabled && mv == 3300 ? 0 : 1));
+            assert(PMU.registerReadCalls[XPOWERS_AXP2101_LDO_ONOFF_CTRL0] == 3);
+            assert(PMU.registerReadCalls[XPOWERS_AXP2101_LDO_VOL0_CTRL] == 2);
+        };
+        setup(); Wire.onBegin = nullptr;
+        assert(displayBegan && gProductionDisplayReady && g_taskCreates == 1);
+        assert(gDegraded.mode() == Mode::Normal && !logCount("WARNING: ALDO1"));
+        bootMessagesAfterUsbWait(); ++cases;
+    }
+
+    // Failed writes, lying writes and either unreadable verification must
+    // warn once after USB is ready, but still start the display and logger.
+    for (unsigned failure = 0; failure < 6; ++failure) {
+        world(); PMU.aldo1 = false;
+        PMU.failAldo1Voltage = failure == 0;
+        PMU.failAldo1Enable = failure == 1;
+        PMU.aldo1VoltageStuck = failure == 2;
+        PMU.aldo1EnableStuck = failure == 3;
+        if (failure == 4) failNextRead(XPOWERS_AXP2101_LDO_ONOFF_CTRL0, 3);
+        if (failure == 5) failNextRead(XPOWERS_AXP2101_LDO_VOL0_CTRL, 2);
+        setup();
+        assert(gDegraded.mode() == Mode::Normal && gProductionDisplayReady && g_taskCreates == 1);
+        assert(logCount("WARNING: ALDO1 3.3 V/on setup unconfirmed") == 1);
+        assert(std::count(PMU.operations.begin(), PMU.operations.end(), "setALDO1Voltage") == 1);
+        assert(std::count(PMU.operations.begin(), PMU.operations.end(), "enableALDO1") == 1);
+        bootMessagesAfterUsbWait(); ++cases;
+    }
+    // Unknown initial state cannot skip settling; successful final reads can
+    // still confirm the requested setting without producing a warning.
+    for (bool control : {false, true}) {
+        world(); PMU.aldo1Mv = 3300;
+        failNextRead(control ? XPOWERS_AXP2101_LDO_ONOFF_CTRL0 : XPOWERS_AXP2101_LDO_VOL0_CTRL,
+                     control ? 2 : 1);
+        setup();
+        assert(std::count(bootDelays.begin(), bootDelays.end(), 10) == 1);
+        assert(!logCount("WARNING: ALDO1") && g_taskCreates == 1); ++cases;
+    }
 
     // Disable succeeds, but neither boot nor a degraded retry may accept a
     // failed independent verification. A later real clear read can recover.
     world(); failNextRead(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
     setup();
     assert(!PMU.aldo3 && gDegraded.mode() == Mode::PmuUntrusted);
+    onlyPmuCalls({"begin", "disableALDO3", "disableCellbatteryCharge", "readRegister"});
+    assert(PMU.aldo1 && PMU.aldo1Mv == 1800);
     assert(!logCount("LoRa rail (ALDO3) verified off"));
     assert(PMU.operations[0] == "begin" && PMU.operations[1] == "disableALDO3" &&
            PMU.operations[2] == "readRegister");
@@ -285,6 +348,7 @@ int main() {
         assert(gProductionDisplayReady && gProductionOled.sleeps >= 1 && !gProductionHaveOutput);
 
         onlyPmuCalls({"begin"}); noTrips();
+        assert(PMU.aldo1 && PMU.aldo1Mv == 1800);
         auto all = rows(); assert(contains(all, 1000) && contains(all, 2001) && contains(all, 2007));
         assert(observation(2001).observed && observation(2001).episode && !observation(4003).observed);
         assert(gJournal.stats().backend == (flash ? EventLog::Backend::LittleFs : EventLog::Backend::Ram));
@@ -312,6 +376,7 @@ int main() {
         for (unsigned i = 0; i < 5; ++i) loop();
         assert(std::count(PMU.operations.begin(), PMU.operations.end(), "disableCellbatteryCharge") == 1);
         onlyPmuCalls({"begin", "disableALDO3", "isEnableALDO3", "disableCellbatteryCharge", "readRegister"});
+        assert(PMU.aldo1 && PMU.aldo1Mv == 1800);
         assert(contains(rows(), 2001)); noTrips();
         g_millis += 60000; loop(); assert(gDegraded.waitMs() == 120000);
         retryMessage("power chip state untrusted");

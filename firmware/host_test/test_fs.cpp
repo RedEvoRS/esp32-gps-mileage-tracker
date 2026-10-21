@@ -1420,7 +1420,13 @@ int main(int argc, char** argv) {
         for (bool failMutex : {false, true}) {
             resetWorld();
             g_failMutexCreate = failMutex;
-            g_delayHook = [](uint32_t) {
+            g_delayHook = [](uint32_t ms) {
+                if (ms == 10) {
+                    CHECK(!PMU.aldo3 && !PMU.chargeEnabled && PMU.aldo1 && PMU.aldo1Mv == 3300 &&
+                          Serial.log.empty() && Wire.begins == 0,
+                          "ALDO1 settles with LoRa and charging off, before display and Serial");
+                    return;
+                }
                 CHECK(!PMU.aldo3 && !PMU.bldo1 && !PMU.vbackup,
                       "radio, SD and VBACKUP are off before a startup delay");
                 g_delayHook = nullptr;
@@ -1456,7 +1462,7 @@ int main(int argc, char** argv) {
         g_delayHook = [](uint32_t ms) {
             if (ms == 10) {
                 CHECK(Serial.log.empty() && !PMU.aldo4 && g_disk.mountAttempts == 0 && g_taskCreates == 0,
-                      "PMU retry waits precede Serial, GPS, storage and worker startup");
+                      "PMU retry and ALDO1 settle waits precede Serial, GPS, storage and worker startup");
             } else {
                 CHECK(!PMU.aldo3, "successful PMU retry disables LoRa before later setup delays");
             }
