@@ -4,6 +4,11 @@
 #include <cstddef>
 #include "diag_catalog.h"
 
+// 30 s for early road tests; planned to return to 10 s afterward.
+#ifndef DISPLAY_CARD_MS
+#define DISPLAY_CARD_MS 30000
+#endif
+
 namespace display {
 enum class Motion { Unknown, Parked, Moving };
 // VBUS absence takes precedence, even during a trip's finalization.
@@ -64,7 +69,9 @@ inline Output statusCard(int heard, const Condition* conditions, size_t count) {
 
 class DisplayModel {
 public:
-    static constexpr uint32_t kDurationMs = 10000;
+    static_assert(DISPLAY_CARD_MS >= 1000 && DISPLAY_CARD_MS <= 120000,
+                  "DISPLAY_CARD_MS must be between 1000 and 120000 ms");
+    static constexpr uint32_t kDurationMs = DISPLAY_CARD_MS;
     static constexpr size_t kCapacity = 64;
     struct Input {
         uint32_t now = 0;
