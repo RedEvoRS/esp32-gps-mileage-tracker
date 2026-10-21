@@ -15,11 +15,13 @@ mileage-viewer/**
 !mileage-viewer/Dockerfile
 !mileage-viewer/requirements.txt
 !mileage-viewer/app.py
+!mileage-viewer/geocoding.py
 !mileage-viewer/static/
 mileage-viewer/static/**
 !mileage-viewer/static/leaflet.js
 !mileage-viewer/static/leaflet.css
 !mileage-viewer/static/gpx.js
+!mileage-viewer/static/endpoint-places.js
 !mileage-monitor/
 mileage-monitor/**
 !mileage-monitor/Dockerfile

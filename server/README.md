@@ -391,12 +391,81 @@ so they are also available for existing summaries. They describe the raw
 recording, including any final stationary samples; they are not geocoded
 addresses or a corrected route. Missing, corrupt, or invalid GPX files leave
 coordinates blank without preventing the rest of the export. Destination
-is entered manually. On startup, the viewer automatically adds an empty
+is entered manually or filled from an endpoint suggestion (see below). On startup,
+the viewer automatically adds an empty
 destination column to existing annotation databases while preserving their
 categories and notes. Existing categories remain business / personal / other.
 
 The viewer mounts `./data` **read-only** — it never modifies GPX or
 summary files. The only thing it writes is the annotations database.
+
+### Endpoint place suggestions
+
+The trip's **Map / Edit** page can suggest readable start/end places using a
+Nominatim-compatible reverse-geocoding service. It is **disabled by default**.
+Set `VIEWER_GEOCODER_URL` in the private `viewer.env` to the full reverse endpoint
+of a self-hosted instance, for example `http://<geocoder-host>:8080/reverse`, or a
+provider whose terms permit private vehicle-trip endpoints and indefinite local
+caching. This first version accepts endpoints without URL credentials or API-key
+query parameters. Restrict a self-hosted instance to your private network; use
+HTTPS for an external provider. An optional `VIEWER_GEOCODER_USER_AGENT` identifies
+your installation using the contact format required by your provider. Neither
+setting is shown in the viewer. Restart the viewer after changing configuration:
+
+    docker compose up -d --build mileage-viewer
+
+HTTPS providers must have a certificate trusted by the container. A private CA
+can be supplied via `SSL_CERT_FILE` pointing to a CA bundle mounted inside the
+container; certificate verification is never disabled. Lookup requests prefer
+English names (`accept-language=en`).
+
+**Do not configure the public `nominatim.openstreetmap.org` service.** Its
+[usage policy](https://operations.osmfoundation.org/policies/nominatim/) excludes
+vehicle-tracking applications and says not to submit confidential material.
+The viewer rejects `openstreetmap.org` hosts. Map tiles remain independent of
+address lookup. Google Maps/Places is not a provider in this implementation.
+
+Click **Look up start place** or **Look up end place** to send only the selected
+recorded endpoint to your configured provider. No lookup runs when viewing a
+page, exporting, uploading, or in the background. The page explains this before
+the action. No full track, trip/device ID, note, category or destination is sent.
+Your provider can see the coordinate and server IP and may log the query; choose
+a provider and retention policy appropriate for your location data.
+
+Results are suggestions for the nearest mapped object, which may be on another
+street or may omit the business name. They do not verify a visit or correct GPS
+drift. Missing or invalid recordings cannot be looked up. Use **Use end suggestion
+as destination** to fill the editable Destination field, check it, then **Save**.
+Lookup never changes a saved annotation. The saved destination appears in the
+trip list and CSV/XLSX exports through the existing annotation flow. Exports do
+not perform lookup or add unreviewed address suggestions.
+
+Positive and no-match results are cached indefinitely in `annotations.db`, keyed
+by provider URL and exact coordinates, across trips, restarts and workers. The
+cache contains sensitive place text and is included in existing SQLite backups;
+protect those backups as you protect trip data. Changing provider URL uses a
+separate cache namespace. Clearing the URL disables lookup and hides suggestions
+without deleting the cache or changing saved destinations. To refresh all results,
+stop the viewer, back up the database, delete rows from `geocode_cache` using
+SQLite, then restart. A future lookup will query the configured provider again.
+
+Requests are serialized across workers, with at least 1.1 seconds between calls
+and a five-minute cooldown on provider failure (longer `Retry-After` values are
+honoured up to seven days). There are no automatic retries,
+redirects, or ambient HTTP proxies. Responses have a 64 KiB size limit and a
+ten-second monotonic deadline checked between reads, with five-second socket
+timeouts. A single read can overrun the deadline, particularly while parsing
+chunked response framing. DNS resolution and initial response headers are not
+covered by the read checks. Gunicorn's worker timeout is the final bound for a
+stalled request, including framing, resolver or header stalls.
+Busy/unavailable/no-match states leave the map,
+manual annotations and exports usable. Lookup is authenticated and CSRF-protected;
+upstream errors, response bodies, coordinates and URLs are not logged by lookup.
+
+An unusually long provider `Retry-After` can suspend new lookups for up to seven
+days. After fixing the provider, an administrator can stop the viewer, back up
+`annotations.db`, delete its `geocode_gate` row using SQLite, then restart to clear
+that cooldown. Do not clear the gate while a lookup is running.
 
 ## Viewer Login
 

@@ -404,8 +404,8 @@ preflight() {
     for f in docker-compose.yml .dockerignore .env.example viewer.env.example monitor.env.example sample.gpx \
         common/__init__.py common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json} \
         mileage-ingest/{Dockerfile,app.py,diag_store.py,requirements.txt} \
-        mileage-viewer/{Dockerfile,app.py,requirements.txt} \
-        mileage-viewer/static/{leaflet.js,leaflet.css,gpx.js} \
+        mileage-viewer/{Dockerfile,app.py,geocoding.py,requirements.txt} \
+        mileage-viewer/static/{leaflet.js,leaflet.css,gpx.js,endpoint-places.js} \
         mileage-monitor/{Dockerfile,monitor.py,gelf.py,prometheus.py,loki.py} ntfy/server.yml \
         backup/{backup.sh,restore.sh,lib.sh,backup.conf.example} \
         backup/mileage-backup@.{service,timer}; do
