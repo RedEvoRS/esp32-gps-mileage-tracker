@@ -32,6 +32,20 @@ flags=("${assert_flags[@]}" -std=gnu++20 -O1 -w -DDISPLAY_DEBUG="${DISPLAY_DEBUG
 incs=(-I"$here/stubs" -I"$here/../04_trip_logger" -I"$build/include" -I"$here/display_stubs")
 status=0
 
+for display in 0 1; do
+    for base in fallback stamped; do
+        echo "== test_build_version (DISPLAY_DEBUG=$display, $base)"
+        version_args=()
+        if [ "$base" = stamped ]; then
+            version_args=('-DFIRMWARE_VERSION_BASE="0123456789-dirty"' -DFIRMWARE_VERSION_REQUIRE_STAMP)
+        fi
+        "${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -pedantic \
+            -DDISPLAY_DEBUG="$display" "${version_args[@]}" -I"$here/../04_trip_logger" \
+            "$here/test_build_version.cpp" -o "$build/test_build_version.exe"
+        "$build/test_build_version.exe" || status=1
+    done
+done
+
 echo "== test_temperature (Bosch compensation and checked debug probes)"
 "${cxx[@]}" "${assert_flags[@]}" -std=c++14 -O1 -Wall -Wextra -pedantic \
     "$here/test_temperature.cpp" -o "$build/test_temperature.exe"

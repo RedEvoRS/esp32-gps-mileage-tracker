@@ -254,6 +254,10 @@ unless you select a version.
 
 ### Upload a sketch and read its messages
 
+Before compiling Stage 4, run `python tools/stamp_firmware_version.py` from
+the repository root. Otherwise Device health shows `unversioned` (`unversioned+dbg`
+in the default debug build). Run it again before each build to refresh the commit.
+
 A *sketch* is an Arduino program, stored in an `.ino` file inside a folder
 with the same name. *Firmware* is the program installed on the board.
 *Uploading* or *flashing* compiles the sketch and writes that firmware to
@@ -911,8 +915,9 @@ storage backend `sd`, zero dropped events, a boot counter and no active
 conditions. History included the earlier E3009 antenna episode, raised
 and cleared; E5001's boot-local access-point-absence counter was 6.
 Successful diagnostics uploads print nothing on serial. Confirm them in
-the ingest log or Device health. `Firmware: Not reported` is expected:
-the firmware does not send a version yet. The behaviour below describes
+the ingest log or Device health. That build showed `Firmware: Not reported`
+because it predates version reporting; stamped builds report their Git
+commit (see step 6). The behaviour below describes
 the implementation; this test does not establish LittleFS or
 production-build uploads, or server-failure handling on the Supreme.
 

@@ -70,6 +70,7 @@ static void restartOnLoop() {
 static void bootMessagesAfterUsbWait() {
     assert(!Serial.log.empty() && Serial.log.size() == Serial.logMs.size());
     assert(Serial.log.front() == "\n=== Stage 4: Trip Logger ===");
+    assert(Serial.log[1] == std::string("Firmware: ") + firmware::kVersion + "\n");
     assert(uint32_t(Serial.logMs.front() - Serial.beginMs) == 1000);
     for (auto at : Serial.logMs) assert(uint32_t(at - Serial.beginMs) >= 1000);
 }

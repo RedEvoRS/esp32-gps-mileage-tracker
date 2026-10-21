@@ -62,6 +62,15 @@ int main() {
     Preferences::durable64.clear();
     std::puts("Journal NVS increment, reopen, failure, saturation and fresh identities passed");
 
+    world(false, false);
+    gJournalReady = false;
+    beginJournal();
+    assert(gJournalReady);
+    submit(); assert(gJournal.nextBatch(batch));
+    assert(std::strstr(batch.events[0],
+        (std::string("\"firmware_version\":\"") + firmware::kVersion + "\"").c_str()));
+    std::puts("Journal production begin uses the build version passed");
+
     const esp_reset_reason_t reasons[] = { ESP_RST_POWERON, ESP_RST_DEEPSLEEP, ESP_RST_SW,
         ESP_RST_INT_WDT, ESP_RST_TASK_WDT, ESP_RST_WDT, ESP_RST_BROWNOUT, ESP_RST_PANIC,
         ESP_RST_UNKNOWN, static_cast<esp_reset_reason_t>(255) };
