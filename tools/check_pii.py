@@ -48,8 +48,8 @@ SYNTHETIC_GPX = {
 # Exempt only the GPX attribute rule for these reviewed, made-up fixtures.
 # NMEA, decimal pairs, names, denylisted terms and path checks still apply.
 SYNTHETIC_GPX_CONTENT = SYNTHETIC_GPX | {
-    # Example GPX track in the original firmware design document.
-    "firmware/STAGE4_TECHNICAL_BRIEF.md",
+    # Example GPX track in the archived original firmware research proposal.
+    "docs/history/STAGE4_TECHNICAL_BRIEF.md",
     # Tiny GPX records exercise filesystem recovery and trip splitting.
     "firmware/host_test/test_fs.cpp",
     # Minimal GPX bodies exercise contact/header handling, not road trips.
