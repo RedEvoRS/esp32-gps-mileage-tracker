@@ -862,8 +862,10 @@ cycle to appear, and an upload age stops counting at 999 s.
 
 Things to know:
 
-- With debug off, the production screen shows a status card at every normal
-  power-on, as soon as the display model runs, without waiting for a GPS fix.
+- With debug off, the production screen shows a status card for 30 seconds
+  at every normal power-on, within a couple of seconds and without waiting
+  for a GPS fix. A dark screen at power-on therefore means something is
+  wrong (see E6001 in `DIAGNOSTICS.md`), not just that the GPS is still searching.
   It shows `Sats: N` for satellites **heard** (`Sats: --` until heard or when
   stale), then `OK` or only active warning-and-above `E####` codes. The satellite
   count and codes update while any status card is visible, without extending
