@@ -1016,7 +1016,6 @@ LOGIN_HTML = """
 
 LIST_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Mileage Trips</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
 """ + THEME_HEAD + """<style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index') }}">🚗 Mileage Tracker</a>
   <div class="header-actions">
@@ -1085,7 +1084,6 @@ LIST_HTML = """
 
 TRIP_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Trip {{ t.id }}</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
 """ + THEME_HEAD + """
 <link rel="stylesheet" href="{{ url_for('static', filename='leaflet.css') }}">
 <style>""" + BASE_CSS + """</style></head><body>
