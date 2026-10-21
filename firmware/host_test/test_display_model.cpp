@@ -12,15 +12,40 @@ static_assert(DisplayModel::kDurationMs == kExpectedDurationMs,
 static unsigned cases = 0;
 int main() {
     DisplayModel model; DisplayModel::Input in;
-    in.boot = true;
-    assert(!model.update(in).powered);
-    in.boot = false; in.motion = Motion::Moving; in.now = 100;
-    assert(!model.update(in).powered);
-    in.motion = Motion::Parked;
-    assert(model.update(in).card == Card::StatusCard); ++cases;
-    in.now += DisplayModel::kDurationMs - 1; assert(model.update(in).powered);
+    // The runtime's first update implies boot, without a trusted GPS fix.
+    in.now = 100;
+    assert(model.update(in).card == Card::StatusCard);
+    assert(model.update(in).heard == -1);
+    const uint32_t bootEnd = in.now + DisplayModel::kDurationMs;
+    assert(model.update(in).until == bootEnd); ++cases;
+    Condition live[] = {{3002, 1, 0}, {3006, 2, 0}};
+    in.now += 100; in.heard = 7; in.conditions = live; in.count = 2;
+    assert(model.update(in).heard == 7 && model.update(in).codeCount == 2);
+    assert(model.update(in).codes[0] == 3002 && model.update(in).codes[1] == 3006);
+    assert(model.update(in).until == bootEnd);
+    live[0].episode = 0; in.heard = 12; ++in.now;
+    assert(model.update(in).heard == 12 && model.update(in).codeCount == 1);
+    assert(model.update(in).codes[0] == 3006 && model.update(in).until == bootEnd);
+    in.count = 0; in.heard = -1; ++in.now;
+    assert(model.update(in).heard == -1 && model.update(in).codeCount == 0);
+    assert(model.update(in).until == bootEnd); ++cases;
+    in.now = bootEnd - 1; assert(model.update(in).powered);
     ++in.now; assert(!model.update(in).powered);
+    in.motion = Motion::Parked; assert(!model.update(in).powered);
     in.now += DisplayModel::kDurationMs; assert(!model.update(in).powered); ++cases;
+
+    model = DisplayModel{}; in = {}; in.boot = true;
+    assert(model.update(in).card == Card::StatusCard);
+    in.boot = false; in.now = 100; in.motion = Motion::Moving;
+    assert(!model.update(in).powered);
+    in.motion = Motion::Unknown; assert(!model.update(in).powered);
+    in.motion = Motion::Parked; assert(!model.update(in).powered); ++cases;
+
+    // Becoming Parked during the boot interval does not restart its timer.
+    model = DisplayModel{}; in = {};
+    model.update(in); in.now = 100; in.motion = Motion::Parked;
+    assert(model.update(in).until == DisplayModel::kDurationMs);
+    in.now = DisplayModel::kDurationMs; assert(!model.update(in).powered); ++cases;
 
     model = DisplayModel{}; in = {}; in.boot = true; in.motion = Motion::Parked;
     const auto& boot = model.update(in); assert(boot.powered && boot.until == DisplayModel::kDurationMs);
@@ -41,6 +66,18 @@ int main() {
     in.motion = Motion::Parked;
     assert(model.update(in).card == Card::StatusCard);
     assert(model.update(in).codes[0] == 3002); ++cases;
+    in.now = DisplayModel::kDurationMs; assert(!model.update(in).powered);
+    in.motion = Motion::Unknown; assert(!model.update(in).powered);
+    in.motion = Motion::Parked; assert(model.update(in).card == Card::StatusCard);
+    in.now += DisplayModel::kDurationMs; assert(!model.update(in).powered);
+    // Repeated parked samples do not repeat an unresolved warning.
+    ++in.now; assert(!model.update(in).powered); ++cases;
+
+    // Boot does not consume the unresolved-fault reminder at the next Parked.
+    model = DisplayModel{}; in = {}; in.conditions = warning; in.count = 1;
+    assert(model.update(in).card == Card::StatusCard);
+    in.now = DisplayModel::kDurationMs; assert(!model.update(in).powered);
+    in.motion = Motion::Parked; assert(model.update(in).codes[0] == 3002); ++cases;
 
     Condition errors[] = {{4003, 4, 0}, {4002, 5, 0}, {5004, 6, 1}};
     model = DisplayModel{}; in = {}; in.motion = Motion::Moving; in.conditions = errors; in.count = 3;
@@ -64,13 +101,56 @@ int main() {
     model = DisplayModel{}; in = {}; in.motion = Motion::Parked;
     model.update(in); in.now = DisplayModel::kDurationMs; model.update(in);
     in.tripFinalized = true; assert(model.update(in).card == Card::StatusCard); ++cases;
+    const uint32_t tripEnd = in.now + DisplayModel::kDurationMs;
+    in.tripFinalized = false; in.motion = Motion::Unknown; ++in.now; in.heard = 4;
+    assert(model.update(in).powered && model.update(in).heard == 4);
+    assert(model.update(in).until == tripEnd); ++cases;
     in.tripFinalized = false; in.motion = Motion::Moving;
     assert(!model.update(in).powered); ++cases;
     in.userRequest = true; assert(model.update(in).card == Card::StatusCard);
+    const uint32_t userEnd = in.now + DisplayModel::kDurationMs;
+    in.userRequest = false;
+    in.heard = 9; in.conditions = warning; in.count = 1;
+    assert(model.update(in).heard == 9 && model.update(in).codes[0] == 3002);
+    assert(model.update(in).until == userEnd);
     in.userRequest = false; in.now += DisplayModel::kDurationMs - 1; assert(model.update(in).powered);
     ++in.now; assert(!model.update(in).powered); ++cases;
     in.userRequest = true; model.update(in); in.shutdown = true;
     assert(!model.update(in).powered && model.update(in).card == Card::Blank); ++cases;
+    in.shutdown = in.userRequest = false;
+    assert(!model.update(in).powered); ++cases;
+
+    // Only boot bypasses Parked: finalization waits through Unknown/Moving.
+    model = DisplayModel{}; in = {}; model.update(in);
+    in.now = DisplayModel::kDurationMs; model.update(in);
+    in.tripFinalized = true; assert(!model.update(in).powered);
+    in.tripFinalized = false; in.motion = Motion::Moving; assert(!model.update(in).powered);
+    in.motion = Motion::Unknown; assert(!model.update(in).powered);
+    in.motion = Motion::Parked; assert(model.update(in).card == Card::StatusCard); ++cases;
+
+    // Debug consumes boot, trip and error triggers; only a user overlay shows.
+    model = DisplayModel{}; in = {}; in.suspended = in.boot = in.tripFinalized = true;
+    in.conditions = critical; in.count = 1;
+    assert(!model.update(in).powered);
+    in.boot = in.tripFinalized = in.suspended = false;
+    assert(!model.update(in).powered);
+    in.motion = Motion::Parked; assert(model.update(in).card == Card::StatusCard);
+    in.suspended = true; assert(!model.update(in).powered);
+    in.userRequest = true; assert(model.update(in).card == Card::StatusCard);
+    in.userRequest = false; in.motion = Motion::Moving; in.now = 100; in.heard = 5;
+    assert(model.update(in).heard == 5 && model.update(in).until == DisplayModel::kDurationMs);
+    in.now = DisplayModel::kDurationMs; assert(!model.update(in).powered);
+    in.suspended = false; assert(!model.update(in).powered); ++cases;
+
+    // Dismiss also consumes an unshown boot and preserves episode history.
+    model = DisplayModel{}; in = {}; model.dismiss();
+    assert(!model.update(in).powered);
+    in.conditions = critical; in.count = 1; assert(model.update(in).card == Card::ErrorCard);
+    model.dismiss(); assert(!model.update(in).powered);
+    in.tripFinalized = true; in.motion = Motion::Unknown; model.update(in);
+    in.tripFinalized = false; model.dismiss();
+    in.motion = Motion::Parked; assert(model.update(in).card == Card::StatusCard);
+    model.dismiss(); assert(!model.update(in).powered); ++cases;
 
     model = DisplayModel{}; in = {}; in.now = UINT32_MAX - DisplayModel::kDurationMs / 2;
     in.motion = Motion::Parked;

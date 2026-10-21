@@ -862,17 +862,23 @@ cycle to appear, and an upload age stops counting at 999 s.
 
 Things to know:
 
-- With debug off, the production screen sleeps by default, briefly
-  showing `Sats: N` for satellites **heard** (`Sats: --` when stale),
-  then `OK` or only active warning-and-above `E####` codes at the first
-  parked opportunity after boot or a trip. Codes are severity ordered and
+- With debug off, the production screen shows a status card at every normal
+  power-on, as soon as the display model runs, without waiting for a GPS fix.
+  It shows `Sats: N` for satellites **heard** (`Sats: --` until heard or when
+  stale), then `OK` or only active warning-and-above `E####` codes. The satellite
+  count and codes update while any status card is visible, without extending
+  its timer. After a trip, the status card still waits until parked.
+  The boot card does not repeat just because a trusted fix later confirms
+  the board is parked. Routine status cards turn off when moving is detected;
+  an unknown motion state does not turn them off. Codes are severity ordered and
   deduplicated. Four fit in a two-by-two grid; with more faults, three codes
   and `+N` show how many were omitted. Error cards show only a centred code.
   Production does not render catalog OLED text; catalog v5's text
   validation rules still apply. New
   ERROR/CRITICAL episodes show once even while moving; unresolved faults
   remind at the next parked opportunity. Cards last 30 seconds at maximum
-  contrast, then SH1106 power save turns the panel off. `DISPLAY_CARD_MS`
+  contrast, then SH1106 power save turns the panel off until another card is due.
+  Degraded startup still leaves the screen off. `DISPLAY_CARD_MS`
   sets this duration in milliseconds (default `30000`, build override
   `-DDISPLAY_CARD_MS=10000` for 10 seconds). The default is planned to return
   to 10 seconds after the first road tests. A short press of
