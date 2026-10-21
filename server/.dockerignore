@@ -1,6 +1,7 @@
 # Default deny: only reviewed runtime files enter service build contexts.
 # This excludes .env, viewer.env, monitor.env, data/, backup/, backups/, tests/,
 # __pycache__/, bytecode, editor files and future unlisted files.
+# VERSION, COMMIT and stamp_version.py stay on the build host; use SERVER_VERSION.
 # Re-deny contents after opening each directory: Docker otherwise includes
 # unlisted descendants through the directory exception.
 **
@@ -32,6 +33,7 @@ mileage-monitor/**
 !common/
 common/**
 !common/__init__.py
+!common/version.py
 !common/diagnostics/
 common/diagnostics/**
 !common/diagnostics/__init__.py

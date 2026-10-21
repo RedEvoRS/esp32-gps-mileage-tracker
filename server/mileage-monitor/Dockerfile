@@ -7,5 +7,8 @@ COPY common/ /app/common/
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 RUN mkdir -p /data /state && chown -R app:app /data /state /app
+ARG SERVER_VERSION=unversioned
+ENV SERVER_VERSION=${SERVER_VERSION}
+
 USER app
 CMD ["python", "monitor.py"]

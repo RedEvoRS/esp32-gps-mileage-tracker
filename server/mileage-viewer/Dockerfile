@@ -17,6 +17,9 @@ ENV PYTHONPATH=/app
 # annotations SQLite database (its own writable volume).
 RUN mkdir -p /data /db && chown -R app:app /data /db /app
 
+ARG SERVER_VERSION=unversioned
+ENV SERVER_VERSION=${SERVER_VERSION}
+
 USER app
 
 EXPOSE 8091

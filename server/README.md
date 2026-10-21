@@ -93,6 +93,9 @@ by the `mileage-viewer` service, which reads these files independently.
     mileage-tracker/           # this folder, copied to the server
     ├── docker-compose.yml     # All Python builds use this server directory as context
     ├── .dockerignore          # Runtime allowlist; excludes secrets, tests and data
+    ├── VERSION                # Server release number
+    ├── COMMIT                 # Archive commit; literal placeholder in a Git checkout
+    ├── stamp_version.py       # Build stamp from Git, then COMMIT, then VERSION alone
     ├── common/diagnostics/    # Shared validators and catalog.json (required)
     ├── .env.example           # Template for .env
     ├── .env                   # Upload token and BIND_ADDR (created by you or install.sh, never committed)
@@ -198,6 +201,83 @@ Backups include consistent diagnostics and monitor-state database snapshots.
 The optional ntfy volume (users, tokens and cached messages) needs a separate
 backup. Full policy and schema details are in [DIAGNOSTICS.md](../DIAGNOSTICS.md).
 
+## Server version and deployments
+
+`VERSION` starts at `v0.01`, independently of the firmware version. Every
+viewer page, including sign-in, has a server version footer. **Device health**
+also puts the viewer's server version next to each reported firmware version.
+The footer describes the viewer image; use both services' `/health` responses
+or `bash install.sh --check` to confirm ingest is running the same build.
+Both `/health` endpoints keep their `status` and `service` fields and add
+`version`. They need no login: anyone who can reach ports 8090/8091 on the LAN
+can read the build version. Keep the documented LAN-only binding in place.
+
+Before **each deployment to the real server**, bump `server/VERSION` in its
+own commit (`v<major>.<two-digit minor>`, major 0-99, for example `v0.02`).
+Build from that clean commit, then tag the exact deployed commit `srv-v0.NN`
+(for example `srv-v0.02`) after verifying the deployment. The initial release
+uses `srv-v0.01`. These server tags are separate from firmware tags. Do not
+tag a dirty build as a release: its uncommitted changes cannot be recovered
+from a Git tag.
+
+From this folder, `python3 stamp_version.py` prints the release plus the first
+ten Git commit characters, for example `v0.01+abcdef1234`. Any uncommitted
+tracked change anywhere in the repository appends `-dirty`; untracked and
+ignored files (including credentials/data) do not. Run it again for every
+build, as the commands below do. `install.sh` computes it automatically and
+passes it through Compose to ingest, viewer and optional monitor build
+arguments. Docker stores the stamp in each image's `SERVER_VERSION`
+environment value; restarting an old image does not give it a new version.
+The monitor reports its version in its startup log.
+
+Python 3 is required on the build host (`install.sh` installs it on Debian).
+A Git clone with Git installed provides the commit and dirty state. Without
+usable Git metadata, the helper reads `COMMIT` if it contains a full 40- or
+64-hex hash and uses its first ten characters. Commit/tag archives and GitHub
+source downloads supply this hash; no Git install is needed on the server.
+Archives start clean, so this fallback never adds `-dirty`; later hand edits
+cannot be detected. Recopy clean source before rebuilding for an accurate stamp.
+If `COMMIT` is missing, invalid or still contains `$Format:%H$`, the helper
+uses VERSION alone with a reason on stderr. `COMMIT` is optional for hand
+copies and stays outside the Docker images; the stamp arrives as a build arg.
+A missing/invalid VERSION gives `unversioned`. Building without the argument
+also gives `unversioned`; runtime values outside a 1-64 character ASCII token
+(letters, digits, `.`, `_`, `+`, `-`, starting with a letter/digit) are replaced
+by `unversioned` before HTML, JSON or monitor logs. `--check` prints both
+running versions and warns about missing stamps or mismatches without
+changing its exit code for those warnings. A mismatch means the two services
+may contain different code; rebuild both with the same stamp and check again.
+
+To copy a committed build for installation or an update, run this from the
+repository root **on your computer**, using Git Bash on Windows or a
+macOS/Linux terminal:
+
+```bash
+git -c core.autocrlf=false archive HEAD server | ssh <user>@<host> 'mkdir -p ~/mileage-tracker && tar -x --strip-components=1 -C ~/mileage-tracker'
+```
+
+Replace `<user>` and `<host>` with the server login and address. `HEAD` can
+also be a commit hash or tag. This places `docker-compose.yml`, dotfiles
+such as `.env.example`/`.dockerignore`, and an expanded `COMMIT` directly in
+`~/mileage-tracker`, overwriting supplied source files while leaving untracked
+`.env`, `viewer.env`, `monitor.env` and `data/` in place. It does not delete
+obsolete source files. Uncommitted changes are not sent. Keep
+`-c core.autocrlf=false`: on Windows, Git would otherwise send every file
+with CRLF line endings. Do not use
+`git archive HEAD:server`: that selects a tree, and Git cannot expand `COMMIT`
+without a commit or tag. Do not pipe tar data through Windows PowerShell 5.1,
+which can corrupt it; use Git Bash (native binary pipes require PowerShell
+7.4 or newer, as explained in
+[Step 2 of the runbook](../DEPLOY_DEBIAN.md#step-2--copy-the-server-directory-over)).
+
+Without Git, copy `server/` from a fresh unzipped GitHub source download:
+`scp -r server <user>@<host>:~/mileage-tracker` for a first install, or
+`scp -r server/. <user>@<host>:~/mileage-tracker/` for updates. The latter
+includes dotfiles without creating a nested `server/` folder; use a fresh
+download without local credentials or data. The download's expanded `COMMIT`
+preserves the commit stamp. Copying a Git clone's working tree with `scp`
+gives **VERSION only, no commit**, because its `COMMIT` is still a placeholder.
+
 ## First-Time Setup
 
 The easy way is `bash install.sh` from this directory. It sets up both
@@ -234,8 +314,9 @@ Step 1).
 
 5. Build and start both services:
 
-       BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
+       SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
 
+   The `SERVER_VERSION` command computes a fresh stamp for this build.
    Set `BUILDX_NO_DEFAULT_ATTESTATIONS=1` on every manual build/rebuild so
    cached builds keep stable image IDs on Docker 29 and leave unchanged
    containers running. `install.sh` sets it automatically; this works with
@@ -245,7 +326,7 @@ Step 1).
 
        curl http://localhost:8090/health
 
-   You should see `{"service":"mileage-ingest","status":"ok"}`.
+   You should see `{"service":"mileage-ingest","status":"ok","version":"v0.01+abcdef1234"}`.
 
 7. Test an authenticated upload with the sample trip, `sample.gpx`, which
    is in this folder:
@@ -294,9 +375,11 @@ Stop the service entirely:
 
     docker compose down
 
-Update to newer dependency versions (after editing requirements.txt):
+To update code or dependency versions, first copy the new committed source
+and its `COMMIT` using the archive command above (or copy a fresh GitHub source
+download). Then rebuild **on the server**, from this folder:
 
-    BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
+    SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
 
 ## Inspecting Your Trip Data
 
@@ -324,7 +407,7 @@ gpx.studio, Google Earth, OsmAnd, or QGIS.
 A second service, `mileage-viewer`, gives you a web page to browse,
 audit, and export your trips. It's defined in the same
 `docker-compose.yml` and starts alongside ingest with
-`BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build`.
+`SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build`.
 
 The viewer follows your OS colour scheme; the Theme button on each page cycles
 Auto, Light and Dark and remembers the choice in this browser.
@@ -421,7 +504,7 @@ HTTPS for an external provider. An optional `VIEWER_GEOCODER_USER_AGENT` identif
 your installation using the contact format required by your provider. Neither
 setting is shown in the viewer. Restart the viewer after changing configuration:
 
-    docker compose up -d --build mileage-viewer
+    SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build mileage-viewer
 
 HTTPS providers must have a certificate trusted by the container. A private CA
 can be supplied via `SSL_CERT_FILE` pointing to a CA bundle mounted inside the
@@ -491,7 +574,7 @@ from `.env`, so the viewer never holds a copy of the ingest token):
 Generate the password hash — you're prompted for the password, it isn't
 echoed, and the plaintext is never written anywhere:
 
-    BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose build mileage-viewer
+    SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose build mileage-viewer
     docker compose run --rm --no-deps mileage-viewer python -c \
       "from getpass import getpass; \
        from werkzeug.security import generate_password_hash as g; \
@@ -511,7 +594,8 @@ which shell and Compose expansion will otherwise eat):
 How it behaves:
 
 - Every route except `/health` needs a session. `/health` stays open
-  because Docker's healthcheck calls it and it reveals nothing.
+  for Docker's healthcheck. It exposes the server version without a login to
+  anyone who can reach the port on the LAN; it contains no trip or device data.
 - Session cookie is HttpOnly, SameSite=Lax, 30-day lifetime.
 - The annotate and logout forms carry CSRF tokens.
 - Five bad passwords from one IP locks that IP out for 15 minutes. The
@@ -674,7 +758,7 @@ The viewer's `/device-health` page shipped in #119. The backup procedure above
 preserves diagnostics through SQLite snapshots rather than copying the live file.
 
 Build both images from this directory with
-`BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose build`. Both service
+`SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose build`. Both service
 Dockerfiles use this directory as their context and include `common/`, including
 `catalog.json`. Copy the whole `server/` tree and its `.dockerignore` when
 installing; the allowlist keeps `.env`, `viewer.env`, data and backups out of

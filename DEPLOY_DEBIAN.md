@@ -135,16 +135,65 @@ docker compose version      # expect v2 or newer
 
 Run the copy **on your computer**, where you cloned or unzipped the repo.
 If you are still in the SSH session from Step 1, type `exit` first to
-return to your computer's terminal. Then:
+return to your computer's terminal.
+
+**From a Git clone, use a commit archive.** Run this from the repository
+root in **Git Bash on Windows**, or a macOS/Linux terminal:
+
+```bash
+cd "<path to your copy of the repo>"
+git -c core.autocrlf=false archive HEAD server | ssh <user>@<host> 'mkdir -p ~/mileage-tracker && tar -x --strip-components=1 -C ~/mileage-tracker'
+```
+
+This copies the committed `server/` files, including `.env.example` and
+`.dockerignore`, directly into `~/mileage-tracker` (so `docker-compose.yml`
+is there, with no extra `server/` directory). It works for both a first copy
+and updates. Only tracked files from `HEAD` are sent: commit your intended
+changes first, or replace `HEAD` with the commit or tag you want to deploy.
+Your server's `.env`, `viewer.env`, `monitor.env` and `data/` are not in Git
+and are left in place. The copy overwrites supplied source files but does
+not remove old files that are absent from the archive.
+
+`-c core.autocrlf=false` keeps Linux line endings. Git for Windows turns
+`core.autocrlf` on by default, and `git archive` applies it, so without
+the flag every file arrives with Windows (CRLF) line endings. It's harmless
+on macOS and Linux.
+
+The archive also writes its full commit hash into `COMMIT`, allowing a build
+on the server to display the exact source commit without a Git clone there.
+Use **`git archive HEAD server`**, not **`git archive HEAD:server`**: the latter
+selects a tree rather than a commit, so Git leaves the `$Format:%H$`
+placeholder unexpanded and the server can only report the release number.
+[Git's archive attributes](https://git-scm.com/docs/gitattributes#Documentation/gitattributes.txt-export-subst)
+require a commit or tag for this substitution.
+
+Do not run this binary archive pipeline in **Windows PowerShell 5.1**: it can
+corrupt the tar stream. Use Git Bash as above. PowerShell only preserves
+native binary pipelines starting with 7.4; see
+[Microsoft's pipeline documentation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_pipelines#using-native-commands-in-the-pipeline).
+
+**Without Git**, copy the `server/` folder from your unzipped GitHub source
+download instead:
 
 ```bash
 cd "<path to your copy of the repo>"
 scp -r server <user>@<host>:~/mileage-tracker
 ```
 
-`scp` comes with Windows 10 and later, macOS and Linux, and works the same
-in each. Use this for the first copy only: if `~/mileage-tracker` already
-exists, `scp -r` puts the new copy inside it as `server/`.
+`scp` comes with Windows 10 and later, macOS and Linux, and also works in
+PowerShell 5.1. Use this form for the first copy only: if `~/mileage-tracker`
+already exists, `scp -r` puts the new copy inside it as `server/`. For an
+update to an existing install, copy the folder's contents, including dotfiles:
+
+```bash
+scp -r server/. <user>@<host>:~/mileage-tracker/
+```
+
+Use a fresh source download, without local credentials or data. GitHub's
+source zip/tarball has an expanded `COMMIT`, so copying that folder preserves
+the commit stamp. Copying a Git clone's working tree with `scp` leaves the
+literal placeholder and gives **VERSION only, no commit**. A hand copy with
+no `COMMIT` still works, with the same release-only fallback.
 
 Reconnect from your computer:
 
@@ -312,11 +361,56 @@ workers, which is why it's configured rather than generated at startup.
 
 ## Step 5 — Build and start
 
+### Server version for each deployment
+
+The server release is `server/VERSION` (`v0.01` initially), independent of the
+ESP32 firmware version. Before each build deployed to the real server, bump
+that file in its own commit, using `v<major>.<two-digit minor>` (major 0-99).
+Build from the clean commit; after verifying deployment, tag that exact commit
+`srv-v0.NN`, for example `srv-v0.02` for release `v0.02` (`srv-v0.01` for the
+initial release). These tags identify server releases separately from firmware.
+Do not tag dirty builds as releases: a tag cannot preserve uncommitted code.
+
+`python3 stamp_version.py`, run in the server folder, prints the release plus
+ten Git commit characters, such as `v0.01+abcdef1234`. Tracked uncommitted
+changes anywhere in the repository add `-dirty`; ignored/untracked credentials
+and data do not. The manual commands below recompute it for every build.
+`install.sh` does this automatically, including optional monitor builds.
+Compose passes it as a build argument, and all three Python images store it
+as `SERVER_VERSION`. A restart keeps the old image's stamp; rebuild to change
+code/version. The monitor includes its version in its startup log.
+
+Install Python 3 on a manual build host (`sudo apt install python3`);
+`install.sh` installs it automatically. A build inside a Git clone uses Git
+for its commit and dirty state. Without usable Git metadata, the helper reads
+`COMMIT`: Step 2's commit archive and GitHub source downloads contain a full
+40- or 64-hex hash, giving the same release-plus-ten-character-commit stamp.
+Archives start clean, so this fallback adds no `-dirty`; later hand edits to
+extracted files cannot be detected. Recopy a clean archive before rebuilding
+to keep the stamp accurate. If `COMMIT` is missing, invalid or still an
+unexpanded placeholder, the helper prints a reason on stderr and uses VERSION
+alone. That identifies the release but not its commit or dirty state. A missing or
+invalid VERSION, or a build without a stamp argument, reports `unversioned`.
+Services replace invalid stamps with `unversioned` before displaying them;
+only 1-64 ASCII letters/digits/`.`, `_`, `+`, `-` are accepted, starting with a
+letter or digit.
+
+Look in the footer of every viewer page (including sign-in), or on **Device
+health** next to the firmware version. This is the viewer's image version.
+Both ingest and viewer `/health` also return a `version` field alongside the
+existing `status` and `service` fields. These endpoints require **no login**:
+anyone who can reach their LAN ports can read the build version, so retain
+the LAN-only binding in Step 7. `bash install.sh --check` prints both running
+versions and warns if they differ or have no valid stamp. Those warnings do
+not fail the check; a mismatch means services may contain different code.
+Rebuild both using the same stamp, then check again.
+
 ```bash
 cd ~/mileage-tracker
-BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
+SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
 ```
 
+The `SERVER_VERSION` assignment computes the stamp before Compose builds.
 Use `BUILDX_NO_DEFAULT_ATTESTATIONS=1` for every manual build or rebuild
 (including `docker compose build`). It disables default provenance attestations,
 which otherwise change image IDs on Docker 29's containerd store even when
@@ -346,7 +440,7 @@ curl http://localhost:8090/health
 curl http://localhost:8091/health
 ```
 
-Expect `{"service":"mileage-ingest","status":"ok"}` and the viewer equivalent.
+Expect `{"service":"mileage-ingest","status":"ok","version":"v0.01+abcdef1234"}` and the viewer equivalent.
 
 **Reject an unauthenticated upload** (this must fail — it's the test that
 matters):
@@ -485,7 +579,7 @@ Confirm the mappings and health from the server:
 docker compose port mileage-ingest 8090   # expect 192.168.1.10:8090
 docker compose port mileage-viewer 8091   # expect 192.168.1.10:8091
 docker compose port mileage-monitor 8093 # when the monitor profile is started
-curl http://192.168.1.10:8090/health    # expect {"service":"mileage-ingest","status":"ok"}
+curl http://192.168.1.10:8090/health    # expect {"service":"mileage-ingest","status":"ok","version":"v0.01+abcdef1234"}
 ```
 
 Both mappings must show only the LAN address; a wildcard (`0.0.0.0` or
@@ -1045,7 +1139,7 @@ MONITOR_ENV_FILE=./monitor.env
 ```
 
 ```bash
-BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --profile monitor up -d --build mileage-monitor
+SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --profile monitor up -d --build mileage-monitor
 docker compose logs --tail 30 mileage-monitor
 ```
 
@@ -1230,7 +1324,7 @@ history, screenshots and Git. In the existing `.env`, select that file with
 `MONITOR_ENV_FILE=./monitor.env`. Apply the settings:
 
 ```bash
-BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --profile monitor up -d --build mileage-monitor
+SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --profile monitor up -d --build mileage-monitor
 docker compose logs --tail 30 mileage-monitor
 ```
 
@@ -1300,7 +1394,7 @@ credentials in the URL or commit them. In `.env`, select the private file with
 
 ```bash
 cd ~/mileage-tracker
-BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --profile monitor up -d --build mileage-monitor
+SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --profile monitor up -d --build mileage-monitor
 docker compose logs --tail 30 mileage-monitor
 ```
 
@@ -1465,7 +1559,13 @@ the host-side port mapping in `docker-compose.yml`.
 
 **Rebuild after code changes:**
 
+First copy the new committed source from your computer using Step 2's
+`git -c core.autocrlf=false archive HEAD server | ssh ...` command (or copy a fresh source download
+with `scp -r server/. ...`). This refreshes `COMMIT` along with the code;
+do not use `HEAD:server`. Then run this **on the server**. Rebuilding without
+copying new source keeps the old code and stamp.
+
 ```bash
 cd ~/mileage-tracker
-BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
+SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
 ```
