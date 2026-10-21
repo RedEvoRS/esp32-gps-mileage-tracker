@@ -31,6 +31,13 @@ inline Aldo3State aldo3State(int control) {
     return (control & (1 << 2)) ? Aldo3State::On : Aldo3State::Off;
 }
 
+inline bool aldo1Ready(int control, int voltage) {
+    if (control < 0 || voltage < 0) return false;
+    // XPowersLib 0.3.3: 0x90 bit 0 enables ALDO1; 0x92 bits 0..4
+    // select 500 mV + 100 mV/step. Check raw reads, not its masked getter.
+    return (control & 1) && 500 + (voltage & 0x1F) * 100 == 3300;
+}
+
 inline VbusState vbusState(int status1, int status2) {
     if (status1 < 0 || status2 < 0) return VbusState::Unknown;
     // XPowersLib 0.3.3 isVbusIn(): STATUS2 bit 3 clear AND STATUS1 bit 5 set.

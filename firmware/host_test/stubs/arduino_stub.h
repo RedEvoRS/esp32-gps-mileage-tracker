@@ -485,6 +485,7 @@ constexpr uint8_t XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL = 0x18;
 constexpr uint8_t XPOWERS_AXP2101_STATUS1 = 0x00;
 constexpr uint8_t XPOWERS_AXP2101_STATUS2 = 0x01;
 constexpr uint8_t XPOWERS_AXP2101_LDO_ONOFF_CTRL0 = 0x90;
+constexpr uint8_t XPOWERS_AXP2101_LDO_VOL0_CTRL = 0x92;
 constexpr uint8_t XPOWERS_AXP2101_INTSTS1 = 0x48;
 constexpr uint8_t XPOWERS_AXP2101_INTSTS2 = 0x49;
 constexpr uint8_t XPOWERS_AXP2101_INTSTS3 = 0x4A;
@@ -518,7 +519,8 @@ struct XPowersAXP2101 {
         if (reg == 0x35) return batteryMv & 0xff;
         if (reg == XPOWERS_AXP2101_STATUS1) return (vbusIn ? 0x20 : 0) | (batteryConnected ? 0x08 : 0);
         if (reg == XPOWERS_AXP2101_STATUS2) return vbusNotIn ? 0x08 : 0;
-        if (reg == XPOWERS_AXP2101_LDO_ONOFF_CTRL0) return aldo3 ? 0x04 : 0;
+        if (reg == XPOWERS_AXP2101_LDO_ONOFF_CTRL0) return (aldo3 ? 0x04 : 0) | (aldo1 ? 0x01 : 0);
+        if (reg == XPOWERS_AXP2101_LDO_VOL0_CTRL) return (aldo1Mv - 500) / 100;
         if (reg == XPOWERS_AXP2101_INTSTS1) return (lowIrq ? 0x40 : 0) | (criticalIrq ? 0x80 : 0);
         if (reg == XPOWERS_AXP2101_INTSTS2) return (removeIrq ? 0x40 : 0) | (insertIrq ? 0x80 : 0) |
             (longPressIrq ? 0x04 : 0) | (shortPressIrq ? 0x08 : 0);
@@ -537,6 +539,9 @@ struct XPowersAXP2101 {
     int shutdownCalls = 0;
     void (*onShutdown)() = nullptr;
     bool aldo3 = true, aldo4 = false, bldo1 = true, vbackup = true;
+    bool aldo1 = true, failAldo1Voltage = false, failAldo1Enable = false;
+    bool aldo1VoltageStuck = false, aldo1EnableStuck = false;
+    int aldo1Mv = 1800;
     bool failRadioDisable = false, radioStuckOn = false;
     int aldo4Mv = 0, bldo1Mv = 1800;
     bool failSdVoltage = false, failSdEnable = false, failSdDisable = false;
@@ -556,6 +561,18 @@ struct XPowersAXP2101 {
         return !failRadioDisable;
     }
     bool isEnableALDO3() { operations.push_back("isEnableALDO3"); return aldo3; }
+    bool setALDO1Voltage(uint16_t mv) {
+        operations.push_back("setALDO1Voltage");
+        if (failAldo1Voltage) return false;
+        if (!aldo1VoltageStuck) aldo1Mv = mv;
+        return true;
+    }
+    bool enableALDO1() {
+        operations.push_back("enableALDO1");
+        if (failAldo1Enable) return false;
+        if (!aldo1EnableStuck) aldo1 = true;
+        return true;
+    }
     void setALDO4Voltage(int mv) { operations.push_back("setALDO4Voltage"); aldo4Mv = mv; }
     void enableALDO4() { operations.push_back("enableALDO4"); aldo4 = true; } void disableALDO4() { operations.push_back("disableALDO4"); aldo4 = false; }
     bool disableBLDO1() { operations.push_back("disableBLDO1");

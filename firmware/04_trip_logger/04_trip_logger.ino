@@ -2679,7 +2679,7 @@ static void beginDebugTemperature() {
     Serial.printf("Temp setup: TS %s, REG50 %s, REG30 %s (target external input, 50 uA).\n",
                   gDebugTempTs.ready ? "verified" : "unavailable", control, adc);
     // ALDO1 supplies BME280 + OLED + magnetometer. Do not change any rail:
-    // Stage 4 leaves ALDO1 as found; an unpowered/missing sensor shows --.
+    // Trusted startup sets ALDO1 to 3.3 V; an unpowered/missing sensor shows --.
     gDebugTempEnabled = true;
     gDebugTempPending = false;
     gDebugTempLogMs = millis();
@@ -2974,6 +2974,7 @@ void setup() {
     // and initialization, BEFORE Serial, storage or GPS setup can block.
     bool pmuReady = beginPmuWithRecovery(Wire1, PMU, I2C_SDA, I2C_SCL, gPmuStartup);
     bool radioOff = pmuReady && PMU.disableALDO3() && aldo3State() == Aldo3State::Off;
+    bool aldo1Warning = false;
     gBootBattery = diagnostics::BatterySample();
     if (radioOff) {
         // Stop retained charging before display/USB/storage waits. Only trusted
@@ -2981,6 +2982,20 @@ void setup() {
         PMU.disableCellbatteryCharge();
         PMU.enableBattDetection();
         PMU.enableBattVoltageMeasure();
+        // ALDO1 supplies the OLED/BME280/magnetometer and Wire pull-ups.
+        int aldo1Control = PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
+        int aldo1Voltage = PMU.readRegister(XPOWERS_AXP2101_LDO_VOL0_CTRL);
+        bool aldo1WasReady = pmu_read::aldo1Ready(aldo1Control, aldo1Voltage);
+        bool voltageSet = PMU.setALDO1Voltage(3300);
+        bool enabled = PMU.enableALDO1();
+        aldo1Control = PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
+        aldo1Voltage = PMU.readRegister(XPOWERS_AXP2101_LDO_VOL0_CTRL);
+        aldo1Warning = !voltageSet || !enabled || !pmu_read::aldo1Ready(aldo1Control, aldo1Voltage);
+        // No 250 ms off/on cycle: the reported failures were cold power-ons.
+        // 10 ms is a conservative guess for the LDO ramp and local supply
+        // capacitors to settle before I2C, not a measured board requirement.
+        // Unknown initial state may also mean the rail changed or enabled.
+        if (!aldo1WasReady) delay(10);
     }
     // SH1106 can retain its state across an ESP32 reset. Put it to sleep
     // before either degraded startup branch; never touch the PMU's Wire1.
@@ -3005,8 +3020,9 @@ void setup() {
     // Supreme GPS backup RAM comes straight from the 18650. LilyGO also
     // disables VBACKUP; a 60 s ALDO4-off test hot-started in 2.0 s with it off.
     PMU.disableButtonBatteryCharge();
-    // Leave ALDO1/ALDO2 and DCDC4/DCDC5 as found. Peripheral loads and
-    // PMU/RTC bus pull-up dependencies need proof before disabling them.
+    // ALDO1 is set to 3.3 V above. Leave ALDO2 and DCDC4/DCDC5 as found.
+    // Peripheral loads and PMU/RTC bus pull-up dependencies need proof
+    // before disabling them.
     // Never touch DCDC1 (ESP32).
 
     Serial.begin(115200);
@@ -3018,6 +3034,8 @@ void setup() {
     Serial.println("\n=== Stage 4: Trip Logger ===");
     Serial.printf("Firmware: %s\n", firmware::kVersion);
     printPmuStartup(gPmuStartup);
+    if (aldo1Warning)
+        Serial.println("WARNING: ALDO1 3.3 V/on setup unconfirmed; OLED/BME280/magnetometer may be unavailable.");
     gRtc.printBootStatus();
     Serial.println("LoRa rail (ALDO3) verified off; SD rail (BLDO1) off; VBACKUP off.");
     Serial.printf("PMU power-on source 0x%02X, power-off source 0x%02X.\n",

@@ -144,7 +144,8 @@ CI runs all of these on every PR:
 
 Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 `firmware/README.md`.
-- **Rails differ from the V1.2:** ALDO3 = LoRa, ALDO4 = GPS (3.3 V). Never
+- **Rails differ from the V1.2:** ALDO3 = LoRa, ALDO4 = GPS (3.3 V);
+  ALDO1 = OLED/BME280/magnetometer (Stage 4 sets 3.3 V). Never
   run V1.2 rail code on the Supreme. **ALDO3 comes up ON after a USB-power
   power-on**, so firmware switches it off first thing after `PMU.begin()`
 - PMU (0x34) and PCF8563 RTC (0x51) share `Wire1`, SDA 42 / SCL 41. OLED and
