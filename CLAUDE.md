@@ -141,9 +141,10 @@ CI runs these on PRs; the PII/tools job is skipped for Dependabot PRs:
   check the output.
 - Firmware compile: all four sketches for the Supreme (ESP32-S3), with
   pinned Arduino tools and libraries.
-- Installer: the `installer` integration job exercises a fresh install,
-  Docker builds, uploads, viewer login/exports, systemd backups, reruns,
-  config repair, Docker restart and detection of broken installs by `--check`.
+- Installer: the `installer` job runs shellcheck, then a fresh install as a
+  sudo user, reruns, config repair (unquoted hash, CRLF `.env`), a Docker
+  restart, concurrent `--check` runs, turning on metrics, and `--check`
+  reporting a stopped viewer.
 
 ## Key Technical Details
 
@@ -246,9 +247,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   request buffers allocated once per boot in pseudo-static RAM (PSRAM; if
   that fails, uploads are off and the journal stays local), a ten-second
   deadline and independent retry state. Current snapshots include
-  observed/active conditions and AP-absence counts. Rejected singleton
-  records (one-record batches) use a reserved bounded inspection slot and
-  durable loss accounting. Heartbeats use existing awake opportunities
+  observed/active conditions and AP-absence counts. A single record the
+  server still rejects after the batch is halved down to it uses a reserved
+  bounded inspection slot and durable loss accounting. Heartbeats use existing awake opportunities
   after 24 hours without contact (first boot contact age is unknown).
   Successful diagnostics uploads print nothing on serial; confirm them
   in ingest logs or Device health.
