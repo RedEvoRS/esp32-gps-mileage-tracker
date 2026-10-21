@@ -255,8 +255,11 @@ unless you select a version.
 ### Upload a sketch and read its messages
 
 Before compiling Stage 4, run `python tools/stamp_firmware_version.py` from
-the repository root. Otherwise Device health shows `unversioned` (`unversioned+dbg`
-in the default debug build). Run it again before each build to refresh the commit.
+the repository root. It combines `firmware/VERSION` with the ten-character Git
+commit, for example `v0.05+3f9a1c07be`, adding `-dirty` for tracked edits and
+`+dbg` in the default debug build. Without the generated header, Device health
+shows `unversioned` (`unversioned+dbg` in debug builds). Run the script before
+every build; an old header keeps its old version.
 
 A *sketch* is an Arduino program, stored in an `.ino` file inside a folder
 with the same name. *Firmware* is the program installed on the board.
@@ -282,6 +285,26 @@ hardware; they do not record trips. **Leave Stage 4 installed for use in
 the car.** When updating it later, keep its `partitions.csv` and leave
 **Erase All Flash Before Sketch Upload → Disabled** to preserve internal
 trips and settings. Reflashing does not erase trips on the card.
+
+#### Firmware versions and releases
+
+Versions `v0.xx` are beta; `v1.00` marks release once most firmware development
+is finished. Only bump the number when preparing a build to flash for road use.
+Builds between bumps show the last number plus their own commit.
+
+For the next road build:
+
+1. Change `firmware/VERSION` to the next number (for example `v0.06`) in its
+   own commit, titled `Firmware v0.06`, and merge it.
+2. On that merged commit, create and push an annotated tag:
+   `git tag -a fw-v0.06 -m "Firmware v0.06"`, then `git push origin fw-v0.06`.
+3. Run `python tools/stamp_firmware_version.py`, build from that commit, then flash.
+
+Keep `firmware/VERSION` to one line in the form `v<major>.<two-digit minor>`:
+major 0–99 without leading zeros, such as `v0.05` or `v1.00`. The stamp script
+tolerates surrounding whitespace, including LF/CRLF line endings, and stops
+with an error if the file is missing or malformed. Git tags are release markers;
+the build reads the file, so shallow checkouts work too.
 
 #### If uploading fails
 
@@ -445,7 +468,12 @@ Before flashing:
    defines. A snapshot is the board's current diagnostic state; its revision
    must be newer than the server's saved value. GPX delivery does not depend
    on this enrollment, but diagnostics stay local without revision authority.
-4. **On a new board, erase once as described below.** The factory firmware
+4. **Stamp the version before every build.** Run
+   `python tools/stamp_firmware_version.py` from the repository root to record
+   `firmware/VERSION` plus the Git commit (for example `v0.05+3f9a1c07be`).
+   See [Firmware versions and releases](#firmware-versions-and-releases) for
+   road-use version bumps and tags.
+5. **On a new board, erase once as described below.** The factory firmware
    can leave data where Stage 4 expects its internal trip partition.
 
 #### First flash on a new board
@@ -919,8 +947,8 @@ conditions. History included the earlier E3009 antenna episode, raised
 and cleared; E5001's boot-local access-point-absence counter was 6.
 Successful diagnostics uploads print nothing on serial. Confirm them in
 the ingest log or Device health. That build showed `Firmware: Not reported`
-because it predates version reporting; stamped builds report their Git
-commit (see step 6). The behaviour below describes
+because it predates version reporting; stamped builds report their version
+number plus Git commit (see step 6). The behaviour below describes
 the implementation; this test does not establish LittleFS or
 production-build uploads, or server-failure handling on the Supreme.
 
