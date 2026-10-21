@@ -65,6 +65,8 @@ for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resol
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
+from common.version import server_version
+
 from common.diagnostics import CatalogError, ProtocolError, load_catalog, parse_request, validate_device_id
 from common.diagnostics.protocol import MAX_REQUEST_BYTES
 from diag_store import ConflictError, DiagnosticsStore
@@ -717,7 +719,7 @@ def health():
     trivial JSON body. Intentionally does not require authentication
     so monitoring tools can poll it freely.
     """
-    return jsonify({"status": "ok", "service": "mileage-ingest"}), 200
+    return jsonify({"status": "ok", "service": "mileage-ingest", "version": server_version()}), 200
 
 
 @app.errorhandler(413)

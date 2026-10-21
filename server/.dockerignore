@@ -32,6 +32,7 @@ mileage-monitor/**
 !common/
 common/**
 !common/__init__.py
+!common/version.py
 !common/diagnostics/
 common/diagnostics/**
 !common/diagnostics/__init__.py

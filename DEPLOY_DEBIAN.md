@@ -312,11 +312,52 @@ workers, which is why it's configured rather than generated at startup.
 
 ## Step 5 — Build and start
 
+### Server version for each deployment
+
+The server release is `server/VERSION` (`v0.01` initially), independent of the
+ESP32 firmware version. Before each build deployed to the real server, bump
+that file in its own commit, using `v<major>.<two-digit minor>` (major 0-99).
+Build from the clean commit; after verifying deployment, tag that exact commit
+`srv-v0.NN`, for example `srv-v0.02` for release `v0.02` (`srv-v0.01` for the
+initial release). These tags identify server releases separately from firmware.
+Do not tag dirty builds as releases: a tag cannot preserve uncommitted code.
+
+`python3 stamp_version.py`, run in the server folder, prints the release plus
+ten Git commit characters, such as `v0.01+abcdef1234`. Tracked uncommitted
+changes anywhere in the repository add `-dirty`; ignored/untracked credentials
+and data do not. The manual commands below recompute it for every build.
+`install.sh` does this automatically, including optional monitor builds.
+Compose passes it as a build argument, and all three Python images store it
+as `SERVER_VERSION`. A restart keeps the old image's stamp; rebuild to change
+code/version. The monitor includes its version in its startup log.
+
+Install Python 3 on a manual build host (`sudo apt install python3`);
+`install.sh` installs it automatically. For full commit information, build
+inside a Git clone with Git installed, from its `server/` directory. If you
+used Step 2's copy-only layout, or Git is unavailable, the helper prints a
+reason on stderr and falls back to VERSION alone. That still identifies the
+release, but cannot identify the source commit or dirty state. A missing or
+invalid VERSION, or a build without a stamp argument, reports `unversioned`.
+Services replace invalid stamps with `unversioned` before displaying them;
+only 1-64 ASCII letters/digits/`.`, `_`, `+`, `-` are accepted, starting with a
+letter or digit.
+
+Look in the footer of every viewer page (including sign-in), or on **Device
+health** next to the firmware version. This is the viewer's image version.
+Both ingest and viewer `/health` also return a `version` field alongside the
+existing `status` and `service` fields. These endpoints require **no login**:
+anyone who can reach their LAN ports can read the build version, so retain
+the LAN-only binding in Step 7. `bash install.sh --check` prints both running
+versions and warns if they differ or have no valid stamp. Those warnings do
+not fail the check; a mismatch means services may contain different code.
+Rebuild both using the same stamp, then check again.
+
 ```bash
 cd ~/mileage-tracker
-BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
+SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
 ```
 
+The `SERVER_VERSION` assignment computes the stamp before Compose builds.
 Use `BUILDX_NO_DEFAULT_ATTESTATIONS=1` for every manual build or rebuild
 (including `docker compose build`). It disables default provenance attestations,
 which otherwise change image IDs on Docker 29's containerd store even when
@@ -346,7 +387,7 @@ curl http://localhost:8090/health
 curl http://localhost:8091/health
 ```
 
-Expect `{"service":"mileage-ingest","status":"ok"}` and the viewer equivalent.
+Expect `{"service":"mileage-ingest","status":"ok","version":"v0.01+abcdef1234"}` and the viewer equivalent.
 
 **Reject an unauthenticated upload** (this must fail — it's the test that
 matters):
@@ -485,7 +526,7 @@ Confirm the mappings and health from the server:
 docker compose port mileage-ingest 8090   # expect 192.168.1.10:8090
 docker compose port mileage-viewer 8091   # expect 192.168.1.10:8091
 docker compose port mileage-monitor 8093 # when the monitor profile is started
-curl http://192.168.1.10:8090/health    # expect {"service":"mileage-ingest","status":"ok"}
+curl http://192.168.1.10:8090/health    # expect {"service":"mileage-ingest","status":"ok","version":"v0.01+abcdef1234"}
 ```
 
 Both mappings must show only the LAN address; a wildcard (`0.0.0.0` or
@@ -1045,7 +1086,7 @@ MONITOR_ENV_FILE=./monitor.env
 ```
 
 ```bash
-BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --profile monitor up -d --build mileage-monitor
+SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --profile monitor up -d --build mileage-monitor
 docker compose logs --tail 30 mileage-monitor
 ```
 
@@ -1230,7 +1271,7 @@ history, screenshots and Git. In the existing `.env`, select that file with
 `MONITOR_ENV_FILE=./monitor.env`. Apply the settings:
 
 ```bash
-BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --profile monitor up -d --build mileage-monitor
+SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --profile monitor up -d --build mileage-monitor
 docker compose logs --tail 30 mileage-monitor
 ```
 
@@ -1300,7 +1341,7 @@ credentials in the URL or commit them. In `.env`, select the private file with
 
 ```bash
 cd ~/mileage-tracker
-BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --profile monitor up -d --build mileage-monitor
+SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --profile monitor up -d --build mileage-monitor
 docker compose logs --tail 30 mileage-monitor
 ```
 
@@ -1467,5 +1508,5 @@ the host-side port mapping in `docker-compose.yml`.
 
 ```bash
 cd ~/mileage-tracker
-BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
+SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
 ```

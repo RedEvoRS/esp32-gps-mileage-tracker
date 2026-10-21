@@ -13,6 +13,9 @@ ENV PYTHONPATH=/app
 
 RUN mkdir -p /data && chown -R app:app /data /app
 
+ARG SERVER_VERSION=unversioned
+ENV SERVER_VERSION=${SERVER_VERSION}
+
 USER app
 
 EXPOSE 8090

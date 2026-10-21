@@ -258,6 +258,14 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 
 ### Server
 
+- Version: `server/VERSION`; `python3 server/stamp_version.py` prints release +
+  ten-character Git commit (+ `-dirty` for tracked changes; VERSION alone if
+  Git is unavailable). Pass as Compose build arg `SERVER_VERSION`; installer
+  does this automatically for all Python images. Missing/invalid stamps are
+  `unversioned`. Viewer footer/Device health and unauthenticated `/health`
+  expose it on the LAN; `install.sh --check` warns on service mismatches.
+  Each real deployment bumps VERSION in its own commit and tags the deployed
+  commit `srv-v0.NN` (see DEPLOY_DEBIAN.md).
 - Ingest port: 8090, bearer token auth, GPX body in → raw `.gpx` + derived
   `.json` summary out (atomic writes); distance = haversine over moving
   steps only (speed > 2 mph at either end), HDOP > 5 and > 60 m/s jumps

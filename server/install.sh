@@ -75,6 +75,7 @@ TEST_NEW_DIR=       # data/<ym>, if this run's upload is what created it
 TMP_FILES=()
 WARNINGS=()
 FAILURES=0
+BUILD_SERVER_VERSION=unversioned
 
 # --- Output ------------------------------------------------------------
 
@@ -249,9 +250,9 @@ need_sudo() {
 # hop so first installs and re-runs both keep unchanged images stable.
 compose() {
     if (( ${#AS_ME[@]} )); then
-        "${AS_ME[@]}" env BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose "$@"
+        "${AS_ME[@]}" env BUILDX_NO_DEFAULT_ATTESTATIONS=1 SERVER_VERSION="$BUILD_SERVER_VERSION" docker compose "$@"
     else
-        BUILDX_NO_DEFAULT_ATTESTATIONS=1 "${DOCKER[@]}" compose "$@"
+        BUILDX_NO_DEFAULT_ATTESTATIONS=1 SERVER_VERSION="$BUILD_SERVER_VERSION" "${DOCKER[@]}" compose "$@"
     fi
 }
 
@@ -401,7 +402,7 @@ preflight() {
     esac
 
     local f missing=()
-    for f in docker-compose.yml .dockerignore .env.example viewer.env.example monitor.env.example sample.gpx \
+    for f in VERSION stamp_version.py common/version.py docker-compose.yml .dockerignore .env.example viewer.env.example monitor.env.example sample.gpx \
         common/__init__.py common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json} \
         mileage-ingest/{Dockerfile,app.py,diag_store.py,requirements.txt} \
         mileage-viewer/{Dockerfile,app.py,geocoding.py,requirements.txt} \
@@ -537,7 +538,7 @@ apt_get() {
     sudo DEBIAN_FRONTEND=noninteractive apt-get -q -y "$@" < /dev/null
 }
 
-WANTED_PACKAGES=(ca-certificates curl gnupg jq openssl openssh-client rsync iproute2)
+WANTED_PACKAGES=(ca-certificates curl gnupg jq openssl openssh-client rsync iproute2 python3)
 
 have_apt() { command -v apt-get > /dev/null && command -v dpkg-query > /dev/null; }
 have_systemd() { [[ -d /run/systemd/system ]]; }
@@ -571,14 +572,14 @@ install_packages() {
         fi
         ok "Packages installed: ${wanted[*]}"
     else
-        for p in curl jq openssl rsync ssh ip flock; do
+        for p in curl jq openssl rsync ssh ip flock python3; do
             command -v "$p" > /dev/null || missing+=("$p")
         done
         if (( ${#missing[@]} )); then
             die "Commands not found: ${missing[*]}" \
                 "Install them with your package manager, then run this again."
         fi
-        ok "Commands available: curl jq openssl rsync ssh ip flock"
+        ok "Commands available: curl jq openssl rsync ssh ip flock python3"
     fi
 }
 
@@ -934,6 +935,8 @@ configure() {
 
 build_images() {
     section "Build and start"
+    BUILD_SERVER_VERSION=$(python3 "$SCRIPT_DIR/stamp_version.py")
+    note "Server build version: $BUILD_SERVER_VERSION"
     note "Building the images. The first build downloads Python and takes a few minutes."
     if ! compose build < /dev/null 2>&1 | indent; then
         die "Building the images failed (output above)." \
@@ -1239,10 +1242,8 @@ upload_test_trip() {
     fi
 }
 
-verify_end_to_end() {
-    section "End-to-end checks"
-    if (( ${#DATA_SUDO[@]} )); then need_sudo; fi
-    local url body code
+verify_health_versions() {
+    local url body version versions=()
     for url in "$INGEST_URL/health" "$VIEWER_URL/health"; do
         body=$(curl -sS -m 10 "$url" 2>&1) || true
         if [[ $(jq -r '.status // empty' <<< "$body" 2> /dev/null) == ok ]]; then
@@ -1252,7 +1253,30 @@ verify_end_to_end() {
                 "If BIND_ADDR is set, the containers may need recreating: docker compose up -d"
             return 1
         fi
+        # Match common/version.py's ASCII token budget before printing data
+        # from an unauthenticated endpoint (including older servers).
+        version=$(jq -r '.version | if type == "string" then
+            if test("\\A[A-Za-z0-9][A-Za-z0-9._+-]{0,63}\\z") then . else "unversioned" end
+            else "unversioned" end' <<< "$body" 2> /dev/null) || version=unversioned
+        versions+=("$version")
     done
+    ok "mileage-ingest version: ${versions[0]}"
+    ok "mileage-viewer version: ${versions[1]}"
+    if [[ ${versions[0]} != "${versions[1]}" ]]; then
+        warn "Ingest and viewer report different server versions" \
+            "Rebuild both with the same SERVER_VERSION stamp, then run --check again."
+    fi
+    if [[ ${versions[0]} == unversioned || ${versions[1]} == unversioned ]]; then
+        warn "A service has no valid server version stamp" \
+            "Rebuild with install.sh or the stamped build command in DEPLOY_DEBIAN.md."
+    fi
+}
+
+verify_end_to_end() {
+    section "End-to-end checks"
+    if (( ${#DATA_SUDO[@]} )); then need_sudo; fi
+    local body code
+    verify_health_versions || return 1
 
     code=$(http_status -X POST -H 'Content-Type: application/gpx+xml' \
         --data-binary @sample.gpx "$INGEST_URL/upload")

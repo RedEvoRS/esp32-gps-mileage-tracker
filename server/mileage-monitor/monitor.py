@@ -30,6 +30,8 @@ for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resol
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
+from common.version import server_version
+
 from common.diagnostics import CatalogError, load_catalog, validate_device_id, validate_request  # noqa: E402
 
 import gelf  # noqa: E402
@@ -686,6 +688,7 @@ class Monitor:
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    LOG.info("Server version: %s", server_version())
     try:
         config = Config.from_env()
     except ValueError as exc:

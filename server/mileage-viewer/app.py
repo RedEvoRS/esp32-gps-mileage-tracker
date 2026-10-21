@@ -67,11 +67,14 @@ from flask import (
 )
 from openpyxl import Workbook
 from werkzeug.security import check_password_hash
+from werkzeug.exceptions import HTTPException
 
 # Support source-tree importlib tests and the container's flat /app layout.
 for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resolve().parent):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
+
+from common.version import server_version
 
 from common.diagnostics import CatalogError, load_catalog
 from geocoding import Geocoder, GeocodeError
@@ -134,9 +137,8 @@ MAX_FAILS = 5
 LOCKOUT_MINUTES = 15
 
 # Only /health and the login page itself are reachable without a session.
-# /health stays open because Docker's healthcheck calls it and it leaks
-# nothing; everything else -- including /static and the GPX files -- is
-# behind the session check.
+# /health stays open for Docker and reports the public server build version.
+# Everything else -- including /static and GPX files -- needs a session.
 PUBLIC_ENDPOINTS = {"health", "login"}
 
 
@@ -917,6 +919,8 @@ THEME_CSS = """
 """ + DARK_THEME_CSS + """
   }
   :root[data-theme="light"] { color-scheme: light; }
+  .server-version { color: var(--muted); font-size: 12px; text-align: center;
+                    padding: 16px; overflow-wrap: anywhere; }
 """
 
 BASE_CSS = THEME_CSS + """
@@ -975,6 +979,32 @@ BASE_CSS = THEME_CSS + """
       border: 1px solid var(--input-border); border-radius: 4px; }
 """
 
+@app.context_processor
+def version_context():
+    return {"server_version": server_version()}
+
+
+VERSION_FOOTER = '<footer class="server-version">Server {{ server_version }}</footer>'
+
+
+ERROR_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><title>{{ error.name }}</title>
+""" + THEME_HEAD + """<style>""" + BASE_CSS + """</style></head><body>
+<main class="wrap"><h1>{{ error.code }} {{ error.name }}</h1>
+<p>{{ error.description }}</p></main>
+""" + VERSION_FOOTER + """</body></html>
+"""
+
+
+@app.errorhandler(HTTPException)
+def http_error(error):
+    # Keep status and headers (such as Allow on 405), and include the footer
+    # on error pages as well as the normal templates.
+    response = error.get_response()
+    response.set_data(render_template_string(ERROR_HTML, error=error))
+    return response
+
+
 LOGIN_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Sign in · Mileage Tracker</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1009,7 +1039,7 @@ LOGIN_HTML = """
              autocomplete="current-password" required>
       <button type="submit">Sign in</button>
     </form>
-    """ + THEME_BUTTON + """
+    """ + THEME_BUTTON + VERSION_FOOTER + """
   </div>
 </body></html>
 """
@@ -1079,7 +1109,7 @@ LIST_HTML = """
     <tr><td colspan="8" class="muted">No trips in this selection.</td></tr>
     {% endif %}
   </table>
-</div></body></html>
+</div>""" + VERSION_FOOTER + """</body></html>
 """
 
 TRIP_HTML = """
@@ -1201,7 +1231,7 @@ TRIP_HTML = """
   }).addTo(map);
 </script>
 {% endif %}
-</body></html>
+""" + VERSION_FOOTER + """</body></html>
 """
 
 
@@ -1247,6 +1277,7 @@ DEVICE_HEALTH_HTML = """
         ('pending_events', 'Pending events'), ('dropped_events', 'Dropped events'),
         ('boot_counter', 'Boot counter'), ('uptime_ms', 'Uptime (ms)')] %}
       <dt>{{ label }}</dt><dd>{{ d.snapshot.get(key, 'Not reported') }}</dd>
+      {% if key == 'firmware_version' %}<dt>Server</dt><dd>{{ server_version }}</dd>{% endif %}
     {% endfor %}
       <dt>Status revision</dt><dd>{{ d.status_sequence }}</dd>
       <dt>Counters (boot-local)</dt><dd>
@@ -1299,7 +1330,7 @@ DEVICE_HEALTH_HTML = """
     {% if page > 1 %}<a class="btn" href="{{ url_for('device_health', page=page-1, code=code or '', severity=severity) }}">Newer</a>{% endif %}
     {% if has_next %}<a class="btn" href="{{ url_for('device_health', page=page+1, code=code or '', severity=severity) }}">Older</a>{% endif %}
   </nav>
-{% endif %}</main></body></html>
+{% endif %}</main>""" + VERSION_FOOTER + """</body></html>
 """
 
 
@@ -1310,7 +1341,7 @@ DEVICE_HEALTH_HTML = """
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "service": "mileage-viewer"}), 200
+    return jsonify({"status": "ok", "service": "mileage-viewer", "version": server_version()}), 200
 
 
 @app.route("/device-health")
