@@ -187,7 +187,7 @@ Measured with Stages 1–3 unless marked.
 |---|---|---|
 | PMU (AXP2101) | `Wire1`, SDA 42 / SCL 41, address 0x34 | Interrupt on GPIO 40, which can't wake the ESP32-S3 from deep sleep |
 | RTC (PCF8563) | `Wire1`, address 0x51 | Shares the PMU's bus |
-| OLED (SH1106), BME280 | `Wire`, SDA 17 / SCL 18, 0x3C / 0x77 | ALDO1 also powers the magnetometer and Wire pull-ups. Stage 4 sets it to 3.3 V and enables it after the PMU is trusted, so the display and sensors get their intended supply and the bus uses 3.3 V logic levels |
+| OLED (SH1106), BME280 | `Wire`, SDA 17 / SCL 18, 0x3C / 0x77 | Powered by ALDO1, which also feeds the magnetometer and, per LilyGO's schematic, this bus's pull-ups. ALDO1 starts at 1.8 V; Stage 4 sets it to 3.3 V once the PMU checks out, as LilyGO's and Meshtastic's code do. At 1.8 V the bus's high level sits below the ESP32-S3's input spec (#274) |
 | GPS UART | ESP32 RX 9 / TX 8, 9600 baud | u-blox MAX-M10S, firmware SPG 5.10 |
 | GPS_EN | GPIO 7 | Drive HIGH. Low or high made no difference on this GPS |
 | GPS PPS | GPIO 6 | One pulse per second once the GPS has a fix |
