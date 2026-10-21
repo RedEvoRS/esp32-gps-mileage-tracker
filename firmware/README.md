@@ -426,11 +426,12 @@ first real uploads from microSD succeeded on 2026-10-21 (UTC): four trips
 received HTTP 200, were deleted from the card and appeared in the viewer.
 This used main commit `a358eaf`'s earlier Stage 4 debug firmware, flashed at
 20:39Z on 2026-10-20 with real settings and one-time diagnostics enrollment.
-Uploads also succeeded with the former production build `v0.05+615a13ffae`
-and with `v0.06`. Since v0.06 there is one firmware build: debug mode starts
-off at every power-on and can be toggled by holding BOOT and tapping POWER.
-On 2026-10-21 (UTC), with `v0.05+615a13ffae`, ingest was stopped with a test
-trip queued. Both upload attempts returned `HTTP -1` (connection failure),
+A trip upload with debug off also succeeded, on the former production build
+`v0.05+615a13ffae` (the server-down test below). `v0.06` has so far uploaded
+diagnostics, but no trips yet. Since v0.06 there is one firmware build: debug
+mode starts off at every power-on and can be toggled by holding BOOT and
+tapping POWER. On 2026-10-21 (UTC), with `v0.05+615a13ffae`, ingest was
+stopped with a test trip queued. Both upload attempts returned `HTTP -1` (connection failure),
 and the trip stayed queued. The next retry after ingest restarted received
 HTTP 200 and deleted the local file. LittleFS uploads remain untested on
 the Supreme.
