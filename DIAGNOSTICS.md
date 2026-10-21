@@ -1,5 +1,352 @@
 # Device diagnostics framework
 
+Diagnostics help explain what happened to the tracker and whether a fault is
+still active. **Stage 4** means the main trip-logger sketch,
+[`firmware/04_trip_logger/`](firmware/04_trip_logger/). It keeps a bounded event
+history on the board and sends a current-health snapshot after trip uploads.
+The server stores these reports for the viewer's **Device health** page and
+optional notifications/exports. Diagnostics are separate from GPX trip files
+(GPS Exchange Format; GPS means Global Positioning System); a rejected
+diagnostic upload must not block a valid trip.
+
+Start with the [operator guide](#operator-guide) to prepare/enroll a board,
+read its screen, [look up a code](#looking-up-a-code), or troubleshoot delivery.
+The [developer reference](#developer-reference) follows with delivery evidence,
+catalog/protocol contracts, journal format, runtime/concurrency/memory details,
+server internals and backups. Hardware acceptance limits remain explicit there.
+
+## Operator guide
+
+### What you need
+
+- A T-Beam Supreme running **Stage 4**, the main trip-logger sketch in
+  `firmware/04_trip_logger/`, with a **working FAT32 SD (Secure Digital) card**
+  (FAT32 is the card's required File Allocation Table filesystem format).
+  Diagnostics uploads require EventLog's SD revision allocator. Internal
+  LittleFS (the internal flash filesystem) fallback can retain local diagnostics, but cannot provide that
+  allocator; trip-file uploads can still work from a mounted trip store.
+- A reachable ingest server and the same private bearer token and `DEVICE_ID`
+  configured in the firmware. The device label is not authentication. See
+  [DEPLOY_DEBIAN.md](DEPLOY_DEBIAN.md) for setup and exact server commands, and
+  [firmware setup](firmware/README.md) for board/flashing settings.
+- **Deploy the server catalog before firmware that uses new codes/context.**
+  Ingest validates against its installed catalog; an older server can reject
+  new fields and the firmware may isolate/discard rejected history. Update and
+  restart ingest, viewer and monitor together. The catalog reference below
+  explains version changes; no installation method is assumed here.
+
+### Snapshot revision enrollment and recovery
+
+A **snapshot** is the board's current health report. Its `status_sequence` is
+a device-wide revision that must keep increasing across boots. The **server
+high-water** is the server's highest accepted `status_sequence` for that
+`DEVICE_ID`; a missing device row or null revision means zero. There is no web
+endpoint for discovering it. Read it from the ingest database using the
+read-only command in [DEPLOY_DEBIAN.md: one-time diagnostics enrollment](DEPLOY_DEBIAN.md#one-time-diagnostics-enrollment).
+If that read fails, resolve the error; do not substitute zero.
+
+The SD card also stores a revision. It can be **ahead of the server**, because
+firmware saves a revision before sending its snapshot. Before enrollment or
+recovery, the value chosen for `DIAGNOSTICS_STATUS_HIGH_WATER` must be **at least
+both the server high-water and the SD card's stored revision**. A server read
+alone is insufficient when reusing a card.
+
+Enrollment is one-use: core 0 saves and verifies the ID in `diag/enroll` in
+**NVS (non-volatile storage, the ESP32's settings memory)** before calling
+`restoreStatusSequence(highWater)` under the journal lock. NVS is written once
+per explicit enrollment, not per check-in. A restore below the saved SD revision
+is refused **after the ID has been consumed**. Raising only the ID while keeping
+that too-low value repeats the failure and consumes another ID. Fix the lower
+bound or storage problem first; only then retry with a higher ID and reboot.
+
+1. Read the server high-water for the exact `DEVICE_ID`. With the tracker
+   powered off, inspect the card's revision using the read-only procedure below.
+   Keep the tracker off until choosing the value, so its allocator cannot advance
+   after your inspection. Zero is appropriate only for verified fresh state,
+   never as a guess after a failed read or unexplained metadata loss.
+2. In private `firmware/04_trip_logger/secrets.h`, set
+   `DIAGNOSTICS_STATUS_HIGH_WATER` to the verified lower bound above and
+   `DIAGNOSTICS_ENROLLMENT_ID` to a positive value greater than **every ID
+   previously used on this board**. Both must fit 0..2^63-1 (the ID cannot be 0).
+   The example's `0ULL`/`1ULL` is only for verified fresh state. `ULL` means an
+   unsigned long long integer in C++. Follow the flashing procedure in the
+   deployment runbook; a used board normally keeps erase **Disabled**.
+3. Let the normal awake network cycle finish eligible trip uploads, then check
+   the viewer's **Device health** page for a newly received current diagnostics
+   snapshot from this boot. GPX contact by itself does not prove enrollment succeeded.
+4. **Remove both defines and reflash with Erase All Flash Before Sketch Upload
+   set to Disabled.** Editing the header alone does not change the board's
+   installed firmware. Normal boots then allocate from the existing SD metadata.
+
+For recovery after metadata loss/replacement or a confirmed snapshot conflict,
+preserve the existing metadata, re-read the server and inspect the card before
+choosing the recovery value. Never reset the server high-water or treat a
+replacement card as a new device identity. A conflict suspends revision
+allocation and blocks diagnostics in memory; explicit recovery with a new ID,
+verified lower bound and reboot is required. The normal cleanup above applies
+again after a successful current snapshot.
+
+Leaving enrollment firmware installed normally cannot reuse a consumed ID
+while NVS survives. **Erase-all clears `diag/enroll`**: firmware still carrying
+the defines can then enroll again using its compiled-in, possibly stale value.
+That is why both removing the defines and reflashing with erase Disabled matter.
+
+With SD absent, unenrolled, corrupt or unable to persist a revision, **all
+diagnostics requests stop and back off**. Every request requires a check-in;
+events-only uploads cannot bypass that requirement. Local LittleFS/RAM journaling
+and GPX uploads continue within their existing storage/durability limits. A
+working allocator issuing lower-but-valid revisions is different: history and
+contact still upload, but current health cannot advance until the revision is
+above the server high-water. There is no automatic switch to another revision
+authority; an alternate durable allocator needs an explicit migration design.
+
+<details>
+<summary>Read the SD revision without changing it</summary>
+
+With the tracker powered off, use a read-only mount or write-protected card
+reader to copy `diag/ack-0` and `diag/ack-1` to a directory on your computer.
+Inspect copies rather than editing the card. Save this Python code outside the
+repository as `inspect_revision.py`, run `python inspect_revision.py`, and enter
+that directory. It prints only slot validity, revision and enrollment state;
+it does not read journal events or personal data. The checks and newest-valid-
+generation selection match `EventLog::load()` in `event_log.cpp`.
+
+```python
+from pathlib import Path
+import struct
+import zlib
+
+directory = Path(input("Directory containing copied ack files: "))
+valid = []
+limit = (1 << 63) - 1
+for slot in (0, 1):
+    path = directory / f"ack-{slot}"
+    if not path.exists():
+        print(f"ack-{slot}: missing")
+        continue
+    data = path.read_bytes()[:80]  # read only; no writes to either copy
+    if len(data) != 80:
+        print(f"ack-{slot}: invalid length")
+        continue
+    generation, = struct.unpack_from("<Q", data, 8)
+    segment, offset, next_segment = struct.unpack_from("<III", data, 16)
+    revision, dropped, pending = struct.unpack_from("<QQQ", data, 32)
+    discarded, = struct.unpack_from("<I", data, 56)
+    crc, = struct.unpack_from("<I", data, 76)
+    ok = (data[:4] == b"ELG1" and zlib.crc32(data[:76]) == crc
+          and 0 < generation <= limit and generation % 2 == slot
+          and segment <= 99999999 and offset <= 65536
+          and 0 < next_segment <= 100000000 and revision <= limit
+          and dropped <= limit and pending <= dropped
+          and discarded <= 99999999 and data[60] <= 1)
+    print(f"ack-{slot}: {'valid' if ok else 'invalid'}")
+    if ok:
+        valid.append((generation, revision, bool(data[60])))
+if not valid:
+    raise SystemExit("No valid slot: lower bound unknown; investigate before recovery")
+_, revision, enrolled = max(valid)
+print(f"SD stored revision: {revision}; enrolled: {enrolled}")
+```
+
+A missing/invalid slot can coexist with a valid older slot after a torn write;
+use the highest valid generation, not the largest revision found in arbitrary
+bytes. If neither validates, or copying/reading fails, do not infer zero.
+Distinguish verified unused media from lost/corrupt metadata before explicitly
+rebuilding revision authority. Keep copies for that investigation.
+
+</details>
+
+### What the screen shows
+
+The **OLED (organic light-emitting diode) screen** starts in production mode
+at each power-on. It normally sleeps. Cards are steady and last **30 seconds**
+with the current default; they do not scroll or flash.
+
+- A status card shows at boot, even before motion is known, unless the board
+  is already judged moving. A finalized trip queues another card for when
+  parked. Entering parked with unresolved faults also reminds once. Routine
+  status cards blank when motion becomes moving.
+- Each new accepted **error/critical continuing-condition episode** can show
+  an automatic error card in any motion state, including while moving.
+  Warnings/info and repeated observations do not wake another error card;
+  the bounded queue can miss excess episodes. A historical reset notice is
+  not an active episode.
+- Tap **POWER** to request a status card in any motion state for its full
+  duration. It shows `Sats: N` (satellites heard), or `Sats: --` when unknown,
+  followed by `OK` when no faults are active or active warning-and-above codes,
+  most severe first. Up to four slots fit; with more faults, the last slot is
+  `+N`. `OK` describes the observed active list, not proof that every subsystem
+  has been tested. An error card shows one large `E####`.
+- While the board is running, **hold BOOT, then tap POWER** to toggle the live
+  debug page. A two-second message confirms the change. POWER alone can overlay
+  a status card in debug mode. Debug is not saved across power cycles; holding
+  BOOT during power-up instead selects the chip's download mode.
+
+Short-press actions need a successfully read power-management interrupt batch;
+unknown reads cannot request a card or toggle debug. Degraded startup does not
+run display updates or normal short-press actions. Either display adapter
+failing disables both display paths for that boot; recording can continue.
+
+The layout was approved on the bench on **2026-10-21**. Daytime readability
+is accepted as a panel limit; OLED current was deliberately not measured.
+Road checks, including production-card behavior, remain open in #206; #158's
+remaining debug-screen checks were moved there. These are recorded hardware
+decisions, not claims established by host tests.
+
+### Looking up a code
+
+Open the viewer's **Device health** page after logging in. Current conditions
+are separate from history: an old event does not prove a fault is still active.
+The page gives catalog explanations and recovery hints; unknown codes have no
+invented severity. See the developer runtime-hook table for exact triggers.
+
+This complete index is generated from catalog v6's **48 definitions**, with
+each producer checked against Stage 4. A catalog entry alone does not prove
+firmware emits it. Symbols use subsystem abbreviations: **PMU** is the power
+management unit, **GPS** the satellite positioning receiver, **RTC** the real-time
+clock, **UTC** coordinated universal time, **FS** filesystem, **NET** networking,
+and **ACK/NACK** acknowledgment/negative acknowledgment. LittleFS is the internal
+flash filesystem. A mutex is a lock protecting shared access.
+
+Journal policy: `transitions` means raise/repeat/clear for an ongoing condition;
+`per_occurrence` means a one-off history notice; `counter` means a boot-local
+total instead of one event per occurrence. "Yes" means a current producer path
+exists, not that every occurrence is guaranteed durable or already road-tested.
+
+| Code | Symbol | Severity | Journal policy | Stage 4 emits today? |
+|---|---|---|---|---|
+| E1000 | `BOOT` | info | `per_occurrence` | Yes |
+| E1001 | `FS_MUTEX_FAILED` | critical | `transitions` | No; catalog only (lock failure restarts) |
+| E1002 | `NET_TASK_FAILED` | error | `transitions` | No; catalog only (serial failure message) |
+| E1003 | `WATCHDOG_RESET` | error | `per_occurrence` | Yes |
+| E1004 | `BROWNOUT_RESET` | warning | `per_occurrence` | Yes |
+| E1005 | `PANIC_RESET` | error | `per_occurrence` | Yes |
+| E1006 | `ID_STATE_FAILED` | warning | `transitions` | No; catalog only (counter failure uses zero) |
+| E1007 | `NET_STACK_LOW` | warning | `transitions` | Yes |
+| E2001 | `PMU_INIT_FAILED` | critical | `transitions` | Yes |
+| E2002 | `BATTERY_LOW` | warning | `transitions` | Yes |
+| E2003 | `BATTERY_CRITICAL` | error | `transitions` | Yes |
+| E2004 | `CHARGE_HOT` | warning | `transitions` | Yes |
+| E2005 | `CHARGE_COLD` | warning | `transitions` | Yes |
+| E2006 | `CHARGE_TEMP_UNREADABLE` | error | `transitions` | Yes |
+| E2007 | `PMU_STARTUP_RECOVERY` | warning | `per_occurrence` | Yes |
+| E2008 | `CHARGE_CONTROL_FAILED` | error | `transitions` | Yes |
+| E2009 | `BATTERY_POWER_OFF` | info | `per_occurrence` | Yes |
+| E3001 | `GPS_NO_DATA` | error | `transitions` | Yes |
+| E3002 | `GPS_NO_FIX` | warning | `transitions` | Yes |
+| E3003 | `GPS_CONFIG_NACK` | warning | `per_occurrence` | Yes |
+| E3004 | `GPS_CONFIG_TIMEOUT` | warning | `per_occurrence` | Yes |
+| E3005 | `GPS_TRIP_FIX_LOST` | warning | `transitions` | Yes |
+| E3006 | `UTC_UNAVAILABLE` | warning | `transitions` | Yes |
+| E3007 | `RTC_UNAVAILABLE` | warning | `transitions` | Yes |
+| E3008 | `RTC_TIME_INVALID` | warning | `transitions` | Yes |
+| E3009 | `GPS_ANTENNA_SUSPECT` | warning | `transitions` | Yes |
+| E4001 | `SD_UNAVAILABLE` | warning | `transitions` | Yes |
+| E4002 | `LITTLEFS_UNAVAILABLE` | error | `transitions` | Yes |
+| E4003 | `NO_RECORDING_STORAGE` | critical | `transitions` | Yes |
+| E4004 | `STORAGE_LOW` | warning | `transitions` | Yes |
+| E4005 | `STORAGE_FULL` | critical | `transitions` | Yes |
+| E4006 | `TRIP_WRITE_FAILED` | critical | `transitions` | Yes |
+| E4007 | `TRIP_RECOVERY_FAILED` | error | `per_occurrence` | Yes |
+| E4008 | `EVENT_WRITE_FAILED` | error | `transitions` | No; catalog only (internal I/O counter) |
+| E4009 | `EVENTS_DROPPED` | warning | `per_occurrence` | Yes |
+| E4010 | `TRIP_RECOVERED` | info | `per_occurrence` | Yes |
+| E5001 | `HOME_AP_ABSENT` | info | `counter` | Counter only; snapshot, no journal event |
+| E5002 | `WIFI_JOIN_FAILED` | warning | `transitions` | Yes |
+| E5003 | `UPLOAD_TRANSPORT_FAILED` | warning | `transitions` | Yes |
+| E5004 | `UPLOAD_AUTH_FAILED` | error | `transitions` | Yes |
+| E5005 | `UPLOAD_TOO_LARGE` | error | `transitions` | Yes |
+| E5006 | `UPLOAD_INVALID` | error | `transitions` | Yes |
+| E5007 | `UPLOAD_CONFLICT` | error | `transitions` | Yes |
+| E5008 | `UPLOAD_SERVER_FAILED` | warning | `transitions` | Yes |
+| E5009 | `UPLOAD_HTTP_OTHER` | warning | `transitions` | Yes |
+| E5010 | `EVENT_ACK_INVALID` | error | `transitions` | Yes |
+| E6001 | `DISPLAY_UNAVAILABLE` | warning | `transitions` | Yes |
+| E7001 | `DEVICE_SILENT` | warning | `transitions` | No; server monitor only |
+
+E4009 loss notices come from EventLog itself. Journal input/output (I/O) failures increment
+its internal `storageFailures` counter; they do not currently emit E4008.
+E7001 is derived on the server from time since accepted contact, not emitted by
+the board. E5001 counts successful scans that miss the configured home access
+point; it is expected away from home and does not flood journal history.
+
+For Prometheus metric names, labels and meanings, use the
+[Grafana metric reference](server/grafana/README.md); the code index is not a
+second metric reference.
+
+### Basic troubleshooting
+
+| Symptom | What to check |
+|---|---|
+| No Device health entry | A successful GPX upload with a valid `X-Device-Id`, or an accepted diagnostics request, creates contact. Verify the configured identity, server reachability and upload result. Legacy GPX uploads without identity are not assigned to a guessed device. |
+| Contact exists, but no current snapshot | GPX contact does not establish diagnostics health. Check SD enrollment/revision authority and the one-time upload-workspace allocation warning. No SD allocator means no diagnostics request, even with local history. |
+| Diagnostics stay local while trips upload | Eligible completed GPX files always take priority, even after a failed trip attempt. Diagnostics use the next eligible awake network opportunity and independent retry backoff. Also check SD revision authority and the serial warning `diagnostics upload disabled: PSRAM allocation failed`; PSRAM is the board's external working memory. |
+| Enrollment/recovery is refused or never produces a current snapshot | Check the server high-water **and** SD stored revision before consuming another ID. An attempted enrollment can consume the ID even when restore fails. A confirmed snapshot conflict needs explicit recovery and reboot; do not clear server state to hide it. |
+| History arrives but current health stays old | Lower-but-valid revisions can deliver history/contact without replacing current health. Compare revision bounds and use the recovery procedure above. An identical retry also does not refresh snapshot age. |
+| An old fault is in history, or a condition says unknown | History is not current health. A reboot or omitted/unobserved condition is unknown, not measured recovery. Use the current snapshot and receipt age. |
+| The screen is dark | Production normally sleeps between cards. Try POWER while running. E6001 means display failure disabled both display paths for this boot; missing pixels alone cannot diagnose the cause. |
+| Serial prints `DEGRADED:` | No trips are being recorded and no diagnostics uploads run in that boot. Address the reported power/storage startup failure; bounded retries restart the board after recovery. See [degraded startup service](#degraded-startup-service-126). |
+| Viewer says Diagnostics unavailable (503) | The database read, schema or lock failed; inspect the viewer warning and server storage/service state. This is unavailable evidence, not an empty healthy result. |
+
+Successful diagnostics requests do not print a serial success line. Confirm
+them in ingest logs or Device health's snapshot receipt, rather than assuming
+a GPX `200` proves diagnostics delivery. Keep tokens and personal data out of
+shared logs and troubleshooting reports.
+
+### Optional monitoring and notifications
+
+The optional monitor watches every device that has checked in. It can send
+self-hosted ntfy phone notifications for eligible current faults and for server
+silence (seven days by default), and can feed external Grafana/Prometheus,
+Graylog or Loki. Outputs are off unless configured; setup and private settings
+are in [DEPLOY_DEBIAN.md Step 11](DEPLOY_DEBIAN.md#step-11--optional-device-notifications).
+The [Grafana README](server/grafana/README.md) is the metric reference.
+
+Default fault notifications require a snapshot received within 24 hours,
+error-or-higher severity and a five-minute hold (critical faults bypass the
+hold). Silence uses server contact time, including accepted GPX, independently
+of fault severity/hold. Notification limits, reminders and explicit recovery
+rules reduce repeated alerts; a reboot is not a resolution. Delivery is at
+least once, so duplicates are possible. On iOS, instant push from self-hosted
+ntfy needs its public wake-up relay; Android does not (see the runbook).
+
+The monitor waits 60 seconds **after each completed tick**. Slow exports can
+delay database reads, alert checks and metrics refresh. Separate sink failure
+handling does not provide separate timing. Monitoring does not wake the tracker
+or replace its journal; the heartbeat uses an existing awake network opportunity.
+
+## Developer reference
+
+### Terms used in this reference
+
+The operator guide introduces SD, NVS, OLED, PMU, GPS, RTC, UTC and ACK/NACK.
+Additional abbreviations below: **CRC/CRC32** = cyclic redundancy check (a
+32-bit corruption check); **FAT/FAT32** = File Allocation Table filesystem;
+**DRAM** = dynamic RAM; **PSRAM** = pseudo-static RAM (external working memory);
+**VFS** = virtual filesystem interface; **FS_LOCK** = the project's filesystem
+lock wrapper; **FSM** = finite-state machine (trip lifecycle states); **ABI** =
+application binary interface (layout/alignment conventions); **IRQ/ISR** =
+interrupt request / interrupt service routine; **I/O** = input/output;
+**I2C** = Inter-Integrated Circuit peripheral bus; **SPI** = Serial Peripheral
+Interface; **UART** = Universal Asynchronous Receiver/Transmitter; **GPIO** =
+general-purpose input/output; **ADC** = analog-to-digital converter; **SOC** =
+state of charge; **VBUS** = USB supply voltage; **BCD** = binary-coded decimal;
+**SNTP** = Simple Network Time Protocol; **NMEA** = National Marine Electronics
+Association receiver sentences; **UBX** = u-blox binary receiver protocol;
+**GSV** = satellites-in-view sentence; **RMC** = recommended minimum navigation
+sentence; **NAV-PVT** = navigation position/velocity/time message; **AGC** =
+automatic gain control; **RF** = radio frequency; **HDOP** = horizontal dilution
+of precision; **C/N0** = carrier-to-noise density ratio; **HTTP** = Hypertext
+Transfer Protocol; **JSON** = JavaScript Object Notation; **GELF** = Graylog
+Extended Log Format; **TLS** = Transport Layer Security; **DNS** = Domain Name
+System; **DMA** = direct memory access; **PII** = personally identifiable
+information; **CI** = continuous integration. A **seqlock** is a versioned
+publication scheme: readers detect a concurrent write and reject/retry a copy
+instead of waiting for a writer lock. Code identifiers and units retain their
+literal spelling in the reference.
+
+### Recorded delivery evidence and acceptance limits
+
 This is the reference for the diagnostics framework (issues #117 through
 #130 and the later items in the delivery map below). Both halves are
 implemented: the Stage 4 firmware journals error codes, shows them on the
@@ -45,7 +392,7 @@ No diagnostic record contains credentials, SSID/BSSID, coordinates, trip paths,
 raw HTTP bodies, or arbitrary error strings. The catalog permits only specific
 numeric measurements and fixed enumerated values in context.
 
-## Delivery map and prerequisites
+### Delivery map and prerequisites
 
 - **#117:** catalog, protocol v1 validation, generator, host compile test, CI
   drift check, and this reference.
@@ -73,17 +420,18 @@ numeric measurements and fixed enumerated values in context.
 - **#126:** implemented bounded degraded service loops for PMU/LoRa-rail and
   trip-storage startup failures, with local journaling and restart on recovery.
 - **#127:** implemented production-only SH1106 adapter, power save, POWER
-  short-press status and latched E6001 transport failure; visual/current bench
-  acceptance remains hardware work.
+  short-press status and latched E6001 transport failure. Layout was approved
+  on the bench on 2026-10-21; daytime readability is accepted as a panel limit,
+  OLED current was deliberately not measured, and road checks remain open (#206).
 - **#128:** implemented diagnostics-only PCF8563 boot timestamps, bounded
   GPS/SNTP RTC setting and clock-confidence/runtime tests; the RTC keeps time
   across PMU power-off (bench, 2026-10-20).
-- **#129:** consistent diagnostics database and monitor-state backups/restores.
+- **#129:** shipped consistent diagnostics database and monitor-state backups/restores.
 - **#130:** induced-fault, power-cut, backlog and display shakedown on hardware.
-- **#134:** Prometheus `/metrics` for the owner's external Grafana (not bundled).
+- **#134:** shipped Prometheus `/metrics` for the owner's external Grafana (not bundled).
 - **#135:** shipped GELF export to the owner's external Graylog (not bundled).
-- **#136:** optional push to an external Loki (not bundled).
-- **#137:** installer questions choosing these outputs.
+- **#136:** shipped optional push to an external Loki (not bundled).
+- **#137:** shipped installer output selection; see the deployment runbook for setup.
 - **#151:** E2007 catalog entry, retained Stage 4 PMU startup result and boot
   journal emission in normal and degraded startup are implemented. This
   one-off notice stays in journal/server history; production cards list active
@@ -94,7 +442,7 @@ numeric measurements and fixed enumerated values in context.
 Host tests prove catalog consistency and policy behavior. They do not prove bus
 wiring, power rails, charging safety, FAT power-cut recovery or road behavior.
 
-## Catalog and on-screen codes (#117)
+### Catalog and on-screen codes (#117)
 
 `server/common/diagnostics/catalog.json` is the source of truth. It lives under
 `server/` because deployment copies that directory to the host. The generated
@@ -165,7 +513,7 @@ violation. The C++ table includes code,
 symbol, severity, OLED lines, title, notify and journal policy; longer recovery
 and context definitions stay in the JSON for the server.
 
-### Updating the catalog
+#### Updating the catalog
 
 From the local repository root:
 
@@ -210,7 +558,7 @@ path; those readings are not guaranteed to be delivered later. Update/restart
 ingest, viewer and monitor together so all load catalog v6. No database migration
 or new service dependency is needed.
 
-## Protocol v1 (#117 contract, #118 and #125 integration)
+### Protocol v1 (#117 contract, #118 and #125 integration)
 
 The endpoint is `POST /v1/device-events` on ingest port 8090. It uses
 the existing bearer token and an `X-Device-Id` header. Firmware already defines
@@ -280,7 +628,7 @@ A minimal valid example (synthetic identifiers, unset device clock):
 }
 ```
 
-### Identifiers, limits and record meaning
+#### Identifiers, limits and record meaning
 
 - `device_id`: 1-32 lowercase ASCII letters/digits, `_` or `-`, starting with a
   letter/digit. No personal names or network addresses.
@@ -319,7 +667,7 @@ catalog first when adding context-bearing codes. A known code's context and
 journal policy are checked against the installed catalog. Incoming severity,
 notify flags and free text are not protocol fields.
 
-### Snapshots and reboot ordering
+#### Snapshots and reboot ordering
 
 The required check-in fields are `boot_id`, `status_sequence`, `uptime_ms`, and
 `active`. Each active entry has only `code` and `episode_id`; codes are unique.
@@ -359,18 +707,21 @@ do not write it for every scan or event. EventLog's allocator uses one durable
 on scans/events. This is an operation count verified by host tests, not an NVS
 wear measurement. The #125 worker defines its check-in rate and explicit
 recovery policy below; any future NVS adapter needs its own wear review.
-After allocator rollback/failure the
-device may still upload events and GPX, but snapshots cannot advance until the
-revision exceeds the server high-water mark. Recovery must explicitly restore
-that allocator or re-enroll identity; never silently reset the server high-water
-mark. This is a required integration review point, not functionality in #117.
+A working allocator with lower-but-valid revisions can still upload journal
+history and refresh contact; current health advances only above the server
+high-water mark. Missing, unenrolled or failed revision authority instead
+prevents snapshot creation and therefore **all diagnostics requests**: every
+request requires a check-in. Local journaling and GPX uploads continue within
+their existing storage limits. Recovery must explicitly restore the allocator
+or re-enroll identity; never silently reset the server high-water mark. See
+[snapshot revision enrollment and recovery](#snapshot-revision-enrollment-and-recovery).
 
 On a newer boot's accepted snapshot, old-boot conditions become unknown unless
 the new boot observes them. Do not generate a recovery notification merely from
 a reboot. Old events remain history. #118 must apply these rules in the same
 transaction as the batch; the stateless validator cannot enforce ordering.
 
-### Acknowledgments and retries (#118/#125)
+#### Acknowledgments and retries (#118/#125)
 
 Commit the entire valid batch in one transaction, then return 200 with exactly
 the accepted IDs: `{"accepted":[{"boot_id":"...","sequence":1}]}`. The
@@ -389,7 +740,7 @@ reports loss when discarded, and must not discard an otherwise valid batch.
 413 shrinks the next batch until its full body fits. No event upload failure
 changes trip-upload backoff or deletes a trip.
 
-## On-device journal and degraded operation (#122/#124/#126)
+### On-device journal and degraded operation (#122/#124/#126)
 
 Producers submit short bounded records into a RAM queue and never wait for SD,
 networking or display operations. A core-0 service task performs filesystem
@@ -424,7 +775,7 @@ on reset, so report that limitation and cumulative known drops. Do not format a
 mount failure or delete unuploaded trips to make diagnostic space. #130 must
 power-cut test frame writes, sealing, acknowledgments and quota reclamation.
 
-### EventLog module (#122 implementation)
+#### EventLog module (#122 implementation)
 
 `firmware/04_trip_logger/event_log.h` and `.cpp` build as standard C++14 on the
 host and as sketch-folder sources on the ESP32-S3. Stage 4 instantiates the
@@ -600,7 +951,7 @@ close and enumeration errors. None of these establishes SD/FAT power-cut safety.
 #126 wires bounded degraded startup/retry behavior. Uploads and snapshots run
 after explicit enrollment on normal boots; degraded boots never start networking.
 
-### Stage 4 boot and shutdown plumbing (#124 part A)
+#### Stage 4 boot and shutdown plumbing (#124 part A)
 
 The boot-time trip-store selection is unchanged: SD when mounted, otherwise
 LittleFS, with no destination changes during a trip. Diagnostics try that boot's
@@ -669,7 +1020,7 @@ safety keeps its bounded wait and reports incomplete sealing instead of waiting
 forever for diagnostics. A late VBUS return or failed PMU shutdown can leave an
 E2009 for an attempted power-off that did not happen; it is not proof of rail-off.
 
-### Reading parked battery drain without a meter
+#### Reading parked battery drain without a meter
 
 On the Supreme, parked means PMU power-off: the 18650 still supplies the PMU,
 RTC and GPS backup RAM. After updating the server and firmware, ordinary drives
@@ -740,14 +1091,16 @@ is worth investigating from several pairs and the existing logs. A meter is a
 last resort if those data cannot explain it. Firmware/helper tests do not
 complete the real parked-data acceptance step.
 
-### Stage 4 runtime fault hooks (#124 part B)
+#### Stage 4 runtime fault hooks (#124 part B)
 
 `runtime_faults.h` holds fixed condition slots and one static event builder per
 owning task. Core 1 owns GPS, power, trip storage/recovery and display hooks;
 core 0 owns WiFi/HTTP/stack and the AP-absence counter. The builders only call
 EventLog's bounded, nonblocking `submit`, never filesystem APIs or ISRs. Journal
-adapter/service errors do not enter these hooks; E4008/E4009 remain EventLog's
-own policy. The trip/FS operations being measured keep their existing locks.
+adapter/service errors do not enter these hooks. EventLog emits E4009 loss
+notices internally. E4008 is catalog-defined but is not currently emitted;
+journal I/O failures only increment the internal `storageFailures` counter
+(`EventLog::fail()` / `stats()`), without producing an event. The trip/FS operations being measured keep their existing locks.
 
 Continuing conditions emit one accepted `raise`, no hot-loop records, at most
 one `repeat` per **15 minutes**, and one accepted `clear` on measured recovery.
@@ -887,7 +1240,7 @@ remains non-fatal. RTC E3007/E3008 are implemented by #128; E5010 and diagnostic
 uploads/snapshots by #125. Production error-code OLED pages are implemented by #127; antenna detection
 is implemented by #164.
 
-### Degraded startup service (#126)
+#### Degraded startup service (#126)
 
 Every degraded boot prints `DEGRADED:` after the Stage 4 banner. These lines
 mean **no trips are being recorded**. A separate loop returns before GPS parsing,
@@ -952,7 +1305,7 @@ successful retry. Reboot, omitted/unknown status and old journal records alone
 are not recovery. Networking stays off until a normal boot, so fault history
 persisted on LittleFS reaches the server only later; D's RAM history is lost.
 
-## Trip-first upload scheduling (#125, implemented)
+### Trip-first upload scheduling (#125, implemented)
 
 `diag_worker.h` runs on the existing core-0 network task, after each GPX batch
 on that connection. It uses `hasPending()` before snapshot preparation and
@@ -999,7 +1352,7 @@ short fixed retry/yield overhead at the boundary; no long call gets a fresh
 acceptance item; diagnostic I/O uses a zero-wait mutex and the existing
 per-operation trip-demand gate, releasing the mutex before networking.
 
-### Acknowledgments, rejection and independent backoff
+#### Acknowledgments, rejection and independent backoff
 
 Only a 2xx with a completely parsed, bounded acknowledgment matching the exact
 sent ID set can advance EventLog's durable cursor. The parser accepts either
@@ -1045,34 +1398,7 @@ counts an HTTP rejection as successful delivery. RAM heads stay queued until
 normal journal service persists them, so isolation never claims a volatile
 cursor/count was durable. No trip is removed to make quarantine space.
 
-### Snapshot revision enrollment and recovery
-
-The existing EventLog revision authority is **SD only**. There is no HTTP
-high-water discovery endpoint. Before first use, an operator must inspect
-`devices.status_sequence` in the ingest diagnostics database for the exact
-`DEVICE_ID` (a missing row/null revision means zero). In private `secrets.h`,
-set `DIAGNOSTICS_STATUS_HIGH_WATER` to that value and choose a positive
-`DIAGNOSTICS_ENROLLMENT_ID` greater than any used on this board. The commented
-example shows `0ULL`/`1ULL` for a verified fresh identity only.
-
-Core 0 consumes and verifies the enrollment ID in `diag/enroll` NVS **before**
-calling `restoreStatusSequence(highWater)` under the journal mutex. This writes
-NVS once per explicit enrollment, not once per check-in. Normal boots allocate
-from the existing SD metadata even if those defines are removed. A failed
-attempt consumes the token: retry with a higher ID after checking the server
-and storage. Reusing firmware after metadata loss cannot silently enroll at
-zero. Never reset the server high-water or assume a replacement SD is new
-identity enrollment. After a confirmed snapshot conflict, restore with a new
-enrollment ID and verified high-water; reboot to clear the in-memory block.
-
-With SD absent, unenrolled, corrupt or unable to persist a revision, diagnostic
-requests remain suspended and back off; GPX remains available. Protocol v1
-requires a check-in, so an events-only request cannot bypass this constraint.
-LittleFS/RAM journaling still works within its existing durability limits. A
-future alternate durable revision authority needs explicit migration design;
-the worker never switches authorities automatically.
-
-### Opportunistic heartbeat and memory
+#### Opportunistic heartbeat and memory
 
 A GPX 200 or fully validated diagnostic 2xx records successful server contact.
 After **24 hours** without it, an empty-event check-in can use the existing
@@ -1107,7 +1433,10 @@ and once after the first diagnostics HTTP attempt made with debug on (including
 failure). These are measurement hooks for #6. During and after the real SD uploads on
 2026-10-21 (UTC), the debug build's minimum free network stack was
 **7,436 of 12,288 bytes**, with GPS logging active. The earlier no-upload
-measurement was 7,468 free bytes. Real-upload heap measurements and the
+measurement after #182 was **7,356 free bytes** (2026-10-20), as recorded in
+#6. The server-down/recovery run on 2026-10-21 recorded 7,556 free bytes;
+#6 is closed with the 12,288-byte allocation retained. HTTP 401/413/5xx
+and visible-AP join failures remain untested on hardware. Real-upload heap measurements and the
 untested upload paths still need checks. No host test establishes ESP32
 heap/stack headroom, SD latency or power-cut safety.
 
@@ -1128,7 +1457,7 @@ uploads. Every complete generated test
 request passes the real `common.diagnostics.parse_request` validator and real
 Flask ingest test-client commit plus duplicate replay, without opening sockets.
 
-## Display policy and Supreme hardware (#123/#127/#128/#130)
+### Display policy and Supreme hardware (#123/#127/#128/#130)
 
 DisplayModel (`display_model.h`) is pure, header-only C++ policy; only the
 SH1106 adapters touch hardware, both exclusively on core 1. Stage 4 ships as
@@ -1148,8 +1477,10 @@ changes. No button or OLED work runs on core 0 or in the PMU ISR.
   The default is planned to return to 10 seconds after the first road tests.
   No flashing, scrolling or always-on content.
   The adapter uses maximum SH1106 contrast (255), per #166: the panel is about
-  100 nits and lights only briefly. Current and the revised large-font layout
-  still need bench checks. An always-on design would need a separate burn-in policy.
+  100 nits and lights only briefly. The owner approved the large-font layout
+  on the bench on 2026-10-21 and accepted daytime readability as a panel limit
+  (#206/#158). OLED current was deliberately not measured; road behavior
+  remains open under #206. An always-on design would need a separate burn-in policy.
 
 Production cards show **satellites heard**, from fresh
 `DebugGsv::signal(now).heard`: unique GSV entries with C/N0 > 0, or `--` when
@@ -1227,7 +1558,7 @@ retries hardware initialization or blocks recording, uploads or power handling.
 A disconnected panel cannot be commanded asleep after the bus has failed.
 The screen is a brief aid; the server history remains the durable fault record.
 
-### Production fonts and pixel layout
+#### Production fonts and pixel layout
 
 U8g2 **2.36.18** supplies all three `_tr` fonts, including upper/lower case,
 digits, `:`, `+`, `-` and `OK`. `display_font_metrics.h` records actual bitmap
@@ -1237,34 +1568,35 @@ content; the pure `production_display_layout.h` computes positions from
 these metrics, and the adapter draws using baseline coordinates.
 
 The 128x64 panel keeps at least **2 pixels of margin** on every edge.
-Coordinates below use exclusive right/bottom bounds; baselines are U8g2
+Ink ranges below use `[left,right)` and `[top,bottom)`: right/bottom are
+exclusive, so width/height are the difference of the bounds. Baselines are U8g2
 draw coordinates. Horizontal centring uses actual ink bounds, including
 glyph offsets, rather than nominal font sizes or character counts.
 
 - **Sats: `u8g2_font_logisoso26_tr`.** `Sats: 99` advances 123 pixels;
-  its ink is 119x27. Origin `(2,29)` gives ink x=4..122, y=2..28.
+  its ink is 119x27. Origin `(2,29)` gives ink x=[4,123), y=[2,29).
   The `3` glyph extends one pixel below baseline, so `Sats: 33` occupies
-  y=2..29. Digits advance 17, `S` 17, `a` 19, `t` 10, `s` 16,
+  y=[2,30). Digits advance 17, `S` 17, `a` 19, `t` 10, `s` 16,
   colon 10 and space 17 pixels. `Sats: --` advances 121 pixels and fits.
   The next logisoso size, 28, has 125 pixels of ink for `Sats: 99`,
   exceeding the 124-pixel inner width. Heard counts above 99 retain their
   numeric value using the smaller `helvB14_tr` font when needed.
 - **No faults or one code:** the lower line also uses `logisoso26_tr`,
   baseline 61, centred across the panel. `OK` has 34-pixel advance and
-  30x26 ink at origin `(47,61)` (ink x=49..78, y=35..60).
-  `E9999` advances 85 pixels with 81x26 ink; digit `3` can extend to y=61.
+  30x26 ink at origin `(47,61)` (ink x=[49,79), y=[35,61)).
+  `E9999` advances 85 pixels with 81x26 ink; digit `3` can extend the bottom bound to 62 (last occupied y=61).
 - **Multiple codes: `u8g2_font_helvB14_tr`.** Two 62-pixel cells per row
   start at x=2 and x=64, with at most two rows (four slots). `E9999`
   advances 53 pixels and has 50x14 ink (`E` advances 13; digits 10).
   With three/four tokens, baselines are 46 and 62, placing ink at
-  y=32..45 and y=48..61. For `E9999`, draw origins are x=6 and x=68,
-  placing ink at x=8..57 and x=70..119. With only two tokens, baseline
+  y=[32,46) and y=[48,62). For `E9999`, draw origins are x=6 and x=68,
+  placing ink at x=[8,58) and x=[70,120). With only two tokens, baseline
   55 centres the single row in the lower area. `+99` advances 31 pixels,
   with 29x13 ink; all `+N` values through two digits fit a full slot.
   Font 18 in the same bold Helvetica family cannot fit two codes per row.
 - **Error: `u8g2_font_logisoso38_tr`.** `E9999` advances 121 pixels
   (`E` 25; digits 24) with 116x38 ink. Origin `(3,51)` centres it at
-  x=6..121, y=13..50. Codes containing `3` have 39-pixel ink height;
+  x=[6,122), y=[13,51). Codes containing `3` have 39-pixel ink height;
   vertical centring accounts for this. The next size, 42, has 129-pixel
   ink width for `E9999`, exceeding the inner width.
 
@@ -1309,7 +1641,7 @@ uptime and receipt time preserve their original meaning. #130 validates these
 behaviors plus degraded storage, reset reporting, motion suppression, deep
 sleep, upload interruption, backlog drain and notification recovery on hardware.
 
-## Server storage and Device health (#118/#119)
+### Server storage and Device health (#118/#119)
 
 Ingest owns `/data/diagnostics/events.db`, with events, boots and devices tables
 (and schema/index metadata as needed). Use SQLite `synchronous=FULL` and DELETE
@@ -1361,7 +1693,7 @@ only the required runtime files. Secrets, data and development artifacts stay
 outside the build context. All three services load the catalog once at startup and
 fail fast if it is missing or invalid.
 
-### Device health page (#119, shipped)
+#### Device health page (#119, shipped)
 
 Open `/device-health` from the viewer navigation after logging in. It shows
 each device's last server contact and age, latest snapshot receipt and age,
@@ -1395,12 +1727,15 @@ migrates, writes or recovers the diagnostics DB. An absent file gives a normal
 and hot journals requiring recovery give **Diagnostics unavailable**, HTTP 503,
 and a viewer warning log, with no healthy empty state substituted.
 
-## Optional monitor and notifications (#120/#121, shipped)
+### Optional monitor and notifications (#120/#121, shipped)
 
 The stdlib-only `mileage-monitor` service optionally publishes metrics on port
-8093; the endpoint is disabled unless configured. Every 60 seconds
-it reads `/data:ro` and stores its own delivery/deduplication state in a separate
-writable volume. It watches **every device that has ever checked in**; there is
+8093; the endpoint is disabled unless configured. Each tick reads `/data:ro`
+and stores its own delivery/deduplication state in a separate writable volume,
+then waits **60 seconds after the completed tick**. ntfy, GELF and Loki run
+sequentially before metrics publication; slow synchronous exports delay the
+next database read, alert check and metrics refresh. Sink failures and progress
+are handled separately, but their timing is shared. It watches **every device that has ever checked in**; there is
 no `MONITOR_DEVICE_IDS` watchlist. Removing an obsolete device requires a future
 explicit administrative retirement policy, rather than an implicit
 watchlist omission. The intended installation has a single tracker.
@@ -1459,7 +1794,7 @@ severity and hold: its warning-level alert is enabled by `MONITOR_ENABLED` with 
 gated by `NOTIFY_ENABLED`, otherwise the default `error` threshold would
 silently suppress it.
 
-### Shipped service and state policy
+#### Shipped service and state policy
 
 `install.sh` asks which outputs to turn on (its Notifications step). For manual enablement, use
 [DEPLOY_DEBIAN.md Step 11](DEPLOY_DEBIAN.md#step-11--optional-device-notifications). `monitor` and `ntfy` are independent Compose profiles;
@@ -1530,11 +1865,12 @@ device label and catalog recovery hint (silence adds whole days without contact)
 No context, device clock, location, links or credentials are included. Configure
 booleans and bounded numeric values as described in the deployment settings;
 default silence is exactly seven days with an inclusive threshold. Firmware
-heartbeat integration is implemented by #125, and consistent state backups remain #129.
+heartbeat integration is implemented by #125; consistent state backups shipped
+under #129 (see [backups and acceptance](#backups-and-acceptance-129130)).
 Installer test uploads omit `X-Device-Id` so a routine `--check` does not enroll
 an ever-watched synthetic device; their unique `X-Trip-Id` still owns cleanup.
 
-### Prometheus metrics (#134)
+#### Prometheus metrics (#134)
 
 The monitor can expose `/metrics` for a Prometheus server that you run
 separately. The `monitor` Compose profile publishes host port 8093 on
@@ -1556,14 +1892,16 @@ there is no event text, coordinates, SSIDs or credentials. Counter-like alert
 values are gauges derived from monitor state, so restoring monitor-state can
 reduce them.
 
-### Graylog export (#135, shipped)
+#### Graylog export (#135, shipped)
 
 Owner decision (2026-10-16): Graylog runs on a separate server the owner
 manages; this repo never bundles it and only sends to it. Setup steps and
 starter Event Definitions are in
 [DEPLOY_DEBIAN.md Step 11d](DEPLOY_DEBIAN.md#11d--optional-send-diagnostics-to-your-own-graylog).
 The code is `server/mileage-monitor/gelf.py`, called from each monitor tick
-after the ntfy step; any Graylog failure is caught there and never affects ntfy.
+after the ntfy step. Graylog failures are caught separately and do not change
+ntfy delivery state or trip uploads. A slow export still delays later work
+and the next monitor tick; this is failure/progress isolation, not timing isolation.
 
 **Why facts, not ntfy decisions.** ntfy's decisions are phone policy: the
 hold, the hourly cap and digests, dropping a not-yet-sent alert when its fault
@@ -1573,7 +1911,8 @@ ntfy off it would forward nothing. GELF therefore carries two kinds of facts,
 independent of `NOTIFY_ENABLED` and `NOTIFY_*` settings (only
 `MONITOR_STALE_DAYS` and the 24-hour snapshot freshness apply):
 
-- `event`: every row in `events.db`, in rowid order, each forwarded once. The
+- `event`: cursor-based, at-least-once forwarding of `events.db` rows in rowid
+  order. An interrupted send before cursor commit can produce duplicates. The
   cursor is the last delivered rowid (`gelf_cursor`). The ingest never deletes
   events, so rowids only grow; if the table's highest rowid is ever below the
   cursor (events.db replaced by a restore), the cursor resets to 0 and history
@@ -1591,9 +1930,15 @@ independent of `NOTIFY_ENABLED` and `NOTIFY_*` settings (only
 
 Level: catalog severity (critical 2, error 3, warning 4, info 6; unknown code
 5) for active conditions and raise/repeat/notice events; 6 for clear/unknown
-states and clear events. Only catalog fields, validated identifiers, bounded
-device-clock fields and catalog context (re-checked: short tokens, integers,
-booleans as `"true"`/`"false"`) are sent; the source is the fixed
+states and clear events. The trust boundary is **catalog/protocol validation
+at ingest**, including identifiers, clock bounds and per-code context. GELF
+export derives descriptive fields from the catalog but only checks stored
+context key/value shape: short token strings, integers and booleans (sent as
+`"true"`/`"false"`). It does not re-check per-code key membership, integer ranges
+or enum membership; device-clock integers are type-checked, not range-checked.
+A damaged database row can therefore export an unknown context key or an
+out-of-range value. Loki instead filters context to the current code schema
+and validates the resulting event before export. The source is the fixed
 `mileage-tracker`; the reserved `_id` is never used.
 
 Transport: GELF HTTP (one message per POST, success on 2xx; Graylog answers
@@ -1607,7 +1952,7 @@ doubling to an hour, in `gelf_retry`, separate from ntfy's `retry`. The GELF
 tables are additive to monitor schema v1 (`CREATE TABLE IF NOT EXISTS`), so an
 existing `monitor.db` gains them at startup without a migration.
 
-### Loki push (#136)
+#### Loki push (#136)
 
 The monitor can push to an external Loki endpoint; Compose does not install
 Loki. Set `LOKI_PUSH_URL` to its `/loki/api/v1/push` endpoint in `monitor.env`
@@ -1620,7 +1965,11 @@ accepted in the URL. Setup and sample LogQL are in
 Each new `events.db` row becomes one JSON log line. A `condition_change` line
 is sent when a device/code condition changes to active, clear or unknown,
 including E7001 silence and recovery. `loki_conditions` stores the last state
-per device/code, so persistent faults do not repeat on deep-sleep wakes. These
+per device/code, so persistent faults do not repeat on deep-sleep wakes. On
+first export, and after that export state is lost, unseen state is treated as
+unknown: current active/clear conditions are emitted as a **baseline**, including
+E7001 clear for a device with recent contact. An active/clear line alone does
+not prove a transition happened at its export time. These
 condition changes are independent of `NOTIFY_ENABLED`. Each successful ntfy
 alert, reminder or resolution remains a separate `alert_decision` line; it
 records only the catalog title/symbol/severity, code, validated device ID and
@@ -1651,20 +2000,39 @@ only the Loki event cursor resets and that history is sent again. Loki runs
 after ntfy and GELF; its failures are caught separately and do not change
 either sink's progress or trip uploads.
 
-## Backups and acceptance (#129/#130)
+### Backups and acceptance (#129/#130)
 
-Use SQLite's backup API (or a coordinated service pause) to take consistent
-copies of events.db and the monitor's own SQLite state. `backup.sh` currently
-rsyncs `/data`, which now includes `/data/diagnostics/events.db`; that live-file
-copy is not a guaranteed consistent SQLite snapshot. Implementing and testing
-the consistent snapshot is **#129's job**, still required before relying on
-diagnostics backups. Do not blindly copy a live database file and assume it is
-consistent. Preserve restrictive file
-permissions and include schema/catalog versions in restore validation. Restored
-monitor state can replay notifications; restored diagnostics state can lower
-server high-water revisions. #129 must test those cases and document recovery
-without inventing liveness or clearing current faults. Never store ntfy tokens
-in the public repository or ordinary journal snapshots.
+`server/backup/backup.sh` ships consistent SQLite backup-API snapshots of
+viewer annotations, ingest `events.db`, and optional `monitor.db` when its
+volume exists. Viewer helpers read annotations/diagnostics; the monitor helper
+reads its own volume. Missing diagnostics/monitor databases are normal and
+recorded in `INFO`. Monitor-volume discovery errors warn and record
+`monitor=unknown`; trips, annotations and diagnostics still back up, without
+running a helper against an absent/unknown monitor volume.
+
+Trip data is rsynced under ingest's upload lock; the live diagnostics database
+and its SQLite sidecars are excluded. Checked database snapshots sit beside
+`annotations.db` and are covered by `SHA256SUMS`. Each database is consistent
+individually, **not one transaction across services**. Never substitute a live
+database-file copy for a consistent snapshot. Restrictive permissions remain
+required; the shipped scripts use `umask 077` and validate database schemas.
+Preserve catalog-version compatibility when restoring.
+
+`restore.sh` checks manifests and saved databases, stops ingest/viewer and any
+discovered monitor writer, saves safety snapshots of the current databases
+before replacing any, and restores with the owning service's helpers. It then
+restarts the default services and a monitor only if previously running. Unknown
+monitor discovery skips monitor replacement and monitor service actions; manual
+recovery is in [DEPLOY_DEBIAN.md Step 10](DEPLOY_DEBIAN.md#step-10--backups).
+Older backups without the new snapshots leave those live databases unchanged;
+an old live `data/diagnostics/events.db` or sidecar is never replayed by rsync.
+
+Restored monitor state can replay notifications or exports; restored diagnostics
+state can lower server high-water revisions. Use explicit revision recovery
+when needed, without inventing liveness or clearing current faults. Optional
+ntfy cache/auth state needs its own backup; never store ntfy tokens in the public
+repository or ordinary journal snapshots. Restore tests and recovery commands
+are in the deployment runbook.
 
 Before deployment, #130 must exercise real fault/recovery episodes, all three
 storage levels, corrupted/torn frames, segment quota exhaustion, lost responses,
