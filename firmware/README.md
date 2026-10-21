@@ -1111,7 +1111,7 @@ against the server's stdlib protocol validator.
 This section is for validating the firmware on hardware. You don't need it
 to build or use the tracker.
 
-The network task reserves 12,288 bytes, measured in issue #6. During
+The network task reserves 12,288 bytes; issue #6 records how much stays free. During
 and after the real SD uploads on 2026-10-21 (UTC), the debug build's
 minimum free stack was **7,436 bytes**, with GPS logging active. This
 measures the successful-upload path; it does not establish headroom for
