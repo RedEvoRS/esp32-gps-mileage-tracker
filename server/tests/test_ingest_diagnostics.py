@@ -72,6 +72,21 @@ class DiagnosticsIngest(unittest.TestCase):
         finally:
             db.close()
 
+    def test_battery_boot_and_power_off_context(self):
+        for sequence, code in enumerate((1000, 2009), 1):
+            body = batch(revision=sequence, sequence=sequence)
+            row = body["events"][0]
+            row.update(code=code, catalog_version=6, transition="notice", episode_id=None,
+                       context={"battery_mv": 3975, "battery_pct": 0})
+            row["context"].update({"reset_reason": "power_on"} if code == 1000 else {"reason": "idle_battery"})
+            self.assertEqual(self.post(body).status_code, 200)
+        self.assertEqual(self.rows("SELECT code, severity FROM events ORDER BY sequence"),
+                         [(1000, "info"), (2009, "info")])
+        body = batch(3, 3)
+        body["events"][0].update(code=2009, transition="notice", episode_id=None,
+                                 context={"battery_pct": -1})
+        self.assertEqual(self.post(body).status_code, 400)
+
     def stream_post(self, payload, *, length=True, chunked=False, headers=None):
         stream = io.BytesIO(payload)
         overrides = {"wsgi.input": stream}

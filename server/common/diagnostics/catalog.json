@@ -1,5 +1,5 @@
 {
-  "catalog_version": 5,
+  "catalog_version": 6,
   "codes": [
     {
       "code": 1000,
@@ -23,6 +23,16 @@
             "panic",
             "other"
           ]
+        },
+        "battery_mv": {
+          "type": "integer",
+          "min": 1,
+          "max": 6000
+        },
+        "battery_pct": {
+          "type": "integer",
+          "min": 0,
+          "max": 100
         }
       },
       "notify": false,
@@ -295,6 +305,39 @@
       "context": {},
       "notify": true,
       "journal": "transitions"
+    },
+    {
+      "code": 2009,
+      "symbol": "BATTERY_POWER_OFF",
+      "severity": "info",
+      "oled": [
+        "Battery at power-off"
+      ],
+      "title": "Battery sampled before power-off",
+      "explanation": "A clean PMU power-off was prepared after trip finalization. Battery readings precede journal sealing; a late VBUS return or failed shutdown may cancel power-off.",
+      "recovery": "No action needed. Compare with the next power-on BOOT for a rough parked-drain estimate; missing measurements are unknown.",
+      "context": {
+        "battery_mv": {
+          "type": "integer",
+          "min": 1,
+          "max": 6000
+        },
+        "battery_pct": {
+          "type": "integer",
+          "min": 0,
+          "max": 100
+        },
+        "reason": {
+          "type": "enum",
+          "values": [
+            "idle_battery",
+            "battery_critical",
+            "user_long_press"
+          ]
+        }
+      },
+      "notify": false,
+      "journal": "per_occurrence"
     },
     {
       "code": 3001,

@@ -127,6 +127,8 @@ int main() {
     g_millis += 120000; restartOnLoop(); ++cases;
 
     for (uint8_t reg : {XPOWERS_AXP2101_STATUS1, XPOWERS_AXP2101_STATUS2}) {
+        static uint8_t injectedVbusReg;
+        injectedVbusReg = reg;
         // Both entry and final checks reject unknown even if USB is really
         // present. The final case simulates USB returning without an IRQ.
         world(); setup();
@@ -136,8 +138,12 @@ int main() {
         assert(logCount(VBUS_UNREADABLE) == 1); ++cases;
 
         world(); setup(); PMU.vbusIn = false; gVbusLost = true;
-        failNextRead(reg, 2);
-        g_disk.onUnmount = [] { PMU.vbusIn = true; };
+        // Fail the final VBUS read itself, after the new battery sample's
+        // STATUS1 read. Do not depend on unrelated register-read counts.
+        g_disk.onUnmount = [] {
+            PMU.vbusIn = true;
+            failNextRead(injectedVbusReg);
+        };
         powerOffForVbus();
         assertAwakeRecovery(); assert(!gVbusLost && gVbusRetry == VbusRetry::None);
         assert(logCount(VBUS_UNREADABLE) == 1); ++cases;
@@ -145,7 +151,8 @@ int main() {
         // Returning shutdown exercises recovery seed independently of the
         // successful absent entry and final reads.
         world(); setup(); PMU.vbusIn = false; PMU.failShutdown = true;
-        failNextRead(reg, 3); powerOffForVbus();
+        PMU.onShutdown = [] { failNextRead(injectedVbusReg); };
+        powerOffForVbus();
         assert(PMU.shutdownCalls == 1 && !gVbusLost && gVbusRetry == VbusRetry::Seed);
         assert(!gNetHold && !gNetAbort && !gVbusOffPending && g_disk.mounted && g_lockDepth == 0);
         auto reads = PMU.registerReadCalls[reg];
@@ -157,7 +164,10 @@ int main() {
         // retry corrects battery-only startup, including no-storage mode.
         for (bool degraded : {false, true}) {
             world(); PMU.vbusIn = false; g_disk.failMount = degraded;
-            failNextRead(reg); setup();
+            PMU.onRegisterRead = [](uint8_t readReg) {
+                if (readReg == 0xA4) failNextRead(injectedVbusReg); // after early battery snapshot
+            };
+            setup(); PMU.onRegisterRead = nullptr;
             assert(!gVbusLost && gVbusRetry == VbusRetry::Seed);
             reads = PMU.registerReadCalls[reg];
             for (unsigned i = 0; i < 20; ++i) serviceVbusRecheck();

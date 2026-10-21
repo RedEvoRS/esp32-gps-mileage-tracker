@@ -24,6 +24,7 @@ static void world(bool sd, bool flash, EventLog::Config config = EventLog::Confi
     SD.dirs.clear(); LittleFS.dirs.clear();
     g_lockDepth = 0; gFsDemand = 0; gNetHold = gNetBusy = gNetAbort = false;
     gJournalSealRequested = gJournalSealDone = gJournalSealOk = false;
+    gPowerOffEventPending = false;
     gJournalStarted = gJournalSealing = gJournalBootReported = false;
     gJournal.~EventLog(); new (&gJournal) EventLog(sd ? &gSdJournalFs : nullptr, flash ? &gFlashJournalFs : nullptr, config);
     gJournalBoot = newJournalBoot();
@@ -222,7 +223,7 @@ int main() {
     assert(!gJournalStarted && bootId == gJournalBoot.id);
     submit(); serviceJournal();
     xSemaphoreTake(gFsMutex, 0);
-    assert(gJournal.nextBatch(batch) && batch.count == 3);
+    assert(gJournal.nextBatch(batch) && batch.count == 4);
     for (size_t i = 0; i < batch.count; ++i) assert(bootId == batch.ids[i].bootId);
     xSemaphoreGive(gFsMutex);
     if (debugMode()) {

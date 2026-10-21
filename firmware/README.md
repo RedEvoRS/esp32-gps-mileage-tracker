@@ -1,5 +1,14 @@
 # Firmware
 
+Stage 4 records an early BOOT battery reading and one INFO battery sample
+before clean PMU power-off, then uploads them with the existing diagnostics.
+Update the server to catalog v6 **before** installing this firmware; older
+firmware remains compatible with the new server. No meter or new viewer UI is
+needed. The read-only helper and interpretation guide are in
+[Reading parked battery drain](../DIAGNOSTICS.md#reading-parked-battery-drain-without-a-meter).
+Collect at least three parked intervals of eight hours or longer; voltage and
+PMU percentage give rough estimates, not a measured off-state current.
+
 The firmware targets the **LilyGO T-Beam Supreme with u-blox MAX-M10S GPS**
 (not the L76K version), using a **SanDisk 32 GB Max Endurance microSD card**
 for trips. LilyGO's [T-Beam Supreme hardware guide](https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/docs/en/t_beam_supreme/t_beam_supreme_hw.md)

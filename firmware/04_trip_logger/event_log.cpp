@@ -45,12 +45,15 @@ using Type = EventContext::Type;
 #define HTTP(code) NUMBER(code, "http_status", 100, 599), ENUM(code, "target", "trip|events")
 const Field fields[] = {
     ENUM(1000, "reset_reason", "power_on|deep_sleep|software|watchdog|brownout|panic|other"),
+    NUMBER(1000, "battery_mv", 1, 6000), NUMBER(1000, "battery_pct", 0, 100),
     NUMBER(1007, "free_bytes", 0, 1048576),
     NUMBER(2002, "battery_mv", 0, 6000), NUMBER(2003, "battery_mv", 0, 6000),
     NUMBER(2004, "temperature_mc", -50000, 150000), NUMBER(2005, "temperature_mc", -50000, 150000),
     NUMBER(2007, "clock_count", 0, 27), NUMBER(2007, "attempt_count", 1, 3),
     ENUM(2007, "recovery_state", "not_needed|recovered|sda_stuck|scl_stuck"),
     BOOL(2007, "pmu_ready"), BOOL(2007, "wire_end_failed"),
+    NUMBER(2009, "battery_mv", 1, 6000), NUMBER(2009, "battery_pct", 0, 100),
+    ENUM(2009, "reason", "idle_battery|battery_critical|user_long_press"),
     NUMBER(3001, "elapsed_ms", 0, INT64_MAX), NUMBER(3002, "elapsed_ms", 0, INT64_MAX),
     NUMBER(3002, "satellites", 0, 255),
     NUMBER(3003, "message_class", 0, 255), NUMBER(3003, "message_id", 0, 255),
