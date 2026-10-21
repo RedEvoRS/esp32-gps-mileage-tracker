@@ -20,8 +20,9 @@ shutdown; Stage 2 checks it before the GPS and trip-logging stages.
 All four stages run on the Supreme. On 2026-10-21 (UTC), Stage 4's debug
 build uploaded four real trips from microSD to the deployed server, then
 delivered all 115 pending diagnostic events and a current snapshot.
-LittleFS uploads, production-build uploads, server errors (401/413/5xx)
-and server-down behaviour remain untested on the Supreme.
+Uploads with debug mode off and server-down retry were also verified on
+2026-10-21 (UTC). LittleFS uploads and server errors (401/413/5xx) remain
+untested on the Supreme.
 
 **Have a T-Beam V1.2?** That board is retired. Its last firmware and full
 instructions are on the frozen [`tbeam-v1.2` branch](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/tree/tbeam-v1.2),
@@ -425,7 +426,15 @@ first real uploads from microSD succeeded on 2026-10-21 (UTC): four trips
 received HTTP 200, were deleted from the card and appeared in the viewer.
 This used main commit `a358eaf`'s earlier Stage 4 debug firmware, flashed at
 20:39Z on 2026-10-20 with real settings and one-time diagnostics enrollment.
-Uploads from LittleFS and with debug off remain untested on the Supreme.
+A trip upload with debug off also succeeded, on the former production build
+`v0.05+615a13ffae` (the server-down test below). `v0.06` has so far uploaded
+diagnostics, but no trips yet. Since v0.06 there is one firmware build: debug
+mode starts off at every power-on and can be toggled by holding BOOT and
+tapping POWER. On 2026-10-21 (UTC), with `v0.05+615a13ffae`, ingest was
+stopped with a test trip queued. Both upload attempts returned `HTTP -1` (connection failure),
+and the trip stayed queued. The next retry after ingest restarted received
+HTTP 200 and deleted the local file. LittleFS uploads remain untested on
+the Supreme.
 
 USB insertion powered the board on at 04:14:50Z on 2026-10-21. Boot was
 clean, GPS configured on attempt 1, and the FAT32 card had 29.71 GiB free.
@@ -667,7 +676,9 @@ How it behaves once flashed:
   and were deleted locally. A scan at 04:35:35Z missed the access point;
   its 60 s retry led to the current trip's upload at 04:36:41Z. A scan
   miss at the edge of range can delay an upload; it need not mean the
-  settings are wrong. Server errors (401/413/5xx) and server-down handling
+  settings are wrong. Server-down retry was also verified on 2026-10-21
+  (UTC): two `HTTP -1` failures kept the trip queued, then HTTP 200 after
+  ingest restarted deleted the local file. Server errors (401/413/5xx)
   described here are code behaviour, still untested on the Supreme.
 - **Power loss:** after USB power has been absent for 10 s, the firmware
   finalizes the current trip. Once idle on battery for 10 minutes, it
@@ -725,8 +736,10 @@ Watch the Serial Monitor (115200) for state transitions:
 `Upload /trips/t000006.gpx (142443 B, 2.7 s) -> HTTP 200 (deleted)`.
 The local SD file was deleted, and the trip appeared in the viewer.
 
-The failure handling below describes the code; server errors (401/413/5xx)
-and server-down behaviour remain untested on the Supreme.
+Server-down retry was verified on 2026-10-21 (UTC): the trip stayed queued
+after two `HTTP -1` failures and uploaded with HTTP 200 after ingest
+restarted. Server errors (401/413/5xx) below describe the code and remain
+untested on the Supreme.
 If a trip does not appear, first confirm `Trip started` and `Trip finalized`:
 an active or discarded trip cannot upload. `HTTP 401` means the upload
 token does not match. A negative result means a connection or transfer
@@ -977,8 +990,9 @@ Successful diagnostics uploads print nothing on serial. Confirm them in
 the ingest log or Device health. That build showed `Firmware: Not reported`
 because it predates version reporting; stamped builds report their version
 number plus Git commit (see step 6). The behaviour below describes
-the implementation; this test does not establish LittleFS or
-production-build uploads, or server-failure handling on the Supreme.
+the implementation; LittleFS uploads and server errors (401/413/5xx)
+remain untested on the Supreme. Trip uploads with debug mode off and
+server-down retry were verified separately (see [Stage 4](#stage-4-the-trip-logger)).
 
 Stage 4 carries a board-independent `event_log.h` / `event_log.cpp` module with
 a fixed producer queue, CRC-protected rolling segments, durable acknowledgment
@@ -1089,7 +1103,9 @@ The network task reserves 12,288 bytes, matching the Stage 4 brief. During
 and after the real SD uploads on 2026-10-21 (UTC), the debug build's
 minimum free stack was **7,436 bytes**, with GPS logging active. This
 measures the successful-upload path; it does not establish headroom for
-server errors, server-down behaviour, LittleFS or production-build uploads.
+server errors, server-down retries, LittleFS uploads or debug mode off.
+Trip uploads with debug mode off and server-down retry were verified
+separately; those results do not establish their heap/stack headroom.
 Serial diagnostics report the task's lifetime minimum free stack at startup,
 after each GPX HTTP upload (including failures), and after each network cycle.
 Diagnostic requests sample the watermark silently between batches.

@@ -22,9 +22,11 @@ them in the ingest log or Device health. That build showed
 stamped with `tools/stamp_firmware_version.py` report their version number
 plus Git commit.
 
-This confirms SD delivery in the debug build. LittleFS uploads,
-production-build uploads, server errors (401/413/5xx) and server-down
-behaviour remain untested on the Supreme. Setup steps are in
+This confirms SD diagnostics delivery in the earlier debug build. Trip
+uploads with debug mode off and server-down retry were verified separately
+on 2026-10-21 (UTC): two `HTTP -1` failures kept the trip queued, then HTTP
+200 after ingest restarted deleted the local file. LittleFS uploads and
+server errors (401/413/5xx) remain untested on the Supreme. Setup steps are in
 [README.md](README.md) and [DEPLOY_DEBIAN.md](DEPLOY_DEBIAN.md) Step 8.
 
 The tracker normally runs unattended in a car. A serial console cannot explain

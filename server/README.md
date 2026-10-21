@@ -15,9 +15,11 @@ the viewer listed all four with distances. The board deleted each local
 file after HTTP 200. For the new drive, the board reported 11.40 mi and
 the server reported 11.41 mi; the two calculate distance separately.
 Diagnostics followed in two HTTP 200 requests, storing all 115 pending
-events and a current snapshot visible in Device health. LittleFS uploads,
-production-build uploads, server errors (401/413/5xx) and server-down
-behaviour remain untested on the Supreme.
+events and a current snapshot visible in Device health. Trip uploads with
+debug mode off and server-down retry were also verified on 2026-10-21
+(UTC): two `HTTP -1` failures kept the trip queued, then HTTP 200 after
+ingest restarted deleted the local file. LittleFS uploads and server errors
+(401/413/5xx) remain untested on the Supreme.
 
 It runs as two default Docker containers, with two optional services, all
 defined in `docker-compose.yml`:

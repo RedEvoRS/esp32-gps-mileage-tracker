@@ -611,8 +611,10 @@ version number plus Git commit. Enrollment ID 1 was consumed; the Step 8 command
 above had returned high-water 0 because the database did not yet exist.
 
 The internal LittleFS store was mounted but had no trips to upload.
-LittleFS uploads, production-build uploads, server errors (401/413/5xx)
-and server-down behaviour remain untested on the Supreme.
+Uploads with debug mode off and server-down retry were also verified on
+2026-10-21 (UTC): two `HTTP -1` failures kept the trip queued, then HTTP 200
+after ingest restarted deleted the local file. LittleFS uploads and server
+errors (401/413/5xx) remain untested on the Supreme.
 
 Then follow [README step 4: Check it works](README.md#4-check-it-works)
 and [step 5: Put it in the car](README.md#5-put-it-in-the-car). If storage
