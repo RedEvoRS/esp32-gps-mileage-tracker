@@ -802,8 +802,11 @@ Things to know:
   Production does not render catalog OLED text; catalog v5's text
   validation rules still apply. New
   ERROR/CRITICAL episodes show once even while moving; unresolved faults
-  remind at the next parked opportunity. Cards last 10 seconds at maximum
-  contrast, then SH1106 power save turns the panel off. A short press of
+  remind at the next parked opportunity. Cards last 30 seconds at maximum
+  contrast, then SH1106 power save turns the panel off. `DISPLAY_CARD_MS`
+  sets this duration in milliseconds (default `30000`, build override
+  `-DDISPLAY_CARD_MS=10000` for 10 seconds). The default is planned to return
+  to 10 seconds after the first road tests. A short press of
   **POWER** shows a status card in any motion state after a verified PMU
   INTSTS1..3 batch, outside degraded mode. Only production enables the
   short-key IRQ in the shared enabled/batch mask. Long press keeps its

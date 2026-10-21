@@ -1022,7 +1022,10 @@ the timing, motion, queue, POWER, shutdown and E6001 policies below are unchange
 - **Debug on:** the existing continuously lit bench/shakedown page: FSM,
   satellites heard/used, GPS AGC, fix/HDOP, storage, queues, network and battery.
 - **Debug off (production):** off by default using SH1106 power save, with
-  steady cards lasting 10 seconds. No flashing, scrolling or always-on content.
+  steady cards lasting 30 seconds by default (`DISPLAY_CARD_MS=30000`, in
+  milliseconds; build override `-DDISPLAY_CARD_MS=10000` for 10 seconds).
+  The default is planned to return to 10 seconds after the first road tests.
+  No flashing, scrolling or always-on content.
   The adapter uses maximum SH1106 contrast (255), per #166: the panel is about
   100 nits and lights only briefly. Current and the revised large-font layout
   still need bench checks. An always-on design would need a separate burn-in policy.
@@ -1047,16 +1050,18 @@ Production policy:
   Unknown suppress routine content. Finalization back to IDLE queues another
   status card for Parked. Entering Parked with unresolved faults reminds once.
 - Every new accepted ERROR/CRITICAL condition episode queues one ErrorCard in
-  any motion state. Each gets 10 seconds, in observation order. Repeats cannot
-  extend or re-light it. The 64-entry queue drops excess new episodes once;
+  any motion state. Each gets `DISPLAY_CARD_MS` (default 30 seconds), in
+  observation order. Repeats cannot extend or re-light it.
+  The 64-entry queue drops excess new episodes once;
   it never loops through unresolved faults. WARNING/INFO cannot wake a card.
 - A short POWER press explicitly requests a StatusCard in any motion state.
   Only production includes `XPOWERS_AXP2101_PKEY_SHORT_IRQ` in the shared
   enabled/batch mask and tests it with `irq.has(...)` after a known batch,
   outside degraded mode. Unknown batches request no card. Long press keeps
   the existing clean battery power-off/USB-ignore meaning. A new error preempts a routine status card;
-  a user request can replace the current card and holds its full 10 seconds
-  before queued errors resume. Routine cards blank if motion
+  a user request can replace the current card and holds its full
+  `DISPLAY_CARD_MS` (default 30 seconds) before queued errors resume.
+  Routine cards blank if motion
   stops being Parked. Card text is captured when shown and stays steady.
 - StatusCard: `Sats: N` or `Sats: --`, then `OK` when no faults are active,
   otherwise only active warning-and-above `E####` codes, most severe first

@@ -76,6 +76,12 @@ for test in test_display_model test_production_display_layout test_production_di
     "$build/$test.exe" || status=1
 done
 
+echo "== test_display_model (DISPLAY_CARD_MS=10000)"
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -pedantic \
+    -DDISPLAY_CARD_MS=10000 -I"$here/../04_trip_logger" \
+    "$here/test_display_model.cpp" -o "$build/test_display_model_10s.exe"
+"$build/test_display_model_10s.exe" || status=1
+
 u8g2="${U8G2_DIR:-$HOME/Documents/Arduino/libraries/U8g2}"
 if [ -f "$u8g2/src/clib/u8g2_fonts.c" ]; then
     "${PYTHON:-python}" "$here/check_display_fonts.py" "$u8g2" || status=1

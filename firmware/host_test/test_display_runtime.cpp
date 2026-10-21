@@ -63,8 +63,9 @@ int main() {
     faultWorld(); beginProductionDisplay();
     diagnosticFix(1000, 100, 0); serviceProductionDisplay();
     assert(gProductionLastOutput.card == display::Card::StatusCard);
-    g_millis += 10000; serviceProductionDisplay(); assert(!gProductionLastOutput.powered);
+    g_millis += display::DisplayModel::kDurationMs; serviceProductionDisplay(); assert(!gProductionLastOutput.powered);
     // Stale speed is Unknown and cannot consume a newly queued boot status.
+    g_millis += 2501; // exceed speed freshness even with a short card setting
     gDisplayModel = display::DisplayModel(); serviceProductionDisplay();
     assert(!gProductionLastOutput.powered);
     // VBUS absence is Parked even without a trusted/fresh fix.
@@ -75,9 +76,9 @@ int main() {
     gNetFaults.event(5004, g_millis).enumeration("target", "trip").integer("http_status", 401).condition(true);
     serviceProductionDisplay();
     assert(gProductionLastOutput.errorCode == 4003);
-    g_millis += 10000; serviceProductionDisplay();
+    g_millis += display::DisplayModel::kDurationMs; serviceProductionDisplay();
     assert(gProductionLastOutput.errorCode == 5004);
-    g_millis += 10000; serviceProductionDisplay(); assert(!gProductionLastOutput.powered);
+    g_millis += display::DisplayModel::kDurationMs; serviceProductionDisplay(); assert(!gProductionLastOutput.powered);
     // The trip-network snapshot is read on core 1 as well as core-1 faults.
     assert(gDisplayConditionCounts[1] && gDisplayConditions[1][3].episode);
     ++cases;
