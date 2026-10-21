@@ -448,7 +448,11 @@ stop the viewer, back up the database, delete rows from `geocode_cache` using
 SQLite, then restart. A future lookup will query the configured provider again.
 
 Requests are serialized across workers, with at least 1.1 seconds between calls
-and a five-minute cooldown on provider failure (longer `Retry-After` values are
+by default. Set `VIEWER_GEOCODER_INTERVAL` in `viewer.env` to change this gap
+(0.1 to 60 seconds); leaving it unset or empty keeps the default, which suits
+providers with a one-request-per-second policy. Use values below 1 second only
+with self-hosted Nominatim or a provider that explicitly permits them.
+Provider failures trigger a five-minute cooldown (longer `Retry-After` values are
 honoured up to seven days). There are no automatic retries,
 redirects, or ambient HTTP proxies. Responses have a 64 KiB size limit and a
 ten-second monotonic deadline checked between reads, with five-second socket

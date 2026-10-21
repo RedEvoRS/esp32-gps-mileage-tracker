@@ -73,6 +73,7 @@ class EndpointPlaceTests(unittest.TestCase):
             "DISPLAY_TZ": "UTC",
             "VIEWER_GEOCODER_URL": cls.provider_url,
             "VIEWER_GEOCODER_USER_AGENT": "MileageTests/1.0",
+            "VIEWER_GEOCODER_INTERVAL": "",
         }):
             cls.viewer = load_service("mileage-viewer")
         cls.month = cls.viewer.DATA_ROOT / "2026-10"
@@ -221,6 +222,51 @@ class EndpointPlaceTests(unittest.TestCase):
         self.assertEqual(self.viewer.GEOCODER._retry_delay("bad"), 300)
         with patch("geocoding.time.time", return_value=0):
             self.assertEqual(self.viewer.GEOCODER._retry_delay("Thu, 01 Jan 1970 01:00:00 GMT"), 3600)
+
+    def test_default_interval_is_applied_to_success_gate(self):
+        for i, value in enumerate((None, "", " ")):
+            with self.subTest(value=value), patch.dict(os.environ, {"VIEWER_GEOCODER_URL": self.provider_url}):
+                if value is None:
+                    os.environ.pop("VIEWER_GEOCODER_INTERVAL", None)
+                else:
+                    os.environ["VIEWER_GEOCODER_INTERVAL"] = value
+                geocoder = self.viewer.Geocoder(self.viewer.DB_PATH)
+                self.reset_gate()
+                with patch("geocoding.time.time", return_value=10000):
+                    self.assertTrue(geocoder.lookup(i, i + 2))
+                with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn:
+                    self.assertEqual(conn.execute("SELECT next_allowed FROM geocode_gate").fetchone()[0], 10001.1)
+
+    def test_custom_interval_is_enforced_across_workers(self):
+        with patch.dict(os.environ, {"VIEWER_GEOCODER_URL": self.provider_url, "VIEWER_GEOCODER_INTERVAL": "0.5"}):
+            geocoder = self.viewer.Geocoder(self.viewer.DB_PATH)
+            other_worker = self.viewer.Geocoder(self.viewer.DB_PATH)
+        with patch("geocoding.time.time", return_value=10000):
+            self.assertTrue(geocoder.lookup(1, 3))
+        with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn:
+            self.assertEqual(conn.execute("SELECT next_allowed FROM geocode_gate").fetchone()[0], 10000.5)
+        with patch("geocoding.time.time", return_value=10000.49):
+            with self.assertRaises(self.viewer.GeocodeError) as error:
+                other_worker.lookup(2, 4)
+            self.assertEqual(error.exception.status, 429)
+        self.assertEqual(len(self.received), 1)
+        with patch("geocoding.time.time", return_value=10000.5):
+            self.assertTrue(other_worker.lookup(2, 4))
+        self.assertEqual(len(self.received), 2)
+
+    def test_interval_range_includes_both_limits(self):
+        for value in ("0.1", "60"):
+            with self.subTest(value=value), patch.dict(os.environ, {"VIEWER_GEOCODER_INTERVAL": value}):
+                self.assertEqual(self.viewer.Geocoder(self.viewer.DB_PATH).interval, float(value))
+
+    def test_invalid_interval_rejected_even_when_disabled(self):
+        for url in ("", self.provider_url):
+            for value in ("abc", "nan", "inf", "-inf", "-1", "0", "0.05", "61"):
+                with self.subTest(enabled=bool(url), value=value), patch.dict(os.environ, {
+                    "VIEWER_GEOCODER_URL": url, "VIEWER_GEOCODER_INTERVAL": value,
+                }):
+                    with self.assertRaisesRegex(RuntimeError, "VIEWER_GEOCODER_INTERVAL.*finite.*0.1 to 60"):
+                        self.viewer.Geocoder(self.viewer.DB_PATH)
 
     def test_provider_text_is_escaped_and_only_saved_destination_is_exported(self):
         hostile = '=HYPERLINK("x")<img src=x onerror=alert(1)>'

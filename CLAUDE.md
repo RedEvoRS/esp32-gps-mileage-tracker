@@ -260,6 +260,7 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   `annotations.db` (SQLite) in the `viewer-db` volume. Optional `geocoding.py`
   sends a selected endpoint to an explicitly configured provider only on an
   authenticated, CSRF-protected click and caches suggestions in that database.
+  Configurable interval, default 1.1 s.
   No lookup on page views, exports or uploads; never use public OSMF Nominatim.
   `/device-health` reads
   diagnostics schema v1 via `mode=ro` with a 2 s busy timeout, shows contact and
