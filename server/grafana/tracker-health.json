@@ -4,7 +4,7 @@
       "name": "DS_PROMETHEUS",
       "label": "Prometheus",
       "description": "Prometheus data source scraping the tracker monitor",
-      "type": " datasource",
+      "type": "datasource",
       "pluginId": "prometheus",
       "pluginName": "Prometheus"
     }
