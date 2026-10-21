@@ -88,8 +88,7 @@ tools/generate_error_catalog.py     Generates sketch-local diag_catalog.h
 DIAGNOSTICS.md                     Framework reference and issue delivery map
 .github/workflows/audit-tests.yml   CI: PII scan + server tests + firmware host tests
 .github/dependabot.yml              Dependabot: monthly pip, Docker and Actions bumps
-CODE_REVIEW_2026-06-09.md, AUDIT_2026-08-04.md, AUDIT_2026-10-05.md,
-INDEPENDENT_AUDIT_2026-10-05.md      Review history (see Where Status Lives)
+docs/history/                     Review history (see Where Status Lives)
 ```
 
 ## Where Status Lives
@@ -107,8 +106,8 @@ names no issue numbers on purpose, because they go stale; keep it that way.
 - **Picking what's next:** look at the open issues, favouring whatever
   blocks deploying the server or road-testing the tracker, then severity.
 - **Closed issues** record what was fixed and why. The audit docs
-  (`CODE_REVIEW_2026-06-09.md` → `AUDIT_2026-08-04.md` →
-  `AUDIT_2026-10-05.md` → `INDEPENDENT_AUDIT_2026-10-05.md`) record the
+  (`docs/history/CODE_REVIEW_2026-06-09.md` → `docs/history/AUDIT_2026-08-04.md` →
+  `docs/history/AUDIT_2026-10-05.md` → `docs/history/INDEPENDENT_AUDIT_2026-10-05.md`) record the
   findings and V1.2 bench results as they were at the time.
 - **History and visibility:** this repo starts from a clean snapshot
   taken 2026-10-13. Earlier commits, PRs and closed issues stay in a

@@ -1,5 +1,10 @@
 # Code Review — 2026-06-09
 
+> This is a historical record, kept as written. It covers the retired T-Beam V1.2 and the code as it was then.
+> Its pin, power-rail and storage details do not apply to the T-Beam Supreme.
+> Any PR numbers, commit hashes and branch names refer to the project's earlier private repository and will not resolve here.
+> For current status, see this repository's GitHub issues; see the [history index](README.md) for context.
+
 Full review of Stage 4 firmware, ingest service, viewer service, and Docker
 config, ahead of deployment and the on-hardware shakedown. Both server
 services were exercised end-to-end with the Flask test client (auth, upload,

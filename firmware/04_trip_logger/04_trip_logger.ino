@@ -40,7 +40,7 @@
 // do that pass before trusting it in the car (see the README).
 // 2026-06-09 review fixes: per-chunk FS locking during upload, battery
 // idle deep-sleep, ARMING-phase point capture, stationary-jitter distance
-// gate, fix-loss trip finalization. See CODE_REVIEW_2026-06-09.md.
+// gate, fix-loss trip finalization. See ../../docs/history/CODE_REVIEW_2026-06-09.md.
 // =================================================================
 
 #include <Wire.h>
