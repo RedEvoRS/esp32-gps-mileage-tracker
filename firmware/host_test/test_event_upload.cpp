@@ -125,12 +125,37 @@ int main(int argc, char** argv) {
     gNetFaults.event(5008, millis()).enumeration("target", "trip").integer("http_status", 503).condition(true);
     gEventFaults.event(5008, millis()).enumeration("target", "events").integer("http_status", 503).condition(true);
     assert(eventSnapshot());
+    assert(std::strstr(gEventBuffers->snapshot,
+        (std::string("\"firmware_version\":\"") + firmware::kVersion + "\"").c_str()));
     assert(std::strstr(gEventBuffers->snapshot, "\"5001\":5"));
     assert(std::strstr(gEventBuffers->snapshot, "\"active\":[{"));
     assert(std::strstr(gEventBuffers->snapshot, "\"observed\":["));
     assert(eventLock()); gJournal.service(16); eventUnlock(); drainEvents();
     assert(g_httpBodies[0].find("\"code\":5008") != std::string::npos);
     std::puts("Event upload: atomic task snapshots, active/observed merge and E5001 counter passed");
+
+    // Bound the snapshot for all 64 slots, maximum numeric widths, and the
+    // longest allowed version. Synthetic future codes need not be catalogued:
+    // already accepted episodes are published without submitting new events.
+    uploadWorld();
+    RuntimeFaults::Condition maximum[64] = {};
+    gLoopFaults.~RuntimeFaults(); new (&gLoopFaults) RuntimeFaults(gJournal, maximum, 64);
+    for (unsigned i = 0; i < 64; ++i) {
+        auto& slot = maximum[i];
+        slot.code = 60000 + i; slot.observed = slot.desired = true;
+        slot.episode = kMaxEventInteger; slot.acceptedMs = millis();
+        gLoopFaults.event(slot.code, millis()).condition(true);
+    }
+    gJournalBoot.counter = gContactUptime = kMaxEventInteger;
+    assert(enrollAt(kMaxEventInteger - 1));
+    assert(eventSnapshot() && gEventObservationCount == 64);
+    // dropped_events and E5001 are currently zero (one digit); budget 19
+    // digits for each, and the longer "littlefs" backend instead of "sd".
+    size_t worstSnapshot = std::strlen(gEventBuffers->snapshot) +
+        32 - std::strlen(firmware::kVersion) + 2 * 18 + 6;
+    assert(worstSnapshot < sizeof(gEventBuffers->snapshot));
+    assert(eventBody(0) && eventBody(0) <= kRequestBytes);
+    std::printf("Event upload: 64-slot snapshot with maximum version <= %zu/6144 bytes passed\n", worstSnapshot);
 
     // Exercise the complete-envelope boundary independently of today's short
     // catalog records. Whitespace padding is valid JSON and canonicalizes back

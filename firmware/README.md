@@ -254,6 +254,10 @@ unless you select a version.
 
 ### Upload a sketch and read its messages
 
+Before compiling Stage 4, run `python tools/stamp_firmware_version.py` from
+the repository root. Otherwise Device health shows `unversioned` (`unversioned+dbg`
+in the default debug build). Run it again before each build to refresh the commit.
+
 A *sketch* is an Arduino program, stored in an `.ino` file inside a folder
 with the same name. *Firmware* is the program installed on the board.
 *Uploading* or *flashing* compiles the sketch and writes that firmware to

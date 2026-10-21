@@ -124,6 +124,9 @@ jobs:
           arduino-cli core install "esp32:esp32@$ESP32_CORE_VERSION" --additional-urls "$ESP32_INDEX_URL"
           arduino-cli lib update-index
           arduino-cli lib install "XPowersLib@$XPOWERS_VERSION" "TinyGPSPlus@$TINYGPS_VERSION" "U8g2@$U8G2_VERSION"
+      # rev-parse HEAD works in the default shallow checkout; no tags needed.
+      - name: Stamp Stage 4 firmware version
+        run: python3 tools/stamp_firmware_version.py
       - name: Compile all four sketches
         shell: bash
         run: |
@@ -159,10 +162,11 @@ jobs:
               size_args=(--build-property "upload.maximum_size=$max_size")
             fi
             arduino-cli compile --fqbn "$FQBN" --warnings default --jobs 2 \
-              "${size_args[@]}" "firmware/$sketch"
+              "${size_args[@]}" --build-property 'compiler.cpp.extra_flags=-DFIRMWARE_VERSION_REQUIRE_STAMP' \
+              "firmware/$sketch"
             if [ "$sketch" = 04_trip_logger ]; then
               arduino-cli compile --fqbn "$FQBN" --warnings default --jobs 2 \
-                "${size_args[@]}" --build-property 'compiler.cpp.extra_flags=-DDISPLAY_DEBUG=0' \
+                "${size_args[@]}" --build-property 'compiler.cpp.extra_flags=-DFIRMWARE_VERSION_REQUIRE_STAMP -DDISPLAY_DEBUG=0' \
                 "firmware/$sketch"
             fi
             echo "::endgroup::"

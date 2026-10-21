@@ -27,6 +27,7 @@ with tempfile.TemporaryDirectory(prefix="event-upload-") as temp:
         counts.append(len(request["events"]))
         assert len(raw) <= 32768 and len(request["events"]) <= 64
         snapshot = request["checkin"]
+        assert snapshot["firmware_version"]
         mixed_boots |= any(event["boot_id"] != snapshot["boot_id"] for event in request["events"])
         counters |= snapshot.get("counters", {}).get("5001") == 5
         active |= bool(snapshot["active"])

@@ -130,9 +130,9 @@ static bool eventSnapshot() {
     if (!allocated) return false;
     diagnostics::JsonWriter json{gEventBuffers->snapshot, sizeof(gEventBuffers->snapshot)};
     json.add("{\"boot_id\":\"%s\",\"status_sequence\":%llu,\"uptime_ms\":%llu,"
-             "\"boot_counter\":%llu,\"storage_backend\":\"%s\",\"dropped_events\":%llu,\"active\":[",
+             "\"boot_counter\":%llu,\"firmware_version\":\"%s\",\"storage_backend\":\"%s\",\"dropped_events\":%llu,\"active\":[",
              gJournalBoot.id, (unsigned long long)revision, (unsigned long long)contactUptime(),
-             (unsigned long long)gJournalBoot.counter,
+             (unsigned long long)gJournalBoot.counter, firmware::kVersion,
              stats.backend == diagnostics::EventLog::Backend::Sd ? "sd" :
              stats.backend == diagnostics::EventLog::Backend::LittleFs ? "littlefs" : "ram",
              (unsigned long long)stats.dropped);

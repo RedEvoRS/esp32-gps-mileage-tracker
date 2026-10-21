@@ -306,6 +306,12 @@ Only continuing conditions can be active. Optional fields are `firmware_version`
 `counters` maps decimal catalog counter codes (currently only `"5001"`) to
 boot-local totals, with at most 16 entries. They are not independent events.
 
+Stage 4 sends `firmware_version`: the ten-character Git commit plus `-dirty`
+for tracked edits and `+dbg` when `DISPLAY_DEBUG` is enabled. Run
+`python tools/stamp_firmware_version.py` before compiling; without the generated
+header it reports `unversioned` (with `+dbg` in debug builds). The boot banner,
+new events and current snapshot use the same 1–32 character protocol token.
+
 `observed` is an optional, unique list of at most 64 condition codes evaluated
 in this boot. When present, every active code must be included. An observed but
 inactive code is clear. Omitted codes are unknown, not proof of recovery. When
@@ -412,7 +418,9 @@ before appending again. Reconstruct EventLog after external changes or replacing
 remounting media; do not reuse cached state for a different card.
 
 - `begin(boot_id, boot_counter, firmware_version)` accepts caller-owned identity
-  before tasks start. The caller supplies a new random boot ID on every wake;
+  before tasks start. Stage 4 passes its build version constant, also used by
+  the check-in snapshot and boot banner; old journal records keep their original
+  version. The caller supplies a new random boot ID on every wake;
   NVS boot-counter persistence belongs to that integration. Event sequences
   start at 1, are assigned only on acceptance, and stop at SQLite's signed
   64-bit maximum. They are never regenerated on retry or rollover.
@@ -836,11 +844,12 @@ EventLog exports unchanged records in batches of at most **64**, with at most
 30 KiB for the events array. The worker subtracts the actual snapshot/envelope
 size from the **32 KiB complete-body cap** and checks the finished body again.
 Old records keep their original boot IDs, sequences, UTC and JSON, alongside
-a snapshot of this boot. The snapshot includes boot identity/counter, extended
-awake uptime, active episodes, observed codes, backend, dropped count and the
-boot-local E5001 counter. Unobserved conditions stay unknown. Duplicate network
-codes across trip/events targets merge into one active condition when either
-target is unhealthy; clearing one target does not clear the other. The optional
+a snapshot of this boot. The snapshot includes firmware version, boot
+identity/counter, extended awake uptime, active episodes, observed codes, backend,
+dropped count and the boot-local E5001 counter. Unobserved conditions stay unknown.
+Duplicate network codes across trip/events targets merge into one active
+condition when either target is unhealthy; clearing one target does not clear
+the other. The optional
 `pending_events` count is omitted to avoid a full journal scan per upload.
 
 One newly persisted revision is allocated per drain opportunity (normally no
