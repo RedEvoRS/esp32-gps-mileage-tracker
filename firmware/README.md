@@ -8,10 +8,11 @@ USB, power and GPS before installing the trip logger for use in the car.
 The power-management unit (PMU) controls the board's rails, battery and
 shutdown; Stage 2 checks it before the GPS and trip-logging stages.
 
-All four stages run on the Supreme. Stage 4 has recorded real drives on
-the card. The server is deployed, but uploading from the board has **not
-been tested end to end**.
-<!-- TODO(first upload): Replace the upload status with the date and scope of the first successful board-to-deployed-server upload. -->
+All four stages run on the Supreme. On 2026-10-21 (UTC), Stage 4's debug
+build uploaded four real trips from microSD to the deployed server, then
+delivered all 115 pending diagnostic events and a current snapshot.
+LittleFS uploads, production-build uploads, server errors (401/413/5xx)
+and server-down behaviour remain untested on the Supreme.
 
 **Have a T-Beam V1.2?** That board is retired. Its last firmware and full
 instructions are on the frozen [`tbeam-v1.2` branch](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/tree/tbeam-v1.2),
@@ -155,9 +156,10 @@ a card. Stage 4 has since recorded two real drives on the card.
     5–6 hours of driving.
 - **Upload behaviour in the code:** the logger attempts finished trips from
   both the card and internal flash, including trips left by a boot without
-  a card. It deletes each only after an accepted server response. The
-  server is deployed, but board-to-server upload has not been tested end to end.
-  <!-- TODO(first upload): After a successful real upload, record the verification date and confirm uploads from the card; keep internal-flash upload unconfirmed unless also tested. -->
+  a card. It deletes each only after an accepted server response. On
+  2026-10-21 (UTC), four trips uploaded from the card with HTTP 200 and
+  were deleted locally. Internal LittleFS was mounted but held no trips;
+  uploading from that fallback remains untested on the Supreme.
 - **Power cuts:** FAT copes with a sudden power loss worse than LittleFS
   does. The 18650 is what lets the logger close its files and unmount the
   card cleanly after the car's USB power goes away, so keep it fitted.
@@ -373,10 +375,33 @@ socket.
 ### Stage 4: The trip logger
 
 The `04_trip_logger/` sketch detects trips, accumulates mileage and writes
-GPX files to the microSD card, with internal LittleFS as fallback. Its WiFi
-upload code is ready for testing against the deployed home server; a real
-board-to-server upload is still unverified.
-<!-- TODO(first upload): Replace this status with the successful test date and the storage backend actually uploaded. -->
+GPX files to the microSD card, with internal LittleFS as fallback. Its
+first real uploads from microSD succeeded on 2026-10-21 (UTC): four trips
+received HTTP 200, were deleted from the card and appeared in the viewer.
+This used main commit `a358eaf`'s Stage 4 debug build (the default
+`DISPLAY_DEBUG` setting), flashed at 20:39Z on 2026-10-20 with real settings
+and one-time diagnostics enrollment. Uploads from LittleFS and with
+`DISPLAY_DEBUG=0` remain untested on the Supreme.
+
+USB insertion powered the board on at 04:14:50Z on 2026-10-21. Boot was
+clean, GPS configured on attempt 1, and the FAT32 card had 29.71 GiB free.
+The journal reported `sd, 115 unacknowledged records`. The new trip started
+at 04:15:21Z. At home, between 04:32:15Z and 04:32:27Z, three older,
+finished trips uploaded while GPS logging continued. Upload order follows
+the card's directory order, not trip number:
+
+```text
+Upload /trips/t000001.gpx (16038 B, 0.8 s) -> HTTP 200 (deleted)
+Upload /trips/t000005.gpx (176229 B, 9.1 s) -> HTTP 200 (deleted)
+Upload /trips/t000004.gpx (158341 B, 3.1 s) -> HTTP 200 (deleted)
+```
+
+The current trip finalized at 04:35:09Z after three minutes below 2 mph:
+`Trip finalized: /trips/t000006.gpx (11.40 mi)`. It uploaded at 04:36:41Z
+(142443 B, 2.7 s, HTTP 200, deleted). Ingest logged acceptance and HTTP 200
+for all four trips, and stored each as `data/YYYY-MM/<trip>.gpx` plus
+`.json`. The viewer listed all four with distances; the new drive was
+11.40 mi on the board and 11.41 mi on the server.
 
 At boot it uses the [Supreme pins and rails](#supreme-pin-and-power-reference):
 it verifies LoRa power off first, switches SD power and VBACKUP off, and
@@ -576,7 +601,7 @@ How it behaves once flashed:
   duration and average speed remain unknown while its distance is retained.
   GPS segment boundaries stay attached to the first fix after each gap,
   including fixes buffered before UTC.
-- **Upload logic (end-to-end test pending):** the board checks for finished
+- **Upload logic:** the board checks for finished
   trips every 30 s and scans for your home WiFi when a retry is due and a
   complete trip is waiting.
   Incomplete files are preserved for recovery and do not trigger radio work.
@@ -592,8 +617,13 @@ How it behaves once flashed:
   POSTs each trip to the ingest server as GPX and deletes it locally once
   the server accepts it. GPS
   parsing runs on core 1; networking runs on core 0 and never blocks
-  it.
-  <!-- TODO(first upload): Confirm the observed WiFi retry, accepted HTTP response and local-file deletion after the first real upload; retain untested paths as code behaviour. -->
+  it. On 2026-10-21 (UTC), absent home WiFi produced retry waits of
+  60, 120, 240, 300 and 300 s. Once home, four SD trips received HTTP 200
+  and were deleted locally. A scan at 04:35:35Z missed the access point;
+  its 60 s retry led to the current trip's upload at 04:36:41Z. A scan
+  miss at the edge of range can delay an upload; it need not mean the
+  settings are wrong. Server errors (401/413/5xx) and server-down handling
+  described here are code behaviour, still untested on the Supreme.
 - **Power loss:** after USB power has been absent for 10 s, the firmware
   finalizes the current trip. Once idle on battery for 10 minutes, it
   closes files, stops networking, seals the diagnostic journal, unmounts
@@ -637,16 +667,19 @@ How it behaves once flashed:
   must have at least 64 KiB free to start a trip; below 24 KiB it ends
   the one in progress. For LittleFS, free space excludes the unused part
   of the separate 64 KiB diagnostics reserve. Card free space uses the
-  card's own total and used bytes. An accepted upload is intended to free
-  space by deleting its local file; do not assume this has been verified
-  on the board yet.
+  card's own total and used bytes. Accepted uploads freed space by deleting
+  the local SD files on 2026-10-21 (UTC). The same deletion path for
+  LittleFS uploads remains untested on the Supreme.
 
 Watch the Serial Monitor (115200) for state transitions:
 `Trip started` → (drive) → `Trip finalized`, then
-`Upload ... -> HTTP 200 (deleted)` if the server accepts it. That is the
-expected successful-upload log, not yet a confirmed board-to-server result.
-<!-- TODO(first upload): After the real test, record the date and observed upload line, and verify that the trip appears in the viewer and the local copy is deleted. -->
+`Upload ... -> HTTP 200 (deleted)` if the server accepts it. On
+2026-10-21 (UTC), the serial log showed
+`Upload /trips/t000006.gpx (142443 B, 2.7 s) -> HTTP 200 (deleted)`.
+The local SD file was deleted, and the trip appeared in the viewer.
 
+The failure handling below describes the code; server errors (401/413/5xx)
+and server-down behaviour remain untested on the Supreme.
 If a trip does not appear, first confirm `Trip started` and `Trip finalized`:
 an active or discarded trip cannot upload. `HTTP 401` means the upload
 token does not match. A negative result means a connection or transfer
@@ -867,14 +900,25 @@ GPS configured on attempt 1 (1500 ms after config start): RMC+GGA+NAV-PVT, GSV e
 > display modes. Its FQBN is
 > `esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled`.
 > Host tests run with `bash firmware/host_test/run.sh`. Compile and host
-> checks do not establish hardware durability, upload stack/heap headroom
-> or end-to-end upload success; those still need the board and deployed server.
+> checks do not establish hardware durability or live upload headroom. The
+> real SD upload and network stack measurement above and below cover the
+> debug build's successful-upload path; heap and failure-path checks remain.
 
 ### Diagnostic journal module
 
-The behaviour below describes the implementation. Delivery of diagnostics
-from the board to the deployed server still needs its first real test.
-<!-- TODO(first upload): Record successful diagnostics delivery separately from GPX delivery, including the Device health contact and current snapshot. -->
+The first real diagnostics delivery succeeded on 2026-10-21 (UTC), using
+the debug build and SD journal. After the last GPX, two
+`POST /v1/device-events` requests returned HTTP 200 at 04:36:43Z and
+04:36:44Z. The server created `data/diagnostics/events.db` with all 115
+pending events. Device health showed recent contact and snapshot receipt,
+storage backend `sd`, zero dropped events, a boot counter and no active
+conditions. History included the earlier E3009 antenna episode, raised
+and cleared; E5001's boot-local access-point-absence counter was 6.
+Successful diagnostics uploads print nothing on serial. Confirm them in
+the ingest log or Device health. `Firmware: Not reported` is expected:
+the firmware does not send a version yet. The behaviour below describes
+the implementation; this test does not establish LittleFS or
+production-build uploads, or server-failure handling on the Supreme.
 
 Stage 4 carries a board-independent `event_log.h` / `event_log.cpp` module with
 a fixed producer queue, CRC-protected rolling segments, durable acknowledgment
@@ -930,8 +974,11 @@ positive and greater than any previously used on this board. NVS consumes it
 before restoring the SD allocator; a failed enrollment requires a higher ID.
 After the first successful diagnostics upload, remove both defines and
 reflash with erase disabled. Existing SD metadata works on later boots
-without them. Never reuse a fresh-identity zero after changing/corrupting
-cards: inspect the server again.
+without them. The first real test consumed enrollment ID 1 after the
+deployment Step 8 command returned high-water 0 (no `events.db` yet).
+Re-enrollment needs a fresh server read and an ID of at least 2, higher
+than every ID already used. Never reuse a fresh-identity zero after
+changing/corrupting cards: inspect the server again.
 Without an enrolled writable SD revision authority, events remain local and
 GPX upload logic remains available independently of diagnostics enrollment.
 See [revision enrollment and recovery](../DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
@@ -978,8 +1025,11 @@ against the server's stdlib protocol validator.
 This section is for validating the firmware on hardware. You don't need it
 to build or use the tracker.
 
-The network task reserves 12,288 bytes, matching the Stage 4 brief. This is
-a conservative starting point; it has **not** been sized from board measurements.
+The network task reserves 12,288 bytes, matching the Stage 4 brief. During
+and after the real SD uploads on 2026-10-21 (UTC), the debug build's
+minimum free stack was **7,436 bytes**, with GPS logging active. This
+measures the successful-upload path; it does not establish headroom for
+server errors, server-down behaviour, LittleFS or production-build uploads.
 Serial diagnostics report the task's lifetime minimum free stack at startup,
 after each GPX HTTP upload (including failures), and after each network cycle.
 Diagnostic requests sample the watermark silently between batches.

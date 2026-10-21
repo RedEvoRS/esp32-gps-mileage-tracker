@@ -25,11 +25,13 @@ the board off when the car is parked and back on when the car starts, and
 it has recorded real drives on the microSD card, which were read back on a
 PC. If no card mounts, trips go to the board's internal flash instead,
 which holds about 6 hours of driving. The server has been deployed with its
-installer on a real Debian machine.
-<!-- TODO(first upload): replace the next sentence once the first upload
-from the Supreme to the deployed server succeeds. -->
-Uploading trips from the board to that server hasn't been tested end to
-end yet.
+installer on Debian 13 on 2026-10-20; `install.sh --check` passed.
+On 2026-10-21 (UTC), the Supreme's Stage 4 debug build uploaded four real
+trips from the card. All four received HTTP 200, were deleted from the
+card and appeared in the viewer. Diagnostics arrived too: all 115 pending
+events and a current snapshot were visible in Device health.
+Uploads from internal flash, production-build uploads and server-failure
+handling remain untested on the Supreme.
 
 Still to check on the road: the everyday (production) screen, the board's
 current draw while switched off, and a few car-power cases. Project progress
@@ -393,14 +395,19 @@ Do this before a test drive, not during a trip.
    the battery was out can take a minute outside. After 10 seconds above
    5 mph you'll see `Trip started`.
 3. Park at home and wait. Three minutes below 2 mph ends the trip
-   (`Trip finalized`). Within about a minute the board finds your WiFi and
-   uploads it: `Upload ... -> HTTP 200 (deleted)`. The file is deleted from
-   the board only after the server has accepted it.
-   <!-- TODO(first upload): confirm this step against the first real
-   Supreme upload, including the timing. -->
+   (`Trip finalized`). The board then tries your WiFi and uploads it:
+   `Upload ... -> HTTP 200 (deleted)`. The file is deleted from the board
+   only after the server has accepted it. On 2026-10-21 (UTC), the trip
+   finalized at 04:35:09Z and uploaded at 04:36:41Z. A scan at 04:35:35Z
+   missed the access point and scheduled a retry in 60 s, so allow time
+   for retries at the edge of WiFi range. Older finished trips can upload
+   while the current trip is still recording; this happened on that drive.
 4. Open the viewer at `http://<server>:8091/` and log in. The trip should
    be on the list. If you enrolled diagnostics, **Device health** shows
    when the board last checked in and any active error codes.
+
+The failure responses below describe the code's behaviour. Server errors
+(401/413/5xx) and server-down behaviour remain untested on the Supreme.
 
 If the trip does not appear, first confirm both `Trip started` and
 `Trip finalized`. A trip still in progress cannot upload; a short trip

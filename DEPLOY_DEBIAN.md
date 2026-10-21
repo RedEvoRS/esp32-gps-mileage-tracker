@@ -579,16 +579,32 @@ After the **first successful diagnostics upload**, check the viewer's
 **Device health** page for the board's contact and a current snapshot.
 Then remove both defines and reflash with erase **Disabled**. Existing SD
 revision metadata is used on later boots. Re-enrollment after lost or
-replaced metadata needs a higher ID and a fresh server read. Erase-all
-also clears the consumed ID (`diag/enroll`); leaving the defines in the
+replaced metadata needs a higher ID (at least 2 after using ID 1) and a
+fresh server read. Erase-all also clears the consumed ID (`diag/enroll`);
+leaving the defines in the
 firmware then re-enrolls from the compiled-in, possibly stale high-water.
 See [snapshot revision enrollment and recovery](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery).
 
-The expected trip-upload result is `HTTP 200 (deleted)` in the Serial
-Monitor and the trip appearing in the viewer. Those are checks to perform:
-the server is deployed and real drives have been recorded on SD, but
-uploading from the board has not yet been tested end to end.
-<!-- TODO(first upload): Record the successful test date, the observed GPX acceptance and local deletion, and the Device health contact/snapshot result; distinguish any still-untested diagnostics or storage path. -->
+The first real upload succeeded on 2026-10-21 (UTC), after deployment with
+`server/install.sh` on Debian 13 on 2026-10-20 and a passing
+`install.sh --check`. The Supreme's Stage 4 debug build uploaded four
+finished trips from microSD. Each logged `HTTP 200 (deleted)`, and the
+ingest log confirmed acceptance. Each produced a GPX file and JSON summary
+under `data/YYYY-MM/`; all four appeared in the viewer.
+
+Diagnostics succeeded separately: two `POST /v1/device-events` requests
+returned HTTP 200 at 04:36:43Z and 04:36:44Z, after the last GPX. The new
+`data/diagnostics/events.db` held all 115 pending events. Device health
+showed recent contact and snapshot receipt, storage backend `sd`, zero
+dropped events and no active conditions. Successful diagnostics uploads
+print nothing on serial; check the ingest log or Device health.
+`Firmware: Not reported` is expected until firmware version reporting is
+implemented. Enrollment ID 1 was consumed; the Step 8 command above had
+returned high-water 0 because the database did not yet exist.
+
+The internal LittleFS store was mounted but had no trips to upload.
+LittleFS uploads, production-build uploads, server errors (401/413/5xx)
+and server-down behaviour remain untested on the Supreme.
 
 Then follow [README step 4: Check it works](README.md#4-check-it-works)
 and [step 5: Put it in the car](README.md#5-put-it-in-the-car). If storage

@@ -7,10 +7,17 @@ the complete setup.
 
 The board is the LilyGO T-Beam Supreme with MAX-M10S GPS and microSD trip
 storage, though the server accepts GPX uploads from any board. The server
-has been installed with `install.sh` on a real Debian machine, and the
-board has recorded real drives on its card, but an upload from the board
-to an installed server hasn't been tested end to end yet.
-<!-- TODO(first upload): Record the date and scope of the first successful Supreme-to-deployed-server upload, including confirmation in the viewer. -->
+was deployed with `install.sh` on Debian 13 on 2026-10-20;
+`install.sh --check` passed. On 2026-10-21 (UTC), the Supreme's Stage 4
+debug build uploaded four real trips from microSD. Ingest logged acceptance
+and HTTP 200 for each, wrote `data/YYYY-MM/<trip>.gpx` and `.json`, and
+the viewer listed all four with distances. The board deleted each local
+file after HTTP 200. For the new drive, the board reported 11.40 mi and
+the server reported 11.41 mi; the two calculate distance separately.
+Diagnostics followed in two HTTP 200 requests, storing all 115 pending
+events and a current snapshot visible in Device health. LittleFS uploads,
+production-build uploads, server errors (401/413/5xx) and server-down
+behaviour remain untested on the Supreme.
 
 It runs as two default Docker containers, with two optional services, all
 defined in `docker-compose.yml`:

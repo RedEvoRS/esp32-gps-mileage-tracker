@@ -7,10 +7,22 @@ production screen and uploads them after trips; the server stores them,
 shows them on the viewer's Device health page and can optionally notify or
 export them. What remains is hardware acceptance on the T-Beam Supreme
 (#130 and the shakedown issues).
-<!-- TODO(first upload): once the board's first diagnostics upload to the
-deployed server succeeds, say so here with the date. -->
-Until then, delivery from the board to a deployed server is implemented and
-host-tested but not yet confirmed end to end. Setup steps are in
+
+The first real diagnostics upload succeeded on 2026-10-21 (UTC), using
+Stage 4's debug build and the SD journal. After the last GPX upload, two
+`POST /v1/device-events` requests returned HTTP 200 at 04:36:43Z and
+04:36:44Z. The server created `data/diagnostics/events.db` with all 115
+pending events. Device health showed recent contact and snapshot receipt,
+storage backend `sd`, zero dropped events, a boot counter and no active
+conditions. Its history included the earlier E3009 antenna condition,
+raised and cleared; the E5001 access-point-absence counter was 6 for this
+boot. Successful diagnostics uploads print nothing on serial: confirm
+them in the ingest log or Device health. `Firmware: Not reported` is
+expected because the firmware does not send a version yet.
+
+This confirms SD delivery in the debug build. LittleFS uploads,
+production-build uploads, server errors (401/413/5xx) and server-down
+behaviour remain untested on the Supreme. Setup steps are in
 [README.md](README.md) and [DEPLOY_DEBIAN.md](DEPLOY_DEBIAN.md) Step 8.
 
 The tracker normally runs unattended in a car. A serial console cannot explain
@@ -962,10 +974,12 @@ HTTPClient's small objects and bounded parser/socket scratch remain on the
 existing **12 KiB** network stack; no large upload buffer goes there. Debug
 builds print free internal heap, its largest free block and free PSRAM at boot
 and once after the first diagnostics HTTP attempt (including failure). These
-are measurement hooks for #6; actual real-upload heap/stack measurements remain
-open, including comparison with the previously observed **7468 free bytes with
-no upload**. No host test establishes ESP32 heap/stack headroom, SD latency or
-power-cut safety.
+are measurement hooks for #6. During and after the real SD uploads on
+2026-10-21 (UTC), the debug build's minimum free network stack was
+**7,436 of 12,288 bytes**, with GPS logging active. The earlier no-upload
+measurement was 7,468 free bytes. Real-upload heap measurements and the
+untested upload paths still need checks. No host test establishes ESP32
+heap/stack headroom, SD latency or power-cut safety.
 
 Supreme/core 3.3.11 compile results with PSRAM enabled: static RAM falls from
 193,804 to **108,356 bytes** with `DISPLAY_DEBUG=1`, and from 169,836 to
