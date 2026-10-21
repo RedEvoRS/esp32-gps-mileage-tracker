@@ -84,7 +84,10 @@ public:
     };
     const Output& update(const Input& in) {
         if (in.shutdown) { out_ = {}; return out_; }
-        if (in.boot || in.tripFinalized) pendingStatus_ = true;
+        // The runtime's first call is boot; later routine triggers wait for Parked.
+        const bool boot = in.boot || bootPending_;
+        bootPending_ = false;
+        if (in.tripFinalized) pendingStatus_ = true;
         bool unresolved = false;
         for (size_t i = 0; i < in.count; ++i) {
             const auto& c = in.conditions[i];
@@ -112,24 +115,30 @@ public:
         }
         if (out_.powered && uint32_t(in.now - started_) >= kDurationMs) out_ = {};
         // A routine status card must not remain visible after driving resumes.
-        if (out_.card == Card::StatusCard && !userCard_ && in.motion != Motion::Parked) out_ = {};
+        if (out_.card == Card::StatusCard && !userCard_ && in.motion == Motion::Moving) out_ = {};
         if (in.userRequest) {
             show(statusCard(in.heard, in.conditions, in.count), in.now); userCard_ = true;
             if (in.motion == Motion::Parked) pendingStatus_ = false;
         } else if (queued_ && out_.card != Card::ErrorCard && !(out_.powered && userCard_)) {
             show(errorCard(queue_[head_]), in.now);
             head_ = (head_ + 1) % kCapacity; --queued_; userCard_ = false;
-        } else if (pendingStatus_ && in.motion == Motion::Parked &&
+        } else if (!in.suspended && ((boot && in.motion != Motion::Moving) ||
+                   (pendingStatus_ && in.motion == Motion::Parked)) &&
                    (!out_.powered || (in.tripFinalized && out_.card == Card::StatusCard))) {
             show(statusCard(in.heard, in.conditions, in.count), in.now);
             pendingStatus_ = false; userCard_ = false;
+        }
+        if (out_.card == Card::StatusCard) {
+            uint32_t until = out_.until;
+            out_ = statusCard(in.heard, in.conditions, in.count);
+            out_.until = until; // refresh content without restarting the interval
         }
         return out_;
     }
     // Preserve episode/motion history across ownership changes, but never
     // replay a card or pending trigger from the previous mode.
     void dismiss() {
-        out_ = {}; pendingStatus_ = userCard_ = false;
+        out_ = {}; bootPending_ = pendingStatus_ = userCard_ = false;
         head_ = queued_ = 0;
     }
 private:
@@ -137,7 +146,7 @@ private:
     Output out_;
     uint32_t started_ = 0;
     Motion previousMotion_ = Motion::Unknown;
-    bool pendingStatus_ = true, userCard_ = false;
+    bool bootPending_ = true, pendingStatus_ = false, userCard_ = false;
     Condition seen_[kCapacity] = {};
     size_t seenCount_ = 0, head_ = 0, queued_ = 0;
     uint16_t queue_[kCapacity] = {};

@@ -173,16 +173,43 @@ int main() {
     // the stub throws instead of removing power. Reset that simulated boot.
     g_lockDepth = 0;
     gJournalSealRequested = gJournalSealDone = false;
+    // The indoor boot card wakes without a fix; fresh GSV and warning changes
+    // repaint it while weak NAV-PVT accuracy still leaves motion Unknown.
+    faultWorld(); gDebugMode = false; beginProductionDisplay(); serviceDisplay();
+    assert(!gHaveLastFix && gProductionLastOutput.card == display::Card::StatusCard);
+    assert(gProductionOled.text[0].value == "Sats: --");
+    const uint32_t indoorEnd = gProductionLastOutput.until;
+    diagnosticFix(g_millis + 1000, 7000);
+    assert(!gLatestSpeedTrusted);
+    feed(nmea("GPGSV,1,1,04,01,40,083,15,02,17,308,16,03,07,344,18,04,22,228,20,1"));
+    gLoopFaults.event(3006, g_millis).condition(true);
+    auto frames = gProductionOled.frames; serviceDisplay();
+    assert(gProductionOled.frames == frames + 1 && gProductionOled.text[0].value == "Sats: 4");
+    assert(gProductionLastOutput.codeCount == 1 && gProductionLastOutput.codes[0] == 3006);
+    assert(gProductionLastOutput.until == indoorEnd);
+    gLoopFaults.event(3006, g_millis).condition(false); serviceDisplay();
+    assert(!gProductionLastOutput.codeCount && gProductionOled.text[1].value == "OK");
+    assert(gProductionLastOutput.until == indoorEnd);
+    g_millis = indoorEnd - 1; serviceDisplay(); assert(gProductionLastOutput.powered);
+    ++g_millis; serviceDisplay(); assert(!gProductionLastOutput.powered);
+    diagnosticFix(g_millis + 1000, 100);
+    assert(gLatestSpeedTrusted); serviceDisplay();
+    assert(!gProductionLastOutput.powered); ++cases;
+
     faultWorld(); gDebugMode = false; beginProductionDisplay();
     diagnosticFix(1000, 100, 0); serviceProductionDisplay();
     assert(gProductionLastOutput.card == display::Card::StatusCard);
     g_millis += display::DisplayModel::kDurationMs; serviceProductionDisplay(); assert(!gProductionLastOutput.powered);
-    // Stale speed is Unknown and cannot consume a newly queued boot status.
+    // Stale speed is Unknown, but a fresh model still shows its boot card.
     g_millis += 2501; // exceed speed freshness even with a short card setting
     gDisplayModel = display::DisplayModel(); serviceProductionDisplay();
-    assert(!gProductionLastOutput.powered);
+    assert(gProductionLastOutput.card == display::Card::StatusCard);
+    const uint32_t bootEnd = gProductionLastOutput.until;
+    assert(bootEnd == g_millis + display::DisplayModel::kDurationMs);
     // VBUS absence is Parked even without a trusted/fresh fix.
-    gVbusLost = true; serviceProductionDisplay(); assert(gProductionLastOutput.powered); ++cases;
+    gVbusLost = true; serviceProductionDisplay();
+    assert(gProductionLastOutput.powered && gProductionLastOutput.until == bootEnd);
+    g_millis = bootEnd; serviceProductionDisplay(); assert(!gProductionLastOutput.powered); ++cases;
 
     faultWorld(); gDebugMode = false; beginProductionDisplay(); gState = ACTIVE;
     gLoopFaults.event(4003, g_millis).condition(true);

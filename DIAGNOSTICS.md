@@ -1167,9 +1167,12 @@ motion trust immediately. FINALIZING alone is not evidence of motion.
 
 Production policy:
 
-- Boot queues one StatusCard for the first Parked opportunity; Moving and
-  Unknown suppress routine content. Finalization back to IDLE queues another
-  status card for Parked. Entering Parked with unresolved faults reminds once.
+- Boot shows one StatusCard on the first model update, including Unknown motion:
+  no trusted GPS fix is needed. It lasts `DISPLAY_CARD_MS` (default 30 seconds),
+  unless moving is detected or an error card takes over. It consumes the boot
+  trigger, so the first Parked observation does not show a second boot card.
+  Finalization back to IDLE still queues a status card for Parked only.
+  Entering Parked with unresolved faults still reminds once.
 - Every new accepted ERROR/CRITICAL condition episode queues one ErrorCard in
   any motion state. Each gets `DISPLAY_CARD_MS` (default 30 seconds), in
   observation order. Repeats cannot extend or re-light it.
@@ -1183,8 +1186,9 @@ Production policy:
   the existing clean battery power-off/USB-ignore meaning. A new error preempts a routine status card;
   a user request can replace the current card and holds its full
   `DISPLAY_CARD_MS` (default 30 seconds) before queued errors resume.
-  Routine cards blank if motion
-  stops being Parked. Card text is captured when shown and stays steady.
+  Routine status cards blank when motion becomes Moving; Unknown does not
+  blank them. Every visible status card (boot, trip, reminder or POWER tap)
+  refreshes its heard count and active codes without restarting its timer.
 - StatusCard: `Sats: N` or `Sats: --`, then `OK` when no faults are active,
   otherwise only active warning-and-above `E####` codes, most severe first
   (code order breaks ties). Duplicate active codes from the two upload
