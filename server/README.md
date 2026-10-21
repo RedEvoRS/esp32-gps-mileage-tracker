@@ -253,7 +253,7 @@ repository root **on your computer**, using Git Bash on Windows or a
 macOS/Linux terminal:
 
 ```bash
-git archive HEAD server | ssh <user>@<host> 'mkdir -p ~/mileage-tracker && tar -x --strip-components=1 -C ~/mileage-tracker'
+git -c core.autocrlf=false archive HEAD server | ssh <user>@<host> 'mkdir -p ~/mileage-tracker && tar -x --strip-components=1 -C ~/mileage-tracker'
 ```
 
 Replace `<user>` and `<host>` with the server login and address. `HEAD` can
@@ -261,7 +261,9 @@ also be a commit hash or tag. This places `docker-compose.yml`, dotfiles
 such as `.env.example`/`.dockerignore`, and an expanded `COMMIT` directly in
 `~/mileage-tracker`, overwriting supplied source files while leaving untracked
 `.env`, `viewer.env`, `monitor.env` and `data/` in place. It does not delete
-obsolete source files. Uncommitted changes are not sent. Do not use
+obsolete source files. Uncommitted changes are not sent. Keep
+`-c core.autocrlf=false`: on Windows, Git would otherwise send every file
+with CRLF line endings. Do not use
 `git archive HEAD:server`: that selects a tree, and Git cannot expand `COMMIT`
 without a commit or tag. Do not pipe tar data through Windows PowerShell 5.1,
 which can corrupt it; use Git Bash (native binary pipes require PowerShell

@@ -142,7 +142,7 @@ root in **Git Bash on Windows**, or a macOS/Linux terminal:
 
 ```bash
 cd "<path to your copy of the repo>"
-git archive HEAD server | ssh <user>@<host> 'mkdir -p ~/mileage-tracker && tar -x --strip-components=1 -C ~/mileage-tracker'
+git -c core.autocrlf=false archive HEAD server | ssh <user>@<host> 'mkdir -p ~/mileage-tracker && tar -x --strip-components=1 -C ~/mileage-tracker'
 ```
 
 This copies the committed `server/` files, including `.env.example` and
@@ -153,6 +153,11 @@ changes first, or replace `HEAD` with the commit or tag you want to deploy.
 Your server's `.env`, `viewer.env`, `monitor.env` and `data/` are not in Git
 and are left in place. The copy overwrites supplied source files but does
 not remove old files that are absent from the archive.
+
+`-c core.autocrlf=false` keeps Linux line endings. Git for Windows turns
+`core.autocrlf` on by default, and `git archive` applies it, so without
+the flag every file arrives with Windows (CRLF) line endings. It's harmless
+on macOS and Linux.
 
 The archive also writes its full commit hash into `COMMIT`, allowing a build
 on the server to display the exact source commit without a Git clone there.
@@ -1555,7 +1560,7 @@ the host-side port mapping in `docker-compose.yml`.
 **Rebuild after code changes:**
 
 First copy the new committed source from your computer using Step 2's
-`git archive HEAD server | ssh ...` command (or copy a fresh source download
+`git -c core.autocrlf=false archive HEAD server | ssh ...` command (or copy a fresh source download
 with `scp -r server/. ...`). This refreshes `COMMIT` along with the code;
 do not use `HEAD:server`. Then run this **on the server**. Rebuilding without
 copying new source keeps the old code and stamp.
