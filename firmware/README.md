@@ -388,17 +388,13 @@ clean, GPS configured on attempt 1, and the FAT32 card had 29.71 GiB free.
 The journal reported `sd, 115 unacknowledged records`. The new trip started
 at 04:15:21Z. At home, between 04:32:15Z and 04:32:27Z, three older,
 finished trips uploaded while GPS logging continued. Upload order follows
-the card's directory order, not trip number:
-
-```text
-Upload /trips/t000001.gpx (16038 B, 0.8 s) -> HTTP 200 (deleted)
-Upload /trips/t000005.gpx (176229 B, 9.1 s) -> HTTP 200 (deleted)
-Upload /trips/t000004.gpx (158341 B, 3.1 s) -> HTTP 200 (deleted)
-```
+the card's directory order, not trip number: `t000001.gpx` (16 KB, 0.8 s),
+then `t000005.gpx` (176 KB, 9.1 s), then `t000004.gpx` (158 KB, 3.1 s).
+Each line read `Upload /trips/<file> (<bytes> B, <seconds> s) -> HTTP 200 (deleted)`.
 
 The current trip finalized at 04:35:09Z after three minutes below 2 mph:
 `Trip finalized: /trips/t000006.gpx (11.40 mi)`. It uploaded at 04:36:41Z
-(142443 B, 2.7 s, HTTP 200, deleted). Ingest logged acceptance and HTTP 200
+(142 KB, 2.7 s, HTTP 200, deleted). Ingest logged acceptance and HTTP 200
 for all four trips, and stored each as `data/YYYY-MM/<trip>.gpx` plus
 `.json`. The viewer listed all four with distances; the new drive was
 11.40 mi on the board and 11.41 mi on the server.
