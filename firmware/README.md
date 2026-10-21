@@ -308,6 +308,15 @@ For the next road build:
 2. On that merged commit, create and push an annotated tag:
    `git tag -a fw-v0.06 -m "Firmware v0.06"`, then `git push origin fw-v0.06`.
 3. Run `python tools/stamp_firmware_version.py`, build from that commit, then flash.
+4. Publish a GitHub release from the tag, titled `Supreme firmware v0.06 (beta)`,
+   as a full release marked **Latest**:
+   `gh release create fw-v0.06 --verify-tag --latest --title "..." --notes-file notes.md`.
+   Don't mark it pre-release: a pre-release can't be Latest, and the frozen
+   "T-Beam V1.2 final" release would then look like the current firmware.
+   Copy the previous release's notes and update them: what's new, what works
+   and what's still unproven (the open `Shakedown:` issues), the build steps,
+   and whether the server must be updated first. Attach no binary, because
+   each owner's WiFi password and upload token are compiled in.
 
 Keep `firmware/VERSION` to one line in the form `v<major>.<two-digit minor>`:
 major 0–99 without leading zeros, such as `v0.05` or `v1.00`. The stamp script
