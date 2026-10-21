@@ -1,4 +1,7 @@
-"""Stamp Stage 4 with the current Git commit; run before each compile."""
+"""Stamp Stage 4 with firmware/VERSION and the Git commit before each compile.
+
+VERSION accepts surrounding whitespace (including LF or CRLF line endings).
+"""
 
 from pathlib import Path
 import re
@@ -7,6 +10,8 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 HEADER = Path("firmware/04_trip_logger/firmware_version.h")
+VERSION = Path("firmware/VERSION")
+RELEASE = re.compile(r"v(0|[1-9][0-9]?)\.[0-9]{2}", re.ASCII)
 TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,31}", re.ASCII)
 
 
@@ -17,6 +22,13 @@ def validate_version(version):
 
 
 def git_version(root):
+    try:
+        release = (Path(root) / VERSION).read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        raise ValueError("cannot read firmware/VERSION; expected an ASCII version such as v0.05") from None
+    if not RELEASE.fullmatch(release):
+        raise ValueError("firmware/VERSION must match v<major>.<two-digit minor> (major 0-99, no leading zeros)")
+
     def git(*args):
         return subprocess.check_output(
             ["git", *args], cwd=root, text=True, encoding="utf-8",
@@ -29,7 +41,7 @@ def git_version(root):
     # (including untracked submodule content) or ignored build/secret files.
     dirty = git("status", "--porcelain", "--untracked-files=no",
                 "--ignore-submodules=untracked")
-    version = commit + ("-dirty" if dirty else "")
+    version = release + "+" + commit + ("-dirty" if dirty else "")
     validate_version(version)
     return version
 
@@ -50,5 +62,7 @@ def stamp(root=ROOT):
 if __name__ == "__main__":
     try:
         print(stamp())
-    except (OSError, subprocess.CalledProcessError, ValueError):
+    except ValueError as error:
+        raise SystemExit(f"Cannot stamp firmware version: {error}")
+    except (OSError, subprocess.CalledProcessError):
         raise SystemExit("Cannot stamp firmware version: check Git and the repository checkout")

@@ -344,10 +344,13 @@ error also shows once by itself, even while driving. [firmware/README.md](firmwa
 each shows. The everyday screen hasn't been road-tested yet.
 
 **Stamp the version.** From the repository folder, run
-`python tools/stamp_firmware_version.py` before every build. It records the
-Git commit the board will report on the viewer's Device health page. If you
-skip it, the board reports `unversioned`. If you skip it after an earlier
-run, it reports the old commit.
+`python tools/stamp_firmware_version.py` before every build. It combines
+`firmware/VERSION` with the ten-character Git commit (for example
+`v0.05+3f9a1c07be`), adding `-dirty` for tracked edits and `+dbg` in debug builds.
+The board reports it on the viewer's Device health page. Without a generated
+header it reports `unversioned`; an old header keeps its old version.
+See [Firmware versions and releases](firmware/README.md#firmware-versions-and-releases)
+for road-use version bumps and tags.
 
 **Flash it.** Open `firmware/04_trip_logger/04_trip_logger.ino`, check the
 [Supreme board settings](firmware/README.md#board-settings) and the board's

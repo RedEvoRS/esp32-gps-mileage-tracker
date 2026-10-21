@@ -19,7 +19,8 @@ raised and cleared; the E5001 access-point-absence counter was 6 for this
 boot. Successful diagnostics uploads print nothing on serial: confirm
 them in the ingest log or Device health. That build showed
 `Firmware: Not reported` because it predates version reporting; builds
-stamped with `tools/stamp_firmware_version.py` report their Git commit.
+stamped with `tools/stamp_firmware_version.py` report their version number
+plus Git commit.
 
 This confirms SD delivery in the debug build. LittleFS uploads,
 production-build uploads, server errors (401/413/5xx) and server-down
@@ -307,8 +308,9 @@ Only continuing conditions can be active. Optional fields are `firmware_version`
 `counters` maps decimal catalog counter codes (currently only `"5001"`) to
 boot-local totals, with at most 16 entries. They are not independent events.
 
-Stage 4 sends `firmware_version`: the ten-character Git commit plus `-dirty`
-for tracked edits and `+dbg` when `DISPLAY_DEBUG` is enabled. Run
+Stage 4 sends `firmware_version`: `firmware/VERSION` plus `+` and the ten-character
+Git commit (for example `v0.05+3f9a1c07be`), with `-dirty` for tracked edits and
+`+dbg` when `DISPLAY_DEBUG` is enabled. Run
 `python tools/stamp_firmware_version.py` before compiling; without the generated
 header it reports `unversioned` (with `+dbg` in debug builds). The boot banner,
 new events and current snapshot use the same 1–32 character protocol token.

@@ -37,7 +37,7 @@ for display in 0 1; do
         echo "== test_build_version (DISPLAY_DEBUG=$display, $base)"
         version_args=()
         if [ "$base" = stamped ]; then
-            version_args=('-DFIRMWARE_VERSION_BASE="0123456789-dirty"' -DFIRMWARE_VERSION_REQUIRE_STAMP)
+            version_args=('-DFIRMWARE_VERSION_BASE="v0.05+0123456789-dirty"' -DFIRMWARE_VERSION_REQUIRE_STAMP)
         fi
         "${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -pedantic \
             -DDISPLAY_DEBUG="$display" "${version_args[@]}" -I"$here/../04_trip_logger" \

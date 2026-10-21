@@ -532,8 +532,11 @@ esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled
 ```
 
 Before each Stage 4 build, run `python tools/stamp_firmware_version.py` from
-the repository root so Device health shows the build's Git commit rather than
-`unversioned` (or a stale commit from an earlier stamp).
+the repository root so Device health shows `firmware/VERSION` plus the ten-character
+Git commit (for example `v0.05+3f9a1c07be`), with `-dirty` for tracked edits and
+`+dbg` in debug builds. Without the generated header it shows `unversioned`;
+an old header keeps its old version. Road-use version bumps and tags are described
+in [Firmware versions and releases](firmware/README.md#firmware-versions-and-releases).
 
 Fit a **FAT32 microSD card** with the board switched off. Stage 4 records
 there when it mounts, otherwise it uses internal LittleFS. Its bundled
@@ -604,8 +607,8 @@ dropped events and no active conditions. Successful diagnostics uploads
 print nothing on serial; check the ingest log or Device health.
 That build showed `Firmware: Not reported` because it predates version
 reporting; builds stamped with `tools/stamp_firmware_version.py` show their
-Git commit. Enrollment ID 1 was consumed; the Step 8 command above had
-returned high-water 0 because the database did not yet exist.
+version number plus Git commit. Enrollment ID 1 was consumed; the Step 8 command
+above had returned high-water 0 because the database did not yet exist.
 
 The internal LittleFS store was mounted but had no trips to upload.
 LittleFS uploads, production-build uploads, server errors (401/413/5xx)

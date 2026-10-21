@@ -5,7 +5,8 @@
 
 static_assert(firmware::validVersion("unversioned"), "fallback token");
 static_assert(firmware::validVersion("unversioned+dbg"), "debug fallback token");
-static_assert(firmware::validVersion("0123456789-dirty+dbg"), "dirty debug token");
+static_assert(firmware::validVersion("v0.05+0123456789-dirty+dbg"), "dirty debug token");
+static_assert(firmware::validVersion("v99.99+0123456789-dirty+dbg"), "largest release dirty debug token");
 static_assert(firmware::validVersion("A._+-9"), "allowed characters");
 static_assert(firmware::validVersion("abcdefghijklmnopqrstuvwxyz012345"), "32 characters");
 static_assert(!firmware::validVersion("abcdefghijklmnopqrstuvwxyz0123456"), "33 rejected");
