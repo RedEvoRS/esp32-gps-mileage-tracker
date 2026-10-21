@@ -121,7 +121,7 @@ static constexpr uint32_t SD_SPI_HZ = 4000000; // core default; ample for ~119 B
 static constexpr uint32_t SD_SETTLE_MS = 250;
 
 // -----------------------------------------------------------------
-// Trip state machine tuning (from brief section 5)
+// Trip state machine thresholds and timing
 // -----------------------------------------------------------------
 static constexpr float    START_MPS       = 2.235f;          // 5 mph
 static constexpr float    END_MPS         = 0.894f;          // 2 mph
@@ -169,7 +169,7 @@ static constexpr uint32_t NET_ABORT_MS = 15UL * 1000;
 // How often the networking task wakes to look for pending uploads.
 static constexpr uint32_t NET_TICK_MS     = 30000;
 static constexpr uint32_t NET_RETRY_MAX_MS = 5UL * 60 * 1000;
-// Restore the brief's conservative allocation until measured on hardware.
+// 12 KiB network stack; real-upload free-stack measurements are recorded in #6.
 // ESP-IDF task stack sizes and high-water marks are in bytes, not words.
 static constexpr uint32_t NET_STACK_BYTES = 12288;
 // #6: 2 KiB leaves warning room before HTTP/journal calls exhaust the stack.

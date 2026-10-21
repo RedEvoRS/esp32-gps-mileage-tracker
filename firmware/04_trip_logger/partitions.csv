@@ -1,4 +1,4 @@
-# No-OTA layout: 1.5 MB app, 2.375 MB LittleFS for trips (Stage 4 brief).
+# No-OTA layout: 1.5 MB app, 2.375 MB LittleFS for fallback trip storage.
 # The ESP32 core uses a partitions.csv in the sketch folder in place of the
 # Tools -> Partition Scheme menu. LittleFS mounts the "spiffs"-labelled
 # partition by default, hence the name.

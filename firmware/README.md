@@ -420,6 +420,8 @@ socket.
 
 ### Stage 4: The trip logger
 
+For why it works this way, see [the firmware design](DESIGN.md).
+
 The `04_trip_logger/` sketch detects trips, accumulates mileage and writes
 GPX files to the microSD card, with internal LittleFS as fallback. Its
 first real uploads from microSD succeeded on 2026-10-21 (UTC): four trips
@@ -1109,7 +1111,7 @@ against the server's stdlib protocol validator.
 This section is for validating the firmware on hardware. You don't need it
 to build or use the tracker.
 
-The network task reserves 12,288 bytes, matching the Stage 4 brief. During
+The network task reserves 12,288 bytes, measured in issue #6. During
 and after the real SD uploads on 2026-10-21 (UTC), the debug build's
 minimum free stack was **7,436 bytes**, with GPS logging active. This
 measures the successful-upload path; it does not establish headroom for

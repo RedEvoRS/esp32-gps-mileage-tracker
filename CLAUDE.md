@@ -61,7 +61,7 @@ firmware/
   03_gps_test/           Stage 3: TinyGPSPlus NMEA parsing
   04_trip_logger/        Stage 4: the trip logger, plus its partitions.csv
   host_test/             Host-side tests for Stage 4 (run.sh, stubs/)
-  STAGE4_TECHNICAL_BRIEF.md  Stage 4 design brief (written for the V1.2)
+  DESIGN.md              Why Stage 4 works the way it does
   secrets.h.example      Copy to 04_trip_logger/secrets.h; fill in WiFi + server creds
   README.md              Full setup guide + pin reference
 
@@ -88,7 +88,7 @@ tools/generate_error_catalog.py     Generates sketch-local diag_catalog.h
 DIAGNOSTICS.md                     Framework reference and issue delivery map
 .github/workflows/audit-tests.yml   CI: PII scan + server tests + firmware host tests
 .github/dependabot.yml              Dependabot: monthly pip, Docker and Actions bumps
-docs/history/                     Review history (see Where Status Lives)
+docs/history/                     Reviews and original V1.2 design brief (see Where Status Lives)
 ```
 
 ## Where Status Lives

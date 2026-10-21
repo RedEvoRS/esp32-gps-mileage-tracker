@@ -1,11 +1,10 @@
-> **Historical design record:** written in 2026 for the T-Beam V1.2
-> (ESP32 + NEO-M8N), before the move to the T-Beam Supreme. Kept as the
-> design record: rails, pins, partitions/storage and sleep behaviour differ
-> on the Supreme. There ALDO3 powers LoRa, trips use microSD with LittleFS
-> fallback, shutdown uses PMU power-off instead of deep sleep, and the M10
-> receiver is configured with UBX-CFG-VALSET. See [firmware/README.md](README.md)
-> for current behaviour. V1.2 owners should use the frozen
-> [`tbeam-v1.2` branch](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/tree/tbeam-v1.2).
+> This is a historical record, kept as written: an original 2026 research proposal for the retired T-Beam V1.2, written before the firmware existed.
+> It includes ideas never implemented or later superseded: HTTPS with Transport Layer Security (TLS), GPX 1.1/Garmin extensions, LittleFS auto-format, a car-voltage divider, V1.2 pins and deep sleep.
+> It is **not build instructions** and does not fully describe the V1.2 release either. **Do not copy its wiring, pin or power-rail code.**
+> For current behavior, see [the firmware design](../../firmware/DESIGN.md) and [the firmware guide](../../firmware/README.md).
+> For the V1.2 release, use the frozen [`tbeam-v1.2` branch](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/tree/tbeam-v1.2).
+> Any earlier PR numbers, commit hashes and branch names in the proposal refer to the project's private archive and will not resolve here.
+> For current status, see this repository's GitHub issues; see the [history index](README.md) for context.
 
 # Stage 4 firmware technical brief for T-Beam V1.2 mileage tracker
 
