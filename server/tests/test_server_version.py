@@ -1,11 +1,14 @@
 """Server stamp provenance, public token validation and service rendering."""
 
+from contextlib import redirect_stderr
+import io
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -45,13 +48,16 @@ class VersionStamp(unittest.TestCase):
         self.server.mkdir()
         self.version = self.server / "VERSION"
         self.version.write_text("v0.01\n", encoding="ascii")
+        (self.server / "COMMIT").write_text("$Format:%H$\n", encoding="ascii")
+        (self.root / ".gitattributes").write_bytes((SERVER.parent / ".gitattributes").read_bytes())
         self.git("init", "-q")
         self.git("config", "user.name", "Test")
         self.git("config", "user.email", "test@example.invalid")
         self.git("config", "core.autocrlf", "false")
         self.git("add", ".")
         self.git("-c", "commit.gpgsign=false", "commit", "-qm", "Test fixture")
-        self.commit = self.git("rev-parse", "HEAD")[:10]
+        self.full_commit = self.git("rev-parse", "HEAD")
+        self.commit = self.full_commit[:10]
         self.warnings = []
 
     def git(self, *args):
@@ -109,6 +115,61 @@ class VersionStamp(unittest.TestCase):
             (Path(folder) / "VERSION").write_text("v0.01")
             self.assertEqual(stamp(folder, warn=self.warnings.append), "v0.01")
         self.assertTrue(self.warnings)
+
+    def archive(self, destination, *args):
+        data = subprocess.check_output(["git", "archive", "--format=tar", *args],
+                                       cwd=self.root)
+        with tarfile.open(fileobj=io.BytesIO(data)) as archive:
+            archive.extractall(destination, filter="data")
+
+    def test_commit_archive_has_commit_stamp_without_git(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.archive(folder, self.full_commit, "server")
+            extracted = Path(folder) / "server"
+            self.assertEqual((extracted / "COMMIT").read_text().strip(), self.full_commit)
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                self.assertEqual(stamp(extracted), "v0.01+" + self.commit)
+            self.assertEqual(errors.getvalue(), "")
+
+    def test_tree_archive_keeps_placeholder_and_warns_on_stderr(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.archive(folder, "HEAD:server")
+            self.assertEqual((Path(folder) / "COMMIT").read_text().strip(), "$Format:%H$")
+            errors = io.StringIO()
+            with redirect_stderr(errors):
+                self.assertEqual(stamp(folder), "v0.01")
+            self.assertIn("unexpanded archive placeholder", errors.getvalue())
+            self.assertIn("using VERSION alone", errors.getvalue())
+
+    def test_git_wins_over_archive_commit(self):
+        # The checked-in placeholder already proves it cannot leak into a stamp.
+        self.assertEqual(self.stamp(), "v0.01+" + self.commit)
+        (self.server / "COMMIT").write_text("a" * 40, encoding="ascii")
+        self.assertEqual(self.stamp(), "v0.01+" + self.commit + "-dirty")
+        self.assertEqual(self.warnings, [])
+
+    def test_archive_hash_fallback_when_git_is_missing(self):
+        for commit in ("a" * 40, "b" * 64, "ABCDEF0123" * 4):
+            with self.subTest(commit_length=len(commit)), \
+                    patch("stamp_version.subprocess.check_output", side_effect=FileNotFoundError()):
+                (self.server / "COMMIT").write_text(commit + "\n", encoding="ascii")
+                self.assertEqual(self.stamp(), "v0.01+" + commit[:10].lower())
+        self.assertEqual(self.warnings, [])
+
+    def test_placeholder_and_invalid_commit_fall_back(self):
+        with tempfile.TemporaryDirectory() as folder:
+            copied = Path(folder)
+            (copied / "VERSION").write_text("v0.01", encoding="ascii")
+            for value in (b"$Format:%H$", b"a" * 39, b"a" * 41, b"g" * 40,
+                          b"a" * 65, b"\xff", b""):
+                with self.subTest(value=value):
+                    (copied / "COMMIT").write_bytes(value)
+                    errors = io.StringIO()
+                    with redirect_stderr(errors):
+                        self.assertEqual(stamp(copied), "v0.01")
+                    self.assertIn("COMMIT", errors.getvalue())
+                    self.assertIn("using VERSION alone", errors.getvalue())
 
 
 class ServiceVersions(unittest.TestCase):
@@ -172,6 +233,12 @@ class ServiceVersions(unittest.TestCase):
                 patch.object(self.viewer, "read_diagnostics", return_value=data):
             html = client.get("/device-health").get_data(as_text=True)
         self.assertRegex(html, r"<dt>Firmware</dt><dd>v0.06\+0123456789</dd>\s*<dt>Server</dt><dd>v0.01\+abcdef1234</dd>")
+        data["devices"][0]["snapshot"] = None
+        with patch.dict(os.environ, SERVER_VERSION="v0.01+abcdef1234"), \
+                patch.object(self.viewer, "read_diagnostics", return_value=data):
+            html = client.get("/device-health").get_data(as_text=True)
+        self.assertIn("<dt>Server</dt><dd>v0.01+abcdef1234</dd>", html)
+        self.assertIn("No health snapshot received", html)
 
     def test_footer_on_http_errors_preserves_status_and_headers(self):
         client = self.viewer.app.test_client()

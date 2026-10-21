@@ -135,16 +135,60 @@ docker compose version      # expect v2 or newer
 
 Run the copy **on your computer**, where you cloned or unzipped the repo.
 If you are still in the SSH session from Step 1, type `exit` first to
-return to your computer's terminal. Then:
+return to your computer's terminal.
+
+**From a Git clone, use a commit archive.** Run this from the repository
+root in **Git Bash on Windows**, or a macOS/Linux terminal:
+
+```bash
+cd "<path to your copy of the repo>"
+git archive HEAD server | ssh <user>@<host> 'mkdir -p ~/mileage-tracker && tar -x --strip-components=1 -C ~/mileage-tracker'
+```
+
+This copies the committed `server/` files, including `.env.example` and
+`.dockerignore`, directly into `~/mileage-tracker` (so `docker-compose.yml`
+is there, with no extra `server/` directory). It works for both a first copy
+and updates. Only tracked files from `HEAD` are sent: commit your intended
+changes first, or replace `HEAD` with the commit or tag you want to deploy.
+Your server's `.env`, `viewer.env`, `monitor.env` and `data/` are not in Git
+and are left in place. The copy overwrites supplied source files but does
+not remove old files that are absent from the archive.
+
+The archive also writes its full commit hash into `COMMIT`, allowing a build
+on the server to display the exact source commit without a Git clone there.
+Use **`git archive HEAD server`**, not **`git archive HEAD:server`**: the latter
+selects a tree rather than a commit, so Git leaves the `$Format:%H$`
+placeholder unexpanded and the server can only report the release number.
+[Git's archive attributes](https://git-scm.com/docs/gitattributes#Documentation/gitattributes.txt-export-subst)
+require a commit or tag for this substitution.
+
+Do not run this binary archive pipeline in **Windows PowerShell 5.1**: it can
+corrupt the tar stream. Use Git Bash as above. PowerShell only preserves
+native binary pipelines starting with 7.4; see
+[Microsoft's pipeline documentation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_pipelines#using-native-commands-in-the-pipeline).
+
+**Without Git**, copy the `server/` folder from your unzipped GitHub source
+download instead:
 
 ```bash
 cd "<path to your copy of the repo>"
 scp -r server <user>@<host>:~/mileage-tracker
 ```
 
-`scp` comes with Windows 10 and later, macOS and Linux, and works the same
-in each. Use this for the first copy only: if `~/mileage-tracker` already
-exists, `scp -r` puts the new copy inside it as `server/`.
+`scp` comes with Windows 10 and later, macOS and Linux, and also works in
+PowerShell 5.1. Use this form for the first copy only: if `~/mileage-tracker`
+already exists, `scp -r` puts the new copy inside it as `server/`. For an
+update to an existing install, copy the folder's contents, including dotfiles:
+
+```bash
+scp -r server/. <user>@<host>:~/mileage-tracker/
+```
+
+Use a fresh source download, without local credentials or data. GitHub's
+source zip/tarball has an expanded `COMMIT`, so copying that folder preserves
+the commit stamp. Copying a Git clone's working tree with `scp` leaves the
+literal placeholder and gives **VERSION only, no commit**. A hand copy with
+no `COMMIT` still works, with the same release-only fallback.
 
 Reconnect from your computer:
 
@@ -332,11 +376,15 @@ as `SERVER_VERSION`. A restart keeps the old image's stamp; rebuild to change
 code/version. The monitor includes its version in its startup log.
 
 Install Python 3 on a manual build host (`sudo apt install python3`);
-`install.sh` installs it automatically. For full commit information, build
-inside a Git clone with Git installed, from its `server/` directory. If you
-used Step 2's copy-only layout, or Git is unavailable, the helper prints a
-reason on stderr and falls back to VERSION alone. That still identifies the
-release, but cannot identify the source commit or dirty state. A missing or
+`install.sh` installs it automatically. A build inside a Git clone uses Git
+for its commit and dirty state. Without usable Git metadata, the helper reads
+`COMMIT`: Step 2's commit archive and GitHub source downloads contain a full
+40- or 64-hex hash, giving the same release-plus-ten-character-commit stamp.
+Archives start clean, so this fallback adds no `-dirty`; later hand edits to
+extracted files cannot be detected. Recopy a clean archive before rebuilding
+to keep the stamp accurate. If `COMMIT` is missing, invalid or still an
+unexpanded placeholder, the helper prints a reason on stderr and uses VERSION
+alone. That identifies the release but not its commit or dirty state. A missing or
 invalid VERSION, or a build without a stamp argument, reports `unversioned`.
 Services replace invalid stamps with `unversioned` before displaying them;
 only 1-64 ASCII letters/digits/`.`, `_`, `+`, `-` are accepted, starting with a
@@ -1505,6 +1553,12 @@ cp -p ~/mileage-backups/snapshots/<time>/data/$TRIP.gpx data/$TRIP.gpx
 the host-side port mapping in `docker-compose.yml`.
 
 **Rebuild after code changes:**
+
+First copy the new committed source from your computer using Step 2's
+`git archive HEAD server | ssh ...` command (or copy a fresh source download
+with `scp -r server/. ...`). This refreshes `COMMIT` along with the code;
+do not use `HEAD:server`. Then run this **on the server**. Rebuilding without
+copying new source keeps the old code and stamp.
 
 ```bash
 cd ~/mileage-tracker

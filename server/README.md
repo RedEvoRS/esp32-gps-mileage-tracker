@@ -93,6 +93,9 @@ by the `mileage-viewer` service, which reads these files independently.
     mileage-tracker/           # this folder, copied to the server
     ├── docker-compose.yml     # All Python builds use this server directory as context
     ├── .dockerignore          # Runtime allowlist; excludes secrets, tests and data
+    ├── VERSION                # Server release number
+    ├── COMMIT                 # Archive commit; literal placeholder in a Git checkout
+    ├── stamp_version.py       # Build stamp from Git, then COMMIT, then VERSION alone
     ├── common/diagnostics/    # Shared validators and catalog.json (required)
     ├── .env.example           # Template for .env
     ├── .env                   # Upload token and BIND_ADDR (created by you or install.sh, never committed)
@@ -228,9 +231,15 @@ environment value; restarting an old image does not give it a new version.
 The monitor reports its version in its startup log.
 
 Python 3 is required on the build host (`install.sh` installs it on Debian).
-A Git clone with Git installed provides the full stamp. A copied `server/`
-folder without usable Git metadata falls back to VERSION alone with a reason
-on stderr: it cannot identify the deployed commit or whether it was dirty.
+A Git clone with Git installed provides the commit and dirty state. Without
+usable Git metadata, the helper reads `COMMIT` if it contains a full 40- or
+64-hex hash and uses its first ten characters. Commit/tag archives and GitHub
+source downloads supply this hash; no Git install is needed on the server.
+Archives start clean, so this fallback never adds `-dirty`; later hand edits
+cannot be detected. Recopy clean source before rebuilding for an accurate stamp.
+If `COMMIT` is missing, invalid or still contains `$Format:%H$`, the helper
+uses VERSION alone with a reason on stderr. `COMMIT` is optional for hand
+copies and stays outside the Docker images; the stamp arrives as a build arg.
 A missing/invalid VERSION gives `unversioned`. Building without the argument
 also gives `unversioned`; runtime values outside a 1-64 character ASCII token
 (letters, digits, `.`, `_`, `+`, `-`, starting with a letter/digit) are replaced
@@ -238,6 +247,34 @@ by `unversioned` before HTML, JSON or monitor logs. `--check` prints both
 running versions and warns about missing stamps or mismatches without
 changing its exit code for those warnings. A mismatch means the two services
 may contain different code; rebuild both with the same stamp and check again.
+
+To copy a committed build for installation or an update, run this from the
+repository root **on your computer**, using Git Bash on Windows or a
+macOS/Linux terminal:
+
+```bash
+git archive HEAD server | ssh <user>@<host> 'mkdir -p ~/mileage-tracker && tar -x --strip-components=1 -C ~/mileage-tracker'
+```
+
+Replace `<user>` and `<host>` with the server login and address. `HEAD` can
+also be a commit hash or tag. This places `docker-compose.yml`, dotfiles
+such as `.env.example`/`.dockerignore`, and an expanded `COMMIT` directly in
+`~/mileage-tracker`, overwriting supplied source files while leaving untracked
+`.env`, `viewer.env`, `monitor.env` and `data/` in place. It does not delete
+obsolete source files. Uncommitted changes are not sent. Do not use
+`git archive HEAD:server`: that selects a tree, and Git cannot expand `COMMIT`
+without a commit or tag. Do not pipe tar data through Windows PowerShell 5.1,
+which can corrupt it; use Git Bash (native binary pipes require PowerShell
+7.4 or newer, as explained in
+[Step 2 of the runbook](../DEPLOY_DEBIAN.md#step-2--copy-the-server-directory-over)).
+
+Without Git, copy `server/` from a fresh unzipped GitHub source download:
+`scp -r server <user>@<host>:~/mileage-tracker` for a first install, or
+`scp -r server/. <user>@<host>:~/mileage-tracker/` for updates. The latter
+includes dotfiles without creating a nested `server/` folder; use a fresh
+download without local credentials or data. The download's expanded `COMMIT`
+preserves the commit stamp. Copying a Git clone's working tree with `scp`
+gives **VERSION only, no commit**, because its `COMMIT` is still a placeholder.
 
 ## First-Time Setup
 
@@ -336,7 +373,9 @@ Stop the service entirely:
 
     docker compose down
 
-Update to newer dependency versions (after editing requirements.txt):
+To update code or dependency versions, first copy the new committed source
+and its `COMMIT` using the archive command above (or copy a fresh GitHub source
+download). Then rebuild **on the server**, from this folder:
 
     SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
 

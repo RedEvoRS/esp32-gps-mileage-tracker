@@ -260,7 +260,7 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 
 - Version: `server/VERSION`; `python3 server/stamp_version.py` prints release +
   ten-character Git commit (+ `-dirty` for tracked changes; VERSION alone if
-  Git is unavailable). Pass as Compose build arg `SERVER_VERSION`; installer
+  Git and archive COMMIT are unavailable). Pass as Compose build arg `SERVER_VERSION`; installer
   does this automatically for all Python images. Missing/invalid stamps are
   `unversioned`. Viewer footer/Device health and unauthenticated `/health`
   expose it on the LAN; `install.sh --check` warns on service mismatches.

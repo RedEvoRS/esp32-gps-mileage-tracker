@@ -1285,7 +1285,7 @@ DEVICE_HEALTH_HTML = """
         <div>E{{ key }} = {{ value }}</div>
       {% else %}Not reported{% endfor %}</dd>
     </dl>
-    {% else %}<p>No health snapshot received. Contact alone does not establish device health.</p>{% endif %}
+    {% else %}<p>No health snapshot received. Contact alone does not establish device health.</p><dl><dt>Server</dt><dd>{{ server_version }}</dd></dl>{% endif %}
     {% for state_name, conditions in d.groups.items() %}
     {# Unknown is usually most of the catalog; keep it folded away. #}
     {% if state_name == 'unknown' %}<details><summary>{% endif %}

@@ -401,6 +401,7 @@ preflight() {
             "This script can't install Docker here, so it expects it installed already." ;;
     esac
 
+    # COMMIT is optional: archives supply it, but hand copies can use VERSION alone.
     local f missing=()
     for f in VERSION stamp_version.py common/version.py docker-compose.yml .dockerignore .env.example viewer.env.example monitor.env.example sample.gpx \
         common/__init__.py common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json} \
