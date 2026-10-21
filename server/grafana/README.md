@@ -13,6 +13,12 @@ no records. Follow the full setup in [DEPLOY_DEBIAN.md Step 11e
 (Prometheus/Grafana)](../../DEPLOY_DEBIAN.md#11e--optional-prometheus-metrics-for-external-grafana)
 and [Step 11f (Loki)](../../DEPLOY_DEBIAN.md#11f--optional-push-to-external-loki).
 
+Tested with Grafana 13.2.4, Prometheus 3.15.1 (`promtool` 3.15.1) and Loki 3.7.9
+on 2026-10-21 (UTC); the Loki examples also passed on Loki 2.9.17. Loki 2.4 or
+newer is required, because the monitor sends records with their original
+timestamps and older Loki releases reject out-of-order lines. To repeat the
+test, run `python live-test/live_test.py` (see [`live-test/`](live-test/README.md)).
+
 - Merge `prometheus-scrape.yml` into Prometheus `scrape_configs`, changing
   `<host>` to the tracker server's LAN address or a host reachable over your
   VPN. Store the bearer token in the referenced private token file.
