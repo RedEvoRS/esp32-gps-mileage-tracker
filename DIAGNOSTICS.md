@@ -155,7 +155,7 @@ notices by themselves. Silence code 7001 is derived by the server monitor;
 the protocol rejects 7xxx codes from devices so one cannot forge it.
 
 Catalog OLED text is printable ASCII, at most **three lines of 21 characters**.
-These remain catalog validation rules in **catalog v5**; production cards do
+These remain catalog validation rules in **catalog v6**; production cards do
 not render the `oled` field. The historical compact-text geometry is U8g2
 `u8g2_font_5x8_tf`, with 5-pixel advances and 8-pixel rows: 21 characters
 occupy 105 pixels. Never scroll or shrink text to work around a catalog
@@ -188,6 +188,25 @@ failures, with attempts 30 seconds apart, and clears only on a confirmed intende
 state. Its context is empty. E2004/E2005 now say a temperature-driven pause is
 required, rather than claiming the charger stopped; E2008 reports persistent
 failure to confirm that command. Earlier published fingerprints are retained.
+
+Catalog v6 adds **2009 BATTERY_POWER_OFF**, an INFO, non-notifying,
+`per_occurrence` notice, and optional battery measurements to **1000 BOOT**.
+Both accept `battery_mv` (1-6000 mV) and `battery_pct` (0-100 PMU charge
+percentage). Failed/disconnected/invalid measurements are omitted, never
+invented as zero; a successfully read 0% is valid. E2009 also carries `reason`
+(`idle_battery`, `battery_critical` or `user_long_press`). Each event uses at
+most three context keys, within the existing eight-key/502-byte event limits.
+The catalog OLED text fits the usual limits; INFO history never produces a
+production fault card or notification. Existing Device health history and
+monitor exports render the new catalog fields without a new viewer interface.
+
+**Upgrade the server before installing this firmware.** A v6 server accepts
+older firmware, including BOOT without battery fields. An older server rejects
+the new BOOT keys and context-bearing E2009, even though protocol/schema v1 is
+unchanged. Rejected batches can enter the firmware's existing bounded isolation
+path; those readings are not guaranteed to be delivered later. Update/restart
+ingest, viewer and monitor together so all load catalog v6. No database migration
+or new service dependency is needed.
 
 ## Protocol v1 (#117 contract, #118 and #125 integration)
 
@@ -611,6 +630,18 @@ the active backend and physical unacknowledged valid-frame/segment counts;
 uncertain inventory is labeled incomplete. Ambiguous writes can retain duplicate
 IDs, so physical frame counts can exceed distinct event counts.
 
+After trusted PMU/LoRa startup, charging is disabled and battery detection/ADC
+are enabled before display/USB waits. After the existing one-second USB wait,
+the raw battery registers are sampled once, before storage, GPS startup and the
+charge guard's first charger-enable decision. BOOT retains that early reading;
+its normal event timestamp is assigned when the journal starts after storage
+mounting, so it can be seconds later than the measurement. Failed/untrusted PMU
+startup omits battery context and retains its conservative degraded policy.
+Residual bias remains: the PMU can charge before software disables it (including
+across an ESP32 reset), a failed disable may leave charging on, the ADC/gauge
+may be stale, and USB/load/temperature/voltage relaxation affect the reading.
+This is an early sample, not a proven open-circuit voltage or current measurement.
+
 Before PMU shutdown, core 1 ends the trip and stops networking, then asks the
 core-0 consumer to drain the bounded queue and seal open segments. The consumer
 closes each write before returning. Core 1 waits at most 15 seconds for this
@@ -620,6 +651,65 @@ Cancelled/failed shutdown remounts the same stores and invalidates journal
 caches while retaining the boot identity and RAM queue. RAM-only history is lost
 on reset/power-off. Hardware tests must measure individual VFS operation latency
 and trip-write delay, plus induced failures during sealing and remount.
+
+Immediately before requesting that seal, core 1 captures one E2009 battery
+sample with the existing UTC/confidence provider and the known shutdown reason.
+Core 0 drains a queue slot, submits the retained notice exactly once, then drains
+and seals it with the earlier events. A full writable queue therefore does not
+lose the sample. PMU reads stay on core 1; filesystem writes stay with the
+existing consumer (the sole degraded-loop consumer handles no-storage mode).
+There is no journal write after sealing/unmounting or between the final VBUS
+check and `PMU.shutdown()`. Successful closed writes and sealing provide the
+existing filesystem durability; physical power-loss guarantees still need bench
+testing, particularly FAT metadata. Failed media, a stuck consumer, the existing
+15-second deadline or RAM-only operation cannot guarantee persistence. Power
+safety keeps its bounded wait and reports incomplete sealing instead of waiting
+forever for diagnostics. A late VBUS return or failed PMU shutdown can leave an
+E2009 for an attempted power-off that did not happen; it is not proof of rail-off.
+
+### Reading parked battery drain without a meter
+
+On the Supreme, parked means PMU power-off: the 18650 still supplies the PMU,
+RTC and GPS backup RAM. After updating the server and firmware, ordinary drives
+and parked nights collect the two readings; no special driving procedure is
+needed. Once the board next uploads its retained journal, run this from a copy
+of the repository on the server, where the diagnostics database is accessible:
+
+```sh
+python server/parked_drain.py /data/diagnostics/events.db
+```
+
+Use the database's actual mounted path. The stdlib-only helper opens SQLite
+with `mode=ro`, a two-second timeout, `query_only` and one read transaction. It
+never initializes, migrates or changes the database. CSV output identifies the
+device and off/boot UTC times, hours parked, mV drop, mV/hour and charge
+**percentage points** lost. Missing voltage/percentage pairs print `unknown`
+independently. A voltage rise remains negative rather than being clamped to zero.
+An empty result means no usable pairs yet; it does not mean no drain.
+
+The helper pairs adjacent UTC-ordered BOOTs of the same device and uses the
+last event of the earlier boot only when it is E2009. It requires the next
+reset reason to be `power_on`, positive unique consecutive boot counters as an
+additional gap check, and increasing known UTC. Counter values are not an
+ordering authority; server receipt times and random boot IDs are never clocks.
+Gaps, software resets, ambiguous counters, unknown times and later same-boot
+events after an attempted shutdown are skipped. Lost records, counter resets,
+clock corrections or a cancelled shutdown without a later event can still make
+a pair misleading. Inspect the history and clock confidence before using it;
+allow retained history to finish uploading before drawing conclusions.
+
+Collect at least **three parked pairs of eight hours or longer** and compare
+them at similar temperatures and charge levels. An 18650's voltage and stored
+charge have a **non-linear** relationship: there is no universal conversion
+from mV/hour to mA. Use the particular cell's discharge curve and usable
+capacity for a rough current estimate. As a separate rough check,
+`capacity_mAh * percentage_points_drop / 100 / hours_parked` estimates mA only
+if the PMU gauge is accurate; its integer steps and recalibration can overwhelm
+small overnight changes. Load removal causes voltage rebound, and early USB
+charging can hide drain. An estimated drain consistently above **about 2 mA**
+is worth investigating from several pairs and the existing logs. A meter is a
+last resort if those data cannot explain it. Firmware/helper tests do not
+complete the real parked-data acceptance step.
 
 ### Stage 4 runtime fault hooks (#124 part B)
 

@@ -28,6 +28,7 @@ PUBLISHED_CATALOGS = {
     3: "0a1c02d50c538e8a4b65c0cfc68ea82126fade31957e2f4227f465113a4c009f",
     4: "6454b5e2c5958a8552ef5a04864cbae2ac0d02998f5fc78d514b8bfec533fb93",
     5: "061911d5a8a96724f2ef5aa9dd9938cc7419812145eadc9bf293d089434cca5c",
+    6: "5f442ea44577763d8852e48e185a25564e98ae1b3a578ab5292fc1296874b4f0",
 }
 
 
@@ -53,7 +54,7 @@ class CatalogTests(unittest.TestCase):
 
     def test_catalog_unique_codes_and_symbols(self):
         rows = self.catalog["codes"]
-        self.assertEqual(len(rows), 47)
+        self.assertEqual(len(rows), 48)
         self.assertEqual(len({r["code"] for r in rows}), len(rows))
         self.assertEqual(len({r["symbol"] for r in rows}), len(rows))
 
@@ -120,7 +121,7 @@ class CatalogTests(unittest.TestCase):
 
     def test_charge_control_failure_and_pause_wording(self):
         rows = {row["code"]: row for row in self.catalog["codes"]}
-        self.assertEqual(self.catalog["catalog_version"], 5)
+        self.assertEqual(self.catalog["catalog_version"], 6)
         self.assertEqual(rows[2008]["symbol"], "CHARGE_CONTROL_FAILED")
         self.assertEqual(rows[2008]["severity"], "error")
         self.assertTrue(rows[2008]["notify"])
@@ -173,6 +174,43 @@ class CatalogTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_battery_history_context_limits_and_rolling_upgrade(self):
+        catalog = load_catalog()
+        row = next(r for r in catalog["codes"] if r["code"] == 2009)
+        self.assertEqual((row["severity"], row["notify"], row["journal"]),
+                         ("info", False, "per_occurrence"))
+        for code in (1000, 2009):
+            # Combined largest battery fields still fit the 502-byte frame,
+            # even at maximum counters and a full 32-character version token.
+            combined = {"battery_mv": 6000, "battery_pct": 100}
+            combined.update({"reset_reason": "deep_sleep"} if code == 1000
+                            else {"reason": "battery_critical"})
+            validate_request(request([event(code, transition="notice", episode_id=None,
+                firmware_version="v" * 32, boot_counter=MAX_INTEGER, sequence=MAX_INTEGER,
+                uptime_ms=4294967295, utc_ms=253402300799999, time_source="gps",
+                sync_age_ms=MAX_INTEGER, context=combined)]))
+            for context in ({}, {"battery_mv": 4000, "battery_pct": 0},
+                            {"battery_mv": 6000, "battery_pct": 100}):
+                value = request([event(code, transition="notice", episode_id=None,
+                                       catalog_version=6, context=context)])
+                validate_request(value)
+            for context in ({"battery_mv": 0}, {"battery_mv": -1}, {"battery_mv": 6001},
+                            {"battery_pct": -1}, {"battery_pct": 101}, {"battery_pct": True}):
+                self.invalid(request([event(code, transition="notice", episode_id=None, context=context)]))
+        old = copy.deepcopy(catalog)
+        old["catalog_version"] = 5
+        old["codes"] = [r for r in old["codes"] if r["code"] != 2009]
+        for r in old["codes"]:
+            if r["code"] == 1000:
+                r["context"] = {"reset_reason": r["context"]["reset_reason"]}
+        for code in (1000, 2009):
+            with self.assertRaises(ProtocolError):
+                validate_request(request([event(code, transition="notice", episode_id=None,
+                    context={"battery_mv": 4000})]), catalog=old)
+        # The new catalog still accepts old firmware's BOOT context.
+        validate_request(request([event(1000, transition="notice", episode_id=None,
+                                       context={"reset_reason": "power_on"})]))
+
     def invalid(self, value):
         with self.assertRaises(ProtocolError):
             validate_request(value)

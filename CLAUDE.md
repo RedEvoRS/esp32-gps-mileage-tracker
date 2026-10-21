@@ -211,7 +211,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   and fall back to RMC-only speed
 - FreeRTOS: networking on core 0, GPS on core 1
 - Stage 4 diagnostics: static EventLog, random boot identity and NVS boot
-  counter; boot/reset, retained PMU recovery and runtime fault hooks. GPS,
+  counter; early BOOT/pre-seal power-off battery samples and a read-only
+  parked-drain helper (deploy the server catalog first); boot/reset, retained
+  PMU recovery and runtime fault hooks. GPS,
   battery/charge guard, trip storage/recovery, WiFi/HTTP, network stack and
   OLED faults use the catalog policy (production: brief heard-satellite/fault cards), including an AGC/GSV antenna check
   in all builds. Conditions raise/clear with

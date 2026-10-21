@@ -314,6 +314,11 @@ static std::atomic<uint32_t> gFsDemand{0};
 #define FS_UNLOCK() do { xSemaphoreGive(gFsMutex); gFsDemand.fetch_sub(1); } while (0)
 
 static std::atomic<bool> gJournalSealRequested{false}, gJournalSealDone{false}, gJournalSealOk{false};
+// Core 1 fills the immutable shutdown notice before publishing the seal request.
+// Core 0 drains a queue slot, submits it once, then seals. Static task storage.
+static diagnostics::EventInput gPowerOffEvent;
+static std::atomic<bool> gPowerOffEventPending{false};
+static diagnostics::BatterySample gBootBattery;
 static bool gJournalSealing = false; // core-0 only, while holding the mutex
 static bool gEventIoBudget = false; // core-0 only, cooperative VFS deadline
 static uint32_t gEventIoStarted = 0;
@@ -490,7 +495,13 @@ static void serviceJournal() {
                       gJournalBoot.counterPersisted ? "persisted" : "unavailable");
         gJournalBootReported = true;
     }
-    if (sealing) {
+    if (sealing && gPowerOffEventPending.load()) {
+        auto result = gJournal.submit(gPowerOffEvent);
+        if (result == diagnostics::EventLog::Submit::Accepted) gPowerOffEventPending.store(false);
+        // Full/busy stays pending for the next service tick, within the same
+        // bounded shutdown deadline. Never submit a second accepted notice.
+    }
+    if (sealing && !gPowerOffEventPending.load()) {
         gJournalSealOk.store(gJournal.seal());
         gJournalSealDone.store(true);
     }
@@ -1481,7 +1492,7 @@ static const char* const VBUS_UNREADABLE =
 
 static bool mountSdStorage();
 
-static void powerOffForVbus() {
+static void powerOffForVbus(const char* reason = "idle_battery") {
     // AXP2101 powers on on a VBUS INSERT EDGE, not its steady level. Never
     // shut down on USB, even for a power-key or low-battery interrupt: the
     // board would stay off until USB was unplugged and replugged (#106).
@@ -1504,6 +1515,14 @@ static void powerOffForVbus() {
     // The core-0 consumer closes each append itself; ask it to drain and seal
     // before unmount. A stuck network task cannot delay power safety forever.
     if (gJournalReady) {
+        gPowerOffEvent = diagnostics::EventInput();
+        gPowerOffEvent.code = static_cast<uint16_t>(diagnostics::Code::BATTERY_POWER_OFF);
+        gPowerOffEvent.uptimeMs = millis();
+        gJournal.stamp(gPowerOffEvent);
+        diagnostics::addBatteryContext(gPowerOffEvent, diagnostics::readBatterySample(PMU));
+        gPowerOffEvent.context[gPowerOffEvent.contextCount++] =
+            diagnostics::EventContext::enumeration("reason", reason);
+        gPowerOffEventPending.store(true);
         gJournalSealDone.store(false);
         gJournalSealRequested.store(true);
         uint32_t journalWait = millis();
@@ -1574,6 +1593,7 @@ static void powerOffForVbus() {
     }
     gJournal.invalidateStorage(); // same boot/queue, reload metadata after remount
     gJournalStarted = false; // recheck FAT allocation geometry on core 0
+    gPowerOffEventPending.store(false); // consumer excluded by FS_LOCK
     gJournalSealRequested.store(false);
     gJournalSealDone.store(false);
     FS_UNLOCK();
@@ -1620,7 +1640,7 @@ static void pollPmu() {
         if (gBootButton.held(millis())) toggleRuntimeDebug();
         else gDisplayUserRequest = true;
     }
-    if (irq.has(XPOWERS_AXP2101_PKEY_LONG_IRQ)) powerOffForVbus();
+    if (irq.has(XPOWERS_AXP2101_PKEY_LONG_IRQ)) powerOffForVbus("user_long_press");
     // Observe hardware's existing low/critical policy before shutdown. Never
     // submit from the ISR (it only latches gPmuIrqFlag).
     if (gJournalReady) {
@@ -1629,7 +1649,7 @@ static void pollPmu() {
         if (irq.has(XPOWERS_AXP2101_WARNING_LEVEL2_IRQ))
             batteryCondition(2003, true, millis());
     }
-    if (irq.has(XPOWERS_AXP2101_WARNING_LEVEL2_IRQ)) powerOffForVbus();
+    if (irq.has(XPOWERS_AXP2101_WARNING_LEVEL2_IRQ)) powerOffForVbus("battery_critical");
 
     PMU.clearIrqStatus();   // write-1-to-clear, or the line never re-fires
 }
@@ -2851,7 +2871,7 @@ static void beginJournal() {
     gJournalBoot = diagnostics::newJournalBoot();
     gJournalReady = gJournal.begin(gJournalBoot.id, gJournalBoot.counter, firmware::kVersion);
     gJournal.setTimeProvider(stampDiagnosticTime);
-    if (gJournalReady) diagnostics::submitJournalBoot(gJournal, esp_reset_reason(), gPmuStartup, millis());
+    if (gJournalReady) diagnostics::submitJournalBoot(gJournal, esp_reset_reason(), gPmuStartup, millis(), gBootBattery);
 }
 
 static bool createFsMutex() {
@@ -2954,6 +2974,14 @@ void setup() {
     // and initialization, BEFORE Serial, storage or GPS setup can block.
     bool pmuReady = beginPmuWithRecovery(Wire1, PMU, I2C_SDA, I2C_SCL, gPmuStartup);
     bool radioOff = pmuReady && PMU.disableALDO3() && aldo3State() == Aldo3State::Off;
+    gBootBattery = diagnostics::BatterySample();
+    if (radioOff) {
+        // Stop retained charging before display/USB/storage waits. Only trusted
+        // PMU startup may do this; degraded power modes retain their policy.
+        PMU.disableCellbatteryCharge();
+        PMU.enableBattDetection();
+        PMU.enableBattVoltageMeasure();
+    }
     // SH1106 can retain its state across an ESP32 reset. Put it to sleep
     // before either degraded startup branch; never touch the PMU's Wire1.
     beginProductionDisplay();
@@ -2978,12 +3006,15 @@ void setup() {
     // disables VBACKUP; a 60 s ALDO4-off test hot-started in 2.0 s with it off.
     PMU.disableButtonBatteryCharge();
     // Leave ALDO1/ALDO2 and DCDC4/DCDC5 as found. Peripheral loads and
-    // PMU/RTC bus pull-up dependencies need proof before disabling them;
-    // #25 owns the measured current decision. Never touch DCDC1 (ESP32).
+    // PMU/RTC bus pull-up dependencies need proof before disabling them.
+    // Never touch DCDC1 (ESP32).
 
     Serial.begin(115200);
     gRtc.begin(Wire1, gDiagnosticClock);
     delay(1000);
+    // ADC has had a conversion interval, charger still disabled. Retain this
+    // early sample across storage startup; never re-read it after charge guard.
+    gBootBattery = diagnostics::readBatterySample(PMU);
     Serial.println("\n=== Stage 4: Trip Logger ===");
     Serial.printf("Firmware: %s\n", firmware::kVersion);
     printPmuStartup(gPmuStartup);
@@ -3006,12 +3037,9 @@ void setup() {
     // No charging until the temperature guard's first check. The PMU keeps
     // the charger on across ESP32 resets, and storage setup (mount, fsck)
     // can halt or crash before that check runs.
-    PMU.disableCellbatteryCharge();
     // Enable the measurements the battery/VBUS predicates and the charge
     // temperature guard rely on.
     PMU.enableTemperatureMeasure();
-    PMU.enableBattDetection();
-    PMU.enableBattVoltageMeasure();
     PMU.enableVbusVoltageMeasure();
     PMU.enableSystemVoltageMeasure();
     setupPmuIrq();

@@ -115,6 +115,12 @@ echo "== test_journal (Stage 4 mounted adapter/service integration)"
     "$here/../04_trip_logger/event_log.cpp" -o "$build/test_journal.exe"
 run_modes "$build/test_journal.exe"
 
+echo "== test_battery_events (checked samples and shutdown durability)"
+"${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_battery_events.cpp" \
+    "$here/../04_trip_logger/event_log.cpp" -o "$build/test_battery_events.exe"
+run_modes "$build/test_battery_events.exe"
+run_modes "${PYTHON:-python}" "$here/check_battery_events_protocol.py" "$build/test_battery_events.exe"
+
 echo "== test_journal_vfs (checked mounted VFS operations)"
 "${cxx[@]}" "${flags[@]}" -I"$here/../04_trip_logger" "$here/test_journal_vfs.cpp" \
     -o "$build/test_journal_vfs.exe"

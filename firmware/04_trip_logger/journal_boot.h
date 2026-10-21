@@ -4,6 +4,7 @@
 #include <cstring>
 #include "event_log.h"
 #include "pmu_startup_event.h"
+#include "battery_sample.h"
 
 namespace diagnostics {
 struct JournalBoot {
@@ -45,13 +46,15 @@ inline const char* journalResetReason(esp_reset_reason_t reason) {
     }
 }
 inline void submitJournalBoot(EventLog& log, esp_reset_reason_t reason,
-                              const PmuStartupResult& pmu, uint64_t uptime) {
+                              const PmuStartupResult& pmu, uint64_t uptime,
+                              const BatterySample& battery = BatterySample()) {
     EventInput event; event.uptimeMs = uptime;
     log.stamp(event);
     event.code = static_cast<uint16_t>(Code::BOOT);
     event.contextCount = 1;
     const char* reset = journalResetReason(reason);
     event.context[0] = EventContext::enumeration("reset_reason", reset);
+    addBatteryContext(event, battery);
     log.submit(event);
     // All boots retain E1000's reason. Error reset notices also carry their
     // existing severity-specific history code, with no active episode.
