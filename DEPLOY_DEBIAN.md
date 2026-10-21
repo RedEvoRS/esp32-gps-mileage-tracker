@@ -395,8 +395,9 @@ Services replace invalid stamps with `unversioned` before displaying them;
 only 1-64 ASCII letters/digits/`.`, `_`, `+`, `-` are accepted, starting with a
 letter or digit.
 
-Look in the footer of every viewer page (including sign-in), or on **Device
-health** next to the firmware version. This is the viewer's image version.
+Look in the header of each viewer page (footer on sign-in and error pages), or
+on **Device health** next to the firmware version. This is the viewer's image
+version.
 Both ingest and viewer `/health` also return a `version` field alongside the
 existing `status` and `service` fields. These endpoints require **no login**:
 anyone who can reach their LAN ports can read the build version, so retain

@@ -930,6 +930,7 @@ BASE_CSS = THEME_CSS + """
   header a { color: var(--header-text); text-decoration: none; font-weight: 600; }
   .header-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
                     justify-content: flex-end; margin-left: auto; }
+  .header-version { color: var(--header-text); opacity: .85; font-size: 12px; white-space: nowrap; }
   header form.logout { margin: 0; }
   header form.logout button, header .theme-toggle, header .device-health {
            background: var(--header-button-bg); color: var(--header-button-text);
@@ -985,6 +986,7 @@ def version_context():
 
 
 VERSION_FOOTER = '<footer class="server-version">Server {{ server_version }}</footer>'
+VERSION_HEADER = '<div class="header-version">Server {{ server_version }}</div>'
 
 
 ERROR_HTML = """
@@ -1049,7 +1051,7 @@ LIST_HTML = """
 """ + THEME_HEAD + """<style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index') }}">🚗 Mileage Tracker</a>
   <div class="header-actions">
-    """ + DEVICE_HEALTH_BUTTON + THEME_BUTTON + """
+    """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit">Log out</button>
@@ -1109,7 +1111,7 @@ LIST_HTML = """
     <tr><td colspan="8" class="muted">No trips in this selection.</td></tr>
     {% endif %}
   </table>
-</div>""" + VERSION_FOOTER + """</body></html>
+</div></body></html>
 """
 
 TRIP_HTML = """
@@ -1119,7 +1121,7 @@ TRIP_HTML = """
 <style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index', year=year or '') }}">← {{ year or 'All' }} trips</a>
   <div class="header-actions">
-    """ + DEVICE_HEALTH_BUTTON + THEME_BUTTON + """
+    """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit">Log out</button>
@@ -1231,7 +1233,7 @@ TRIP_HTML = """
   }).addTo(map);
 </script>
 {% endif %}
-""" + VERSION_FOOTER + """</body></html>
+</body></html>
 """
 
 
@@ -1251,7 +1253,7 @@ DEVICE_HEALTH_HTML = """
 </style></head><body>
 <header><a href="{{ url_for('index') }}">← Trips</a>
   <div class="header-actions">
-    """ + DEVICE_HEALTH_BUTTON + THEME_BUTTON + """
+    """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit">Log out</button>
@@ -1330,7 +1332,7 @@ DEVICE_HEALTH_HTML = """
     {% if page > 1 %}<a class="btn" href="{{ url_for('device_health', page=page-1, code=code or '', severity=severity) }}">Newer</a>{% endif %}
     {% if has_next %}<a class="btn" href="{{ url_for('device_health', page=page+1, code=code or '', severity=severity) }}">Older</a>{% endif %}
   </nav>
-{% endif %}</main>""" + VERSION_FOOTER + """</body></html>
+{% endif %}</main></body></html>
 """
 
 

@@ -111,8 +111,9 @@ class ViewerThemeTests(unittest.TestCase):
         children = [element for element, parents in elements
                     if parents and parents[-1] == actions]
         self.assertEqual([element[0] for element in children],
-                         ["span" if current else "a", "button", "form"])
-        box, theme, logout = children
+                         ["div", "span" if current else "a", "button", "form"])
+        version, box, theme, logout = children
+        self.assertEqual(version[1], {"class": "header-version"})
         self.assertEqual(box[1].get("class"), "device-health")
         self.assertIn("data-theme-toggle", theme[1])
         self.assertEqual(logout[1].get("class"), "logout")
@@ -175,8 +176,22 @@ class ViewerThemeTests(unittest.TestCase):
 
         light = properties(self.viewer.THEME_CSS.split("@media")[0])
         dark = {**light, **properties(self.viewer.DARK_THEME_CSS)}
+        version_rule = re.search(r"\.header-version\s*\{([^}]+)\}", self.viewer.BASE_CSS).group(1)
+        version_style = dict(re.findall(r"([\w-]+):\s*([^;]+);", version_rule))
+        self.assertEqual(version_style, {
+            "color": "var(--header-text)", "opacity": ".85",
+            "font-size": "12px", "white-space": "nowrap",
+        })
         self.assertEqual(rgb(light["header-button-text"]), [1, 1, 1])
         for mode, palette in (("light", light), ("dark", dark)):
+            with self.subTest(mode=mode, foreground="header-version", background="header-bg"):
+                opacity = float(version_style["opacity"])
+                header_bg = rgb(palette["header-bg"])
+                version_color = [fg * opacity + bg * (1 - opacity)
+                                 for fg, bg in zip(rgb(palette["header-text"]), header_bg)]
+                values = sorted((luminance(version_color), luminance(header_bg)))
+                self.assertGreaterEqual((values[1] + .05) / (values[0] + .05), 4.5)
+
             def background(name, under):
                 value = palette[name]
                 if value == "transparent":
