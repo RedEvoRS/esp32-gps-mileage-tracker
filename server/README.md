@@ -1,14 +1,23 @@
 # Mileage Tracker Server
 
-This folder is the server half of the GPS mileage tracker. Once the target
-board firmware is ready, it will upload each finished trip here over your
-home WiFi, and you can review, tag and export the trips in a web page. The
-[top-level README](../README.md) explains the current hardware target and
-which parts of the project can be set up now.
+This folder is the server half of the GPS mileage tracker. It accepts
+finished trips as GPX files over home WiFi, and lets you review, tag and
+export them in a web page. The [top-level README](../README.md) explains
+the complete setup.
 
-The current hardware target is the LilyGO T-Beam Supreme with MAX-M10S
-GPS. Its firmware port is pending, but the server accepts GPX uploads
-independently of the board model, so the server can be set up ahead of it.
+The board is the LilyGO T-Beam Supreme with MAX-M10S GPS and microSD trip
+storage, though the server accepts GPX uploads from any board. The server
+was deployed with `install.sh` on Debian 13 on 2026-10-20;
+`install.sh --check` passed. On 2026-10-21 (UTC), the Supreme's Stage 4
+debug build uploaded four real trips from microSD. Ingest logged acceptance
+and HTTP 200 for each, wrote `data/YYYY-MM/<trip>.gpx` and `.json`, and
+the viewer listed all four with distances. The board deleted each local
+file after HTTP 200. For the new drive, the board reported 11.40 mi and
+the server reported 11.41 mi; the two calculate distance separately.
+Diagnostics followed in two HTTP 200 requests, storing all 115 pending
+events and a current snapshot visible in Device health. LittleFS uploads,
+production-build uploads, server errors (401/413/5xx) and server-down
+behaviour remain untested on the Supreme.
 
 It runs as two default Docker containers, with two optional services, all
 defined in `docker-compose.yml`:
@@ -448,7 +457,11 @@ stop the viewer, back up the database, delete rows from `geocode_cache` using
 SQLite, then restart. A future lookup will query the configured provider again.
 
 Requests are serialized across workers, with at least 1.1 seconds between calls
-and a five-minute cooldown on provider failure (longer `Retry-After` values are
+by default. Set `VIEWER_GEOCODER_INTERVAL` in `viewer.env` to change this gap
+(0.1 to 60 seconds); leaving it unset or empty keeps the default, which suits
+providers with a one-request-per-second policy. Use values below 1 second only
+with self-hosted Nominatim or a provider that explicitly permits them.
+Provider failures trigger a five-minute cooldown (longer `Retry-After` values are
 honoured up to seven days). There are no automatic retries,
 redirects, or ambient HTTP proxies. Responses have a 64 KiB size limit and a
 ten-second monotonic deadline checked between reads, with five-second socket

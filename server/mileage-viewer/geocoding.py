@@ -41,6 +41,14 @@ class Geocoder:
         self.user_agent = os.environ.get(
             "VIEWER_GEOCODER_USER_AGENT", "GPSMileageTracker/1.0"
         ).strip()
+        try:
+            self.interval = float(os.environ.get("VIEWER_GEOCODER_INTERVAL", "").strip() or self.INTERVAL)
+            if not math.isfinite(self.interval) or not 0.1 <= self.interval <= 60:
+                raise ValueError
+        except ValueError:
+            raise RuntimeError(
+                "Invalid VIEWER_GEOCODER_INTERVAL. Use a finite number from 0.1 to 60 seconds."
+            ) from None
         if self.url:
             try:
                 parts = urlsplit(self.url)
@@ -125,7 +133,7 @@ class Geocoder:
         cooldown = 300
         try:
             label = self._fetch(latitude, longitude)
-            cooldown = self.INTERVAL
+            cooldown = self.interval
             with closing(sqlite3.connect(self.db_path)) as conn, conn:
                 conn.execute(
                     "INSERT OR REPLACE INTO geocode_cache VALUES (?, ?, ?)",

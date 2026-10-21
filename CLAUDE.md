@@ -18,15 +18,24 @@ held only ~6 h of driving between uploads. Its last firmware is on the
 backports. Never commit to it or base work on it; all work targets the
 Supreme on `main`.
 
-**Port in progress:** Stages 1–3 and the trip logger (Stage 4) run on the
+**Supreme status:** Stages 1–3 and the trip logger (Stage 4) run on the
 Supreme: pins, rails, PMU power-off and USB wake were bench-checked
 2026-10-18. Stage 4 stores trips on the microSD card, with the internal
 2.375 MB LittleFS partition as fallback. The card was bench-checked
 2026-10-18, and by 2026-10-20 two real drives were recorded on it and read
-back on a PC; uploading from it is untested until the server is deployed.
-The rest of the port (label `supreme-port`) is open. Don't assume a
-Supreme pin, rail or peripheral works until its port issue is closed and
-it's verified on the bench.
+back on a PC. The server was deployed on Debian 13 with `server/install.sh`
+on 2026-10-20; `install.sh --check` passed. The first real uploads from SD
+succeeded on 2026-10-21 (UTC), using main commit `a358eaf`'s Stage 4 debug
+build, flashed at 20:39Z on 2026-10-20. Four trips received HTTP 200 and
+were deleted locally; ingest stored GPX and JSON files, and the viewer
+listed all four. Diagnostics then delivered all 115 pending events and a
+current snapshot; Device health showed SD storage, zero dropped events
+and no active conditions. Minimum free network stack was 7,436 of 12,288
+bytes with GPS logging active. LittleFS uploads, production-build uploads,
+server errors (401/413/5xx) and server-down behaviour remain untested on
+the Supreme. Other hardware acceptance is tracked under `supreme-port`.
+Don't assume a Supreme pin, rail or peripheral works until its port issue
+is closed and it's verified on the bench.
 
 ## Architecture
 
@@ -102,8 +111,8 @@ names no issue numbers on purpose, because they go stale; keep it that way.
 - **History and visibility:** this repo starts from a clean snapshot
   taken 2026-10-13. Earlier commits, PRs and closed issues stay in a
   private, archived repo, so commit hashes and PR numbers in the audit
-  docs point there. This repo is private for now; the owner plans to make
-  it public once the server is deployed and the tracker works on the road.
+  docs point there. This repo is private for now and will go public when
+  the owner decides.
 - **Conventions:** when a PR fixes an issue, say "Fixes #N" (one line per
   issue) so merging it closes the issue. File every new finding as its own
   issue, however small, never as an item on a checklist issue.
@@ -164,7 +173,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   held high. BLDO1 powers up
   ON at 1.8 V: switch it off, set 3.3 V, then enable. Stage 4 picks its
   trip store once at boot, never formats the card, falls back to LittleFS,
-  uploads from both stores, and unmounts both before `PMU.shutdown()`
+  attempts uploads from both stores, and unmounts both before `PMU.shutdown()`.
+  SD uploads were verified on 2026-10-21 (UTC); LittleFS uploads remain untested
 - Build: `esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled`
   (8 MB flash, 8 MB QSPI PSRAM, native USB). Download mode, the factory
   flash backup and its Windows read quirk: `firmware/README.md`
@@ -218,8 +228,15 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   stays local), a ten-second deadline and independent retry state. Current
   snapshots include observed/active conditions and AP-absence counts; the SD-only
   snapshot revision authority needs explicit one-use enrollment in secrets.h
-  against the server high-water (see DIAGNOSTICS.md). Missing revision authority
-  retains diagnostics locally without blocking GPX. Rejected singleton records
+  against the server high-water (see DIAGNOSTICS.md). Remove the two
+  `DIAGNOSTICS_*` defines after the first good diagnostics upload and reflash
+  with erase disabled; normal boots use existing SD metadata. Re-enrollment
+  needs a new ID greater than any used (at least 2 after ID 1) and a fresh
+  server high-water read. Successful diagnostics uploads print nothing on
+  serial; confirm them in ingest logs or Device health. The firmware does
+  not send a version yet, so Device health shows `Firmware: Not reported`.
+  Missing revision authority retains diagnostics locally without blocking GPX.
+  Rejected singleton records
   use a reserved bounded inspection slot and durable loss accounting. Heartbeats
   use existing awake opportunities after 24 hours without contact (first boot
   contact age is unknown). Bounded degraded startup retries restart on recovery;
@@ -260,6 +277,7 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   `annotations.db` (SQLite) in the `viewer-db` volume. Optional `geocoding.py`
   sends a selected endpoint to an explicitly configured provider only on an
   authenticated, CSRF-protected click and caches suggestions in that database.
+  Configurable interval, default 1.1 s.
   No lookup on page views, exports or uploads; never use public OSMF Nominatim.
   `/device-health` reads
   diagnostics schema v1 via `mode=ro` with a 2 s busy timeout, shows contact and
