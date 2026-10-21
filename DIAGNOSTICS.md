@@ -682,10 +682,35 @@ python server/parked_drain.py /data/diagnostics/events.db
 Use the database's actual mounted path. The stdlib-only helper opens SQLite
 with `mode=ro`, a two-second timeout, `query_only` and one read transaction. It
 never initializes, migrates or changes the database. CSV output identifies the
-device and off/boot UTC times, hours parked, mV drop, mV/hour and charge
-**percentage points** lost. Missing voltage/percentage pairs print `unknown`
-independently. A voltage rise remains negative rather than being clamped to zero.
-An empty result means no usable pairs yet; it does not mean no drain.
+device and off/boot UTC times, hours parked, raw mV drop, raw mV/hour and charge
+**percentage points** lost. These first seven columns are unchanged; appended
+columns classify pairs, show each device's rebound calibration and report
+corrected drop, corrected mV/hour, resolution and drain status. Missing readings
+print `unknown` independently. Raw voltage rises remain negative for inspection;
+check `drain_status` before interpreting any rate. An empty result means no
+usable pairs yet; it does not mean no drain.
+
+The power-off sample is taken under load; the early boot sample has a lighter
+load. The cell's voltage rebounds as the load drops: one eight-second park
+measured **4137 → 4152 mV**, a 15 mV rise without gaining charge. Pairs parked
+**under 10 minutes** are `short` calibration pairs, not drain measurements.
+Change the cutoff with `--short-minutes MINUTES`; a pair exactly at the cutoff
+is `long`. To calibrate, unplug USB, hold POWER for a normal shutdown, then plug
+USB back in after a few seconds. Repeat a few times at similar charge levels
+and temperatures, then let the journal upload.
+
+For each device, the helper takes the **median boot-minus-power-off mV** from
+short pairs with both voltage readings. Long pairs use
+`corrected_mv_drop = mv_drop + rebound_offset_mv`; corrected mV/hour divides
+that drop by hours parked. Percentages are unchanged. With no usable short
+voltage pairs, the offset is zero and `rebound_status` explicitly says
+`no short voltage pairs; uncorrected`. `rebound_pairs` counts usable samples;
+`rebound_spread_mv` is their largest absolute deviation from the median.
+Corrected drops at or below the larger of that spread and **3 mV** are flagged
+`below resolution`, including zero and negative results. Their numeric columns
+remain visible, but are not meaningful drain estimates. The 3 mV floor is a
+reporting rule, not proven ADC accuracy; one short pair cannot establish
+repeatability. Calibration does not remove charging, temperature or gauge bias.
 
 The helper pairs adjacent UTC-ordered BOOTs of the same device and uses the
 last event of the earlier boot only when it is E2009. It requires the next
@@ -699,14 +724,16 @@ a pair misleading. Inspect the history and clock confidence before using it;
 allow retained history to finish uploading before drawing conclusions.
 
 Collect at least **three parked pairs of eight hours or longer** and compare
-them at similar temperatures and charge levels. An 18650's voltage and stored
+them at similar temperatures and charge levels. At about **1 mA**, an overnight
+park loses only a few mV, easily hidden by rebound and measurement variation;
+**parks of two days or longer give the best estimates**. An 18650's voltage and stored
 charge have a **non-linear** relationship: there is no universal conversion
 from mV/hour to mA. Use the particular cell's discharge curve and usable
 capacity for a rough current estimate. As a separate rough check,
 `capacity_mAh * percentage_points_drop / 100 / hours_parked` estimates mA only
-if the PMU gauge is accurate; its integer steps and recalibration can overwhelm
-small overnight changes. Load removal causes voltage rebound, and early USB
-charging can hide drain. An estimated drain consistently above **about 2 mA**
+if the PMU gauge is accurate. On a 3000 mAh cell, each integer **1% step is about
+30 mAh** (about 30 hours at 1 mA); gauge recalibration can overwhelm small changes.
+Early USB charging can still hide drain. An estimated drain consistently above **about 2 mA**
 is worth investigating from several pairs and the existing logs. A meter is a
 last resort if those data cannot explain it. Firmware/helper tests do not
 complete the real parked-data acceptance step.
