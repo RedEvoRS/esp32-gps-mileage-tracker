@@ -16,15 +16,17 @@ REMOTE=backup@nas.lan:/volume1/backups/mileage-tracker
 #BACKUP_DIR=/home/<user>/mileage-backups
 
 # Retention for local snapshots: the newest KEEP_RECENT, plus the first
-# snapshot of each of the newest KEEP_MONTHLY months. Unchanged files are
-# hard links between snapshots, so keeping lots of them costs little.
+# snapshot of each of the newest KEEP_MONTHLY months. Unchanged trip files
+# are hard links between snapshots; each kept snapshot also holds full
+# copies of the databases, so allow space for those.
 # 84 months covers the IRS's longest common retention period (7 years).
 KEEP_RECENT=14
 KEEP_MONTHLY=84
 
-# yes = prune the off-host copy the same way. Default no: the off-host
-# copy only ever grows, so a mistake or a compromise on this box can't
-# delete history from it.
+# yes = prune the off-host copy the same way. Default no: this script
+# never prunes old remote snapshots. Protection from a compromised server
+# needs retention/snapshots enforced on the backup host or a restricted
+# account; ordinary write access can still delete or overwrite history.
 REMOTE_PRUNE=no
 
 # Optional URL to GET after each successful backup, for a dead man's
