@@ -31,9 +31,11 @@ were deleted locally; ingest stored GPX and JSON files, and the viewer
 listed all four. Diagnostics then delivered all 115 pending events and a
 current snapshot; Device health showed SD storage, zero dropped events
 and no active conditions. Minimum free network stack was 7,436 of 12,288
-bytes with GPS logging active. LittleFS uploads, production-build uploads,
-server errors (401/413/5xx) and server-down behaviour remain untested on
-the Supreme. Other hardware acceptance is tracked under `supreme-port`.
+bytes with GPS logging active. Trip uploads with debug mode off and
+server-down retry were also verified on 2026-10-21 (UTC): two `HTTP -1`
+failures kept the trip queued, then HTTP 200 after ingest restarted deleted
+the local file. LittleFS uploads and server errors (401/413/5xx) remain
+untested on the Supreme. Other hardware acceptance is tracked under `supreme-port`.
 Don't assume a Supreme pin, rail or peripheral works until its port issue
 is closed and it's verified on the bench.
 

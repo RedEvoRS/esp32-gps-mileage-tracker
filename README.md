@@ -30,8 +30,9 @@ On 2026-10-21 (UTC), the Supreme's Stage 4 debug build uploaded four real
 trips from the card. All four received HTTP 200, were deleted from the
 card and appeared in the viewer. Diagnostics arrived too: all 115 pending
 events and a current snapshot were visible in Device health.
-Uploads from internal flash, production-build uploads and server-failure
-handling remain untested on the Supreme.
+Uploads with debug mode off and server-down retry were also verified on
+2026-10-21 (UTC). Uploads from internal flash and server errors
+(401/413/5xx) remain untested on the Supreme.
 
 Still to check on the road: the everyday (production) screen, the board's
 current draw while switched off, and a few car-power cases. Project progress
@@ -415,8 +416,10 @@ Do this before a test drive, not during a trip.
    be on the list. If you enrolled diagnostics, **Device health** shows
    when the board last checked in and any active error codes.
 
-The failure responses below describe the code's behaviour. Server errors
-(401/413/5xx) and server-down behaviour remain untested on the Supreme.
+Server-down retry was verified on 2026-10-21 (UTC): two attempts returned
+`HTTP -1`, the trip stayed queued, and the next retry after ingest restarted
+received HTTP 200 and deleted the local file. Server errors (401/413/5xx)
+below describe the code's behaviour and remain untested on the Supreme.
 
 If the trip does not appear, first confirm both `Trip started` and
 `Trip finalized`. A trip still in progress cannot upload; a short trip
