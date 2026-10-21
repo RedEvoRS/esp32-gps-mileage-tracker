@@ -915,8 +915,9 @@ storage backend `sd`, zero dropped events, a boot counter and no active
 conditions. History included the earlier E3009 antenna episode, raised
 and cleared; E5001's boot-local access-point-absence counter was 6.
 Successful diagnostics uploads print nothing on serial. Confirm them in
-the ingest log or Device health. `Firmware: Not reported` is expected:
-the firmware does not send a version yet. The behaviour below describes
+the ingest log or Device health. That build showed `Firmware: Not reported`
+because it predates version reporting; stamped builds report their Git
+commit (see step 6). The behaviour below describes
 the implementation; this test does not establish LittleFS or
 production-build uploads, or server-failure handling on the Supreme.
 

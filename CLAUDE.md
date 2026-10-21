@@ -233,8 +233,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   with erase disabled; normal boots use existing SD metadata. Re-enrollment
   needs a new ID greater than any used (at least 2 after ID 1) and a fresh
   server high-water read. Successful diagnostics uploads print nothing on
-  serial; confirm them in ingest logs or Device health. The firmware does
-  not send a version yet, so Device health shows `Firmware: Not reported`.
+  serial; confirm them in ingest logs or Device health. Builds report a
+  stamped Git version (run `tools/stamp_firmware_version.py` before compiling;
+  `unversioned` otherwise); boards flashed before that show `Not reported`.
   Missing revision authority retains diagnostics locally without blocking GPX.
   Rejected singleton records
   use a reserved bounded inspection slot and durable loss accounting. Heartbeats
