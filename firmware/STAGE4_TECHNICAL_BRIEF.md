@@ -1,3 +1,12 @@
+> **Historical design record:** written in 2026 for the T-Beam V1.2
+> (ESP32 + NEO-M8N), before the move to the T-Beam Supreme. Kept as the
+> design record: rails, pins, partitions/storage and sleep behaviour differ
+> on the Supreme. There ALDO3 powers LoRa, trips use microSD with LittleFS
+> fallback, shutdown uses PMU power-off instead of deep sleep, and the M10
+> receiver is configured with UBX-CFG-VALSET. See [firmware/README.md](README.md)
+> for current behaviour. V1.2 owners should use the frozen
+> [`tbeam-v1.2` branch](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/tree/tbeam-v1.2).
+
 # Stage 4 firmware technical brief for T-Beam V1.2 mileage tracker
 
 **The single most important architectural decision is to run a FreeRTOS networking task pinned to core 0 while the Arduino `loop()` stays on core 1 draining NMEA.** Everything else — LittleFS durability, AXP2101 VBUS-loss handling, trip state machine — is secondary, but pairs naturally with that split. The rest of this brief gives concrete, verified APIs and code for each of your six research topics, with version caveats against esp32 Arduino core 2.x and 3.x, XPowersLib current master, and the GPX 1.1 / Garmin TrackPointExtension v2 schemas. A note upfront on your PMU rail mapping: your Stage 2 firmware uses **ALDO4 for GPS**, which works on your board, but the Meshtastic-confirmed T-Beam V1.2 mapping is **ALDO3 = GPS, ALDO2 = LoRa+OLED, DC1 = ESP32 3V3**. Verify with a meter once; if ALDO4 is actually what LilyGo wired on your unit, keep it — but the reference code below assumes ALDO3. Swap the symbol if needed.

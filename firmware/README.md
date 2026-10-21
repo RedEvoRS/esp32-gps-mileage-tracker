@@ -1,35 +1,34 @@
-# Firmware — Legacy T-Beam V1.2 Reference
+# Firmware
 
-> **Current hardware target:** LilyGO T-Beam Supreme with the u-blox
-> **MAX-M10S GPS** version (not L76K), plus a **SanDisk 32 GB Max Endurance
-> microSD card** for trip storage. See LilyGO's [T-Beam Supreme hardware
-> guide](https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/docs/en/t_beam_supreme/t_beam_supreme_hw.md).
->
-> **The Supreme port is in progress.** All four stages run on the Supreme:
-> start with [T-Beam Supreme bring-up](#t-beam-supreme-bring-up). Stage 4,
-> the trip logger, stores trips on the [microSD card](#microsd-card) and
-> falls back to the internal LittleFS partition (about 6 hours of driving)
-> when no card mounts. The microSD support was bench-checked on
-> 2026-10-18 and has recorded two real drives; uploading trips from the
-> card isn't tested yet, because that needs the deployed server. Much of
-> the rest of this README, including most of the Stage 4 section, still
-> describes the retired T-Beam V1.2 with NEO-M8N GPS. Read
-> [Stage 4 on the Supreme](#stage-4-on-the-supreme) for what differs.
+The firmware targets the **LilyGO T-Beam Supreme with u-blox MAX-M10S GPS**
+(not the L76K version), using a **SanDisk 32 GB Max Endurance microSD card**
+for trips. LilyGO's [T-Beam Supreme hardware guide](https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/docs/en/t_beam_supreme/t_beam_supreme_hw.md)
+identifies the board and its connectors. The four progressive stages check
+USB, power and GPS before installing the trip logger for use in the car.
+The power-management unit (PMU) controls the board's rails, battery and
+shutdown; Stage 2 checks it before the GPS and trip-logging stages.
 
-The firmware is organized into progressive stages that let you verify
-each hardware subsystem before building the full mileage tracker.
+All four stages run on the Supreme. On 2026-10-21 (UTC), Stage 4's debug
+build uploaded four real trips from microSD to the deployed server, then
+delivered all 115 pending diagnostic events and a current snapshot.
+LittleFS uploads, production-build uploads, server errors (401/413/5xx)
+and server-down behaviour remain untested on the Supreme.
 
-The [top-level README](../README.md) describes the Supreme MAX-M10S target
-and server setup; its step-by-step flashing guide is still the V1.2 one.
+**Have a T-Beam V1.2?** That board is retired. Its last firmware and full
+instructions are on the frozen [`tbeam-v1.2` branch](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/tree/tbeam-v1.2),
+which receives no updates. The instructions below are for the Supreme.
+See the [top-level README](../README.md) for the complete setup sequence.
 
 ## T-Beam Supreme bring-up
 
 These steps were checked on a real T-Beam Supreme (MAX-M10S version) on
-2026-10-18. They cover the factory backup and Stages 1–3. Stage 4 isn't
-ported yet.
+2026-10-18. They cover the factory backup and Stages 1–3. Stage 4 also
+runs on the Supreme and has recorded real drives on the microSD card.
 
 ### Before the first power-up
 
+- **Use a data-capable USB-C cable.** A charge-only cable powers the board
+  but provides no serial port for programming or messages.
 - **Attach the 915 MHz LoRa antenna** to the SMA socket first. The board
   ships with Meshtastic, which can transmit, and transmitting without an
   antenna can damage the radio.
@@ -39,8 +38,9 @@ ported yet.
   all, even outdoors.
 - The board powers an **active** GPS antenna, so an external active antenna
   on an SMA cable works (through an adapter cable to the GPS socket).
-- **18650:** match the + marking on the holder. While a cell is fitted,
-  unplugging USB does not switch the board off.
+- **18650:** use a protected cell and match the + marking on the holder.
+  Unplugging USB does not switch the board off while a cell is fitted. It
+  powers the upload window and clean storage shutdown after the car turns off.
 
 ### Buttons
 
@@ -50,7 +50,7 @@ port on the right. The buttons sit along the bottom edge:
 | Button | Where | What it does |
 |---|---|---|
 | **RESET** | Left of the close pair near the middle | Restarts the ESP32 |
-| **POWER** | Right of that pair | Power key on the PMU: ~1 s switches the board on, ~6 s forces it off. Under Stage 4, a shorter long press on battery is a clean power-off (see [Stage 4 on the Supreme](#stage-4-on-the-supreme)) |
+| **POWER** | Right of that pair | Power key on the PMU: ~1 s switches the board on, ~6 s forces it off. Under Stage 4, a shorter long press on battery is a clean power-off (see [Normal operation](#normal-operation)) |
 | **BOOT** | On its own, further right | GPIO 0. Held while the board powers up, it selects download mode |
 
 ### Board settings
@@ -62,16 +62,20 @@ In the Arduino IDE pick **Tools → Board → esp32 → ESP32S3 Dev Module**, th
 - **Flash Size:** 8MB (64Mb)
 - **PSRAM:** QSPI PSRAM
 
-Install the libraries from [step 5](#5-install-required-libraries) below.
-The same settings as an arduino-cli FQBN, which CI uses to compile every
-sketch:
+For Stage 4, its bundled `partitions.csv` overrides the **Partition Scheme**
+menu. Leave **Erase All Flash Before Sketch Upload → Disabled**, except
+for the [first Stage 4 upload](#first-flash-on-a-new-board).
+
+Install the libraries from [Install required libraries](#install-required-libraries) below.
+The same settings as an arduino-cli fully qualified board name (FQBN),
+which automated compile checks (CI) use for every sketch:
 
 ```text
 esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled
 ```
 
-The Supreme uses the ESP32-S3's built-in USB port, so it needs no CH9102
-driver. Windows lists it as **USB Serial Device (COMn)**, USB ID 303A:1001.
+The Supreme uses the ESP32-S3's built-in USB port, so it needs no separate
+USB serial driver. Windows lists it as **USB Serial Device (COMn)**, USB ID 303A:1001.
 The COM number can change between a normal boot and download mode, so
 check **Tools → Port** after each restart.
 
@@ -149,16 +153,19 @@ a card. Stage 4 has since recorded two real drives on the card.
     followed by
     `WARNING: microSD unavailable -- using internal flash (2.30 MiB free).`
     No usable card: trips go to the internal partition, which holds about
-    6 hours of driving.
-- **Uploads** come from both places: trips on the card, and any left in
-  internal flash from a boot without a card. Each is deleted only after
-  the server accepts it.
+    5–6 hours of driving.
+- **Upload behaviour in the code:** the logger attempts finished trips from
+  both the card and internal flash, including trips left by a boot without
+  a card. It deletes each only after an accepted server response. On
+  2026-10-21 (UTC), four trips uploaded from the card with HTTP 200 and
+  were deleted locally. Internal LittleFS was mounted but held no trips;
+  uploading from that fallback remains untested on the Supreme.
 - **Power cuts:** FAT copes with a sudden power loss worse than LittleFS
   does. The 18650 is what lets the logger close its files and unmount the
   card cleanly after the car's USB power goes away, so keep it fitted.
 - **Very long trips:** firmware splits a trip into pieces below 8 MiB,
   half the server's 16 MiB upload limit. Recording continues immediately
-  with the boundary fix shared by both pieces, and each uploads separately.
+  with the boundary fix shared by both pieces, and each is queued for a separate upload.
   A very long drive can therefore show up as more than one trip. This also
   keeps a parked, powered device's GPS drift from creating one oversized file.
 
@@ -195,159 +202,106 @@ while it's powered down, and found a fix 2 s after being off for a minute
 fix took 33 s outdoors (a cold start). It also keeps its settings until
 the cell comes out, including any left by the factory firmware.
 
-## Legacy V1.2 Hardware
+## Development environment setup
 
-- **Board:** LilyGO TTGO T-Beam V1.2 (ESP32 + SX1262 LoRa + NEO-M8N GPS)
-- **PMU:** AXP2101 (NOT AXP192 — older code examples need updating)
-- **GPS:** u-blox NEO-M8N (GPS/GLONASS/BeiDou, IPEX antenna)
-- **LoRa:** SX1262 at 915MHz (unused in this project)
-- **Battery:** 18650 cell in the onboard holder. Needed in practice: it
-  runs the board for the upload after the car turns off (see Stage 4 →
-  Normal operation)
-- **USB:** Micro-USB via CH9102F serial converter
+### Install Arduino IDE
 
-### Identify the controls and connectors
+Download the Arduino IDE from https://www.arduino.cc/en/software and
+install the version for your operating system.
 
-Use the markings on the board; do not substitute a pinout from a T-Beam
-Supreme or an older AXP192 board. LilyGO's
-[T-Beam hardware guide](https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/docs/en/t_beam/t_beam_hw.md#button-description)
-and [V1.2 schematic](https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/schematic/LilyGo_TBeam_V1.2.pdf)
-identify these controls:
+### Add ESP32 board support
 
-| Marking / connection | What it is for |
-|---|---|
-| **PWR** | Button connected to the power-management chip; Stage 4 uses it for sleep/wake |
-| **IO38** | User button on GPIO 38; unused by this firmware, not an ESP32 BOOT button |
-| **RST** | Restarts the ESP32 program; useful for seeing startup messages again |
-| **GPS antenna** | Small IPEX/u.FL connection for the GPS antenna; needed to receive satellites |
-| **LoRa antenna** | Separate radio antenna connection; not the GPS antenna |
-| **Micro-USB** | Power and the computer's serial connection for flashing and diagnostics |
-
-The board has charging and GPS indicator lights, but none reports that
-this firmware has saved or uploaded a trip.
-
-## Development Environment Setup
-
-### 1. Install the CH9102 USB-Serial Driver
-
-**Windows** needs a driver. Download it from Adafruit's guide:
-https://learn.adafruit.com/how-to-install-drivers-for-wch-usb-to-serial-chips-ch9102f-ch9102/windows-driver-installation
-
-After installing, plug in the T-Beam and check Device Manager for
-"Ports (COM & LPT)" → "USB-Enhanced-SERIAL CH9102 (COMx)".
-Note the COM number — you'll need it in the Arduino IDE.
-
-**macOS:** first check whether a new serial port appears when you plug in
-the board. If none appears with a known data cable, install the
-[WCH macOS driver linked by LilyGO](https://www.wch-ic.com/downloads/CH34XSER_MAC_ZIP.html)
-and follow its installation instructions.
-
-**Linux** normally has the driver built in. If the port appears but the
-upload fails with "permission denied", Debian/Ubuntu users can join the
-`dialout` group (`sudo usermod -aG dialout $USER`), then log out and back
-in. Other distributions may use a different serial-port access group.
-
-### 2. Install Arduino IDE
-
-Download from https://www.arduino.cc/en/software and install the version
-for your OS. On Windows, say yes to the USB drivers during install.
-
-### 3. Add ESP32 Board Support
-
-1. Open Arduino IDE
-2. File → Preferences (Arduino IDE → Settings on macOS)
-3. In "Additional boards manager URLs" paste:
+1. Open **File → Preferences** (**Arduino IDE → Settings** on macOS).
+2. In **Additional boards manager URLs**, add:
    https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-4. Click OK
-5. Tools → Board → Boards Manager
-6. Search "esp32", find "esp32 by Espressif Systems", pick version
-   **3.3.11** in its version list, and install (~300MB)
+3. Open **Tools → Board → Boards Manager**, search for `esp32`, and install
+   **esp32 by Espressif Systems**, version **3.3.11**.
 
-The trip logger is tested on core 3.3.11. It relies on 3.x behaviour, so
-don't use a 2.x core. A newer 3.x will probably work but hasn't been
-tested. The Boards Manager installs the newest version unless you pick one.
+The project's automated compile checks (CI) pin core **3.3.11**. Select it
+explicitly: Boards Manager otherwise installs the newest version. The
+logger relies on 3.x behaviour; do not use a 2.x core.
 
-### 4. Configure Board Settings
+### Configure board settings
 
-- Tools → Board → esp32 → ESP32 Dev Module
-- Tools → Port → (the board's port from step 1)
-- Tools → Upload Speed → 921600
-- Tools → Flash Size → 4MB (32Mb)
-- Tools → Partition Scheme → Default 4MB with spiffs. Stages 1-3 use
-  this; Stage 4 brings its own `partitions.csv` and ignores the menu.
-- Tools → Erase All Flash Before Sketch Upload → **Disabled** (the
-  default). Enabled, it wipes any trips waiting on the board, and the
-  trip storage has to be set up again (Stage 4 → First flash on a new
-  board).
+Use the [Board settings](#board-settings) above: **ESP32S3 Dev Module**,
+**USB CDC On Boot → Enabled**, **USB Mode → Hardware CDC and JTAG**,
+**Flash Size → 8MB (64Mb)** and **PSRAM → QSPI PSRAM**. Select the board's
+current entry under **Tools → Port**. Stage 4's `partitions.csv` overrides
+the **Partition Scheme** menu. Keep **Erase All Flash Before Sketch
+Upload → Disabled**, except once for the [first Stage 4 upload](#first-flash-on-a-new-board).
 
-### 5. Install Required Libraries
+The Supreme uses native USB (USB ID **303A:1001**); no separate USB serial
+driver is needed. Windows lists **USB Serial Device (COMn)**. Its COM
+number can change between download mode and normal operation, so check
+the port again after a restart.
 
-Open Sketch → Include Library → Manage Libraries and install these,
-picking the version from each one's version list:
+On Linux, if the port appears but uploading fails with `permission denied`,
+Debian/Ubuntu users can join the `dialout` group
+(`sudo usermod -aG dialout $USER`), then log out and back in. Other
+distributions may use a different serial-port access group.
 
-1. **XPowersLib** by lewisxhe, version **0.3.3** — for the AXP2101 power manager
-2. **TinyGPSPlus** by Mikal Hart, version **1.0.3** — for NMEA GPS parsing
-3. **U8g2** by olikraus, version **2.36.18** — for Stage 4's debug and production OLED pages
+### Install required libraries
 
-Those are the versions the trip logger is tested with. The Library Manager
-installs the newest unless you pick one.
+Open **Sketch → Include Library → Manage Libraries** and install these,
+picking the version from each library's version list:
 
-### 6. Upload a sketch and read its messages
+1. **XPowersLib**, version **0.3.3** — controls the AXP2101 power manager.
+2. **TinyGPSPlus**, version **1.0.3** — parses the GPS receiver's NMEA messages.
+3. **U8g2**, version **2.36.18** — draws Stage 4's debug and production OLED screens.
+
+These are the versions pinned by CI. Library Manager installs the newest
+unless you select a version.
+
+### Upload a sketch and read its messages
 
 A *sketch* is an Arduino program, stored in an `.ino` file inside a folder
 with the same name. *Firmware* is the program installed on the board.
 *Uploading* or *flashing* compiles the sketch and writes that firmware to
 the board's flash memory. A *partition* is a reserved area of that memory;
-Stage 4 stores trips in its LittleFS filesystem partition.
+Stage 4 uses a LittleFS filesystem partition as fallback when no microSD
+card mounts.
 
-1. Connect the board with a data-capable USB cable and open the stage's
+1. Connect the board with a data-capable USB-C cable and open the stage's
    `.ino` file with **File → Open**. Keep it in its supplied folder.
-2. Select **ESP32 Dev Module** and the board's **Tools → Port** entry.
+2. Select **ESP32S3 Dev Module**, the [board settings](#board-settings),
+   and the board's **Tools → Port** entry.
 3. Click **Upload**, the right-arrow button (or **Sketch → Upload**).
-   The checkmark button only compiles; it does not install the program.
-   Wait for the upload to finish before disconnecting anything.
-4. Open **Tools → Serial Monitor** and select **115200 baud**, the speed
-   used by the board's diagnostic messages. Garbled text usually means
-   the monitor is set to a different speed.
-5. If the startup messages have already scrolled past or you opened the
-   monitor too late, briefly press **RST** to restart the sketch. With
-   Stage 4, do this before a test trip, not during recording.
+   The checkmark only compiles; it does not install the program. Wait for
+   uploading to finish before disconnecting anything.
+4. Open **Tools → Serial Monitor** at **115200 baud**. Opening the port can
+   reset the board, so startup messages may appear again.
+5. If you missed startup, briefly press **RESET**. With Stage 4, do this
+   before a test trip, not while recording.
 
-Each upload replaces the previous stage's program. Stages 1–3 are hardware
-checks; they do not record trips. **Leave Stage 4 installed for use in the
-car.** When updating Stage 4 later, keep its `partitions.csv` and leave
-**Erase All Flash Before Sketch Upload → Disabled** to preserve trips.
+Each upload replaces the previous stage's program. Stages 1–3 check
+hardware; they do not record trips. **Leave Stage 4 installed for use in
+the car.** When updating it later, keep its `partitions.csv` and leave
+**Erase All Flash Before Sketch Upload → Disabled** to preserve internal
+trips and settings. Reflashing does not erase trips on the card.
 
 #### If uploading fails
 
-The T-Beam V1.2 has **PWR, IO38 and RST**, not a GPIO 0 BOOT button.
-Holding IO38 while pressing RST does not select the ESP32 bootloader.
-
-1. Close Serial Monitor and any other program using the port. Reconnect
-   the USB cable, select the port again, and retry Upload.
-2. If there is no port, check the data cable and
-   [USB driver](#1-install-the-ch9102-usb-serial-driver). If there is a
-   port but transfers fail, try **Tools → Upload Speed →
-   115200** and a direct USB connection instead of a hub.
-3. If it still stops at `Connecting...`, keep the exact upload error and
-   check the board's automatic reset/boot wiring against the V1.2
-   schematic above and
-   [Espressif's boot-mode troubleshooting](https://docs.espressif.com/projects/esptool/en/latest/esp32/advanced-topics/boot-mode-selection.html).
-   Manual bootloader entry uses GPIO 0, not IO38 or PWR; do not follow a
-   generic "hold BOOT" sequence or guess which pads to connect.
+1. Close Serial Monitor and other programs using the port. Reconnect the
+   USB cable, select the current port, and retry Upload.
+2. If no port appears, try a known data-capable cable and a direct USB
+   connection instead of a hub. Check the port again after restarting.
+3. If automatic entry fails, follow [Download mode](#download-mode).
+   The Supreme's **BOOT** button is **GPIO 0**. After uploading from
+   manually entered download mode, press **RESET** if the log remains at
+   `waiting for download`.
+4. Keep the exact error if it still fails; check
+   [Espressif's ESP32-S3 boot-mode troubleshooting](https://docs.espressif.com/projects/esptool/en/latest/esp32s3/advanced-topics/boot-mode-selection.html).
 
 ## Firmware Stages
 
 Work through these in order. Each stage builds on the previous one
 and verifies a specific hardware subsystem before moving on.
 
-Stages 1–3 are for the **T-Beam Supreme**. Use the
+All four stages are for the **T-Beam Supreme**. Use the
 [Supreme board settings](#board-settings) and
 [back up the factory flash](#back-up-the-factory-flash-first) before the
-first upload. Stage 4 runs on the Supreme too; see
-[Stage 4 on the Supreme](#stage-4-on-the-supreme) for where its section
-still describes the V1.2. Every stage prints at 115200 baud; open the
-Serial Monitor after uploading.
+first upload. Every stage prints at 115200 baud; open the Serial Monitor
+after uploading.
 
 ### Stage 1: Hello World (`01_hello_world/`)
 
@@ -386,12 +340,13 @@ clock stretching; a line that stays low is reported as a failure.
 PMU startup gets up to three attempts, releasing `Wire1` and waiting 10 ms
 between attempts. Serial reports recovery results, clock counts and retries;
 Stage 4 prints these after its early LoRa rail safety check. If all attempts
-fail, the existing halt remains. Recovery is host-tested; repeatedly resetting
-during PMU reads still needs a bench check. Stage 4 retains the boot result
+fail, Stages 2 and 3 halt; Stage 4 enters [degraded service](#startup-failures).
+Recovery is host-tested; repeatedly resetting during PMU reads still needs
+a bench check. Stage 4 retains the boot result
 and has a host-tested helper for E2007 PMU_STARTUP_RECOVERY (#151). Stage 4
 now queues that notice in its diagnostic journal after storage startup;
-failed-startup reporting also needs the degraded loop (#126). OLED reporting
-remains with #127.
+failed startup is now reported by the degraded loop (#126). OLED reporting
+is implemented for normal operation (#127); the panel stays off in degraded mode.
 
 ### Stage 3: GPS (`03_gps_test/`)
 
@@ -417,232 +372,38 @@ the AGC around 30%. `heard=0` with the AGC stuck near 80% means no signal
 reaches the receiver: check that the GPS cable is clicked onto the **GPS**
 socket.
 
-### Stage 4: Full Mileage Tracker (`04_trip_logger/`)
+### Stage 4: The trip logger
 
-**Purpose:** Trip detection, mileage accumulation, crash-safe GPX
-logging to LittleFS, and WiFi upload to your home server.
+The `04_trip_logger/` sketch detects trips, accumulates mileage and writes
+GPX files to the microSD card, with internal LittleFS as fallback. Its
+first real uploads from microSD succeeded on 2026-10-21 (UTC): four trips
+received HTTP 200, were deleted from the card and appeared in the viewer.
+This used main commit `a358eaf`'s Stage 4 debug build (the default
+`DISPLAY_DEBUG` setting), flashed at 20:39Z on 2026-10-20 with real settings
+and one-time diagnostics enrollment. Uploads from LittleFS and with
+`DISPLAY_DEBUG=0` remain untested on the Supreme.
 
-#### Stage 4 on the Supreme
+USB insertion powered the board on at 04:14:50Z on 2026-10-21. Boot was
+clean, GPS configured on attempt 1, and the FAT32 card had 29.71 GiB free.
+The journal reported `sd, 115 unacknowledged records`. The new trip started
+at 04:15:21Z. At home, between 04:32:15Z and 04:32:27Z, three older,
+finished trips uploaded while GPS logging continued. Upload order follows
+the card's directory order, not trip number: `t000001.gpx` (16 KB, 0.8 s),
+then `t000005.gpx` (176 KB, 9.1 s), then `t000004.gpx` (158 KB, 3.1 s).
+Each line read `Upload /trips/<file> (<bytes> B, <seconds> s) -> HTTP 200 (deleted)`.
 
-The rest of this section was written for the V1.2. On the Supreme
-(bench-tested 2026-10-18), these things differ:
+The current trip finalized at 04:35:09Z after three minutes below 2 mph:
+`Trip finalized: /trips/t000006.gpx (11.40 mi)`. It uploaded at 04:36:41Z
+(142 KB, 2.7 s, HTTP 200, deleted). Ingest logged acceptance and HTTP 200
+for all four trips, and stored each as `data/YYYY-MM/<trip>.gpx` plus
+`.json`. The viewer listed all four with distances; the new drive was
+11.40 mi on the board and 11.41 mi on the server.
 
-- **Startup failures:** `DEGRADED:` Serial lines mean trips are **not being
-  recorded**. Without SD or LittleFS, the board keeps the charge guard, power
-  key, low-battery shutdown and ten-minute battery idle power-off active. If
-  the power chip is absent or its LoRa rail cannot be verified off, it avoids
-  ordinary PMU control (one best-effort charge-disable attempt for an answered
-  but untrusted chip); only internal-flash diagnostics and retries remain.
-  Neither mode starts GPS processing or networking. Retries wait 60 seconds,
-  double up to ten minutes, and restart on recovery. Check the Serial reason,
-  SD seating/FAT32 and BLDO1 supply for storage failures; check board variant,
-  power and Wire1 SDA 42 / SCL 41 for PMU failures. Do not assume charge control
-  works in a PMU-failure mode. Restore the fault and verify a recorded test trip
-  before relying on the tracker; see [degraded startup details](../DIAGNOSTICS.md#degraded-startup-service-126).
-- **RTC:** the PCF8563 supplies diagnostic event timestamps before GPS/SNTP
-  sync, never GPX times. The `RTC:` boot line reports whether its clock is
-  usable and, when known, how long ago it was set. `invalid (stopped/VL)` is
-  normal after the battery was removed; trusted GPS/SNTP time repairs it with
-  one verified setting per boot. It keeps counting while the board is
-  switched off (checked on the bench, 2026-10-20) and runs about 10 s/day
-  slow, so a reset corrects it only when it's off by 2 s or more.
-- **Build** with the [Supreme board settings](#board-settings), not the
-  V1.2 ones in [step 4](#4-configure-board-settings). Stage 4's
-  `partitions.csv` still applies.
-- **First flash:** trip storage is only set up on a fully erased partition
-  (see [First flash on a new board](#first-flash-on-a-new-board)). The trip
-  partition can still hold leftover data, from the factory firmware for
-  example. If neither store works, startup uses degraded service and preserves
-  the data. So erase the
-  flash once for the first Stage 4 upload (Arduino IDE: **Tools → Erase All
-  Flash Before Sketch Upload → Enabled** for that one upload, then set it
-  back to Disabled so later uploads keep your trips).
-- **Storage:** trips go to the [microSD card](#microsd-card) when one
-  mounts at boot, and to the internal LittleFS partition otherwise. Trip
-  storage in internal flash is still set up as described under First
-  flash, because it's the fallback.
-- **Pins and power** are the Supreme's: see the
-  [Supreme pin and power reference](#supreme-pin-and-power-reference), not
-  the V1.2 pin table further down. At boot the logger switches the LoRa
-  rail off first, the SD rail and VBACKUP off, and the GPS rail on.
-- **Parking:** after the car's USB power has been gone 10 s and the board
-  has idled on battery for 10 minutes (the upload window), it **switches
-  itself off completely**, not into deep sleep. Power returning to the USB
-  port switches it back on. Unreadable USB-power state keeps the board awake
-  and is retried; it never confirms car-off or authorizes power-off. Persistent
-  read failures on battery leave the PMU's hardware under-voltage cutoff as
-  the final protection. The boot log shows
-  `PMU power-on source 0x04, power-off source 0x02` when that worked.
-- **POWER button:** on the Supreme a long press of POWER doesn't put the
-  board into deep sleep, as the V1.2 text under Normal operation says. Hold
-  it for a second or two and let go well before 6 s. On battery, the logger
-  then switches off cleanly, the same way as Parking: it finalizes any
-  trip, stops the network task, seals the diagnostics journal, unmounts
-  storage and switches the board off completely. **With USB power
-  plugged in, the press is ignored** and the Serial Monitor shows
-  `VBUS present -- staying awake instead of powering off.` An unreadable
-  USB-power state also keeps it awake, with
-  `VBUS state unreadable -- staying awake instead of powering off.` That's
-  deliberate: USB power switches the board on only at the moment it
-  arrives, so a board switched off with USB still in would stay off, and
-  in the car nothing would switch it back on until the USB power was cut
-  and restored. Unplug USB first if you want to switch it off. To switch
-  it back on, press POWER for about 1 s or plug in USB power. Holding
-  POWER for 6 s is the power chip's own hard power-off: the firmware
-  closes nothing first, so an open trip is repaired at the next boot
-  instead of being closed, and diagnostics not yet written to the journal
-  are lost. Use it only if the board stops responding.
-- **GPS settings:** Stage 4 sends one UBX-CFG-VALSET (`06 8A`) at every
-  boot to the receiver's RAM layer, without saving to battery-backed RAM
-  or flash. It explicitly enables UART1 RMC, GGA and NAV-PVT at rate 1;
-  disables GLL, GSA and VTG; enables GSV every 5 epochs in all builds;
-  and selects the automotive dynamic model. The
-  navigation rate stays at the default 1 Hz. GGA supplies altitude, HDOP
-  and satellite count; NAV-PVT supplies speed/horizontal accuracy used
-  before recording movement.
-  E3009 means high receiver gain and no usable-strength satellite persisted
-  for two minutes, suggesting a loose or damaged GPS antenna cable; check the
-  plug inside the case and the cable. It clears on lower gain or a strong
-  satellite, including after reconnecting indoors; the thresholds come from
-  one board and antenna, so the warning is a prompt to inspect them.
-  The key IDs and one-byte values come from the [M10 SPG 5.10 interface
-  description (UBX-21035062 R03)](https://content.u-blox.com/sites/default/files/u-blox-M10-SPG-5.10_InterfaceDescription_UBX-21035062.pdf),
-  sections 3.10.5.1, 4.9.11 and 4.9.12. The bench receiver still ACKs
-  legacy CFG-MSG and CFG-NAV5, but VALSET is the future-proof interface.
-  After a cold power-up the MAX-M10S can emit NMEA before accepting UBX.
-  The logger waits for checksum-valid NMEA (up to 3 s per attempt), then
-  configures in the background while continuing to parse fixes. Each send
-  waits 2 s for an ACK: at 9600 baud (8N1, about 960 bytes/s), a ~1 KB GSV
-  burst takes ~1.1 s, with more time needed for other queued NMEA,
-  NAV-PVT (~100 bytes/s), and the ACK. Nothing is resent within that window.
-  Silence permits up to three sends per attempt; a NAK ends that attempt.
-  Failed attempts wait 8 s before retrying, up to five attempts. Success
-  logs `GPS configured on attempt N (... ms after config start)`; final
-  failure warns and continues with current settings, without a legacy
-  command fallback. The ten-second NAV-PVT fallback wait starts at success
-  or final failure (see [normal operation](#normal-operation)). Replies during
-  backoff, after the ACK deadline, or begun before the current send are
-  ignored. ACKs have no attempt ID: a complete old reply first arriving
-  after another identical VALSET send cannot be distinguished, but it
-  acknowledges the same complete set of settings.
-- **Debug screen:** for road testing, the OLED shows a status page that
-  redraws about once a second. Example:
-
-  ```text
-  ACTIVE 0h12m          trip state, time since boot
-  SATS R:19 U:12 A31%   satellites heard / used in the fix, GPS AGC
-  FIX OK H0.9 0s        fix yes/no, HDOP, seconds since last position
-  Speed 42.3 mph
-  Trip 12m 008.4mi      current trip: minutes, miles ("Trip --" if none)
-  Store SD Q:3          trip store (SD, FLASH, NONE), trips waiting to upload
-  Net OFF OK 20s        WiFi (OFF/SCAN/JOIN/ON), last upload, seconds ago
-  B85% 4.02V U1 C1      battery, USB power in (U1), charging (C1)
-  ```
-
-  `--` means unknown or stale. The queue count (`Q`) is refreshed by the
-  upload task about every 30 s, so a trip that just ended can take one
-  cycle to appear, and an upload age stops counting at 999 s.
-
-  Things to know:
-  - It's switched by `DISPLAY_DEBUG` at the top of the sketch (default `1`).
-    Set `DISPLAY_DEBUG` to `0` at the top of the sketch to build the production
-    screen and disable the `GPS RF:` serial line. It sleeps by default, briefly
-    showing `Sats: N` for satellites **heard** (`Sats: --` when stale),
-    then `OK` or only active warning-and-above `E####` codes at the first
-    parked opportunity after boot or a trip. Codes are severity ordered and
-    deduplicated. Four fit in a two-by-two grid; with more faults, three codes
-    and `+N` show how many were omitted. Error cards show only a centred code.
-    Production does not render catalog OLED text; catalog v5's text
-    validation rules still apply. New
-    ERROR/CRITICAL episodes show once even while moving; unresolved faults
-    remind at the next parked opportunity. Cards last 10 seconds at maximum
-    contrast, then SH1106 power save turns the panel off. A short press of
-    **POWER** shows a status card in any motion state after a verified PMU
-    INTSTS1..3 batch, outside degraded mode. Only production enables the
-    short-key IRQ in the shared enabled/batch mask. Long press keeps its
-    existing clean power-off behavior on battery and is ignored on USB.
-    GSV/MON-RF antenna checking and NAV-PVT speed accuracy gating stay enabled
-    in both builds. On **2026-10-20**, the owner saw the working production
-    screen on hardware and requested much larger text filling the panel,
-    without descriptions. The revised layout uses U8g2 `logisoso26_tr`
-    for sats/OK/a single status code, `helvB14_tr` for multiple status codes,
-    and `logisoso38_tr` for error cards. Real font data gives `Sats: 99`
-    a 123-pixel advance (119x27 ink), status-grid `E9999` 53 pixels
-    (50x14 ink), and error `E9999` 121 pixels (116x38 ink).
-    It keeps two-pixel panel margins and separated rows; `+N` fits through
-    two digits. Full metrics, pixel positions and unchanged policy are in
-    [DIAGNOSTICS.md](../DIAGNOSTICS.md#production-fonts-and-pixel-layout).
-    The revised font layout and current consumption still need bench acceptance.
-  - A question mark, such as `Speed 3.3? mph`, means the displayed speed
-    failed the accuracy check; it cannot start or extend a trip and the
-    point is omitted from the GPX.
-  - `R` counts satellites actually **heard**: GSV entries with a positive
-    C/N0 (signal strength), counted once even if several signals name the
-    same satellite. The receiver's predicted "in view" total can stay high
-    indoors with no signal, so it is not used. Each complete GSV group
-    replaces its previous signal group; data expires after 15 s. The GPS
-    sends GSV every 5th second, because a full set is about 1 KB and the
-    link runs at just 9600 baud (~960 bytes/s).
-  - `A` is GPS automatic gain control (AGC), as a percentage of its maximum.
-    Near 100% means the receiver is using full gain; compare it with `R`
-    and the serial RF log to investigate weak or missing signals. Counts
-    stop at 999; the space before `A` is omitted if needed to fit 21 chars.
-  - Every 30 s the serial log prints one `GPS RF:` line: jamming state,
-    CW jamming indicator (0-255), noise per ms, AGC, antenna status/power,
-    heard satellites (including how many reach 30 dBHz and the strongest
-    C/N0), satellites used, HDOP and RMC fix status (`A` valid, `V` invalid).
-    It also shows the latest fresh NAV-PVT `sAcc` (speed accuracy, m/s,
-    two decimals) and `hAcc` (horizontal accuracy, metres, one decimal).
-    It contains no coordinates. MON-RF polling starts after boot GPS
-    configuration succeeds or gives up; each line reports the preceding
-    poll's reply without waiting for it. A missing/invalid reply shows
-    `rf --`, and unknown or stale NMEA values show `--`. Antenna status
-    and power may read `DONTKNOW` without an antenna supervisor; that
-    alone does not mean the antenna failed.
-  - Debug builds also print a `Temp:` line every 30 s: the guard's PMU die
-    temperature with sample age and its die-minus-9 C estimate (the retired
-    V1.2 calibration; samples older than 35 s show `--`),
-    TS voltage/raw ADC count, BME280 temperature, actual charging/phase,
-    battery voltage/percent and VBUS. Unavailable values show `--`. Compare
-    TS voltage across temperatures to identify whether the Supreme's TS
-    resistor is fixed (flat) or a thermistor (temperature-dependent); TS stays
-    independent of the charger, with a 50 uA measurement bias. BME280 uses
-    temperature-only forced mode on the OLED's core/bus; its ALDO1 supply
-    (also OLED/magnetometer) is left as found. These readings do not change
-    the guard's offset or thresholds. The line and probes are debug-only.
-  - The screen can't stop logging. If it's missing or an I2C write fails,
-    the serial log says `WARNING: debug OLED I2C failed` once and the
-    screen stays off until the next boot.
-  - It uses maximum SH1106 contrast (`DEBUG_OLED_CONTRAST = 255`). The old
-    setting (`16`) was unreadable outdoors on the first road test
-    (2026-10-19). Full contrast speeds OLED burn-in and draws a little more
-    current, acceptable for this temporary shakedown-only page. It shifts
-    sideways a few pixels each minute to limit burn-in and switches off
-    before the board powers down. The future everyday display has its own
-    burn-in rules (see the display policy in `DIAGNOSTICS.md`).
-  - Not yet checked on the board: the screen's supply rail and current
-    draw, whether full contrast is readable in daylight, and which GSV
-    talkers the MAX-M10S actually sends.
-
-  Bench check for the heard count: after a cold start under open sky, `R`
-  should rise as signals arrive and `U` should rise when the receiver gets
-  a fix. Indoors or with a blocked antenna, `R` should fall as signals
-  disappear, even if the receiver still predicts satellites in view. Check
-  that both show `--` when their input is stale, and record the RF line
-  during a fix loss on the next drive. These checks still need the board.
-- **Expected boot log** (illustrative; attempt count and timing vary):
-
-  ```text
-  === Stage 4: Trip Logger ===
-  LoRa rail (ALDO3) verified off; SD rail (BLDO1) off; VBACKUP off.
-  PMU power-on source 0x04, power-off source 0x02.
-  PMU ready, MAX-M10S GPS rail (ALDO4) on at 3.3 V, charge to 4.1 V. VBUS present.
-  Trip storage: microSD (29.72 GiB free); internal flash queue mounted.
-  GPS: waiting for checksum-valid NMEA (up to 3 s).
-  Setup complete. Logging trips.
-  GPS ready: checksum-valid NMEA received.
-  GPS configured on attempt 1 (1500 ms after config start): RMC+GGA+NAV-PVT, GSV every 5 epochs, automotive model.
-  ```
+At boot it uses the [Supreme pins and rails](#supreme-pin-and-power-reference):
+it verifies LoRa power off first, switches SD power and VBACKUP off, and
+enables the GPS rail. Storage setup then powers and mounts the card. It
+chooses its trip store once per boot and attempts uploads from both mounted
+stores.
 
 Before flashing:
 
@@ -651,7 +412,7 @@ Before flashing:
    next to the `.ino` (the build won't find it anywhere else), and fill
    it in. The top-level README has a table of
    the settings in the
-   [legacy V1.2 flashing section](../README.md#3-legacy-v12-firmware-do-not-use-with-the-supreme).
+   [flashing section](../README.md#3-flash-the-firmware).
    The ones that catch people out:
    - The WiFi has to be 2.4 GHz (the ESP32 has no 5 GHz radio), and
      **hidden networks won't work**: the board only uploads when it sees
@@ -665,58 +426,87 @@ Before flashing:
      supplies `http://`, the port and `/upload` itself.
    - **These settings are built into the firmware.** If the server's
      address, the token, or your WiFi name or password changes, the board
-     can't upload until you edit `secrets.h` and flash again. Nothing on
-     the board shows it: trips just stop appearing in the viewer and wait
-     on the board.
-2. **Partitions are handled for you.** The sketch folder includes a
-   `partitions.csv` (no OTA: 1.5 MB app, 2.375 MB of trip storage), and
-   the ESP32 core uses it in place of whatever Tools -> Partition Scheme
-   says. At ~118 bytes per second of driving that's roughly 5-6 hours
-   between uploads. **Once it's full, the board stops recording**: it
-   ends the trip in progress and won't start another until it uploads.
-3. **On a new board, check the first-flash output below.** Storage is
-   provisioned automatically only when the whole partition is erased.
+     can't upload until you edit `secrets.h` and flash again. Trips wait
+     on the board; use the Serial Monitor and [screen](#the-screen)
+     to investigate failures.
+2. **Partitions are handled for you.** The sketch's `partitions.csv` gives
+   a 1.5 MB app partition and 2.375 MB internal LittleFS fallback, with no
+   over-the-air firmware update slot (no OTA). It overrides **Tools →
+   Partition Scheme**. Internal fallback holds roughly 5–6 hours of driving;
+   the [microSD card](#microsd-card) holds far more. A full trip store ends
+   the current trip and prevents another until space is freed.
+3. **Prepare diagnostics enrollment.** Follow [README step 3](../README.md#3-flash-the-firmware)
+   and [deployment Step 8](../DEPLOY_DEBIAN.md#step-8--point-the-firmware-at-it)
+   to read the server's snapshot revision and set the two one-use enrollment
+   defines. A snapshot is the board's current diagnostic state; its revision
+   must be newer than the server's saved value. GPX delivery does not depend
+   on this enrollment, but diagnostics stay local without revision authority.
+4. **On a new board, erase once as described below.** The factory firmware
+   can leave data where Stage 4 expects its internal trip partition.
 
 #### First flash on a new board
 
-Flash the sketch normally, with its bundled `partitions.csv`, and watch
-the Serial Monitor. If the trip partition mounts, startup proceeds as
-usual. If it doesn't mount, the firmware reads **every byte** of the
-`spiffs` data partition. Only when every read succeeds and every byte is
-erased (`0xFF`) does it format the partition once and mount it again. It
-prints
+Back up the factory flash before installing any project sketch. For the
+**first Stage 4 upload on a Supreme**, use its bundled `partitions.csv`
+and set **Tools → Erase All Flash Before Sketch Upload → Enabled** once.
+After that upload, immediately set it back to **Disabled**. The factory
+firmware leaves data in the area used for the trip partition, and Stage 4
+will not overwrite non-erased data merely because it cannot mount it.
 
-```
+**Erase-all also wipes the board's settings memory (NVS):** the trip
+counter (`tripno`), diagnostic journal boot counter and consumed enrollment
+ID (`diag/enroll`), among other settings. If `DIAGNOSTICS_ENROLLMENT_ID`
+and `DIAGNOSTICS_STATUS_HIGH_WATER` are still defined in `secrets.h`, the
+next boot can consume that ID again and re-enroll from its possibly stale
+high-water value. Follow [deployment Step 8](../DEPLOY_DEBIAN.md#step-8--point-the-firmware-at-it),
+then remove both defines after the first successful diagnostics upload and
+reflash with erase disabled. If you must erase an enrolled board later,
+read a fresh server high-water and choose a higher enrollment ID first.
+
+Watch the Serial Monitor. If LittleFS mounts, startup uses it normally.
+Otherwise the firmware reads **every byte** of the `spiffs` data partition.
+Only when every read succeeds and every byte is erased (`0xFF`) does it
+format that partition once and mount it again. Successful provisioning
+prints:
+
+```text
 LittleFS partition is fully erased; provisioning trip storage.
 ...
 Setup complete. Logging trips.
 ```
 
-No sketch edits or second flash are needed. A board sold as new may still
-contain factory test data, so "new" alone is not enough to allow formatting.
-Any non-erased byte, failed read, or missing partition leaves storage
-untouched and halts startup with `LittleFS mount failed. Storage preserved`.
-A format or subsequent mount failure also halts, with
-`LittleFS provisioning failed`. The battery's charge-temperature guard
-keeps running while halted. Follow [storage recovery](#if-the-trip-storage-wont-mount-later)
-if startup halts; do not enable format-on-mount-failure.
-An interrupted format may leave non-erased bytes, so the next boot can
-also halt for recovery instead of trying another format.
+No sketch edits or second flash are needed for provisioning. Any non-erased
+byte, failed read or missing partition leaves the data untouched. A failed
+mount prints `ERROR: LittleFS mount failed. Storage preserved.` followed
+by the recovery pointer. A failed format or subsequent mount prints
+`ERROR: LittleFS provisioning failed.` An interrupted format can leave
+non-erased bytes, so the next boot preserves them rather than formatting again.
 
-After that, the trip storage survives reflashing. You only do this again
-if the partition is fully erased again. Before changing the partition
-layout or erasing flash, upload or independently back up every trip.
+If the card mounts, recording can continue there even when LittleFS fails.
+If **neither store works**, startup enters [DEGRADED service](#startup-failures):
+no trips or networking, but power management and the charge guard remain
+active when the PMU is trusted. Follow [storage recovery](#if-the-trip-storage-wont-mount-later);
+do not enable format-on-mount-failure.
+
+Later uploads with erase **Disabled** preserve trips on the card and in
+internal flash, along with NVS and trip numbering. Before changing the
+partition layout or erasing flash, upload or independently back up every
+trip. Erase-all does not erase the removable card, but it does reset NVS.
 
 #### If the trip storage won't mount later
 
-On a board that's been working, `LittleFS mount failed` doesn't mean the
-trips are gone. Keep format-on-mount-failure disabled. Check that you
+For microSD trips, switch the board off and read or copy the card on a PC.
+Check its seating and FAT32 format before trying it again; the firmware
+never formats it. Preserve its data before any repair or reformat.
+
+For internal flash on a board that's been working, `LittleFS mount failed`
+doesn't mean the trips are gone. Keep format-on-mount-failure disabled. Check that you
 flashed with this sketch's `partitions.csv`, and try the firmware that last
 worked. Before anything that could erase the partition, copy it to a file
 with esptool (it comes with the ESP32 core, or `pip install esptool`):
 
 ```
-esptool --port <port> read-flash 0x190000 0x260000 trips-backup.bin
+esptool --chip esp32s3 --port <port> read-flash 0x190000 0x260000 trips-backup.bin
 ```
 
 Close Serial Monitor before running esptool. Replace `<port>` with the
@@ -743,7 +533,7 @@ Do not use this step to recover trips you still need from the device.
 With Serial Monitor closed, run:
 
 ```
-esptool --port <port> erase-region 0x190000 0x260000
+esptool --chip esp32s3 --port <port> erase-region 0x190000 0x260000
 ```
 
 Older esptool versions spell it `erase_region`. The address and size are
@@ -751,7 +541,8 @@ for this project's bundled `spiffs` partition only. Reset the board (or
 power-cycle it) after a successful erase; the unchanged firmware verifies
 the erased partition, provisions it, and reaches `Setup complete. Logging
 trips.` No second flash or format-on-mount-failure build is needed. If it
-still halts, investigate the reported error rather than repeating erases.
+still enters degraded service, investigate the reported error rather than
+repeating erases.
 
 #### Normal operation
 
@@ -798,16 +589,17 @@ How it behaves once flashed:
   system-clock corrections do not change the position's epoch. A fix
   without valid RMC date/time stays untimed even if GPS or NTP has set
   the system clock. Untimed points retain their order in a 90-point buffer;
-  older points spill to flash, and the remaining tail is flushed before
-  the next timed fix or at trip end, always without invented times.
+  older points spill to the selected trip store, and the remaining tail
+  is flushed before the next timed fix or at trip end, always without invented times.
   System-clock synchronization and local file naming are independent.
   The viewer lists a wholly untimed trip without a date.
   A partly timed trip is marked **Partial timing**; its full-trip dates,
   duration and average speed remain unknown while its distance is retained.
   GPS segment boundaries stay attached to the first fix after each gap,
   including fixes buffered before UTC.
-- **Upload:** the board checks for finished trips every 30 s and scans
-  for your home WiFi when a retry is due and a complete trip is waiting.
+- **Upload logic:** the board checks for finished
+  trips every 30 s and scans for your home WiFi when a retry is due and a
+  complete trip is waiting.
   Incomplete files are preserved for recovery and do not trigger radio work.
   Failed scans, connections, or
   uploads double the retry wait (60 s, 120 s, 240 s, then at most 5 min).
@@ -815,43 +607,75 @@ How it behaves once flashed:
   once due. A successful upload resets the wait to 30 s, and an empty
   queue clears it. A trip ending clears it too, since the car may just
   have parked at home: the board tries within 30 s, then about 1, 3 and
-  7 minutes later, all before it sleeps. Each failed try prints why and
-  when the next one is, e.g.
+  7 minutes later, within its normal battery upload window. Each failed
+  try prints why and when the next one is, e.g.
   `Network: home WiFi not found "<ssid>" -- next try in 60 s.` When connected, it
   POSTs each trip to the ingest server as GPX and deletes it locally once
   the server accepts it. GPS
   parsing runs on core 1; networking runs on core 0 and never blocks
-  it.
-- **Power loss:** when the car turns off (USB power off for 10 s), the
-  current trip is finalized cleanly and kept for the next upload. The
-  board stays awake on battery for 10 minutes, so a trip that ends at
-  home uploads right away, then deep-sleeps until the car turns on. An
-  upload still running at 10 minutes gets up to 6 more to finish; one
-  cut off then stays queued and is sent next time. Without the 18650,
-  the board loses power with the car, so it can only upload while the
-  car is on. On a USB port that stays powered with the car off, it never
-  sees the car turn off and never sleeps.
-- **Buttons:** a long press of PWR finalizes any trip and puts the board
-  into deep sleep; a short press, or USB power coming back, wakes it.
-  Holding PWR for 6 seconds is the power chip's own power-off (LilyGO's
-  default), which cuts power completely; a short press turns it back on.
+  it. On 2026-10-21 (UTC), absent home WiFi produced retry waits of
+  60, 120, 240, 300 and 300 s. Once home, four SD trips received HTTP 200
+  and were deleted locally. A scan at 04:35:35Z missed the access point;
+  its 60 s retry led to the current trip's upload at 04:36:41Z. A scan
+  miss at the edge of range can delay an upload; it need not mean the
+  settings are wrong. Server errors (401/413/5xx) and server-down handling
+  described here are code behaviour, still untested on the Supreme.
+- **Power loss:** after USB power has been absent for 10 s, the firmware
+  finalizes the current trip. Once idle on battery for 10 minutes, it
+  closes files, stops networking, seals the diagnostic journal, unmounts
+  storage and calls `PMU.shutdown()` to switch the board off completely.
+  It does not deep-sleep. The next USB power insert switches it on again.
+  An upload still running at 10 minutes gets up to **16 more minutes** to
+  finish; a file cut off then remains queued. This is the opportunity to
+  upload at home, subject to the pending end-to-end test. Without an 18650,
+  the board loses power with the car and has no battery upload window or
+  clean shutdown. A car USB port that stays powered never triggers this
+  power-off. Unreadable USB-power state keeps the board awake for retries;
+  it never counts as confirmed USB loss or permission to power off.
+  Persistent read failures on battery leave the PMU's hardware
+  under-voltage cutoff as the final protection.
+- **Buttons:** on battery, hold **POWER** for a second or two and release
+  well before 6 s for a clean shutdown: finalize the trip, stop networking,
+  seal the journal and unmount storage before switching off. With USB
+  plugged in, the request is ignored and Serial prints
+  `VBUS present -- staying awake instead of powering off.` An unreadable
+  USB state also keeps it awake and prints
+  `VBUS state unreadable -- staying awake instead of powering off.`
+  USB switches the board on only when power arrives: shutting it down
+  while USB remained connected would leave it off until power was cut and
+  restored. Unplug USB first to switch it off. Press POWER for about 1 s
+  or insert USB power to switch it back on. A 6 s hold forces the PMU's
+  hard power-off with no file closing; any open trip needs boot repair and
+  unwritten diagnostics are lost. Use that only if the board stops responding.
+  A short POWER press requests a status card in the production display
+  build; see [The screen](#the-screen).
 - **Charging:** the firmware pauses charging at high or low temperatures
   reported by the AXP2101 power-management chip. Its temperature is an
-  indirect estimate, not a measurement of the battery cell or a guarantee
-  of safe charging in a hot car. Logging continues while charging is paused.
+  indirect estimate using a 9 °C die-temperature offset measured on the
+  retired V1.2; recalibration for the Supreme is still pending. Debug builds
+  log the readings it needs (the `Temp:` line under [The screen](#the-screen)). It is not
+  a measurement of the battery cell or a guarantee of safe charging in a
+  hot car. Logging continues while charging is paused.
   The guard verifies every charger on/off command with a checked register read
   and retries unconfirmed commands every 30 s; E2008 means three attempts failed
   to confirm the requested state, so charging may still be on or remain off.
-- **Storage full:** below 64 KB free it won't start a trip, and below
-  24 KB it ends the one in progress. An upload frees the space.
-- **No display:** the firmware doesn't use a screen or a status LED. The
-  Serial Monitor shows what it's doing; once it's in the car, trips
-  appearing in the viewer are how you know it works.
+- **Storage full:** the selected trip store (microSD or internal flash)
+  must have at least 64 KiB free to start a trip; below 24 KiB it ends
+  the one in progress. For LittleFS, free space excludes the unused part
+  of the separate 64 KiB diagnostics reserve. Card free space uses the
+  card's own total and used bytes. Accepted uploads freed space by deleting
+  the local SD files on 2026-10-21 (UTC). The same deletion path for
+  LittleFS uploads remains untested on the Supreme.
 
 Watch the Serial Monitor (115200) for state transitions:
 `Trip started` → (drive) → `Trip finalized`, then
-`Upload ... -> HTTP 200 (deleted)` when you get home.
+`Upload ... -> HTTP 200 (deleted)` if the server accepts it. On
+2026-10-21 (UTC), the serial log showed
+`Upload /trips/t000006.gpx (142443 B, 2.7 s) -> HTTP 200 (deleted)`.
+The local SD file was deleted, and the trip appeared in the viewer.
 
+The failure handling below describes the code; server errors (401/413/5xx)
+and server-down behaviour remain untested on the Supreme.
 If a trip does not appear, first confirm `Trip started` and `Trip finalized`:
 an active or discarded trip cannot upload. `HTTP 401` means the upload
 token does not match. A negative result means a connection or transfer
@@ -864,9 +688,9 @@ scan or join prints `Network: home WiFi not found "<ssid>"` or
 the next try (up to 5 minutes). Check the SSID and 2.4 GHz coverage after
 a scan miss. Join status `4` (`WL_CONNECT_FAILED`) can indicate a wrong
 password; `1` is `WL_NO_SSID_AVAIL` and `6` is `WL_DISCONNECTED`. These are
-connection states, not a definitive diagnosis. Press **RST** to try again
+connection states, not a definitive diagnosis. Press **RESET** to try again
 at once. See the
-[legacy V1.2 troubleshooting steps](../README.md#4-check-it-works-legacy-v12-only)
+[troubleshooting steps](../README.md#4-check-it-works)
 for what to check and preserve in each case.
 
 Boot repair also examines `.gpx.fix` files left by interrupted repairs.
@@ -880,13 +704,217 @@ inspection; they may continue to consume storage. Failed storage operations
 leave recoverable copies available for the next boot. Hardware power-cut
 testing remains necessary to verify the flash driver's behavior.
 
-> Note: this sketch **compiles cleanly on ESP32 core 3.3.11** with
-> XPowersLib 0.3.3 and TinyGPSPlus 1.0.3 (~1.03 MB of the 1.5 MB app
-> partition). Host-side tests: `bash firmware/host_test/run.sh`. It still needs an on-hardware shakedown — verify the GPS
-> rail with a meter and watch the Serial Monitor through a real trip and
-> upload before relying on it in the car.
+#### Startup failures
+
+`DEGRADED:` Serial lines mean trips are **not being
+recorded**. Without SD or LittleFS, the board keeps the charge guard, power
+key, low-battery shutdown and ten-minute battery idle power-off active. If
+the power chip is absent or its LoRa rail cannot be verified off, it avoids
+ordinary PMU control (one best-effort charge-disable attempt for an answered
+but untrusted chip); only internal-flash diagnostics and retries remain.
+Neither mode starts GPS processing or networking. Retries wait 60 seconds,
+double up to ten minutes, and restart on recovery. Check the Serial reason,
+SD seating/FAT32 and BLDO1 supply for storage failures; check board variant,
+power and Wire1 SDA 42 / SCL 41 for PMU failures. Do not assume charge control
+works in a PMU-failure mode. Restore the fault and verify a recorded test trip
+before relying on the tracker; see [degraded startup details](../DIAGNOSTICS.md#degraded-startup-service-126).
+
+#### RTC
+
+The PCF8563 real-time clock (RTC) supplies diagnostic event timestamps
+before GPS/SNTP sync, never GPX times. The `RTC:` boot line reports whether its clock is
+usable and, when known, how long ago it was set. `invalid (stopped/VL)` is
+normal after the battery was removed; trusted GPS or network time (SNTP)
+repairs it with one verified setting per boot. It keeps counting while the board is
+switched off (checked on the bench, 2026-10-20) and runs about 10 s/day
+slow, so a reset corrects it only when it's off by 2 s or more.
+
+#### GPS settings
+
+Stage 4 sends one UBX-CFG-VALSET (`06 8A`) at every
+boot to the receiver's RAM layer, without saving to battery-backed RAM
+or flash. It explicitly enables UART1 RMC, GGA and NAV-PVT at rate 1;
+disables GLL, GSA and VTG; enables GSV every 5 epochs in all builds;
+and selects the automotive dynamic model. The
+navigation rate stays at the default 1 Hz. GGA supplies altitude, HDOP
+and satellite count; NAV-PVT supplies speed/horizontal accuracy used
+before recording movement.
+E3009 means high receiver gain and no usable-strength satellite persisted
+for two minutes, suggesting a loose or damaged GPS antenna cable; check the
+plug inside the case and the cable. It clears on lower gain or a strong
+satellite, including after reconnecting indoors; the thresholds come from
+one board and antenna, so the warning is a prompt to inspect them.
+The key IDs and one-byte values come from the [M10 SPG 5.10 interface
+description (UBX-21035062 R03)](https://content.u-blox.com/sites/default/files/u-blox-M10-SPG-5.10_InterfaceDescription_UBX-21035062.pdf),
+sections 3.10.5.1, 4.9.11 and 4.9.12. The bench receiver still ACKs
+legacy CFG-MSG and CFG-NAV5, but VALSET is the future-proof interface.
+After a cold power-up the MAX-M10S can emit NMEA before accepting UBX.
+The logger waits for checksum-valid NMEA (up to 3 s per attempt), then
+configures in the background while continuing to parse fixes. Each send
+waits 2 s for an ACK: at 9600 baud (8N1, about 960 bytes/s), a ~1 KB GSV
+burst takes ~1.1 s, with more time needed for other queued NMEA,
+NAV-PVT (~100 bytes/s), and the ACK. Nothing is resent within that window.
+Silence permits up to three sends per attempt; a NAK ends that attempt.
+Failed attempts wait 8 s before retrying, up to five attempts. Success
+logs `GPS configured on attempt N (... ms after config start)`; final
+failure warns and continues with current settings, without a legacy
+command fallback. The ten-second NAV-PVT fallback wait starts at success
+or final failure (see [normal operation](#normal-operation)). Replies during
+backoff, after the ACK deadline, or begun before the current send are
+ignored. ACKs have no attempt ID: a complete old reply first arriving
+after another identical VALSET send cannot be distinguished, but it
+acknowledges the same complete set of settings.
+
+#### The screen
+
+With `DISPLAY_DEBUG=1`, the OLED shows a status page for road testing that
+redraws about once a second. Illustrative values:
+
+```text
+ACTIVE 0h12m          trip state, time since boot
+SATS R:19 U:12 A31%   satellites heard / used in the fix, GPS AGC
+FIX OK H0.9 0s        fix yes/no, HDOP, seconds since last position
+Speed 42.3 mph
+Trip 12m 008.4mi      current trip: minutes, miles ("Trip --" if none)
+Store SD Q:3          trip store (SD, FLASH, NONE), trips waiting to upload
+Net OFF OK 20s        WiFi (OFF/SCAN/JOIN/ON), last upload, seconds ago
+B85% 4.02V U1 C1      battery, USB power in (U1), charging (C1)
+```
+
+`--` means unknown or stale. The queue count (`Q`) is refreshed by the
+upload task about every 30 s, so a trip that just ended can take one
+cycle to appear, and an upload age stops counting at 999 s.
+
+Things to know:
+
+- It's switched by `DISPLAY_DEBUG` at the top of the sketch (default `1`).
+  Set `DISPLAY_DEBUG` to `0` at the top of the sketch to build the production
+  screen and disable the `GPS RF:` serial line. It sleeps by default, briefly
+  showing `Sats: N` for satellites **heard** (`Sats: --` when stale),
+  then `OK` or only active warning-and-above `E####` codes at the first
+  parked opportunity after boot or a trip. Codes are severity ordered and
+  deduplicated. Four fit in a two-by-two grid; with more faults, three codes
+  and `+N` show how many were omitted. Error cards show only a centred code.
+  Production does not render catalog OLED text; catalog v5's text
+  validation rules still apply. New
+  ERROR/CRITICAL episodes show once even while moving; unresolved faults
+  remind at the next parked opportunity. Cards last 10 seconds at maximum
+  contrast, then SH1106 power save turns the panel off. A short press of
+  **POWER** shows a status card in any motion state after a verified PMU
+  INTSTS1..3 batch, outside degraded mode. Only production enables the
+  short-key IRQ in the shared enabled/batch mask. Long press keeps its
+  existing clean power-off behavior on battery and is ignored on USB.
+  GSV/MON-RF antenna checking and NAV-PVT speed accuracy gating stay enabled
+  in both builds. On **2026-10-20**, the owner saw the working production
+  screen on hardware and requested much larger text filling the panel,
+  without descriptions. The revised layout uses U8g2 `logisoso26_tr`
+  for sats/OK/a single status code, `helvB14_tr` for multiple status codes,
+  and `logisoso38_tr` for error cards. Real font data gives `Sats: 99`
+  a 123-pixel advance (119x27 ink), status-grid `E9999` 53 pixels
+  (50x14 ink), and error `E9999` 121 pixels (116x38 ink).
+  It keeps two-pixel panel margins and separated rows; `+N` fits through
+  two digits. Full metrics, pixel positions and unchanged policy are in
+  [DIAGNOSTICS.md](../DIAGNOSTICS.md#production-fonts-and-pixel-layout).
+  The revised font layout and current consumption still need bench acceptance.
+  The production screen has not been road-tested.
+- A question mark, such as `Speed 3.3? mph`, means the displayed speed
+  failed the accuracy check; it cannot start or extend a trip and the
+  point is omitted from the GPX.
+- `R` counts satellites actually **heard**: GSV entries with a positive
+  C/N0 (signal strength), counted once even if several signals name the
+  same satellite. The receiver's predicted "in view" total can stay high
+  indoors with no signal, so it is not used. Each complete GSV group
+  replaces its previous signal group; data expires after 15 s. The GPS
+  sends GSV every 5th second, because a full set is about 1 KB and the
+  link runs at just 9600 baud (~960 bytes/s).
+- `A` is GPS automatic gain control (AGC), as a percentage of its maximum.
+  Near 100% means the receiver is using full gain; compare it with `R`
+  and the serial RF log to investigate weak or missing signals. Counts
+  stop at 999; the space before `A` is omitted if needed to fit 21 chars.
+- Every 30 s the serial log prints one `GPS RF:` line: jamming state,
+  CW jamming indicator (0-255), noise per ms, AGC, antenna status/power,
+  heard satellites (including how many reach 30 dBHz and the strongest
+  C/N0), satellites used, HDOP and RMC fix status (`A` valid, `V` invalid).
+  It also shows the latest fresh NAV-PVT `sAcc` (speed accuracy, m/s,
+  two decimals) and `hAcc` (horizontal accuracy, metres, one decimal).
+  It contains no coordinates. MON-RF polling starts after boot GPS
+  configuration succeeds or gives up; each line reports the preceding
+  poll's reply without waiting for it. A missing/invalid reply shows
+  `rf --`, and unknown or stale NMEA values show `--`. Antenna status
+  and power may read `DONTKNOW` without an antenna supervisor; that
+  alone does not mean the antenna failed.
+- Debug builds also print a `Temp:` line every 30 s: the guard's PMU die
+  temperature with sample age and its die-minus-9 C estimate (the retired
+  V1.2 calibration; samples older than 35 s show `--`),
+  TS voltage/raw ADC count, BME280 temperature, actual charging/phase,
+  battery voltage/percent and VBUS. Unavailable values show `--`. Compare
+  TS voltage across temperatures to identify whether the Supreme's TS
+  resistor is fixed (flat) or a thermistor (temperature-dependent); TS stays
+  independent of the charger, with a 50 uA measurement bias. BME280 uses
+  temperature-only forced mode on the OLED's core/bus; its ALDO1 supply
+  (also OLED/magnetometer) is left as found. These readings do not change
+  the guard's offset or thresholds. The line and probes are debug-only.
+- The screen can't stop logging. If it's missing or an I2C write fails,
+  the serial log says `WARNING: debug OLED I2C failed` once and the
+  screen stays off until the next boot.
+- It uses maximum SH1106 contrast (`DEBUG_OLED_CONTRAST = 255`). The old
+  setting (`16`) was unreadable outdoors on the first road test
+  (2026-10-19). Full contrast speeds OLED burn-in and draws a little more
+  current, acceptable for this temporary shakedown-only page. It shifts
+  sideways a few pixels each minute to limit burn-in and switches off
+  before the board powers down. The production display has its own
+  burn-in rules (see the display policy in `DIAGNOSTICS.md`).
+- Not yet checked on the board: the screen's supply rail and current
+  draw, whether full contrast is readable in daylight, and which GSV
+  talkers the MAX-M10S actually sends.
+
+Bench check for the heard count: after a cold start under open sky, `R`
+should rise as signals arrive and `U` should rise when the receiver gets
+a fix. Indoors or with a blocked antenna, `R` should fall as signals
+disappear, even if the receiver still predicts satellites in view. Check
+that both show `--` when their input is stale, and record the RF line
+during a fix loss on the next drive. These checks still need the board.
+
+#### Expected boot log
+
+Illustrative; free space, attempt count and timing vary:
+
+```text
+=== Stage 4: Trip Logger ===
+LoRa rail (ALDO3) verified off; SD rail (BLDO1) off; VBACKUP off.
+PMU power-on source 0x04, power-off source 0x02.
+PMU ready, MAX-M10S GPS rail (ALDO4) on at 3.3 V, charge to 4.1 V. VBUS present.
+Trip storage: microSD (29.72 GiB free); internal flash queue mounted.
+GPS: waiting for checksum-valid NMEA (up to 3 s).
+Setup complete. Logging trips.
+GPS ready: checksum-valid NMEA received.
+GPS configured on attempt 1 (1500 ms after config start): RMC+GGA+NAV-PVT, GSV every 5 epochs, automotive model.
+```
+
+> CI compiles this sketch for the Supreme on **ESP32 core 3.3.11**, with
+> **XPowersLib 0.3.3**, **TinyGPSPlus 1.0.3** and **U8g2 2.36.18**, in both
+> display modes. Its FQBN is
+> `esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled`.
+> Host tests run with `bash firmware/host_test/run.sh`. Compile and host
+> checks do not establish hardware durability or live upload headroom. The
+> real SD upload and network stack measurement above and below cover the
+> debug build's successful-upload path; heap and failure-path checks remain.
 
 ### Diagnostic journal module
+
+The first real diagnostics delivery succeeded on 2026-10-21 (UTC), using
+the debug build and SD journal. After the last GPX, two
+`POST /v1/device-events` requests returned HTTP 200 at 04:36:43Z and
+04:36:44Z. The server created `data/diagnostics/events.db` with all 115
+pending events. Device health showed recent contact and snapshot receipt,
+storage backend `sd`, zero dropped events, a boot counter and no active
+conditions. History included the earlier E3009 antenna episode, raised
+and cleared; E5001's boot-local access-point-absence counter was 6.
+Successful diagnostics uploads print nothing on serial. Confirm them in
+the ingest log or Device health. `Firmware: Not reported` is expected:
+the firmware does not send a version yet. The behaviour below describes
+the implementation; this test does not establish LittleFS or
+production-build uploads, or server-failure handling on the Supreme.
 
 Stage 4 carries a board-independent `event_log.h` / `event_log.cpp` module with
 a fixed producer queue, CRC-protected rolling segments, durable acknowledgment
@@ -935,14 +963,21 @@ the board.
 
 **Enable snapshot delivery deliberately:** read this device's current
 `devices.status_sequence` in the ingest diagnostics database (zero only for a
-verified new identity), then uncomment/set `DIAGNOSTICS_STATUS_HIGH_WATER` and
+verified new identity), using [deployment Step 8](../DEPLOY_DEBIAN.md#step-8--point-the-firmware-at-it).
+Then uncomment/set `DIAGNOSTICS_STATUS_HIGH_WATER` and
 `DIAGNOSTICS_ENROLLMENT_ID` in private `secrets.h`. The enrollment ID must be
 positive and greater than any previously used on this board. NVS consumes it
 before restoring the SD allocator; a failed enrollment requires a higher ID.
-Existing SD metadata works on later boots without those defines. Never reuse
-a fresh-identity zero after changing/corrupting cards: inspect the server again.
+After the first successful diagnostics upload, remove both defines and
+reflash with erase disabled. Existing SD metadata works on later boots
+without them. The first real test consumed enrollment ID 1 after the
+deployment Step 8 command returned high-water 0 (no `events.db` yet).
+Re-enrollment needs a fresh server read and an ID of at least 2, higher
+than every ID already used. Never reuse a fresh-identity zero after
+changing/corrupting cards: inspect the server again.
 Without an enrolled writable SD revision authority, events remain local and
-GPX still uploads. See [revision enrollment and recovery](../DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
+GPX upload logic remains available independently of diagnostics enrollment.
+See [revision enrollment and recovery](../DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
 for the complete procedure and snapshot-conflict recovery.
 
 The upload batch (35,280 bytes), request (32,769), snapshot (6,144), reply
@@ -951,8 +986,8 @@ workspace on ESP32-S3, including alignment padding. Setup allocates it once,
 before the network task starts, with PSRAM-only heap capabilities; it is never
 freed, retried or replaced with internal RAM. If PSRAM is unavailable or the
 allocation fails, one `WARNING:` disables diagnostics upload for that boot;
-local journaling and GPX uploads continue. No existing catalog code describes
-this allocation failure, so no event code is substituted.
+local journaling and GPX upload logic remain available. No existing catalog
+code describes this allocation failure, so no event code is substituted.
 Small controls, producer builders and cross-core atomic publications stay in
 internal RAM. Workspace accesses run only in setup or the core-0 worker, never
 in the PMU ISR, DNS callback or cache-disabled code. Journal flash operations
@@ -970,10 +1005,12 @@ account for the remaining internal-memory overhead.
 Compiler frames are 432 bytes for the HTTP wrapper, 672 for `nextBatch`, 240
 for acknowledgment and 1,088 for singleton isolation, before callees. These
 figures supplement, but do not replace, the real-upload watermark measurements
-below. Degraded startup (#126) and OLED error-code pages
-(#127) remain future work. PMU/storage failure still halts
-before journal startup. SD/FAT
-power-cut safety and operation latency still need hardware validation.
+below. Degraded startup (#126) and production OLED code cards (#127)
+are implemented. Failed PMU startup attempts a non-formatting LittleFS
+mount for diagnostics; failure of both trip stores uses the bounded RAM
+journal. Neither degraded mode starts networking, and the production panel
+stays off there. SD/FAT power-cut safety and operation latency still need
+hardware validation.
 See [DIAGNOSTICS.md](../DIAGNOSTICS.md#eventlog-module-122-implementation)
 for the API, on-disk format, quota and recovery rules. Run
 `bash firmware/host_test/run.sh` for fault tests and the exported-event check
@@ -984,8 +1021,11 @@ against the server's stdlib protocol validator.
 This section is for validating the firmware on hardware. You don't need it
 to build or use the tracker.
 
-The network task reserves 12,288 bytes, matching the Stage 4 brief. This is
-a conservative starting point; it has **not** been sized from board measurements.
+The network task reserves 12,288 bytes, matching the Stage 4 brief. During
+and after the real SD uploads on 2026-10-21 (UTC), the debug build's
+minimum free stack was **7,436 bytes**, with GPS logging active. This
+measures the successful-upload path; it does not establish headroom for
+server errors, server-down behaviour, LittleFS or production-build uploads.
 Serial diagnostics report the task's lifetime minimum free stack at startup,
 after each GPX HTTP upload (including failures), and after each network cycle.
 Diagnostic requests sample the watermark silently between batches.
@@ -1008,7 +1048,51 @@ is not proof that every path has been exercised. Keep issue #6 open until these 
 recorded and the final allocation is justified. Host tests check diagnostics
 only and cannot measure ESP32 stack use.
 
-## Pin Reference (T-Beam V1.2)
+## Legacy T-Beam V1.2
+
+**For reference only; do not use with the Supreme.** The T-Beam V1.2 is
+retired and unsupported on `main`. Its last firmware and full setup
+instructions live on the frozen [`tbeam-v1.2` branch](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/tree/tbeam-v1.2),
+which receives no fixes or backports.
+
+- **Board:** LilyGO TTGO T-Beam V1.2 (ESP32 + SX1262 LoRa + NEO-M8N GPS)
+- **PMU:** AXP2101 (NOT AXP192 — older code examples need updating)
+- **GPS:** u-blox NEO-M8N (GPS/GLONASS/BeiDou, IPEX antenna)
+- **LoRa:** SX1262 at 915MHz (unused in this project)
+- **Battery:** 18650 cell in the onboard holder. Needed in practice: it
+  runs the legacy firmware after the car turns off
+- **USB:** Micro-USB via CH9102F serial converter
+
+**Controls and connectors (V1.2 only):**
+
+Use the markings on the board; do not substitute a pinout from a T-Beam
+Supreme or an older AXP192 board. LilyGO's
+[T-Beam hardware guide](https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/docs/en/t_beam/t_beam_hw.md#button-description)
+and [V1.2 schematic](https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/schematic/LilyGo_TBeam_V1.2.pdf)
+identify these controls:
+
+| Marking / connection | What it is for |
+|---|---|
+| **PWR** | Button connected to the power-management chip; Stage 4 uses it for sleep/wake |
+| **IO38** | User button on GPIO 38; unused by this firmware, not an ESP32 BOOT button |
+| **RST** | Restarts the ESP32 program; useful for seeing startup messages again |
+| **GPS antenna** | Small IPEX/u.FL connection for the GPS antenna; needed to receive satellites |
+| **LoRa antenna** | Separate radio antenna connection; not the GPS antenna |
+| **Micro-USB** | Power and the computer's serial connection for flashing and diagnostics |
+
+**V1.2 USB driver:** Windows uses the CH9102 driver; see
+[Adafruit's CH9102 driver instructions](https://learn.adafruit.com/how-to-install-drivers-for-wch-usb-to-serial-chips-ch9102f-ch9102/windows-driver-installation).
+Device Manager lists `USB-Enhanced-SERIAL CH9102 (COMn)`. On macOS, first
+check for a port with a data cable; if none appears, use the
+[WCH macOS driver linked by LilyGO](https://www.wch-ic.com/downloads/CH34XSER_MAC_ZIP.html).
+Linux normally includes the driver; serial-port access permissions still apply.
+
+**V1.2 board settings:** **ESP32 Dev Module**, **Flash Size → 4MB (32Mb)**.
+Stages 1–3 on that branch use **Default 4MB with spiffs**; the legacy Stage 4
+uses its bundled `partitions.csv`. Keep erase disabled to preserve stored
+trips. These are not Supreme settings.
+
+**V1.2 pin reference:**
 
 | Function        | GPIO Pin | Notes                          |
 |-----------------|----------|--------------------------------|
@@ -1025,19 +1109,7 @@ only and cannot measure ESP32 stack use.
 | PWR button      | —        | Connected to the AXP2101 PMU  |
 | RST button      | —        | Resets the ESP32              |
 
-## Important Notes
-
-- The T-Beam V1.2 uses **AXP2101**, not AXP192. Many online
-  tutorials and code examples reference AXP192 — they won't work
-  without modification. Use XPowersLib which supports both.
-
-- The GPS antenna (IPEX connector) must be attached for satellite
-  reception. Without it, the GPS module will never get a fix.
-
-- A **data-capable** micro-USB cable is required for programming.
-  Charge-only cables will power the board but won't appear in
-  Device Manager. Test with your phone if unsure.
-
-- Use a **protected 18650 cell** for the battery. It keeps the board
-  running for 10 minutes after the car turns off, which is when trips
-  upload at home, then lets it sleep until the car starts again.
+The V1.2 here uses **AXP2101**, not AXP192. Older AXP192 tutorials and
+examples need modification; XPowersLib supports both chips. The rails also
+differ between boards: V1.2 ALDO3 powers GPS, while Supreme ALDO3 powers
+LoRa and ALDO4 powers GPS. Never apply the V1.2 rail code to the Supreme.
