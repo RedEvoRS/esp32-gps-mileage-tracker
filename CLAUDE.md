@@ -62,7 +62,7 @@ firmware/
   04_trip_logger/        Stage 4: the trip logger, plus its partitions.csv
   host_test/             Host-side tests for Stage 4 (run.sh, stubs/)
   STAGE4_TECHNICAL_BRIEF.md  Stage 4 design brief (written for the V1.2)
-  secrets.h.example      Copy to secrets.h and fill in WiFi + server creds
+  secrets.h.example      Copy to 04_trip_logger/secrets.h; fill in WiFi + server creds
   README.md              Full setup guide + pin reference
 
 server/
@@ -120,22 +120,30 @@ names no issue numbers on purpose, because they go stale; keep it that way.
 
 ## Tests
 
-CI runs all of these on every PR:
+CI runs these on PRs; the PII/tools job is skipped for Dependabot PRs:
 - PII: `python tools/check_pii.py` (add `--commits origin/main..HEAD`
   before pushing) and `python -m unittest discover -s tools`.
   The scanner checks positions and new commit dates; commit with TZ=UTC.
-- Server: `python -m unittest discover -s server/tests` and
-  `node server/tests/test_viewer_map.js`. Needs the service requirements
-  installed. Monitor needs no additional dependencies and uses fake time,
-  real SQLite, and local fake HTTP receivers for ntfy, GELF and Loki.
+- Server: `python -m unittest discover -s server/tests`,
+  `python tools/generate_error_catalog.py --check`,
+  `node server/tests/test_viewer_map.js` and `node server/tests/test_viewer_places.js`.
+  Needs the service requirements installed. Monitor needs no additional
+  dependencies and uses fake time, real SQLite, and local fake HTTP receivers
+  for ntfy, GELF and Loki.
   `test_backup` needs bash and rsync, so it skips on Windows; run it in
   WSL (`wsl -d Ubuntu -- python3 -m unittest server/tests/test_backup.py`).
 - Firmware: `bash firmware/host_test/run.sh` (filesystem, I2C/PMU, diagnostics
   journal/catalog, Python protocol bridge, and GPS against real TinyGPSPlus).
   No host compiler on this PC: set
-  `CXX="<venv python> -m ziglang c++"`.
+  `CXX="<venv python> -m ziglang c++"`. Set `TINYGPS_DIR` to TinyGPSPlus's
+  `src/` folder and `U8G2_DIR` to the U8g2 library folder; see
+  `firmware/host_test/README.md`. A passing run can include `SKIPPED` suites;
+  check the output.
 - Firmware compile: all four sketches for the Supreme (ESP32-S3), with
   pinned Arduino tools and libraries.
+- Installer: the `installer` integration job exercises a fresh install,
+  Docker builds, uploads, viewer login/exports, systemd backups, reruns,
+  config repair, Docker restart and detection of broken installs by `--check`.
 
 ## Key Technical Details
 
@@ -149,8 +157,10 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   power-on**, so firmware switches it off first thing after `PMU.begin()`
 - PMU (0x34) and PCF8563 RTC (0x51) share `Wire1`, SDA 42 / SCL 41. OLED and
   BME280 are on `Wire`, SDA 17 / SCL 18
-- RTC: read once at boot for diagnostic event timestamps only, never GPX;
-  set at most once per boot from GPS/SNTP with read-back verification.
+- RTC: read at boot to anchor diagnostic timestamps only, never GPX;
+  checked again when GPS/SNTP time is trusted. Up to three sync attempts
+  per boot, at least 60 s apart; a failed write or read-back verification
+  uses one attempt. Stops after one verified success.
   It keeps time across `PMU.shutdown()` (bench, 2026-10-20) and drifts
   about 10 s/day; the PCF8563 has no calibration register
 - GPS: MAX-M10S, firmware SPG 5.10, 9600 baud on RX 9 / TX 8, GPS_EN GPIO 7
@@ -194,7 +204,7 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   over UBX at boot for RMC+GGA only, 1 Hz, automotive dynamic model
 - LittleFS: use `file.close()` not `file.flush()` for durability
 
-### Firmware (both boards)
+### Firmware (Supreme, main)
 
 - Trip files are **GPX 1.0** at ~119 B/point (1.0 allows `<speed>` and
   `<hdop>` directly on `<trkpt>`). Trackpoint UTC uses the same RMC's date
@@ -203,8 +213,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   a system-clock sync
 - Trip detection: start >5 mph for 10s; end <2 mph for 3 min. NAV-PVT
   speed/horizontal accuracy must be <=0.5 m/s / 5 m to start,
-  <=1.0 m/s / 10 m during a trip (first guesses for drive-log calibration);
-  cooldown resumes after 3 consecutive trusted fixes >2 mph, keeping its
+  <=1.0 m/s / 10 m during a trip. Limits were kept after the recorded
+  road-test calibration; parking-garage behaviour remains unverified.
+  Cooldown resumes after 3 consecutive trusted fixes >2 mph, keeping its
   original deadline until then. Cooldown adds no distance or moving duration;
   the confirming fix starts a new distance baseline without a bridge;
   rejected points count as stopped and are not recorded. Fallback is disabled
@@ -212,48 +223,56 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   after >10s without NAV-PVT from config end or the last NAV-PVT, warn once
   and fall back to RMC-only speed
 - FreeRTOS: networking on core 0, GPS on core 1
-- Stage 4 diagnostics: static EventLog, random boot identity and NVS boot
-  counter; early BOOT/pre-seal power-off battery samples and a read-only
-  parked-drain helper (deploy the server catalog first); boot/reset, retained
-  PMU recovery and runtime fault hooks. GPS,
+- Stage 4 diagnostics: static EventLog, random boot identity and a boot
+  counter in nonvolatile storage (NVS); early BOOT/pre-seal power-off battery
+  samples and a read-only parked-drain helper (deploy the server catalog
+  first); boot/reset, retained PMU recovery and runtime fault hooks. GPS,
   battery/charge guard, trip storage/recovery, WiFi/HTTP, network stack and
-  OLED faults use the catalog policy (production: brief heard-satellite/fault cards), including an AGC/GSV antenna check
-  in all builds. Conditions raise/clear with
-  15-minute repeats; AP absence is a boot-local counter, never a scan event.
-  Per-core static producer builders keep event buffers off task stacks. The network
-  task services one queued record at a time using a zero-wait filesystem
-  lock and yields maintenance to trip/upload demand. Mounted SD has a
-  16 MiB journal quota; LittleFS has a 64 KiB reserve included in trip
-  free-space checks; both failing leaves a bounded volatile RAM queue.
-  Journal writes use checked mounted VFS sync/close, never format media,
-  and seal on core 0 before PMU unmount/power-off. After GPX batches,
-  diagnostic uploads use exact validated acks, request buffers allocated
-  once per boot in PSRAM (if that fails, uploads are off and the journal
-  stays local), a ten-second deadline and independent retry state. Current
-  snapshots include observed/active conditions and AP-absence counts; the SD-only
-  snapshot revision authority needs explicit one-use enrollment in secrets.h
-  against the server high-water (see DIAGNOSTICS.md). Remove the two
-  `DIAGNOSTICS_*` defines after the first good diagnostics upload and reflash
-  with erase disabled; normal boots use existing SD metadata. Re-enrollment
-  needs a new ID greater than any used (at least 2 after ID 1) and a fresh
-  server high-water read. Successful diagnostics uploads print nothing on
-  serial; confirm them in ingest logs or Device health. Builds report a
-  stamped version number plus Git commit (run `tools/stamp_firmware_version.py` before compiling;
-  `unversioned` otherwise); boards flashed before that show `Not reported`.
-  Missing revision authority retains diagnostics locally without blocking GPX.
-  Rejected singleton records
-  use a reserved bounded inspection slot and durable loss accounting. Heartbeats
-  use existing awake opportunities after 24 hours without contact (first boot
-  contact age is unknown). Bounded degraded startup retries restart on recovery;
-  One Stage 4 firmware starts with debug off at every power-on, never saved.
-  While running, hold BOOT then tap POWER to toggle the live page and debug
-  serial output. POWER alone shows a production status card in either mode.
-  The verified PMU IRQ batch handles short presses outside degraded mode;
-  long press is unchanged. BOOT held during power-up still means download mode.
-  Core 1 owns the debounced GPIO 0 input and both OLED renderers; core 0
-  reads only an atomic mode flag. Switching off never replays stale cards.
-  Host tests do not establish
-  storage timing or durability
+  OLED faults use the catalog policy (production: brief heard-satellite/fault
+  cards), including an antenna check using automatic gain control (AGC) and
+  satellites in view (GSV) in all builds. Conditions raise/clear with
+  15-minute repeats; WiFi access point (AP) absence is a boot-local counter,
+  never a scan event. Per-core static producer builders keep event buffers
+  off task stacks. Bounded degraded startup retries restart on recovery.
+- Diagnostic journal: the network task services one queued record at a time
+  using a zero-wait filesystem lock and yields maintenance to trip/upload
+  demand. Mounted SD has a 16 MiB journal quota; LittleFS has a 64 KiB reserve
+  included in trip free-space checks; both failing leaves a bounded volatile
+  RAM queue.
+  Journal writes use checked sync/close on the mounted virtual filesystem
+  (VFS), never format media, and seal on core 0 before PMU unmount/power-off.
+  Host tests do not establish storage timing or durability.
+- Diagnostic uploads: after GPX batches, use exact validated acknowledgments,
+  request buffers allocated once per boot in pseudo-static RAM (PSRAM; if
+  that fails, uploads are off and the journal stays local), a ten-second
+  deadline and independent retry state. Current snapshots include
+  observed/active conditions and AP-absence counts. Rejected singleton
+  records (one-record batches) use a reserved bounded inspection slot and
+  durable loss accounting. Heartbeats use existing awake opportunities
+  after 24 hours without contact (first boot contact age is unknown).
+  Successful diagnostics uploads print nothing on serial; confirm them
+  in ingest logs or Device health.
+- Snapshot enrollment: the SD-only snapshot revision allocator needs explicit
+  one-use enrollment in `secrets.h` against the server high-water: the server's
+  highest accepted `status_sequence` for the device (see `DIAGNOSTICS.md`).
+  Remove `DIAGNOSTICS_ENROLLMENT_ID` and `DIAGNOSTICS_STATUS_HIGH_WATER`
+  after the first good diagnostics upload and reflash with erase disabled;
+  normal boots use existing SD metadata. Re-enrollment needs a new ID
+  greater than any used (at least 2 after ID 1) and a fresh server high-water
+  read. Missing revision authority retains diagnostics locally without
+  blocking GPX.
+- Firmware identity: builds report a stamped version number plus Git commit.
+  No generated `firmware_version.h` means `unversioned`; an existing header
+  keeps its old stamp. Run `python tools/stamp_firmware_version.py` before
+  every build. Boards flashed before version reporting show `Not reported`.
+- Display/debug: one Stage 4 firmware starts with debug off at every power-on,
+  never saved. While running, hold BOOT then tap POWER to toggle the live
+  page and debug serial output. POWER alone shows a production status card
+  in either mode. The verified PMU interrupt (IRQ) batch handles short presses
+  outside degraded mode; long press is unchanged. BOOT held during power-up
+  still means download mode. Core 1 owns the debounced GPIO 0 input and both
+  OLED renderers; core 0 reads only an atomic mode flag. Switching off never
+  replays stale cards.
 - Five-state FSM for trip lifecycle
 
 ### Server
@@ -328,12 +347,14 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 - Optional Graylog export (`gelf.py`): `GRAYLOG_ENABLED` plus exactly one
   of `GRAYLOG_GELF_URL` (GELF HTTP, preferred) or `GRAYLOG_GELF_TCP` (optional
   TLS) in `monitor.env`. Graylog runs on the owner's own server; never bundle it.
-  Sends facts, not ntfy decisions: every events.db row once (rowid cursor,
-  reset if events.db is restored lower), and per-(device, code) condition state
-  changes (active/clear/unknown, E7001 silence), so deep-sleep wakes don't
-  repeat. Independent of NOTIFY_*; own retry/backoff; failures never affect
-  ntfy. Tables `gelf_cursor`, `gelf_conditions`, `gelf_retry` are additive to
-  monitor schema v1. Setup and Event Definitions: DEPLOY_DEBIAN Step 11d.
+  Sends facts, not ntfy decisions: cursor-based, at-least-once forwarding of
+  events.db rows (rowid cursor, reset if events.db is restored lower), and
+  per-(device, code) condition state changes (active/clear/unknown, E7001 silence),
+  so deep-sleep wakes don't repeat. Duplicates are possible after an
+  interrupted send or a lower events.db restore. Independent of NOTIFY_*;
+  own retry/backoff; failures never affect ntfy. Tables `gelf_cursor`,
+  `gelf_conditions`, `gelf_retry` are additive to monitor schema v1.
+  Setup and Event Definitions: DEPLOY_DEBIAN Step 11d.
 - Optional Prometheus metrics (`prometheus.py`): `METRICS_ENABLED=true`
   plus a separate token of at least 32 printable ASCII characters in
   `monitor.env`. `/metrics` publishes on `BIND_ADDR` port 8093 with bearer auth.
