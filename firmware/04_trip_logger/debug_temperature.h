@@ -1,4 +1,4 @@
-// Included only with DISPLAY_DEBUG=1. Core 1 owns this state and all I2C.
+// Runtime debug measurements. Core 1 owns this state and all I2C.
 #pragma once
 #include <stdint.h>
 #include <cmath>

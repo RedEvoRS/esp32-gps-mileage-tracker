@@ -25,8 +25,8 @@ static void initEventUpload() {
     // misreport it as NET_TASK_FAILED or NET_STACK_LOW; the GPX task still runs.
 }
 
-#if DISPLAY_DEBUG
 static void reportEventHeap() {
+    if (!debugMode()) return;
     constexpr uint32_t internal = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
     Serial.printf("Heap: internal %lu free (largest %lu), PSRAM %lu free\n",
                   (unsigned long)heap_caps_get_free_size(internal),
@@ -34,7 +34,6 @@ static void reportEventHeap() {
                   (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 }
 static bool gEventHeapReported = false; // worker-owned, one post-attempt line
-#endif
 static diagnostics::UploadRetry gEventRetry;
 static size_t gEventObservationCount = 0;
 static uint8_t gEventTransportFailures = 0;
@@ -238,9 +237,7 @@ static void drainEvents(bool afterTrips = false) {
         if (!eventTimeLeft(started) || hasPending()) return;
         const char* ackError = nullptr;
         int code = postEvents(started, gEventBuffers->batch.count, ackError);
-#if DISPLAY_DEBUG
-        if (!gEventHeapReported) { gEventHeapReported = true; reportEventHeap(); }
-#endif
+        if (debugMode() && !gEventHeapReported) { gEventHeapReported = true; reportEventHeap(); }
         eventHttpFault(code, ackError);
         bool success = code >= 200 && code < 300 && !ackError;
         if (success) {

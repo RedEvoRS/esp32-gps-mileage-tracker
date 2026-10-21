@@ -73,14 +73,23 @@
 #include "runtime_faults.h"
 #include "rtc_runtime.h"
 
-#ifndef DISPLAY_DEBUG
-#define DISPLAY_DEBUG 1
-#endif
+#include "runtime_debug.h"
+// Core 1 is the only writer. Core 0 reads the mode, never the button or OLED.
+static std::atomic<bool> gDebugMode{false};
+static bool debugMode();
+static constexpr int DEBUG_BOOT_PIN = 0;
+static runtime_debug::BootButton gBootButton;
+static void toggleRuntimeDebug();
+static void serviceDisplay();
+enum class DisplayOwner { Production, Debug, Feedback };
+static DisplayOwner gDisplayOwner = DisplayOwner::Production;
+static bool gModeFeedback = false, gDebugNeedsWake = true;
+static uint32_t gModeFeedbackMs = 0;
+static constexpr uint32_t DEBUG_FEEDBACK_MS = 2000;
 #if __has_include("firmware_version.h")
 #include "firmware_version.h"
 #endif
 #include "build_version.h"
-#if DISPLAY_DEBUG
 #include "debug_display.h"
 #include "debug_temperature.h"
 static float gDebugTempDie = NAN;
@@ -88,11 +97,9 @@ static uint32_t gDebugTempDieMs = 0, gDebugTempLogMs = 0;
 static bool gDebugTempEnabled = false, gDebugTempPending = false;
 static debug_temperature::TsSetup gDebugTempTs;
 static bme280_temp::Sensor gDebugTempBme;
-#else
 #include "production_display.h"
 static display::DisplayModel gDisplayModel;
 static bool gDisplayTripFinalized = false, gDisplayUserRequest = false;
-#endif
 #include "debug_gsv.h"
 #include "debug_rf.h"
 #include "gps_antenna.h"
@@ -213,13 +220,11 @@ static GpsAntenna gGpsAntenna;
 // the next poll invalidates gDebugRf. Unmeasured context stays omitted.
 static DebugRf gAntennaRf;
 static DebugSignal gAntennaSignal;
-#if DISPLAY_DEBUG
 static bool gDebugRmcValid = false;
 // Core 0 publishes a coherent network snapshot; core 1 only copies it.
 // Critical sections contain just scalar copies, never I/O or formatting.
 static portMUX_TYPE gDebugNetMux = portMUX_INITIALIZER_UNLOCKED;
 static DebugNetwork gDebugNet;
-#endif
 
 static startup::DegradedPolicy gDegraded;
 
@@ -423,6 +428,8 @@ static uint64_t contactUptime() {
     gContactUptime += uint32_t(now - gContactTick); gContactTick = now;
     return gContactUptime;
 }
+static bool debugMode() { return gDebugMode.load(); }
+
 static void serverContact() { gLastContact = contactUptime(); gContactKnown = true; }
 static bool heartbeatDue() {
     return !gContactKnown || contactUptime() - gLastContact >= diagnostics::kHeartbeatMs;
@@ -468,24 +475,20 @@ static void serviceJournal() {
         if (!journalMayRun()) { gJournalSealing = false; xSemaphoreGive(gFsMutex); return; }
         gJournal.setSdAllocationUnit(cluster);
         gJournalStarted = true;
-        // Boot recovery runs on core 0, with the same cooperative adapter gate.
-        gJournal.service(1);
-#if DISPLAY_DEBUG
-        if (!gJournalBootReported) {
-            auto backlog = gJournal.backlog();
-            backlog.complete = backlog.complete && journalMayRun();
-            auto stats = gJournal.stats();
-            const char* backend = stats.backend == diagnostics::EventLog::Backend::Sd ? "sd" :
-                                  stats.backend == diagnostics::EventLog::Backend::LittleFs ? "littlefs" : "ram";
-            Serial.printf("Journal: %s, %llu unacknowledged records, %u segments%s; boot counter %s.\n",
-                          backend, (unsigned long long)backlog.records, (unsigned)backlog.segments,
-                          backlog.complete ? "" : " (inventory incomplete)",
-                          gJournalBoot.counterPersisted ? "persisted" : "unavailable");
-            gJournalBootReported = true;
-        }
-#endif
-    } else {
-        gJournal.service(1);
+    }
+    // Boot recovery and later maintenance each service exactly one record.
+    gJournal.service(1);
+    if (debugMode() && !gJournalBootReported) {
+        auto backlog = gJournal.backlog();
+        backlog.complete = backlog.complete && journalMayRun();
+        auto stats = gJournal.stats();
+        const char* backend = stats.backend == diagnostics::EventLog::Backend::Sd ? "sd" :
+                              stats.backend == diagnostics::EventLog::Backend::LittleFs ? "littlefs" : "ram";
+        Serial.printf("Journal: %s, %llu unacknowledged records, %u segments%s; boot counter %s.\n",
+                      backend, (unsigned long long)backlog.records, (unsigned)backlog.segments,
+                      backlog.complete ? "" : " (inventory incomplete)",
+                      gJournalBoot.counterPersisted ? "persisted" : "unavailable");
+        gJournalBootReported = true;
     }
     if (sealing) {
         gJournalSealOk.store(gJournal.seal());
@@ -537,7 +540,8 @@ static bool      gDistanceContinuous = true; // never bridge across a rejected p
 // Every valid RMC, including rejected speed: separate from last accepted point.
 static uint32_t  gLastFixMonoMs = 0;
 
-#if DISPLAY_DEBUG
+// Keep scalar history current even with debug off, so runtime entry cannot
+// show stale WiFi/upload state. Expensive scans and serial output stay gated.
 static void debugWifi(DebugWifi wifi) {
     portENTER_CRITICAL(&gDebugNetMux);
     gDebugNet.wifi = wifi;
@@ -551,7 +555,6 @@ static void debugUpload(int code) {
     gDebugNet.uploadMs = now;
     portEXIT_CRITICAL(&gDebugNetMux);
 }
-#endif
 
 // =================================================================
 // Time helpers
@@ -1012,9 +1015,7 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
     gPendCount = gPendHead = 0;
     gTripWriteFailed = false;
     gState = nextState;
-#if !DISPLAY_DEBUG
     if (nextState == IDLE) gDisplayTripFinalized = true;
-#endif
     gNetRetryNow.store(true);   // after the file is closed and no longer active
 }
 
@@ -1390,9 +1391,7 @@ void IRAM_ATTR onPmuIrq() { gPmuIrqFlag = true; }
 // One mask for both IRQ configuration and checked-batch interpretation.
 static constexpr uint32_t PMU_ENABLED_IRQS =
     XPOWERS_AXP2101_VBUS_REMOVE_IRQ | XPOWERS_AXP2101_VBUS_INSERT_IRQ |
-#if !DISPLAY_DEBUG
     XPOWERS_AXP2101_PKEY_SHORT_IRQ |
-#endif
     XPOWERS_AXP2101_PKEY_LONG_IRQ | XPOWERS_AXP2101_WARNING_LEVEL1_IRQ |
     XPOWERS_AXP2101_WARNING_LEVEL2_IRQ;
 static constexpr uint32_t PMU_IRQ_RETRY_MS = 100;
@@ -1521,14 +1520,18 @@ static void powerOffForVbus() {
     FS_LOCK();
     if (gSdMounted) SD.end();
     if (gFlashMounted) LittleFS.end();
-#if DISPLAY_DEBUG
-    // Before the final VBUS read, preserving its immediate shutdown write.
-    debugDisplayPowerSave(true);
-#else
+    // Only the current owner sleeps the shared panel, before the final VBUS
+    // read. A latched failure must not retry via the other adapter.
     display::DisplayModel::Input displayOff; displayOff.shutdown = true;
-    drawProductionDisplay(gDisplayModel.update(displayOff));
-    productionDisplayPowerSave(true);
-#endif
+    gDisplayModel.update(displayOff);
+    if (!gDebugDisplayFailed && !gProductionDisplayFailed) {
+        if (gDisplayOwner == DisplayOwner::Debug) debugDisplayPowerSave(true);
+        else {
+            drawProductionDisplay(gDisplayModel.update(displayOff));
+            productionDisplayPowerSave(true);
+        }
+    }
+    gProductionHaveOutput = false;
     // PMU shutdown cuts all main rails, including SD BLDO1 and GPS ALDO4.
     // Leave rails and awake IRQs alone so a cancelled shutdown can resume.
     // GPS backup RAM is supplied directly by the 18650, not VBACKUP.
@@ -1575,9 +1578,10 @@ static void powerOffForVbus() {
     gJournalSealDone.store(false);
     FS_UNLOCK();
     seedVbusState();   // also catches a missed INSERT interrupt; unknown stays awake
-#if DISPLAY_DEBUG
-    debugDisplayPowerSave(false);
-#endif
+    // The owning display service redraws before waking after recovery.
+    gProductionHaveOutput = false;
+    gDebugDrawMs = millis() - 1000;
+    gDebugNeedsWake = true;
     gVbusOffPending = false;
     gIdleSince = millis();        // failed power-off retries after the idle grace
     gNetAbort.store(false);
@@ -1588,6 +1592,7 @@ static void powerOffForVbus() {
 }
 
 static void pollPmu() {
+    gBootButton.sample(millis(), digitalRead(DEBUG_BOOT_PIN) == LOW);
     if (!gPmuIrqFlag && !gPmuIrqRetry) return;
     uint32_t now = millis();
     if (gPmuIrqRetry && uint32_t(now - gPmuIrqReadMs) < PMU_IRQ_RETRY_MS) return;
@@ -1609,9 +1614,12 @@ static void pollPmu() {
     if (irq.has(XPOWERS_AXP2101_VBUS_REMOVE_IRQ) || irq.has(XPOWERS_AXP2101_VBUS_INSERT_IRQ)) {
         observeVbusChange(vbusState());
     }
-#if !DISPLAY_DEBUG
-    if (gDegraded.mode() == startup::Mode::Normal && irq.has(XPOWERS_AXP2101_PKEY_SHORT_IRQ)) gDisplayUserRequest = true;
-#endif
+    if (gDegraded.mode() == startup::Mode::Normal && irq.has(XPOWERS_AXP2101_PKEY_SHORT_IRQ)) {
+        // Read again at batch handling: a release must not use a cached low.
+        gBootButton.sample(millis(), digitalRead(DEBUG_BOOT_PIN) == LOW);
+        if (gBootButton.held(millis())) toggleRuntimeDebug();
+        else gDisplayUserRequest = true;
+    }
     if (irq.has(XPOWERS_AXP2101_PKEY_LONG_IRQ)) powerOffForVbus();
     // Observe hardware's existing low/critical policy before shutdown. Never
     // submit from the ISR (it only latches gPmuIrqFlag).
@@ -1682,11 +1690,9 @@ static void serviceChargeTemp() {
     gChargeChecked = true;
 
     float die = PMU.getTemperature();
-#if DISPLAY_DEBUG
     // Reuse this exact sample, including NAN on failure. No second PMU read.
     gDebugTempDie = die;
     gDebugTempDieMs = now;
-#endif
     bool pause;
     const char* why = "";
     if (!std::isfinite(die)) {
@@ -1926,9 +1932,7 @@ static bool uploadFile(fs::FS& storage, const char* path) {
     File f = storage.open(path, FILE_READ);
     if (!f) {
         FS_UNLOCK();
-#if DISPLAY_DEBUG
         debugUpload(-1);
-#endif
         return false;
     }
     size_t sz = f.size();
@@ -1974,9 +1978,7 @@ static bool uploadFile(fs::FS& storage, const char* path) {
     }
     FS_UNLOCK();
 
-#if DISPLAY_DEBUG
     debugUpload(code);
-#endif
     if (ok) {
         Serial.printf("Upload %s (%u B, %.1f s) -> HTTP 200 (deleted)\n",
                       path, (unsigned)sz, secs);
@@ -2065,7 +2067,6 @@ static bool hasPending() {
 
 #include "diag_worker.h"
 
-#if DISPLAY_DEBUG
 // Only the network task scans: once per ~30 s cycle, and again after an
 // upload batch. gNetBusy protects unmount; per-entry FS locking lets GPS
 // writes interleave even with a large SD backlog. Count complete files on
@@ -2077,7 +2078,7 @@ static unsigned debugPendingCount(fs::FS& storage) {
     bool directory = dir && dir.isDirectory();
     FS_UNLOCK();
     if (directory) {
-        while (!gNetHold.load() && !gNetAbort.load()) {
+        while (debugMode() && !gNetHold.load() && !gNetAbort.load()) {
             FS_LOCK();
             File e = dir.openNextFile();
             bool end = !e;
@@ -2100,12 +2101,11 @@ static void refreshDebugPending() {
     unsigned count = 0;
     if (gSdMounted) count += debugPendingCount(SD);
     if (gFlashMounted) count += debugPendingCount(LittleFS);
-    if (gNetHold.load() || gNetAbort.load()) return; // partial count is unknown
+    if (!debugMode() || gNetHold.load() || gNetAbort.load()) return; // partial count is unknown
     portENTER_CRITICAL(&gDebugNetMux);
     gDebugNet.pending = (int)count;
     portEXIT_CRITICAL(&gDebugNetMux);
 }
-#endif
 
 // One pass of the network task. gNetBusy covers everything that touches
 // WiFi or the filesystem, and is raised before gNetHold is read (see the
@@ -2114,9 +2114,7 @@ static void netCycle() {
     contactUptime(); // extend millis across wrap while the awake task ticks
     gNetBusy.store(true);
     if (!gNetHold.load()) {
-#if DISPLAY_DEBUG
-        refreshDebugPending();
-#endif
+        if (debugMode()) refreshDebugPending();
         // A trip just ended, so the car may be parked at home: try now,
         // whatever the backoff reached while driving or parked elsewhere.
         if (gNetRetryNow.exchange(false)) gNetRetryMs = 0;
@@ -2133,35 +2131,25 @@ static void netCycle() {
             bool uploaded = false;
             const char* miss = nullptr;
             int joinStatus = -1;
-#if DISPLAY_DEBUG
             debugWifi(DebugWifi::Scan);
-#endif
             bool homeFound = homeApInRange();
-#if DISPLAY_DEBUG
             debugWifi(homeFound ? DebugWifi::Join : DebugWifi::Off);
-#endif
             if (!homeFound) {
                 miss = "home WiFi not found";
             } else if (!connectWifi()) {
                 miss = "couldn't join home WiFi";
                 joinStatus = (int)WiFi.status();  // capture before disconnect
             } else {
-#if DISPLAY_DEBUG
                 debugWifi(DebugWifi::On);
-#endif
                 trySntp();
                 if (tripDue) uploaded = uploadPending();
                 drainEvents(tripDue);
-#if DISPLAY_DEBUG
-                refreshDebugPending();
-#endif
+                if (debugMode()) refreshDebugPending();
                 if (tripDue && !uploaded) miss = "no trip uploaded";
             }
             WiFi.disconnect(true);
             WiFi.mode(WIFI_OFF);
-#if DISPLAY_DEBUG
             debugWifi(DebugWifi::Off);
-#endif
             // Back off AP misses, failed joins, and server failures alike.
             // Seeing the AP alone must not undo a server-failure backoff.
             if (diagnosticsDue && (!homeFound || joinStatus >= 0)) gEventRetry.failed(millis(), -1);
@@ -2332,20 +2320,14 @@ static bool rmcFixArrived() {
     if (gRmcStatusGN.isUpdated()) {
         bool valid = gRmcStatusGN.value()[0] == 'A';
         fix |= valid;
-#if DISPLAY_DEBUG
         gDebugRmcValid = valid;
-#else
         if (!valid) gLatestSpeedTrusted = false;
-#endif
     }
     if (gRmcStatusGP.isUpdated()) {
         bool valid = gRmcStatusGP.value()[0] == 'A';
         fix |= valid;
-#if DISPLAY_DEBUG
         gDebugRmcValid = valid;
-#else
         if (!valid) gLatestSpeedTrusted = false;
-#endif
     }
     return fix;
 }
@@ -2439,12 +2421,7 @@ static void serviceRuntimeDiagnostics() {
         storageConditions(fsFreeBytes(), now);
     }
     serviceBatteryDiagnostics();
-#if DISPLAY_DEBUG
-    // debug_display.h latches failure and disables the OLED for this boot.
-    gLoopFaults.event(6001, now).condition(gDebugDisplayFailed);
-#else
-    gLoopFaults.event(6001, now).condition(gProductionDisplayFailed);
-#endif
+    gLoopFaults.event(6001, now).condition(gDebugDisplayFailed || gProductionDisplayFailed);
 }
 
 static void receiveGpsByte(uint8_t c) {
@@ -2630,7 +2607,6 @@ static bool mountTripStorage(bool allowProvision = true) {
     return gSdMounted || gFlashMounted;
 }
 
-#if DISPLAY_DEBUG
 static int debugSatellitesUsed() {
     return gps.satellites.isValid() && gps.satellites.age() <= 15000 ?
            (int)gps.satellites.value() : -1;
@@ -2639,7 +2615,6 @@ static int debugSatellitesUsed() {
 static float debugHdop() {
     return gps.hdop.isValid() && gps.hdop.age() <= 2500 ? gps.hdop.hdop() : -1;
 }
-#endif
 
 static void serviceDebugRf() {
     if (gGpsConfig.state != GPS_CONFIG_DONE) return;
@@ -2649,21 +2624,21 @@ static void serviceDebugRf() {
         gAntennaRf = gDebugRf;
         gAntennaSignal = gDebugGsv.signal(now);
         gGpsAntenna.update(now, gAntennaRf.valid, gAntennaRf.agcPct, gAntennaSignal);
-#if DISPLAY_DEBUG
-        char fix = 0;
-        if ((gRmcStatusGN.isValid() && gRmcStatusGN.age() <= 2500) ||
-            (gRmcStatusGP.isValid() && gRmcStatusGP.age() <= 2500))
-            fix = gDebugRmcValid ? 'A' : 'V';
-        char line[DEBUG_RF_LINE_BYTES];
-        formatDebugRf(gDebugRf, gDebugGsv.signal(now), debugSatellitesUsed(),
-                      debugHdop(), fix, line, sizeof line);
-        size_t n = strlen(line);
-        if (gNavPvt.seen && uint32_t(now - gNavPvt.receivedMs) <= NAV_PVT_FRESH_MS)
-            snprintf(line + n, sizeof line - n, " | sAcc %.2f m/s hAcc %.1f m",
-                     gNavPvt.sAccMmps / 1000.0, gNavPvt.hAccMm / 1000.0);
-        else snprintf(line + n, sizeof line - n, " | sAcc -- m/s hAcc -- m");
-        Serial.println(line);
-#endif
+        if (debugMode()) {
+            char fix = 0;
+            if ((gRmcStatusGN.isValid() && gRmcStatusGN.age() <= 2500) ||
+                (gRmcStatusGP.isValid() && gRmcStatusGP.age() <= 2500))
+                fix = gDebugRmcValid ? 'A' : 'V';
+            char line[DEBUG_RF_LINE_BYTES];
+            formatDebugRf(gDebugRf, gDebugGsv.signal(now), debugSatellitesUsed(),
+                          debugHdop(), fix, line, sizeof line);
+            size_t n = strlen(line);
+            if (gNavPvt.seen && uint32_t(now - gNavPvt.receivedMs) <= NAV_PVT_FRESH_MS)
+                snprintf(line + n, sizeof line - n, " | sAcc %.2f m/s hAcc %.1f m",
+                         gNavPvt.sAccMmps / 1000.0, gNavPvt.hAccMm / 1000.0);
+            else snprintf(line + n, sizeof line - n, " | sAcc -- m/s hAcc -- m");
+            Serial.println(line);
+        }
     }
     // First poll starts after config succeeds OR gives up. Each later poll
     // evaluates the previous interval's reply, then invalidates it. Never wait.
@@ -2672,9 +2647,8 @@ static void serviceDebugRf() {
     ubxSend(0x0A, 0x38, nullptr, 0);
 }
 
-#if DISPLAY_DEBUG
 static void beginDebugTemperature() {
-    // Only normal startup reaches here, after LoRa-off verification, storage,
+    // Only runtime debug entry reaches here, after LoRa-off verification, storage,
     // and the first guard check. PMU/Wire1 accesses (including RTC and IRQ
     // batches) all run serially on core 1; the ISR only sets a flag. There is
     // no PMU access from the networking task and no PMU mutex to acquire.
@@ -2692,7 +2666,7 @@ static void beginDebugTemperature() {
 }
 
 static void serviceDebugTemperature() {
-    if (!gDebugTempEnabled || gDegraded.mode() != startup::Mode::Normal) return;
+    if (!debugMode() || !gDebugTempEnabled || gDegraded.mode() != startup::Mode::Normal) return;
     uint32_t now = millis();
     if (!gDebugTempPending) {
         // Same rollover-safe 30 s scheduling pattern as serviceDebugRf().
@@ -2738,6 +2712,7 @@ static void serviceDebugTemperature() {
 }
 
 static void serviceDebugDisplay() {
+    if (!debugMode()) return;
     uint32_t now = millis();
     if (!gDebugDisplayReady || now - gDebugDrawMs < 1000) return;
     gDebugDrawMs = now;
@@ -2766,9 +2741,7 @@ static void serviceDebugDisplay() {
     s.charging = PMU.isCharging();
     drawDebugDisplay(s);
 }
-#endif
 
-#if !DISPLAY_DEBUG
 // Each source has its own accepted raise sequence and may share a code with
 // another source. Cache only complete atomic snapshots; contention never clears
 // a fault or invents another episode. These buffers belong solely to core 1.
@@ -2776,7 +2749,7 @@ static display::Condition gDisplayConditions[3][64];
 static size_t gDisplayConditionCounts[3] = {};
 static diagnostics::RuntimeFaults::Observation gDisplayCopy[64];
 static display::Condition gDisplayMerged[64];
-static void serviceProductionDisplay() {
+static const display::Output& serviceProductionDisplay(bool render = true) {
     diagnostics::RuntimeFaults* sources[] = {&gLoopFaults, &gNetFaults, &gEventFaults};
     size_t merged = 0;
     for (unsigned source = 0; source < 3; ++source) {
@@ -2798,6 +2771,7 @@ static void serviceProductionDisplay() {
                  gps.location.isValid() && gps.location.age() <= 2500;
     display::DisplayModel::Input input;
     input.now = now;
+    input.suspended = debugMode();
     input.motion = display::motion(gVbusLost, gState == IDLE,
         gState == ARMING || gState == ACTIVE || gState == COOLDOWN,
         fresh, gps.speed.mps(), END_MPS);
@@ -2805,9 +2779,69 @@ static void serviceProductionDisplay() {
     input.userRequest = gDisplayUserRequest; gDisplayUserRequest = false;
     input.heard = gDebugGsv.signal(now).heard;
     input.conditions = gDisplayMerged; input.count = merged;
-    drawProductionDisplay(gDisplayModel.update(input));
+    const auto& output = gDisplayModel.update(input);
+    if (render) drawProductionDisplay(output);
+    return output;
 }
-#endif
+
+// These functions execute only on the loop task/core 1. Core 0 can only
+// observe gDebugMode; it never initializes a sensor or transfers OLED pixels.
+static void toggleRuntimeDebug() {
+    if (gDegraded.mode() != startup::Mode::Normal) return;
+    bool enabled = !debugMode();
+    gDebugMode.store(enabled);
+    gDisplayModel.dismiss();
+    gDisplayUserRequest = gDisplayTripFinalized = false;
+    gModeFeedback = true; gModeFeedbackMs = millis();
+    // Drop an unfinished BME conversion; the next entry starts a fresh cycle.
+    gDebugTempPending = false;
+    gDebugTempBme = bme280_temp::Sensor();
+    if (enabled) {
+        gDebugWireReady = gProductionWireReady;
+        if (!gDebugTempEnabled) beginDebugTemperature();
+        gDebugTempLogMs = millis();
+        reportEventHeap(); // current heap at debug entry, rather than a boot-time fiction
+    }
+    Serial.println(enabled ? "Debug mode: on" : "Debug mode: off");
+    // Paint feedback now, without waiting for a later loop iteration.
+    if (!gDebugDisplayFailed && !gProductionDisplayFailed) {
+        if (gDisplayOwner == DisplayOwner::Debug) debugDisplayPowerSave(true);
+        else productionDisplayPowerSave(true);
+    }
+    gDisplayOwner = DisplayOwner::Feedback;
+    gProductionHaveOutput = false;
+    if (!gDebugDisplayFailed && !gProductionDisplayFailed) drawDebugModeFeedback(enabled);
+}
+
+static void serviceDisplay() {
+    if (gDegraded.mode() != startup::Mode::Normal) return;
+    const auto& out = serviceProductionDisplay(false);
+    if (gModeFeedback && uint32_t(millis() - gModeFeedbackMs) >= DEBUG_FEEDBACK_MS)
+        gModeFeedback = false;
+    // Either adapter failing disables the shared panel for this boot.
+    if (gDebugDisplayFailed || gProductionDisplayFailed) return;
+    DisplayOwner owner = gModeFeedback ? DisplayOwner::Feedback :
+        (debugMode() && !out.powered ? DisplayOwner::Debug : DisplayOwner::Production);
+    if (owner != gDisplayOwner) {
+        if (gDisplayOwner == DisplayOwner::Debug) debugDisplayPowerSave(true);
+        else productionDisplayPowerSave(true);
+        if (gDebugDisplayFailed || gProductionDisplayFailed) return;
+        gProductionHaveOutput = false;
+        gDisplayOwner = owner;
+        if (owner == DisplayOwner::Debug) {
+            beginDebugDisplay(gProductionWireReady);
+            gDebugDrawMs = millis() - 1000; // first frame immediately
+            gDebugNeedsWake = true;
+        }
+    }
+    if (owner == DisplayOwner::Debug) {
+        serviceDebugDisplay();
+        if (gDebugNeedsWake) {
+            debugDisplayPowerSave(false); // only after drawing
+            gDebugNeedsWake = false;
+        }
+    } else if (owner == DisplayOwner::Production) drawProductionDisplay(out);
+}
 
 // Shared boot producers, including failed startup's retained E2007 notice.
 static void beginJournal() {
@@ -2831,11 +2865,9 @@ static bool createFsMutex() {
 
 static void enterDegraded(startup::Mode mode) {
     gDegraded.begin(mode, millis());
-#if !DISPLAY_DEBUG
     // Setup initialized this independent Wire adapter asleep, even if the
     // PMU or storage failed. No display service runs in the degraded loop.
     productionDisplayPowerSave(true);
-#endif
     if (mode == startup::Mode::NoStorage) {
         // No mounted store: boot and faults stay in the bounded RAM queue.
         beginJournal();
@@ -2886,9 +2918,7 @@ static void degradedLoop() {
     } else {
         gLoopFaults.event(2001, millis()).condition(true);
     }
-#if !DISPLAY_DEBUG
     gLoopFaults.event(6001, millis()).condition(gProductionDisplayFailed);
-#endif
     serviceJournal(); // single consumer; no network task in any degraded mode
     if (gDegraded.retryDue(millis())) {
         bool recovered = false;
@@ -2924,11 +2954,13 @@ void setup() {
     // and initialization, BEFORE Serial, storage or GPS setup can block.
     bool pmuReady = beginPmuWithRecovery(Wire1, PMU, I2C_SDA, I2C_SCL, gPmuStartup);
     bool radioOff = pmuReady && PMU.disableALDO3() && aldo3State() == Aldo3State::Off;
-#if !DISPLAY_DEBUG
     // SH1106 can retain its state across an ESP32 reset. Put it to sleep
     // before either degraded startup branch; never touch the PMU's Wire1.
     beginProductionDisplay();
-#endif
+    gDebugMode.store(false); // boot-local, never restored from NVS
+    pinMode(DEBUG_BOOT_PIN, INPUT_PULLUP); // ROM has already sampled the strap
+    gBootButton = runtime_debug::BootButton();
+    gBootButton.sample(millis(), digitalRead(DEBUG_BOOT_PIN) == LOW);
     startup::Mode powerMode = startup::selectMode(pmuReady, radioOff, true);
     if (powerMode != startup::Mode::Normal) {
         Serial.begin(115200);
@@ -3024,19 +3056,12 @@ void setup() {
     // PMU.)
     serviceChargeTemp();
 
-#if DISPLAY_DEBUG
-    beginDebugDisplay();
-    beginDebugTemperature();
-#endif
     initEventUpload();
     // --- Networking task on core 0; GPS/FSM stay on core 1 (loop) ---
     if (xTaskCreatePinnedToCore(networkTask, "net", NET_STACK_BYTES,
                                nullptr, 1, nullptr, 0) != pdPASS) {
         Serial.println("ERROR: network task creation failed; trips remain queued for a later boot.");
     }
-#if DISPLAY_DEBUG
-    reportEventHeap();
-#endif
 
     Serial.println("Setup complete. Logging trips.");
 }
@@ -3089,10 +3114,6 @@ void loop() {
         if (!gNetBusy.load() || millis() - gIdleSince >= IDLE_BATT_SLEEP_MS + NET_DRAIN_MS)
             powerOffForVbus();
     }
-#if DISPLAY_DEBUG
-    serviceDebugDisplay();
-    serviceDebugTemperature();
-#else
-    serviceProductionDisplay();
-#endif
+    serviceDisplay();
+    if (debugMode()) serviceDebugTemperature();
 }

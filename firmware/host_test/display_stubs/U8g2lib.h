@@ -16,7 +16,7 @@ static const uint8_t u8g2_font_helvB14_tr[] = {2};
 static const uint8_t u8g2_font_logisoso38_tr[] = {3};
 struct U8G2_SH1106_128X64_NONAME_F_HW_I2C {
     u8x8_t bus;
-    unsigned sleeps = 0;
+    unsigned sleeps = 0, wakes = 0, frames = 0;
     const uint8_t* font = nullptr;
     bool baseline = false;
     struct Text { unsigned x, y; std::string value; const uint8_t* font; };
@@ -41,6 +41,6 @@ struct U8G2_SH1106_128X64_NONAME_F_HW_I2C {
     void setFontPosBaseline() { baseline = true; }
     void clearBuffer() { text.clear(); }
     void drawStr(unsigned x, unsigned y, const char* value) { text.push_back({x, y, value, font}); }
-    void sendBuffer() { transfers(); }
-    void setPowerSave(int off) { sleeps += off; transfers(); }
+    void sendBuffer() { ++frames; transfers(); }
+    void setPowerSave(int off) { sleeps += off; wakes += !off; transfers(); }
 };

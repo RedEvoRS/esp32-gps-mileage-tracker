@@ -12,6 +12,7 @@ static constexpr uint8_t DEBUG_OLED_CONTRAST = 255;  // SH1106 maximum
 static U8G2_SH1106_128X64_NONAME_F_HW_I2C gDebugOled(U8G2_R0, U8X8_PIN_NONE);
 static bool gDebugDisplayReady = false, gDebugDisplayFailed = false;
 static bool gDebugWireReady = false; // also permits BME280 when only OLED is absent
+static bool gDebugDisplayBegun = false;
 static uint32_t gDebugDrawMs = 0;
 
 // U8g2's stock Arduino callback ignores endTransmission errors. Latch the
@@ -47,10 +48,12 @@ static void debugDisplayCheck() {
     }
 }
 
-static void beginDebugDisplay() {
+static void beginDebugDisplay(bool wireAlreadyReady = false) {
+    if (gDebugDisplayBegun) return; // never reinitialize/revive after a failure
+    gDebugDisplayBegun = true;
     gDebugDisplayReady = true;  // also makes an init failure log exactly once
     Wire.setTimeOut(10);
-    gDebugWireReady = Wire.begin(17, 18, 400000);
+    gDebugWireReady = wireAlreadyReady || Wire.begin(17, 18, 400000);
     if (!gDebugWireReady) gDebugDisplayFailed = true;
     if (!gDebugDisplayFailed) {
         Wire.beginTransmission(0x3C);
@@ -60,7 +63,7 @@ static void beginDebugDisplay() {
         gDebugOled.getU8x8()->byte_cb = debugOledByte;
         gDebugOled.setI2CAddress(0x3C << 1);  // U8g2 takes an 8-bit address
         gDebugOled.setBusClock(400000);
-        gDebugOled.begin();
+        gDebugOled.initDisplay(); // asleep until the owner has drawn fresh pixels
         gDebugOled.setContrast(DEBUG_OLED_CONTRAST);
         gDebugOled.setFont(u8g2_font_5x8_tf);  // 21 chars = 105 px; 8 rows
         gDebugOled.setFontPosTop();

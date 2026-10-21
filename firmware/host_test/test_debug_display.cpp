@@ -8,6 +8,7 @@ struct DisplaySerial {
 #include "debug_display.h"
 
 static void reset() {
+    gDebugDisplayBegun = false;
     Wire = DisplayTestWire{};
     gDebugDisplayFailed = gDebugDisplayReady = false;
     Serial.warnings = 0;

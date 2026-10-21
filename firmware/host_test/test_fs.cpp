@@ -28,6 +28,11 @@ static std::string g_outDir;
 static double gLat = 37.0, gLon = -122.0;
 
 static void resetWorld() {
+    gDebugMode.store(hostDebugMode());
+    gProductionDisplayReady = gProductionDisplayFailed = gProductionDisplayBegun = false;
+    gProductionHaveOutput = gProductionWireReady = false;
+    gModeFeedback = false; gDisplayOwner = DisplayOwner::Production;
+    gDisplayModel = display::DisplayModel();
     gDegraded = startup::DegradedPolicy();
     gFsDemand = 0; gJournalReady = gJournalStarted = false;
     gJournalSealing = gJournalBootReported = false; gJournalSealRequested = gJournalSealDone = gJournalSealOk = false;
@@ -1033,7 +1038,7 @@ int main(int argc, char** argv) {
             CHECK(gNetLastAttemptMs == g_millis && !gNetBusy &&
                   WiFi.currentMode == WIFI_OFF && WiFi.scanDeletes == WiFi.scans,
                   "wait begins after the attempt; radio and busy flag cleared");
-            g_millis = gNetLastAttemptMs + wait - 1 - (DISPLAY_DEBUG ? 1 : 0);
+            g_millis = gNetLastAttemptMs + wait - 1 - (debugMode() ? 1 : 0);
             netCycle();
             CHECK(WiFi.scans == before + 1, "no scan before retry is due");
             ++g_millis;
@@ -1048,7 +1053,7 @@ int main(int argc, char** argv) {
         WiFi.scanSsids = {WIFI_SSID};
         uint32_t joinStart = g_millis;
         netCycle();
-        CHECK(WiFi.joins == 1 && g_millis - joinStart == 17000 + (DISPLAY_DEBUG ? 1 : 0) && gNetRetryMs == NET_RETRY_MAX_MS,
+        CHECK(WiFi.joins == 1 && g_millis - joinStart == 17000 + (debugMode() ? 1 : 0) && gNetRetryMs == NET_RETRY_MAX_MS,
               "seeing the AP but failing to join keeps the backoff");
         CHECK(gNetLastAttemptMs == g_millis, "join timeout does not consume the next retry wait");
         CHECK(logHas("Network: couldn't join home WiFi \"" WIFI_SSID "\" (status 0) -- next try in 300 s."),
@@ -1071,7 +1076,7 @@ int main(int argc, char** argv) {
         CHECK(logCount("Network: ") == misses, "a cycle that uploaded anything logs no miss");
         g_httpHook = nullptr;
         scans = WiFi.scans;
-        g_millis = gNetLastAttemptMs + NET_TICK_MS - 1 - (DISPLAY_DEBUG ? 1 : 0); netCycle();
+        g_millis = gNetLastAttemptMs + NET_TICK_MS - 1 - (debugMode() ? 1 : 0); netCycle();
         CHECK(WiFi.scans == scans, "success still waits the normal 30 s before another attempt");
         ++g_millis; netCycle();
         CHECK(g_httpRequests == 4 && gNetRetryMs == 60000, "a new failure grows from the reset wait");
@@ -1089,7 +1094,7 @@ int main(int argc, char** argv) {
         g_disk.files["/trips/t999999.gpx"] = complete;
         g_millis = UINT32_MAX - 1000;
         netCycle();
-        g_millis = gNetLastAttemptMs + gNetRetryMs - 1 - (DISPLAY_DEBUG ? 1 : 0); netCycle();
+        g_millis = gNetLastAttemptMs + gNetRetryMs - 1 - (debugMode() ? 1 : 0); netCycle();
         CHECK(WiFi.scans == 1, "wrapped clock: no early retry");
         ++g_millis; netCycle();
         CHECK(WiFi.scans == 2 && gNetRetryMs == 120000, "wrapped clock: retry when due");
@@ -1422,7 +1427,7 @@ int main(int argc, char** argv) {
             };
             try { setup(); } catch (const Restarted&) {}
             CHECK(PMU.bus == &Wire1 && Wire1.sda == 42 && Wire1.scl == 41 &&
-                  Wire.begins == (DISPLAY_DEBUG && !failMutex ? 1 : 0),
+                  Wire.begins == 1,
                   "PMU uses only Wire1 on SDA 42 / SCL 41");
             CHECK(std::vector<std::string>(PMU.operations.begin(), PMU.operations.begin() + 3) ==
                   std::vector<std::string>({"begin", "disableALDO3", "readRegister"}),

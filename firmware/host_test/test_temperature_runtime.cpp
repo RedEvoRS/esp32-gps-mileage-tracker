@@ -8,7 +8,7 @@ static std::map<uint8_t,uint8_t> bmeRegs;
 static unsigned bmeTransactions = 0;
 static bool bmeMissing = false;
 static void prepare() {
-    faultWorld(); Wire = TwoWire(); Wire1 = TwoWire();
+    faultWorld(); gDebugMode = true; Wire = TwoWire(); Wire1 = TwoWire();
     gDebugDrawMs = 0;
     bmeTransactions = 0; bmeMissing = false;
     bmeRegs = {{0xd0,0x60},{0xf3,0},{0x88,0x70},{0x89,0x6b},

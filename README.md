@@ -333,20 +333,20 @@ the firmware never formats it. The firmware chooses where to store trips
 once, at startup, so a card inserted while it runs isn't used until the
 next start.
 
-**Pick the screen.** Near the top of `04_trip_logger.ino`,
-`#define DISPLAY_DEBUG 1` gives a status page that's always on and redraws
-every second: satellites, speed, the trip so far, storage and WiFi. It's
-for testing, so use it for your first drives. `0` gives the everyday
-screen: normally blank. After boot or a trip, and whenever you
-short-press **POWER**, it shows a brief card with the satellite count and
-`OK`, or any active warning and error codes such as `E3009`. A new serious
-error also shows once by itself, even while driving. [firmware/README.md](firmware/README.md#the-screen) says what
-each shows. The everyday screen hasn't been road-tested yet.
+**One firmware, two screen modes.** Every power-on starts with the everyday
+screen: normally asleep, with 30-second status and error cards. Tap **POWER**
+to see satellites heard and `OK`, or active warning/error codes. While the
+board is running, hold **BOOT**, then tap **POWER** to toggle debug mode:
+a live page with satellites, speed, trip, storage and WiFi, plus extra
+serial diagnostics. The screen briefly says `Debug ON` or `Debug OFF`.
+Debug is never saved. Holding BOOT while powering up still enters download
+mode. [firmware/README.md](firmware/README.md#the-screen) explains the screens.
+The runtime toggle still needs bench verification.
 
 **Stamp the version.** From the repository folder, run
 `python tools/stamp_firmware_version.py` before every build. It combines
 `firmware/VERSION` with the ten-character Git commit (for example
-`v0.05+3f9a1c07be`), adding `-dirty` for tracked edits and `+dbg` in debug builds.
+`v0.05+3f9a1c07be`), adding `-dirty` for tracked edits.
 The board reports it on the viewer's Device health page. Without a generated
 header it reports `unversioned`; an old header keeps its old version.
 See [Firmware versions and releases](firmware/README.md#firmware-versions-and-releases)

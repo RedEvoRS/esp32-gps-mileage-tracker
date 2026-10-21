@@ -50,8 +50,8 @@ port on the right. The buttons sit along the bottom edge:
 | Button | Where | What it does |
 |---|---|---|
 | **RESET** | Left of the close pair near the middle | Restarts the ESP32 |
-| **POWER** | Right of that pair | Power key on the PMU: ~1 s switches the board on, ~6 s forces it off. Under Stage 4, a shorter long press on battery is a clean power-off (see [Normal operation](#normal-operation)) |
-| **BOOT** | On its own, further right | GPIO 0. Held while the board powers up, it selects download mode |
+| **POWER** | Right of that pair | Tap for a status card. While running, hold BOOT then tap POWER to toggle debug. ~1 s switches the board on; a shorter long press on battery shuts down cleanly; ~6 s forces it off (see [Normal operation](#normal-operation)) |
+| **BOOT** | On its own, further right | GPIO 0. While running, hold it then tap POWER to toggle debug. Held while powering up, it still selects download mode |
 
 ### Board settings
 
@@ -256,10 +256,10 @@ unless you select a version.
 
 Before compiling Stage 4, run `python tools/stamp_firmware_version.py` from
 the repository root. It combines `firmware/VERSION` with the ten-character Git
-commit, for example `v0.05+3f9a1c07be`, adding `-dirty` for tracked edits and
-`+dbg` in the default debug build. Without the generated header, Device health
-shows `unversioned` (`unversioned+dbg` in debug builds). Run the script before
-every build; an old header keeps its old version.
+commit, for example `v0.05+3f9a1c07be`, adding `-dirty` for tracked edits.
+There is one firmware; runtime debug mode does not change the version.
+Without the generated header, Device health shows `unversioned`. Run the
+script before every build; an old header keeps its old version.
 
 A *sketch* is an Arduino program, stored in an `.ino` file inside a folder
 with the same name. *Firmware* is the program installed on the board.
@@ -405,10 +405,9 @@ The `04_trip_logger/` sketch detects trips, accumulates mileage and writes
 GPX files to the microSD card, with internal LittleFS as fallback. Its
 first real uploads from microSD succeeded on 2026-10-21 (UTC): four trips
 received HTTP 200, were deleted from the card and appeared in the viewer.
-This used main commit `a358eaf`'s Stage 4 debug build (the default
-`DISPLAY_DEBUG` setting), flashed at 20:39Z on 2026-10-20 with real settings
-and one-time diagnostics enrollment. Uploads from LittleFS and with
-`DISPLAY_DEBUG=0` remain untested on the Supreme.
+This used main commit `a358eaf`'s earlier Stage 4 debug firmware, flashed at
+20:39Z on 2026-10-20 with real settings and one-time diagnostics enrollment.
+Uploads from LittleFS and with debug off remain untested on the Supreme.
 
 USB insertion powered the board on at 04:14:50Z on 2026-10-21. Boot was
 clean, GPS configured on attempt 1, and the FAT32 card had 29.71 GiB free.
@@ -679,8 +678,10 @@ How it behaves once flashed:
   or insert USB power to switch it back on. A 6 s hold forces the PMU's
   hard power-off with no file closing; any open trip needs boot repair and
   unwritten diagnostics are lost. Use that only if the board stops responding.
-  A short POWER press requests a status card in the production display
-  build; see [The screen](#the-screen).
+  A short POWER press alone requests a status card in either mode. While
+  running, hold BOOT then tap POWER to toggle debug; it starts off at every
+  power-on. BOOT held during power-up still means download mode.
+  See [The screen](#the-screen).
 - **Charging:** the firmware pauses charging at high or low temperatures
   reported by the AXP2101 power-management chip. Its temperature is an
   indirect estimate using a 9 °C die-temperature offset measured on the
@@ -799,8 +800,19 @@ acknowledges the same complete set of settings.
 
 #### The screen
 
-With `DISPLAY_DEBUG=1`, the OLED shows a status page for road testing that
-redraws about once a second. Illustrative values:
+There is one Stage 4 firmware. Debug is **off at every power-on** and is
+never saved. While the board is running, **hold BOOT, then tap POWER** to
+toggle debug. A two-second `Debug ON` / `Debug OFF` message and serial
+`Debug mode: on` / `off` confirm the change. Holding BOOT while powering
+up still selects download mode. Long POWER presses keep their usual meaning.
+
+Debug off uses the everyday cards below. Debug on shows a live page that
+redraws about once a second and enables `GPS RF:`, `Temp:`, heap and other
+debug serial output. POWER alone shows the normal status card in either
+mode; the live page resumes when that card expires. Turning debug off
+returns to production power save after the brief feedback, unless a fresh
+card is due; old cards and errors are not replayed. The toggle and shared
+panel handoff still need bench verification. Illustrative debug values:
 
 ```text
 ACTIVE 0h12m          trip state, time since boot
@@ -819,9 +831,7 @@ cycle to appear, and an upload age stops counting at 999 s.
 
 Things to know:
 
-- It's switched by `DISPLAY_DEBUG` at the top of the sketch (default `1`).
-  Set `DISPLAY_DEBUG` to `0` at the top of the sketch to build the production
-  screen and disable the `GPS RF:` serial line. It sleeps by default, briefly
+- With debug off, the production screen sleeps by default, briefly
   showing `Sats: N` for satellites **heard** (`Sats: --` when stale),
   then `OK` or only active warning-and-above `E####` codes at the first
   parked opportunity after boot or a trip. Codes are severity ordered and
@@ -836,11 +846,11 @@ Things to know:
   `-DDISPLAY_CARD_MS=10000` for 10 seconds). The default is planned to return
   to 10 seconds after the first road tests. A short press of
   **POWER** shows a status card in any motion state after a verified PMU
-  INTSTS1..3 batch, outside degraded mode. Only production enables the
-  short-key IRQ in the shared enabled/batch mask. Long press keeps its
+  INTSTS1..3 batch, outside degraded mode. The short-key IRQ is always enabled;
+  BOOT is sampled and debounced on the loop task. Long press keeps its
   existing clean power-off behavior on battery and is ignored on USB.
   GSV/MON-RF antenna checking and NAV-PVT speed accuracy gating stay enabled
-  in both builds. On **2026-10-20**, the owner saw the working production
+  in both runtime modes. On **2026-10-20**, the owner saw the working production
   screen on hardware and requested much larger text filling the panel,
   without descriptions. The revised layout uses U8g2 `logisoso26_tr`
   for sats/OK/a single status code, `helvB14_tr` for multiple status codes,
@@ -1029,12 +1039,12 @@ internal RAM. Workspace accesses run only in setup or the core-0 worker, never
 in the PMU ISR, DNS callback or cache-disabled code. Journal flash operations
 use internal frame/metadata scratch, and ESP-IDF suspends tasks during its
 cache-disabled flash operations. The network stack remains 12 KiB.
-Debug builds print `Heap: internal ... free (largest ...), PSRAM ... free`
-at boot and once after the first diagnostics HTTP attempt, whether it succeeds
-or fails. Record those lines during #6's real-upload checks; host tests and
-compile sizes are not measurements of live heap pressure.
-With core 3.3.11 and PSRAM enabled, compiled static RAM is 108,356 bytes in
-debug and 84,388 in release, down from 193,804/169,836 with internal upload
+Debug mode prints `Heap: internal ... free (largest ...), PSRAM ... free`
+on entry and once after the first diagnostics HTTP attempt made with debug on,
+whether it succeeds or fails. Record those lines during #6's real-upload
+checks; host tests and compile sizes are not measurements of live heap pressure.
+Earlier core 3.3.11 builds with PSRAM enabled used 108,356 bytes of static
+RAM in debug and 84,388 in release, down from 193,804/169,836 with internal upload
 buffers. Each build recovers 85,448 bytes and is 2,736 above its pre-upload
 baseline (105,620/81,652). Cross-core publications and producer/control state
 account for the remaining internal-memory overhead.

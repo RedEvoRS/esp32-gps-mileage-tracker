@@ -77,6 +77,7 @@ public:
         uint32_t now = 0;
         Motion motion = Motion::Unknown;
         bool boot = false, tripFinalized = false, userRequest = false, shutdown = false;
+        bool suspended = false; // debug owns panel; still consume observed episodes
         int heard = -1;
         const Condition* conditions = nullptr;
         size_t count = 0;
@@ -104,6 +105,11 @@ public:
         }
         if (in.motion == Motion::Parked && previousMotion_ != Motion::Parked && unresolved) pendingStatus_ = true;
         previousMotion_ = in.motion;
+        if (in.suspended) {
+            pendingStatus_ = false;
+            head_ = queued_ = 0;
+            if (!userCard_) out_ = {};
+        }
         if (out_.powered && uint32_t(in.now - started_) >= kDurationMs) out_ = {};
         // A routine status card must not remain visible after driving resumes.
         if (out_.card == Card::StatusCard && !userCard_ && in.motion != Motion::Parked) out_ = {};
@@ -119,6 +125,12 @@ public:
             pendingStatus_ = false; userCard_ = false;
         }
         return out_;
+    }
+    // Preserve episode/motion history across ownership changes, but never
+    // replay a card or pending trigger from the previous mode.
+    void dismiss() {
+        out_ = {}; pendingStatus_ = userCard_ = false;
+        head_ = queued_ = 0;
     }
 private:
     void show(Output card, uint32_t now) { out_ = card; started_ = now; out_.until = now + kDurationMs; }

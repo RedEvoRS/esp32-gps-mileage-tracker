@@ -771,3 +771,6 @@ struct HTTPClient {
     }
     void end() {}
 };
+
+// Test-process runtime selection; never included in the device firmware.
+inline bool hostDebugMode() { const char* mode = std::getenv("HOST_DEBUG"); return mode && std::strcmp(mode, "1") == 0; }

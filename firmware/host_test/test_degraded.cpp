@@ -53,10 +53,8 @@ static RuntimeFaults::Observation observation(unsigned code) {
     assert(false); return {};
 }
 static void noTrips() {
-#if DISPLAY_DEBUG
     assert(!gDebugTempEnabled);
     assert(std::find(PMU.operations.begin(), PMU.operations.end(), "writeRegister") == PMU.operations.end());
-#endif
     assert(gState == IDLE && !gTripPath[0] && gArmCount == 0 && gPendCount == 0);
     for (auto* disk : {&g_disk, &g_sdDisk}) for (const auto& file : disk->files)
         assert(file.first.rfind("/trips/", 0) != 0);
@@ -218,9 +216,8 @@ int main() {
     for (int i = 0; i < 1000; ++i) loop();
     assert(g_millis - started == 20000 && g_disk.mountAttempts == mounts && GPSSerial.rxPos == 0);
     noTrips();
-#if !DISPLAY_DEBUG
     assert(!gProductionHaveOutput); // degraded loop never invokes the model/renderer
-#endif
+
     PMU.dieC = 60; g_millis += CHG_CHECK_MS; loop(); assert(!PMU.chargeEnabled);
     PMU.dieC = 35; g_millis += CHG_CHECK_MS; loop(); assert(PMU.chargeEnabled);
     assert(!g_disk.formatAttempts && !g_sdDisk.formatRequested);
@@ -275,9 +272,8 @@ int main() {
         auto attempts = PMU.beginCalls;
         for (unsigned i = 0; i < 5; ++i) loop();
         assert(PMU.beginCalls == attempts);
-#if !DISPLAY_DEBUG
         assert(gProductionDisplayReady && gProductionOled.sleeps >= 1 && !gProductionHaveOutput);
-#endif
+
         onlyPmuCalls({"begin"}); noTrips();
         auto all = rows(); assert(contains(all, 1000) && contains(all, 2001) && contains(all, 2007));
         assert(observation(2001).observed && observation(2001).episode && !observation(4003).observed);
@@ -288,9 +284,8 @@ int main() {
         retryMessage("power chip not responding");
         attempts = PMU.beginCalls; loop(); assert(PMU.beginCalls == attempts);
         PMU.failBegins = 0; g_millis += 120000; restartOnLoop();
-#if !DISPLAY_DEBUG
         assert(gProductionDisplayReady && gProductionOled.sleeps >= 1 && !gProductionHaveOutput);
-#endif
+
         onlyPmuCalls({"begin"}); noTrips(); ++cases;
     }
     for (bool writeFails : {false, true}) for (unsigned chargeResult = 0; chargeResult < 3; ++chargeResult) {
@@ -332,5 +327,5 @@ int main() {
     assert(gJournal.nextBatch(degradedBatch));
     for (size_t i = 0; i < degradedBatch.count; ++i) assert(oldId != degradedBatch.ids[i].bootId);
     xSemaphoreGive(gFsMutex); ++cases;
-    std::printf("test_degraded: %u integration scenarios passed (DISPLAY_DEBUG=%d)\n", cases, DISPLAY_DEBUG);
+    std::printf("test_degraded: %u integration scenarios passed (runtime debug=%d)\n", cases, debugMode());
 }
