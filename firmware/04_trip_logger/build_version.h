@@ -21,10 +21,6 @@ template <unsigned N> constexpr bool validVersion(const char (&text)[N]) {
             text[i] != '+' && text[i] != '-') return false;
     return true;
 }
-#if DISPLAY_DEBUG
-constexpr char kVersion[] = FIRMWARE_VERSION_BASE "+dbg";
-#else
 constexpr char kVersion[] = FIRMWARE_VERSION_BASE;
-#endif
 static_assert(validVersion(kVersion), "Firmware version must be a protocol token of 1-32 characters");
 } // namespace firmware

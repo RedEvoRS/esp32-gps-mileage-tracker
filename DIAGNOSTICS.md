@@ -309,11 +309,10 @@ Only continuing conditions can be active. Optional fields are `firmware_version`
 boot-local totals, with at most 16 entries. They are not independent events.
 
 Stage 4 sends `firmware_version`: `firmware/VERSION` plus `+` and the ten-character
-Git commit (for example `v0.05+3f9a1c07be`), with `-dirty` for tracked edits and
-`+dbg` when `DISPLAY_DEBUG` is enabled. Run
+Git commit (for example `v0.05+3f9a1c07be`), with `-dirty` for tracked edits. Run
 `python tools/stamp_firmware_version.py` before compiling; without the generated
-header it reports `unversioned` (with `+dbg` in debug builds). The boot banner,
-new events and current snapshot use the same 1–32 character protocol token.
+header it reports `unversioned`. Runtime debug does not change the version.
+The boot banner, new events and current snapshot use the same 1–32 character protocol token.
 
 `observed` is an optional, unique list of at most 64 condition codes evaluated
 in this boot. When present, every active code must be included. An observed but
@@ -698,7 +697,7 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E5007 | HTTP 409 | Next HTTP 200 trip upload | `http_status`, `target=trip` |
 | E5008 | HTTP 500-599 | Next HTTP 200 trip upload | `http_status`, `target=trip` |
 | E5009 | Other positive HTTP result except 200 | Next HTTP 200 trip upload | `http_status` when 100-599, `target=trip` |
-| E6001 | Either OLED adapter latches I2C/init failure | Adapter healthy; either adapter disables display for the rest of the boot | none; both DISPLAY_DEBUG modes |
+| E6001 | Either OLED adapter latches I2C/init failure | Adapter healthy; either adapter disables display for the rest of the boot | none; both runtime modes |
 
 Battery diagnostics use the **existing hardware SOC thresholds**, without adding
 a new voltage cutoff or changing shutdown policy. XPowersLib 0.3.3 returns the
@@ -756,7 +755,7 @@ not generate transport/join faults.
 Host tests exercise each hook's transitions and context through production paths,
 the notice policies, checksum/readiness deadlines, charge hysteresis, queue-full
 retry/episode handling, rollover, the counter without scan events and a normal
-real-parser drive/upload with only E1000. Both DISPLAY_DEBUG modes run, and actual
+real-parser drive/upload with only E1000. Both runtime modes run, and actual
 exports pass the server protocol validator. They cannot measure the network task's
 watermark or storage latency. The 12 KiB allocation is unchanged; the 2 KiB warning
 margin follows #6. Static builders avoid event-sized stack frames; compiler stack
@@ -984,18 +983,18 @@ are disabled. No application cache-disabled path accesses this workspace.
 
 HTTPClient's small objects and bounded parser/socket scratch remain on the
 existing **12 KiB** network stack; no large upload buffer goes there. Debug
-builds print free internal heap, its largest free block and free PSRAM at boot
-and once after the first diagnostics HTTP attempt (including failure). These
-are measurement hooks for #6. During and after the real SD uploads on
+mode prints free internal heap, its largest free block and free PSRAM on entry
+and once after the first diagnostics HTTP attempt made with debug on (including
+failure). These are measurement hooks for #6. During and after the real SD uploads on
 2026-10-21 (UTC), the debug build's minimum free network stack was
 **7,436 of 12,288 bytes**, with GPS logging active. The earlier no-upload
 measurement was 7,468 free bytes. Real-upload heap measurements and the
 untested upload paths still need checks. No host test establishes ESP32
 heap/stack headroom, SD latency or power-cut safety.
 
-Supreme/core 3.3.11 compile results with PSRAM enabled: static RAM falls from
-193,804 to **108,356 bytes** with `DISPLAY_DEBUG=1`, and from 169,836 to
-**84,388 bytes** with `DISPLAY_DEBUG=0` (85,448 bytes recovered in each build).
+Earlier Supreme/core 3.3.11 compile results with PSRAM enabled: static RAM fell from
+193,804 to **108,356 bytes** in the former debug build, and from 169,836 to
+**84,388 bytes** in the former production build (85,448 bytes recovered in each build).
 Both are 2,736 bytes above the pre-upload-worker baselines of 105,620/81,652
 bytes; the remaining internal state includes the atomic publications and
 upload fault producer. These are link-time sizes, not live heap measurements.
@@ -1013,13 +1012,14 @@ Flask ingest test-client commit plus duplicate replay, without opening sockets.
 ## Display policy and Supreme hardware (#123/#127/#128/#130)
 
 DisplayModel (`display_model.h`) is pure, header-only C++ policy; only the
-SH1106 adapter touches hardware. **Owner decisions, 2026-10-20:** keep
-`DISPLAY_DEBUG=1` as the default, with its road-tested debug page unchanged;
-implement the production screen now behind `DISPLAY_DEBUG=0`.
-After a production build was flashed on **2026-10-20**, the owner confirmed
-the screen worked well and requested much larger text filling the panel,
-with descriptions removed. Round 2 changes only card content and fonts;
-the timing, motion, queue, POWER, shutdown and E6001 policies below are unchanged.
+SH1106 adapters touch hardware, both exclusively on core 1. Stage 4 ships as
+one firmware, starting with debug off at every power-on (never persisted).
+While running, hold BOOT (GPIO 0), then tap POWER to toggle debug. BOOT is
+INPUT_PULLUP, sampled only after boot, with a 40 ms low debounce and a fresh
+sample when the verified short-key batch is handled. It has no other Stage 4
+user. Holding BOOT during power-up still selects the ROM download mode.
+A two-second OLED message and `Debug mode: on` / `off` serial line confirm
+changes. No button or OLED work runs on core 0 or in the PMU ISR.
 
 - **Debug on:** the existing continuously lit bench/shakedown page: FSM,
   satellites heard/used, GPS AGC, fix/HDOP, storage, queues, network and battery.
@@ -1057,9 +1057,10 @@ Production policy:
   The 64-entry queue drops excess new episodes once;
   it never loops through unresolved faults. WARNING/INFO cannot wake a card.
 - A short POWER press explicitly requests a StatusCard in any motion state.
-  Only production includes `XPOWERS_AXP2101_PKEY_SHORT_IRQ` in the shared
-  enabled/batch mask and tests it with `irq.has(...)` after a known batch,
-  outside degraded mode. Unknown batches request no card. Long press keeps
+  The single build always includes `XPOWERS_AXP2101_PKEY_SHORT_IRQ` in the
+  shared enabled/batch mask and tests `irq.has(...)` only after a known batch,
+  outside degraded mode. BOOT held toggles debug instead. Unknown batches
+  request no card and cannot toggle debug. Long press keeps
   the existing clean battery power-off/USB-ignore meaning. A new error preempts a routine status card;
   a user request can replace the current card and holds its full
   `DISPLAY_CARD_MS` (default 30 seconds) before queued errors resume.
@@ -1079,6 +1080,15 @@ Production policy:
   includes source identity and survives clears; unknown/unaccepted raises
   cannot invent display events. This is bounded snapshot observation, so a
   condition raised and cleared entirely between reads can be missed.
+- Only one renderer owns the panel at a time. Toggle feedback uses the
+  production adapter; after it expires, the owner draws fresh pixels before
+  waking the panel. Debug off returns to power save unless a fresh card is due.
+  The production model consumes episodes while debug owns the panel, without
+  queuing stale cards. POWER alone overlays a full-duration status card in debug
+  mode, then resumes the live page. Either adapter failing disables both paths
+  for the boot. Runtime debug also enables RF, temperature and heap serial
+  diagnostics; the charge guard, GPS trust and antenna checks remain active
+  with debug off. The core-0 worker still services one journal record at a time.
 - Shutdown blanks the model and puts the panel in power save before the final
   VBUS check/`PMU.shutdown()`. Cancelled/failed shutdown resumes blank until
   a later display trigger. Production initialization uses `initDisplay()`

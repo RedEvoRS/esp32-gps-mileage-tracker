@@ -241,8 +241,13 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   use a reserved bounded inspection slot and durable loss accounting. Heartbeats
   use existing awake opportunities after 24 hours without contact (first boot
   contact age is unknown). Bounded degraded startup retries restart on recovery;
-  Production OLED cards use the verified PMU IRQ batch for short POWER
-  presses outside degraded mode; debug builds do not enable that IRQ.
+  One Stage 4 firmware starts with debug off at every power-on, never saved.
+  While running, hold BOOT then tap POWER to toggle the live page and debug
+  serial output. POWER alone shows a production status card in either mode.
+  The verified PMU IRQ batch handles short presses outside degraded mode;
+  long press is unchanged. BOOT held during power-up still means download mode.
+  Core 1 owns the debounced GPIO 0 input and both OLED renderers; core 0
+  reads only an atomic mode flag. Switching off never replays stale cards.
   Host tests do not establish
   storage timing or durability
 - Five-state FSM for trip lifecycle

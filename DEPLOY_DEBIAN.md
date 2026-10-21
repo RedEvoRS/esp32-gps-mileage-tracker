@@ -533,9 +533,9 @@ esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled
 
 Before each Stage 4 build, run `python tools/stamp_firmware_version.py` from
 the repository root so Device health shows `firmware/VERSION` plus the ten-character
-Git commit (for example `v0.05+3f9a1c07be`), with `-dirty` for tracked edits and
-`+dbg` in debug builds. Without the generated header it shows `unversioned`;
-an old header keeps its old version. Road-use version bumps and tags are described
+Git commit (for example `v0.05+3f9a1c07be`), with `-dirty` for tracked edits.
+Runtime debug mode does not change the version. Without the generated header
+it shows `unversioned`; an old header keeps its old version. Road-use version bumps and tags are described
 in [Firmware versions and releases](firmware/README.md#firmware-versions-and-releases).
 
 Fit a **FAT32 microSD card** with the board switched off. Stage 4 records

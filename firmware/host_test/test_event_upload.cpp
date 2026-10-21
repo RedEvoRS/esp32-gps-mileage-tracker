@@ -101,14 +101,16 @@ int main(int argc, char** argv) {
     assert(g_psramAllocationBytes == sizeof(EventUploadBuffers));
     assert(g_psramAllocationCaps == (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     initEventUpload(); assert(g_psramAllocations == 1);
-#if DISPLAY_DEBUG
-    reportEventHeap();
-    assert(logLines("Heap: internal 123456 free (largest 65536), PSRAM 8123456 free") == 1);
-#endif
+    if (debugMode()) {
+        reportEventHeap();
+        assert(logLines("Heap: internal 123456 free (largest 65536), PSRAM 8123456 free") == 1);
+    }
+
     uploadWorld(); records(130); drainEvents();
-#if DISPLAY_DEBUG
-    assert(gEventHeapReported && logLines("Heap:") == 1);
-#endif
+    if (debugMode()) {
+        assert(gEventHeapReported && logLines("Heap:") == 1);
+    }
+
     assert(g_httpBodies.size() == 3 && eventCount(g_httpBodies[0]) == 64 &&
            eventCount(g_httpBodies[1]) == 64 && eventCount(g_httpBodies[2]) == 2);
     assert(backlog().records == 0);
@@ -333,9 +335,10 @@ int main(int argc, char** argv) {
     trip(); gNetRetryMs = 0; netCycle(); assert(!hasPending());
     std::puts("Event upload: explicit revision enrollment, rollback fail-closed and GPX independence passed");
     collect();
-#if DISPLAY_DEBUG
-    assert(gEventHeapReported && logLines("Heap:") == 0); // no repeated post-attempt reports
-#endif
+    if (debugMode()) {
+        assert(gEventHeapReported && logLines("Heap:") == 0); // no repeated post-attempt reports
+    }
+
     assert(g_psramAllocations == 1); // all drains/retries reused the boot allocation
     if (argc > 1) for (const auto& body : requests) std::printf("REQUEST %s\n", body.c_str());
     std::printf("Event upload: %zu complete firmware requests; PSRAM Batch=%zu request=%zu snapshot=%zu ack=%zu bytes\n",

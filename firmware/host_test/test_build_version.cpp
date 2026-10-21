@@ -4,9 +4,8 @@
 #include "build_version.h"
 
 static_assert(firmware::validVersion("unversioned"), "fallback token");
-static_assert(firmware::validVersion("unversioned+dbg"), "debug fallback token");
-static_assert(firmware::validVersion("v0.05+0123456789-dirty+dbg"), "dirty debug token");
-static_assert(firmware::validVersion("v99.99+0123456789-dirty+dbg"), "largest release dirty debug token");
+static_assert(firmware::validVersion("v0.05+0123456789-dirty"), "dirty token");
+static_assert(firmware::validVersion("v99.99+0123456789-dirty"), "largest release dirty token");
 static_assert(firmware::validVersion("A._+-9"), "allowed characters");
 static_assert(firmware::validVersion("abcdefghijklmnopqrstuvwxyz012345"), "32 characters");
 static_assert(!firmware::validVersion("abcdefghijklmnopqrstuvwxyz0123456"), "33 rejected");
@@ -16,11 +15,7 @@ static_assert(!firmware::validVersion("a b"), "space rejected");
 static_assert(!firmware::validVersion("a\nb"), "newline rejected");
 static_assert(!firmware::validVersion("a\0b"), "embedded null rejected");
 int main() {
-#if DISPLAY_DEBUG
-    assert(std::strcmp(firmware::kVersion, FIRMWARE_VERSION_BASE "+dbg") == 0);
-#else
     assert(std::strcmp(firmware::kVersion, FIRMWARE_VERSION_BASE) == 0);
-#endif
     assert(firmware::validVersion(firmware::kVersion));
-    std::printf("Build version: %s; token limits and flavour passed\n", firmware::kVersion);
+    std::printf("Build version: %s; token limits passed\n", firmware::kVersion);
 }

@@ -103,6 +103,13 @@ static void run(float mps, int seconds, bool fix = true, bool ggaFirst = false,
 }
 
 static void resetWorld() {
+    gDebugMode.store(hostDebugMode());
+    gBootButton = runtime_debug::BootButton();
+    gModeFeedback = false; gDisplayOwner = DisplayOwner::Production;
+    gDebugDisplayBegun = gProductionWireReady = false;
+    gDebugNeedsWake = true;
+    gDebugOled = U8G2_SH1106_128X64_NONAME_F_HW_I2C(U8G2_R0, U8X8_PIN_NONE);
+    Wire = TwoWire();
     g_disk = FakeDisk();
     g_sdDisk = FakeDisk(); g_sdDisk.mounted = false; g_sdDisk.renameOverwrites = false;
     SD.dirs.clear(); SD.cardPresent = false; SD.begins = SD.ends = 0;
@@ -122,21 +129,19 @@ static void resetWorld() {
     gGpsAntenna = GpsAntenna(); gAntennaRf = DebugRf(); gAntennaSignal = DebugSignal();
     gDebugGsv = DebugGsv();
     gDebugRf = DebugRf(); gDebugRfPollMs = 0; gDebugRfStarted = false;
-#if DISPLAY_DEBUG
     gDebugRmcValid = false;
     gDebugDisplayReady = gDebugDisplayFailed = false;
     gDebugWireReady = gDebugTempEnabled = gDebugTempPending = false;
     gDebugTempDie = NAN; gDebugTempDieMs = gDebugTempLogMs = 0;
     gDebugTempTs = {}; gDebugTempBme = {};
     gDebugNet = DebugNetwork{};
-#else
     gProductionDisplayReady = gProductionDisplayFailed = gProductionDisplayBegun = false;
     gProductionHaveOutput = false;
     gProductionOled = U8G2_SH1106_128X64_NONAME_F_HW_I2C(U8G2_R0, U8X8_PIN_NONE);
     gDisplayModel = display::DisplayModel();
     gDisplayTripFinalized = gDisplayUserRequest = false;
     for (auto& count : gDisplayConditionCounts) count = 0;
-#endif
+
     GPSSerial = HardwareSerial(1);
     gGpsConfig = GpsConfig(); gGpsUbxRx = GpsUbxRx();
     gNavPvt = GpsNavPvt(); gSpeedFallback = false; gLatestSpeedTrusted = false;
@@ -412,19 +417,20 @@ int main(int argc, char** argv) {
                   "HDOP still comes through from GGA");
         }
         dump("G4");
-#if DISPLAY_DEBUG
-        CHECK(gDebugGsv.signal(g_millis).heard == 9,
-              "live GSV excludes empty C/N0 fields while the same drive logs normally");
-        g_disk.files["/trips/incomplete.gpx"] = "<gpx>";
-        g_disk.files["/trips/rejected.gpx.bad"] = "</gpx>";
-        refreshDebugPending();
-        CHECK(gDebugNet.pending == 1 && g_lockDepth == 0,
-              "cached queue counts complete trips only and releases every FS lock");
-        gNetHold.store(true); gDebugNet.pending = 7;
-        refreshDebugPending();
-        CHECK(gDebugNet.pending == 7,
-              "power-off interruption preserves the previous cache instead of publishing a partial scan");
-#endif
+        if (debugMode()) {
+            CHECK(gDebugGsv.signal(g_millis).heard == 9,
+                  "live GSV excludes empty C/N0 fields while the same drive logs normally");
+            g_disk.files["/trips/incomplete.gpx"] = "<gpx>";
+            g_disk.files["/trips/rejected.gpx.bad"] = "</gpx>";
+            refreshDebugPending();
+            CHECK(gDebugNet.pending == 1 && g_lockDepth == 0,
+                  "cached queue counts complete trips only and releases every FS lock");
+            gNetHold.store(true); gDebugNet.pending = 7;
+            refreshDebugPending();
+            CHECK(gDebugNet.pending == 7,
+                  "power-off interruption preserves the previous cache instead of publishing a partial scan");
+        }
+
     }
 
     printf("G5 GGA before RMC\n");
@@ -753,8 +759,8 @@ int main(int argc, char** argv) {
         GPSSerial.rx += sentences({30, 37, -122, 15, false})[0];
         loop();
         CHECK(GPSSerial.tx == frame(0x0A, 0x38, {}) + frame(0x0A, 0x38, {}) &&
-              logCount("GPS RF: jam ok cw 12 noise 85 agc 31% ant DONTKNOW pwr DONTKNOW") == DISPLAY_DEBUG &&
-              logCount("fix V") == DISPLAY_DEBUG && !gDebugRf.valid,
+              logCount("GPS RF: jam ok cw 12 noise 85 agc 31% ant DONTKNOW pwr DONTKNOW") == debugMode() &&
+              logCount("fix V") == debugMode() && !gDebugRf.valid,
               "previous reply is consumed before the next poll; only debug logs a coordinate-free line");
         std::string bad = packet; bad.back() ^= 1;
         GPSSerial.rx += bad + frame(0x0A, 0x38, {0, 1, 0, 0}) +
@@ -762,7 +768,7 @@ int main(int argc, char** argv) {
         loop();
         CHECK(!gDebugRf.valid, "bad checksum, wrong length and oversized packets cannot publish RF data");
         g_millis = gDebugRfPollMs + 30000; loop();
-        CHECK(logCount("GPS RF:") == 2 * DISPLAY_DEBUG && logCount("GPS RF: rf --") == DISPLAY_DEBUG,
+        CHECK(logCount("GPS RF:") == 2 * debugMode() && logCount("GPS RF: rf --") == debugMode(),
               "a missing valid reply prints rf -- instead of reusing an old sample");
         GPSSerial.rx += packet.substr(0, 12); loop();
         g_millis += 501;
@@ -774,9 +780,9 @@ int main(int argc, char** argv) {
               "multiple RF blocks validate their full length and retain the first block");
         g_millis = UINT32_MAX - 1000; gDebugRfPollMs = g_millis;
         g_millis += 29999; serviceDebugRf();
-        CHECK(logCount("GPS RF:") == 2 * DISPLAY_DEBUG && GPSSerial.tx.size() == 24, "RF cadence does not fire early across millis rollover");
+        CHECK(logCount("GPS RF:") == 2 * debugMode() && GPSSerial.tx.size() == 24, "RF cadence does not fire early across millis rollover");
         ++g_millis; serviceDebugRf();
-        CHECK(logCount("GPS RF:") == 3 * DISPLAY_DEBUG && logCount("blocks 2") == DISPLAY_DEBUG && GPSSerial.tx.size() == 32,
+        CHECK(logCount("GPS RF:") == 3 * debugMode() && logCount("blocks 2") == debugMode() && GPSSerial.tx.size() == 32,
               "RF cadence survives rollover and reports an unexpected block count");
     }
 
@@ -973,23 +979,24 @@ int main(int argc, char** argv) {
               "next complete attempt reconfigures and ACKs NAV-PVT successfully");
     }
 
-#if DISPLAY_DEBUG
-    printf("G29 coordinate-free accuracy diagnostics and rejected speed marker\n");
-    {
-        resetWorld(); gGpsConfig.state = GPS_CONFIG_DONE;
-        run(4.65f, 31, true, false, 2500, false, 3, 1, 12345);
-        CHECK(logCount("sAcc 2.50 m/s hAcc 12.3 m") == 1 && logCount("37.000") == 0 && logCount("-122") == 0,
-              "30 s GPS RF line includes only speed/horizontal accuracy, never position");
-        DebugStatus s; s.mph = 3.3; s.speedTrusted = gLatestSpeedTrusted;
-        char lines[8][22]; formatDebugStatus(s, lines);
-        CHECK(!strcmp(lines[3], "Speed 3.3? mph"), "untrusted OLED speed has a question mark");
-        s.mph = 1e9; formatDebugStatus(s, lines);
-        CHECK(!strcmp(lines[3], "Speed 999.9? mph"), "worst-case untrusted speed remains bounded");
-        for (const auto& line : lines) CHECK(strlen(line) <= 21, "every OLED line fits 21 characters");
-        g_millis = gDebugRfPollMs + 30000; loop();
-        CHECK(logCount("sAcc -- m/s hAcc -- m") == 1, "missing/stale PVT reports unknown accuracy");
+    if (debugMode()) {
+        printf("G29 coordinate-free accuracy diagnostics and rejected speed marker\n");
+        {
+            resetWorld(); gGpsConfig.state = GPS_CONFIG_DONE;
+            run(4.65f, 31, true, false, 2500, false, 3, 1, 12345);
+            CHECK(logCount("sAcc 2.50 m/s hAcc 12.3 m") == 1 && logCount("37.000") == 0 && logCount("-122") == 0,
+                  "30 s GPS RF line includes only speed/horizontal accuracy, never position");
+            DebugStatus s; s.mph = 3.3; s.speedTrusted = gLatestSpeedTrusted;
+            char lines[8][22]; formatDebugStatus(s, lines);
+            CHECK(!strcmp(lines[3], "Speed 3.3? mph"), "untrusted OLED speed has a question mark");
+            s.mph = 1e9; formatDebugStatus(s, lines);
+            CHECK(!strcmp(lines[3], "Speed 999.9? mph"), "worst-case untrusted speed remains bounded");
+            for (const auto& line : lines) CHECK(strlen(line) <= 21, "every OLED line fits 21 characters");
+            g_millis = gDebugRfPollMs + 30000; loop();
+            CHECK(logCount("sAcc -- m/s hAcc -- m") == 1, "missing/stale PVT reports unknown accuracy");
+        }
     }
-#endif
+
 
     printf("G30 horizontal accuracy boundaries and indoor noise\n");
     {

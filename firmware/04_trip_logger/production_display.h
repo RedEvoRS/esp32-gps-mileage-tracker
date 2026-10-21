@@ -10,6 +10,7 @@ static constexpr uint8_t PRODUCTION_OLED_CONTRAST = 255;  // SH1106 maximum
 static U8G2_SH1106_128X64_NONAME_F_HW_I2C gProductionOled(U8G2_R0, U8X8_PIN_NONE);
 static bool gProductionDisplayReady = false, gProductionDisplayFailed = false;
 static bool gProductionDisplayBegun = false;
+static bool gProductionWireReady = false;
 static display::Output gProductionLastOutput;
 static bool gProductionHaveOutput = false;
 
@@ -51,7 +52,8 @@ static void beginProductionDisplay() {
     gProductionDisplayBegun = true;
     gProductionDisplayReady = true;
     Wire.setTimeOut(10);
-    if (!Wire.begin(17, 18, 400000)) gProductionDisplayFailed = true;
+    gProductionWireReady = Wire.begin(17, 18, 400000);
+    if (!gProductionWireReady) gProductionDisplayFailed = true;
     if (!gProductionDisplayFailed) {
         Wire.beginTransmission(0x3C);
         if (Wire.endTransmission() != 0) gProductionDisplayFailed = true;
@@ -73,6 +75,16 @@ static void productionDisplayPowerSave(bool off) {
     if (!gProductionDisplayReady) return;
     gProductionOled.setPowerSave(off ? 1 : 0);
     productionDisplayCheck();
+}
+
+static void drawDebugModeFeedback(bool enabled) {
+    if (!gProductionDisplayReady) return;
+    gProductionOled.clearBuffer();
+    gProductionOled.setFont(u8g2_font_helvB14_tr);
+    gProductionOled.drawStr(8, 40, enabled ? "Debug ON" : "Debug OFF");
+    gProductionOled.sendBuffer();
+    productionDisplayPowerSave(false); // new pixels before wake
+    gProductionHaveOutput = false;
 }
 
 // Stable cards are sent once. Deadline changes alone do not redraw their pixels.

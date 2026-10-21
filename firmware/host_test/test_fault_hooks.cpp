@@ -172,7 +172,7 @@ static void gpsAntennaRegressions() {
         assert(antennaObservation().observed && !antennaObservation().episode);
         antennaInterval(-1, false, false); assert(take().empty());
     }
-    if (!exportJson) std::printf("GPS antenna integration: 2 recovery episodes passed (DISPLAY_DEBUG=%d).\n", DISPLAY_DEBUG);
+    if (!exportJson) std::printf("GPS antenna integration: 2 recovery episodes passed (runtime debug=%d).\n", debugMode());
 }
 
 static void gpsFixGapRegressions() {
@@ -349,14 +349,19 @@ int main(int argc, char**) {
         g_sdDisk.files.clear(); g_sdDisk.failNextOpens = bad ? 1 : 0;
         beginTrip(fx);
     }, "\"operation\":\"open\"");
-#if DISPLAY_DEBUG
-    cycle(6001, [](bool bad) {
-        runtimeHealthy();
-        if (bad && !gDebugDisplayFailed) { Wire.failBegins = 1; beginDebugDisplay(); }
-        if (!bad) { gDebugDisplayFailed = false; beginDebugDisplay(); }
-        serviceRuntimeDiagnostics();
-    }, "\"context\":{}");
-#endif
+    if (debugMode()) {
+        cycle(6001, [](bool bad) {
+            runtimeHealthy();
+            if (bad && !gDebugDisplayFailed) {
+                TwoWire::transaction = [](TwoWire&, bool) -> uint8_t { return 5; };
+                drawDebugDisplay(DebugStatus{});
+                TwoWire::transaction = nullptr;
+            }
+            if (!bad) { gDebugDisplayFailed = gDebugDisplayBegun = false; beginDebugDisplay(); }
+            serviceRuntimeDiagnostics();
+        }, "\"context\":{}");
+    }
+
     cycle(5002, [](bool bad) { WiFi.connectionStatus = bad ? 0 : WL_CONNECTED; connectWifi(); }, "\"attempts\":1");
     const int statuses[] = {-1, 401, 413, 400, 409, 503, 404};
     for (int i = 0; i < 7; ++i) cycle(5003 + i, [i, &statuses](bool bad) {
@@ -460,6 +465,6 @@ int main(int argc, char**) {
     assert(happy.size() == 1); has(happy[0], "\"code\":1000,");
     assert(gJournal.stats().dropped == 0 && g_lockDepth == 0);
     if (exportJson) for (const auto& row : exported) std::printf("EVENT %s\n", row.c_str());
-    std::printf("Runtime hook transitions, fields, counter, overflow and happy drive passed (DISPLAY_DEBUG=%d).\n", DISPLAY_DEBUG);
+    std::printf("Runtime hook transitions, fields, counter, overflow and happy drive passed (runtime debug=%d).\n", debugMode());
 }
 #endif

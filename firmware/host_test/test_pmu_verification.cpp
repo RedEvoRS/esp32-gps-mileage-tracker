@@ -158,5 +158,5 @@ int main() {
     pmuWorld(); g_millis = UINT32_MAX - 100; PMU.failChargeRead = true; serviceChargeTemp();
     g_millis += CHG_CHECK_MS - 1; serviceChargeTemp(); assert(calls("enableCellbatteryCharge") == 1);
     ++g_millis; serviceChargeTemp(); assert(calls("enableCellbatteryCharge") == 2); ++cases;
-    std::printf("PMU verification: %u scenarios plus exhaustive IRQ/charge/threshold bytes passed (DISPLAY_DEBUG=%d).\n", cases, DISPLAY_DEBUG);
+    std::printf("PMU verification: %u scenarios plus exhaustive IRQ/charge/threshold bytes passed (runtime debug=%d).\n", cases, debugMode());
 }

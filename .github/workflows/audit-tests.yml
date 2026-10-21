@@ -164,11 +164,6 @@ jobs:
             arduino-cli compile --fqbn "$FQBN" --warnings default --jobs 2 \
               "${size_args[@]}" --build-property 'compiler.cpp.extra_flags=-DFIRMWARE_VERSION_REQUIRE_STAMP' \
               "firmware/$sketch"
-            if [ "$sketch" = 04_trip_logger ]; then
-              arduino-cli compile --fqbn "$FQBN" --warnings default --jobs 2 \
-                "${size_args[@]}" --build-property 'compiler.cpp.extra_flags=-DFIRMWARE_VERSION_REQUIRE_STAMP -DDISPLAY_DEBUG=0' \
-                "firmware/$sketch"
-            fi
             echo "::endgroup::"
           done
 

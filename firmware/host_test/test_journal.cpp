@@ -15,6 +15,7 @@ using namespace diagnostics;
 static EventLog::Batch batch; // also static, as required on target
 
 static void world(bool sd, bool flash, EventLog::Config config = EventLog::Config()) {
+    gDebugMode.store(hostDebugMode());
     g_disk = FakeDisk(); g_sdDisk = FakeDisk();
     g_disk.mounted = flash; g_sdDisk.mounted = sd;
     SD.cardPresent = sd;
@@ -224,11 +225,12 @@ int main() {
     assert(gJournal.nextBatch(batch) && batch.count == 3);
     for (size_t i = 0; i < batch.count; ++i) assert(bootId == batch.ids[i].bootId);
     xSemaphoreGive(gFsMutex);
-#if DISPLAY_DEBUG
-    size_t bootLines = 0;
-    for (const auto& line : Serial.log) if (line.rfind("Journal: sd,", 0) == 0) ++bootLines;
-    assert(bootLines == 1);
-#endif
+    if (debugMode()) {
+        size_t bootLines = 0;
+        for (const auto& line : Serial.log) if (line.rfind("Journal: sd,", 0) == 0) ++bootLines;
+        assert(bootLines == 1);
+    }
+
     std::puts("Journal failed power-off remount reloads caches, preserves identity and reports boot once passed");
     return 0;
 }

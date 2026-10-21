@@ -226,5 +226,5 @@ int main(int argc, char**) {
         gLoopFaults.event(3003,millis()).notice(); has(take()[0],"\"sync_age_ms\":null");
     }
     if (exportJson) for (auto& row : exported) std::printf("EVENT %s\n",row.c_str());
-    std::printf("RTC runtime: 20 scenario groups passed (DISPLAY_DEBUG=%d)\n",DISPLAY_DEBUG);
+    std::printf("RTC runtime: 20 scenario groups passed (runtime debug=%d)\n",debugMode());
 }
