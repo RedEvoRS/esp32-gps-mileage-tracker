@@ -76,6 +76,10 @@
 #ifndef DISPLAY_DEBUG
 #define DISPLAY_DEBUG 1
 #endif
+#if __has_include("firmware_version.h")
+#include "firmware_version.h"
+#endif
+#include "build_version.h"
 #if DISPLAY_DEBUG
 #include "debug_display.h"
 #include "debug_temperature.h"
@@ -2811,7 +2815,7 @@ static void beginJournal() {
     new (&gJournal) diagnostics::EventLog(gSdMounted ? &gSdJournalFs : nullptr,
                                          gFlashMounted ? &gFlashJournalFs : nullptr, diagnostics::uploadJournalConfig());
     gJournalBoot = diagnostics::newJournalBoot();
-    gJournalReady = gJournal.begin(gJournalBoot.id, gJournalBoot.counter, "stage4-diag-upload");
+    gJournalReady = gJournal.begin(gJournalBoot.id, gJournalBoot.counter, firmware::kVersion);
     gJournal.setTimeProvider(stampDiagnosticTime);
     if (gJournalReady) diagnostics::submitJournalBoot(gJournal, esp_reset_reason(), gPmuStartup, millis());
 }
@@ -2930,6 +2934,7 @@ void setup() {
         Serial.begin(115200);
         delay(1000); // Allow native USB to become ready before boot messages.
         Serial.println("\n=== Stage 4: Trip Logger ===");
+        Serial.printf("Firmware: %s\n", firmware::kVersion);
         printPmuStartup(gPmuStartup);
         enterDegraded(powerMode);
         return;
@@ -2948,6 +2953,7 @@ void setup() {
     gRtc.begin(Wire1, gDiagnosticClock);
     delay(1000);
     Serial.println("\n=== Stage 4: Trip Logger ===");
+    Serial.printf("Firmware: %s\n", firmware::kVersion);
     printPmuStartup(gPmuStartup);
     gRtc.printBootStatus();
     Serial.println("LoRa rail (ALDO3) verified off; SD rail (BLDO1) off; VBACKUP off.");
