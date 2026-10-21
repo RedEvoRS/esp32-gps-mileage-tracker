@@ -1,8 +1,9 @@
 # Independent code audit — 2026-10-05
 
-> This audit predates this repository. The commit hashes, branch and PR
-> numbers below belong to the project's earlier private repository, whose
-> history isn't public.
+> This is a historical record, kept as written. It covers the retired T-Beam V1.2 and the code as it was then.
+> Its pin, power-rail and storage details do not apply to the T-Beam Supreme.
+> Any PR numbers, commit hashes and branch names refer to the project's earlier private repository and will not resolve here.
+> For current status, see this repository's GitHub issues; see the [history index](README.md) for context.
 
 Original audit baseline: `7a9d787f2ae26b3c47dc847efa1fe07d4a1fe3dc`.
 Updated against `main` at `444b2a537f3d479818540cad8f6dbebef8788131`,
