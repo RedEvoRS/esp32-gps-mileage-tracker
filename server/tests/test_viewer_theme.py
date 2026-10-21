@@ -5,12 +5,32 @@ import os
 import re
 import tempfile
 import unittest
+from html.parser import HTMLParser
 from pathlib import Path
 from unittest.mock import patch
 
 from werkzeug.security import generate_password_hash
 
 from test_round_trip import load_service
+
+
+class HeaderParser(HTMLParser):
+    """Record header elements and their parents without depending on whitespace."""
+
+    def __init__(self, html):
+        super().__init__()
+        self.parents = []
+        self.elements = []
+        self.feed(re.search(r"<header>.*?</header>", html, re.S).group())
+
+    def handle_starttag(self, tag, attrs):
+        element = (tag, dict(attrs))
+        self.elements.append((element, list(self.parents)))
+        if tag not in {"input", "br", "hr", "img", "meta", "link"}:
+            self.parents.append(element)
+
+    def handle_endtag(self, tag):
+        self.parents.pop()
 
 
 class ViewerThemeTests(unittest.TestCase):
@@ -82,6 +102,44 @@ class ViewerThemeTests(unittest.TestCase):
 
     def test_device_health_theme(self):
         self.assert_theme_page("/device-health")
+
+    def assert_device_health_box(self, route, current=False):
+        html = self.assert_theme_page(route)
+        elements = HeaderParser(html).elements
+        actions = next(element for element, _ in elements
+                       if element[1].get("class") == "header-actions")
+        children = [element for element, parents in elements
+                    if parents and parents[-1] == actions]
+        self.assertEqual([element[0] for element in children],
+                         ["span" if current else "a", "button", "form"])
+        box, theme, logout = children
+        self.assertEqual(box[1].get("class"), "device-health")
+        self.assertIn("data-theme-toggle", theme[1])
+        self.assertEqual(logout[1].get("class"), "logout")
+        health_elements = [element for element, _ in elements
+                           if element[1].get("class") == "device-health"]
+        self.assertEqual(health_elements, [box])
+        if current:
+            self.assertEqual(box[1].get("aria-current"), "page")
+            self.assertNotIn("href", box[1])
+            # The only header span is the box inside the action group.
+            self.assertEqual([element for element, _ in elements if element[0] == "span"], [box])
+            self.assertFalse(any(element[1].get("href") == "/device-health"
+                                 for element, _ in elements))
+            self.assertIn('<a href="/">← Trips</a>', html)
+            self.assertIn("<h1>Device health</h1>", html)
+        else:
+            self.assertEqual(box[1].get("href"), "/device-health")
+            self.assertNotIn("aria-current", box[1])
+
+    def test_list_device_health_box_precedes_theme(self):
+        self.assert_device_health_box("/")
+
+    def test_trip_device_health_box_precedes_theme(self):
+        self.assert_device_health_box("/trip/2026-10/sample")
+
+    def test_device_health_current_box_replaces_centered_label(self):
+        self.assert_device_health_box("/device-health", current=True)
 
     def test_map_filter_only_affects_tiles(self):
         css = self.viewer.BASE_CSS

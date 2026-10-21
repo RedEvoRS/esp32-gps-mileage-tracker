@@ -859,6 +859,14 @@ THEME_HEAD = """
 
 THEME_BUTTON = '<button type="button" class="theme-toggle" data-theme-toggle>Theme: Auto</button>'
 
+DEVICE_HEALTH_BUTTON = """
+{% if request.endpoint == 'device_health' %}
+<span class="device-health" aria-current="page">Device health</span>
+{% else %}
+<a class="device-health" href="{{ url_for('device_health') }}">Device health</a>
+{% endif %}
+"""
+
 # Reuse the dark palette for OS preference and the explicit override.
 DARK_THEME_CSS = """
     --page-bg: #15191e; --text: #e9ecef; --header-bg: #123b60;
@@ -914,15 +922,22 @@ THEME_CSS = """
 BASE_CSS = THEME_CSS + """
   body { font-family: system-ui, sans-serif; margin: 0; color: var(--text); background: var(--page-bg); }
   header { background: var(--header-bg); color: var(--header-text); padding: 14px 22px;
-           display: flex; align-items: center; justify-content: space-between; }
+           display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
   header a { color: var(--header-text); text-decoration: none; font-weight: 600; }
-  .header-actions { display: flex; gap: 8px; align-items: center; }
+  .header-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+                    justify-content: flex-end; margin-left: auto; }
   header form.logout { margin: 0; }
-  header form.logout button, header .theme-toggle {
+  header form.logout button, header .theme-toggle, header .device-health {
            background: var(--header-button-bg); color: var(--header-button-text);
            border: 1px solid var(--header-button-border); padding: 5px 12px;
-           border-radius: 5px; font-size: 13px; cursor: pointer; }
-  header form.logout button:hover, header .theme-toggle:hover { background: var(--header-button-hover); }
+           border-radius: 5px; font: 13px/1.4 system-ui, sans-serif; white-space: nowrap; }
+  header form.logout button, header .theme-toggle, header a.device-health { cursor: pointer; }
+  header form.logout button:hover, header .theme-toggle:hover, header a.device-health:hover {
+           background: var(--header-button-hover); }
+  header form.logout button:focus-visible, header .theme-toggle:focus-visible, header a.device-health:focus-visible {
+           outline: 2px solid var(--header-text); outline-offset: 3px; }
+  header .device-health[aria-current="page"] {
+           background: var(--header-text); color: var(--header-bg); }
   .wrap { padding: 22px; }
   table { border-collapse: collapse; width: 100%; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
@@ -1001,11 +1016,11 @@ LOGIN_HTML = """
 
 LIST_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Mileage Trips</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 """ + THEME_HEAD + """<style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index') }}">🚗 Mileage Tracker</a>
-  <a href="{{ url_for('device_health') }}">Device health</a>
   <div class="header-actions">
-    """ + THEME_BUTTON + """
+    """ + DEVICE_HEALTH_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit">Log out</button>
@@ -1070,13 +1085,13 @@ LIST_HTML = """
 
 TRIP_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Trip {{ t.id }}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 """ + THEME_HEAD + """
 <link rel="stylesheet" href="{{ url_for('static', filename='leaflet.css') }}">
 <style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index', year=year or '') }}">← {{ year or 'All' }} trips</a>
-  <a href="{{ url_for('device_health') }}">Device health</a>
   <div class="header-actions">
-    """ + THEME_BUTTON + """
+    """ + DEVICE_HEALTH_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit">Log out</button>
@@ -1206,9 +1221,9 @@ DEVICE_HEALTH_HTML = """
   .oled { white-space: pre-wrap; }
   .condition { border-bottom: 1px solid var(--border); padding: 8px 0; }
 </style></head><body>
-<header><a href="{{ url_for('index') }}">← Trips</a><span>Device health</span>
+<header><a href="{{ url_for('index') }}">← Trips</a>
   <div class="header-actions">
-    """ + THEME_BUTTON + """
+    """ + DEVICE_HEALTH_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit">Log out</button>
