@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -206,8 +207,24 @@ class ServiceVersions(unittest.TestCase):
                     self.assertEqual(response.status_code, 200)
                     self.assertEqual(response.json, {"status": "ok", "service": name, "version": expected})
 
-    def test_footers_on_all_pages_including_login(self):
+    def assert_header_version(self, html, expected):
+        header = re.search(r"<header>.*?</header>", html, re.S).group()
+        self.assertEqual(html.count(f"Server {expected}"), 1)
+        self.assertEqual(html.count('class="header-version"'), 1)
+        self.assertRegex(header, r'<div class="header-actions">\s*'
+                         r'<div class="header-version">Server ' + re.escape(expected) +
+                         r'</div>\s*<(?:a|span) class="device-health"')
+        self.assertNotIn("<footer", html)
+
+    def assert_footer_version(self, html, expected):
+        self.assertEqual(html.count(f"Server {expected}"), 1)
+        self.assertEqual(html.count(f'<footer class="server-version">Server {expected}</footer>'), 1)
+        self.assertNotIn("<header>", html)
+        self.assertNotIn('class="header-version"', html)
+
+    def test_header_versions_and_login_footer(self):
         for value, expected in (("v0.01+abcdef1234", "v0.01+abcdef1234"),
+                                ("a" * 64, "a" * 64),
                                 ("<script>", "unversioned")):
             with patch.dict(os.environ, SERVER_VERSION=value):
                 client = self.viewer.app.test_client()
@@ -219,7 +236,10 @@ class ServiceVersions(unittest.TestCase):
                     response = client.get(route)
                     self.assertEqual(response.status_code, 200)
                     html = response.get_data(as_text=True)
-                    self.assertEqual(html.count(f'<footer class="server-version">Server {expected}</footer>'), 1)
+                    if route == "/login":
+                        self.assert_footer_version(html, expected)
+                    else:
+                        self.assert_header_version(html, expected)
 
     def test_server_next_to_firmware_on_device_health(self):
         client = self.viewer.app.test_client()
@@ -247,15 +267,15 @@ class ServiceVersions(unittest.TestCase):
         with patch.dict(os.environ, SERVER_VERSION="v0.01"):
             response = client.get("/trip/2026-10/missing")
             self.assertEqual(response.status_code, 404)
-            self.assertIn('<footer class="server-version">Server v0.01</footer>', response.text)
+            self.assert_footer_version(response.text, "v0.01")
             response = client.put("/health")
             self.assertEqual(response.status_code, 405)
             self.assertIn("GET", response.headers["Allow"])
-            self.assertIn('<footer class="server-version">Server v0.01</footer>', response.text)
+            self.assert_footer_version(response.text, "v0.01")
             with patch.object(self.viewer, "read_diagnostics", return_value={"state": "unavailable"}):
                 response = client.get("/device-health")
             self.assertEqual(response.status_code, 503)
-            self.assertIn('<footer class="server-version">Server v0.01</footer>', response.text)
+            self.assert_header_version(response.text, "v0.01")
 
 
 class BuildVersionWiring(unittest.TestCase):

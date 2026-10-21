@@ -204,9 +204,10 @@ backup. Full policy and schema details are in [DIAGNOSTICS.md](../DIAGNOSTICS.md
 ## Server version and deployments
 
 `VERSION` starts at `v0.01`, independently of the firmware version. Every
-viewer page, including sign-in, has a server version footer. **Device health**
-also puts the viewer's server version next to each reported firmware version.
-The footer describes the viewer image; use both services' `/health` responses
+viewer page has a server version in the header (footer on sign-in and error
+pages). **Device health** also puts the viewer's server version next to each
+reported firmware version.
+This version describes the viewer image; use both services' `/health` responses
 or `bash install.sh --check` to confirm ingest is running the same build.
 Both `/health` endpoints keep their `status` and `service` fields and add
 `version`. They need no login: anyone who can reach ports 8090/8091 on the LAN
