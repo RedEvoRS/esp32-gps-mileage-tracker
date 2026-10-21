@@ -17,8 +17,9 @@ storage backend `sd`, zero dropped events, a boot counter and no active
 conditions. Its history included the earlier E3009 antenna condition,
 raised and cleared; the E5001 access-point-absence counter was 6 for this
 boot. Successful diagnostics uploads print nothing on serial: confirm
-them in the ingest log or Device health. `Firmware: Not reported` is
-expected because the firmware does not send a version yet.
+them in the ingest log or Device health. That build showed
+`Firmware: Not reported` because it predates version reporting; builds
+stamped with `tools/stamp_firmware_version.py` report their Git commit.
 
 This confirms SD delivery in the debug build. LittleFS uploads,
 production-build uploads, server errors (401/413/5xx) and server-down

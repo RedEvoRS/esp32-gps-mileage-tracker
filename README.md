@@ -343,6 +343,12 @@ short-press **POWER**, it shows a brief card with the satellite count and
 error also shows once by itself, even while driving. [firmware/README.md](firmware/README.md#the-screen) says what
 each shows. The everyday screen hasn't been road-tested yet.
 
+**Stamp the version.** From the repository folder, run
+`python tools/stamp_firmware_version.py` before every build. It records the
+Git commit the board will report on the viewer's Device health page. If you
+skip it, the board reports `unversioned`. If you skip it after an earlier
+run, it reports the old commit.
+
 **Flash it.** Open `firmware/04_trip_logger/04_trip_logger.ino`, check the
 [Supreme board settings](firmware/README.md#board-settings) and the board's
 port under **Tools → Port**, then click **Upload** (the right-arrow button)

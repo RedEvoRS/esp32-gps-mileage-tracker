@@ -531,6 +531,10 @@ The equivalent arduino-cli board identifier (FQBN) is:
 esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled
 ```
 
+Before each Stage 4 build, run `python tools/stamp_firmware_version.py` from
+the repository root so Device health shows the build's Git commit rather than
+`unversioned` (or a stale commit from an earlier stamp).
+
 Fit a **FAT32 microSD card** with the board switched off. Stage 4 records
 there when it mounts, otherwise it uses internal LittleFS. Its bundled
 `partitions.csv` overrides the Arduino IDE's Partition Scheme menu.
@@ -598,8 +602,9 @@ returned HTTP 200 at 04:36:43Z and 04:36:44Z, after the last GPX. The new
 showed recent contact and snapshot receipt, storage backend `sd`, zero
 dropped events and no active conditions. Successful diagnostics uploads
 print nothing on serial; check the ingest log or Device health.
-`Firmware: Not reported` is expected until firmware version reporting is
-implemented. Enrollment ID 1 was consumed; the Step 8 command above had
+That build showed `Firmware: Not reported` because it predates version
+reporting; builds stamped with `tools/stamp_firmware_version.py` show their
+Git commit. Enrollment ID 1 was consumed; the Step 8 command above had
 returned high-water 0 because the database did not yet exist.
 
 The internal LittleFS store was mounted but had no trips to upload.
