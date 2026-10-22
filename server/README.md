@@ -31,11 +31,29 @@ defined in `docker-compose.yml`:
 | `mileage-monitor` | 8093 | Optional `monitor` profile: authenticated Prometheus metrics; current-fault and seven-day no-contact alerts |
 | `ntfy` | 8092 | Optional `ntfy` profile: self-hosted phone notifications, authenticated topic access |
 
-**To set it up, run `bash install.sh`** on the server, from this folder
-once it's copied over (normally `~/mileage-tracker`). It does everything
-below and checks each step. `DEPLOY_DEBIAN.md` at the top of the repo
-walks through the same steps by hand. This file is the reference for how
-the services behave.
+**Install or update from a release:** on the Debian 13 server, as a normal
+login with sudo and working Docker Engine / Compose v2:
+
+```bash
+curl -fsSL https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases/latest/download/setup.sh | bash
+```
+
+This verifies/copies the release, runs `install.sh` to configure, build and
+check the services, then offers a personal firmware build. Read the
+[trust note and download/read/run alternative](../README.md#setting-it-up)
+before executing downloaded code. Follow [deployment Step 2](../DEPLOY_DEBIAN.md#step-2--run-setupsh)
+for prerequisites, LAN-only `BIND_ADDR`, backups and optional notifications.
+The builder downloads ~1–2 GB once and asks for WiFi/device settings; its
+owner-only `firmware-out/` contains your WiFi password and upload token in
+the binaries. Flash from the USB-connected PC using
+[README Step 2](../README.md#step-2--flash-the-tracker), then do the one-time
+cleanup after the first diagnostics snapshot.
+
+To update, rerun setup on the server and accept the firmware build, then
+rerun the PC flash script **without first install** (answer no at that
+prompt). Updates write only the app and preserve settings/trips. Setup's
+source copy preserves private configuration/data; the builder replaces its
+own output. See the [update procedure](../DEPLOY_DEBIAN.md#updating).
 
 `install.sh --check` leaves configuration unchanged but uploads and removes
 a temporary test trip and can test the viewer login. Automatic backups
@@ -213,8 +231,8 @@ Both `/health` endpoints keep their `status` and `service` fields and add
 `version`. They need no login: anyone who can reach ports 8090/8091 on the LAN
 can read the build version. Keep the documented LAN-only binding in place.
 
-Before **each deployment to the real server**, bump `server/VERSION` in its
-own commit (`v<major>.<two-digit minor>`, major 0-99, for example `v0.02`).
+For maintainer source deployments, before **each deployment to the real
+server**, bump `server/VERSION` in its own commit (`v<major>.<two-digit minor>`, major 0-99, for example `v0.02`).
 Build from that clean commit, then tag the exact deployed commit `srv-v0.NN`
 (for example `srv-v0.02`) after verifying the deployment. The initial release
 uses `srv-v0.01`. These server tags are separate from firmware tags. Do not
@@ -249,41 +267,18 @@ running versions and warns about missing stamps or mismatches without
 changing its exit code for those warnings. A mismatch means the two services
 may contain different code; rebuild both with the same stamp and check again.
 
-To copy a committed build for installation or an update, run this from the
-repository root **on your computer**, using Git Bash on Windows or a
-macOS/Linux terminal:
-
-```bash
-git -c core.autocrlf=false archive HEAD server | ssh <user>@<host> 'mkdir -p ~/mileage-tracker && tar -x --strip-components=1 -C ~/mileage-tracker'
-```
-
-Replace `<user>` and `<host>` with the server login and address. `HEAD` can
-also be a commit hash or tag. This places `docker-compose.yml`, dotfiles
-such as `.env.example`/`.dockerignore`, and an expanded `COMMIT` directly in
-`~/mileage-tracker`, overwriting supplied source files while leaving untracked
-`.env`, `viewer.env`, `monitor.env` and `data/` in place. It does not delete
-obsolete source files. Uncommitted changes are not sent. Keep
-`-c core.autocrlf=false`: on Windows, Git would otherwise send every file
-with CRLF line endings. Do not use
-`git archive HEAD:server`: that selects a tree, and Git cannot expand `COMMIT`
-without a commit or tag. Do not pipe tar data through Windows PowerShell 5.1,
-which can corrupt it; use Git Bash (native binary pipes require PowerShell
-7.4 or newer, as explained in
-[Step 2 of the runbook](../DEPLOY_DEBIAN.md#step-2--copy-the-server-directory-over)).
-
-Without Git, copy `server/` from a fresh unzipped GitHub source download:
-`scp -r server <user>@<host>:~/mileage-tracker` for a first install, or
-`scp -r server/. <user>@<host>:~/mileage-tracker/` for updates. The latter
-includes dotfiles without creating a nested `server/` folder; use a fresh
-download without local credentials or data. The download's expanded `COMMIT`
-preserves the commit stamp. Copying a Git clone's working tree with `scp`
-gives **VERSION only, no commit**, because its `COMMIT` is still a placeholder.
+For an advanced source deployment, use the
+[manual commit archive/copy route](../DEPLOY_DEBIAN.md#manual-alternative-copy-server).
+It preserves the archive commit stamp and includes the required dotfiles.
+Release users keep the supplied version; the bump/tag instructions above
+are for maintainers deploying source changes.
 
 ## First-Time Setup
 
-The easy way is `bash install.sh` from this directory. It sets up both
+The primary route is release setup above. For an already copied source
+tree, run `bash install.sh` from this directory. It sets up both
 services, the viewer login and backups, checks each step, and tests an
-upload end to end (`DEPLOY_DEBIAN.md` → The quick way). The steps below
+upload end to end ([deployment overview](../DEPLOY_DEBIAN.md#the-quick-way-setupsh)). The steps below
 set up both services by hand, in the order Compose needs them, all run
 from this folder. Docker has to be installed first (`DEPLOY_DEBIAN.md`
 Step 1).
