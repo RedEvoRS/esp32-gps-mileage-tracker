@@ -12,9 +12,16 @@ python live_test.py --keep   # leave the stack running to look at Grafana
 ```
 
 With `--keep`, open `http://127.0.0.1:13000` (user `admin`, password
-`live-test-admin`). Remove the stack afterwards with
-`docker compose -p grafana-live-test -f docker-compose.yml down -v`
-(set `LIVE_TEST_DIR` to any folder first).
+`live-test-admin`). The test has already imported both dashboards through
+Grafana's API (uids `tracker-health` and `tracker-loki-logs`). To try the
+browser import form, delete them first (**Dashboards**, the dashboard,
+**Settings**, **Delete**) or change the UID on the form. Otherwise Grafana
+asks whether to overwrite them. Remove the stack afterwards with
+`docker compose -p grafana-live-test -f docker-compose.yml down -v --rmi local`
+(set `LIVE_TEST_DIR` to any folder first). `--rmi local` also deletes the
+two images the test built (`grafana-live-test-ingest` and
+`grafana-live-test-monitor`, about 380 MB together). Without it they stay
+on your machine.
 
 What it does:
 
@@ -34,7 +41,10 @@ What it does:
 5. Imports both dashboards through Grafana's import API, with the data source
    input mapping, and runs each panel's queries through Grafana's query API.
 
-The stack is removed at the end, including volumes. The images are pinned in
+Unless you pass `--keep`, the stack is removed at the end, including its
+volumes and the two images the test built. The three official images it
+pulled stay in Docker's cache (remove them with `docker rmi` if you want the
+space back). Those images are pinned in
 `docker-compose.yml`; to try another Loki, set `LOKI_IMAGE`, for example
 `LOKI_IMAGE=grafana/loki:2.9.17 python live_test.py`.
 
