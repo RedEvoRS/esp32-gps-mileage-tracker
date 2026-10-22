@@ -539,6 +539,8 @@ a trip lands in and the date the viewer shows always agree.
 
 ## Security
 
+See [SECURITY.md](SECURITY.md) for private vulnerability reporting, supported versions and the threat model.
+
 Both services are meant for your home network only. Don't expose them to the
 internet.
 
