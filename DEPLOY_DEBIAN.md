@@ -46,6 +46,13 @@ setup as your normal login. A failure stops the process: fix the reported
 problem and rerun. Existing valid settings are checked and can be kept.
 The rest of this runbook explains those steps and the manual alternatives.
 
+The closing summary points release installs to the firmware build offered
+next by `setup.sh` (or the command to run it later), then README Steps 2–3
+for flashing on the PC, the first drive, Device health and the one-time
+cleanup flash. Manual source installs get `secrets.h` guidance instead.
+The summary identifies `INGEST_AUTH_TOKEN` in the install directory's `.env`
+without printing its value.
+
 To recheck later without changing configuration:
 
 ```bash
@@ -762,8 +769,10 @@ PowerShell accepts `cp`.) It has to sit in the sketch folder,
 looks for it. Fill in WiFi SSID/password, the server host/IP, port
 `8090`, and set `AUTH_TOKEN` to the `INGEST_AUTH_TOKEN` from Step 4a — it
 must match byte-for-byte. Put only the IP address or hostname in `SERVER_HOST`, with
-no `http://`, port or `/upload`. `install.sh` prints the server lines ready
-to paste. The WiFi has to be 2.4 GHz, and hidden networks won't work.
+no `http://`, port or `/upload`. For a manual source install, `install.sh`
+prints the host and port lines ready to paste and points to `.env` for the
+token; copy that value privately. The WiFi has to be 2.4 GHz, and hidden
+networks won't work.
 
 > **These settings are compiled into the firmware.** If the server's IP or
 > the token changes later, or your WiFi name or password does, the board

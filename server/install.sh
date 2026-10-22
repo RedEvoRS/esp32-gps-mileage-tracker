@@ -27,7 +27,7 @@
 #   Notifications   optional ntfy, metrics, Graylog and Loki outputs, last,
 #                   so an unreachable destination can't hold up the backups
 #                   above; the answers go to monitor.env (Step 11)
-# and finally the settings for the firmware's secrets.h (Step 8).
+# and finally the next firmware build/flash steps (Step 8).
 #
 # Any question can be answered ahead of time with an INSTALL_<NAME>
 # environment variable; the names are in the ask/confirm calls below.
@@ -2882,24 +2882,40 @@ summary() {
     local host=${BIND_ADDR:-$(default_addr)}
     printf '%sThe server is installed and working.%s\n' "$GREEN" "$PLAIN"
     printf 'The viewer is at http://%s:8091/\n\n' "${host:-<this server>}"
-    printf 'For the firmware, copy firmware/secrets.h.example to\n'
-    printf 'firmware/04_trip_logger/secrets.h, fill in your WiFi name and password,\n'
-    printf 'and set these (the token is also in %s/.env):\n\n' "$SCRIPT_DIR"
-    printf '    #define SERVER_HOST   "%s"\n' "${host:-<this server>}"
-    printf '    #define SERVER_PORT   8090\n'
-    printf '    #define AUTH_TOKEN    "%s"\n\n' "$(env_raw .env INGEST_AUTH_TOKEN)"
-    printf 'These are built into the firmware. If this address or the token ever\n'
-    printf 'changes, the board stops uploading until you update secrets.h and\n'
-    printf 'flash it again.\n\n'
+    printf 'The upload token is INGEST_AUTH_TOKEN in %s/.env; keep it private.\n\n' "$SCRIPT_DIR"
+    # setup.sh installs this bundle before invoking us. It also identifies
+    # release installs when install.sh is rerun directly, without the wrapper.
+    if [[ ! -d $SCRIPT_DIR/firmware-src ]]; then
+        printf 'For the firmware, copy firmware/secrets.h.example to\n'
+        printf 'firmware/04_trip_logger/secrets.h, fill in your WiFi name and password,\n'
+        printf 'and set these:\n\n'
+        printf '    #define SERVER_HOST   "%s"\n' "${host:-<this server>}"
+        printf '    #define SERVER_PORT   8090\n\n'
+        printf 'Set AUTH_TOKEN to INGEST_AUTH_TOKEN from the .env file above.\n'
+        printf 'These are built into the firmware. If this address or the token ever\n'
+        printf 'changes, the board stops uploading until you update secrets.h and\n'
+        printf 'flash it again.\n\n'
+    fi
     printf 'Next:\n'
+    if [[ -d $SCRIPT_DIR/firmware-src ]]; then
+        printf '  - setup.sh offers to build your tracker firmware next. If skipped,\n'
+        printf '    run this on the server (the builder reads the token from .env):\n'
+        printf '      bash %q --install-dir %q\n' "$SCRIPT_DIR/firmware-builder/build.sh" "$SCRIPT_DIR"
+        printf '    Changing WiFi, server address or token requires a rebuild and flash.\n'
+        printf '  - On the PC connected to the board, use the flash script in\n'
+        printf '    README.md#step-2--flash-the-tracker (Step 2). For a first install,\n'
+        printf '    it backs up factory flash, then asks you to type ERASE.\n'
+        printf '  - Follow README.md#step-3--first-drive-and-device-health (Step 3):\n'
+        printf '    first drive, Device health snapshot, then the one-time cleanup flash.\n'
+    else
+        printf '  - Build and flash from source: DEPLOY_DEBIAN.md#advanced-local-firmware-settings\n'
+        printf '    (Step 8), including first-flash setup and diagnostics enrollment.\n'
+    fi
     if [[ $RELOGIN == yes ]]; then
         printf '  - Log out and back in, so docker works without sudo.\n'
     fi
     printf '  - Reboot (sudo reboot), then check it all came back:\n'
     printf '      bash %s/install.sh --check\n' "$SCRIPT_DIR"
-    printf '  - Flash the board, check it works and put it in the car: README.md at\n'
-    printf '    the top of the repo, "Setting it up", steps 3 to 5. A new board needs\n'
-    printf '    a one-time storage setup on its first flash (firmware/README.md).\n'
     if [[ $FIRST_BACKUP == yes ]]; then
         # --check tests an existing snapshot; make one after real data
         # arrives instead of checking the empty install-time copy (#23).

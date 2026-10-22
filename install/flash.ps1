@@ -16,6 +16,23 @@ function Invoke-TrackerFlash {
     $esptoolHash = 'd55a96fbeb97fd4cb05bd93f201e5c8f6518b7bfcde2fc6966fd0190fd891629'
 
     # BEGIN PURE HELPERS (also exercised by install/tests/flash.Tests.ps1)
+    function Test-FlashServer {
+        param([string]$Target)
+        # ASCII allowlist for scp (including legacy remote-shell mode). No
+        # leading option, whitespace, colon, shell metacharacters or IPv6 literal.
+        return $Target -cmatch '\A[a-zA-Z0-9_][a-zA-Z0-9_.-]*(@[a-zA-Z0-9_][a-zA-Z0-9_.-]*)?\z'
+    }
+    function Get-FlashScp {
+        $nativeScp = Join-Path $env:SystemRoot 'System32\OpenSSH\scp.exe'
+        if (Test-Path -LiteralPath $nativeScp -PathType Leaf) { return $nativeScp }
+        return 'scp'
+    }
+    function Get-FlashLabel {
+        param([string]$Tag)
+        # Release packaging replaces every literal placeholder; split this one.
+        if ($Tag -ceq ('@' + 'RELEASE_TAG' + '@')) { return 'development checkout' }
+        return "release $Tag"
+    }
     function Get-FlashPart {
         param($Manifest, [bool]$First)
         foreach ($name in @('bootloader', 'partitions', 'boot_app0', 'app')) {
@@ -90,14 +107,26 @@ function Invoke-TrackerFlash {
         return $directory
     }
     function Invoke-FlashCommand {
-        param([string[]]$Arguments)
+        param([string[]]$Arguments, [switch]$AllowFailure)
         if ($DryRun) {
             $quoted = @($Esptool) + $Arguments | ForEach-Object { "'" + $_.Replace("'", "''") + "'" }
             Write-Host ('DRY RUN: & ' + ($quoted -join ' '))
         } else {
-            & $Esptool @Arguments
-            if ($LASTEXITCODE -ne 0) { throw 'esptool failed. Close serial monitors, check the port and re-enter download mode.' }
+            $savedPreference = $ErrorActionPreference
+            try {
+                # Native stderr alone is not failure in Windows PowerShell 5.1.
+                $ErrorActionPreference = 'Continue'
+                & $Esptool @Arguments | Out-Host
+                $commandExitCode = $LASTEXITCODE
+            } finally { $ErrorActionPreference = $savedPreference }
+            if ($AllowFailure) { return ($commandExitCode -eq 0) }
+            if ($commandExitCode -ne 0) { throw 'esptool failed. Close serial monitors, check the port and re-enter download mode.' }
         }
+        if ($AllowFailure) { return $true }
+    }
+    function Read-DownloadMode {
+        Write-Host 'Download mode: hold BOOT, plug in USB (or tap RESET), wait 2-3 seconds, release BOOT.'
+        if (-not $DryRun) { $null = Read-Host 'Enter download mode, then press Enter' }
     }
     function Read-FactoryRange {
         param([long]$Offset, [int]$Length, [string]$Destination)
@@ -131,11 +160,14 @@ function Invoke-TrackerFlash {
     }
     if ($Help) {
         Write-Host @'
-Usage: .\flash.ps1 [-Server <user>@<host>] [-InstallDir ~/mileage-tracker]
+Usage: .\flash.ps1 [-Server <user>@<host>|<alias>] [-InstallDir ~/mileage-tracker]
   [-Path <folder>] [-Cleanup] [-FirstInstall] [-Port COMx] [-DryRun]
   [-Esptool <executable>] [-BackupDir <folder>] [-SkipBackup] [-Help]
 Windows PowerShell 5.1 / PowerShell 7; Windows 10/11 native USB needs no driver.
 Requires OpenSSH scp unless -Path is used. Standalone esptool needs no Python.
+SSH targets accept user@host or a bare SSH config alias (letters, digits, _, ., -;
+start each component with a letter, digit or _; no spaces or shell characters).
+Windows OpenSSH scp is preferred over PATH (including Git Bash's msys scp).
 One-liner: irm <release-url>/flash.ps1 | iex (prompts use Read-Host).
 Download, read, run alternative:
   Invoke-WebRequest <release-url>/flash.ps1 -OutFile flash.ps1
@@ -144,7 +176,9 @@ Download, read, run alternative:
 PowerShell 7: use pwsh instead of powershell.exe.
 -DryRun verifies firmware and esptool but never opens a serial device.
 Default update and -Cleanup write only the app and never erase settings or trips.
+They try automatic USB download mode first; if it fails, follow the BOOT/RESET prompt.
 -FirstInstall: verified double 8 MB backup, type ERASE, erase all flash, write four parts.
+First installs always use the manual BOOT/RESET download-mode prompt.
 Use only for a new/factory board. Internal settings and trips are wiped; SD is untouched.
 -FirstInstall -SkipBackup: re-provision a board you already backed up; still type ERASE.
 Dry run prints the backup/erase/write plan without requesting confirmation.
@@ -167,12 +201,18 @@ The standalone esptool version is pinned independently of the tracker release.
                 [IO.File]::WriteAllBytes((Join-Path $payload $file), [IO.File]::ReadAllBytes($source))
             }
         } else {
-            if (-not $Server) { $Server = Read-Host 'SSH server (<user>@<host>)' }
-            if ($Server -cnotmatch '^[a-zA-Z0-9_.-]+@[a-zA-Z0-9_.-]+$') { throw 'Use an SSH server in user@host form.' }
+            if (-not $Server) { $Server = Read-Host 'SSH server (<user>@<host> or <alias>)' }
+            if (-not (Test-FlashServer $Server)) { throw 'Use user@host or a bare SSH config alias: letters, digits, _, . and - only; start each component with a letter, digit or _. No whitespace or shell characters.' }
             if ($InstallDir -cnotmatch '^(~/|/)[a-zA-Z0-9_./-]+$' -or $InstallDir.Contains('/../')) { throw 'Install directory must be a simple absolute or ~/ path.' }
             $kind = 'current'; if ($Cleanup) { $kind = 'cleanup' }
-            & scp -rq "${Server}:$($InstallDir.TrimEnd('/'))/firmware-out/$kind/" $payload
-            if ($LASTEXITCODE -ne 0) { throw 'Firmware copy failed.' }
+            $scp = Get-FlashScp
+            $savedPreference = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                & $scp -rq "${Server}:$($InstallDir.TrimEnd('/'))/firmware-out/$kind/" $payload
+                $copyExitCode = $LASTEXITCODE
+            } finally { $ErrorActionPreference = $savedPreference }
+            if ($copyExitCode -ne 0) { throw 'Firmware copy failed. If launched from Git Bash, its msys scp may not use the Windows SSH agent (Connection closed); retry from a normal PowerShell window with Windows OpenSSH installed.' }
         }
         try { $manifest = Test-FlashManifest $payload ([bool]$Cleanup) }
         catch { throw 'Invalid firmware manifest, unsafe offsets, kind, size or checksum.' }
@@ -193,24 +233,29 @@ The standalone esptool version is pinned independently of the tracker release.
         $versionOutput = (& $Esptool version 2>&1 | Out-String)
         if ($LASTEXITCODE -ne 0 -or $versionOutput -notmatch 'v?([45])\.[0-9]+') { throw 'A working standalone esptool v4 or v5 executable is required.' }
         $major = $Matches[1]
-        $before = 'no-reset'; $after = 'no-reset'; $hardReset = 'hard-reset'; $chipCommand = 'chip-id'; $readCommand = 'read-flash'; $writeCommand = 'write-flash'
+        $before = 'no-reset'; $autoReset = 'default-reset'; $after = 'no-reset'; $hardReset = 'hard-reset'; $chipCommand = 'chip-id'; $readCommand = 'read-flash'; $writeCommand = 'write-flash'
         $modeFlag = '--flash-mode'; $freqFlag = '--flash-freq'; $sizeFlag = '--flash-size'
         $eraseCommand = 'erase-flash'
         if ($major -eq '4') {
-            $before = 'no_reset'; $after = 'no_reset'; $hardReset = 'hard_reset'; $chipCommand = 'chip_id'; $readCommand = 'read_flash'; $writeCommand = 'write_flash'
+            $before = 'no_reset'; $autoReset = 'default_reset'; $after = 'no_reset'; $hardReset = 'hard_reset'; $chipCommand = 'chip_id'; $readCommand = 'read_flash'; $writeCommand = 'write_flash'
             $modeFlag = '--flash_mode'; $freqFlag = '--flash_freq'; $sizeFlag = '--flash_size'
             $eraseCommand = 'erase_flash'
         }
-        Write-Host "Tracker flash (release $releaseTag). Keep the LoRa antenna attached; use a USB data cable."
-        Write-Host 'Download mode: hold BOOT, plug in USB (or tap RESET), wait 2-3 seconds, release BOOT.'
+        Write-Host "Tracker flash ($(Get-FlashLabel $releaseTag)). Keep the LoRa antenna attached; use a USB data cable."
         Write-Host 'Close serial monitors. Native USB needs no Windows driver; COM number can change in download mode.'
-        if (-not $DryRun) { $null = Read-Host 'Enter download mode, then press Enter' }
-        $candidates = @([IO.Ports.SerialPort]::GetPortNames() | Sort-Object)
-        try {
-            $preferred = @(Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPDeviceID -match 'VID_303A' -and $_.Name -match '\(COM[0-9]+\)' } |
-                ForEach-Object { if ($_.Name -match '\((COM[0-9]+)\)') { $Matches[1] } } | Sort-Object -Unique)
-            $candidates = @($preferred) + @($candidates | Where-Object { $_ -notin $preferred })
-        } catch { Write-Verbose 'PnP metadata unavailable; using serial port names.' }
+        if (-not $FirstInstall -and -not $Cleanup -and -not $DryRun) {
+            $FirstInstall = (Read-Host 'First install on a factory board? Backup, full erase, then write four parts? [y/N]') -match '^(y|yes)$'
+        }
+        if ($FirstInstall) { Read-DownloadMode }
+        $candidates = @()
+        if (-not $Port) {
+            $candidates = @([IO.Ports.SerialPort]::GetPortNames() | Sort-Object)
+            try {
+                $preferred = @(Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPDeviceID -match 'VID_303A' -and $_.Name -match '\(COM[0-9]+\)' } |
+                    ForEach-Object { if ($_.Name -match '\((COM[0-9]+)\)') { $Matches[1] } } | Sort-Object -Unique)
+                $candidates = @($preferred) + @($candidates | Where-Object { $_ -notin $preferred })
+            } catch { Write-Verbose 'PnP metadata unavailable; using serial port names.' }
+        }
         $choice = ''
         if (-not $Port) {
             if ($candidates.Count -eq 0) { throw 'No candidate ports. Re-enter download mode or supply -Port.' }
@@ -219,9 +264,21 @@ The standalone esptool version is pinned independently of the tracker release.
         }
         $Port = Select-FlashPort $Port $candidates $choice
         $common = @('--chip', 'esp32s3', '--port', $Port, '--before', $before, '--after', $after)
-        Invoke-FlashCommand ($common + @($chipCommand))
-        if (-not $FirstInstall -and -not $Cleanup -and -not $DryRun) {
-            $FirstInstall = (Read-Host 'First install on a factory board? Backup, full erase, then write four parts? [y/N]') -match '^(y|yes)$'
+        # Installed Stage 4 can enter USB download mode automatically. Factory
+        # state is unknown, so first installs stay manual. Writes keep hard-reset.
+        if (-not $FirstInstall) {
+            Write-Host 'Trying automatic USB reset into download mode.'
+            $autoCommon = @('--chip', 'esp32s3', '--port', $Port, '--before', $autoReset, '--after', $after)
+            if (-not (Invoke-FlashCommand ($autoCommon + @($chipCommand)) -AllowFailure)) {
+                Write-Host 'Automatic download-mode attempt failed. Close serial monitors and check the USB cable and port.'
+                Read-DownloadMode
+                $answer = Read-Host "Port after entering download mode [$Port] (Enter to keep)"
+                if ($answer) { $Port = $answer }
+                $common = @('--chip', 'esp32s3', '--port', $Port, '--before', $before, '--after', $after)
+                Invoke-FlashCommand ($common + @($chipCommand))
+            }
+        } else {
+            Invoke-FlashCommand ($common + @($chipCommand))
         }
         if ($FirstInstall) {
             if (-not $SkipBackup) {
@@ -260,7 +317,7 @@ The standalone esptool version is pinned independently of the tracker release.
         $writeArgs = $writeCommon + @($writeCommand, $modeFlag, $manifest.flash_mode, $freqFlag, $manifest.flash_freq, $sizeFlag, $manifest.flash_size)
         foreach ($part in @(Get-FlashPart $manifest ([bool]$FirstInstall))) { $writeArgs += @($part.offset, (Join-Path $payload $part.file)) }
         Invoke-FlashCommand $writeArgs
-        Write-Host 'Press RESET once with BOOT released (hard reset) to run the sketch.'
+        Write-Host 'The write requests a hard reset to run the sketch. If it stays in download mode, press RESET once with BOOT released.'
         if ($FirstInstall) {
             Write-Host 'Expect on the serial console: LittleFS partition is fully erased; provisioning trip storage.'
             Write-Host 'Then: Setup complete. Logging trips.'

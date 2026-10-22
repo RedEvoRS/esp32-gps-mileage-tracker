@@ -7,12 +7,21 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
+import signal
 import sqlite3
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
+
+try:
+    import pty
+    import termios
+except ImportError:
+    pty = termios = None
 
 
 HERE = Path(__file__).resolve().parents[1] / "firmware-builder"
@@ -27,6 +36,90 @@ def load(name):
 
 builder = load("builder")
 checker = load("check_pins")
+
+
+@unittest.skipUnless(pty is not None and termios is not None, "needs POSIX pty and termios")
+class FirmwareBuilderTerminalTests(unittest.TestCase):
+    def run_prompt(self, secret, response, default=""):
+        # fork() gives the child a controlling terminal, so ask() opens the
+        # actual /dev/tty rather than a mock or the test runner's stdin.
+        read_fd, write_fd = os.pipe()
+        pid, master = pty.fork()
+        if pid == 0:
+            os.close(read_fd)
+            try:
+                fd = os.open("/dev/tty", os.O_RDWR)
+                before = termios.tcgetattr(fd)
+                result = {}
+                try:
+                    result["answer"] = builder.ask("Test prompt", default, secret)
+                except BaseException as exc:
+                    result["error"] = type(exc).__name__
+                result["restored"] = termios.tcgetattr(fd) == before
+                os.close(fd)
+                os.write(write_fd, json.dumps(result).encode())
+            finally:
+                os._exit(0)
+
+        os.close(write_fd)
+        transcript = b""
+        payload = b""
+        sent = False
+        deadline = time.monotonic() + 5
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([master, read_fd], [], [], 0.01)
+                if master in ready:
+                    try:
+                        transcript += os.read(master, 4096)
+                    except OSError:  # Linux reports EIO when the slave closes.
+                        pass
+                if read_fd in ready:
+                    chunk = os.read(read_fd, 4096)
+                    if not chunk:
+                        break
+                    payload += chunk
+                if not sent and b": " in transcript:
+                    # The prompt is written before ECHO is disabled. Wait for
+                    # the actual terminal setting before typing a secret.
+                    echo = bool(termios.tcgetattr(master)[3] & termios.ECHO)
+                    if echo == (not secret):
+                        os.write(master, response)
+                        sent = True
+            else:
+                self.fail("ask() did not finish within five seconds")
+            self.assertTrue(payload, "prompt child returned no result")
+            result = json.loads(payload)
+            self.assertTrue(sent, result)
+            self.assertTrue(result["restored"], result)
+            return result, transcript
+        finally:
+            # Always reap the child, including assertion failures/timeouts.
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.waitpid(pid, 0)
+            os.close(master)
+            os.close(read_fd)
+
+    def test_ask_normal_and_default_on_real_terminal(self):
+        result, transcript = self.run_prompt(False, "example-é\n".encode())
+        self.assertEqual(result.get("answer"), "example-é")
+        self.assertIn("example-é".encode(), transcript)
+        result, _ = self.run_prompt(False, b"\n", "example-default")
+        self.assertEqual(result.get("answer"), "example-default")
+
+    def test_ask_secret_has_no_echo_on_real_terminal(self):
+        result, transcript = self.run_prompt(True, b"example-password\n")
+        self.assertEqual(result.get("answer"), "example-password")
+        self.assertNotIn(b"example-password", transcript)
+
+    def test_ask_secret_restores_terminal_on_interrupt_and_eof(self):
+        for response, error in ((b"\x03", "KeyboardInterrupt"), (b"\x04", "ValueError")):
+            with self.subTest(error=error):
+                result, _ = self.run_prompt(True, response)
+                self.assertEqual(result.get("error"), error)
 
 
 class FirmwareBuilderTests(unittest.TestCase):

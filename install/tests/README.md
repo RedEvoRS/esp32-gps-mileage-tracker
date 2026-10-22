@@ -42,12 +42,19 @@ and internal trips. SD trips are untouched. Use the default update for a tracker
 already running this project. `-FirstInstall -SkipBackup` / `--first-install
 --skip-backup` is only for re-provisioning a board already backed up, and still
 requires `ERASE`. Dry run prints the sequence and confirmation requirement without
-prompting or accessing a device. Update and cleanup never erase.
+prompting or accessing a device. Update and cleanup never erase. First
+installs select manual BOOT/RESET download mode before chip confirmation;
+updates and cleanup first try automatic USB reset, falling back to manual
+instructions and a port correction prompt after a nonzero chip-ID exit.
+The fallback retries once with no reset; a failed retry prevents the write.
 
 The tests exercise the real control flow with fake esptool executables: v4/v5
 erase spelling and backup/erase/write order; refusal of wrong confirmation;
 read failure, short backup, mismatched reads and erase failure; explicit backup
-skip; and app-only update/cleanup. Bash uses a private pseudo-terminal for the
+skip; app-only update/cleanup with automatic reset success, fallback and
+failure; safe SSH target validation; and development/release banners.
+PowerShell also checks Windows OpenSSH selection and PATH fallback.
+Bash uses a private pseudo-terminal for the
 `/dev/tty` prompts. PowerShell supplies queued `Read-Host` replies. The real
 pinned standalone tool is used separately only for dry runs. Its version is
 pinned independently of the tracker release.

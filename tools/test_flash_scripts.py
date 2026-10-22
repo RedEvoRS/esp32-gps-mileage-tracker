@@ -61,6 +61,21 @@ class BashFlashTests(unittest.TestCase):
     def save(self, manifest):
         (self.folder / "manifest.json").write_text(json.dumps(manifest), encoding="ascii")
 
+    def test_server_allowlist_and_release_label(self):
+        for target in ("alias", "alias-1.example", "_alias", "user@host", "user.name-1@127.0.0.1"):
+            self.run_bash('flash_server_valid "$2"', target)
+        for target in ("", "-alias", "-user@host", "user@-host", "user@@host", "@host", "user@",
+                       " alias", "alias ", "alias\n", "alias\r", "alias\t", "user host", "host:22",
+                       "[::1]", "alias/path", "alias\\path", "$(id)", "`id`", "alias;id", "alias&",
+                       "alias|id", "alias*", "alias?", 'alias"', "alias'", "alias%value", "alias=value"):
+            with self.subTest(target=target):
+                self.run_bash('flash_server_valid "$2"', target, success=False)
+        self.assertEqual(self.run_bash('flash_label "$2"', "@" + "RELEASE_TAG" + "@"),
+                         "development checkout")
+        # Match release packaging's global replacement, including helper source.
+        self.helpers = self.helpers.replace("@" + "RELEASE_TAG" + "@", "v0.00-test")
+        self.assertEqual(self.run_bash('flash_label v0.00-test'), "release v0.00-test")
+
     def test_valid_manifest_and_selection(self):
         self.run_bash('flash_validate "$1" false')
         self.assertEqual(self.run_bash('flash_parts "$1" false | cut -f1'), "app")
@@ -153,6 +168,13 @@ class BashFlashTests(unittest.TestCase):
                 self.assertNotIn("--erase-all", command)
                 self.assertEqual(result.stdout.count("read-flash" if major == 5 else "read_flash"), 2 if first else 0)
                 commands = [line for line in result.stdout.splitlines() if line.startswith("DRY RUN:") and "--chip" in line]
+                self.assertIn("Tracker flash (development checkout).", result.stdout)
+                reset = "no-reset" if first else "default-reset"
+                if major == 4:
+                    reset = reset.replace("-", "_")
+                self.assertIn("--before " + reset, commands[0])
+                self.assertIn("--before " + ("no-reset" if major == 5 else "no_reset"), command)
+                self.assertIn("--after " + ("hard-reset" if major == 5 else "hard_reset"), command)
                 erase = "erase-flash" if major == 5 else "erase_flash"
                 self.assertEqual(sum(erase in line for line in commands), 1 if first else 0)
                 if first:
@@ -161,6 +183,14 @@ class BashFlashTests(unittest.TestCase):
                     self.assertIn("LittleFS partition is fully erased; provisioning trip storage.", result.stdout)
                     self.assertIn("Setup complete. Logging trips.", result.stdout)
                 self.assertEqual(list(self.folder.glob("tracker-firmware.*")), [])
+        release_script = self.folder / "release-flash.sh"
+        release_script.write_bytes((ROOT / "install/flash.sh").read_bytes().replace(
+            b"@" + b"RELEASE_TAG" + b"@", b"v0.00-test"))
+        release_args = [str(release_script) if arg == str(ROOT / "install/flash.sh") else arg for arg in args]
+        result = subprocess.run(release_args, capture_output=True, text=True,
+                                env={**os.environ, "TMPDIR": str(self.folder)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Tracker flash (release v0.00-test).", result.stdout)
         (self.folder / "app.bin").write_bytes(b"bad")
         result = subprocess.run(args, capture_output=True, text=True,
                                 env={**os.environ, "TMPDIR": str(self.folder)})
@@ -184,6 +214,15 @@ with open(os.environ["FLASH_TEST_LOG"], "a") as out:
     out.write(json.dumps(args) + "\\n")
 if args == ["version"]:
     print("esptool v" + os.environ["FLASH_TEST_MAJOR"] + ".6.0")
+elif "chip-id" in args or "chip_id" in args:
+    failure = os.environ["FLASH_TEST_FAILURE"]
+    if failure == "stderr":
+        print("Synthetic diagnostic with a successful exit", file=sys.stderr)
+    if failure == "chip" or (failure == "auto" and ("default-reset" in args or "default_reset" in args)):
+        print("Synthetic connection failure on stderr", file=sys.stderr)
+        sys.exit(1)
+elif ("write-flash" in args or "write_flash" in args) and os.environ["FLASH_TEST_FAILURE"] == "write":
+    sys.exit(1)
 elif "read-flash" in args or "read_flash" in args:
     if os.environ["FLASH_TEST_FAILURE"] == "read":
         sys.exit(1)
@@ -229,7 +268,7 @@ elif ("erase-flash" in args or "erase_flash" in args) and os.environ["FLASH_TEST
         for major in (4, 5):
             for options, replies, expected_reads in (
                     (["--first-install"], "\nERASE\n", 2),
-                    ([], "\nyes\nERASE\n", 2),
+                    ([], "yes\n\nERASE\n", 2),
                     (["--first-install", "--skip-backup"], "\nERASE\n", 0)):
                 with self.subTest(major=major, options=options):
                     code, output, commands = self.interactive(options, replies, major=major)
@@ -239,6 +278,7 @@ elif ("erase-flash" in args or "erase_flash" in args) and os.environ["FLASH_TEST
                     self.assertIn("write" + suffix, commands[-1])
                     self.assertEqual(sum("read" + suffix in c for c in commands), expected_reads)
                     self.assertEqual(sum(arg.endswith(".bin") for arg in commands[-1]), 4)
+                    self.assertFalse(any("default-reset" in c or "default_reset" in c for c in commands))
 
     def test_rejected_confirmation_and_backup_failures_block_erase_and_write(self):
         for skip in (False, True):
@@ -261,15 +301,56 @@ elif ("erase-flash" in args or "erase_flash" in args) and os.environ["FLASH_TEST
     def test_update_cleanup_never_erase_and_skip_requires_first(self):
         self.manifest["kind"] = "normal"
         self.save(self.manifest)
-        for options, replies in (([], "\nno\n"), (["--cleanup"], "\n")):
+        for options, replies in (([], "no\n"), (["--cleanup"], "")):
             code, output, commands = self.interactive(options, replies)
             self.assertEqual(code, 0, output)
             self.assertFalse(any("erase-flash" in c or "read-flash" in c for c in commands))
             self.assertEqual(sum(arg.endswith(".bin") for arg in commands[-1]), 1)
+            self.assertIn("default-reset", commands[1])
+            self.assertNotIn("Download mode: hold BOOT", output)
+            self.assertIn("no-reset", commands[-1])
+            self.assertIn("hard-reset", commands[-1])
         for options in (["--skip-backup"], ["--cleanup", "--first-install"]):
             code, _, commands = self.interactive(options, "\n")
             self.assertNotEqual(code, 0)
             self.assertEqual(commands, [])
+
+    def test_automatic_reset_fallback_and_failures(self):
+        self.manifest["kind"] = "normal"
+        self.save(self.manifest)
+        for major in (4, 5):
+            auto, no_reset, hard_reset, chip, write = (
+                ("default-reset", "no-reset", "hard-reset", "chip-id", "write-flash") if major == 5 else
+                ("default_reset", "no_reset", "hard_reset", "chip_id", "write_flash"))
+            for cleanup in (False, True):
+                options, replies = (["--cleanup"], "") if cleanup else ([], "no\n")
+                code, output, commands = self.interactive(options, replies, major=major)
+                self.assertEqual(code, 0, output)
+                self.assertEqual(len(commands), 3)
+                self.assertIn(auto, commands[1])
+                self.assertNotIn("Download mode: hold BOOT", output)
+                for failure in ("auto", "chip"):
+                    with self.subTest(major=major, cleanup=cleanup, failure=failure):
+                        code, output, commands = self.interactive(
+                            options, replies + "\n/dev/changed\n", failure, major)
+                        self.assertEqual(code == 0, failure == "auto", output)
+                        self.assertIn(auto, commands[1])
+                        self.assertIn(chip, commands[2])
+                        self.assertIn(no_reset, commands[2])
+                        self.assertIn("/dev/changed", commands[2])
+                        self.assertIn("Download mode: hold BOOT", output)
+                        self.assertEqual(sum(write in c for c in commands), 1 if failure == "auto" else 0)
+                        if failure == "auto":
+                            self.assertIn("/dev/changed", commands[-1])
+                            self.assertIn(no_reset, commands[-1])
+                            self.assertIn(hard_reset, commands[-1])
+                            self.assertEqual(sum(arg.endswith(".bin") for arg in commands[-1]), 1)
+                code, output, commands = self.interactive(options, replies, "write", major)
+                self.assertNotEqual(code, 0, output)
+                self.assertEqual(len(commands), 3)
+                code, output, commands = self.interactive(options, replies, "stderr", major)
+                self.assertEqual(code, 0, output)
+                self.assertEqual(len(commands), 3)
 
 
 if __name__ == "__main__":
