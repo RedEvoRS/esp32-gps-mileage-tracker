@@ -196,13 +196,17 @@ def next_trip(trip, trips, unreadable):
         current_start = _parse_iso(trip["start_time"])
         for damaged in unreadable:
             damaged_device = damaged.get("device_id")
-            if not _known_device(damaged_device):
-                return None, "Cannot establish the next trip: an unreadable summary has an unknown device. Repair the summary before merging."
-            if damaged_device != device:
+            if _known_device(damaged_device) and damaged_device != device:
                 continue
+            # A damaged summary usually has no readable device, so its
+            # timestamp ID is the evidence: one provably outside this gap
+            # can't be the trip in between, whatever device recorded it.
             damaged_start = _unreadable_start(damaged)
-            if damaged_start is None or current_start <= damaged_start <= start:
-                return None, "Cannot establish the next trip: an unreadable summary from this device may fall between these recordings. Repair the summary before merging."
+            if damaged_start is not None and not current_start <= damaged_start <= start:
+                continue
+            if not _known_device(damaged_device):
+                return None, "Cannot establish the next trip: an unreadable summary with an unknown device may fall between these recordings. Repair the summary before merging."
+            return None, "Cannot establish the next trip: an unreadable summary from this device may fall between these recordings. Repair the summary before merging."
         return candidate, ""
     return None, ""
 

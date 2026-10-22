@@ -253,7 +253,7 @@ class ViewerMerges(unittest.TestCase):
         with self.assertLogs(self.viewer.app.logger, "WARNING"):
             self.assertEqual(self.merge(a, b).status_code, 409)
             page = self.client.get(f"/trip/{a}").get_data(as_text=True)
-        self.assertIn("an unreadable summary has an unknown device", page)
+        self.assertIn("an unreadable summary with an unknown device may fall between", page)
         self.assertNotIn("No eligible next trip", page)
 
     def test_damaged_summary_from_another_device_does_not_block(self):
@@ -322,15 +322,25 @@ class ViewerMerges(unittest.TestCase):
             (self.data / (key + ".json")).unlink()
             (self.data / (key + ".gpx")).unlink()
 
-    def test_unidentified_damaged_device_blocks_even_with_old_timestamp(self):
+    def test_unidentified_damaged_device_outside_window_does_not_block(self):
+        # A timestamp ID proves chronology whatever device recorded it.
         a, b = self.trip("a", 0), self.trip("b", 120)
         for device in (None, "", "unknown", {"invalid": "device"}):
             key = self.trip("2026-03-14T12-00-00Z", -31 * 86400)
-            self.damage_summary(key, device_id=device)
+            self.damage_summary(key, device_id=device, start_time=None)
+            with self.subTest(device=device), self.assertLogs(self.viewer.app.logger, "WARNING"):
+                page = self.client.get(f"/trip/{a}").get_data(as_text=True)
+            self.assertIn(">Merge with next trip</button>", page)
+
+    def test_unidentified_damaged_device_in_window_blocks(self):
+        a, b = self.trip("a", 0), self.trip("b", 120)
+        for device in (None, "", "unknown", {"invalid": "device"}):
+            key = self.trip("2026-04-14T12-01-30Z", 90)
+            self.damage_summary(key, device_id=device, start_time=None)
             with self.subTest(device=device), self.assertLogs(self.viewer.app.logger, "WARNING"):
                 response = self.merge(a, b)
             self.assertEqual(response.status_code, 409)
-            self.assertIn("unknown device", response.get_data(as_text=True))
+            self.assertIn("unknown device may fall between", response.get_data(as_text=True))
 
     def test_malformed_tracks_are_refused_without_hiding_originals(self):
         a, b = self.trip("a", 0), self.trip("b", 120, .001)
