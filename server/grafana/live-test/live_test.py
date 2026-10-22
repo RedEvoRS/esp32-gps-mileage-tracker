@@ -2,7 +2,7 @@
 
 Usage: python live_test.py [--keep]   (needs Docker; takes about 6 minutes)
 --keep leaves the stack running, to look at Grafana on http://127.0.0.1:13000
-(admin / live-test-admin); remove it later with "docker compose down -v".
+(admin / live-test-admin); remove it later with "docker compose down -v --rmi local".
 
 Starts the throwaway stack in docker-compose.yml, feeds the real ingest a fake
 device ("tbeam-test"), then checks the monitor's /metrics output, the
@@ -304,7 +304,8 @@ def main():
         out = compose("logs", "--no-color", "monitor", check_result=False).stdout
         print("-- monitor log tail --\n" + "\n".join(out.splitlines()[-12:]))
         if "--keep" not in sys.argv:
-            compose("down", "-v", "--remove-orphans", check_result=False)
+            compose("down", "-v", "--rmi", "local", "--remove-orphans",
+                    check_result=False)
     print("%d/%d checks passed" % (sum(RESULTS), len(RESULTS)))
     return 0 if all(RESULTS) else 1
 

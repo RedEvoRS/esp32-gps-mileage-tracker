@@ -310,12 +310,16 @@ git clone https://github.com/RedEvoRS/esp32-gps-mileage-tracker.git
 cd esp32-gps-mileage-tracker
 ```
 
-Use the [manual server copy](DEPLOY_DEBIAN.md#manual-alternative-copy-server)
-and the [Arduino IDE / arduino-cli source route](firmware/README.md#advanced-build-from-source).
-That route keeps the progressive hardware-test sketches, copying
+Follow the [Arduino IDE / arduino-cli source route](firmware/README.md#advanced-build-from-source).
+It is an ordered checklist from installing the tools to uploading. That
+route keeps the progressive hardware-test sketches, copying
 `firmware/secrets.h.example` to `firmware/04_trip_logger/secrets.h`, version
 stamping, and the Supreme board/library settings. First flash still requires
 a factory backup and a one-time erase; later uploads keep erase disabled.
+
+Separately, if you also want to install the server by hand rather than with
+the setup script, see the
+[manual server copy](DEPLOY_DEBIAN.md#manual-alternative-copy-server).
 
 ## The data
 

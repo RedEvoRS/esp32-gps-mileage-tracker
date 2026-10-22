@@ -176,10 +176,27 @@ requires `ERASE`. Do not use it to work around a failed first backup.
 ## Advanced: build from source
 
 The remaining hardware-test and build instructions are for a local source
-build. Clone the repository or download its source ZIP, install the Arduino
-tools below, and prepare Stage 4 settings as described under
-[the trip logger](#stage-4-the-trip-logger). The scripts above build that
-same logger on the server.
+build. The scripts above build that same logger on the server. To build it
+yourself, work through these steps in order:
+
+1. Clone the repository or download its source ZIP.
+2. Install the Arduino IDE or arduino-cli: see
+   [Install Arduino IDE](#install-arduino-ide) or
+   [With arduino-cli](#with-arduino-cli).
+3. Install the ESP32 core, version 3.3.11:
+   [Add ESP32 board support](#add-esp32-board-support).
+4. Install the three libraries:
+   [Install required libraries](#install-required-libraries).
+5. Apply the [board settings](#board-settings).
+6. Stage 4 only: create `secrets.h` and run the version stamp. Stages 1-3
+   compile without `secrets.h`, but Stage 4 won't compile without it. Follow
+   [Before flashing](#stage-4-the-trip-logger) and
+   [Upload a sketch](#upload-a-sketch-and-read-its-messages). Run the version
+   stamp before every Stage 4 build.
+7. Compile and upload the sketch.
+
+Back up the factory flash before your first upload: see
+[Back up the factory flash first](#back-up-the-factory-flash-first).
 
 ## T-Beam Supreme bring-up
 
@@ -225,8 +242,10 @@ In the Arduino IDE pick **Tools → Board → esp32 → ESP32S3 Dev Module**, th
 - **PSRAM:** QSPI PSRAM
 
 For Stage 4, its bundled `partitions.csv` overrides the **Partition Scheme**
-menu. Leave **Erase All Flash Before Sketch Upload → Disabled**, except
-for the [first Stage 4 upload](#first-flash-on-a-new-board).
+menu (but not the compiler's size check; see
+[the size-check note](#stage-4-size-check)). Leave **Erase All Flash Before
+Sketch Upload → Disabled**, except for the
+[first Stage 4 upload](#first-flash-on-a-new-board).
 
 Install the libraries from [Install required libraries](#install-required-libraries) below.
 The same settings as an arduino-cli fully qualified board name (FQBN),
@@ -376,13 +395,44 @@ install the version for your operating system.
 
 1. Open **File → Preferences** (**Arduino IDE → Settings** on macOS).
 2. In **Additional boards manager URLs**, add:
-   https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+   https://espressif.github.io/arduino-esp32/package_esp32_index.json
 3. Open **Tools → Board → Boards Manager**, search for `esp32`, and install
    **esp32 by Espressif Systems**, version **3.3.11**.
 
 The project's automated compile checks (CI) pin core **3.3.11**. Select it
 explicitly: Boards Manager otherwise installs the newest version. The
 logger relies on 3.x behaviour; do not use a 2.x core.
+
+### With arduino-cli
+
+This is the route CI and the server's firmware builder use. It needs
+arduino-cli **1.5.1**, the version CI pins. Download the build for your
+system from
+https://github.com/arduino/arduino-cli/releases/tag/v1.5.1 and put
+`arduino-cli` on your `PATH`. Then, from the repository root:
+
+```bash
+U=https://espressif.github.io/arduino-esp32/package_esp32_index.json
+arduino-cli core update-index --additional-urls "$U"
+arduino-cli core install esp32:esp32@3.3.11 --additional-urls "$U"
+arduino-cli lib update-index
+arduino-cli lib install XPowersLib@0.3.3 TinyGPSPlus@1.0.3 U8g2@2.36.18
+arduino-cli compile --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled firmware/03_gps_test
+```
+
+Replace `03_gps_test` with the sketch you want. Stages 1-3 need nothing
+else. For Stage 4, first create `secrets.h` and run the version stamp (see
+[Before flashing](#stage-4-the-trip-logger)), then add one more option to
+the compile command:
+
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled --build-property upload.maximum_size=1572864 firmware/04_trip_logger
+```
+
+Without that option the compiler checks Stage 4 against the wrong size
+limit; see [the size-check note](#stage-4-size-check). Uploading with
+arduino-cli needs `arduino-cli upload` with `--port` and the same
+`--fqbn`; the IDE route below does this for you.
 
 ### Configure board settings
 
@@ -655,6 +705,20 @@ Before flashing:
    Partition Scheme**. Internal fallback holds roughly 5–6 hours of driving;
    the [microSD card](#microsd-card) holds far more. A full trip store ends
    the current trip and prevents another until space is freed.
+
+   <a id="stage-4-size-check"></a>
+   **The compiler's size limit is lower than the partition.** A source build
+   prints a line like `Maximum is 1310720 bytes`. That number comes from the
+   board menu's default Partition Scheme, not from `partitions.csv`. The real
+   app partition is 1,572,864 bytes. Today's build fits either limit, but
+   once Stage 4 grows past 1,310,720 bytes, a plain compile refuses to
+   build it even though it still fits the board. arduino-cli users pass
+   `--build-property upload.maximum_size=1572864` (see
+   [With arduino-cli](#with-arduino-cli)). The Arduino IDE has no setting
+   for this, so if a future build is refused for size, build it with
+   arduino-cli. Don't pick a larger Partition Scheme to silence it: the
+   menu's bigger limit would let an image bigger than the real 1.5 MB
+   partition pass the check.
 3. **Prepare diagnostics enrollment.** Follow [deployment Step 8](../DEPLOY_DEBIAN.md#step-8--point-the-firmware-at-it)
    to read the server's snapshot revision and set the two one-use enrollment
    defines. A snapshot is the board's current diagnostic state; its revision
