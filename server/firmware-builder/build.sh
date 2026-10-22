@@ -31,7 +31,7 @@ HELP
 }
 
 main() {
-    local noninteractive=0 test_data='' arg uid gid
+    local noninteractive=0 test_data='' arg uid gid image_inputs cached_inputs
     while (($#)); do
         arg=$1; shift
         case "$arg" in
@@ -58,7 +58,26 @@ main() {
     chmod 700 "$PRIVATE_DIR"
     python3 "$SCRIPT_DIR/builder.py" configure "$INSTALL_DIR" "$PRIVATE_DIR" "$noninteractive"
     # Only public builder files are in this context. Toolchain layers are cached.
-    docker build --platform linux/amd64 -t "$IMAGE" "$SCRIPT_DIR"
+    # A saved/loaded image can lose backend-specific build cache. Reuse the
+    # image itself only when every allowed context input matches its label.
+    image_inputs=$(python3 - "$SCRIPT_DIR" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+digest = hashlib.sha256()
+for name in (".dockerignore", "Dockerfile", "builder.py", "pins.env"):
+    digest.update(name.encode() + b"\0" + hashlib.sha256((root / name).read_bytes()).digest())
+print(digest.hexdigest())
+PY
+    )
+    cached_inputs=$(docker image inspect --format '{{ index .Config.Labels "tracker.builder-inputs" }}' "$IMAGE" 2>/dev/null || true)
+    if [[ $cached_inputs != "$image_inputs" ]]; then
+        docker build --platform linux/amd64 --cache-from "$IMAGE" \
+            --build-arg BUILDKIT_INLINE_CACHE=1 --label "tracker.builder-inputs=$image_inputs" \
+            -t "$IMAGE" "$SCRIPT_DIR"
+    fi
     CONTAINER="mileage-firmware-build-$(basename -- "$PRIVATE_DIR" | tr '[:upper:].' '[:lower:]-')"
     if [[ -n $test_data ]]; then
         test_data=$(cd -- "$test_data" && pwd)
