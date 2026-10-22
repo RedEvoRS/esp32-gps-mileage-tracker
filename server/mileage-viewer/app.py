@@ -1067,15 +1067,54 @@ ACCOUNT_HEADER = """
 </form></div></header>{% endif %}
 """
 
+PASSWORD_FIELDS = """
+<label>New password <input type="password" name="password" minlength="8" maxlength="1024" autocomplete="new-password" required></label>
+<label>Confirm new password <input type="password" name="confirm_password" minlength="8" maxlength="1024" autocomplete="new-password" required></label>
+"""
+
 ACCOUNT_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{ title }}</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """</style></head><body>
+<title>{{ title }}</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """
+.login-form { max-width: 420px; margin-bottom: 20px; }
+.login-table { overflow-x: auto; }
+.login-table td { vertical-align: top; }
+.login-table form { margin: 8px 0; }
+.login-table input[type=password] { min-width: 180px; }
+.account-name { overflow-wrap: anywhere; }
+</style></head><body>
 """ + ACCOUNT_HEADER + """<main class="wrap"><h1>{{ title }}</h1>
+{% if message %}<p role="status">{{ message }}</p>{% endif %}
 {% if title == 'Admin' %}<p>{{ admin_username }}: Admin (set in viewer.env)</p>
-<table><tr><th>Everyday login</th><th>Status</th><th>Created</th></tr>
+<h2>Everyday logins</h2><div class="login-table">
+<table><tr><th>Everyday login</th><th>Status</th><th>Created ({{ timezone }})</th><th>Actions</th></tr>
 {% for user in logins %}<tr><td>{{ user.username }}</td><td>{{ 'disabled' if user.disabled else 'enabled' }}</td>
-<td>{{ fmt_date(user.created_at) }}</td></tr>{% endfor %}</table>
-{% else %}<p>The admin password lives in viewer.env. Rerun <code>bash install.sh</code> and answer n to keeping the login to change it.</p>{% endif %}
+<td>{{ fmt_date(user.created_at) }}</td><td>
+<form method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<input type="hidden" name="username" value="{{ user.username }}">
+<input type="hidden" name="action" value="reset-password">
+""" + PASSWORD_FIELDS + """<button class="btn" type="submit">Reset password for {{ user.username }}</button></form>
+<form method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<input type="hidden" name="username" value="{{ user.username }}">
+<input type="hidden" name="action" value="{{ 'enable' if user.disabled else 'disable' }}">
+<button class="btn secondary" type="submit">{{ 'Enable' if user.disabled else 'Disable' }} {{ user.username }}</button></form>
+<form method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<input type="hidden" name="username" value="{{ user.username }}">
+<input type="hidden" name="action" value="remove">
+<label><input type="checkbox" name="confirm" value="yes" required> Confirm removing {{ user.username }}</label>
+<button class="btn secondary" type="submit">Remove {{ user.username }}</button></form>
+</td></tr>{% else %}<tr><td colspan="4">No everyday logins.</td></tr>{% endfor %}</table></div>
+<h2>Add everyday login</h2><form method="post" class="login-form">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="add">
+<label>Username <input type="text" name="username" maxlength="64" autocomplete="off" required></label>
+""" + PASSWORD_FIELDS + """<button class="btn" type="submit">Add everyday login</button></form>
+{% elif g.role == 'admin' %}<p>The admin password lives in viewer.env. Rerun <code>bash install.sh</code> and answer n to keeping the login to change it.</p>
+{% else %}<form method="post" class="login-form">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<label>Current password <input type="password" name="current_password" autocomplete="current-password" required></label>
+""" + PASSWORD_FIELDS + """<button class="btn" type="submit">Change password</button></form>{% endif %}
 </main></body></html>
 """
 
@@ -1559,15 +1598,62 @@ def login():
     return render_template_string(LOGIN_HTML, error=error)
 
 
-@app.route("/admin")
+def _confirmed_password():
+    password = request.form.get("password", "")
+    if password != request.form.get("confirm_password", ""):
+        raise users.UserError("Passwords don't match.")
+    users.validate_password(password)
+    return password
+
+
+@app.route("/admin", methods=["GET", "POST"])
 def admin():
+    if request.method == "POST":
+        try:
+            action = request.form.get("action", "")
+            username = request.form.get("username", "")
+            password = _confirmed_password() if action in {"add", "reset-password"} else None
+            if action == "remove" and request.form.get("confirm") != "yes":
+                raise users.UserError("Confirm removing this login.")
+            users.change_user(DB_PATH, action, username, password, VIEWER_USERNAME)
+            session["account_message"] = "Everyday login updated."
+        except users.UserError as exc:
+            session["account_message"] = str(exc)
+        return redirect(url_for("admin"))
     return render_template_string(ACCOUNT_HTML, title="Admin", admin_username=VIEWER_USERNAME,
-                                  logins=users.list_users(DB_PATH))
+                                  logins=users.list_users(DB_PATH), timezone=DISPLAY_TZ_NAME,
+                                  message=session.pop("account_message", None))
 
 
-@app.route("/account/password")
+@app.route("/account/password", methods=["GET", "POST"])
 def account_password():
-    return render_template_string(ACCOUNT_HTML, title="Change password")
+    if request.method == "POST" and g.role == "editor":
+        ip = _client_ip()
+        if _lock_seconds_remaining(ip):
+            return render_template_string(ACCOUNT_HTML, title="Change password",
+                                          message="Too many failed attempts. Try again later."), 429
+        user = users.get_user(DB_PATH, g.user)
+        # A concurrent removal still takes one hash check and fails closed.
+        valid = check_password_hash(user["password_hash"] if user else DUMMY_PASSWORD_HASH,
+                                    request.form.get("current_password", ""))
+        if not valid or user is None:
+            _record_failure(ip)
+            session["account_message"] = "Incorrect current password."
+        else:
+            try:
+                password = _confirmed_password()
+                updated = users.change_user(DB_PATH, "reset-password", g.user, password, VIEWER_USERNAME,
+                                             expected_tag=session["pw_tag"], secret_key=VIEWER_SECRET_KEY)
+                session["pw_tag"] = users.session_tag(VIEWER_SECRET_KEY, updated)
+                _clear_failures(ip)
+                session["account_message"] = "Password changed. Other sessions for this login have ended."
+            except users.UserError as exc:
+                session["account_message"] = str(exc)
+        return redirect(url_for("account_password"))
+    if request.method == "POST":
+        return redirect(url_for("account_password"))
+    return render_template_string(ACCOUNT_HTML, title="Change password",
+                                  message=session.pop("account_message", None))
 
 
 @app.route("/logout", methods=["POST"])

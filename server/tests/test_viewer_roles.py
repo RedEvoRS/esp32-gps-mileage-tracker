@@ -93,18 +93,39 @@ class ViewerRolesTests(unittest.TestCase):
         endpoints = {rule.endpoint for rule in self.viewer.app.url_map.iter_rules()}
         self.assertEqual(endpoints, set(routes))
         self.assertFalse(endpoints - {'static', 'health', 'login'} - self.viewer.ENDPOINT_ROLES.keys())
+        cases = [(endpoint, *case) for endpoint, case in routes.items()]
+        cases.extend([
+            ('login', '/login', 'POST', 302),
+            ('admin', '/admin', 'POST', 302),
+            ('account_password', '/account/password', 'POST', 302),
+        ])
+        declared_methods = {(rule.endpoint, method) for rule in self.viewer.app.url_map.iter_rules()
+                            for method in rule.methods & {'GET', 'POST'}}
+        self.assertEqual(declared_methods, {(endpoint, method) for endpoint, _, method, _ in cases})
         for role in (None, 'editor', 'admin'):
-            for endpoint, (path, method, status) in routes.items():
-                with self.subTest(role=role, endpoint=endpoint):
+            for endpoint, path, method, status in cases:
+                with self.subTest(role=role, endpoint=endpoint, method=method):
                     self.signed_in(role)
                     expected = status
                     if role is None:
-                        expected = (200 if endpoint in {'health', 'login'} else (302 if method == 'GET' else 401))
+                        expected = (200 if endpoint == 'health' or (endpoint == 'login' and method == 'GET')
+                                    else (302 if method == 'GET' else 401))
                     elif endpoint == 'admin' and role == 'editor':
                         expected = 403
                     response = self.client.open(path, method=method, data={'csrf_token': 'known-token'})
                     self.assertEqual(response.status_code, expected)
                     response.close()
+
+    def test_disabled_login_has_generic_error_and_counts_failure(self):
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('UPDATE users SET disabled=1')
+        with patch.object(self.viewer, 'check_password_hash', wraps=self.viewer.check_password_hash) as check:
+            response = self.login('helper')
+            self.assertEqual(check.call_count, 1)
+        self.assertEqual(response.status_code, 401)
+        self.assertIn(b'Incorrect username or password.', response.data)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute('SELECT fails FROM login_attempts').fetchone()[0], 1)
 
     def test_missing_policy_denied_and_role_precedes_csrf(self):
         self.viewer.app.add_url_rule('/unlisted', 'unlisted', lambda: 'private', methods=['GET', 'POST'])
