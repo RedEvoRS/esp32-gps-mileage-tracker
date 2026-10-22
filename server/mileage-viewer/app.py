@@ -11,6 +11,8 @@ provides a small web UI to:
     a free-text note and destination
   - select a local calendar year and export trips and totals to CSV or XLSX
   - inspect device health and diagnostic history at /device-health
+  - (admin) remove a trip from the log and restore it, at /admin/removed
+  - (admin) review a year's log and close or reopen it for edits, at /admin/year/<YYYY>
 
 Design notes:
   - The GPX/JSON files are the immutable source of truth and are mounted
@@ -18,13 +20,21 @@ Design notes:
   - This service owns annotations.db (SQLite), including annotations and
     merge membership keyed by relative path "YYYY-MM/<id>". If that DB is lost, every
     trip still lists and maps fine -- annotations and merges are gone.
+  - Removing a trip from the log is a row in annotations.db (trip_removals),
+    never a change under the data root: the files stay, and a restore is
+    deleting the row. _load_trips() is the one place removed trips leave the
+    log, so the list, totals, exports and merge suggestions all agree.
+  - A closed year is a tax_years row. While it exists, annotate, merge,
+    undo merge, remove and restore refuse trips in that year (409) for both
+    roles; viewing, exports and place lookup are untouched.
   - Trips are identified in URLs by <ym>/<id> (e.g. 2026-04/2026-04-14...).
     Both components are strictly validated to prevent path traversal.
 
 Authentication:
-  - Every route except /health requires a logged-in session. Credentials
-    come from the environment (VIEWER_USERNAME + VIEWER_PASSWORD_HASH);
-    the plaintext password is never stored anywhere.
+  - The environment login is the admin; everyday editor logins live in
+    annotations.db. Roles are resolved from current server state on every
+    request. All registered private endpoints declare their allowed roles.
+    Passwords are stored only as hashes, never as plaintext.
   - Sessions are signed with VIEWER_SECRET_KEY. That key MUST be supplied
     from the environment and be stable: gunicorn runs multiple workers,
     and a per-process random key would mean a session minted by worker A
@@ -56,6 +66,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import (
     Flask,
+    g,
     abort,
     jsonify,
     redirect,
@@ -66,7 +77,7 @@ from flask import (
     url_for,
 )
 from openpyxl import Workbook
-from werkzeug.security import check_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.exceptions import HTTPException
 
 # Support source-tree importlib tests and the container's flat /app layout.
@@ -78,7 +89,9 @@ from common.version import server_version
 
 from common.diagnostics import CatalogError, load_catalog
 from geocoding import Geocoder, GeocodeError
+import trip_log
 import trip_merges
+import users
 
 try:
     DIAGNOSTICS_CATALOG = load_catalog()
@@ -87,6 +100,7 @@ except CatalogError as exc:
 DIAGNOSTICS_CODES = {row["code"]: row for row in DIAGNOSTICS_CATALOG["codes"]}
 DIAGNOSTICS_SEVERITIES = ("info", "warning", "error", "critical")
 DIAGNOSTICS_PAGE_SIZE = 50
+TRIP_HISTORY_PAGE_SIZE = 50
 
 
 # ---------------------------------------------------------------------
@@ -141,6 +155,32 @@ LOCKOUT_MINUTES = 15
 # /health stays open for Docker and reports the public server build version.
 # Everything else -- including /static and GPX files -- needs a session.
 PUBLIC_ENDPOINTS = {"health", "login"}
+
+# Keep all role decisions here. New endpoints are denied until declared.
+ENDPOINT_ROLES = {
+    "static": {"admin", "editor"},
+    "index": {"admin", "editor"},
+    "trip_view": {"admin", "editor"},
+    "trip_gpx": {"admin", "editor"},
+    "annotate": {"admin", "editor"},
+    "lookup_place": {"admin", "editor"},
+    "merge_trip": {"admin", "editor"},
+    "split_trip": {"admin", "editor"},
+    "export_csv": {"admin", "editor"},
+    "export_xlsx": {"admin", "editor"},
+    "device_health": {"admin", "editor"},
+    "logout": {"admin", "editor"},
+    "admin": {"admin"},
+    "admin_removed": {"admin"},
+    "admin_history": {"admin"},
+    "admin_year": {"admin"},
+    "close_year": {"admin"},
+    "reopen_year": {"admin"},
+    "remove_trip": {"admin"},
+    "restore_trip": {"admin"},
+    "account_password": {"admin", "editor"},
+}
+DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32))
 
 
 def _startup_check():
@@ -225,8 +265,10 @@ def init_db():
         columns = {row[1] for row in conn.execute("PRAGMA table_info(annotations)")}
         if "destination" not in columns:
             conn.execute("ALTER TABLE annotations ADD COLUMN destination TEXT NOT NULL DEFAULT ''")
+        users.init_schema(conn)
         Geocoder.init_schema(conn)
         trip_merges.init_schema(conn)
+        trip_log.init_schema(conn)
         # Failed-login tracking. This lives in SQLite, not in a module
         # global, because gunicorn runs 2 workers -- an in-memory counter
         # would give an attacker MAX_FAILS attempts per worker and would
@@ -237,6 +279,19 @@ def init_db():
                 ip           TEXT PRIMARY KEY,
                 fails        INTEGER NOT NULL DEFAULT 0,
                 locked_until TEXT
+            )
+            """
+        )
+        # Which usernames the failures in login_attempts.fails were against.
+        # A success may only subtract its own username's share; login_attempts
+        # stays the per-IP count and lock, so clearing it unlocks everyone.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS login_attempt_names (
+                ip    TEXT NOT NULL,
+                name  TEXT NOT NULL,
+                fails INTEGER NOT NULL,
+                PRIMARY KEY (ip, name)
             )
             """
         )
@@ -299,9 +354,19 @@ def _lock_seconds_remaining(ip):
     return int(remaining) if remaining > 0 else 0
 
 
-def _record_failure(ip):
-    """Count a bad password and lock the IP once it hits MAX_FAILS."""
+def _failure_name(username):
+    # Case-insensitive, and bounded so a flood of long names can't grow a row.
+    return (username or "").casefold()[:128]
+
+
+def _record_failure(ip, username=""):
+    """Count a bad password and lock the IP once it hits MAX_FAILS.
+
+    The lock and total are per IP, whichever username was tried; the name
+    is kept only so a later success can subtract its own failures.
+    """
     now = datetime.now(timezone.utc)
+    name = _failure_name(username)
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         # Reserve the writer before reading: workers must not both read
         # the same count, then overwrite each other's increment.
@@ -309,6 +374,11 @@ def _record_failure(ip):
         row = conn.execute(
             "SELECT fails, locked_until FROM login_attempts WHERE ip = ?", (ip,)
         ).fetchone()
+        if not row:
+            # Name counts only describe a login_attempts row. A manual
+            # DELETE FROM login_attempts leaves them behind; drop them so
+            # they can't be subtracted from failures counted after the unlock.
+            conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
         # Another request may have established the lock while this request
         # was checking its password. Its failure must not clear that lock.
         if row and row[1] and datetime.fromisoformat(row[1]) > now:
@@ -317,8 +387,16 @@ def _record_failure(ip):
         if fails >= MAX_FAILS:
             locked_until = (now + timedelta(minutes=LOCKOUT_MINUTES)).isoformat()
             fails = 0  # start a fresh count once the lock expires
+            conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
         else:
             locked_until = None
+            conn.execute(
+                """
+                INSERT INTO login_attempt_names (ip, name, fails) VALUES (?, ?, 1)
+                ON CONFLICT(ip, name) DO UPDATE SET fails = fails + 1
+                """,
+                (ip, name),
+            )
         conn.execute(
             """
             INSERT INTO login_attempts (ip, fails, locked_until)
@@ -331,9 +409,36 @@ def _record_failure(ip):
         )
 
 
-def _clear_failures(ip):
+def _clear_failures(ip, username):
+    """Forget this IP's failures against `username` only.
+
+    Anyone who holds one valid login could otherwise reset the count between
+    guesses at another account's password. Failures against other names (or
+    unknown ones) keep counting toward the IP's lock.
+    """
+    name = _failure_name(username)
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
-        conn.execute("DELETE FROM login_attempts WHERE ip = ?", (ip,))
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT fails, locked_until FROM login_attempts WHERE ip = ?", (ip,)
+        ).fetchone()
+        if not row:
+            conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
+            return
+        if row[1] and datetime.fromisoformat(row[1]) > datetime.now(timezone.utc):
+            return  # a lock set by a concurrent request stands
+        own = conn.execute(
+            "SELECT fails FROM login_attempt_names WHERE ip = ? AND name = ?", (ip, name)
+        ).fetchone()
+        if not own:
+            return
+        conn.execute("DELETE FROM login_attempt_names WHERE ip = ? AND name = ?", (ip, name))
+        fails = max(0, row[0] - own[0])
+        if fails:
+            conn.execute("UPDATE login_attempts SET fails = ? WHERE ip = ?", (fails, ip))
+        else:
+            conn.execute("DELETE FROM login_attempts WHERE ip = ?", (ip,))
+            conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
 
 
 def _safe_equal(a, b):
@@ -372,11 +477,26 @@ def _password_tag():
 
 
 def _is_logged_in():
-    return (
-        bool(VIEWER_USERNAME)
-        and session.get("user") == VIEWER_USERNAME
-        and _safe_equal(session.get("pw_tag", ""), _password_tag())
-    )
+    # The cookie identifies a session, never grants a role on its own.
+    g.role = None
+    g.user = None
+    if session.get("kind") == "editor":
+        username = session.get("user", "")
+        try:
+            users.validate_username(username, VIEWER_USERNAME)
+        except users.UserError:
+            return False
+        user = users.get_user(DB_PATH, username)
+        if (user is not None and not user["disabled"]
+                and _safe_equal(session.get("pw_tag", ""), users.session_tag(VIEWER_SECRET_KEY, user))):
+            g.role, g.user = "editor", user["username"]
+            return True
+        return False
+    if (bool(VIEWER_USERNAME) and session.get("user") == VIEWER_USERNAME
+            and _safe_equal(session.get("pw_tag", ""), _password_tag())):
+        g.role, g.user = "admin", VIEWER_USERNAME
+        return True
+    return False
 
 
 def _valid_csrf():
@@ -412,10 +532,18 @@ def _require_login():
 
 
 @app.before_request
+def _require_role():
+    if request.endpoint in PUBLIC_ENDPOINTS or request.endpoint is None:
+        return None
+    if g.role not in ENDPOINT_ROLES.get(request.endpoint, set()):
+        abort(403)
+
+
+@app.before_request
 def _csrf_protect():
     """Reject state-changing requests without a matching session token.
 
-    Registered after _require_login, so it only ever sees authenticated
+    Registered after _require_login and _require_role, so it only ever sees authenticated
     requests. /login validates its own token inside the view, where it can
     show a friendly message instead of a bare 400.
     """
@@ -518,17 +646,17 @@ def read_summary(json_path):
     }, None
 
 
-def load_trips(conn=None):
+def load_trips(conn=None, include_removed=False):
     if conn is not None:
-        return _load_trips(conn)
+        return _load_trips(conn, include_removed)
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         conn.row_factory = sqlite3.Row
         # Serialize cache refreshes with edits/merges across gunicorn workers.
         conn.execute("BEGIN IMMEDIATE")
-        return _load_trips(conn)
+        return _load_trips(conn, include_removed)
 
 
-def _load_trips(conn):
+def _load_trips(conn, include_removed=False):
     """Scan DATA_ROOT for trips and join annotations.
 
     Returns (trips, unreadable). trips is sorted by its date anchor descending,
@@ -537,6 +665,11 @@ def _load_trips(conn):
     trips whose summary read_summary() rejected or couldn't find, sorted
     by trip_key, retaining usable device/start identity but no mileage, plus
     problem. Their miles are unknown, so they're reported, never counted.
+
+    Trips the admin removed from the log are left out of both lists. With
+    include_removed (the admin's views) they stay, each carrying a "removal"
+    dict (reason, removed_by, removed_at); callers that feed totals, exports
+    or merge suggestions must not ask for them.
     """
     annotations = {r["trip_key"]: dict(r) for r in conn.execute("SELECT * FROM annotations")}
     trips, unreadable = [], []
@@ -570,9 +703,44 @@ def _load_trips(conn):
             trips.append(trip)
 
     trips, unreadable = trip_merges.apply_merges(conn, DATA_ROOT, trips, unreadable)
+    # Removal is keyed by the canonical key the list shows (a merged trip's
+    # merge key, a part never), so filtering here, after the merges, hides a
+    # merged trip as a whole. This is the only place that filters: the list,
+    # totals, exports and next_trip all take their input from this function.
+    # An unreadable trip that is removed also leaves next_trip's "an
+    # unreadable summary may fall between" guard. That is intended: removing
+    # it is how the admin clears that warning.
+    removed = trip_log.removals(conn)
+    if include_removed:
+        trips = [{**t, "removal": removed[t["trip_key"]]} if t["trip_key"] in removed else t
+                 for t in trips]
+        unreadable = [{**t, "removal": removed[t["trip_key"]]} if t["trip_key"] in removed else t
+                      for t in unreadable]
+    else:
+        trips = [t for t in trips if t["trip_key"] not in removed]
+        unreadable = [t for t in unreadable if t["trip_key"] not in removed]
     trips.sort(key=lambda t: _trip_date_anchor(t) or "", reverse=True)
     unreadable.sort(key=lambda t: t["trip_key"])
     return trips, unreadable
+
+
+def load_trips_for_merging(conn=None):
+    """(trips, unreadable, removed) for merge suggestions and the merge route.
+
+    trips and unreadable are the standard lists. removed holds the readable
+    trips the admin removed, which next_trip must still see so a merge never
+    bridges one. A removed unreadable trip is dropped: its miles are never
+    counted, and removing it is how the admin clears the unreadable warning.
+    """
+    return split_removed(*load_trips(conn, include_removed=True))[:3]
+
+
+def split_removed(trips, unreadable):
+    """Split include_removed lists: (trips, unreadable, removed trips, removed unreadable)."""
+    return ([t for t in trips if not t.get("removal")],
+            [u for u in unreadable if not u.get("removal")],
+            [t for t in trips if t.get("removal")],
+            [u for u in unreadable if u.get("removal")])
 
 
 # ---------------------------------------------------------------------
@@ -714,6 +882,12 @@ def fmt_date(iso):
     return dt.strftime("%Y-%m-%d %H:%M %Z") if dt else "—"
 
 
+def fmt_day(iso):
+    """A stored UTC timestamp's date in the display timezone."""
+    dt = _to_local(_parse(iso))
+    return dt.strftime("%Y-%m-%d") if dt else "—"
+
+
 def _trip_date_anchor(trip):
     """Year/sort anchor; a partial trip's observed date is not its start."""
     if _parse(trip.get("start_time")):
@@ -785,11 +959,181 @@ def _to_local(dt):
     return dt.astimezone(DISPLAY_TZ)
 
 
+def _history_trip_keys(conn, trip_key, parts=()):
+    """Keys that identify the current trip and its live merge aliases."""
+    canonical = trip_merges.canonical_key(conn, trip_key)
+    keys = {trip_key, canonical, *parts}
+    if not parts:
+        keys.update(trip_merges.parts(conn, canonical))
+    for (alias_key,) in conn.execute("SELECT alias_key FROM trip_merge_aliases"):
+        if trip_merges.canonical_key(conn, alias_key) == canonical:
+            keys.add(alias_key)
+    return canonical, keys
+
+
+def _history_row_dict(row):
+    fields = ("id", "trip_key", "actor", "actor_role", "at", "action", "details")
+    return dict(row) if isinstance(row, sqlite3.Row) else dict(zip(fields, row))
+
+
+def _history_order(value):
+    stamp = _parse(value)
+    if stamp is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(timezone.utc)
+
+
+def _related_history_rows(conn, trip_key, parts=()):
+    """History rows for a trip, its parts, aliases, and merge/split events."""
+    _, keys = _history_trip_keys(conn, trip_key, parts)
+    rows_by_id = {}
+    ordered_keys = sorted(keys)
+    # A merge can contain many recordings. Keep each IN list below SQLite's
+    # conservative parameter limit instead of relying on a build-time limit.
+    for start in range(0, len(ordered_keys), 400):
+        chunk = ordered_keys[start:start + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            f"SELECT id, trip_key, actor, actor_role, at, action, details FROM trip_history "
+            f"WHERE trip_key IN ({placeholders})", chunk,
+        ):
+            item = _history_row_dict(row)
+            rows_by_id[item["id"]] = item
+    for row in conn.execute(
+        "SELECT id, trip_key, actor, actor_role, at, action, details FROM trip_history "
+        "WHERE action IN ('merge', 'split')"
+    ):
+        item = _history_row_dict(row)
+        try:
+            details = json.loads(item["details"])
+        except (TypeError, ValueError):
+            details = {}
+        item["parsed_details"] = details
+        if set(details.get("parts") or ()) & keys:
+            rows_by_id[item["id"]] = item
+    result = list(rows_by_id.values())
+    for item in result:
+        if "parsed_details" not in item:
+            try:
+                item["parsed_details"] = json.loads(item["details"])
+            except (TypeError, ValueError):
+                item["parsed_details"] = {}
+    result.sort(key=lambda item: (_history_order(item["at"]), item["id"]), reverse=True)
+    return result
+
+
+def _last_edited_lookup(conn):
+    """Return a function mapping a trip to its latest edit, from one read of the tables.
+
+    The merge tables and the history are read once here, whatever the number of
+    trips, so an export costs the same few queries for 30 trips or 3,000. The
+    function resolves a trip exactly like _related_history_rows: its own key,
+    its parts and its live merge aliases, plus merge/split rows whose parts
+    include one of those keys. Without any history row it falls back to the
+    annotation and merge timestamps of older data.
+    """
+    part_rows = conn.execute(
+        "SELECT merge_key, part_key FROM trip_merge_parts ORDER BY merge_key, position").fetchall()
+    part_to_merge = {part: merge for merge, part in part_rows}
+    merge_parts = {}
+    for merge, part in part_rows:
+        merge_parts.setdefault(merge, []).append(part)
+    alias_to_merge = dict(conn.execute("SELECT alias_key, merge_key FROM trip_merge_aliases"))
+
+    def canonical(key):
+        return part_to_merge.get(key) or alias_to_merge.get(key) or key
+
+    aliases = {}
+    for alias_key in alias_to_merge:
+        aliases.setdefault(canonical(alias_key), set()).add(alias_key)
+
+    newest = {}  # key -> (instant, id, actor, role, at) of the latest row touching it
+
+    def note(key, entry):
+        if key not in newest or entry[:2] > newest[key][:2]:
+            newest[key] = entry
+
+    for row_id, key, actor, role, at, action, details in conn.execute(
+        "SELECT id, trip_key, actor, actor_role, at, action, "
+        "CASE WHEN action IN ('merge', 'split') THEN details END FROM trip_history"
+    ):
+        entry = (_history_order(at), row_id, actor, role, at)
+        note(key, entry)
+        if action in ("merge", "split"):
+            try:
+                details = json.loads(details)
+            except (TypeError, ValueError):
+                details = {}
+            for part in set(details.get("parts") or ()) if isinstance(details, dict) else ():
+                note(part, entry)
+
+    stamps = {}  # key -> latest annotation or merge updated_at, for pre-history data
+    for table in ("annotations", "trip_merges"):
+        for key, stamp in conn.execute(
+            f"SELECT trip_key, updated_at FROM {table} WHERE updated_at IS NOT NULL AND updated_at != ''"
+        ):
+            if _parse(stamp) and (key not in stamps or _history_order(stamp) > _history_order(stamps[key])):
+                stamps[key] = stamp
+
+    def lookup(trip):
+        parts = trip.get("parts", ())
+        merge = canonical(trip["trip_key"])
+        keys = {trip["trip_key"], merge, *parts, *aliases.get(merge, ())}
+        if not parts:
+            keys.update(merge_parts.get(merge, ()))
+        entries = [newest[key] for key in keys if key in newest]
+        if entries:
+            _, _, actor, role, at = max(entries, key=lambda entry: entry[:2])
+            return {"actor": actor, "actor_role": role, "at": at, "pre_history": False}
+        fallback = [stamps[key] for key in keys if key in stamps]
+        if not fallback:
+            return None
+        return {"actor": None, "actor_role": None, "at": max(fallback, key=_history_order),
+                "pre_history": True}
+
+    return lookup
+
+
+def _last_edited(conn, trip):
+    """Find the latest edit across a trip's current and historical merge keys."""
+    return _last_edited_lookup(conn)(trip)
+
+
+def _set_export_last_edited(lookup, trip):
+    info = lookup(trip)
+    trip["last_edited"] = info
+    trip["last_edited_by"] = (info["actor"] if info and not info["pre_history"] else
+                              "unknown" if info else "")
+    trip["last_edited_at"] = fmt_local_iso(info["at"]) if info else ""
+
+
+def history_filters():
+    """Validate bounded paging and a single optional canonical trip key."""
+    if set(request.args) - {"page", "trip"} or any(
+        len(request.args.getlist(key)) != 1 for key in request.args
+    ):
+        abort(400)
+    raw_page = request.args.get("page", "1")
+    if not re.fullmatch(r"[1-9][0-9]{0,6}", raw_page):
+        abort(400)
+    trip = request.args.get("trip", "")
+    if trip and not re.fullmatch(r"[0-9]{4}-[0-9]{2}/[A-Za-z0-9_-]+", trip):
+        abort(400)
+    return int(raw_page), trip or None
+
+
+def valid_year(raw_year):
+    """A four-digit calendar year (not 0000) as an int, else 400."""
+    if not re.fullmatch(r"[0-9]{4}", raw_year or "") or int(raw_year) == 0:
+        abort(400, description="Year must be a four-digit calendar year.")
+    return int(raw_year)
+
+
 def selected_year():
     raw_year = request.args.get("year", "")
-    if raw_year and (not re.fullmatch(r"[0-9]{4}", raw_year) or int(raw_year) == 0):
-        abort(400, description="Year must be a four-digit calendar year.")
-    return int(raw_year) if raw_year else None
+    return valid_year(raw_year) if raw_year else None
 
 
 def _may_start_in(ym, year):
@@ -802,7 +1146,27 @@ def _may_start_in(ym, year):
     return ym.startswith(f"{year}-") or ym == f"{year + 1}-01"
 
 
-def selected_trips():
+def _folder_years(ym):
+    """The years a trip with an unreadable summary may belong to, by folder."""
+    if not YM_RE.match(ym):
+        return set()  # not an ingest folder: no evidence of a year
+    folder_year = int(ym[:4])
+    return {folder_year, folder_year - 1} if ym.endswith("-01") else {folder_year}
+
+
+def _trip_local_year(trip):
+    """The year the list and exports file a readable trip under, or None."""
+    local = _to_local(_parse(_trip_date_anchor(trip)))
+    return local.year if local else None
+
+
+def year_members(trips, unreadable, year):
+    """The trips of one local year: the single rule behind list, exports and review."""
+    return ([t for t in trips if _trip_local_year(t) == year],
+            [t for t in unreadable if _may_start_in(t["ym"], year)])
+
+
+def selected_trips(include_history=False):
     """Use local start year, or first recorded time for partly timed trips.
 
     Returns (trips, unreadable, year, years). Unreadable trips have no
@@ -810,17 +1174,17 @@ def selected_trips():
     """
     year = selected_year()
     trips, unreadable = load_trips()
-    years = set()
-    selected = []
-    for trip in trips:
-        local = _to_local(_parse(_trip_date_anchor(trip)))
-        if local:
-            years.add(local.year)
-        if year is None or (local and local.year == year):
-            selected.append(trip)
+    years = {y for y in map(_trip_local_year, trips) if y}
+    selected = trips
     if year:
         years.add(year)
-        unreadable = [t for t in unreadable if _may_start_in(t["ym"], year)]
+        selected, unreadable = year_members(trips, unreadable, year)
+    if include_history:
+        with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+            conn.row_factory = sqlite3.Row
+            lookup = _last_edited_lookup(conn)
+            for trip in selected + unreadable:
+                _set_export_last_edited(lookup, trip)
     return selected, unreadable, year, sorted(years, reverse=True)
 
 
@@ -836,8 +1200,78 @@ def mileage_totals(trips):
     return {category: round(miles, 3) for category, miles in totals.items()}
 
 
+# ---------------------------------------------------------------------
+# Closed years
+# ---------------------------------------------------------------------
+
+
+def _recording_years(key):
+    """Years the original recording filed under key may belong to.
+
+    A merged trip hides its parts from the loaded lists, so a part's year has
+    to come from its own summary file, by the same rule as any other trip.
+    """
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}/[A-Za-z0-9_-]+", key or ""):
+        return set()
+    summary, problem = read_summary(DATA_ROOT / f"{key}.json")
+    if problem:
+        return _folder_years(key.split("/")[0])
+    year = _trip_local_year(summary)
+    return {year} if year else set()
+
+
+def trip_years(trip):
+    """Every year a trip counts as belonging to, for the closed-year lock.
+
+    A readable trip belongs to exactly the year the list and exports file it
+    under. An unreadable one goes by its folder: either candidate year counts.
+    A merged trip also counts as belonging to the year of each of its parts,
+    so a merge can't be used to edit a trip in a closed year. A trip with no
+    date anchor has no year here, so it is never locked: the list and the
+    exports file it only under "All years" either.
+    """
+    if "problem" in trip:
+        years = _folder_years(trip["ym"])
+    else:
+        year = _trip_local_year(trip)
+        years = {year} if year else set()
+    for part in trip.get("parts", ()):
+        years |= _recording_years(part)
+    return years
+
+
+def locked_year(trip, closed):
+    """The earliest closed year the trip belongs to, or None. closed: closed_years()."""
+    hit = trip_years(trip) & closed.keys()
+    return min(hit) if hit else None
+
+
+def _abort_if_year_closed(closed, *trips):
+    """409 for an edit that touches a trip in a closed year."""
+    for trip in trips:
+        year = locked_year(trip, closed)
+        if year:
+            abort(409, description=(
+                f"{year} is closed for edits. The admin can reopen it on the year review page."))
+
+
+def _abort_if_key_in_closed_year(conn, *keys):
+    """The same refusal for routes that only have the trip's canonical key.
+
+    Caller holds its BEGIN IMMEDIATE transaction and has set conn.row_factory
+    to sqlite3.Row. A key that matches no trip is left to the route's own
+    404/409, and with no closed year nothing is loaded.
+    """
+    closed = trip_log.closed_years(conn)
+    if not closed:
+        return
+    trips, unreadable = load_trips(conn, include_removed=True)
+    by_key = {t["trip_key"]: t for t in trips + unreadable}
+    _abort_if_year_closed(closed, *(by_key[key] for key in keys if key in by_key))
+
+
 app.jinja_env.globals.update(
-    fmt_date=fmt_date, fmt_trip_date=fmt_trip_date, fmt_duration=fmt_duration,
+    fmt_date=fmt_date, fmt_day=fmt_day, fmt_trip_date=fmt_trip_date, fmt_duration=fmt_duration,
     fmt_speed=fmt_speed, csrf_token=_csrf_token
 )
 
@@ -876,6 +1310,14 @@ THEME_HEAD = """
 """
 
 THEME_BUTTON = '<button type="button" class="theme-toggle" data-theme-toggle>Theme: Auto</button>'
+
+ACCOUNT_BUTTON = """
+{% if g.role %}
+<span class="account-name">{{ g.user }} ({{ 'Admin' if g.role == 'admin' else 'Everyday' }})</span>
+{% if g.role == 'admin' %}<a class="account-link" href="{{ url_for('admin') }}">Admin</a>
+{% else %}<a class="account-link" href="{{ url_for('account_password') }}">Change password</a>{% endif %}
+{% endif %}
+"""
 
 DEVICE_HEALTH_BUTTON = """
 {% if request.endpoint == 'device_health' %}
@@ -948,14 +1390,14 @@ BASE_CSS = THEME_CSS + """
                     justify-content: flex-end; margin-left: auto; }
   .header-version { color: var(--header-text); opacity: .85; font-size: 12px; white-space: nowrap; }
   header form.logout { margin: 0; }
-  header form.logout button, header .theme-toggle, header .device-health {
+  header form.logout button, header .theme-toggle, header .device-health, header .account-link {
            background: var(--header-button-bg); color: var(--header-button-text);
            border: 1px solid var(--header-button-border); padding: 5px 12px;
            border-radius: 5px; font: 13px/1.4 system-ui, sans-serif; white-space: nowrap; }
-  header form.logout button, header .theme-toggle, header a.device-health { cursor: pointer; }
-  header form.logout button:hover, header .theme-toggle:hover, header a.device-health:hover {
+  header form.logout button, header .theme-toggle, header a.device-health, header .account-link { cursor: pointer; }
+  header form.logout button:hover, header .theme-toggle:hover, header a.device-health:hover, header .account-link:hover {
            background: var(--header-button-hover); }
-  header form.logout button:focus-visible, header .theme-toggle:focus-visible, header a.device-health:focus-visible {
+  header form.logout button:focus-visible, header .theme-toggle:focus-visible, header a.device-health:focus-visible, header .account-link:focus-visible {
            outline: 2px solid var(--header-text); outline-offset: 3px; }
   header .device-health[aria-current="page"] {
            background: var(--header-text); color: var(--header-bg); }
@@ -991,7 +1433,7 @@ BASE_CSS = THEME_CSS + """
   .leaflet-control-attribution a { color: var(--map-link); }
   form.annotate { margin-top: 18px; max-width: 520px; }
   label { display: block; margin: 10px 0 4px; font-weight: 600; font-size: 14px; }
-  select, textarea, input[type=text] { width: 100%; padding: 8px; font-size: 14px; box-sizing: border-box;
+  select, textarea, input[type=text], input[type=password] { width: 100%; padding: 8px; font-size: 14px; box-sizing: border-box;
       background: var(--input-bg); color: var(--input-text);
       border: 1px solid var(--input-border); border-radius: 4px; }
 """
@@ -1005,12 +1447,81 @@ VERSION_FOOTER = '<footer class="server-version">Server {{ server_version }}</fo
 VERSION_HEADER = '<div class="header-version">Server {{ server_version }}</div>'
 
 
+ACCOUNT_HEADER = """
+{% if g.role %}<header><a href="{{ url_for('index') }}">Trips</a><div class="header-actions">
+""" + VERSION_HEADER + DEVICE_HEALTH_BUTTON + ACCOUNT_BUTTON + THEME_BUTTON + """
+<form class="logout" method="post" action="{{ url_for('logout') }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Log out</button>
+</form></div></header>{% endif %}
+"""
+
+PASSWORD_FIELDS = """
+<label>New password <input type="password" name="password" minlength="8" maxlength="1024" autocomplete="new-password" required></label>
+<label>Confirm new password <input type="password" name="confirm_password" minlength="8" maxlength="1024" autocomplete="new-password" required></label>
+"""
+
+ACCOUNT_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }}</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """
+.login-form { max-width: 420px; margin-bottom: 20px; }
+.login-table { overflow-x: auto; }
+.login-table td { vertical-align: top; }
+.login-table form { margin: 8px 0; }
+.login-table input[type=password] { min-width: 180px; }
+.account-name { overflow-wrap: anywhere; }
+</style></head><body>
+""" + ACCOUNT_HEADER + """<main class="wrap"><h1>{{ title }}</h1>
+{% if message %}<p role="status">{{ message }}</p>{% endif %}
+{% if title == 'Admin' %}<p>{{ admin_username }}: Admin (set in viewer.env)</p>
+<p><a class="btn secondary" href="{{ url_for('admin_removed') }}">Removed trips</a></p>
+<p><a class="btn secondary" href="{{ url_for('admin_history') }}">Change history</a></p>
+<h2>Year review</h2>
+<p class="muted">Check a year's log before filing, then close it so nothing in it changes by accident.</p>
+<table class="year-table"><tr><th>Year</th><th>Status</th><th></th></tr>
+{% for item in year_list %}<tr><td>{{ item.year }}</td>
+<td>{% if item.closed %}Closed by {{ item.closed.closed_by }} on {{ fmt_day(item.closed.closed_at) }}{% else %}Open{% endif %}</td>
+<td><a class="btn secondary" href="{{ url_for('admin_year', year=item.year) }}">Review {{ item.year }}</a></td></tr>
+{% else %}<tr><td colspan="3" class="muted">No trips yet.</td></tr>{% endfor %}</table>
+<h2>Everyday logins</h2><div class="login-table">
+<table><tr><th>Everyday login</th><th>Status</th><th>Created ({{ timezone }})</th><th>Actions</th></tr>
+{% for user in logins %}<tr><td>{{ user.username }}</td><td>{{ 'disabled' if user.disabled else 'enabled' }}</td>
+<td>{{ fmt_date(user.created_at) }}</td><td>
+<form method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<input type="hidden" name="username" value="{{ user.username }}">
+<input type="hidden" name="action" value="reset-password">
+""" + PASSWORD_FIELDS + """<button class="btn" type="submit">Reset password for {{ user.username }}</button></form>
+<form method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<input type="hidden" name="username" value="{{ user.username }}">
+<input type="hidden" name="action" value="{{ 'enable' if user.disabled else 'disable' }}">
+<button class="btn secondary" type="submit">{{ 'Enable' if user.disabled else 'Disable' }} {{ user.username }}</button></form>
+<form method="post">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<input type="hidden" name="username" value="{{ user.username }}">
+<input type="hidden" name="action" value="remove">
+<label><input type="checkbox" name="confirm" value="yes" required> Confirm removing {{ user.username }}</label>
+<button class="btn secondary" type="submit">Remove {{ user.username }}</button></form>
+</td></tr>{% else %}<tr><td colspan="4">No everyday logins.</td></tr>{% endfor %}</table></div>
+<h2>Add everyday login</h2><form method="post" class="login-form">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="action" value="add">
+<label>Username <input type="text" name="username" maxlength="64" autocomplete="off" required></label>
+""" + PASSWORD_FIELDS + """<button class="btn" type="submit">Add everyday login</button></form>
+{% elif g.role == 'admin' %}<p>The admin password lives in viewer.env. Rerun <code>bash install.sh</code> and answer n to keeping the login to change it.</p>
+{% else %}<form method="post" class="login-form">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<label>Current password <input type="password" name="current_password" autocomplete="current-password" required></label>
+""" + PASSWORD_FIELDS + """<button class="btn" type="submit">Change password</button></form>{% endif %}
+</main></body></html>
+"""
+
+
 ERROR_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>{{ error.name }}</title>
 """ + THEME_HEAD + """<style>""" + BASE_CSS + """</style></head><body>
-<main class="wrap"><h1>{{ error.code }} {{ error.name }}</h1>
+""" + ACCOUNT_HEADER + """<main class="wrap"><h1>{{ error.code }} {{ error.name }}</h1>
 <p>{{ error.description }}</p></main>
-""" + VERSION_FOOTER + """</body></html>
+{% if not g.role %}""" + VERSION_FOOTER + """{% endif %}</body></html>
 """
 
 
@@ -1067,7 +1578,7 @@ LIST_HTML = """
 """ + THEME_HEAD + """<style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index') }}">🚗 Mileage Tracker</a>
   <div class="header-actions">
-    """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + THEME_BUTTON + """
+    """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + ACCOUNT_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit">Log out</button>
@@ -1092,6 +1603,14 @@ LIST_HTML = """
           <button class="btn" type="submit">Undo merge (split back)</button>
         </form>
         {% endif %}
+        {% if g.role == 'admin' %}
+        <form method="post" action="{{ url_for('remove_trip', ym=u.ym, trip_id=u.id, year=year or '') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <label>Reason for removing it from the log
+            <input type="text" name="reason" maxlength="500" required></label>
+          <button class="btn secondary" type="submit">Remove from log</button>
+        </form>
+        {% endif %}
       </li>
       {% endfor %}
     </ul>
@@ -1106,6 +1625,8 @@ LIST_HTML = """
       </select>
       <button class="btn" type="submit">Apply</button>
     </form>
+    {% if year_closed %}<span class="tag other">Closed for edits</span>{% endif %}
+    {% if year and g.role == 'admin' %}<a class="btn secondary" href="{{ url_for('admin_year', year=year) }}">{{ year }} year review</a>{% endif %}
     <a class="btn" href="{{ url_for('export_csv', year=year or '') }}">Export CSV</a>
     <a class="btn secondary" href="{{ url_for('export_xlsx', year=year or '') }}">Export XLSX</a>
     <span class="muted">{{ trips|length }} trip(s) · {{ "%.3f"|format(totals.all) }} mi total</span>
@@ -1146,7 +1667,7 @@ TRIP_HTML = """
 <style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index', year=year or '') }}">← {{ year or 'All' }} trips</a>
   <div class="header-actions">
-    """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + THEME_BUTTON + """
+    """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + ACCOUNT_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit">Log out</button>
@@ -1155,6 +1676,25 @@ TRIP_HTML = """
 </header>
 <div class="wrap">
   <h2>{{ fmt_trip_date(t) }}</h2>
+  {% if last_edited %}
+  <p class="muted">{% if last_edited.pre_history %}Edited before the change history began ({{ fmt_date(last_edited.at) }})
+    {% else %}Last edited by {{ last_edited.actor }} on {{ fmt_date(last_edited.at) }}{% endif %}</p>
+  {% endif %}
+  {% if year_lock %}
+  <div class="warn" role="status">{{ year_lock.year }} is closed for edits (closed by {{ year_lock.closed_by }} on {{ fmt_day(year_lock.closed_at) }}).
+    Nobody can change, merge, remove or restore this trip until the admin reopens {{ year_lock.year }} on the year review page.</div>
+  {% endif %}
+  {% if removal %}
+  <div class="warn" role="status">
+    <b>Removed from the log</b> by {{ removal.removed_by }} on {{ fmt_date(removal.removed_at) }}: {{ removal.reason }}
+    {% if not year_lock %}
+    <form method="post" action="{{ url_for('restore_trip', ym=t.ym, trip_id=t.id, year=year or '') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="btn" type="submit">Restore to the log</button>
+    </form>
+    {% endif %}
+  </div>
+  {% endif %}
   {% if t.get('timing_status') == 'partial' %}
   <p class="muted">Partial timing: some points have no timestamp. Full-trip dates,
     duration and average speed are unknown. Recorded timestamps run from
@@ -1175,6 +1715,11 @@ TRIP_HTML = """
   <p class="muted">GPX file missing — cannot draw the track.</p>
   {% endif %}
 
+  {% if removal %}
+  <p class="muted">This trip is out of the trip list, totals and exports, and can't be edited
+    until it is restored. Its purpose, destination and note were: {{ t.category or '—' }},
+    {{ t.destination or '—' }}, {{ t.purpose_note or '—' }}.</p>
+  {% else %}
   <section aria-labelledby="places-heading">
     <h3 id="places-heading">Recorded endpoint places</h3>
     <p class="muted">Suggestions describe nearby mapped objects, not verified businesses or
@@ -1204,6 +1749,11 @@ TRIP_HTML = """
     {% endif %}
   </section>
 
+  {% if year_lock %}
+  {% if t.get('parts') %}
+  <p>Merged from {{ t.parts|length }} recordings. Source GPX files: <code>{{ t.gpx_file }}</code></p>
+  {% endif %}
+  {% else %}
   <section aria-labelledby="merge-heading">
     <h3 id="merge-heading">Join a split drive</h3>
     {% if t.get('parts') %}
@@ -1238,7 +1788,14 @@ TRIP_HTML = """
       with the next start no more than 15 minutes after this recording ends.</p>
     {% endif %}
   </section>
+  {% endif %}
 
+  {% if year_lock %}
+  <section aria-labelledby="annotation-heading">
+    <h3 id="annotation-heading">Purpose, destination and note</h3>
+    <p>{{ t.category or '—' }}, {{ t.destination or '—' }}, {{ t.purpose_note or '—' }}</p>
+  </section>
+  {% else %}
   <form class="annotate" method="post"
         action="{{ url_for('annotate', ym=t.ym, trip_id=t.id, year=year or '') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -1260,6 +1817,21 @@ TRIP_HTML = """
     <textarea name="purpose_note" id="purpose_note" rows="3">{{ t.purpose_note or "" }}</textarea>
     <p><button class="btn" type="submit">Save</button></p>
   </form>
+  {% endif %}
+  {% if g.role == 'admin' and not year_lock %}
+  <section aria-labelledby="remove-heading">
+    <h3 id="remove-heading">Remove from log</h3>
+    <p>Takes this trip out of the trip list, totals and exports for everyone. The GPX and
+      summary files stay on the server, and you can restore the trip from the Removed trips page.</p>
+    <form method="post" action="{{ url_for('remove_trip', ym=t.ym, trip_id=t.id, year=year or '') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label for="remove-reason">Reason (required)</label>
+      <textarea name="reason" id="remove-reason" rows="2" maxlength="500" required></textarea>
+      <p><button class="btn secondary" type="submit">Remove from log</button></p>
+    </form>
+  </section>
+  {% endif %}
+  {% endif %}
 </div>
 
 {% if geocoder_enabled %}
@@ -1313,7 +1885,7 @@ DEVICE_HEALTH_HTML = """
 </style></head><body>
 <header><a href="{{ url_for('index') }}">← Trips</a>
   <div class="header-actions">
-    """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + THEME_BUTTON + """
+    """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + ACCOUNT_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit">Log out</button>
@@ -1453,23 +2025,557 @@ def login():
         # Always run the hash comparison, even when the username is wrong,
         # so response time doesn't reveal whether the username exists.
         name_ok = _safe_equal(username, VIEWER_USERNAME)
-        pass_ok = check_password_hash(VIEWER_PASSWORD_HASH, password)
+        user = None if name_ok else users.get_user(DB_PATH, username)
+        chosen_hash = VIEWER_PASSWORD_HASH if name_ok else (user["password_hash"] if user else DUMMY_PASSWORD_HASH)
+        pass_ok = check_password_hash(chosen_hash, password)
+        editor_ok = user is not None and not user["disabled"]
+        if editor_ok:
+            try:
+                users.validate_username(user["username"], VIEWER_USERNAME)
+            except users.UserError:
+                editor_ok = False
 
-        if name_ok and pass_ok:
-            _clear_failures(ip)
+        if pass_ok and (name_ok or editor_ok):
+            _clear_failures(ip, VIEWER_USERNAME if name_ok else user["username"])
             session.clear()  # new session id on privilege change
             session["user"] = VIEWER_USERNAME
             session["pw_tag"] = _password_tag()
+            if not name_ok:
+                session["kind"] = "editor"
+                session["user"] = user["username"]
+                session["pw_tag"] = users.session_tag(VIEWER_SECRET_KEY, user)
             session["csrf"] = secrets.token_urlsafe(32)
             session.permanent = True
             return redirect(_safe_next(request.args.get("next")) or url_for("index"))
 
-        _record_failure(ip)
+        _record_failure(ip, username)
         app.logger.warning("Failed login for %r from %s", username[:40], ip)
         error = "Incorrect username or password."
         return render_template_string(LOGIN_HTML, error=error), 401
 
     return render_template_string(LOGIN_HTML, error=error)
+
+
+def _confirmed_password():
+    password = request.form.get("password", "")
+    if password != request.form.get("confirm_password", ""):
+        raise users.UserError("Passwords don't match.")
+    users.validate_password(password)
+    return password
+
+
+@app.route("/admin", methods=["GET", "POST"])
+def admin():
+    if request.method == "POST":
+        try:
+            action = request.form.get("action", "")
+            username = request.form.get("username", "")
+            password = _confirmed_password() if action in {"add", "reset-password"} else None
+            if action == "remove" and request.form.get("confirm") != "yes":
+                raise users.UserError("Confirm removing this login.")
+            users.change_user(DB_PATH, action, username, password, VIEWER_USERNAME)
+            session["account_message"] = "Everyday login updated."
+        except users.UserError as exc:
+            session["account_message"] = str(exc)
+        return redirect(url_for("admin"))
+    return render_template_string(ACCOUNT_HTML, title="Admin", admin_username=VIEWER_USERNAME,
+                                  logins=users.list_users(DB_PATH), timezone=DISPLAY_TZ_NAME,
+                                  year_list=_year_list(),
+                                  message=session.pop("account_message", None))
+
+
+REMOVED_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Removed trips</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """
+.removed-table { overflow-x: auto; }
+.removed-table td { vertical-align: top; }
+</style></head><body>
+""" + ACCOUNT_HEADER + """<main class="wrap"><h1>Removed trips</h1>
+<p class="muted">The original files remain on the server. Restoring a trip returns it to the list,
+totals, exports and merge suggestions.</p>
+<div class="removed-table"><table>
+<thead><tr><th>Date / folder</th><th>Distance</th><th>Reason</th><th>Removed by</th><th>Removed at ({{ timezone }})</th><th>Trip</th><th></th></tr></thead>
+<tbody>{% for entry in entries %}<tr>
+<td>{{ entry.date }}</td><td>{% if entry.unreadable %}unreadable{% else %}{{ "%.2f"|format(entry.distance or 0) }} mi{% endif %}</td>
+<td>{{ entry.removal.reason }}</td><td>{{ entry.removal.removed_by }}</td><td>{{ fmt_date(entry.removal.removed_at) }}</td>
+<td><a href="{{ url_for('trip_view', ym=entry.trip.ym, trip_id=entry.trip.id) }}">{{ entry.trip.trip_key }}</a></td>
+<td><form method="post" action="{{ url_for('restore_trip', ym=entry.trip.ym, trip_id=entry.trip.id) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="btn" type="submit">Restore</button></form></td>
+</tr>{% else %}<tr><td colspan="7" class="muted">No removed trips.</td></tr>{% endfor %}</tbody>
+</table></div></main></body></html>
+"""
+
+
+@app.route("/admin/removed")
+def admin_removed():
+    trips, unreadable = load_trips(include_removed=True)
+    entries = []
+    for trip in trips:
+        removal = trip.get("removal")
+        if removal:
+            entries.append({"trip": trip, "removal": removal,
+                            "date": fmt_trip_date(trip), "distance": trip.get("distance_miles"),
+                            "unreadable": False})
+    for trip in unreadable:
+        removal = trip.get("removal")
+        if removal:
+            entries.append({"trip": trip, "removal": removal, "date": trip["ym"],
+                            "distance": None, "unreadable": True})
+    entries.sort(key=lambda entry: entry["removal"]["removed_at"], reverse=True)
+    return render_template_string(REMOVED_HTML, entries=entries, timezone=DISPLAY_TZ_NAME)
+
+
+HISTORY_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Change history</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """
+.history-table { overflow-x: auto; }
+.history-table td { vertical-align: top; overflow-wrap: anywhere; }
+</style></head><body>
+""" + ACCOUNT_HEADER + """<main class="wrap"><h1>Change history</h1>
+<p class="muted">Times shown in {{ timezone }}. Newest changes appear first.</p>
+<form method="get" class="toolbar">
+  <label for="trip">Trip key (YYYY-MM/ID)</label>
+  <input type="text" id="trip" name="trip" value="{{ trip_filter or '' }}" maxlength="80">
+  <button class="btn" type="submit">Filter</button>
+  {% if trip_filter %}<a class="btn secondary" href="{{ url_for('admin_history') }}">Clear</a>{% endif %}
+</form>
+<div class="history-table"><table>
+<thead><tr><th>When ({{ timezone }})</th><th>Actor</th><th>Action</th><th>Trip</th><th>Change</th></tr></thead>
+<tbody>{% for row in rows %}<tr class="history-row">
+  <td>{{ fmt_date(row.at) }}</td><td>{{ row.actor }}<br><span class="muted">{{ row.actor_role }}</span></td>
+  <td>{{ row.action_label }}</td><td><a href="{{ row.trip_url }}">{{ row.trip_label }}</a></td><td>{{ row.summary }}</td>
+</tr>{% else %}<tr><td colspan="5" class="muted">No changes in this selection.</td></tr>{% endfor %}</tbody>
+</table></div>
+<div class="toolbar" aria-label="History pages">
+  {% if has_newer %}<a class="btn secondary" href="{{ url_for('admin_history', page=page - 1, trip=trip_filter) }}">Newer</a>{% endif %}
+  <span class="muted">Page {{ page }} · {{ total }} change(s)</span>
+  {% if has_older %}<a class="btn secondary" href="{{ url_for('admin_history', page=page + 1, trip=trip_filter) }}">Older</a>{% endif %}
+</div></main></body></html>
+"""
+
+
+def _history_summary(row):
+    details = row["parsed_details"]
+    action = row["action"]
+    if action == "annotate":
+        before, after = details.get("before", {}), details.get("after", {})
+        labels = (("category", "Purpose"), ("purpose_note", "Note"), ("destination", "Destination"))
+        changes = [f"{label}: {before.get(field) or 'unset'} → {after.get(field) or 'unset'}"
+                   for field, label in labels if before.get(field) != after.get(field)]
+        return "; ".join(changes) or "Annotation saved"
+    if action == "merge":
+        merged = ", ".join(details.get("merged_from", ()))
+        source = details.get("annotation_from")
+        return f"Merged {merged}; kept annotation from {source}."
+    if action == "split":
+        return "Restored original recordings: " + ", ".join(details.get("parts", ())) + "."
+    if action == "remove":
+        return "Removed from the log: " + str(details.get("reason", ""))
+    if action == "restore":
+        return "Restored to the log. Removal reason: " + str(details.get("reason", ""))
+    if action == "year_close":
+        return "Closed for edits."
+    if action == "year_reopen":
+        return "Reopened for edits."
+    label = action.replace("_", " ").capitalize()
+    return f"{label}: {json.dumps(details, ensure_ascii=False, sort_keys=True)}"
+
+
+def _history_action_label(action):
+    return {
+        "annotate": "Annotation saved", "merge": "Merge", "split": "Undo merge",
+        "remove": "Removed from log", "restore": "Restored to log",
+        "year_close": "Year closed", "year_reopen": "Year reopened",
+    }.get(action, action.replace("_", " ").capitalize())
+
+
+def _history_trip_link(conn, row):
+    key = row["trip_key"]
+    details = row["parsed_details"]
+    year_key = re.fullmatch(r"year/([0-9]{4})", key)
+    if year_key:
+        year = int(year_key.group(1))
+        return url_for("index", year=year), f"Year {year}"
+    target = key
+    parts = details.get("parts") or ()
+    if parts:
+        target = parts[0]
+    else:
+        canonical = trip_merges.canonical_key(conn, key)
+        if canonical != key:
+            target = canonical
+        else:
+            old_merge = conn.execute(
+                "SELECT details FROM trip_history WHERE trip_key=? AND action IN ('merge', 'split') "
+                "ORDER BY at DESC, id DESC LIMIT 1", (key,),
+            ).fetchone()
+            if old_merge:
+                try:
+                    old_parts = json.loads(old_merge[0]).get("parts") or ()
+                except (TypeError, ValueError):
+                    old_parts = ()
+                if old_parts:
+                    target = old_parts[0]
+    match = re.fullmatch(r"([0-9]{4}-[0-9]{2})/([A-Za-z0-9_-]+)", target)
+    if not match:
+        return url_for("index"), key
+    return url_for("trip_view", ym=match.group(1), trip_id=match.group(2)), key
+
+
+@app.route("/admin/history")
+def admin_history():
+    page, trip_filter = history_filters()
+    offset = (page - 1) * TRIP_HISTORY_PAGE_SIZE
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+        conn.row_factory = sqlite3.Row
+        if trip_filter:
+            canonical = trip_merges.canonical_key(conn, trip_filter)
+            parts = trip_merges.parts(conn, canonical)
+            history_rows = _related_history_rows(conn, canonical, parts)
+            total = len(history_rows)
+            history_rows = history_rows[offset:offset + TRIP_HISTORY_PAGE_SIZE]
+        else:
+            total = conn.execute("SELECT count(*) FROM trip_history").fetchone()[0]
+            history_rows = [_history_row_dict(row) for row in conn.execute(
+                "SELECT id, trip_key, actor, actor_role, at, action, details FROM trip_history "
+                "ORDER BY at DESC, id DESC LIMIT ? OFFSET ?", (TRIP_HISTORY_PAGE_SIZE, offset),
+            )]
+            for row in history_rows:
+                try:
+                    row["parsed_details"] = json.loads(row["details"])
+                except (TypeError, ValueError):
+                    row["parsed_details"] = {}
+        for row in history_rows:
+            row["action_label"] = _history_action_label(row["action"])
+            row["summary"] = _history_summary(row)
+            row["trip_url"], row["trip_label"] = _history_trip_link(conn, row)
+    return render_template_string(
+        HISTORY_HTML, rows=history_rows, page=page, total=total,
+        has_newer=page > 1, has_older=offset + len(history_rows) < total,
+        trip_filter=trip_filter, timezone=DISPLAY_TZ_NAME,
+    )
+
+
+def _year_list():
+    """The years the admin can review, newest first, each with its closed record."""
+    trips, unreadable = load_trips(include_removed=True)
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        closed = trip_log.closed_years(conn)
+    years = {y for y in map(_trip_local_year, trips) if y} | closed.keys()
+    for trip in unreadable:
+        years |= _folder_years(trip["ym"])
+    return [{"year": year, "closed": closed.get(year)} for year in sorted(years, reverse=True)]
+
+
+YEAR_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ year }} year review</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """
+.review-table { overflow-x: auto; }
+.review-table td { vertical-align: top; overflow-wrap: anywhere; }
+</style></head><body>
+""" + ACCOUNT_HEADER + """<main class="wrap">
+{% macro trip_link(t) %}<a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{% if t.problem %}{{ t.trip_key }}{% else %}{{ fmt_trip_date(t) }}{% endif %}</a>{% endmacro %}
+<h1>{{ year }} year review</h1>
+<p class="muted">Times shown in {{ timezone }}. A trip belongs to the year it starts in (or, if partly timed, its
+first recorded time), the same as the trip list and exports.</p>
+<div class="toolbar">
+  <a class="btn secondary" href="{{ url_for('index', year=year) }}">{{ year }} trips</a>
+  <a class="btn" href="{{ url_for('export_csv', year=year) }}">Export CSV</a>
+  <a class="btn secondary" href="{{ url_for('export_xlsx', year=year) }}">Export XLSX</a>
+</div>
+
+<section aria-labelledby="status-heading">
+<h2 id="status-heading">Status</h2>
+{% if closed %}
+<p><span class="tag other">Closed for edits</span> by {{ closed.closed_by }} on {{ fmt_date(closed.closed_at) }}.
+Nobody can annotate, merge, undo a merge, remove or restore a trip in {{ year }} until you reopen it.
+Viewing and exporting still work.</p>
+<form method="post" action="{{ url_for('reopen_year', year=year) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<label><input type="checkbox" name="confirm" value="yes" required> Confirm reopening {{ year }}</label>
+<button class="btn secondary" type="submit">Reopen {{ year }}</button></form>
+{% else %}
+<p>{{ year }} is open. Close it once its return is filed, so its trips can't change by accident.</p>
+<form method="post" action="{{ url_for('close_year', year=year) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<label><input type="checkbox" name="confirm" value="yes" required> Confirm closing {{ year }} for edits</label>
+<button class="btn" type="submit">Close {{ year }}</button></form>
+{% endif %}
+</section>
+
+<section aria-labelledby="totals-heading">
+<h2 id="totals-heading">Totals by category</h2>
+<p class="muted">The same figures as the {{ year }} CSV and XLSX exports.</p>
+<div class="review-table"><table>
+<thead><tr><th>Category</th><th>Trips</th><th>Miles</th></tr></thead>
+<tbody>{% for category, miles in totals.items() %}<tr>
+<td>{{ category }}</td><td>{{ counts[category] }}</td><td>{{ "%.3f"|format(miles) }}</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+
+<section aria-labelledby="uncategorized-heading">
+<h2 id="uncategorized-heading">Trips with no category ({{ uncategorized|length }})</h2>
+<div class="review-table"><table>
+<thead><tr><th>Trip</th><th>Distance</th></tr></thead>
+<tbody>{% for t in uncategorized %}<tr><td>{{ trip_link(t) }}</td><td>{{ "%.2f"|format(t.distance_miles or 0) }} mi</td></tr>
+{% else %}<tr><td colspan="2" class="muted">Every trip has a category.</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+
+<section aria-labelledby="incomplete-heading">
+<h2 id="incomplete-heading">Business trips missing a note or destination ({{ incomplete|length }})</h2>
+<div class="review-table"><table>
+<thead><tr><th>Trip</th><th>Distance</th><th>Missing</th></tr></thead>
+<tbody>{% for item in incomplete %}<tr><td>{{ trip_link(item.trip) }}</td>
+<td>{{ "%.2f"|format(item.trip.distance_miles or 0) }} mi</td><td>{{ item.missing|join(' and ') }}</td></tr>
+{% else %}<tr><td colspan="3" class="muted">Every business trip has a purpose note and a destination.</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+
+<section aria-labelledby="unreadable-heading">
+<h2 id="unreadable-heading">Trips whose summary can't be read ({{ unreadable|length }})</h2>
+<p class="muted">Their miles can't be counted, so the totals above may be short.</p>
+<div class="review-table"><table>
+<thead><tr><th>Trip</th><th>Problem</th></tr></thead>
+<tbody>{% for t in unreadable %}<tr><td>{{ trip_link(t) }}</td><td>{{ t.problem }}</td></tr>
+{% else %}<tr><td colspan="2" class="muted">All summaries can be read.</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+
+<section aria-labelledby="removed-heading">
+<h2 id="removed-heading">Removed trips ({{ removed|length }})</h2>
+<div class="review-table"><table>
+<thead><tr><th>Trip</th><th>Reason</th><th>Removed by</th><th>Removed at ({{ timezone }})</th></tr></thead>
+<tbody>{% for t in removed %}<tr><td>{{ trip_link(t) }}</td><td>{{ t.removal.reason }}</td>
+<td>{{ t.removal.removed_by }}</td><td>{{ fmt_date(t.removal.removed_at) }}</td></tr>
+{% else %}<tr><td colspan="4" class="muted">No trips were removed.</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+
+<section aria-labelledby="late-heading">
+<h2 id="late-heading">Edits after the year ended ({{ edits|length }})</h2>
+<p class="muted">Changes to a {{ year }} trip made on or after {{ year_end }} ({{ timezone }}), and
+every time {{ year }} was closed or reopened.</p>
+<div class="review-table"><table>
+<thead><tr><th>When ({{ timezone }})</th><th>Actor</th><th>Action</th><th>Trip</th><th>Change</th></tr></thead>
+<tbody>{% for row in edits %}<tr>
+<td>{{ fmt_date(row.at) }}</td><td>{{ row.actor }}<br><span class="muted">{{ row.actor_role }}</span></td>
+<td>{{ row.action_label }}</td><td><a href="{{ row.trip_url }}">{{ row.trip_label }}</a></td><td>{{ row.summary }}</td>
+</tr>{% else %}<tr><td colspan="5" class="muted">No edits after the year ended.</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+</main></body></html>
+"""
+
+
+def _late_edit_rows(conn, year, trips):
+    """History rows that touch one of trips on or after local Jan 1 00:00 of year + 1.
+
+    trips are every trip of the year (removed ones too). A trip is touched
+    through its own key, its parts and its merge aliases, like its own
+    history. The year's close/reopen rows come along whatever their date.
+    One pass over the rows after the boundary serves all the trips, instead
+    of one history scan per trip.
+    """
+    keys = set()
+    aliases = {}
+    for alias_key, merge_key in conn.execute("SELECT alias_key, merge_key FROM trip_merge_aliases"):
+        aliases.setdefault(merge_key, []).append(alias_key)
+    for trip in trips:
+        keys.add(trip["trip_key"])
+        keys.update(trip.get("parts", ()))
+        keys.update(aliases.get(trip["trip_key"], ()))
+    rows = {}
+    try:
+        boundary = datetime(year + 1, 1, 1, tzinfo=DISPLAY_TZ).astimezone(timezone.utc)
+    except ValueError:  # year 9999: nothing can happen after it
+        boundary = None
+    if boundary:
+        # The string compare only narrows the scan (a day of margin); the
+        # real comparison below is on parsed instants.
+        for raw in conn.execute(
+            "SELECT id, trip_key, actor, actor_role, at, action, details FROM trip_history WHERE at >= ?",
+            ((boundary - timedelta(days=1)).isoformat(),),
+        ):
+            row = _history_row_dict(raw)
+            if _history_order(row["at"]) < boundary:
+                continue
+            try:
+                details = json.loads(row["details"])
+            except (TypeError, ValueError):
+                details = {}
+            row["parsed_details"] = details
+            touched = row["trip_key"] in keys or (
+                row["action"] in ("merge", "split") and set(details.get("parts") or ()) & keys)
+            if touched:
+                rows[row["id"]] = row
+    for raw in conn.execute(
+        "SELECT id, trip_key, actor, actor_role, at, action, details FROM trip_history WHERE trip_key=?",
+        (f"year/{year}",),
+    ):
+        row = _history_row_dict(raw)
+        try:
+            row["parsed_details"] = json.loads(row["details"])
+        except (TypeError, ValueError):
+            row["parsed_details"] = {}
+        rows[row["id"]] = row
+    result = sorted(rows.values(), key=lambda r: (_history_order(r["at"]), r["id"]), reverse=True)
+    for row in result:
+        row["action_label"] = _history_action_label(row["action"])
+        row["summary"] = _history_summary(row)
+        row["trip_url"], row["trip_label"] = _history_trip_link(conn, row)
+    return result
+
+
+@app.route("/admin/year/<year>")
+def admin_year(year):
+    year = valid_year(year)
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        # Serialize the merge-cache refresh in _load_trips, like load_trips().
+        conn.execute("BEGIN IMMEDIATE")
+        trips, unreadable = _load_trips(conn, include_removed=True)
+        closed = trip_log.closed_years(conn).get(year)
+        # Totals and the problem lists come from the same selection the list
+        # and exports use, applied to the log without its removed trips.
+        live = [t for t in trips if "removal" not in t]
+        live_unreadable = [t for t in unreadable if "removal" not in t]
+        members, broken = year_members(live, live_unreadable, year)
+        gone, gone_unreadable = year_members(
+            [t for t in trips if "removal" in t], [t for t in unreadable if "removal" in t], year)
+        edits = _late_edit_rows(conn, year, members + broken + gone + gone_unreadable)
+    totals = mileage_totals(members)
+    counts = {category: 0 for category in totals}
+    counts["all"] = len(members)
+    for t in members:
+        counts[t.get("category") if t.get("category") in CATEGORIES else "unclassified"] += 1
+    incomplete = []
+    for t in members:
+        if t.get("category") == "business":
+            missing = [label for label, field in (("purpose note", "purpose_note"), ("destination", "destination"))
+                       if not (t.get(field) or "").strip()]
+            if missing:
+                incomplete.append({"trip": t, "missing": missing})
+    removed = sorted(gone + gone_unreadable, key=lambda t: t["removal"]["removed_at"], reverse=True)
+    return render_template_string(
+        YEAR_HTML, year=year, closed=closed, totals=totals, counts=counts, edits=edits,
+        uncategorized=[t for t in members if t.get("category") not in CATEGORIES],
+        incomplete=incomplete, unreadable=broken, removed=removed, timezone=DISPLAY_TZ_NAME,
+        year_end=f"{year + 1}-01-01 00:00",
+    )
+
+
+def _change_year(raw_year, closing_it):
+    """Close or reopen a year: a tax_years row and its history row, in one transaction."""
+    year = valid_year(raw_year)
+    if request.form.get("confirm") != "yes":
+        abort(400, description=f"Confirm {'closing' if closing_it else 'reopening'} {year}.")
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        is_closed = year in trip_log.closed_years(conn)
+        if is_closed == closing_it:
+            abort(409, description=f"{year} is already {'closed' if closing_it else 'open'}.")
+        if closing_it:
+            trip_log.close_year(conn, year, g.user)
+        else:
+            trip_log.reopen_year(conn, year)
+        trip_log.record(conn, f"year/{year}", "year_close" if closing_it else "year_reopen", {},
+                        actor=g.user, actor_role=g.role)
+    return redirect(url_for("admin_year", year=year))
+
+
+@app.route("/admin/year/<year>/close", methods=["POST"])
+def close_year(year):
+    return _change_year(year, True)
+
+
+@app.route("/admin/year/<year>/reopen", methods=["POST"])
+def reopen_year(year):
+    return _change_year(year, False)
+
+
+@app.route("/trip/<ym>/<trip_id>/remove", methods=["POST"])
+def remove_trip(ym, trip_id):
+    year = selected_year()
+    _safe_trip_paths(ym, trip_id)
+    reason = request.form.get("reason", "").strip()
+    if not 1 <= len(reason) <= 500:
+        abort(400, description="Reason must be between 1 and 500 characters.")
+    requested_key = f"{ym}/{trip_id}"
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        key = trip_merges.canonical_key(conn, requested_key)
+        if key != requested_key:
+            abort(409, description="This recording is part of a merged trip; remove the merged trip instead.")
+        if trip_log.removal(conn, key):
+            abort(409, description="This trip is already removed from the log.")
+        trips, unreadable = load_trips(conn, include_removed=True)
+        trip = next((t for t in trips + unreadable if t["trip_key"] == key), None)
+        if trip is None:
+            abort(404)
+        _abort_if_year_closed(trip_log.closed_years(conn), trip)
+        trip_log.add_removal(conn, key, reason, g.user)
+        trip_log.record(conn, key, "remove", {"reason": reason}, actor=g.user, actor_role=g.role)
+    return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
+
+
+@app.route("/trip/<ym>/<trip_id>/restore", methods=["POST"])
+def restore_trip(ym, trip_id):
+    year = selected_year()
+    _safe_trip_paths(ym, trip_id)
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        key = trip_merges.canonical_key(conn, f"{ym}/{trip_id}")
+        removal = trip_log.removal(conn, key)
+        if not removal:
+            abort(409, description="This trip is not removed from the log.")
+        _abort_if_key_in_closed_year(conn, key)
+        # Defense in depth: a merge made before merge suggestions saw removed
+        # trips can already bridge this recording. Restoring it then counts
+        # its stretch twice. A removed unreadable trip has no counted miles
+        # and no reliable span, so it never blocks.
+        trips, _ = load_trips(conn, include_removed=True)
+        removed_trip = next((t for t in trips if t["trip_key"] == key), None)
+        if removed_trip and trip_merges.covering_merge(removed_trip, trips):
+            abort(409, description="A merged trip now covers this recording's time. "
+                                   "Undo that merge first, then restore this trip.")
+        trip_log.delete_removal(conn, key)
+        trip_log.record(conn, key, "restore", {"reason": removal["reason"]},
+                        actor=g.user, actor_role=g.role)
+    return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
+
+
+@app.route("/account/password", methods=["GET", "POST"])
+def account_password():
+    if request.method == "POST" and g.role == "editor":
+        ip = _client_ip()
+        if _lock_seconds_remaining(ip):
+            return render_template_string(ACCOUNT_HTML, title="Change password",
+                                          message="Too many failed attempts. Try again later."), 429
+        user = users.get_user(DB_PATH, g.user)
+        # A concurrent removal still takes one hash check and fails closed.
+        valid = check_password_hash(user["password_hash"] if user else DUMMY_PASSWORD_HASH,
+                                    request.form.get("current_password", ""))
+        if not valid or user is None:
+            _record_failure(ip, g.user)
+            session["account_message"] = "Incorrect current password."
+        else:
+            try:
+                password = _confirmed_password()
+                updated = users.change_user(DB_PATH, "reset-password", g.user, password, VIEWER_USERNAME,
+                                             expected_tag=session["pw_tag"], secret_key=VIEWER_SECRET_KEY)
+                session["pw_tag"] = users.session_tag(VIEWER_SECRET_KEY, updated)
+                _clear_failures(ip, g.user)
+                session["account_message"] = "Password changed. Other sessions for this login have ended."
+            except users.UserError as exc:
+                session["account_message"] = str(exc)
+        return redirect(url_for("account_password"))
+    if request.method == "POST":
+        return redirect(url_for("account_password"))
+    return render_template_string(ACCOUNT_HTML, title="Change password",
+                                  message=session.pop("account_message", None))
 
 
 @app.route("/logout", methods=["POST"])
@@ -1481,9 +2587,11 @@ def logout():
 @app.route("/")
 def index():
     trips, unreadable, year, years = selected_trips()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        year_closed = year in trip_log.closed_years(conn)
     return render_template_string(
         LIST_HTML, trips=trips, unreadable=unreadable, year=year, years=years,
-        totals=mileage_totals(trips), timezone=DISPLAY_TZ_NAME,
+        totals=mileage_totals(trips), timezone=DISPLAY_TZ_NAME, year_closed=year_closed,
     )
 
 
@@ -1491,11 +2599,16 @@ def index():
 def trip_view(ym, trip_id):
     year = selected_year()
     _safe_trip_paths(ym, trip_id)
-    trips, unreadable = load_trips()
     key = f"{ym}/{trip_id}"
     with closing(sqlite3.connect(DB_PATH)) as conn:
         key = trip_merges.canonical_key(conn, key)
+        removed = trip_log.removal(conn, key)
+    # Merge suggestions get the standard lists plus the removed readable
+    # trips; only the admin may open a removed trip itself.
+    trips, unreadable, removed_trips, removed_unreadable = split_removed(*load_trips(include_removed=True))
     t = next((t for t in trips if t["trip_key"] == key or key in t.get("parts", [])), None)
+    if t is None and g.role == "admin" and removed is not None:
+        t = next((t for t in removed_trips + removed_unreadable if t["trip_key"] == key), None)
     if t is None:
         problem = next((u["problem"] for u in unreadable if u["trip_key"] == key), "the file is missing")
         abort(404, description=(
@@ -1505,7 +2618,17 @@ def trip_view(ym, trip_id):
         ))
     if t["trip_key"] != f"{ym}/{trip_id}":
         return redirect(url_for("trip_view", ym=t["ym"], trip_id=t["id"], year=year or ""))
-    merge_next, merge_block_reason = trip_merges.next_trip(t, trips, unreadable)
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+        conn.row_factory = sqlite3.Row
+        last_edited = _last_edited(conn, t)
+        closed = trip_log.closed_years(conn)
+    lock_year = locked_year(t, closed) if closed else None
+    year_lock = {"year": lock_year, **closed[lock_year]} if lock_year else None
+    if t.get("removal"):
+        return render_template_string(TRIP_HTML, t=t, removal=t["removal"], categories=CATEGORIES,
+                                      year=year, geocoder_enabled=False, last_edited=last_edited,
+                                      year_lock=year_lock)
+    merge_next, merge_block_reason = trip_merges.next_trip(t, trips, unreadable, removed_trips)
     places = {}
     if GEOCODER.enabled:
         endpoints = track_endpoints(t)
@@ -1517,6 +2640,7 @@ def trip_view(ym, trip_id):
     return render_template_string(TRIP_HTML, t=t, categories=CATEGORIES, year=year,
                                   geocoder_enabled=GEOCODER.enabled, places=places, merge_next=merge_next,
                                   merge_block_reason=merge_block_reason,
+                                  last_edited=last_edited, year_lock=year_lock,
                                   merge_conflict=bool(merge_next and trip_merges.annotated(t) and trip_merges.annotated(merge_next)))
 
 
@@ -1525,6 +2649,8 @@ def lookup_place(ym, trip_id):
     # Coordinates and provider are always server-selected. This is not an
     # arbitrary geocoding proxy, even for an authenticated browser.
     _safe_trip_paths(ym, trip_id)
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        _abort_if_removed(conn, f"{ym}/{trip_id}")
     t = resolved_trip(ym, trip_id)
     endpoint = request.form.get("endpoint", "")
     if endpoint not in ("start", "end"):
@@ -1542,7 +2668,13 @@ def lookup_place(ym, trip_id):
 @app.route("/gpx/<ym>/<trip_id>")
 def trip_gpx(ym, trip_id):
     gpx_path, _ = _safe_trip_paths(ym, trip_id)
-    t = resolved_trip(ym, trip_id, allow_original=True)
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        removed = trip_log.removal(conn, trip_merges.canonical_key(conn, f"{ym}/{trip_id}"))
+    # The track of a removed trip is the admin's to look at, nobody else's;
+    # without this check the plain-file path below would still serve it.
+    if removed and g.role != "admin":
+        abort(404)
+    t = resolved_trip(ym, trip_id, allow_original=True, include_removed=bool(removed))
     if t and t.get("parts"):
         try:
             raw = trip_merges.combined_gpx(DATA_ROOT, t["parts"])
@@ -1564,32 +2696,52 @@ def annotate(ym, trip_id):
     note = request.form.get("purpose_note", "").strip()
     destination = request.form.get("destination", "").strip()
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
         key = f"{ym}/{trip_id}"
         canonical = trip_merges.canonical_key(conn, key)
         if canonical != key:
             abort(409, description="This part has been merged. Reopen the merged trip before editing.")
-        merged = conn.execute("SELECT 1 FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
+        _abort_if_removed(conn, key)
+        _abort_if_key_in_closed_year(conn, key)
+        merged = conn.execute("SELECT * FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
+        after = {"category": category, "purpose_note": note, "destination": destination}
         if merged:
-            conn.execute("""UPDATE trip_merges SET category=?, purpose_note=?, destination=?, updated_at=?
-                            WHERE trip_key=?""",
-                         (category, note, destination, datetime.now(timezone.utc).isoformat(), key))
+            before = {field: merged[field] or "" for field in trip_merges.ANNOTATION_FIELDS}
         else:
             if not (DATA_ROOT / (key + ".json")).exists():
                 abort(404)
-            conn.execute("""INSERT INTO annotations (trip_key, category, purpose_note, destination, updated_at)
-                VALUES (?, ?, ?, ?, ?) ON CONFLICT(trip_key) DO UPDATE SET
-                category=excluded.category, purpose_note=excluded.purpose_note,
-                destination=excluded.destination, updated_at=excluded.updated_at""",
-                         (key, category, note, destination, datetime.now(timezone.utc).isoformat()))
+            annotation = conn.execute("SELECT * FROM annotations WHERE trip_key=?", (key,)).fetchone()
+            before = ({field: annotation[field] or "" for field in trip_merges.ANNOTATION_FIELDS}
+                      if annotation else {field: "" for field in trip_merges.ANNOTATION_FIELDS})
+        if before != after:
+            stamp = trip_log.now_utc()
+            if merged:
+                conn.execute("""UPDATE trip_merges SET category=?, purpose_note=?, destination=?, updated_at=?
+                                WHERE trip_key=?""",
+                             (category, note, destination, stamp, key))
+            else:
+                conn.execute("""INSERT INTO annotations (trip_key, category, purpose_note, destination, updated_at)
+                    VALUES (?, ?, ?, ?, ?) ON CONFLICT(trip_key) DO UPDATE SET
+                    category=excluded.category, purpose_note=excluded.purpose_note,
+                    destination=excluded.destination, updated_at=excluded.updated_at""",
+                             (key, category, note, destination, stamp))
+            trip_log.record(conn, key, "annotate", {"before": before, "after": after},
+                            actor=g.user, actor_role=g.role)
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
 
 
-def resolved_trip(ym, trip_id, allow_original=False):
+def _abort_if_removed(conn, key):
+    """409 for anything that would change a trip the admin removed from the log."""
+    if trip_log.removal(conn, trip_merges.canonical_key(conn, key)):
+        abort(409, description="This trip is removed from the log. The admin has to restore it first.")
+
+
+def resolved_trip(ym, trip_id, allow_original=False, include_removed=False):
     key = f"{ym}/{trip_id}"
     with closing(sqlite3.connect(DB_PATH)) as conn:
         key = trip_merges.canonical_key(conn, key)
-    trips, _ = load_trips()
+    trips, _ = load_trips(include_removed=include_removed)
     t = next((t for t in trips if t["trip_key"] == key or key in t.get("parts", [])), None)
     if t is None and not allow_original:
         abort(404)
@@ -1603,15 +2755,19 @@ def merge_trip(ym, trip_id):
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
-        trips, unreadable = load_trips(conn)
+        _abort_if_removed(conn, f"{ym}/{trip_id}")
+        trips, unreadable, removed_trips = load_trips_for_merging(conn)
         current = next((t for t in trips if t["trip_key"] == f"{ym}/{trip_id}"), None)
         if current is None:
             abort(409, description="Trip changed or is unavailable. Reopen the trip list.")
-        following, block_reason = trip_merges.next_trip(current, trips, unreadable)
+        closed = trip_log.closed_years(conn)
+        _abort_if_year_closed(closed, current)
+        following, block_reason = trip_merges.next_trip(current, trips, unreadable, removed_trips)
         if block_reason:
             abort(409, description=block_reason)
         if following is None or request.form.get("next_trip") != following["trip_key"]:
             abort(409, description="Only the next trip from the same device within 15 minutes can be merged. Reopen this trip.")
+        _abort_if_year_closed(closed, following)
         if not current["has_gpx"] or not following["has_gpx"]:
             abort(409, description="Both recordings are required to merge.")
         if trip_merges.annotated(current) and trip_merges.annotated(following):
@@ -1633,13 +2789,21 @@ def merge_trip(ym, trip_id):
                              (old["trip_key"], key))
             conn.execute("DELETE FROM trip_merge_parts WHERE merge_key=?", (old["trip_key"],))
             conn.execute("DELETE FROM trip_merges WHERE trip_key=?", (old["trip_key"],))
+        # `stamp` is the source fingerprint apply_merges compares on every list
+        # load; the time of the merge needs its own name or the row looks stale.
+        merged_at = trip_log.now_utc()
         conn.execute("""INSERT INTO trip_merges
             (trip_key, summary, fingerprint, category, purpose_note, destination, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)""",
                      (key, json.dumps(summary), stamp, *(annotation.get(f, "") for f in trip_merges.ANNOTATION_FIELDS),
-                      datetime.now(timezone.utc).isoformat()))
+                      merged_at))
         conn.executemany("INSERT INTO trip_merge_parts (part_key, merge_key, position) VALUES (?, ?, ?)",
                          [(part, key, index) for index, part in enumerate(keys)])
+        trip_log.record(conn, key, "merge", {
+            "parts": keys,
+            "merged_from": [current["trip_key"], following["trip_key"]],
+            "annotation_from": annotation["trip_key"],
+        }, actor=g.user, actor_role=g.role)
     ym, trip_id = key.split("/")
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
 
@@ -1652,13 +2816,17 @@ def split_trip(ym, trip_id):
         abort(400, description="Confirm restoring original annotations and removing the merged annotation.")
     key = f"{ym}/{trip_id}"
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
+        _abort_if_removed(conn, key)
         keys = trip_merges.parts(conn, key)
         if not keys:
             abort(409, description="This merge no longer exists. Reopen the trip list.")
+        _abort_if_key_in_closed_year(conn, key)
         conn.execute("DELETE FROM trip_merge_aliases WHERE merge_key=?", (key,))
         conn.execute("DELETE FROM trip_merge_parts WHERE merge_key=?", (key,))
         conn.execute("DELETE FROM trip_merges WHERE trip_key=?", (key,))
+        trip_log.record(conn, key, "split", {"parts": keys}, actor=g.user, actor_role=g.role)
     first_ym, first_id = keys[0].split("/")
     return redirect(url_for("trip_view", ym=first_ym, trip_id=first_id, year=year or ""))
 
@@ -1690,6 +2858,8 @@ EXPORT_COLUMNS = [
     ("timed_from", lambda t: fmt_local_iso(t.get("timed_from"))),
     ("recorded_until", lambda t: fmt_local_iso(t.get("recorded_until"))),
     ("year_basis", year_basis),
+    ("last_edited_by", lambda t: t.get("last_edited_by", "")),
+    ("last_edited_at", lambda t: t.get("last_edited_at", "")),
 ]
 
 
@@ -1770,7 +2940,10 @@ def _xlsx_literal_text(row):
             cell.data_type = "s"
 
 
-UNREADABLE_COLUMNS = ("trip_id", "gpx_file", "category", "purpose_note", "destination")
+UNREADABLE_COLUMNS = (
+    "trip_id", "gpx_file", "category", "purpose_note", "destination",
+    "last_edited_by", "last_edited_at",
+)
 
 
 def _unreadable_values(t):
@@ -1785,12 +2958,14 @@ def _unreadable_values(t):
         "category": t["category"],
         "purpose_note": t["purpose_note"],
         "destination": t["destination"],
+        "last_edited_by": t.get("last_edited_by", ""),
+        "last_edited_at": t.get("last_edited_at", ""),
     }
 
 
 @app.route("/export.csv")
 def export_csv():
-    trips, unreadable, year, _ = selected_trips()
+    trips, unreadable, year, _ = selected_trips(include_history=True)
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow([name for name, _ in EXPORT_COLUMNS] + ["row_type"])
@@ -1818,7 +2993,7 @@ def export_csv():
 
 @app.route("/export.xlsx")
 def export_xlsx():
-    trips, unreadable, year, _ = selected_trips()
+    trips, unreadable, year, _ = selected_trips(include_history=True)
     wb = Workbook()
     ws = wb.active
     ws.title = "Mileage"

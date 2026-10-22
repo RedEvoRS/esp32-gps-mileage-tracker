@@ -111,8 +111,11 @@ class ViewerThemeTests(unittest.TestCase):
         children = [element for element, parents in elements
                     if parents and parents[-1] == actions]
         self.assertEqual([element[0] for element in children],
-                         ["div", "span" if current else "a", "button", "form"])
-        version, box, theme, logout = children
+                         ["div", "span" if current else "a", "span", "a", "button", "form"])
+        version, box, identity, account, theme, logout = children
+        self.assertEqual(identity[1].get("class"), "account-name")
+        self.assertEqual(account[1].get("class"), "account-link")
+        self.assertEqual(account[1].get("href"), "/admin")
         self.assertEqual(version[1], {"class": "header-version"})
         self.assertEqual(box[1].get("class"), "device-health")
         self.assertIn("data-theme-toggle", theme[1])
@@ -123,8 +126,8 @@ class ViewerThemeTests(unittest.TestCase):
         if current:
             self.assertEqual(box[1].get("aria-current"), "page")
             self.assertNotIn("href", box[1])
-            # The only header span is the box inside the action group.
-            self.assertEqual([element for element, _ in elements if element[0] == "span"], [box])
+            # Both current-page and login identity spans stay in the action group.
+            self.assertEqual([element for element, _ in elements if element[0] == "span"], [box, identity])
             self.assertFalse(any(element[1].get("href") == "/device-health"
                                  for element, _ in elements))
             self.assertIn('<a href="/">← Trips</a>', html)

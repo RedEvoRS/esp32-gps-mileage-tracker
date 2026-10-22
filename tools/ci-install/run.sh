@@ -16,11 +16,19 @@ test -n "$bundle"
 lan_addr=$(ip -4 route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p')
 export INSTALL_BIND_ADDR=$lan_addr INSTALL_DISPLAY_TZ=America/Chicago
 export INSTALL_VIEWER_USER=tester INSTALL_VIEWER_PASSWORD=correct-horse-battery
+export INSTALL_ADD_EDITOR=y INSTALL_EDITOR_USER=helper INSTALL_EDITOR_PASSWORD=staple-battery-horse
 export INSTALL_WAIT_ONLINE=y INSTALL_BACKUPS=y INSTALL_BACKUP_REMOTE=/srv/offhost
 export INSTALL_SAME_DISK=y INSTALL_PING_URL='' INSTALL_OUTPUTS=none
 as_user() { sudo -E -u tester -H "$@"; }
 setup() { as_user bash /assets/setup.sh --bundle "$bundle" --dir "$install_dir" --yes < /dev/null; }
 check() { as_user bash "$install_dir/install.sh" --check < /dev/null; }
+# The everyday login exists exactly once: made by the first install, kept by
+# the rerun (whose preset asks for it again and gets "already exists").
+everyday_login_kept() {
+    local list
+    list=$(docker exec mileage-viewer python manage_users.py list)
+    test "$(grep -cFx $'helper\tenabled' <<< "$list")" = 1
+}
 test ! -e "$install_dir"
 setup
 # install.sh already tests upload, viewer login/exports, and scheduled backup.
@@ -28,6 +36,7 @@ test -n "$(ls /srv/offhost/snapshots)"
 systemctl is-enabled "mileage-backup@$(id -un tester).timer"
 test -z "$(find "$install_dir" -name .git -print -quit)"
 test -f "$install_dir/firmware-src/firmware/COMMIT"
+everyday_login_kept
 
 # Exercise all private exclusions with real files. Monitor stays disabled.
 as_user cp "$install_dir/monitor.env.example" "$install_dir/monitor.env"
@@ -46,6 +55,7 @@ setup
 if grep -q 'CI update marker' "$install_dir/stamp_version.py"; then exit 1; fi
 test "$before" = "$(private_hashes)"
 test "$started" = "$(docker inspect -f '{{.State.StartedAt}}' mileage-ingest mileage-viewer)"
+everyday_login_kept
 check
 expected="$(tr -d '\r\n' < "$install_dir/VERSION")+$(cut -c1-10 "$install_dir/COMMIT")"
 for port in 8090 8091; do

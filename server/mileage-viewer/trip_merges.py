@@ -169,18 +169,28 @@ def _unreadable_start(trip):
     return None
 
 
-def next_trip(trip, trips, unreadable):
+REMOVED_BETWEEN = ("A trip removed from the log lies between these recordings. "
+                   "Restore it to merge them, or leave them separate.")
+
+
+def next_trip(trip, trips, unreadable, removed=()):
     """Return (eligible next trip, blocking reason) for a known device.
 
     Damage blocks adjacency only for an unidentified device or a same-device
     trip whose start could fall between this trip and the next visible one.
+    `removed` holds the readable trips the admin removed from the log. They
+    still count as recordings here: joining the trips on either side of one
+    would bridge its stretch with a straight line and count it twice once it
+    is restored. Removed unreadable trips are left out on purpose; their
+    miles are never counted, and removing one is how the admin clears the
+    unreadable-summary warning.
     """
     device = trip.get("device_id")
     # Ingest uses the literal "unknown" when neither header nor GPX creator
     # identifies a device; two such recordings do not establish one device.
     if not _known_device(device):
         return None, ""
-    same = [t for t in trips if t.get("device_id") == device]
+    same = [t for t in [*trips, *removed] if t.get("device_id") == device]
     if any(not _parse_iso(t.get("start_time")) for t in same):
         return None, ""
     same.sort(key=lambda t: (_parse_iso(t["start_time"]), t["trip_key"]))
@@ -193,6 +203,8 @@ def next_trip(trip, trips, unreadable):
     end = _parse_iso(trip.get("recorded_until")) or _parse_iso(trip.get("end_time"))
     start = _parse_iso(candidate.get("start_time"))
     if end and timedelta(0) <= start - end <= MERGE_MAX_GAP:
+        if candidate.get("removal"):
+            return None, REMOVED_BETWEEN
         current_start = _parse_iso(trip["start_time"])
         for damaged in unreadable:
             damaged_device = damaged.get("device_id")
@@ -209,6 +221,30 @@ def next_trip(trip, trips, unreadable):
             return None, "Cannot establish the next trip: an unreadable summary from this device may fall between these recordings. Repair the summary before merging."
         return candidate, ""
     return None, ""
+
+
+def recorded_span(trip):
+    """(start, end) of a readable trip's recording, or None without both."""
+    start = _parse_iso(trip.get("start_time"))
+    ends = [e for e in (_parse_iso(trip.get("recorded_until")), _parse_iso(trip.get("end_time"))) if e]
+    return (start, max(ends)) if start and ends else None
+
+
+def covering_merge(removed_trip, trips):
+    """A live merged trip whose recorded span overlaps a removed trip's, or None.
+
+    Only data from before merge suggestions saw removed trips can have one.
+    """
+    span = recorded_span(removed_trip)
+    if span is None:
+        return None
+    for t in trips:
+        if not t.get("parts") or t.get("removal") or t.get("device_id") != removed_trip.get("device_id"):
+            continue
+        other = recorded_span(t)
+        if other and other[0] <= span[1] and span[0] <= other[1]:
+            return t
+    return None
 
 
 def annotated(trip):

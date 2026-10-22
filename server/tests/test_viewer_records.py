@@ -284,6 +284,8 @@ class ViewerRecords(unittest.TestCase):
                               bad["purpose_note"], bad["destination"]),
                              ("bad", "bad.gpx", "business", "'=1+2", "Client"))
             self.assertEqual((bad["distance_miles"], bad["date"]), ("", ""))
+            self.assertEqual(bad["last_edited_by"], "unknown")
+            self.assertTrue(bad["last_edited_at"].endswith(("-07:00", "-08:00")))
             totals = {r["category"]: r["distance_miles"] for r in rows if r["row_type"] == "total"}
             self.assertEqual(totals["all"], "2.0")
 
@@ -292,7 +294,9 @@ class ViewerRecords(unittest.TestCase):
                 self.assertEqual(workbook.sheetnames, ["Mileage", "Totals", "Unreadable trips"])
                 header, row = workbook["Unreadable trips"].iter_rows()
                 self.assertEqual([c.value for c in header], list(self.viewer.UNREADABLE_COLUMNS))
-                self.assertEqual([c.value for c in row], ["bad", "bad.gpx", "business", "=1+2", "Client"])
+                self.assertEqual([c.value for c in row[:5]], ["bad", "bad.gpx", "business", "=1+2", "Client"])
+                self.assertEqual(row[5].value, "unknown")
+                self.assertTrue(row[6].value.endswith(("-07:00", "-08:00")))
                 self.assertEqual(row[3].data_type, "s")
                 self.assertEqual(workbook["Mileage"].max_row, 2)
             finally:

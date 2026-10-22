@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+# A new commit replaces an older run for the same PR; other events get their own group.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   pii-scan:
     # The repo is meant to go public, so files, commit messages and author
@@ -35,7 +40,10 @@ jobs:
           COMMITS: ${{ github.event_name == 'pull_request' && format('{0}..{1}', github.event.pull_request.base.sha, github.event.pull_request.head.sha) || '' }}
         run: python tools/check_pii.py ${COMMITS:+--commits "$COMMITS"}
 
+  # Strict up-to-date required checks mean main receives exactly the files tested on the PR.
+  # Keep the push run as the PII backstop; the other checks run on PRs and manual runs.
   server:
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -57,6 +65,7 @@ jobs:
           node server/tests/test_viewer_places.js
 
   firmware-host:
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -82,6 +91,7 @@ jobs:
   firmware-compile:
     # One runner shares the toolchain and core build cache across all sketches.
     # Compilation only; OLED/SD/power behavior still needs hardware validation.
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     outputs:
@@ -213,6 +223,7 @@ jobs:
 
   installer:
     needs: firmware-compile
+    if: github.event_name != 'push'
     # Runs server/install.sh for real on a fresh VM: Docker builds, the
     # test upload, the viewer login and exports, and backups through
     # systemd. Then reruns it, has it repair a mangled config, restarts
@@ -481,7 +492,7 @@ jobs:
   # Optional check: do not add this job to branch protection's five required checks.
   flash-windows:
     needs: firmware-compile
-    if: needs.firmware-compile.outputs.windows == 'true'
+    if: github.event_name != 'push' && needs.firmware-compile.outputs.windows == 'true'
     runs-on: windows-latest
     timeout-minutes: 5
     steps:

@@ -163,6 +163,18 @@ class ViewerMerges(unittest.TestCase):
         self.assertEqual(by_key[b]["destination"], "Test destination")
         self.assertEqual(original, {p.name: p.read_bytes() for p in self.month.iterdir()})
 
+    def test_new_merge_stores_the_source_fingerprint_so_the_next_load_reuses_it(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        with closing(sqlite3.connect(self.db)) as conn:
+            fingerprint, updated_at = conn.execute(
+                "SELECT fingerprint, updated_at FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
+        self.assertEqual(fingerprint, self.viewer.trip_merges.fingerprint(self.data, [a, b]))
+        self.assertNotEqual(fingerprint, updated_at)
+        with patch.object(self.viewer.trip_merges, "combined_summary", side_effect=AssertionError("rebuilt")):
+            self.assertEqual(self.client.get("/").status_code, 200)
+            self.assertEqual(len(self.viewer.load_trips()[0]), 1)
+
     def test_chain_and_old_merged_link_then_split_to_all_originals(self):
         a, b, c = self.trip("a", 0), self.trip("b", 120, .001), self.trip("c", 240, .002)
         self.annotate(a, "business", "Original A")
@@ -240,6 +252,102 @@ class ViewerMerges(unittest.TestCase):
         self.trip("a", 0, device="unknown")
         self.trip("b", 120, .001, device="unknown")
         self.assertEqual(self.merge(a, b).status_code, 409)
+
+    def remove(self, key, reason="Phantom recording"):
+        return self.client.post(f"/trip/{key}/remove", data={"csrf_token": "test-csrf", "reason": reason})
+
+    def restore(self, key):
+        return self.client.post(f"/trip/{key}/restore", data={"csrf_token": "test-csrf"})
+
+    def total_miles(self):
+        return sum(t["distance_miles"] for t in self.viewer.load_trips()[0])
+
+    def three_legs(self):
+        # A and C are a few minutes apart with a removable B between them.
+        return self.trip("a", 0), self.trip("b", 180, .003), self.trip("c", 420, .014)
+
+    def test_removed_trip_between_two_recordings_blocks_merging_across_it(self):
+        a, b, c = self.three_legs()
+        all_three = self.total_miles()
+        self.assertEqual(self.remove(b).status_code, 302)
+        without_b = self.total_miles()
+        self.assertLess(without_b, all_three)
+        reason = "A trip removed from the log lies between these recordings."
+        page = self.client.get(f"/trip/{a}").get_data(as_text=True)
+        self.assertIn(reason, page)
+        self.assertIn("Restore it to merge them, or leave them separate.", page)
+        self.assertNotIn(">Merge with next trip</button>", page)
+        self.assertNotIn("No eligible next trip", page)
+        # A forged request for the pair that skips B is refused as well.
+        forged = self.merge(a, c)
+        self.assertEqual(forged.status_code, 409)
+        self.assertIn(reason, forged.get_data(as_text=True))
+        self.assertEqual(self.merge(a, b).status_code, 409)
+        self.assertEqual(self.total_miles(), without_b)
+        # Restoring B puts the three-trip total back, never more.
+        self.assertEqual(self.restore(b).status_code, 302)
+        self.assertAlmostEqual(self.total_miles(), all_three)
+        self.assertIn(">Merge with next trip</button>", self.client.get(f"/trip/{a}").get_data(as_text=True))
+        # With B back, the pair is offered in order again.
+        self.merged_key(self.merge(a, b))
+
+    def test_removed_trip_far_from_the_next_leg_gives_no_misleading_reason(self):
+        a, b = self.trip("a", 0), self.trip("b", 3600)
+        self.remove(b)
+        page = self.client.get(f"/trip/{a}").get_data(as_text=True)
+        self.assertNotIn("removed from the log lies between", page)
+        self.assertIn("No eligible next trip", page)
+
+    def test_restore_is_refused_while_an_older_merge_covers_the_removed_trip(self):
+        a, b, c = self.three_legs()
+        all_three = self.total_miles()
+        self.remove(b)
+        # Data from before merge suggestions saw removed trips: A+C merged
+        # while B was removed. Insert it as merge_trip would have.
+        key = "2026-04/merge-" + "0" * 24
+        keys = [a, c]
+        summary = self.viewer.trip_merges.combined_summary(self.data, keys)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO trip_merges (trip_key, summary, fingerprint, updated_at) VALUES (?, ?, ?, ?)",
+                         (key, json.dumps(summary), self.viewer.trip_merges.fingerprint(self.data, keys), "2026-04-14T12:00:00+00:00"))
+            conn.executemany("INSERT INTO trip_merge_parts (part_key, merge_key, position) VALUES (?, ?, ?)",
+                             [(part, key, i) for i, part in enumerate(keys)])
+        bridged = self.total_miles()
+        refused = self.restore(b)
+        self.assertEqual(refused.status_code, 409)
+        self.assertIn("A merged trip now covers this recording&#39;s time. Undo that merge first, then restore this trip.",
+                      refused.get_data(as_text=True))
+        self.assertEqual(self.total_miles(), bridged)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM trip_removals").fetchone()[0], 1)
+        # Undoing the merge unblocks the restore, and nothing is counted twice.
+        self.assertEqual(self.split(key).status_code, 302)
+        self.assertEqual(self.restore(b).status_code, 302)
+        self.assertAlmostEqual(self.total_miles(), all_three)
+
+    def test_restore_ignores_merges_that_do_not_overlap_or_belong_to_another_device(self):
+        a, b, c = self.three_legs()
+        other = self.trip("other", 0, .02, device="other-device")
+        self.remove(b)
+        self.assertEqual(self.remove(other).status_code, 302)
+        # A merge of two other-device legs spans B's time but isn't B's device.
+        late = self.trip("late", 7200, .03, device="other-device")
+        self.merged_key(self.merge(late, self.trip("later", 7260, .031, device="other-device")))
+        self.assertEqual(self.restore(b).status_code, 302)
+        self.assertEqual(self.restore(other).status_code, 302)
+
+    def test_removed_unreadable_trip_never_blocks_merging_or_restoring(self):
+        a, b, c = self.three_legs()
+        self.damage_summary(b)
+        with self.assertLogs(self.viewer.app.logger, "WARNING"):
+            self.assertEqual(self.merge(a, c).status_code, 409)
+            self.assertEqual(self.remove(b).status_code, 302)
+        page = self.client.get(f"/trip/{a}").get_data(as_text=True)
+        self.assertIn(">Merge with next trip</button>", page)
+        merged = self.merged_key(self.merge(a, c))
+        # No counted miles and no reliable span: restoring it is still allowed.
+        self.assertEqual(self.restore(b).status_code, 302)
+        self.assertEqual(self.split(merged).status_code, 302)
 
     def test_unknown_start_or_unreadable_summary_cannot_prove_adjacency(self):
         a, b = self.trip("a", 0), self.trip("b", 120, .001)

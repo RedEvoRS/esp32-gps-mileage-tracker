@@ -18,6 +18,9 @@ mileage-viewer/**
 !mileage-viewer/app.py
 !mileage-viewer/geocoding.py
 !mileage-viewer/trip_merges.py
+!mileage-viewer/trip_log.py
+!mileage-viewer/users.py
+!mileage-viewer/manage_users.py
 !mileage-viewer/static/
 mileage-viewer/static/**
 !mileage-viewer/static/leaflet.js
