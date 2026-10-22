@@ -152,12 +152,124 @@ class BashFlashTests(unittest.TestCase):
                 self.assertEqual(command.count(".bin"), count)
                 self.assertNotIn("--erase-all", command)
                 self.assertEqual(result.stdout.count("read-flash" if major == 5 else "read_flash"), 2 if first else 0)
+                commands = [line for line in result.stdout.splitlines() if line.startswith("DRY RUN:") and "--chip" in line]
+                erase = "erase-flash" if major == 5 else "erase_flash"
+                self.assertEqual(sum(erase in line for line in commands), 1 if first else 0)
+                if first:
+                    self.assertIn(erase, commands[-2])
+                    self.assertIn("read-flash" if major == 5 else "read_flash", commands[-3])
+                    self.assertIn("LittleFS partition is fully erased; provisioning trip storage.", result.stdout)
+                    self.assertIn("Setup complete. Logging trips.", result.stdout)
                 self.assertEqual(list(self.folder.glob("tracker-firmware.*")), [])
         (self.folder / "app.bin").write_bytes(b"bad")
         result = subprocess.run(args, capture_output=True, text=True,
                                 env={**os.environ, "TMPDIR": str(self.folder)})
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(list(self.folder.glob("tracker-firmware.*")), [])
+
+    def interactive(self, options, replies, failure="", major=5):
+        # A private pseudo-terminal exercises the real /dev/tty prompts. The
+        # only executable given to the script is a fake tool; no device opens.
+        import fcntl
+        import pty
+        import termios
+
+        fake = self.folder / "esptool"
+        log = self.folder / "commands.txt"
+        log.write_text("", encoding="ascii")
+        fake.write_text('''#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["FLASH_TEST_LOG"], "a") as out:
+    out.write(json.dumps(args) + "\\n")
+if args == ["version"]:
+    print("esptool v" + os.environ["FLASH_TEST_MAJOR"] + ".6.0")
+elif "read-flash" in args or "read_flash" in args:
+    if os.environ["FLASH_TEST_FAILURE"] == "read":
+        sys.exit(1)
+    with open(args[-1], "wb") as out:
+        size = 17 if os.environ["FLASH_TEST_FAILURE"] == "short" else 8388608
+        out.truncate(size)
+        if os.environ["FLASH_TEST_FAILURE"] == "mismatch" and ".verify.bin" in args[-1]:
+            out.write(b"x")
+elif ("erase-flash" in args or "erase_flash" in args) and os.environ["FLASH_TEST_FAILURE"] == "erase":
+    sys.exit(1)
+''', encoding="ascii")
+        fake.chmod(0o700)
+        master, slave = pty.openpty()
+
+        def controlling_terminal():
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+        try:
+            process = subprocess.Popen(
+                ["bash", str(ROOT / "install/flash.sh"), "--path", str(self.folder),
+                 "--port", "/dev/test", "--esptool", str(fake),
+                 "--backup-dir", str(self.folder / "backups"), *options],
+                stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, preexec_fn=controlling_terminal,
+                env={**os.environ, "TMPDIR": str(self.folder), "FLASH_TEST_LOG": str(log),
+                     "FLASH_TEST_FAILURE": failure, "FLASH_TEST_MAJOR": str(major)})
+            try:
+                os.write(master, replies.encode("ascii"))
+                stdout, stderr = process.communicate(timeout=25)
+            except BaseException:
+                process.kill()
+                process.communicate()
+                raise
+        finally:
+            os.close(slave)
+            os.close(master)
+        self.assertEqual(list(self.folder.glob("tracker-firmware.*")), [])
+        commands = [json.loads(line) for line in log.read_text(encoding="ascii").splitlines()]
+        return process.returncode, stdout + stderr, commands
+
+    def test_first_install_erase_gate_and_order(self):
+        for major in (4, 5):
+            for options, replies, expected_reads in (
+                    (["--first-install"], "\nERASE\n", 2),
+                    ([], "\nyes\nERASE\n", 2),
+                    (["--first-install", "--skip-backup"], "\nERASE\n", 0)):
+                with self.subTest(major=major, options=options):
+                    code, output, commands = self.interactive(options, replies, major=major)
+                    self.assertEqual(code, 0, output)
+                    suffix = "-flash" if major == 5 else "_flash"
+                    self.assertIn("erase" + suffix, commands[-2])
+                    self.assertIn("write" + suffix, commands[-1])
+                    self.assertEqual(sum("read" + suffix in c for c in commands), expected_reads)
+                    self.assertEqual(sum(arg.endswith(".bin") for arg in commands[-1]), 4)
+
+    def test_rejected_confirmation_and_backup_failures_block_erase_and_write(self):
+        for skip in (False, True):
+            for reply in ("yes", "erase", "ERASE ", ""):
+                with self.subTest(skip=skip, reply=reply):
+                    options = ["--first-install"] + (["--skip-backup"] if skip else [])
+                    code, output, commands = self.interactive(options, "\n" + reply + "\n")
+                    self.assertNotEqual(code, 0, output)
+                    self.assertIn("confirmation refused", output)
+                    self.assertFalse(any("erase-flash" in c or "write-flash" in c for c in commands))
+        for failure in ("read", "short", "mismatch"):
+            with self.subTest(failure=failure):
+                code, output, commands = self.interactive(["--first-install"], "\nERASE\n", failure)
+                self.assertNotEqual(code, 0, output)
+                self.assertFalse(any("erase-flash" in c or "write-flash" in c for c in commands))
+        code, output, commands = self.interactive(["--first-install"], "\nERASE\n", "erase")
+        self.assertNotEqual(code, 0, output)
+        self.assertFalse(any("write-flash" in c for c in commands))
+
+    def test_update_cleanup_never_erase_and_skip_requires_first(self):
+        self.manifest["kind"] = "normal"
+        self.save(self.manifest)
+        for options, replies in (([], "\nno\n"), (["--cleanup"], "\n")):
+            code, output, commands = self.interactive(options, replies)
+            self.assertEqual(code, 0, output)
+            self.assertFalse(any("erase-flash" in c or "read-flash" in c for c in commands))
+            self.assertEqual(sum(arg.endswith(".bin") for arg in commands[-1]), 1)
+        for options in (["--skip-backup"], ["--cleanup", "--first-install"]):
+            code, _, commands = self.interactive(options, "\n")
+            self.assertNotEqual(code, 0)
+            self.assertEqual(commands, [])
 
 
 if __name__ == "__main__":

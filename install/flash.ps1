@@ -5,7 +5,7 @@ function Invoke-TrackerFlash {
     param(
         [string]$Server, [string]$InstallDir = '~/mileage-tracker',
         [switch]$Cleanup, [switch]$FirstInstall, [string]$Port, [string]$Path,
-        [switch]$DryRun, [switch]$Help, [string]$Esptool, [string]$BackupDir
+        [switch]$DryRun, [switch]$Help, [string]$Esptool, [string]$BackupDir, [switch]$SkipBackup
     )
     $ErrorActionPreference = 'Stop'
     $releaseTag = '@RELEASE_TAG@'
@@ -133,7 +133,7 @@ function Invoke-TrackerFlash {
         Write-Host @'
 Usage: .\flash.ps1 [-Server <user>@<host>] [-InstallDir ~/mileage-tracker]
   [-Path <folder>] [-Cleanup] [-FirstInstall] [-Port COMx] [-DryRun]
-  [-Esptool <executable>] [-BackupDir <folder>] [-Help]
+  [-Esptool <executable>] [-BackupDir <folder>] [-SkipBackup] [-Help]
 Windows PowerShell 5.1 / PowerShell 7; Windows 10/11 native USB needs no driver.
 Requires OpenSSH scp unless -Path is used. Standalone esptool needs no Python.
 One-liner: irm <release-url>/flash.ps1 | iex (prompts use Read-Host).
@@ -143,12 +143,19 @@ Download, read, run alternative:
   powershell.exe -ExecutionPolicy Bypass -File .\flash.ps1 -Server <user>@<host>
 PowerShell 7: use pwsh instead of powershell.exe.
 -DryRun verifies firmware and esptool but never opens a serial device.
+Default update and -Cleanup write only the app and never erase settings or trips.
+-FirstInstall: verified double 8 MB backup, type ERASE, erase all flash, write four parts.
+Use only for a new/factory board. Internal settings and trips are wiped; SD is untouched.
+-FirstInstall -SkipBackup: re-provision a board you already backed up; still type ERASE.
+Dry run prints the backup/erase/write plan without requesting confirmation.
+The standalone esptool version is pinned independently of the tracker release.
 '@
         return
     }
     $temp = $null; $toolTemp = $null
     try {
         if ($Cleanup -and $FirstInstall) { throw 'Cleanup is app-only; cannot combine with FirstInstall.' }
+        if ($SkipBackup -and -not $FirstInstall) { throw 'SkipBackup requires explicit FirstInstall.' }
         $temp = New-PrivateFolder $env:TEMP
         $payload = Join-Path $temp 'payload'
         if ($Path) {
@@ -188,9 +195,11 @@ PowerShell 7: use pwsh instead of powershell.exe.
         $major = $Matches[1]
         $before = 'no-reset'; $after = 'no-reset'; $hardReset = 'hard-reset'; $chipCommand = 'chip-id'; $readCommand = 'read-flash'; $writeCommand = 'write-flash'
         $modeFlag = '--flash-mode'; $freqFlag = '--flash-freq'; $sizeFlag = '--flash-size'
+        $eraseCommand = 'erase-flash'
         if ($major -eq '4') {
             $before = 'no_reset'; $after = 'no_reset'; $hardReset = 'hard_reset'; $chipCommand = 'chip_id'; $readCommand = 'read_flash'; $writeCommand = 'write_flash'
             $modeFlag = '--flash_mode'; $freqFlag = '--flash_freq'; $sizeFlag = '--flash_size'
+            $eraseCommand = 'erase_flash'
         }
         Write-Host "Tracker flash (release $releaseTag). Keep the LoRa antenna attached; use a USB data cable."
         Write-Host 'Download mode: hold BOOT, plug in USB (or tap RESET), wait 2-3 seconds, release BOOT.'
@@ -212,38 +221,50 @@ PowerShell 7: use pwsh instead of powershell.exe.
         $common = @('--chip', 'esp32s3', '--port', $Port, '--before', $before, '--after', $after)
         Invoke-FlashCommand ($common + @($chipCommand))
         if (-not $FirstInstall -and -not $Cleanup -and -not $DryRun) {
-            $FirstInstall = (Read-Host 'First install on a factory board? Backup then write all four parts? [y/N]') -match '^(y|yes)$'
+            $FirstInstall = (Read-Host 'First install on a factory board? Backup, full erase, then write four parts? [y/N]') -match '^(y|yes)$'
         }
         if ($FirstInstall) {
-            if (-not $BackupDir) {
-                $BackupDir = Join-Path ([Environment]::GetFolderPath('UserProfile')) 'mileage-tracker-backups'
-                if (-not $DryRun) { $answer = Read-Host "Backup folder [$BackupDir]"; if ($answer) { $BackupDir = $answer } }
-            }
-            # Use a private child folder even inside a user-chosen/shared parent.
-            if (-not $DryRun) {
-                [IO.Directory]::CreateDirectory($BackupDir) | Out-Null
-                $BackupDir = New-PrivateFolder $BackupDir
-            }
-            $backup = Join-Path $BackupDir ('supreme-factory-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '.bin')
-            $second = $backup + '.verify.bin'
-            if ($DryRun) {
-                Invoke-FlashCommand ($common + @($readCommand, '0', '0x800000', $backup))
-                Invoke-FlashCommand ($common + @($readCommand, '0', '0x800000', $second))
-            } else {
-                Read-FactoryRange 0 8388608 $backup
-                Read-FactoryRange 0 8388608 $second
-                if ((Get-Item -LiteralPath $backup).Length -ne 8388608 -or (Get-Item -LiteralPath $second).Length -ne 8388608) { throw 'Factory backup is not 8 MB; no write performed.' }
-                if ((Get-FileHash -LiteralPath $backup).Hash -cne (Get-FileHash -LiteralPath $second).Hash) { throw 'Factory backup reads differ; no write performed. Keep both for investigation.' }
-                Remove-Item -LiteralPath $second -Force
-            }
-            Write-Host "Keep the factory backup privately outside the repo: $backup (may contain device keys)."
-            Write-Host 'First install writes four separate parts, with erase-all disabled.'
+            if (-not $SkipBackup) {
+                if (-not $BackupDir) {
+                    $BackupDir = Join-Path ([Environment]::GetFolderPath('UserProfile')) 'mileage-tracker-backups'
+                    if (-not $DryRun) { $answer = Read-Host "Backup folder [$BackupDir]"; if ($answer) { $BackupDir = $answer } }
+                }
+                # Use a private child folder even inside a user-chosen/shared parent.
+                if (-not $DryRun) {
+                    [IO.Directory]::CreateDirectory($BackupDir) | Out-Null
+                    $BackupDir = New-PrivateFolder $BackupDir
+                }
+                $backup = Join-Path $BackupDir ('supreme-factory-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '.bin')
+                $second = $backup + '.verify.bin'
+                if ($DryRun) {
+                    Invoke-FlashCommand ($common + @($readCommand, '0', '0x800000', $backup))
+                    Invoke-FlashCommand ($common + @($readCommand, '0', '0x800000', $second))
+                } else {
+                    Read-FactoryRange 0 8388608 $backup
+                    Read-FactoryRange 0 8388608 $second
+                    if ((Get-Item -LiteralPath $backup).Length -ne 8388608 -or (Get-Item -LiteralPath $second).Length -ne 8388608) { throw 'Factory backup is not 8 MB; no write performed.' }
+                    if ((Get-FileHash -LiteralPath $backup).Hash -cne (Get-FileHash -LiteralPath $second).Hash) { throw 'Factory backup reads differ; no write performed. Keep both for investigation.' }
+                    Remove-Item -LiteralPath $second -Force
+                }
+                Write-Host "Keep the factory backup privately outside the repo: $backup (may contain device keys)."
+            } else { Write-Host 'Skipping factory backup: re-provision only a board you already backed up.' }
+            Write-Host 'WARNING: This wipes everything on the board internal flash, including settings (trip counter, diagnostics enrollment record) and any trips on internal flash.'
+            Write-Host 'This is right for a brand-new board or one coming from factory firmware. It is wrong for a tracker already running this project; use the default update instead.'
+            Write-Host 'Trips on the SD card are not touched.'
+            if ($DryRun) { Write-Host 'DRY RUN: A real first install requires typing ERASE. Backup verification is skipped only with explicit SkipBackup.' }
+            elseif ((Read-Host 'Type ERASE to erase the whole internal flash') -cne 'ERASE') { throw 'Erase confirmation refused; nothing erased or written.' }
+            Invoke-FlashCommand ($common + @($eraseCommand))
+            Write-Host 'First install writes four separate parts after the full erase.'
         } else { Write-Host 'App-only update: settings, NVS trip counter, diag/enroll, LittleFS trips and SD trips are kept.' }
         $writeCommon = @($common); $writeCommon[-1] = $hardReset
         $writeArgs = $writeCommon + @($writeCommand, $modeFlag, $manifest.flash_mode, $freqFlag, $manifest.flash_freq, $sizeFlag, $manifest.flash_size)
         foreach ($part in @(Get-FlashPart $manifest ([bool]$FirstInstall))) { $writeArgs += @($part.offset, (Join-Path $payload $part.file)) }
         Invoke-FlashCommand $writeArgs
         Write-Host 'Press RESET once with BOOT released (hard reset) to run the sketch.'
+        if ($FirstInstall) {
+            Write-Host 'Expect on the serial console: LittleFS partition is fully erased; provisioning trip storage.'
+            Write-Host 'Then: Setup complete. Logging trips.'
+        }
         Write-Host 'Check the boot status card, GPS outdoors, WiFi uploads, and Device health.'
         if ($manifest.kind -ceq 'enroll') { Write-Host 'Wait for the first snapshot in Device health, then run this script again with -Cleanup (app only).' }
     } finally {

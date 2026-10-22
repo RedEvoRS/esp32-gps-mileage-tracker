@@ -22,7 +22,7 @@ same commands; this change does not edit its workflow.
 For a manual dry run with the real checksum-verified standalone esptool, supply
 a folder produced by the builder, `--path` / `-Path`, `--dry-run` / `-DryRun`,
 and a placeholder `--port /dev/test` / `-Port COMx`. Add `--first-install` /
-`-FirstInstall` to inspect backup and four-part commands; use a normal-kind
+`-FirstInstall` to inspect backup, full erase and four-part commands; use a normal-kind
 folder with `--cleanup` / `-Cleanup` to inspect app-only cleanup. Dry run skips
 all serial commands, including chip identification, while checking the host
 executable version. Real operation confirms the ESP32-S3 with chip identification
@@ -31,10 +31,31 @@ before reading or writing flash.
 Flash safety fences reflect the checked-in Supreme `partitions.csv`: NVS starts
 at `0x9000` and LittleFS at `0x190000`. A future partition-layout change must
 review these fences along with the builder; offsets used in commands always
-come from the manifest. The scripts never use a padded merged image or erase-all.
+come from the manifest. The scripts never use a padded merged image.
 
-First installs intentionally follow the two-piece interface's no-erase-all rule.
-The current firmware README separately calls for erasing factory LittleFS data
-on first Stage 4 provisioning. Four-part flashing alone may leave that partition
-unavailable; real-board acceptance and a coordinated provisioning decision are
-still required. Do not resolve that by adding erase-all to these scripts.
+First install performs two full 8 MB reads and verifies their size and contents,
+requires the exact case-sensitive answer `ERASE`, erases the whole internal flash,
+then writes all four parts at manifest offsets. This is required to provision
+LittleFS over the factory firmware, as explained in `firmware/README.md`.
+It wipes internal settings (including trip counter and diagnostics enrollment)
+and internal trips. SD trips are untouched. Use the default update for a tracker
+already running this project. `-FirstInstall -SkipBackup` / `--first-install
+--skip-backup` is only for re-provisioning a board already backed up, and still
+requires `ERASE`. Dry run prints the sequence and confirmation requirement without
+prompting or accessing a device. Update and cleanup never erase.
+
+The tests exercise the real control flow with fake esptool executables: v4/v5
+erase spelling and backup/erase/write order; refusal of wrong confirmation;
+read failure, short backup, mismatched reads and erase failure; explicit backup
+skip; and app-only update/cleanup. Bash uses a private pseudo-terminal for the
+`/dev/tty` prompts. PowerShell supplies queued `Read-Host` replies. The real
+pinned standalone tool is used separately only for dry runs. Its version is
+pinned independently of the tracker release.
+
+All fixtures and synthetic backup files are removed by test cleanup, including
+assertion failures. Forced termination can leave `flash-tests-*` under the OS
+temporary directory; the script copies are `tracker-flash-*` under `$env:TEMP`
+(Windows) or `tracker-firmware.*` under `${TMPDIR:-/tmp}` (bash). Download folders
+are `tracker-flash-*` under the Windows user profile or `esptool.*` under
+`~/.cache/mileage-tracker`. Factory backups are deliberately retained in the
+chosen backup directory. Report exact leftover paths after an interrupted run.

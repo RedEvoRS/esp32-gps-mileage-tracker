@@ -98,9 +98,10 @@ tracker_flash() (
     }
     # The literal tilde belongs to the remote user's home, not this computer.
     # shellcheck disable=SC2088
-    local server='' install_dir='~/mileage-tracker' cleanup=false first=false port='' path='' dry=false esptool='' backup_dir=''
+    local server='' install_dir='~/mileage-tracker' cleanup=false first=false port='' path='' dry=false esptool='' backup_dir='' skip_backup=false
     local temp='' tool_temp='' value version major before after chip read_flash write_flash hard_reset='hard-reset'
     local mode_flag=--flash-mode freq_flag=--flash-freq size_flag=--flash-size
+    local erase_flash=erase-flash
     trap 'if [ -n "$temp" ]; then rm -rf -- "$temp"; fi; if [ -n "$tool_temp" ]; then rm -rf -- "$tool_temp"; fi' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -109,17 +110,24 @@ tracker_flash() (
             --help|-h) cat <<'HELP'
 Usage: bash flash.sh [--server <user>@<host>] [--install-dir ~/mileage-tracker]
   [--path <folder>] [--cleanup] [--first-install] [--port <port>] [--dry-run]
-  [--esptool <executable>] [--backup-dir <folder>] [--help]
+  [--esptool <executable>] [--backup-dir <folder>] [--skip-backup] [--help]
 Requires bash, curl, tar, jq, and OpenSSH scp (unless --path). No Python required.
-Install jq with your OS package manager (macOS: brew install jq; Debian: apt install jq).
+Install jq: Debian/Ubuntu: sudo apt install jq; macOS: brew install jq.
 Review before running: curl -fsSL <release-url>/flash.sh -o flash.sh; less flash.sh
 Then: bash flash.sh --server '<user>@<host>'
 Prompts use /dev/tty, including when curl is piped to bash.
 --dry-run verifies firmware and esptool but never opens a serial device.
+Default update and --cleanup write only the app and never erase settings or trips.
+--first-install: verified double 8 MB backup, type ERASE, erase all flash, write four parts.
+Use only for a new/factory board. Internal settings and trips are wiped; SD is untouched.
+--first-install --skip-backup: re-provision a board already backed up; still type ERASE.
+Dry run prints the backup/erase/write plan without requesting confirmation.
+The standalone esptool version is pinned independently of the tracker release.
 HELP
                 return ;;
             --cleanup) cleanup=true ;;
             --first-install) first=true ;;
+            --skip-backup) skip_backup=true ;;
             --dry-run) dry=true ;;
             --server|--install-dir|--port|--path|--esptool|--backup-dir)
                 [ "$#" -ge 2 ] && [ -n "$2" ] || flash_die "Missing value for $1"
@@ -135,7 +143,8 @@ HELP
         shift
     done
     [ "$cleanup" != true ] || [ "$first" != true ] || flash_die 'Cleanup is app-only; cannot combine with first-install.'
-    command -v jq >/dev/null || flash_die 'Install jq with your OS package manager; see --help.'
+    [ "$skip_backup" != true ] || [ "$first" = true ] || flash_die 'skip-backup requires explicit first-install.'
+    command -v jq >/dev/null || flash_die 'jq is required. Debian/Ubuntu: sudo apt install jq; macOS: brew install jq.'
     temp=$(mktemp -d "${TMPDIR:-/tmp}/tracker-firmware.XXXXXXXX"); chmod 700 "$temp"
     if [ -n "$path" ]; then
         mkdir "$temp/payload"
@@ -161,6 +170,7 @@ HELP
         before=no_reset; after=no_reset; chip=chip_id; read_flash=read_flash; write_flash=write_flash
         hard_reset=hard_reset
         mode_flag=--flash_mode; freq_flag=--flash_freq; size_flag=--flash_size
+        erase_flash=erase_flash
     fi
     printf 'Tracker flash (release %s). Keep the LoRa antenna attached; use a USB data cable.\n' "$RELEASE_TAG"
     printf 'Download mode: hold BOOT, plug in USB (or tap RESET), wait 2-3 seconds, release BOOT.\n'
@@ -177,26 +187,38 @@ HELP
     local common=(--chip esp32s3 --port "$port" --before "$before" --after "$after")
     flash_command "${common[@]}" "$chip" || flash_die 'Chip confirmation failed. On Linux check port permissions: Debian/Ubuntu use the dialout group; log out/in after joining. Close serial monitors and retry download mode.'
     if [ "$first" != true ] && [ "$cleanup" != true ] && [ "$dry" != true ]; then
-        value=$(flash_prompt 'First install on a factory board? Backup then write all four parts? [y/N]: ')
+        value=$(flash_prompt 'First install on a factory board? Backup, full erase, then write four parts? [y/N]: ')
         case $value in y|Y|yes|YES) first=true ;; esac
     fi
     if [ "$first" = true ]; then
-        if [ -z "$backup_dir" ]; then
-            backup_dir="$HOME/mileage-tracker-backups"
-            if [ "$dry" != true ]; then value=$(flash_prompt "Backup folder [$backup_dir]: "); backup_dir=${value:-$backup_dir}; fi
+        if [ "$skip_backup" != true ]; then
+            if [ -z "$backup_dir" ]; then
+                backup_dir="$HOME/mileage-tracker-backups"
+                if [ "$dry" != true ]; then value=$(flash_prompt "Backup folder [$backup_dir]: "); backup_dir=${value:-$backup_dir}; fi
+            fi
+            local backup second
+            backup="$backup_dir/supreme-factory-$(date -u +%Y%m%dT%H%M%SZ)-$$.bin"; second="$backup.verify.bin"
+            if [ "$dry" != true ]; then mkdir -p "$backup_dir"; fi
+            flash_command "${common[@]}" "$read_flash" 0 0x800000 "$backup"
+            flash_command "${common[@]}" "$read_flash" 0 0x800000 "$second"
+            if [ "$dry" != true ]; then
+                [ "$(wc -c < "$backup")" -eq 8388608 ] && [ "$(wc -c < "$second")" -eq 8388608 ] || flash_die 'Factory backup is not 8 MB; no flash write performed.'
+                cmp -s "$backup" "$second" || flash_die 'Factory backup reads differ; no flash write performed. Keep both for investigation.'
+                rm -- "$second"
+            fi
+            printf 'Keep the factory backup privately outside the repo: %s (may contain device keys).\n' "$backup"
+        else printf 'Skipping factory backup: re-provision only a board you already backed up.\n'; fi
+        printf 'WARNING: This wipes everything on the board internal flash, including settings (trip counter, diagnostics enrollment record) and any trips on internal flash.\n'
+        printf 'This is right for a brand-new board or one coming from factory firmware. It is wrong for a tracker already running this project; use the default update instead.\n'
+        printf 'Trips on the SD card are not touched.\n'
+        if [ "$dry" = true ]; then
+            printf 'DRY RUN: A real first install requires typing ERASE. Backup verification is skipped only with explicit skip-backup.\n'
+        else
+            value=$(flash_prompt 'Type ERASE to erase the whole internal flash: ')
+            [ "$value" = ERASE ] || flash_die 'Erase confirmation refused; nothing erased or written.'
         fi
-        local backup second
-        backup="$backup_dir/supreme-factory-$(date -u +%Y%m%dT%H%M%SZ)-$$.bin"; second="$backup.verify.bin"
-        if [ "$dry" != true ]; then mkdir -p "$backup_dir"; fi
-        flash_command "${common[@]}" "$read_flash" 0 0x800000 "$backup"
-        flash_command "${common[@]}" "$read_flash" 0 0x800000 "$second"
-        if [ "$dry" != true ]; then
-            [ "$(wc -c < "$backup")" -eq 8388608 ] && [ "$(wc -c < "$second")" -eq 8388608 ] || flash_die 'Factory backup is not 8 MB; no flash write performed.'
-            cmp -s "$backup" "$second" || flash_die 'Factory backup reads differ; no flash write performed. Keep both for investigation.'
-            rm -- "$second"
-        fi
-        printf 'Keep the factory backup privately outside the repo: %s (may contain device keys).\n' "$backup"
-        printf 'First install writes four separate parts, with erase-all disabled.\n'
+        flash_command "${common[@]}" "$erase_flash"
+        printf 'First install writes four separate parts after the full erase.\n'
     else
         printf 'App-only update: settings, NVS trip counter, diag/enroll, LittleFS trips and SD trips are kept.\n'
     fi
@@ -205,6 +227,10 @@ HELP
     while IFS=$'\t' read -r name offset file digest; do args+=("$offset" "$temp/payload/$file"); done < <(flash_parts "$temp/payload" "$first")
     flash_command "${args[@]}"
     printf 'Press RESET once with BOOT released (hard reset) to run the sketch.\n'
+    if [ "$first" = true ]; then
+        printf 'Expect on the serial console: LittleFS partition is fully erased; provisioning trip storage.\n'
+        printf 'Then: Setup complete. Logging trips.\n'
+    fi
     printf 'Check the boot status card, GPS outdoors, WiFi uploads, and Device health.\n'
     if [ "$(jq -r .kind "$temp/payload/manifest.json")" = enroll ]; then
         printf 'Wait for the first snapshot in Device health, then run this script again with --cleanup (app only).\n'
