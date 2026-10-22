@@ -3,6 +3,7 @@
 #include <U8g2lib.h>
 #include <Wire.h>
 #include <cstring>
+#include "build_version.h"
 #include "production_display_layout.h"
 
 static constexpr uint8_t PRODUCTION_OLED_CONTRAST = 255;  // SH1106 maximum
@@ -82,6 +83,17 @@ static void drawDebugModeFeedback(bool enabled) {
     gProductionOled.clearBuffer();
     gProductionOled.setFont(u8g2_font_helvB14_tr);
     gProductionOled.drawStr(8, 40, enabled ? "Debug ON" : "Debug OFF");
+    if (enabled) {
+        // 21 x 5 = 105 px at x=8; wrap all 32 chars, descenders through y=63.
+        char first[22];
+        size_t length = sizeof(firmware::kVersion) - 1;
+        size_t count = length < 21 ? length : 21;
+        std::memcpy(first, firmware::kVersion, count);
+        first[count] = '\0';
+        gProductionOled.setFont(u8g2_font_5x8_tf);
+        gProductionOled.drawStr(8, 52, first);
+        if (length > count) gProductionOled.drawStr(8, 62, firmware::kVersion + count);
+    }
     gProductionOled.sendBuffer();
     productionDisplayPowerSave(false); // new pixels before wake
     gProductionHaveOutput = false;

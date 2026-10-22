@@ -987,6 +987,8 @@ never saved. While the board is running, **hold BOOT, then tap POWER** to
 toggle debug. A two-second `Debug ON` / `Debug OFF` message and serial
 `Debug mode: on` / `off` confirm the change. Holding BOOT while powering
 up still selects download mode. Long POWER presses keep their usual meaning.
+The `Debug ON` card also shows the full firmware version, including its commit
+and any `-dirty` suffix, in small text on up to two lines. `Debug OFF` stays brief.
 
 Debug off uses the everyday cards below. Debug on shows a live page that
 redraws about once a second and enables `GPS RF:`, `Temp:`, heap and other
@@ -997,7 +999,7 @@ card is due; old cards and errors are not replayed. The toggle and shared
 panel handoff still need bench verification. Illustrative debug values:
 
 ```text
-ACTIVE 0h12m          trip state, time since boot
+ACTIVE 0h12m    v0.09  trip state, time since boot, release version
 SATS R:19 U:12 A31%   satellites heard / used in the fix, GPS AGC
 FIX OK H0.9 0s        fix yes/no, HDOP, seconds since last position
 Speed 42.3 mph
@@ -1007,7 +1009,10 @@ Net OFF OK 20s        WiFi (OFF/SCAN/JOIN/ON), last upload, seconds ago
 B85% 4.02V U1 C1      battery, USB power in (U1), charging (C1)
 ```
 
-`--` means unknown or stale. The queue count (`Q`) is refreshed by the
+The top row right-aligns the release version (before the first `+`) only
+when it fits with a separating space; otherwise it shows just state and
+uptime. No text is shortened to make room. `--` means unknown or stale.
+The queue count (`Q`) is refreshed by the
 upload task about every 30 s, so a trip that just ended can take one
 cycle to appear, and an upload age stops counting at 999 s.
 

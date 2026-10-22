@@ -2739,6 +2739,7 @@ static void serviceDebugDisplay() {
     DebugStatus s;
     static const char* states[] = {"IDLE", "ARMING", "ACTIVE", "COOLDOWN", "FINALIZING"};
     s.state = states[gState];
+    s.version = firmware::kVersion;
     s.heard = gDebugGsv.signal(now).heard;
     s.used = debugSatellitesUsed();
     if (gDebugRf.valid) s.agcPct = gDebugRf.agcPct;

@@ -104,6 +104,34 @@ int main() {
     assert(!strcmp(lines[3], "Speed 42.3? mph"));
     bounded(s);
     bounded(DebugStatus{});
+    DebugStatus version;
+    auto topRow = [&](const char* expected) {
+        formatDebugStatus(version, lines);
+        assert(!strcmp(lines[0], expected));
+        bounded(version);
+    };
+    version.version = "v0.09+f7f429d123-dirty";
+    topRow("IDLE 0h00m      v0.09");
+    version.state = "ACTIVE"; version.now = (83 * 60) * 1000;
+    topRow("ACTIVE 1h23m    v0.09");
+    version.state = "COOLDOWN"; version.now = 10 * 3600000;
+    topRow("COOLDOWN 10h00m v0.09"); // exactly one separating space
+    version.state = "FINALIZING"; version.now = UINT32_MAX;
+    topRow("FINALIZING 1193h02m");
+    version.state = "IDLE"; version.now = 0;
+    version.version = "unversioned";
+    topRow("IDLE 0h00m"); // needs 22 characters even with the shortest state
+    version.version = nullptr;
+    topRow("IDLE 0h00m");
+    version.version = "";
+    topRow("IDLE 0h00m");
+    version.version = "v0.09"; // VERSION alone, without a commit suffix
+    topRow("IDLE 0h00m      v0.09");
+    const char* worstVersion = "v1234567890123456789012345678901";
+    assert(strlen(worstVersion) == 32);
+    version.version = worstVersion;
+    topRow("IDLE 0h00m");
+    s.version = worstVersion;
     for (const char* state : {"IDLE", "ARMING", "ACTIVE", "COOLDOWN", "FINALIZING"}) {
         for (DebugWifi wifi : {DebugWifi::Off, DebugWifi::Scan, DebugWifi::Join, DebugWifi::On}) {
             for (int code : {0, -1, 200, 400, 503, INT_MAX}) {

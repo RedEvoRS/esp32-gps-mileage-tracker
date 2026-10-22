@@ -25,7 +25,11 @@ static void toggleRegressions() {
     holdBoot(); shortTap();
     assert(debugMode() && gModeFeedback && !gDisplayUserRequest);
     assert(gDisplayOwner == DisplayOwner::Feedback && logCount("Debug mode: on") == 1);
-    assert(gProductionOled.text.size() == 1 && gProductionOled.text[0].value == "Debug ON");
+    assert(gProductionOled.text.size() >= 2 && gProductionOled.text[0].value == "Debug ON");
+    std::string shownVersion;
+    for (size_t i = 1; i < gProductionOled.text.size(); ++i)
+        shownVersion += gProductionOled.text[i].value;
+    assert(shownVersion == firmware::kVersion);
     assert(!gDebugDisplayBegun && gDebugTempEnabled);
     auto productionFrames = gProductionOled.frames;
     g_millis += DEBUG_FEEDBACK_MS - 1; serviceDisplay();
