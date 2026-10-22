@@ -662,6 +662,17 @@ network, not a substitute for TLS.
 
 If you ever do put a TLS reverse proxy in front, set
 `SESSION_COOKIE_SECURE=True` in `mileage-viewer/app.py`.
+If it also fronts ingest, it must accept request bodies of at least
+`INGEST_MAX_UPLOAD_BYTES` (16 MiB by default; firmware keeps each piece under
+8 MiB). Its request-body read and proxy timeouts must allow a slow upload;
+gunicorn allows 900 s. nginx's `client_max_body_size 1m` default (1 MiB) is
+a common trap: a proxy's HTTP 413 sets the trip aside as `.bad` on the card,
+never retried, so it is missing from the mileage log. For example, in the
+nginx `server` or `location` block serving ingest, set
+`client_max_body_size 16m;`, `client_body_timeout 900s;` and
+`proxy_read_timeout 900s;` (raise the body limit if you raise the ingest cap).
+For diagnostics (`/v1/device-events`), a 413 instead retains events and retries
+with smaller batches and backoff; even a single event still too large is kept.
 
 Both containers run as a non-root user. The viewer mounts the trip data
 read-only, so even a full compromise of the viewer cannot alter the GPX

@@ -547,6 +547,11 @@ it's all plain HTTP, so anyone who can see the traffic can see the
 credentials. The login keeps other people and devices on your network out of
 your trips; it isn't a replacement for TLS. If you do put a TLS reverse proxy
 in front, set `SESSION_COOKIE_SECURE=True` in `mileage-viewer/app.py`.
+If it also fronts ingest, allow bodies of at least `INGEST_MAX_UPLOAD_BYTES`
+(16 MiB by default; firmware pieces stay under 8 MiB) and slow uploads
+(gunicorn allows 900 s). A proxy's HTTP 413 sets the trip aside as `.bad`
+on the card, never retried and missing from the mileage log. See
+[proxy settings and nginx's 1 MiB default trap](server/README.md#security-notes).
 
 Beyond that, the viewer has CSRF protection on its forms and locks out an IP
 for 15 minutes after five wrong passwords. It also refuses to start at all
