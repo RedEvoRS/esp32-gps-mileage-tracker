@@ -75,7 +75,7 @@ def change_user(db_path, action, username, password=None, admin_username="", exp
     """
     if action not in {"add", "reset-password", "disable", "enable", "remove"}:
         raise UserError("Unknown command.", 2)
-    validate_username(username, admin_username)
+    validate_username(username, admin_username if action == "add" else "")
     password_hash = None
     if action in {"add", "reset-password"}:
         validate_password(password)

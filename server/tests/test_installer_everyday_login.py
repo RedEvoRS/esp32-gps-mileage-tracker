@@ -135,9 +135,10 @@ class InstallerEverydayLoginTests(unittest.TestCase):
 
     # --- Admin wording ------------------------------------------------
 
-    def admin_login(self, stdin="", **env):
+    def admin_login(self, stdin="", status=0, **env):
         return self.run_script(
             'setup_viewer_login\n', stdin=stdin,
+            status=status,
             **{**self.clean_env(), "INSTALL_VIEWER_PASSWORD": ADMIN_PASSWORD, **env})
 
     def test_fresh_install_suggests_admin_as_the_username(self):
@@ -167,6 +168,29 @@ class InstallerEverydayLoginTests(unittest.TestCase):
         output = self.admin_login(INSTALL_KEEP_LOGIN="y")
         self.assertIn("The admin login for maintainer is already set up. Keep it?", output)
         self.assertIn("Kept the admin login for maintainer", output)
+
+    def test_new_admin_match_is_case_insensitive_and_terminal_reasks(self):
+        self.viewer_env(user="maintainer", hash_value=f"'{HASH}'")
+        output = self.admin_login(stdin="n\nHELPER\nnewadmin\n",
+                                  FAKE_LIST="helper\\tdisabled\\n")
+        self.assertIn("Admin username HELPER matches an everyday login (helper)", output)
+        self.assertIn("Pick another name, or remove that everyday login on /admin first.", output)
+        self.assertEqual(output.count("Admin username [maintainer]"), 2)
+        self.assertIn("VIEWER_USERNAME=newadmin", self.read("viewer.env"))
+
+    def test_preset_admin_match_stops_with_the_same_message(self):
+        self.viewer_env(user="replace-me")
+        output = self.admin_login(status=1, INSTALL_VIEWER_USER="HELPER",
+                                  FAKE_LIST="helper\\tenabled\\n")
+        self.assertIn("Admin username HELPER matches an everyday login (helper)", output)
+        self.assertIn("Pick another name, or remove that everyday login on /admin first.", output)
+        self.assertIn("VIEWER_USERNAME=replace-me", self.read("viewer.env"))
+
+    def test_kept_admin_login_does_not_list_everyday_logins(self):
+        self.viewer_env(user="maintainer", hash_value=f"'{HASH}'")
+        output = self.admin_login(INSTALL_KEEP_LOGIN="y", FAKE_LIST_RC="1")
+        self.assertIn("Kept the admin login for maintainer", output)
+        self.assertNotIn("manage_users.py list", self.read("compose.log"))
 
     # --- The optional step ----------------------------------------------
 

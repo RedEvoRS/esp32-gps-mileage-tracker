@@ -983,7 +983,7 @@ from werkzeug.security import generate_password_hash
 print(generate_password_hash(sys.stdin.read()))'
 
 setup_viewer_login() {
-    local user hash errors
+    local user hash errors everyday_users name _state matching clash_message
     user=$(env_raw viewer.env VIEWER_USERNAME)
     if viewer_login_set; then
         if confirm KEEP_LOGIN "The admin login for $user is already set up. Keep it?" y; then
@@ -996,6 +996,12 @@ setup_viewer_login() {
         "maintainer's login (it removes trips and manages logins), so it lives in" \
         "viewer.env, and only a scrypt hash of the password is stored. The login for" \
         "everyday use comes next."
+    errors=$(mktemp)
+    TMP_FILES+=("$errors")
+    if ! everyday_users=$(manage_users list < /dev/null 2> "$errors"); then
+        indent < "$errors"
+        die "Couldn't list the everyday logins before changing the admin login (output above)."
+    fi
     # Suggest the name already in viewer.env, unless it's just the example's.
     local default=admin
     if username_ok "$user" && [[ $user != "$(env_raw viewer.env.example VIEWER_USERNAME)" ]]; then
@@ -1003,7 +1009,21 @@ setup_viewer_login() {
     fi
     while :; do
         ask user VIEWER_USER "Admin username" "$default"
-        if username_ok "$user"; then break; fi
+        if username_ok "$user"; then
+            matching=
+            while IFS=$'\t' read -r name _state; do
+                [[ -n $name ]] || continue
+                if [[ ${name,,} == "${user,,}" ]]; then
+                    matching=$name
+                    break
+                fi
+            done <<< "$everyday_users"
+            if [[ -z $matching ]]; then break; fi
+            clash_message="Admin username $user matches an everyday login ($matching). Pick another name, or remove that everyday login on /admin first."
+            if [[ -n ${INSTALL_VIEWER_USER+set} ]]; then die "$clash_message"; fi
+            note "$clash_message"
+            continue
+        fi
         if [[ -n ${INSTALL_VIEWER_USER+set} ]]; then die "INSTALL_VIEWER_USER=$user isn't a usable username."; fi
         note "Use letters, digits and . _ @ - only."
     done
