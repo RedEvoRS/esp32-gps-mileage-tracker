@@ -922,6 +922,12 @@ Watch the Serial Monitor (115200) for state transitions:
 2026-10-21 (UTC), the serial log showed
 `Upload /trips/t000006.gpx (142443 B, 2.7 s) -> HTTP 200 (deleted)`.
 The local SD file was deleted, and the trip appeared in the viewer.
+If the server accepts a trip but the board can't delete its local copy (a
+failing card, for example), the line instead reads
+`-> HTTP 200, but deleting the local file failed (will re-upload; the server ignores identical copies)`.
+The trip is safely on the server; the copy is uploaded again at the next
+chance, and the server answers identical copies with 200 without storing a
+duplicate.
 
 Server-down retry was verified on 2026-10-21 (UTC): the trip stayed queued
 after two `HTTP -1` failures and uploaded with HTTP 200 after ingest

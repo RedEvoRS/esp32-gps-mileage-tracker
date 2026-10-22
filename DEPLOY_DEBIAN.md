@@ -98,7 +98,7 @@ history. Sudo must already work without a prompt for the unattended run
 read -rs -p 'Viewer password (at least 8 characters): ' VIEWER_PASSWORD; echo
 env INSTALL_BIND_ADDR='<host>' \
   INSTALL_DISPLAY_TZ=Europe/London \
-  INSTALL_VIEWER_USER='<user>' \
+  INSTALL_VIEWER_USER='<viewer-user>' \
   INSTALL_VIEWER_PASSWORD="$VIEWER_PASSWORD" \
   INSTALL_WAIT_ONLINE=y \
   INSTALL_BACKUPS=n \
@@ -107,8 +107,8 @@ env INSTALL_BIND_ADDR='<host>' \
 unset VIEWER_PASSWORD
 ```
 
-Here `<host>` must be the server's LAN IP, not its hostname, and `<user>` is
-the viewer username you choose. The CI installer job in
+Here `<host>` must be the server's LAN IP, not its hostname, and
+`<viewer-user>` is the viewer username you choose (not your Debian login). The CI installer job in
 [audit-tests.yml](.github/workflows/audit-tests.yml) exercises these base
 presets with backups enabled too. See `bash setup.sh --help` for
 release/local-bundle options. Run the firmware builder interactively later.
