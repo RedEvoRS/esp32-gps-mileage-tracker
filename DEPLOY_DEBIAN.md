@@ -62,8 +62,56 @@ bash ~/mileage-tracker/install.sh --check
 This uploads and removes a temporary test trip and can test the viewer
 login; it is not a read-only check. For unattended installs, `setup.sh --yes` skips wrapper prompts **and skips the firmware builder**. The inner
 installer still needs its `INSTALL_*` presets for unanswered questions;
-missing answers fail. See each step for those variables and
-`bash setup.sh --help` for release/local-bundle options.
+missing answers fail. The base presets are:
+
+- `INSTALL_BIND_ADDR`: this server's LAN IP, needed if `.env` has no valid
+  bind address. `all` deliberately publishes on every interface.
+- `INSTALL_DISPLAY_TZ`: an IANA timezone such as `Europe/London`, needed if
+  `.env` has no valid zone.
+- `INSTALL_VIEWER_USER` and `INSTALL_VIEWER_PASSWORD`: the new viewer login,
+  needed on first install or when replacing it. The password must have at
+  least eight characters. A supplied password also tests the login.
+- `INSTALL_WAIT_ONLINE=y` or `n`: answers whether to make Docker wait for the
+  network at boot, if the installer finds a supported network-wait service
+  that is not already configured.
+- `INSTALL_BACKUPS=y` or `n`: answers the backup question when backups need
+  setup. They require a UID 1000 login. With `y`, also supply
+  `INSTALL_BACKUP_REMOTE` (an absolute mounted-share path or
+  `<user>@<host>:/<backup-path>`) and `INSTALL_PING_URL` (blank to skip the
+  optional backup-success ping). The destination must already be usable
+  without interactive SSH prompts. `INSTALL_SAME_DISK=y` accepts a destination
+  on the server's own disk if asked; it does not protect against that disk
+  failing. Use `n` to reject such a destination.
+- `INSTALL_OUTPUTS=none`: skips optional notification/dashboard outputs on a
+  fresh install. Step 11 lists the presets for enabling them.
+- On a rerun, `INSTALL_KEEP_LOGIN=y` and `INSTALL_KEEP_OUTPUTS=y` answer the
+  questions about keeping existing settings. Supplying `INSTALL_OUTPUTS`
+  without `INSTALL_KEEP_OUTPUTS` chooses that output list instead.
+
+For a fresh install with backups and optional outputs skipped, download and
+read `setup.sh` as in Step 2, replace the placeholders, then run this in the
+server's Bash shell. Read the password privately so it is not saved in shell
+history. Sudo must already work without a prompt for the unattended run
+(for example, authenticate with `sudo -v` in this shell first):
+
+```bash
+read -rs -p 'Viewer password (at least 8 characters): ' VIEWER_PASSWORD; echo
+env INSTALL_BIND_ADDR='<host>' \
+  INSTALL_DISPLAY_TZ=Europe/London \
+  INSTALL_VIEWER_USER='<user>' \
+  INSTALL_VIEWER_PASSWORD="$VIEWER_PASSWORD" \
+  INSTALL_WAIT_ONLINE=y \
+  INSTALL_BACKUPS=n \
+  INSTALL_OUTPUTS=none \
+  bash setup.sh --yes
+unset VIEWER_PASSWORD
+```
+
+Here `<host>` must be the server's LAN IP, not its hostname, and `<user>` is
+the viewer username you choose. The CI installer job in
+[audit-tests.yml](.github/workflows/audit-tests.yml) exercises these base
+presets with backups enabled too. See `bash setup.sh --help` for
+release/local-bundle options. Run the firmware builder interactively later.
 
 ---
 
@@ -375,12 +423,20 @@ Copy that 64-char hex string, then edit `.env`:
 nano .env
 ```
 
-Set the token, and the timezone you drive in:
+Set the token, the timezone you drive in, and the server's LAN bind address:
 
 ```
 INGEST_AUTH_TOKEN=<paste the hex string>
 DISPLAY_TZ=America/Chicago
+BIND_ADDR=<host>
 ```
+
+Replace `<host>` with the server's LAN **IP address**, not a hostname. Find
+it with `ip -4 addr show` and give it a static IP or DHCP reservation before
+starting the services. With `BIND_ADDR` blank, Docker publishes their ports
+on every interface, and UFW does not restrict those ports. Setting the LAN
+address now keeps the first tests and viewer login on that interface too;
+Step 7 explains how to verify the mapping.
 
 Lock it down and confirm it's not world-readable:
 
@@ -505,9 +561,10 @@ version.
 Both ingest and viewer `/health` also return a `version` field alongside the
 existing `status` and `service` fields. These endpoints require **no login**:
 anyone who can reach their LAN ports can read the build version, so retain
-the LAN-only binding in Step 7. `bash install.sh --check` prints both running
-versions and warns if they differ or have no valid stamp. Those warnings do
-not fail the check; a mismatch means services may contain different code.
+the LAN-only binding set in Step 4a and checked in Step 7.
+`bash install.sh --check` prints both running versions and warns if they
+differ or have no valid stamp. Those warnings do not fail the check; a
+mismatch means services may contain different code.
 Rebuild both using the same stamp, then check again.
 
 ```bash
@@ -538,11 +595,22 @@ period and 30s interval, so give it ~45 seconds). If one says `unhealthy` or
 
 ## Step 6 — Verify end to end
 
+Run these commands from `~/mileage-tracker` on the server. Set `H` once to
+the server's LAN IP address (the `BIND_ADDR` value chosen in Step 4a). Using
+that address also works for an existing install with `BIND_ADDR` blank,
+because it listens on all interfaces. `localhost` does not reach a port
+bound only to the LAN IP.
+
+```bash
+cd ~/mileage-tracker
+H='<host>'
+```
+
 **Health checks:**
 
 ```bash
-curl http://localhost:8090/health
-curl http://localhost:8091/health
+curl "http://$H:8090/health"
+curl "http://$H:8091/health"
 ```
 
 Expect `{"service":"mileage-ingest","status":"ok","version":"v0.01+abcdef1234"}` and the viewer equivalent.
@@ -551,7 +619,7 @@ Expect `{"service":"mileage-ingest","status":"ok","version":"v0.01+abcdef1234"}`
 matters):
 
 ```bash
-curl -i -X POST http://localhost:8090/upload --data-binary @sample.gpx
+curl -i -X POST "http://$H:8090/upload" --data-binary @sample.gpx
 ```
 
 Expect `401`.
@@ -561,10 +629,9 @@ Expect `401`.
 ```bash
 cd ~/mileage-tracker
 TOKEN=$(grep '^INGEST_AUTH_TOKEN=' .env | cut -d= -f2-)
-curl -X POST http://localhost:8090/upload \
+curl -X POST "http://$H:8090/upload" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/gpx+xml" \
-  -H "X-Device-Id: tbeam-01" \
   -H "X-Trip-Id: 2026-04-14T13-45-22" \
   --data-binary @sample.gpx
 ```
@@ -573,20 +640,26 @@ Expect a JSON success body with `distance_miles` ≈ **0.30** over 45 seconds at
 ~24 mph (that's what `sample.gpx` encodes — if the number is wildly different,
 the parse is wrong, not the network).
 
+Leave out `X-Device-Id` for this synthetic upload. Adding it registers a
+device for diagnostics monitoring; deleting the test trip does not remove
+that device, which would later be reported as silent.
+
 **Confirm both files landed:**
 
 ```bash
-ls -l data/2026-04/
-cat data/2026-04/2026-04-14T13-45-22.json | jq .
+sudo ls -l data/2026-04/
+sudo cat data/2026-04/2026-04-14T13-45-22.json | jq .
 ```
 
 You want a `.gpx` (byte-for-byte raw) *and* a derived `.json` summary.
+The files are private to UID 1000, so these commands use `sudo` to work
+even when your server login has another numeric user ID.
 
 **Confirm the viewer requires a login** (do this before opening a browser —
 it's the check that actually matters):
 
 ```bash
-curl -s -o /dev/null -w "%{http_code} %{redirect_url}\n" http://localhost:8091/
+curl -s -o /dev/null -w "%{http_code} %{redirect_url}\n" "http://$H:8091/"
 ```
 
 Expect `302 .../login`. If you get `200`, auth is not engaged — stop and
@@ -658,8 +731,8 @@ for the annotation and timing details.
 **Clean up the test trip** so it doesn't pollute your real mileage log:
 
 ```bash
-rm ~/mileage-tracker/data/2026-04/2026-04-14T13-45-22.{gpx,json}
-rmdir ~/mileage-tracker/data/2026-04   # only goes if nothing else is in it
+sudo rm ~/mileage-tracker/data/2026-04/2026-04-14T13-45-22.{gpx,json}
+sudo rmdir ~/mileage-tracker/data/2026-04   # only goes if nothing else is in it
 ```
 
 (The annotation row stays in the viewer DB but is harmless — it has no
@@ -688,39 +761,41 @@ interface the box has (a VPN, a second NIC). UFW still governs
 services running directly on the host, such as SSH; it just has no say
 over Docker-published ports.
 
-What works is telling Docker which address to listen on. Set `BIND_ADDR`
-in `.env` to the server's LAN IP:
+Step 4a set `BIND_ADDR` before the first start. Confirm it is still the
+server's LAN IP in `.env`:
 
 ```bash
 cd ~/mileage-tracker
-ip -4 addr show          # find the LAN address, e.g. 192.168.1.10
+ip -4 addr show          # find the LAN address
 nano .env
 ```
 
 ```
-BIND_ADDR=192.168.1.10
+BIND_ADDR=<host>
 ```
 
-Then recreate the containers so the new port mapping takes effect:
+Here `<host>` means that LAN IP. If you changed it, recreate the containers
+so the new port mapping takes effect:
 
 ```bash
 docker compose up -d
 docker compose ps
 ```
 
-The `PORTS` column should read `192.168.1.10:8090->8090/tcp` and
-`192.168.1.10:8091->8091/tcp`. When the monitor profile is running, port 8093
-should also be bound to the LAN IP. If a published port says `0.0.0.0`, Compose didn't
-pick up `BIND_ADDR`; check the spelling and that `.env` is next to
+The `PORTS` column should read `<host>:8090->8090/tcp` and
+`<host>:8091->8091/tcp`, with your LAN IP in place of `<host>`. When the monitor
+profile is running, port 8093 should also be bound to the LAN IP. If a
+published port says `0.0.0.0`, Compose didn't pick up `BIND_ADDR`; check
+the spelling and that `.env` is next to
 `docker-compose.yml`.
 
 Confirm the mappings and health from the server:
 
 ```bash
-docker compose port mileage-ingest 8090   # expect 192.168.1.10:8090
-docker compose port mileage-viewer 8091   # expect 192.168.1.10:8091
+docker compose port mileage-ingest 8090   # expect <host>:8090
+docker compose port mileage-viewer 8091   # expect <host>:8091
 docker compose port mileage-monitor 8093 # when the monitor profile is started
-curl http://192.168.1.10:8090/health    # expect {"service":"mileage-ingest","status":"ok","version":"v0.01+abcdef1234"}
+curl 'http://<host>:8090/health'    # expect {"service":"mileage-ingest","status":"ok","version":"v0.01+abcdef1234"}
 ```
 
 Both mappings must show only the LAN address; a wildcard (`0.0.0.0` or
@@ -961,9 +1036,11 @@ off-host destination. Each run:
   snapshot at all, so daily runs cost almost nothing.
 - keeps the newest 14 snapshots plus the first of each month for 7 years.
 - rsyncs to the off-host copy, then reads the newest snapshot back from
-  there and checks it matches byte for byte. The off-host copy is never
-  pruned unless you ask for it, so nothing on this box can delete its
-  history.
+  there and checks it matches byte for byte. The script does not prune remote
+  snapshots by default (`REMOTE_PRUNE=no`). The server still has write access:
+  protection from deletion by a compromised server needs retention or snapshots
+  enforced on the backup host, or a restricted backup account. See
+  [backup.conf.example](server/backup/backup.conf.example).
 
 The timer runs the script as your login user, which has to be able to read
 the trip files. Ingest writes them as UID 1000 with mode 600, so that user
@@ -1347,9 +1424,11 @@ a token. `MONITOR_ENABLED=false` idles without DB reads.
 Silence **E7001 DEVICE_SILENT** reads "No contact for N days", bypasses the
 device-fault severity threshold and hold, and shares reminders and the cap.
 It resolves on genuinely newer contact. Parking away from WiFi can cause it.
-The opportunistic firmware heartbeat is #125; this service adds no heartbeat
-and does not wake the tracker. Retiring an obsolete identity needs a future
-explicit policy; all devices remain watched.
+After 24 hours without contact, the tracker tries a heartbeat during existing
+awake opportunities, with no extra wake-ups. It cannot send while switched off
+or away from WiFi, so a parked tracker can still trigger this notification.
+The monitor does not wake the tracker. Retiring an obsolete identity needs a
+future explicit policy; all devices remain watched.
 
 Faults need a snapshot at most **24 hours** old; GPX contact alone does not
 refresh it. Old events, unknown conditions and a reboot do not imply recovery.
@@ -1401,7 +1480,7 @@ messages with source `mileage-tracker`. Field names below are as Graylog shows
 and searches them; on the wire GELF prefixes each with `_` (`kind` is `_kind`),
 and Graylog removes it:
 
-- `kind:event`: every diagnostic event the tracker uploaded, each once, at the
+- `kind:event`: every diagnostic event the tracker uploaded, at least once, at the
   time the server received it. On first enable, the whole stored history is
   sent, up to 200 messages a minute.
 - `kind:condition`: a change in a fault's state on a device: `state` is
@@ -1411,6 +1490,9 @@ and Graylog removes it:
   E7001 `active` means no contact for `MONITOR_STALE_DAYS`
   (`days_without_contact` says how long); it turns `clear` on the next contact.
   On first enable, each device's current states are sent once as a baseline.
+
+An interrupted send or restoring an older diagnostics database can cause
+duplicates: a successful send can happen before its progress is saved.
 
 Every message carries `device_id`, `code` (e.g. 4005), `symbol`,
 `severity` and `title` from the server's catalog. `level` follows severity
@@ -1435,7 +1517,19 @@ the monitor's state volume, e.g.
 `docker compose cp graylog-ca.pem mileage-monitor:/state/graylog-ca.pem`, and
 set `GRAYLOG_GELF_CA_FILE=/state/graylog-ca.pem`.
 
-**3. Configure the monitor** in `monitor.env` (`MONITOR_ENABLED=true` is required):
+**3. Configure the monitor.** If you skipped ntfy, create the private file
+without overwriting any existing monitor settings:
+
+```bash
+cd ~/mileage-tracker
+test -f monitor.env || install -m 600 monitor.env.example monitor.env
+chmod 600 monitor.env
+nano .env
+```
+
+Add or uncomment `MONITOR_ENV_FILE=./monitor.env` in `.env`; otherwise Compose
+loads the disabled example and the monitor idles. In `monitor.env`, set
+`MONITOR_ENABLED=true` and configure Graylog:
 
 ```dotenv
 GRAYLOG_ENABLED=true
@@ -1482,7 +1576,8 @@ separate token. Do not reuse the ingest token or viewer credentials:
 
 ```bash
 cd ~/mileage-tracker
-install -m 600 monitor.env.example monitor.env
+test -f monitor.env || install -m 600 monitor.env.example monitor.env
+chmod 600 monitor.env
 openssl rand -hex 32
 nano monitor.env
 ```
@@ -1542,6 +1637,14 @@ means the container itself. Permit that outbound path in the relevant host and
 network firewalls. Use HTTPS when the path leaves a trusted network; the
 request contains diagnostic facts, not credentials in its JSON body.
 
+Create the private monitor file if it is missing; keep existing settings:
+
+```bash
+cd ~/mileage-tracker
+test -f monitor.env || install -m 600 monitor.env.example monitor.env
+chmod 600 monitor.env
+```
+
 Set `LOKI_PUSH_URL` to the full HTTP(S) `/loki/api/v1/push` endpoint in the
 private `monitor.env`. Configure either bearer auth or basic auth, never both.
 Add the tenant ID only if your Loki requires `X-Scope-OrgID`:
@@ -1584,11 +1687,15 @@ reminders and resolutions remain separate `alert_decision` lines; those lines
 exist only for notifications ntfy accepted while Loki was enabled. With ntfy
 off, diagnostic events and condition changes still flow to Loki.
 
-Each line is JSON. Loki stream labels are only `job=mileage-tracker`, validated
-`device_id`, and current-catalog `severity`; context and other fields stay in
-the line. Each entry carries its real timestamp (server receipt time for
-events, the monitor tick for condition changes and decisions). This needs Loki
-2.4 or newer, which accepts out-of-order writes within about an hour of a
+Each line is JSON. The monitor sets only the stream labels `job=mileage-tracker`,
+validated `device_id`, and current-catalog `severity`; context and other fields
+stay in the line. Loki 3 can add its own `service_name` label and
+`detected_level` metadata, so queries can show more fields than the monitor
+sends. The [LogQL examples](server/grafana/loki-alerts.md) use the monitor's
+labels and do not depend on those additions. Each entry carries its real
+timestamp (server receipt time for events, the monitor tick for condition
+changes and decisions). This needs Loki 2.4 or newer, which accepts
+out-of-order writes within about an hour of a
 stream's newest entry. While an event backlog drains, for example on first
 enable, the monitor sends only events, oldest first, and holds condition and
 decision lines until it catches up. Loki still rejects anything older than its
@@ -1606,9 +1713,13 @@ the Prometheus rule from Step 11e reads the current active condition state and
 the configured no-contact state. Delivered-decision LogQL examples are
 separate and apply only when ntfy is enabled.
 
-To pause the sink, blank `LOKI_PUSH_URL` and reapply the monitor profile. Its
-cursor and pending decisions stay in `monitor-state`; when re-enabled, it
-resumes from those cursors.
+To pause Loki, comment out all five settings in `monitor.env`:
+`LOKI_PUSH_URL`, `LOKI_BEARER_TOKEN`, `LOKI_BASIC_AUTH_USER`,
+`LOKI_BASIC_AUTH_PASSWORD` and `LOKI_TENANT_ID`. Reapply with
+`docker compose --profile monitor up -d mileage-monitor`. Leaving credentials
+or a tenant set without a URL is a configuration error that stops the whole
+monitor, including its other outputs. Its cursor and pending decisions stay
+in `monitor-state`; when re-enabled, it resumes from those cursors.
 
 ## Troubleshooting
 
@@ -1723,8 +1834,11 @@ ls ~/mileage-backups/snapshots/*/data/$TRIP.gpx      # the snapshots that have i
 cp -p ~/mileage-backups/snapshots/<time>/data/$TRIP.gpx data/$TRIP.gpx
 ```
 
-**Port already in use** — `sudo ss -tlnp | grep -E '8090|8091|8092|8093'`, then change
-the host-side port mapping in `docker-compose.yml`.
+**Port already in use** — `sudo ss -tlnp | grep -E '8090|8091|8092|8093'` shows
+which program has it. Stop or reconfigure that program to free the required
+port, then rerun the installer. Its checks use the supplied ports; changing
+the Compose port mapping does not fix this check, and release updates replace
+the supplied Compose file.
 
 **Rebuild after code changes:**
 
