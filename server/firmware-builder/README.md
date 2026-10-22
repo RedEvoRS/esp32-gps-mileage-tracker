@@ -7,14 +7,57 @@ Run as a normal user with Docker access; root invocation is refused.
 The Linux x86-64 CLI is checksum pinned to CI, so the image explicitly uses
 `linux/amd64`. Other hosts require Docker's amd64 emulation.
 
-The first run downloads about 1-2 GB after confirmation. Core and library
-installation runs as an unprivileged image user; subsequent invocations reuse
-Docker's toolchain layers. A BuildKit download cache also preserves archives
-across interrupted toolchain installations. Compilation runs as the invoking user's UID/GID,
+The first run downloads about 1.8 GB of toolchain archives after confirmation
+and keeps an image of about 2.7 GB (Linux amd64, Docker Desktop's containerd
+image store). Allow at least 10 GiB free for the first build: all chip packages
+are downloaded and extracted before pruning, and image export needs space too.
+Core and library installation runs as an unprivileged image user; subsequent
+invocations reuse Docker's toolchain layers. A BuildKit download cache preserves
+archives across interrupted installations and is cleared after a successful
+install. Compilation runs as the invoking user's UID/GID,
 without networking, privileges or a writable container root filesystem.
 Only its temporary filesystem and private output mount are writable. CLI's
 runtime downloads/staging directory is redirected into that temporary filesystem;
 its installed core/libraries remain read-only and compilation has no network.
+
+The image supports the Supreme's ESP32-S3 build only. In the same `RUN` as core
+installation, an allowlist keeps these complete, pinned Espressif tool packages:
+
+- `esp-x32`: the Xtensa compiler, linker, archiver and size tool.
+- `esp32s3-libs`: S3 headers, precompiled SDK libraries, linker scripts and
+  bootloader ELF files (including the selected `qio_qspi` configuration).
+- `esptool_py`: creates the bootloader and app binaries and the core's merged
+  image; this is needed even though the container never flashes hardware.
+
+This list comes from core 3.3.11's `platform.txt` and the pinned FQBN's expanded
+compile properties: `build.tarch=xtensa`, `build.mcu=esp32s3`, `compiler.path`
+selects `esp-x32`, `compiler.sdk.path` selects `esp32s3-libs`, and the image
+recipes select `esptool_py`. Keeping whole packages preserves their internal
+layout. An allowlist also removes newly added chip packages on future installs;
+revalidate it with an offline Stage 4 compile whenever the pins/FQBN change.
+
+Removed packages are `esp-rv32` (RISC-V compiler; Stage 4 has no ULP program),
+`esp32-libs`, `esp32c3-libs`, `esp32c5-libs`, `esp32c6-libs`, `esp32h2-libs`,
+`esp32p4-libs`, `esp32p4_es-libs`, `esp32s2-libs` (other chips), both
+`xtensa-esp-elf-gdb` and `riscv32-esp-elf-gdb`, and `openocd-esp32` (interactive
+debugging), `mkspiffs` and `mklittlefs` (filesystem-image creation; Stage 4 builds
+no filesystem image), and Arduino's `dfu-util` (DFU flashing). The core and
+Arduino's builtin tools remain: `ctags` is used for sketch preprocessing, and
+CLI initializes discovery/monitor dependencies even for offline compilation.
+No empty tool stubs or package-index edits are needed with CLI 1.5.1. Pruning
+in a later layer would retain the original bytes and defeat the size saving.
+
+The full/slim comparison used the same clean source archive, fake settings,
+absolute build paths, partitions and CI compile flags in containers with no
+network, a read-only root, UID/GID 1000 and the normal builder mounts. Both
+compiles set `SOURCE_DATE_EPOCH` to the source commit's Unix timestamp: otherwise
+the core's `chip-debug-report.cpp` embeds different `__DATE__`/`__TIME__` strings
+and changes the app's ELF hash, image checksum and trailing SHA-256. All four
+published parts (`app.bin`, `bootloader.bin`, `partitions.bin`, `boot_app0.bin`)
+were byte-identical. The baseline `v0.08+3f8518ce92` app used 1,158,995 bytes of
+its 1,572,864-byte slot and 119,332 bytes of RAM. Docker reported 8.21 GB for
+the full image and 2.68 GB for the slim image; the install layer shrank
+from 6.09 GB to 1.72 GB. These are build results, not hardware validation.
 
 The installed tree is:
 

@@ -43,7 +43,8 @@ check the services, then offers a personal firmware build. Read the
 [trust note and download/read/run alternative](../README.md#setting-it-up)
 before executing downloaded code. Follow [deployment Step 2](../DEPLOY_DEBIAN.md#step-2--run-setupsh)
 for prerequisites, LAN-only `BIND_ADDR`, backups and optional notifications.
-The builder downloads ~1–2 GB once and asks for WiFi/device settings; its
+The builder downloads about 1.8 GB once (about 2.7 GB installed image; allow
+10 GiB free for the first build) and asks for WiFi/device settings; its
 owner-only `firmware-out/` contains your WiFi password and upload token in
 the binaries. Flash from the USB-connected PC using
 [README Step 2](../README.md#step-2--flash-the-tracker), then do the one-time

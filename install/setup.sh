@@ -200,8 +200,8 @@ HELP
     available=$(df -Pk -- "$parent" | awk 'NR==2 {print $4}')
     [[ $available =~ ^[0-9]+$ ]] || fail 'Could not measure free disk space. Check: df -h'
     (( available >= 1048576 )) || fail 'Less than 1 GiB free at the install directory. Free space or select --dir on a larger disk; check df -h.'
-    printf 'Free disk: %s KiB. The firmware builder needs about 2 GB more beyond the server.\n' "$available"
-    if (( available < 3145728 )); then printf 'Warning: free more space before running the firmware builder.\n'; fi
+    printf 'Free disk: %s KiB. The firmware builder image needs about 2.7 GB beyond the server; allow 10 GiB free for its first build.\n' "$available"
+    if (( available < 10485760 )); then printf 'Warning: free at least 10 GiB before the first firmware build (download, extraction and image export).\n'; fi
 
     # Global within main for the EXIT trap, which also runs after main returns.
     temp_dir=$(mktemp -d)
@@ -286,7 +286,7 @@ HELP
         (cd "$install_dir"; ./install.sh < /dev/tty)
     fi
     if [[ -f $install_dir/firmware-builder/build.sh ]]; then
-        if [[ $yes == no ]] && confirm 'Build your tracker firmware now (about 2 GB extra disk)?'; then
+        if [[ $yes == no ]] && confirm 'Build your tracker firmware now (about 2.7 GB image; 10 GiB free for first build)?'; then
             bash "$install_dir/firmware-builder/build.sh" --install-dir "$install_dir" < /dev/tty
         else
             printf 'Firmware build skipped. Run when ready:\n  bash %q --install-dir %q\n' \
