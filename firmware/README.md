@@ -516,6 +516,11 @@ After that upload, immediately set it back to **Disabled**. The factory
 firmware leaves data in the area used for the trip partition, and Stage 4
 will not overwrite non-erased data merely because it cannot mount it.
 
+The standalone `install/flash.ps1 -FirstInstall` / `install/flash.sh --first-install`
+performs the same one-time erase after a verified factory backup and an exact
+`ERASE` confirmation, then writes the four firmware parts. Use the default
+app-only update (or cleanup) for a tracker already running this project.
+
 **Erase-all also wipes the board's settings memory (NVS):** the trip
 counter (`tripno`), diagnostic journal boot counter and consumed enrollment
 ID (`diag/enroll`), among other settings. If `DIAGNOSTICS_ENROLLMENT_ID`
