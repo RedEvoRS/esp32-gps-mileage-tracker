@@ -661,6 +661,25 @@ def _load_trips(conn, include_removed=False):
     return trips, unreadable
 
 
+def load_trips_for_merging(conn=None):
+    """(trips, unreadable, removed) for merge suggestions and the merge route.
+
+    trips and unreadable are the standard lists. removed holds the readable
+    trips the admin removed, which next_trip must still see so a merge never
+    bridges one. A removed unreadable trip is dropped: its miles are never
+    counted, and removing it is how the admin clears the unreadable warning.
+    """
+    return split_removed(*load_trips(conn, include_removed=True))[:3]
+
+
+def split_removed(trips, unreadable):
+    """Split include_removed lists: (trips, unreadable, removed trips, removed unreadable)."""
+    return ([t for t in trips if not t.get("removal")],
+            [u for u in unreadable if not u.get("removal")],
+            [t for t in trips if t.get("removal")],
+            [u for u in unreadable if u.get("removal")])
+
+
 # ---------------------------------------------------------------------
 # Read-only diagnostics (ingest owns schema creation and all writes)
 # ---------------------------------------------------------------------
@@ -2397,6 +2416,15 @@ def restore_trip(ym, trip_id):
         if not removal:
             abort(409, description="This trip is not removed from the log.")
         _abort_if_key_in_closed_year(conn, key)
+        # Defense in depth: a merge made before merge suggestions saw removed
+        # trips can already bridge this recording. Restoring it then counts
+        # its stretch twice. A removed unreadable trip has no counted miles
+        # and no reliable span, so it never blocks.
+        trips, _ = load_trips(conn, include_removed=True)
+        removed_trip = next((t for t in trips if t["trip_key"] == key), None)
+        if removed_trip and trip_merges.covering_merge(removed_trip, trips):
+            abort(409, description="A merged trip now covers this recording's time. "
+                                   "Undo that merge first, then restore this trip.")
         trip_log.delete_removal(conn, key)
         trip_log.record(conn, key, "restore", {"reason": removal["reason"]},
                         actor=g.user, actor_role=g.role)
@@ -2459,12 +2487,12 @@ def trip_view(ym, trip_id):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         key = trip_merges.canonical_key(conn, key)
         removed = trip_log.removal(conn, key)
-    # Load removed entries only when the admin opened one, so every normal
-    # trip page feeds the standard filtered lists to merge suggestions.
-    trips, unreadable = load_trips(include_removed=(g.role == "admin" and removed is not None))
+    # Merge suggestions get the standard lists plus the removed readable
+    # trips; only the admin may open a removed trip itself.
+    trips, unreadable, removed_trips, removed_unreadable = split_removed(*load_trips(include_removed=True))
     t = next((t for t in trips if t["trip_key"] == key or key in t.get("parts", [])), None)
-    if t is None:
-        t = next((u for u in unreadable if u["trip_key"] == key and u.get("removal")), None)
+    if t is None and g.role == "admin" and removed is not None:
+        t = next((t for t in removed_trips + removed_unreadable if t["trip_key"] == key), None)
     if t is None:
         problem = next((u["problem"] for u in unreadable if u["trip_key"] == key), "the file is missing")
         abort(404, description=(
@@ -2484,7 +2512,7 @@ def trip_view(ym, trip_id):
         return render_template_string(TRIP_HTML, t=t, removal=t["removal"], categories=CATEGORIES,
                                       year=year, geocoder_enabled=False, last_edited=last_edited,
                                       year_lock=year_lock)
-    merge_next, merge_block_reason = trip_merges.next_trip(t, trips, unreadable)
+    merge_next, merge_block_reason = trip_merges.next_trip(t, trips, unreadable, removed_trips)
     places = {}
     if GEOCODER.enabled:
         endpoints = track_endpoints(t)
@@ -2612,13 +2640,13 @@ def merge_trip(ym, trip_id):
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
         _abort_if_removed(conn, f"{ym}/{trip_id}")
-        trips, unreadable = load_trips(conn)
+        trips, unreadable, removed_trips = load_trips_for_merging(conn)
         current = next((t for t in trips if t["trip_key"] == f"{ym}/{trip_id}"), None)
         if current is None:
             abort(409, description="Trip changed or is unavailable. Reopen the trip list.")
         closed = trip_log.closed_years(conn)
         _abort_if_year_closed(closed, current)
-        following, block_reason = trip_merges.next_trip(current, trips, unreadable)
+        following, block_reason = trip_merges.next_trip(current, trips, unreadable, removed_trips)
         if block_reason:
             abort(409, description=block_reason)
         if following is None or request.form.get("next_trip") != following["trip_key"]:
