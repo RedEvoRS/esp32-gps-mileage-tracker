@@ -226,6 +226,41 @@ class ViewerHistoryTests(unittest.TestCase):
         split_history = self.admin.get(f"/admin/history?trip={first}").get_data(as_text=True)
         self.assertIn("Undo merge", split_history)
 
+    def count_history_queries(self, path):
+        """Statements that read trip_history, merge tables or annotations during one request."""
+        statements = []
+        real_connect = sqlite3.connect
+
+        def traced_connect(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        with patch.object(sqlite3, "connect", traced_connect):
+            response = self.admin.get(path)
+        self.assertEqual(response.status_code, 200)
+        response.close()
+        return len([sql for sql in statements if sql.lstrip().upper().startswith("SELECT")
+                    and any(name in sql for name in ("trip_history", "trip_merge_aliases", "trip_merge_parts"))])
+
+    def test_exports_read_the_history_once_however_many_trips_there_are(self):
+        # Merged chains, split history and plain trips: every kind of lookup.
+        keys = [self.add_trip(f"t{i:02d}", i * 120) for i in range(24)]
+        merged = self.merge(self.merge(keys[0], keys[1]), keys[2])
+        self.admin.post(f"/trip/{merged}/split", data={"csrf_token": "test-csrf", "confirm": "yes"})
+        self.merge(keys[3], keys[4])
+        for key in keys[6:12]:
+            self.annotate(self.admin, key, "business", "Test purpose")
+        few = self.count_history_queries("/export.csv")
+        with patch.object(self.viewer, "_related_history_rows", side_effect=AssertionError("per-trip scan")):
+            self.assertGreater(self.count_history_queries("/export.xlsx"), 0)
+        # Twelve more trips must not add a single history or merge-table query.
+        for i in range(24, 36):
+            self.add_trip(f"t{i:02d}", i * 120)
+        self.assertEqual(self.count_history_queries("/export.csv"), few)
+        self.assertEqual(self.count_history_queries("/export.xlsx"), few)
+        self.assertLessEqual(few, 6)
+
     def test_history_pages_filter_and_reject_invalid_query_parameters(self):
         first = self.add_trip("first")
         other = self.add_trip("other", 120, device="device-b")

@@ -1024,33 +1024,85 @@ def _related_history_rows(conn, trip_key, parts=()):
     return result
 
 
+def _last_edited_lookup(conn):
+    """Return a function mapping a trip to its latest edit, from one read of the tables.
+
+    The merge tables and the history are read once here, whatever the number of
+    trips, so an export costs the same few queries for 30 trips or 3,000. The
+    function resolves a trip exactly like _related_history_rows: its own key,
+    its parts and its live merge aliases, plus merge/split rows whose parts
+    include one of those keys. Without any history row it falls back to the
+    annotation and merge timestamps of older data.
+    """
+    part_rows = conn.execute(
+        "SELECT merge_key, part_key FROM trip_merge_parts ORDER BY merge_key, position").fetchall()
+    part_to_merge = {part: merge for merge, part in part_rows}
+    merge_parts = {}
+    for merge, part in part_rows:
+        merge_parts.setdefault(merge, []).append(part)
+    alias_to_merge = dict(conn.execute("SELECT alias_key, merge_key FROM trip_merge_aliases"))
+
+    def canonical(key):
+        return part_to_merge.get(key) or alias_to_merge.get(key) or key
+
+    aliases = {}
+    for alias_key in alias_to_merge:
+        aliases.setdefault(canonical(alias_key), set()).add(alias_key)
+
+    newest = {}  # key -> (instant, id, actor, role, at) of the latest row touching it
+
+    def note(key, entry):
+        if key not in newest or entry[:2] > newest[key][:2]:
+            newest[key] = entry
+
+    for row_id, key, actor, role, at, action, details in conn.execute(
+        "SELECT id, trip_key, actor, actor_role, at, action, "
+        "CASE WHEN action IN ('merge', 'split') THEN details END FROM trip_history"
+    ):
+        entry = (_history_order(at), row_id, actor, role, at)
+        note(key, entry)
+        if action in ("merge", "split"):
+            try:
+                details = json.loads(details)
+            except (TypeError, ValueError):
+                details = {}
+            for part in set(details.get("parts") or ()) if isinstance(details, dict) else ():
+                note(part, entry)
+
+    stamps = {}  # key -> latest annotation or merge updated_at, for pre-history data
+    for table in ("annotations", "trip_merges"):
+        for key, stamp in conn.execute(
+            f"SELECT trip_key, updated_at FROM {table} WHERE updated_at IS NOT NULL AND updated_at != ''"
+        ):
+            if _parse(stamp) and (key not in stamps or _history_order(stamp) > _history_order(stamps[key])):
+                stamps[key] = stamp
+
+    def lookup(trip):
+        parts = trip.get("parts", ())
+        merge = canonical(trip["trip_key"])
+        keys = {trip["trip_key"], merge, *parts, *aliases.get(merge, ())}
+        if not parts:
+            keys.update(merge_parts.get(merge, ()))
+        entries = [newest[key] for key in keys if key in newest]
+        if entries:
+            _, _, actor, role, at = max(entries, key=lambda entry: entry[:2])
+            return {"actor": actor, "actor_role": role, "at": at, "pre_history": False}
+        fallback = [stamps[key] for key in keys if key in stamps]
+        if not fallback:
+            return None
+        return {"actor": None, "actor_role": None, "at": max(fallback, key=_history_order),
+                "pre_history": True}
+
+    return lookup
+
+
 def _last_edited(conn, trip):
     """Find the latest edit across a trip's current and historical merge keys."""
-    rows = _related_history_rows(conn, trip["trip_key"], trip.get("parts", ()))
-    if rows:
-        row = rows[0]
-        return {"actor": row["actor"], "actor_role": row["actor_role"],
-                "at": row["at"], "pre_history": False}
-    _, keys = _history_trip_keys(conn, trip["trip_key"], trip.get("parts", ()))
-    ordered_keys = sorted(keys)
-    fallback = []
-    for table in ("annotations", "trip_merges"):
-        for start in range(0, len(ordered_keys), 400):
-            chunk = ordered_keys[start:start + 400]
-            placeholders = ",".join("?" for _ in chunk)
-            fallback.extend(row[0] for row in conn.execute(
-                f"SELECT updated_at FROM {table} WHERE trip_key IN ({placeholders}) "
-                "AND updated_at IS NOT NULL AND updated_at != ''", chunk,
-            ))
-    fallback = [stamp for stamp in fallback if _parse(stamp)]
-    if not fallback:
-        return None
-    at = max(fallback, key=_history_order)
-    return {"actor": None, "actor_role": None, "at": at, "pre_history": True}
+    return _last_edited_lookup(conn)(trip)
 
 
-def _set_export_last_edited(conn, trip):
-    info = _last_edited(conn, trip)
+def _set_export_last_edited(lookup, trip):
+    info = lookup(trip)
     trip["last_edited"] = info
     trip["last_edited_by"] = (info["actor"] if info and not info["pre_history"] else
                               "unknown" if info else "")
@@ -1130,8 +1182,9 @@ def selected_trips(include_history=False):
     if include_history:
         with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
             conn.row_factory = sqlite3.Row
+            lookup = _last_edited_lookup(conn)
             for trip in selected + unreadable:
-                _set_export_last_edited(conn, trip)
+                _set_export_last_edited(lookup, trip)
     return selected, unreadable, year, sorted(years, reverse=True)
 
 
