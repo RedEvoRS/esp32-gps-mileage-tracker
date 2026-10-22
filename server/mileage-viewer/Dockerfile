@@ -8,7 +8,7 @@ COPY mileage-viewer/requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY mileage-viewer/app.py /app/
-COPY mileage-viewer/geocoding.py /app/
+COPY mileage-viewer/geocoding.py mileage-viewer/trip_merges.py /app/
 COPY mileage-viewer/static/ /app/static/
 COPY common/ /app/common/
 ENV PYTHONPATH=/app

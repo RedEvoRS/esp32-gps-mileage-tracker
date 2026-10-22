@@ -17,6 +17,7 @@ mileage-viewer/**
 !mileage-viewer/requirements.txt
 !mileage-viewer/app.py
 !mileage-viewer/geocoding.py
+!mileage-viewer/trip_merges.py
 !mileage-viewer/static/
 mileage-viewer/static/**
 !mileage-viewer/static/leaflet.js
@@ -34,6 +35,7 @@ mileage-monitor/**
 common/**
 !common/__init__.py
 !common/version.py
+!common/trip_summary.py
 !common/diagnostics/
 common/diagnostics/**
 !common/diagnostics/__init__.py
