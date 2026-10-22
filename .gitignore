@@ -12,6 +12,9 @@ server/data/
 # Build artifacts
 firmware/04_trip_logger/firmware_version.h
 build/
+firmware-out/
+.firmware-build.*/
+.firmware-builder.lock
 .audit-venv/
 .audit-tools/
 *.bin
