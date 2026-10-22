@@ -1,6 +1,7 @@
 name: Audit regression tests
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]
@@ -24,6 +25,8 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
+      - name: Install flash test dependency
+        run: command -v jq || (sudo apt-get update && sudo apt-get install -y jq)
       - name: Test the scanner
         run: python -m unittest discover -s tools -v
       - name: Scan files, and on a PR its commits, for personal info
@@ -81,6 +84,9 @@ jobs:
     # Compilation only; OLED/SD/power behavior still needs hardware validation.
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    outputs:
+      builder: ${{ steps.paths.outputs.builder }}
+      windows: ${{ steps.paths.outputs.windows }}
     env:
       # When updating the CLI version, update SHA-256 from that release's checksums file.
       ARDUINO_CLI_VERSION: '1.5.1'
@@ -95,6 +101,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: Gate expensive integration work by changed paths
+        id: paths
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 tools/ci_paths.py
       - name: Install Arduino CLI
         shell: bash
         run: |
@@ -161,13 +175,44 @@ jobs:
               echo "App partition limit: $max_size bytes"
               size_args=(--build-property "upload.maximum_size=$max_size")
             fi
+            output_args=()
+            if [[ $sketch == 04_trip_logger && '${{ steps.paths.outputs.builder }}' == true ]]; then
+              output_args=(--output-dir "$RUNNER_TEMP/stage4")
+            fi
             arduino-cli compile --fqbn "$FQBN" --warnings default --jobs 2 \
-              "${size_args[@]}" --build-property 'compiler.cpp.extra_flags=-DFIRMWARE_VERSION_REQUIRE_STAMP' \
+              "${size_args[@]}" "${output_args[@]}" --build-property 'compiler.cpp.extra_flags=-DFIRMWARE_VERSION_REQUIRE_STAMP' \
               "firmware/$sketch"
             echo "::endgroup::"
           done
+      - name: Record Stage 4 provenance for builder parity
+        if: steps.paths.outputs.builder == 'true'
+        env:
+          REFERENCE: ${{ runner.temp }}/stage4
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          root = Path(os.environ['REFERENCE'])
+          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          version = Path('firmware/VERSION').read_text().strip() + '+' + commit[:10]
+          assert version.encode('ascii') in (root / '04_trip_logger.ino.bin').read_bytes()
+          (root / 'provenance.json').write_text(json.dumps(dict(commit=commit, version=version, fqbn=os.environ['FQBN'])))
+          PY
+      - name: Share only the synthetic Stage 4 app and provenance
+        if: steps.paths.outputs.builder == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: stage4-reference
+          path: |
+            ${{ runner.temp }}/stage4/04_trip_logger.ino.bin
+            ${{ runner.temp }}/stage4/provenance.json
+          if-no-files-found: error
+          retention-days: 1
 
   installer:
+    needs: firmware-compile
     # Runs server/install.sh for real on a fresh VM: Docker builds, the
     # test upload, the viewer login and exports, and backups through
     # systemd. Then reruns it, has it repair a mangled config, restarts
@@ -176,7 +221,7 @@ jobs:
     # Match Docker 29 and its containerd image store, installed from Docker's
     # Debian repo by DEPLOY_DEBIAN.md, so CI exercises the real server setup.
     runs-on: ubuntu-26.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     env:
       PASSWORD: correct-horse-battery
     steps:
@@ -184,7 +229,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Lint
-        run: shellcheck server/install.sh
+        run: shellcheck server/install.sh install/setup.sh install/flash.sh server/firmware-builder/build.sh tools/build_release_bundle.sh tools/ci-install/*.sh
       - name: Make a login like a fresh Debian install's
         # UID 1000 with sudo, not in the docker group yet, and the server
         # files in ~/mileage-tracker, as DEPLOY_DEBIAN.md Step 2 leaves them.
@@ -364,3 +409,46 @@ jobs:
           grep -q 'mileage-viewer is stopped (exit code 0)' stopped.log
           grep -q 'docker compose up -d' stopped.log
           ! grep -q 'missing or mangled setting in viewer.env' stopped.log
+      - name: Build the exact release assets from this commit
+        run: bash tools/build_release_bundle.sh ci "$RUNNER_TEMP/two-piece-assets"
+      - name: Restore public builder toolchain image
+        if: needs.firmware-compile.outputs.builder == 'true'
+        id: builder-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/two-piece-cache
+          # Exact public inputs only; never cache personal firmware or settings.
+          key: linux-amd64-builder-v1-${{ hashFiles('server/firmware-builder/Dockerfile', 'server/firmware-builder/pins.env') }}
+      - name: Download Stage 4 reference
+        if: needs.firmware-compile.outputs.builder == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: stage4-reference
+          path: ${{ runner.temp }}/stage4-reference
+      - name: Debian 13 bundle install, update, backup/restore and optional builder parity
+        env:
+          RUN_BUILDER: ${{ needs.firmware-compile.outputs.builder }}
+        run: |
+          bash tools/ci-install/lab.sh "$RUNNER_TEMP/two-piece-assets" \
+            "$RUNNER_TEMP/two-piece-cache" "$RUNNER_TEMP/stage4-reference"
+
+  # Optional check: do not add this job to branch protection's five required checks.
+  flash-windows:
+    needs: firmware-compile
+    if: needs.firmware-compile.outputs.windows == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Analyze and test PowerShell flash safety without hardware
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force -Repository PSGallery
+          Import-Module PSScriptAnalyzer -RequiredVersion 1.25.0
+          $findings = @(Invoke-ScriptAnalyzer -Path install/flash.ps1 -Severity Warning,Error)
+          $findings | Format-Table -AutoSize
+          if ($findings.Count) { throw 'PSScriptAnalyzer reported findings.' }
+          & ./install/tests/flash.Tests.ps1
