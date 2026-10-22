@@ -29,6 +29,133 @@ instructions are on the frozen [`tbeam-v1.2` branch](https://github.com/RedEvoRS
 which receives no updates. The instructions below are for the Supreme.
 See the [top-level README](../README.md) for the complete setup sequence.
 
+## Flash from the server build
+
+This is the primary install/update route. Complete
+[server setup](../README.md#step-1--set-up-the-server) first and accept its
+firmware-build prompt. No Arduino IDE, Python or ESP32 toolchain is needed
+on the PC connected to the board. The server's container downloads about
+1–2 GB of tools on the first build and reuses them later; see the
+[builder guide](../server/firmware-builder/README.md).
+
+### PC prerequisites and commands
+
+Use Windows PowerShell 5.1/7 with OpenSSH `scp`, or macOS/Linux with Bash,
+curl, tar, jq and OpenSSH `scp`. Install jq with `brew install jq` on macOS
+(Homebrew required), or `sudo apt install jq` on Debian/Ubuntu. The pinned
+standalone esptool supports Windows x64, macOS Intel/Apple Silicon, and
+Linux x86-64, ARM64 and ARMv7. Other platforms need a compatible standalone
+esptool supplied with `-Esptool` / `--esptool`. Native USB needs no Windows
+driver. On Linux your login needs serial-port access (on Debian/Ubuntu,
+join `dialout` and log out/in). Check `ssh <user>@<host>` works from this PC.
+
+Use the commands printed by setup for its release. The latest-release forms are:
+
+```powershell
+irm https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases/latest/download/flash.ps1 | iex
+```
+
+```bash
+curl -fsSL https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases/latest/download/flash.sh | bash -s -- --server '<user>@<host>'
+```
+
+These execute downloaded code; the [README trust note and download/read/run
+alternatives](../README.md#setting-it-up) apply. Saving the script also lets
+you pass options on Windows:
+
+```powershell
+Invoke-WebRequest https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases/latest/download/flash.ps1 -OutFile flash.ps1
+Get-Content .\flash.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\flash.ps1 -Server '<user>@<host>' -FirstInstall -Port COMx
+```
+
+```bash
+curl -fsSL https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases/latest/download/flash.sh -o flash.sh
+less flash.sh
+bash flash.sh --server '<user>@<host>' --first-install
+```
+
+Replace placeholders first. Omit `-Port` to choose from detected ports.
+`-InstallDir '~/mileage-tracker'` / `--install-dir '~/mileage-tracker'` selects
+the remote installation (use your actual path if nondefault). Remote paths
+must be simple absolute or `~/` paths without spaces; SSH targets must be
+`user@host` with a hostname or IPv4 address, rather than an IPv6 literal. For help run
+`powershell.exe -ExecutionPolicy Bypass -File .\flash.ps1 -Help` or
+`bash flash.sh --help`. PowerShell 7 can use `pwsh` instead of `powershell.exe`.
+
+### First install, update and cleanup
+
+Before power-up, attach both antennas and fit the 18650 with correct polarity;
+see [hardware preparation](#before-the-first-power-up). Fit the FAT32 card
+while switched off. Close serial monitors. The script fetches
+`firmware-out/current/` over `scp`, validates its manifest and all four part
+hashes, then downloads checksum-pinned standalone **esptool from Espressif's
+GitHub releases**. The firmware is your private build, not a generic binary.
+Server output directories/files are owner-only (0700/0600); binaries contain
+your WiFi password and upload token. The PC's temporary firmware copy is
+private and removed on exit; keep any manually copied binaries private too.
+
+For **every script flash**, enter download mode as prompted: hold BOOT,
+plug USB in (or tap RESET), wait 2–3 seconds, release BOOT. Select the port;
+its name can change in download mode. See [download mode](#download-mode)
+for factory-firmware and battery details. Press RESET with BOOT released
+after flashing to run the program.
+
+- **First install on a factory board:** use `-FirstInstall` / `--first-install`,
+  or answer yes at the first-install prompt. The script reads all 8 MB of
+  factory flash twice, verifies the sizes and matching hashes/content, and
+  stops before any erase/write if verification fails. Windows retries failed
+  reads in smaller pieces for the native-USB read quirk. The default backup
+  location is `mileage-tracker-backups` under your PC home directory; the
+  script asks for the location and prints the saved path. Keep it outside
+  the repo: it can contain factory device keys. Type **`ERASE`** to confirm
+  the full internal-flash erase, then it writes the bootloader, partition
+  table, boot support image and app. All internal trips and settings memory
+  (NVS), including counters and enrollment records, are erased. The SD card
+  is untouched. The erase lets Stage 4 provision its internal trip filesystem;
+  see [first-flash behavior](#first-flash-on-a-new-board).
+- **Update an installed tracker:** update/build on the server first, then
+  rerun the script without the first-install flag and answer **no** at that
+  prompt. This writes only the app, preserving NVS, internal trips and SD
+  trips. It does not update the partition table or bootloader. WiFi/address/token
+  changes need another server build and flash; the builder asks for settings
+  each time. Never use first install for a routine update.
+- **One-time enrollment cleanup:** for a new board and fresh card with no
+  saved server snapshot revision, the builder prepares both `current/`
+  (enrollment) and `cleanup/` (normal). After Device health shows a newly
+  received current snapshot, run the saved script with `-Cleanup` / `--cleanup`
+  as below. Contact from a trip alone is insufficient. Cleanup writes only
+  the app, removing enrollment defines and preserving settings/trips. Do it
+  before the next server build: a normal build removes stale cleanup output.
+  Used boards/cards or an existing server revision need the
+  [diagnostics recovery procedure](../DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery),
+  rather than claiming they are new.
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\flash.ps1 -Server '<user>@<host>' -Cleanup
+```
+
+```bash
+bash flash.sh --server '<user>@<host>' --cleanup
+```
+
+`-DryRun` / `--dry-run` still copies and validates firmware and obtains/runs
+esptool's version command, but never opens the serial device. It prints the
+plan; add the first-install flag to preview backup/erase/all-part writes.
+`-Path` / `--path` can select a local firmware folder instead of SSH;
+for cleanup select the local cleanup folder explicitly. `-SkipBackup` /
+`--skip-backup` requires an explicit first-install flag and is only for
+re-provisioning a board whose factory backup you already hold; it still
+requires `ERASE`. Do not use it to work around a failed first backup.
+
+## Advanced: build from source
+
+The remaining hardware-test and build instructions are for a local source
+build. Clone the repository or download its source ZIP, install the Arduino
+tools below, and prepare Stage 4 settings as described under
+[the trip logger](#stage-4-the-trip-logger). The scripts above build that
+same logger on the server.
+
 ## T-Beam Supreme bring-up
 
 These steps were checked on a real T-Beam Supreme (MAX-M10S version) on
@@ -85,20 +212,21 @@ esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled
 ```
 
 The Supreme uses the ESP32-S3's built-in USB port, so it needs no separate
-USB serial driver. Windows lists it as **USB Serial Device (COMn)**, USB ID 303A:1001.
+USB serial driver. Windows lists it as **USB Serial Device (COMx)**, USB ID 303A:1001.
 The COM number can change between a normal boot and download mode, so
 check **Tools → Port** after each restart.
 
 ### Back up the factory flash first
 
-Uploading anything replaces the factory firmware. Read the whole 8 MB
+The flash scripts above automate the verified backup. For source builds,
+uploading anything replaces the factory firmware. Read the whole 8 MB
 first, so the board can go back to stock. esptool comes with the ESP32
 core, at
 `%LOCALAPPDATA%\Arduino15\packages\esp32\tools\esptool_py\<version>\esptool.exe`.
 Put the board in [download mode](#download-mode), then:
 
 ```text
-esptool --chip esp32s3 --port COMn --before no-reset read-flash 0 0x800000 supreme-factory.bin
+esptool --chip esp32s3 --port COMx --before no-reset read-flash 0 0x800000 supreme-factory.bin
 ```
 
 Read it a second time into another file and compare the two
@@ -107,7 +235,7 @@ this repo: it can hold the factory firmware's device keys. To go back to
 stock later:
 
 ```text
-esptool --chip esp32s3 --port COMn write-flash 0 supreme-factory.bin
+esptool --chip esp32s3 --port COMx write-flash 0 supreme-factory.bin
 ```
 
 **Windows read quirk:** on our board, reading the factory flash over the
@@ -241,7 +369,7 @@ the **Partition Scheme** menu. Keep **Erase All Flash Before Sketch
 Upload → Disabled**, except once for the [first Stage 4 upload](#first-flash-on-a-new-board).
 
 The Supreme uses native USB (USB ID **303A:1001**); no separate USB serial
-driver is needed. Windows lists **USB Serial Device (COMn)**. Its COM
+driver is needed. Windows lists **USB Serial Device (COMx)**. Its COM
 number can change between download mode and normal operation, so check
 the port again after a restart.
 
@@ -468,9 +596,7 @@ Before flashing:
 1. **Create `secrets.h`.** From the repo's top folder, copy
    `firmware/secrets.h.example` to `firmware/04_trip_logger/secrets.h`,
    next to the `.ino` (the build won't find it anywhere else), and fill
-   it in. The top-level README has a table of
-   the settings in the
-   [flashing section](../README.md#3-flash-the-firmware).
+   it in. The [source settings table](#source-build-settings) explains each value.
    The ones that catch people out:
    - The WiFi has to be 2.4 GHz (the ESP32 has no 5 GHz radio), and
      **hidden networks won't work**: the board only uploads when it sees
@@ -493,8 +619,7 @@ Before flashing:
    Partition Scheme**. Internal fallback holds roughly 5–6 hours of driving;
    the [microSD card](#microsd-card) holds far more. A full trip store ends
    the current trip and prevents another until space is freed.
-3. **Prepare diagnostics enrollment.** Follow [README step 3](../README.md#3-flash-the-firmware)
-   and [deployment Step 8](../DEPLOY_DEBIAN.md#step-8--point-the-firmware-at-it)
+3. **Prepare diagnostics enrollment.** Follow [deployment Step 8](../DEPLOY_DEBIAN.md#step-8--point-the-firmware-at-it)
    to read the server's snapshot revision and set the two one-use enrollment
    defines. A snapshot is the board's current diagnostic state; its revision
    must be newer than the server's saved value. GPX delivery does not depend
@@ -506,6 +631,20 @@ Before flashing:
    road-use version bumps and tags.
 5. **On a new board, erase once as described below.** The factory firmware
    can leave data where Stage 4 expects its internal trip partition.
+
+#### Source build settings
+
+| Setting | What goes in it |
+|---|---|
+| `WIFI_SSID` | Your home network's name, exactly as it appears, capitals included. It has to be 2.4 GHz, and not hidden: the board only uploads when it sees this name in a WiFi scan. |
+| `WIFI_PASSWORD` | Its password. If the password has a `"` or `\` in it, write them as `\"` and `\\`. |
+| `SERVER_HOST` | Only the server's IP address or hostname, from `install.sh` on the server. Do not include `http://`, a port, or `/upload`. |
+| `SERVER_PORT` | `8090`. |
+| `AUTH_TOKEN` | The token from `install.sh` on the server. It has to match `INGEST_AUTH_TOKEN` in the server's `.env` exactly, or every upload is refused. |
+| `DEVICE_ID` | A name for this board. The default, `tbeam-01`, is fine. |
+
+Leave `USE_BSSID_FILTER` at 0 unless you want to restrict uploads to one
+router; the example explains it. Keep `secrets.h` private and gitignored.
 
 #### First flash on a new board
 
@@ -764,7 +903,7 @@ a scan miss. Join status `4` (`WL_CONNECT_FAILED`) can indicate a wrong
 password; `1` is `WL_NO_SSID_AVAIL` and `6` is `WL_DISCONNECTED`. These are
 connection states, not a definitive diagnosis. Press **RESET** to try again
 at once. See the
-[troubleshooting steps](../README.md#4-check-it-works)
+[troubleshooting steps](#check-recording-and-uploads)
 for what to check and preserve in each case.
 
 Boot repair also examines `.gpx.fix` files left by interrupted repairs.
@@ -1148,6 +1287,126 @@ is not proof that every path has been exercised. Keep issue #6 open until these 
 recorded and the final allocation is justified. Host tests check diagnostics
 only and cannot measure ESP32 stack use.
 
+### Check recording and uploads
+
+Open **Tools → Serial Monitor** in the Arduino IDE and set its speed to
+**115200** baud. With the board in the case (screen on the left, USB-C on
+the right), **RESET** is the left of the close pair of buttons along the
+bottom edge; press it to see the startup messages again. Opening the
+Serial Monitor can itself restart the board, so messages may show twice.
+Do this before a test drive, not during a trip.
+
+1. After flashing, look for these lines:
+   - `Trip storage: microSD (... GiB free); internal flash queue mounted.`
+     Trips go to the card (the free-space figure depends on your card). If it says `WARNING: microSD unavailable -- using
+     internal flash`, the card didn't mount: switch off, check it's FAT32 and
+     seated, and switch on again.
+   - `Setup complete. Logging trips.`
+   - A line starting `DEGRADED:` means the board is **not recording trips**,
+     because neither storage worked or the power chip didn't answer. It
+     retries by itself; the message says why. See
+     [Stage 4 on the Supreme](#stage-4-the-trip-logger).
+2. Take it for a drive of a few minutes, powered from a laptop with the
+   Serial Monitor open. (Anything under 30 seconds or a tenth of a mile is
+   thrown away as noise.) GPS doesn't work indoors, and the first fix after
+   the battery was out can take a minute outside. After 10 seconds above
+   5 mph you'll see `Trip started`.
+3. Park at home and wait. Three minutes below 2 mph ends the trip
+   (`Trip finalized`). The board then tries your WiFi and uploads it:
+   `Upload ... -> HTTP 200 (deleted)`. The file is deleted from the board
+   only after the server has accepted it. On 2026-10-21 (UTC), the trip
+   finalized at 04:35:09Z and uploaded at 04:36:41Z. A scan at 04:35:35Z
+   missed the access point and scheduled a retry in 60 s, so allow time
+   for retries at the edge of WiFi range. Older finished trips can upload
+   while the current trip is still recording; this happened on that drive.
+4. Open the viewer at `http://<host>:8091/` and log in. The trip should
+   be on the list. If you enrolled diagnostics, **Device health** shows
+   when the board last checked in and any active error codes.
+
+Server-down retry was verified on 2026-10-21 (UTC): two attempts returned
+`HTTP -1`, the trip stayed queued, and the next retry after ingest restarted
+received HTTP 200 and deleted the local file. Server errors (401/413/5xx)
+below describe the code's behaviour and remain untested on the Supreme.
+
+If the trip does not appear, first confirm both `Trip started` and
+`Trip finalized`. A trip still in progress cannot upload; a short trip
+discarded as noise has nothing to upload. Then look for the upload result:
+
+- `HTTP 401`: the token in `secrets.h` doesn't match the server's.
+- A negative number, like `HTTP -1`: a connection or transfer failed.
+  This can include a dropped connection or timeout after reaching the
+  server. Check WiFi signal, `SERVER_HOST`, `SERVER_PORT` and server logs.
+- `HTTP 400` or `HTTP 413`: the server rejected the file as invalid or
+  too large. Look for `kept as .bad, not retried`. That file remains on
+  the board for inspection and uses storage, but no longer uploads
+  automatically. Preserve it and investigate the server logs; changing
+  WiFi settings will not make it retry. If the rename fails, the log says
+  `rename failed, will retry` instead.
+- `HTTP 409` or a `5xx` status: the trip stays queued for retry. Check
+  server logs for a conflicting trip identity (409) or a server error.
+- `Network: home WiFi not found` or `Network: couldn't join home WiFi`:
+  the message names the configured SSID; a join failure also reports
+  `status N` (`4` can indicate a wrong password). Check the name and
+  password, and that the network is 2.4 GHz and not hidden. See the
+  [firmware status notes](#normal-operation) for details.
+  After repeated failures the board waits up to 5 minutes between
+  tries; the message says how long. Press **RESET** to try again at once.
+- No upload result and no `Network:` line after a saved trip: check
+  earlier serial messages for storage errors, incomplete files or files
+  set aside as `.bad`, which are not eligible for normal upload.
+
+Once it's in the car, the viewer (and the screen's `OK` or error codes
+after you park) are the signs the board is working. Look at the viewer
+every so often after you've driven. If trips stop showing up, check
+whether any of the `secrets.h` settings have changed, then plug in a
+laptop and watch the Serial Monitor.
+
+### Put it in the car
+
+- **Power.** Use a USB port that turns off with the ignition. To check,
+  plug in a phone, turn the car off, and see whether it stops charging. A
+  port that stays on for a few minutes is fine. On a port that's always
+  on, the board never knows the car is off: it never switches itself off,
+  and it draws on the car's battery the whole time it's parked.
+- **Battery.** Keep the 18650 fitted. It charges from USB while you drive,
+  and it's what lets the board close its files, upload at home and switch
+  off cleanly once the car's USB power goes. The firmware pauses charging
+  when the power-management chip reports a high or low temperature. That's
+  an indirect estimate, not a measurement of the cell's temperature or a
+  guarantee of safe charging in a hot car, and its calibration was measured
+  on the older T-Beam V1.2; re-measuring it on the Supreme is still to do.
+  Logging carries on while charging is paused.
+- **Antenna.** The GPS antenna needs a view of the sky. The dashboard or
+  the rear shelf works; the glovebox, under a seat or the trunk doesn't.
+- **WiFi range.** The board uploads from wherever you park, so your
+  2.4 GHz WiFi has to reach that spot. A phone on the same network,
+  standing where the car parks, is a quick test.
+- **Switching off and on.** The board switches on by itself when the car's
+  USB port comes on. Once that power has been gone for 10 seconds, it ends
+  the trip, stays on battery for 10 minutes to upload (up to 16 minutes more
+  if an upload is still running), then switches itself off completely. Unplugged from USB, on your desk say, it does the same:
+  10 minutes, then off. It hasn't died; plug USB back in, or press
+  **POWER** for about a second, to switch it on. On battery, holding
+  **POWER** for a second or two (let go well before 6 s) switches it off
+  cleanly. **With USB plugged in, that press is ignored**, because USB
+  power only switches the board on at the moment it arrives: a board
+  switched off with USB still in would stay off until the car's port next
+  went off and on. Holding **POWER** for 6 s cuts power without closing
+  anything first; use it only if the board stops responding.
+  [trip logger guide](#stage-4-the-trip-logger) has the
+  details.
+
+**Check the installed power setup.** With the battery fitted and Stage 4
+running from the intended car USB port, take another short drive and park
+within home WiFi range. Turn the ignition off and confirm the port loses
+power after any normal delay. Leave the board connected to the car, not
+the laptop: laptop USB power would mask this test. Confirm that the new
+trip reaches the viewer during the battery-powered upload window. On the
+next start, take another short drive and confirm a second trip appears
+after parking. This checks the installed recording and upload path across
+power-off and restart. It doesn't measure how much current the board draws
+while switched off, which still needs a meter.
+
 ## Legacy T-Beam V1.2
 
 **For reference only; do not use with the Supreme.** The T-Beam V1.2 is
@@ -1182,7 +1441,7 @@ identify these controls:
 
 **V1.2 USB driver:** Windows uses the CH9102 driver; see
 [Adafruit's CH9102 driver instructions](https://learn.adafruit.com/how-to-install-drivers-for-wch-usb-to-serial-chips-ch9102f-ch9102/windows-driver-installation).
-Device Manager lists `USB-Enhanced-SERIAL CH9102 (COMn)`. On macOS, first
+Device Manager lists `USB-Enhanced-SERIAL CH9102 (COMx)`. On macOS, first
 check for a port with a data cable; if none appears, use the
 [WCH macOS driver linked by LilyGO](https://www.wch-ic.com/downloads/CH34XSER_MAC_ZIP.html).
 Linux normally includes the driver; serial-port access permissions still apply.

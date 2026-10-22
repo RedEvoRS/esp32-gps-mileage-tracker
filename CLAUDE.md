@@ -65,7 +65,14 @@ firmware/
   secrets.h.example      Copy to 04_trip_logger/secrets.h; fill in WiFi + server creds
   README.md              Full setup guide + pin reference
 
+install/
+  setup.sh               Release-based server install/update wrapper
+  flash.ps1              Windows tracker flash helper
+  flash.sh               macOS/Linux tracker flash helper
+  tests/                 Setup wrapper integration tests
+
 server/
+  firmware-builder/      Private server-side firmware build (build.sh, README.md)
   common/diagnostics/    Shared catalog and protocol validators (stdlib only)
   docker-compose.yml     Default ports 8090 + 8091; optional ntfy 8092 and monitor 8093
   .dockerignore          Default-deny runtime allowlist; excludes secrets and data
@@ -86,6 +93,7 @@ server/
 tools/check_pii.py                  Personal-info scan (CI runs it; see Do Not)
 tools/generate_error_catalog.py     Generates sketch-local diag_catalog.h
 DIAGNOSTICS.md                     Framework reference and issue delivery map
+.github/workflows/release.yml       Published-release bundle, scripts and checksums
 .github/workflows/audit-tests.yml   CI: PII scan + server tests + firmware host tests
 .github/dependabot.yml              Dependabot: monthly pip, Docker and Actions bumps
 docs/history/                     Reviews and original V1.2 design brief (see Where Status Lives)

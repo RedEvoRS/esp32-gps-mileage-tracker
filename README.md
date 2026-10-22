@@ -95,410 +95,200 @@ with the IRS.
 
 ## What you need
 
-The target hardware:
-
-- **LilyGO T-Beam Supreme with MAX-M10S GPS.** Select the MAX-M10S version,
-  not the L76K version. It uses an ESP32-S3 and has an onboard microSD slot.
-  See LilyGO's [T-Beam Supreme hardware guide](https://github.com/Xinyuan-LilyGO/LilyGo-LoRa-Series/blob/master/docs/en/t_beam_supreme/t_beam_supreme_hw.md).
-- **A microSD card of 32 GB or less, formatted FAT32.** This project uses
-  a SanDisk 32 GB Max Endurance, which is built for constant writing and
-  comes formatted FAT32. The firmware can't read exFAT, which most cards of
-  64 GB and up ship with. See [microSD card](firmware/README.md#microsd-card)
-  for checking the format and spotting fake cards.
-- **A protected 18650 cell** for the onboard holder. It keeps the board
-  running after the car switches off, which is when trips upload at home.
-  Without it the board can only upload while the engine is running.
-- **A car USB port that switches off with the ignition.** The board
-  learns that the car is off when that port loses power. On a port that
-  stays powered, it never switches itself off and keeps drawing from the
-  car's battery the whole time the car is parked.
-- **A USB-C data cable**, not a charge-only one, for flashing and for
-  reading the board's messages on a computer.
-- **The GPS antenna**, attached to the socket marked **GPS**. The board
-  powers an active antenna, so an external active antenna works too.
-- **The 915 MHz LoRa antenna** (see the warning below).
-- An enclosure. Mine is a heavily modified remix of a published T-Beam
-  Supreme case, printed in PETG, which copes with a hot car better than
-  PLA. A case made for the older T-Beam V1.2 doesn't fit the Supreme.
-  <!-- TODO(enclosure): link the owner's published remix here, and credit
-  the original Supreme case it's based on (name, author, link, licence).
-  If the original is CC BY-SA, the remix must carry the same licence. -->
-
-The LoRa radio isn't used by this project, but the Supreme may arrive with
-factory firmware that transmits. Attach the correct 915 MHz LoRa antenna
-**before connecting USB or inserting the 18650 battery**, and leave it
-attached while the board is powered.
-
-And around it:
-
-- **A server**: a Debian 12/13 or Ubuntu machine on your home network
-  that stays on, with SSH access and a login that can use sudo (run
-  administrative commands). Everything runs in Docker, which the installer
-  sets up. For automatic backups, that account currently needs numeric
-  user ID **1000**; run `id -u` on the server to check. The installer skips
-  backups for other IDs. See [backup setup](DEPLOY_DEBIAN.md#step-10--backups).
-- **Home WiFi on 2.4 GHz** that reaches where you park. The ESP32-S3 does
-  not have 5 GHz WiFi.
-- **A computer with the Arduino IDE** (Windows, macOS or Linux) to build
-  and flash the firmware. Step 3 below says which board support and
-  library versions to install.
+- **LilyGO T-Beam Supreme with u-blox MAX-M10S GPS** (not L76K), a
+  protected **18650 cell**, and a **microSD card formatted FAT32**. A
+  SanDisk 32 GB Max Endurance is the tested card; exFAT is unsupported.
+  See [microSD card](firmware/README.md#microsd-card).
+- Attach the GPS antenna to **GPS** and the correct **915 MHz LoRa antenna
+  before inserting the battery or connecting USB**: factory firmware may
+  transmit even though this project does not use LoRa. Match the battery's
+  polarity to the holder. Use a car USB port that switches off with the ignition.
+- **A Debian 13 server** on your home network, with a stable LAN address,
+  SSH access, a normal login with sudo, and **Docker Engine with Compose v2**
+  already usable by that login. [Deployment Steps 0–1](DEPLOY_DEBIAN.md#step-0--confirm-ssh-works)
+  cover preparation. Allow space for Docker images and trips; the firmware
+  builder needs about 2 GB extra. Automatic backups currently require the
+  server login's numeric user ID to be 1000; see [backups](DEPLOY_DEBIAN.md#step-10--backups).
+- **A Windows, macOS or Linux PC**, a **USB-C data cable**, and OpenSSH
+  (`ssh` and `scp`) access to the server. macOS/Linux also need Bash, curl,
+  tar and jq; see [flashing prerequisites](firmware/README.md#flash-from-the-server-build).
+- **Visible 2.4 GHz home WiFi** reaching your parking spot; 5 GHz and hidden
+  networks do not work.
 
 ## Setting it up
 
-Get the code and set up the server first: the firmware needs the server's
-address and upload token, and they're built into it when you flash.
+Replace angle-bracket placeholders, including the brackets, with your values.
+`<user>@<host>` is your server SSH login and address; the viewer login and
+board upload token are separate credentials.
 
-### 1. Get the code
+The one-liners download scripts and the source bundle from **this repo's
+GitHub releases**, and the flash scripts download **esptool from Espressif's
+GitHub releases**. They work starting with the first release carrying these
+assets: [the release workflow](.github/workflows/release.yml) attaches them
+when a release is published. Docker and toolchain dependencies need internet
+access too. Piping `curl` into Bash (or `irm` into `iex`) executes downloaded
+code with your account's permissions: do this only if you trust that source.
+The download, read, then run alternatives below let you inspect the script
+first; the bundle checksum does not authenticate the script you already ran.
 
-Clone this repository, or on GitHub use **Code → Download ZIP** and unzip
-it. On your computer, open PowerShell (Windows) or Terminal (macOS/Linux)
-and change to the top folder of that copy:
+<a id="1-get-the-code"></a>
+<a id="2-set-up-the-server"></a>
 
-```bash
-cd "<path to your copy of the repo>"
-```
+### Step 1 — Set up the server
 
-Replace text in angle brackets, including the brackets, with your own
-values. Keep the quotes around directory paths, especially if they contain
-spaces. Commands below say when to switch between this computer and the
-server.
-
-### 2. Set up the server
-
-Before you start, give the server a fixed address on your network: a DHCP
-reservation in your router, or a static IP. The firmware has this address
-built in; if it changes, the board can't upload until you flash it again
-with the new one.
-
-**On your computer**, in the repo's top folder, copy `server/` over and
-connect to the server. `<user>` is your Linux login on the server;
-`<server>` is its IP address or hostname:
+Connect with `ssh <user>@<host>`. **In that SSH session on the Debian server**,
+run as your normal login, not root:
 
 ```bash
-scp -r server <user>@<server>:~/mileage-tracker
-ssh <user>@<server>
+curl -fsSL https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases/latest/download/setup.sh | bash
 ```
 
-**In that SSH session on the server**, run the installer as your normal
-login, not root:
+Or download, inspect, then run:
 
 ```bash
-bash ~/mileage-tracker/install.sh
+curl -fsSL https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases/latest/download/setup.sh -o setup.sh
+less setup.sh
+bash setup.sh
 ```
 
-It installs Docker if it isn't there, generates the upload token and the
-viewer's session key, asks for your timezone and a username and password
-for the web page, and starts both services. Then it checks the whole thing actually works:
-it uploads the sample trip, logs in to the viewer, finds the trip on the
-list, the map and in both exports, and deletes it again. It also sets up
-nightly backups to another machine if you let it. If any step fails it
-tells you what to fix, and you just run it again; whatever's already done
-stays done.
+It verifies the release bundle, copies it into `~/mileage-tracker`, and runs
+`install.sh` to configure, build and check the server. Answer its LAN address,
+timezone, viewer login, backup and optional notification questions. Docker's
+published ports bypass UFW: choose the server's LAN address for `BIND_ADDR`,
+not all interfaces. See the [deployment runbook](DEPLOY_DEBIAN.md).
 
-At the end it prints the viewer's address and three lines for the
-firmware's settings file, `secrets.h`: `SERVER_HOST`, `SERVER_PORT` and
-`AUTH_TOKEN`. Copy them somewhere for step 3. The token is also in
-`~/mileage-tracker/.env` on the server, as `INGEST_AUTH_TOKEN`.
+**Accept “Build your tracker firmware now”** to prepare Step 2. The builder
+asks before its first **~1–2 GB toolchain download**; later builds reuse it.
+Enter your WiFi settings, a name for the board (`DEVICE_ID`, default
+`tbeam-01`), and confirm the server address and port (default 8090). It reads
+the upload token from the server's `.env`. For a new device it also checks
+the server's saved diagnostics revision and asks whether the SD card is
+fresh and the board has never used an enrollment ID; answer truthfully.
+It prepares the one-time enrollment and cleanup images when those checks
+allow it. Recovery for a reused board/card is in
+[DIAGNOSTICS.md](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery).
 
-`bash ~/mileage-tracker/install.sh --check` reruns the checks later
-without changing the configuration. It uploads and removes a temporary
-test trip and can test the viewer login, so it is not a read-only check.
+**Keep `firmware-out/` private:** its owner-only directories/files (0700/0600)
+contain firmware with your WiFi password and upload token built in. Do not
+share or commit them. The settings are compiled in; changing WiFi, token or
+server address requires another build and flash. When setup finishes, use
+its printed Step 2 commands (they select the same release), then type `exit`
+to return to your PC.
 
-There are three separate credentials to keep straight:
+<a id="3-flash-the-firmware"></a>
 
-| Credential | Where you use it |
-|---|---|
-| Server SSH login | To connect to and administer the Linux server |
-| Viewer username and password | To sign in to the trips web page |
-| Upload token | Used by the board firmware and set on the server as `INGEST_AUTH_TOKEN`; it is not either login password |
+### Step 2 — Flash the tracker
 
-When the installer finishes and you have saved the server details and token,
-leave the SSH session to return to your computer:
+**On the PC connected to the board**, close any serial monitor and run the
+command for your OS. These latest-release forms also work; use the commands
+printed by Step 1 when selecting a specific release or installation directory.
+
+**Windows PowerShell (5.1 or 7):**
+
+```powershell
+irm https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases/latest/download/flash.ps1 | iex
+```
+
+It asks for `<user>@<host>`. To inspect it and supply `-Server`, save it first
+(the `irm | iex` form cannot pass script arguments):
+
+```powershell
+Invoke-WebRequest https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases/latest/download/flash.ps1 -OutFile flash.ps1
+Get-Content .\flash.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\flash.ps1 -Server '<user>@<host>'
+```
+
+**macOS/Linux Terminal:**
 
 ```bash
-exit
+curl -fsSL https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases/latest/download/flash.sh | bash -s -- --server '<user>@<host>'
 ```
 
-If you'd rather do it by hand, [DEPLOY_DEBIAN.md](DEPLOY_DEBIAN.md) goes
-through the same steps one at a time.
-
-### 3. Flash the firmware
-
-**Back on your computer.** A few words first: a *sketch* is an Arduino
-program (an `.ino` file in a folder of the same name); *uploading* or
-*flashing* compiles it and installs it on the board. The *Serial Monitor* is
-the Arduino IDE's window for the board's diagnostic messages over USB.
-
-**Before the board's first power-up, screw on the 915 MHz LoRa antenna and
-press the GPS antenna onto the socket marked GPS** (see the warning under
-[What you need](#what-you-need)). Fit the 18650 with its + end matching the
-holder's marking.
-
-**Set up the Arduino IDE.** [firmware/README.md](firmware/README.md#development-environment-setup)
-walks through it: the ESP32 board support and three libraries, and the
-board settings for the Supreme. Use the versions the firmware is tested
-with: ESP32 core **3.3.11**, XPowersLib **0.3.3**, TinyGPSPlus **1.0.3** and
-U8g2 **2.36.18**. The Boards Manager and Library Manager install the newest
-version unless you pick one from the list. The Supreme uses the ESP32-S3's
-built-in USB, so no USB driver is needed.
-
-**Back up the factory firmware first.** The board ships with factory
-firmware (Meshtastic), and the first upload replaces it for good. If you
-might ever want it back, read it off with esptool before uploading
-anything: [back up the factory flash](firmware/README.md#back-up-the-factory-flash-first).
-That section also covers *download mode*, which you may have to enter by
-hand while the factory firmware is still on the board.
-
-**Work through the test stages.** If the board is new to you, flash stages
-1 to 3 first. Each gets one piece of hardware working (USB and memory, then
-the power chip and microSD slot, then the GPS) before the next depends on
-it, and it's a lot easier to debug that way:
-[Firmware stages](firmware/README.md#firmware-stages). Each stage replaces
-the previous program. Only Stage 4, the trip logger, records trips, and
-it's the one you leave on the board.
-
-**Fill in `secrets.h`.** Stage 4 reads your settings from `secrets.h`,
-which has to sit next to `04_trip_logger.ino`; the build doesn't look for
-it anywhere else. Start from the example:
+Or download, inspect, then run:
 
 ```bash
-cd firmware/04_trip_logger
-cp ../secrets.h.example secrets.h
+curl -fsSL https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases/latest/download/flash.sh -o flash.sh
+less flash.sh
+bash flash.sh --server '<user>@<host>'
 ```
 
-(PowerShell accepts `cp`; in Windows `cmd`, use
-`copy ..\secrets.h.example secrets.h`.) Then edit it:
+The script copies your private firmware over SSH and checks its hashes.
+Follow its download-mode prompt: hold **BOOT**, plug in USB (or tap
+**RESET**), wait 2–3 seconds, release BOOT, then select the port (`COMx` on
+Windows; it can change in download mode).
 
-| Setting | What goes in it |
-|---|---|
-| `WIFI_SSID` | Your home network's name, exactly as it appears, capitals included. It has to be 2.4 GHz, and not hidden: the board only uploads when it sees this name in a WiFi scan. |
-| `WIFI_PASSWORD` | Its password. If the password has a `"` or `\` in it, write them as `\"` and `\\`. |
-| `SERVER_HOST` | Only the server's IP address or hostname, from the installer's output. Do not include `http://`, a port, or `/upload`. |
-| `SERVER_PORT` | `8090`. |
-| `AUTH_TOKEN` | The token from the installer's output. It has to match `INGEST_AUTH_TOKEN` in the server's `.env` exactly, or every upload is refused. |
-| `DEVICE_ID` | A name for this board. The default, `tbeam-01`, is fine. |
+**For the first install on a factory board, answer yes to first install.**
+The script reads the full 8 MB factory flash twice and checks the copies
+match. Keep the backup privately outside the repo; it may contain device
+keys. You must then type **`ERASE`**: this erases all internal flash,
+including settings and any internal trips, before writing all four firmware
+parts. The SD card is untouched. Updates use the default app-only path.
+Press RESET with BOOT released after flashing. See the
+[firmware guide](firmware/README.md#flash-from-the-server-build) for details.
 
-Leave `USE_BSSID_FILTER` at 0 unless you want to lock the board to one
-router; the comments in `secrets.h` explain it. `secrets.h` is in
-`.gitignore`, so it stays out of git.
+<a id="4-check-it-works"></a>
+<a id="5-put-it-in-the-car"></a>
 
-> **These settings are built into the firmware.** The board only knows
-> what was in `secrets.h` when you flashed it. If the server's address
-> changes, the token is regenerated, or your WiFi name or password changes
-> (a new router, say), the board can't upload any more. Trips just stop
-> showing up in the viewer. On the everyday screen, a refused upload (a
-> wrong token, say) shows as an `E5xxx` error code; WiFi or connection
-> trouble only shows if you short-press **POWER** after parking; and a
-> WiFi name the board can't find never shows. The Serial Monitor explains
-> each failure. Fix `secrets.h` and flash again. Trips recorded
-> in the meantime wait on the board and upload once it can reach the
-> server.
+### Step 3 — First drive and Device health
 
-**Turn on diagnostics uploads (optional, once).** Trips upload without
-this step. The board's health journal (see [How it works](#how-it-works))
-only uploads after a one-time *enrollment*, which tells the board where the
-server's count of its status reports stands, so the two can never disagree.
-The firmware can't ask the server for it, so you read it yourself.
-**On the server**, in an SSH session, run this with your `DEVICE_ID` in
-place of `<DEVICE_ID>`:
+Fit the FAT32 card with the board switched off. Take a drive of a few minutes
+outdoors, with the GPS antenna facing the sky and the battery fitted. Trips
+start after 10 seconds above 5 mph; drives shorter than 30 seconds or about
+a tenth of a mile are discarded. Park within home WiFi range and allow three
+minutes stopped for the trip to finish, plus time for uploads/retries. The
+battery keeps the board running after the car USB turns off.
+
+Open `http://<host>:8091/` and sign in with the viewer login. Check the trip,
+then open **Device health** and check for a newly received **current status
+snapshot**. A listed device or recent trip contact alone does not prove
+that diagnostics enrollment succeeded. See
+[detailed checks](firmware/README.md#check-recording-and-uploads) and
+[car installation](firmware/README.md#put-it-in-the-car).
+
+**After the first diagnostics snapshot, do the one-time cleanup flash**
+using the saved Step 2 script, before rebuilding firmware on the server.
+If you used the one-liner, download the script using Step 2 first:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\flash.ps1 -Server '<user>@<host>' -Cleanup
+```
 
 ```bash
-cd ~/mileage-tracker
-docker compose exec -T mileage-viewer python -c "import os,sqlite3,sys;p='/data/diagnostics/events.db';r=sqlite3.connect('file:'+p+'?mode=ro',uri=True).execute('SELECT status_sequence FROM devices WHERE device_id=?',(sys.argv[1],)).fetchone() if os.path.exists(p) else None;print((r and r[0]) or 0)" <DEVICE_ID>
+bash flash.sh --server '<user>@<host>' --cleanup
 ```
 
-It only reads: it runs in the viewer container, which sees the data
-read-only. It prints a number, `0` on a new server. In `secrets.h`, remove
-the `//` from the two `DIAGNOSTICS_` lines and set them:
+This selects `firmware-out/cleanup/`, removes the one-use enrollment values,
+and writes only the app. It preserves the board's settings, trip counter,
+SD diagnostics metadata and queued trips. Follow the download-mode prompt
+again. [Enrollment and recovery](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
+explains why those values must be removed.
 
-```c
-#define DIAGNOSTICS_ENROLLMENT_ID 1ULL
-#define DIAGNOSTICS_STATUS_HIGH_WATER <the number it printed>ULL
+## Updating
+
+Rerun **Step 1 on the server**, accept the firmware build, and enter/confirm
+your settings again. It updates supplied source files and rebuilds/checks
+the services; private configuration and trip data are retained. Then rerun
+**Step 2 on your PC**, answering **no** to first install. Do not use
+`-FirstInstall` / `--first-install` on an installed tracker: a normal update
+writes only the app and preserves settings and trips. Update the server
+before the board so it understands the new firmware's diagnostics.
+See the [update runbook](DEPLOY_DEBIAN.md#updating).
+
+## Advanced: build from source
+
+To build locally, clone the repository (or use GitHub's **Code → Download ZIP**):
+
+```bash
+git clone https://github.com/RedEvoRS/esp32-gps-mileage-tracker.git
+cd esp32-gps-mileage-tracker
 ```
 
-Diagnostics uploads need the microSD card: that's where the board keeps
-its count. The board uses an enrollment ID once and remembers it, even if
-the attempt fails. Once the first diagnostics upload has succeeded, the
-viewer's **Device health** page shows a status snapshot from the board.
-Just seeing the board listed there isn't enough, because a trip upload on
-its own lists it. Then **delete those two lines again** and flash once
-more, with erase disabled. Left in,
-they'd enroll the board again from a stale number if its memory were ever
-erased (see *Erase All Flash* below). To enroll again later, after a new
-card for example, read the number again and use a higher ID, `2ULL` and
-up. [DIAGNOSTICS.md](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
-has the details.
-
-**Fit the microSD card** with the board switched off. It has to be FAT32;
-the firmware never formats it. The firmware chooses where to store trips
-once, at startup, so a card inserted while it runs isn't used until the
-next start.
-
-**One firmware, two screen modes.** Every power-on starts with the everyday
-screen: normally asleep, with 30-second status and error cards. Tap **POWER**
-to see satellites heard and `OK`, or active warning/error codes. While the
-board is running, hold **BOOT**, then tap **POWER** to toggle debug mode:
-a live page with satellites, speed, trip, storage and WiFi, plus extra
-serial diagnostics. The screen briefly says `Debug ON` or `Debug OFF`.
-Debug is never saved. Holding BOOT while powering up still enters download
-mode. [firmware/README.md](firmware/README.md#the-screen) explains the screens.
-The runtime toggle still needs bench verification.
-
-**Stamp the version.** From the repository folder, run
-`python tools/stamp_firmware_version.py` before every build. It combines
-`firmware/VERSION` with the ten-character Git commit (for example
-`v0.05+3f9a1c07be`), adding `-dirty` for tracked edits.
-The board reports it on the viewer's Device health page. Without a generated
-header it reports `unversioned`; an old header keeps its old version.
-See [Firmware versions and releases](firmware/README.md#firmware-versions-and-releases)
-for road-use version bumps and tags.
-
-**Flash it.** Open `firmware/04_trip_logger/04_trip_logger.ino`, check the
-[Supreme board settings](firmware/README.md#board-settings) and the board's
-port under **Tools → Port**, then click **Upload** (the right-arrow button)
-and wait for it to finish. The sketch folder's own `partitions.csv` sets
-aside 2.375 MB of the board's internal flash for trips; it overrides the
-Partition Scheme menu, so leave that menu alone.
-
-> **The first Stage 4 upload only:** set **Tools → Erase All Flash Before
-> Sketch Upload → Enabled**, upload, then set it straight back to
-> **Disabled**. The internal trip storage is only set up on fully erased
-> flash, and the factory firmware leaves data there. Erasing also wipes the
-> board's settings memory (NVS): the trip counter, the boot counter and the
-> used enrollment ID. That's fine on a new board. **Never erase again** on
-> a board in use: trips waiting in internal flash would be lost, and the
-> `DIAGNOSTICS_` lines, if still there, would enroll again.
-
-Every later upload, with erase disabled, keeps the trips waiting on the
-card and in internal flash, and the board's settings memory. See
-[First flash on a new board](firmware/README.md#first-flash-on-a-new-board)
-for the messages to expect and what to do if storage won't mount.
-
-**How much it holds.** A 32 GB card holds far more driving than you'll do
-between uploads. Without a card the board uses internal flash, which holds
-about 5 to 6 hours of driving. **Once that's full, the board stops
-recording**: it ends the trip in progress and won't start another until it
-gets home and uploads.
-
-### 4. Check it works
-
-Open **Tools → Serial Monitor** in the Arduino IDE and set its speed to
-**115200** baud. With the board in the case (screen on the left, USB-C on
-the right), **RESET** is the left of the close pair of buttons along the
-bottom edge; press it to see the startup messages again. Opening the
-Serial Monitor can itself restart the board, so messages may show twice.
-Do this before a test drive, not during a trip.
-
-1. After flashing, look for these lines:
-   - `Trip storage: microSD (... GiB free); internal flash queue mounted.`
-     Trips go to the card (the free-space figure depends on your card). If it says `WARNING: microSD unavailable -- using
-     internal flash`, the card didn't mount: switch off, check it's FAT32 and
-     seated, and switch on again.
-   - `Setup complete. Logging trips.`
-   - A line starting `DEGRADED:` means the board is **not recording trips**,
-     because neither storage worked or the power chip didn't answer. It
-     retries by itself; the message says why. See
-     [Stage 4 on the Supreme](firmware/README.md#stage-4-the-trip-logger).
-2. Take it for a drive of a few minutes, powered from a laptop with the
-   Serial Monitor open. (Anything under 30 seconds or a tenth of a mile is
-   thrown away as noise.) GPS doesn't work indoors, and the first fix after
-   the battery was out can take a minute outside. After 10 seconds above
-   5 mph you'll see `Trip started`.
-3. Park at home and wait. Three minutes below 2 mph ends the trip
-   (`Trip finalized`). The board then tries your WiFi and uploads it:
-   `Upload ... -> HTTP 200 (deleted)`. The file is deleted from the board
-   only after the server has accepted it. On 2026-10-21 (UTC), the trip
-   finalized at 04:35:09Z and uploaded at 04:36:41Z. A scan at 04:35:35Z
-   missed the access point and scheduled a retry in 60 s, so allow time
-   for retries at the edge of WiFi range. Older finished trips can upload
-   while the current trip is still recording; this happened on that drive.
-4. Open the viewer at `http://<server>:8091/` and log in. The trip should
-   be on the list. If you enrolled diagnostics, **Device health** shows
-   when the board last checked in and any active error codes.
-
-Server-down retry was verified on 2026-10-21 (UTC): two attempts returned
-`HTTP -1`, the trip stayed queued, and the next retry after ingest restarted
-received HTTP 200 and deleted the local file. Server errors (401/413/5xx)
-below describe the code's behaviour and remain untested on the Supreme.
-
-If the trip does not appear, first confirm both `Trip started` and
-`Trip finalized`. A trip still in progress cannot upload; a short trip
-discarded as noise has nothing to upload. Then look for the upload result:
-
-- `HTTP 401`: the token in `secrets.h` doesn't match the server's.
-- A negative number, like `HTTP -1`: a connection or transfer failed.
-  This can include a dropped connection or timeout after reaching the
-  server. Check WiFi signal, `SERVER_HOST`, `SERVER_PORT` and server logs.
-- `HTTP 400` or `HTTP 413`: the server rejected the file as invalid or
-  too large. Look for `kept as .bad, not retried`. That file remains on
-  the board for inspection and uses storage, but no longer uploads
-  automatically. Preserve it and investigate the server logs; changing
-  WiFi settings will not make it retry. If the rename fails, the log says
-  `rename failed, will retry` instead.
-- `HTTP 409` or a `5xx` status: the trip stays queued for retry. Check
-  server logs for a conflicting trip identity (409) or a server error.
-- `Network: home WiFi not found` or `Network: couldn't join home WiFi`:
-  the message names the configured SSID; a join failure also reports
-  `status N` (`4` can indicate a wrong password). Check the name and
-  password, and that the network is 2.4 GHz and not hidden. See the
-  [firmware status notes](firmware/README.md#normal-operation) for details.
-  After repeated failures the board waits up to 5 minutes between
-  tries; the message says how long. Press **RESET** to try again at once.
-- No upload result and no `Network:` line after a saved trip: check
-  earlier serial messages for storage errors, incomplete files or files
-  set aside as `.bad`, which are not eligible for normal upload.
-
-Once it's in the car, the viewer (and the screen's `OK` or error codes
-after you park) are the signs the board is working. Look at the viewer
-every so often after you've driven. If trips stop showing up, check
-whether any of the `secrets.h` settings have changed, then plug in a
-laptop and watch the Serial Monitor.
-
-### 5. Put it in the car
-
-- **Power.** Use a USB port that turns off with the ignition. To check,
-  plug in a phone, turn the car off, and see whether it stops charging. A
-  port that stays on for a few minutes is fine. On a port that's always
-  on, the board never knows the car is off: it never switches itself off,
-  and it draws on the car's battery the whole time it's parked.
-- **Battery.** Keep the 18650 fitted. It charges from USB while you drive,
-  and it's what lets the board close its files, upload at home and switch
-  off cleanly once the car's USB power goes. The firmware pauses charging
-  when the power-management chip reports a high or low temperature. That's
-  an indirect estimate, not a measurement of the cell's temperature or a
-  guarantee of safe charging in a hot car, and its calibration was measured
-  on the older T-Beam V1.2; re-measuring it on the Supreme is still to do.
-  Logging carries on while charging is paused.
-- **Antenna.** The GPS antenna needs a view of the sky. The dashboard or
-  the rear shelf works; the glovebox, under a seat or the trunk doesn't.
-- **WiFi range.** The board uploads from wherever you park, so your
-  2.4 GHz WiFi has to reach that spot. A phone on the same network,
-  standing where the car parks, is a quick test.
-- **Switching off and on.** The board switches on by itself when the car's
-  USB port comes on. Once that power has been gone for 10 seconds, it ends
-  the trip, stays on battery for 10 minutes to upload (up to 16 minutes more
-  if an upload is still running), then switches itself off completely. Unplugged from USB, on your desk say, it does the same:
-  10 minutes, then off. It hasn't died; plug USB back in, or press
-  **POWER** for about a second, to switch it on. On battery, holding
-  **POWER** for a second or two (let go well before 6 s) switches it off
-  cleanly. **With USB plugged in, that press is ignored**, because USB
-  power only switches the board on at the moment it arrives: a board
-  switched off with USB still in would stay off until the car's port next
-  went off and on. Holding **POWER** for 6 s cuts power without closing
-  anything first; use it only if the board stops responding.
-  [firmware/README.md](firmware/README.md#stage-4-the-trip-logger) has the
-  details.
-
-**Check the installed power setup.** With the battery fitted and Stage 4
-running from the intended car USB port, take another short drive and park
-within home WiFi range. Turn the ignition off and confirm the port loses
-power after any normal delay. Leave the board connected to the car, not
-the laptop: laptop USB power would mask this test. Confirm that the new
-trip reaches the viewer during the battery-powered upload window. On the
-next start, take another short drive and confirm a second trip appears
-after parking. This checks the installed recording and upload path across
-power-off and restart. It doesn't measure how much current the board draws
-while switched off, which still needs a meter.
+Use the [manual server copy](DEPLOY_DEBIAN.md#manual-alternative-copy-server)
+and the [Arduino IDE / arduino-cli source route](firmware/README.md#advanced-build-from-source).
+That route keeps the progressive hardware-test sketches, copying
+`firmware/secrets.h.example` to `firmware/04_trip_logger/secrets.h`, version
+stamping, and the Supreme board/library settings. First flash still requires
+a factory backup and a one-time erase; later uploads keep erase disabled.
 
 ## The data
 

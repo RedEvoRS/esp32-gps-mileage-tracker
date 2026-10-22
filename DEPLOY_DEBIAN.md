@@ -12,11 +12,11 @@ Deploys both services from `server/`:
 This is the server half of the project. The [top-level README](README.md)
 gives the complete setup. The board is the T-Beam Supreme with MAX-M10S
 GPS and a SanDisk 32 GB Max Endurance microSD card. Step 8 covers its
-`secrets.h`, flashing and one-time diagnostics enrollment. The retired
+server-built firmware, flashing and one-time diagnostics enrollment. The retired
 T-Beam V1.2's last firmware and instructions are on the frozen
 [`tbeam-v1.2` branch](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/tree/tbeam-v1.2).
 
-Assumes: Debian 12/13, a non-root user with sudo, SSH reachable.
+Assumes: Debian 13, a non-root user with sudo, SSH reachable.
 Placeholders: `<user>` = your Debian login, `<host>` = server IP or hostname.
 Replace the angle-bracket placeholders before running commands. The server
 SSH login is separate from the viewer login you create below and from the
@@ -27,42 +27,36 @@ numeric user ID **1000** (`id -u`). The installer skips backups for other
 IDs; changing ownership of `data/` alone does not give that login access
 to the private trip files. See Steps 3 and 10 before choosing the account.
 
-## The quick way: `install.sh`
+<a id="the-quick-way-installsh"></a>
 
-Copy `server/` over (Step 2), then on the server, as your normal login
-(not root):
+## The quick way: `setup.sh`
 
-```bash
-bash ~/mileage-tracker/install.sh
-```
+Prepare SSH and Docker in Steps 0–1, then run the release one-liner in
+[Step 2](#step-2--run-setupsh). It downloads and verifies the release,
+runs the existing interactive `install.sh`, and offers to build your
+personal tracker firmware on the server. No source clone is needed.
+The PC connected to the board then runs the flash script from
+[README Step 2](README.md#step-2--flash-the-tracker).
 
-It works through Steps 1 and 3 to 10 below, checking each one, and asks
-for the few things only you can answer: the LAN address to publish the
-ports on, the timezone trips are shown in, a username and password for the
-viewer, where backups should go, and, last, which optional alert and dashboard
-outputs to turn on (none by default; [Step 11](#step-11--optional-device-notifications)
-explains each one). Those optional outputs come after the backups, so a
-problem with one can't hold them up. It uploads `sample.gpx`, logs in to the viewer, finds
-the trip in the list, on its map and in both exports, then deletes it
-again. At the end it prints the lines for the firmware's `secrets.h` (Step 8).
+`install.sh` configures the LAN bind address, timezone, viewer login,
+backups and optional alert/dashboard outputs, and builds/starts the
+services. It tests a sample upload, viewer login, list, map and both
+exports, then removes the sample. It asks for sudo when needed; run
+setup as your normal login. A failure stops the process: fix the reported
+problem and rerun. Existing valid settings are checked and can be kept.
+The rest of this runbook explains those steps and the manual alternatives.
 
-Every question can also be answered in advance with an `INSTALL_` variable
-(for example `INSTALL_DISPLAY_TZ=America/Chicago`), which is how an
-unattended run works. The names are listed where each question is explained.
-
-If something fails, it says what and stops. Fix that and run it again:
-anything already set up is checked and kept, never redone.
-
-To check an install later, after a reboot say, without changing its
-configuration (the check uploads and removes a temporary test trip and
-can test the viewer login):
+To recheck later without changing configuration:
 
 ```bash
 bash ~/mileage-tracker/install.sh --check
 ```
 
-The steps below are what the script does, one at a time. Follow them if
-you'd rather do it by hand, or to understand a step it stopped on.
+This uploads and removes a temporary test trip and can test the viewer
+login; it is not a read-only check. For unattended installs, `setup.sh --yes` skips wrapper prompts **and skips the firmware builder**. The inner
+installer still needs its `INSTALL_*` presets for unanswered questions;
+missing answers fail. See each step for those variables and
+`bash setup.sh --help` for release/local-bundle options.
 
 ---
 
@@ -114,7 +108,7 @@ sudo apt install -y docker-ce docker-ce-cli containerd.io \
 ```
 
 Let your user run Docker without sudo, then **log out and back in** so the
-group change takes effect:
+group change takes effect (Docker group access grants root-level privileges):
 
 ```bash
 sudo usermod -aG docker $USER
@@ -131,7 +125,71 @@ docker compose version      # expect v2 or newer
 
 ---
 
-## Step 2 — Copy the `server/` directory over
+<a id="step-2--copy-the-server-directory-over"></a>
+
+## Step 2 — Run `setup.sh`
+
+**On the server**, in the SSH session from Step 1, run as your normal login:
+
+```bash
+curl -fsSL https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases/latest/download/setup.sh | bash
+```
+
+This executes downloaded code with your account's permissions. Review the
+[download sources and trust note](README.md#setting-it-up); to inspect first:
+
+```bash
+curl -fsSL https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases/latest/download/setup.sh -o setup.sh
+less setup.sh
+bash setup.sh
+```
+
+Docker Engine and Compose v2 must already be usable without sudo (Step 1).
+The wrapper also checks curl, tar, sha256sum and at least 1 GiB of free space;
+allow about 2 GB extra for the firmware builder plus room for trip data.
+The builder image is linux/amd64; other server architectures require Docker
+amd64 emulation (see the [builder README](server/firmware-builder/README.md)).
+
+Setup verifies the bundle against that release's `SHA256SUMS`, shows the
+old/new versions and asks before copying. Server files go directly into
+`~/mileage-tracker/`; firmware sources and the version-stamping tool go in
+`firmware-src/`. Use `bash setup.sh --dir "$HOME/mileage-tracker"` to choose
+a different destination. For the flash helpers, use a simple absolute path
+or `~/` path without spaces, and an SSH hostname or IPv4 address.
+It then runs `install.sh` to configure, rebuild,
+start and verify the services. Choose the **LAN IP for `BIND_ADDR`**: UFW
+does not filter Docker-published ports; see [Step 7](#step-7--firewall-and-network).
+Backups and optional notification outputs are explained in Steps 10–11.
+
+Accept the firmware-build offer to continue to the board. The builder asks
+before a first ~1–2 GB toolchain download (cached for later builds), prompts
+for WiFi settings, device ID and server address/port, and reads the upload
+token from `.env`. For a new device it reads the server's diagnostics
+revision and asks you to confirm fresh SD state and an unused board
+enrollment ID. Only when those checks permit it does it build enrollment
+and cleanup images; database errors stop the build. It does not automate
+recovery of a used board/card. See [Step 8](#step-8--point-the-firmware-at-it).
+
+`firmware-out/current/` is the image to flash; `firmware-out/cleanup/` is
+created alongside a first-enrollment image. Directories are owner-only
+0700 and files 0600 because the binaries contain the **WiFi password and
+upload token**. Do not share them or store unrelated files in `firmware-out/`.
+If you skip the build, run it later on the server:
+
+```bash
+bash ~/mileage-tracker/firmware-builder/build.sh --install-dir ~/mileage-tracker
+```
+
+After setup succeeds, Steps 3–6 and 9 have been performed by the installer;
+review the network binding in Step 7, flash/check the board in Step 8, and
+verify your backup and notification choices in Steps 10–11.
+
+### Manual alternative: copy `server/`
+
+This is the source-build route. Copying only `server/` does not provide the
+`firmware-src/` bundle needed by the builder; build the firmware locally
+using the [advanced firmware guide](firmware/README.md#advanced-build-from-source),
+or use setup above to install both pieces.
 
 Run the copy **on your computer**, where you cloned or unzipped the repo.
 If you are still in the SSH session from Step 1, type `exit` first to
@@ -226,6 +284,41 @@ works with no internet except OSM map tiles).
 > `scp server/.dockerignore <user>@<host>:~/mileage-tracker/`
 > Run that copy from your computer in a separate local terminal, not from
 > the server's SSH session.
+
+---
+
+## Updating
+
+Before updating, take a backup and verify its destination using
+[Step 10](#step-10--backups). On the server rerun the Step 2 one-liner to get
+the latest release, selecting the same install directory (`--dir` if
+nondefault). Setup shows the old/new versions, copies the supplied source,
+and runs `install.sh` to rebuild, start and verify the server. The wrapper
+excludes `.env`, `viewer.env`, `monitor.env`, `backup/backup.conf`, `data/`
+and `firmware-out/` from the source copy. It does **not remove obsolete
+source files**; review local source changes/obsolete files before updating.
+The installer may still change configuration when you answer its prompts.
+
+Accept the firmware-build prompt and enter/confirm the WiFi/device settings
+again; settings are not saved for reuse by the builder. A successful build
+replaces its output, and a normal build removes stale cleanup images.
+Finish a pending enrollment cleanup before rebuilding. Then run the printed
+flash command on your PC, without `-FirstInstall` / `--first-install`, and
+answer **no** to first install. App-only updates preserve settings and trips.
+Always update the server before installing newer firmware.
+
+For a specific release, download that release's `setup.sh` rather than
+`latest`, or run a saved script with `--tag '<tag>'`. A saved script defaults
+to its stamped release, not whatever is latest later. For offline source
+copying, `--bundle <file>` requires an adjacent `SHA256SUMS`; the installer
+and builder still need dependencies. A checkout's unstamped `install/setup.sh`
+requires `--tag` or `--bundle`. These options are described by `--help`.
+
+The manual source route is to repeat the commit archive copy in Step 2,
+then run `bash ~/mileage-tracker/install.sh` on the server to rebuild/check.
+For release installs, keep the published version stamps; the version bump
+and deployment-tag instructions below apply to maintainers deploying source
+changes.
 
 ---
 
@@ -364,8 +457,9 @@ workers, which is why it's configured rather than generated at startup.
 ### Server version for each deployment
 
 The server release is `server/VERSION` (`v0.01` initially), independent of the
-ESP32 firmware version. Before each build deployed to the real server, bump
-that file in its own commit, using `v<major>.<two-digit minor>` (major 0-99).
+ESP32 firmware version. Release users keep the published version. For
+maintainer source deployments, bump that file in its own commit before each
+build deployed to the real server, using `v<major>.<two-digit minor>` (major 0-99).
 Build from the clean commit; after verifying deployment, tag that exact commit
 `srv-v0.NN`, for example `srv-v0.02` for release `v0.02` (`srv-v0.01` for the
 initial release). These tags identify server releases separately from firmware.
@@ -593,6 +687,27 @@ the tracker is published. Use the LAN IP for any curl tests from here on.
 
 ## Step 8 — Point the firmware at it
 
+For the primary route, the builder in Step 2 has already read the upload
+token and built the server address and WiFi settings into the firmware.
+Exit SSH and use the printed flash command **on the PC connected by USB**;
+see [README Step 2](README.md#step-2--flash-the-tracker) and the
+[full flash guide](firmware/README.md#flash-from-the-server-build).
+First install verifies a factory backup, requires typing `ERASE`, erases
+all internal flash and writes four parts. Updates are app-only; do not
+choose first install for an existing tracker.
+
+For a fresh device/card with no saved server snapshot revision, the builder
+prepares one-use enrollment values and a separate cleanup image. After the
+first newly received **current snapshot** in Device health, run the flash
+script with `-Cleanup` (Windows) / `--cleanup` (macOS/Linux), before another
+server build. This removes enrollment values with an app-only flash. A
+listed device or GPX contact alone is insufficient. Reused cards/boards,
+lost metadata or snapshot conflicts need
+[diagnostics recovery](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery);
+do not answer the builder's new-device questions as if they were fresh.
+
+### Advanced: local firmware settings
+
 **On your computer**, create the firmware's settings file from the
 example. If you are still in the server's SSH session, type `exit` first.
 If `secrets.h` already exists, edit it instead of overwriting it with the example.
@@ -619,7 +734,7 @@ to paste. The WiFi has to be 2.4 GHz, and hidden networks won't work.
 
 Build and flash `firmware/04_trip_logger` for the **T-Beam Supreme**,
 using **ESP32S3 Dev Module**, ESP32 core **3.3.11**, and the libraries and
-board settings in the [full flashing walkthrough](README.md#3-flash-the-firmware).
+board settings in the [source-build walkthrough](firmware/README.md#advanced-build-from-source).
 The equivalent arduino-cli board identifier (FQBN) is:
 
 ```text
@@ -646,7 +761,8 @@ internal trips, so back up existing data before using it again.
 
 ### One-time diagnostics enrollment
 
-Before the first boot with diagnostics enrollment enabled, read the
+For a manual source build on a fresh board/card, before the first boot
+with diagnostics enrollment enabled, read the
 server's saved snapshot revision for this `DEVICE_ID`. A snapshot describes
 the board's current conditions; the server accepts a newer revision so an
 old upload cannot replace newer state. **Run this command on the server**,
@@ -676,6 +792,9 @@ must be positive and **greater than every ID previously used on this
 board**; use a higher value if needed. `ULL` marks an unsigned long long
 integer in C++. The firmware consumes the ID in NVS before restoring the
 snapshot revision on the SD card, so even a failed attempt needs a higher ID.
+For any reused card or recovery, also read the SD stored revision and follow
+[the recovery procedure](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery);
+the server value alone is not a safe recovery bound.
 
 After the **first successful diagnostics upload**, check the viewer's
 **Device health** page for the board's contact and a current snapshot.
@@ -711,8 +830,8 @@ Uploads with debug mode off and server-down retry were also verified on
 after ingest restarted deleted the local file. LittleFS uploads and server
 errors (401/413/5xx) remain untested on the Supreme.
 
-Then follow [README step 4: Check it works](README.md#4-check-it-works)
-and [step 5: Put it in the car](README.md#5-put-it-in-the-car). If storage
+Then follow the firmware guide's [recording and upload checks](firmware/README.md#check-recording-and-uploads)
+and [car installation](firmware/README.md#put-it-in-the-car). If storage
 fails on a board that has already logged trips, use the firmware guide's
 [storage recovery steps](firmware/README.md#if-the-trip-storage-wont-mount-later)
 to preserve the data before considering an erase.
