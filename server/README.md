@@ -586,7 +586,7 @@ English names (`accept-language=en`).
 
 Suggestions are formatted as a standard address, not the provider's long
 `display_name`. In the US that is `<house number> <road>, <city>, <ST> <postcode>`,
-for example `123 Example Road, Sampletown, CA 90000`, with the two-letter state.
+for example `123 Example Road, Sampletown, ST 00000`, with the two-letter state.
 A business or airport name goes first when the provider returns one. Elsewhere the
 state and country are spelled out. Neighbourhood, suburb and county names are always
 left out, and so is the country for US addresses. Any part the provider doesn't

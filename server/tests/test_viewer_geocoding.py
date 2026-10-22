@@ -169,9 +169,9 @@ class EndpointPlaceTests(unittest.TestCase):
     def test_address_formatted_as_standard_address(self):
         us = {"country_code": "us", "house_number": "123", "road": "Example Road",
               "quarter": "Q Quarter", "suburb": "Sub Suburb", "city": "Sampletown",
-              "county": "Sample County", "state": "Examplestate", "ISO3166-2-lvl4": "US-CA",
-              "postcode": "90000", "country": "United States"}
-        full = "123 Example Road, Sampletown, CA 90000"
+              "county": "Sample County", "state": "Examplestate", "ISO3166-2-lvl4": "US-ZZ",
+              "postcode": "00000", "country": "United States"}
+        full = "123 Example Road, Sampletown, ZZ 00000"
         self.assertEqual(self.label_for({
             "display_name": "ignored", "name": "", "address": us}), full)
         # Name only when distinct from house number, road and city.
@@ -182,20 +182,20 @@ class EndpointPlaceTests(unittest.TestCase):
         self.assertEqual(self.label_for({"name": 5, "address": us}), full)
         no_number = {k: v for k, v in us.items() if k != "house_number"}
         self.assertEqual(self.label_for({"address": no_number}),
-                         "Example Road, Sampletown, CA 90000")
-        for bad in ({"ISO3166-2-lvl4": None}, {"ISO3166-2-lvl4": "CA"},
-                    {"ISO3166-2-lvl4": "US-C1"}, {"ISO3166-2-lvl4": "US-CAL"}):
+                         "Example Road, Sampletown, ZZ 00000")
+        for bad in ({"ISO3166-2-lvl4": None}, {"ISO3166-2-lvl4": "ZZ"},
+                    {"ISO3166-2-lvl4": "US-C1"}, {"ISO3166-2-lvl4": "US-ZZZ"}):
             self.assertEqual(self.label_for({"address": {**us, **bad}}),
-                             "123 Example Road, Sampletown, Examplestate 90000")
+                             "123 Example Road, Sampletown, Examplestate 00000")
         missing = {k: v for k, v in us.items() if k != "ISO3166-2-lvl4"}
         self.assertEqual(self.label_for({"address": missing}),
-                         "123 Example Road, Sampletown, Examplestate 90000")
+                         "123 Example Road, Sampletown, Examplestate 00000")
         town = {k: v for k, v in us.items() if k != "city"} | {"town": "Sampleton"}
-        self.assertEqual(self.label_for({"address": town}), "123 Example Road, Sampleton, CA 90000")
+        self.assertEqual(self.label_for({"address": town}), "123 Example Road, Sampleton, ZZ 00000")
         no_post = {k: v for k, v in us.items() if k != "postcode"}
-        self.assertEqual(self.label_for({"address": no_post}), "123 Example Road, Sampletown, CA")
+        self.assertEqual(self.label_for({"address": no_post}), "123 Example Road, Sampletown, ZZ")
         self.assertEqual(self.label_for({"address": {**us, "city": " ", "village": "Samplevale"}}),
-                         "123 Example Road, Samplevale, CA 90000")
+                         "123 Example Road, Samplevale, ZZ 00000")
 
     def test_non_us_address_includes_country(self):
         address = {"country_code": "gb", "house_number": "7", "road": "Example Road",
@@ -213,12 +213,12 @@ class EndpointPlaceTests(unittest.TestCase):
                      {"display_name": shown, "address": "text"},
                      {"display_name": shown, "address": []},
                      {"display_name": shown, "address": {}},
-                     {"display_name": shown, "address": {"state": "Examplestate", "postcode": "90000"}},
+                     {"display_name": shown, "address": {"state": "Examplestate", "postcode": "00000"}},
                      {"display_name": shown, "address": {"road": 5, "city": ["Sampletown"], "house_number": 1}}):
             self.assertEqual(self.label_for(body), "Invented workshop, Example Road")
         self.assertEqual(self.label_for({"address": {
             "country_code": "us", "road": "Example Road", "house_number": 9,
-            "city": "Sampletown", "state": 4, "postcode": 90000}}),
+            "city": "Sampletown", "state": 4, "postcode": 12345}}),
             "Example Road, Sampletown")
         # Built labels still obey the label validation.
         for address in ({"road": "a\nb", "city": "Sampletown"}, {"road": "x" * 1001}):
