@@ -19,7 +19,8 @@
 #   Preflight       files, sudo, UID
 #   Docker          packages and Docker Engine (Step 1)
 #   Configuration   data/, .env, viewer.env (Steps 3, 4a, 4b, 7)
-#   Start           build, viewer login, start, wait for healthy (Step 5)
+#   Start           build, admin login, optional everyday login, start,
+#                   wait for healthy (Step 5)
 #   End to end      upload sample.gpx, find it in the viewer and the
 #                   exports, then delete it again (Steps 6, 7)
 #   Reboots         Docker comes back with the network (Step 9)
@@ -62,7 +63,10 @@ DOCKER=(docker)     # becomes sudo-prefixed if this session can't use Docker
 AS_ME=()            # runs a command as $ME with fresh group membership
 DATA_SUDO=()        # sudo, if trip files (UID 1000) aren't ours to touch
 BIND_ADDR=
-VIEWER_PASSWORD=
+VIEWER_PASSWORD=    # the admin's password, when entered during this run
+EVERYDAY_USER=      # an everyday login made by this run, and its password
+EVERYDAY_PASSWORD=  # (only kept for the login test; never written anywhere)
+EVERYDAY_LOGINS=()  # labels of all everyday logins, from list_everyday
 RELOGIN=no
 FIRST_BACKUP=no     # yes once this run has made the first backup
 SUDO_READY=no
@@ -869,7 +873,7 @@ dhcp_reminder() {
 }
 
 # viewer.env needs to exist before Compose will do anything, even build.
-# The login itself is set after the build (setup_viewer_login), because
+# The admin login itself is set after the build (setup_viewer_login), because
 # the password hash is made with the viewer image's own werkzeug.
 setup_viewer_env() {
     if [[ ! -f viewer.env ]]; then
@@ -917,9 +921,9 @@ setup_viewer_env() {
 
     if [[ $MODE == check ]]; then
         if viewer_login_set; then
-            ok "The viewer login is set up for $(env_raw viewer.env VIEWER_USERNAME)"
+            ok "The admin login is set up for $(env_raw viewer.env VIEWER_USERNAME)"
         else
-            problem "The viewer login in viewer.env isn't set up" \
+            problem "The admin login in viewer.env isn't set up" \
                 "Run install.sh to set it, or see DEPLOY_DEBIAN.md Step 4b."
         fi
     fi
@@ -956,7 +960,7 @@ viewer_login_set() {
 new_password() {
     local again
     while :; do
-        ask_secret VIEWER_PASSWORD VIEWER_PASSWORD "Viewer password (at least 8 characters)"
+        ask_secret VIEWER_PASSWORD VIEWER_PASSWORD "Admin password (at least 8 characters)"
         if (( ${#VIEWER_PASSWORD} < 8 )); then
             if [[ -n ${INSTALL_VIEWER_PASSWORD+set} ]]; then
                 die "INSTALL_VIEWER_PASSWORD is shorter than 8 characters."
@@ -982,21 +986,23 @@ setup_viewer_login() {
     local user hash errors
     user=$(env_raw viewer.env VIEWER_USERNAME)
     if viewer_login_set; then
-        if confirm KEEP_LOGIN "The viewer login for $user is already set up. Keep it?" y; then
-            ok "Kept the viewer login for $user"
+        if confirm KEEP_LOGIN "The admin login for $user is already set up. Keep it?" y; then
+            ok "Kept the admin login for $user"
             return 0
         fi
     fi
 
-    note "Choose a username and password for the web viewer. Only a scrypt hash of" \
-        "the password is stored."
+    note "Choose a username and password for the web viewer's admin login. This is the" \
+        "maintainer's login (it removes trips and manages logins), so it lives in" \
+        "viewer.env, and only a scrypt hash of the password is stored. The login for" \
+        "everyday use comes next."
     # Suggest the name already in viewer.env, unless it's just the example's.
-    local default=$ME
+    local default=admin
     if username_ok "$user" && [[ $user != "$(env_raw viewer.env.example VIEWER_USERNAME)" ]]; then
         default=$user
     fi
     while :; do
-        ask user VIEWER_USER "Viewer username" "$default"
+        ask user VIEWER_USER "Admin username" "$default"
         if username_ok "$user"; then break; fi
         if [[ -n ${INSTALL_VIEWER_USER+set} ]]; then die "INSTALL_VIEWER_USER=$user isn't a usable username."; fi
         note "Use letters, digits and . _ @ - only."
@@ -1013,7 +1019,138 @@ setup_viewer_login() {
     hash_ok "$hash" || die "The password hash came out in an unexpected format."
     env_set viewer.env VIEWER_USERNAME "$user"
     env_set viewer.env VIEWER_PASSWORD_HASH "'$hash'"
-    ok "Viewer login set for $user"
+    ok "Admin login set for $user"
+}
+
+# --- Everyday login ----------------------------------------------------
+
+# Run manage_users.py inside the viewer image. This works before the
+# services start (the image and the viewer-db volume are enough; the script
+# creates its table on first use), and it's how the everyday logins are
+# made. Passwords go in on stdin, never as arguments or environment.
+manage_users() {
+    compose run --rm --no-deps -T mileage-viewer python manage_users.py "$@"
+}
+
+# Is there someone to ask? Tests replace this.
+have_terminal() { [[ -t 0 ]]; }
+
+# list_everyday running|image [errors-file]: fill EVERYDAY_LOGINS with one
+# label per everyday login, "name" or "name (disabled)". "running" asks the
+# running viewer; "image" starts a one-off container, so it also works
+# before the services start. Fails if the list can't be had.
+list_everyday() {
+    local how=$1 out name state
+    EVERYDAY_LOGINS=()
+    if [[ $how == running ]]; then
+        out=$(compose exec -T mileage-viewer python manage_users.py list < /dev/null 2> /dev/null) || return 1
+    else
+        out=$(manage_users list < /dev/null 2> "$2") || return 1
+    fi
+    while IFS=$'\t' read -r name state; do
+        [[ -n $name ]] || continue
+        if [[ $state == disabled ]]; then
+            EVERYDAY_LOGINS+=("$name (disabled)")
+        else
+            EVERYDAY_LOGINS+=("$name")
+        fi
+    done <<< "$out"
+}
+
+# The everyday logins as "a, b".
+everyday_text() {
+    local text='' item
+    for item in "${EVERYDAY_LOGINS[@]}"; do text+="${text:+, }$item"; done
+    printf '%s' "$text"
+}
+
+# Optional: a second login for whoever annotates trips day to day. It can't
+# remove trips or manage logins, so the admin's password isn't shared around.
+setup_everyday_login() {
+    local errors question="Add an everyday login for the person who'll annotate trips?" default=y
+    errors=$(mktemp)
+    TMP_FILES+=("$errors")
+    if ! list_everyday image "$errors"; then
+        indent < "$errors"
+        die "Couldn't list the everyday logins (output above)." \
+            "The viewer image should contain manage_users.py; rebuild it: docker compose build"
+    fi
+    note "An everyday login is for whoever annotates trips. It can't remove trips or" \
+        "manage logins; the admin does that on the viewer's /admin page, where more" \
+        "everyday logins can be added or turned off later."
+    if (( ${#EVERYDAY_LOGINS[@]} )); then
+        ok "Everyday logins already set up, and kept: $(everyday_text)"
+        question="Add another everyday login?"
+        default=n
+    fi
+    # An optional step must never fail an unattended install: with nobody to
+    # ask and no preset, skip it.
+    if [[ -z ${INSTALL_ADD_EDITOR+set} ]] && ! have_terminal; then
+        note "Skipped adding an everyday login: there's no terminal to ask in." \
+            "Add one on the viewer's /admin page, or run install.sh again with" \
+            "INSTALL_ADD_EDITOR=y INSTALL_EDITOR_USER=... INSTALL_EDITOR_PASSWORD=..."
+        return 0
+    fi
+    if confirm ADD_EDITOR "$question" "$default"; then
+        add_everyday_login "$errors"
+        list_everyday image "$errors" || true
+    else
+        note "No everyday login added."
+    fi
+}
+
+# add_everyday_login errors-file
+add_everyday_login() {
+    local errors=$1 admin user pw rc
+    admin=$(env_raw viewer.env VIEWER_USERNAME)
+    while :; do
+        while :; do
+            ask user EDITOR_USER "Everyday username"
+            if username_ok "$user" && [[ ${user,,} != "${admin,,}" ]]; then break; fi
+            if [[ -n ${INSTALL_EDITOR_USER+set} ]]; then
+                die "INSTALL_EDITOR_USER=$user isn't a usable username." \
+                    "Use letters, digits and . _ @ - only, and not the admin's name ($admin)."
+            fi
+            note "Use letters, digits and . _ @ - only, and not the admin's name ($admin)."
+        done
+        while :; do
+            ask_new_secret pw EDITOR_PASSWORD "Everyday password (at least 8 characters)" 8
+            if (( ${#pw} <= 1024 )); then break; fi
+            if [[ -n ${INSTALL_EDITOR_PASSWORD+set} ]]; then
+                die "INSTALL_EDITOR_PASSWORD is longer than 1024 characters."
+            fi
+            note "That's too long; use at most 1024 characters."
+        done
+
+        rc=0
+        printf '%s' "$pw" | manage_users add "$user" > /dev/null 2> "$errors" || rc=$?
+        case $rc in
+            0)
+                ok "Everyday login added for $user"
+                # Kept for the login test only; it was made by this run.
+                EVERYDAY_USER=$user
+                EVERYDAY_PASSWORD=$pw
+                return 0
+                ;;
+            5)
+                note "An everyday login named $user already exists, so it was kept as it is" \
+                    "(its password wasn't changed). Reset it on the viewer's /admin page."
+                return 0
+                ;;
+            3)
+                indent < "$errors"
+                if [[ -n ${INSTALL_EDITOR_USER+set} || -n ${INSTALL_EDITOR_PASSWORD+set} ]]; then
+                    die "The viewer turned down the everyday login for $user (output above)." \
+                        "Check INSTALL_EDITOR_USER and INSTALL_EDITOR_PASSWORD."
+                fi
+                note "The viewer turned that down. Try again."
+                ;;
+            *)
+                indent < "$errors"
+                die "Couldn't create the everyday login for $user (output above)."
+                ;;
+        esac
+    done
 }
 
 # Fail early if something else already listens where a port has to go.
@@ -1320,13 +1457,17 @@ verify_end_to_end() {
     user=$(env_raw viewer.env VIEWER_USERNAME)
     if [[ -z $VIEWER_PASSWORD ]]; then
         ask_secret VIEWER_PASSWORD VIEWER_PASSWORD \
-            "Viewer password for $user, to test logging in (Enter to skip)" optional
+            "Admin password for $user, to test logging in (Enter to skip)" optional
     fi
     if [[ -n $VIEWER_PASSWORD ]]; then
         verify_viewer "$user" || true
     else
         warn "Skipped the login test" "Log in at $VIEWER_URL/ from a browser to check it."
     fi
+    if [[ -n $EVERYDAY_PASSWORD ]]; then
+        verify_everyday_login "$EVERYDAY_USER" || true
+    fi
+    if [[ $MODE == check ]]; then report_everyday_logins; fi
 
     if remove_test_trip; then
         ok "Deleted the test trip"
@@ -1354,9 +1495,9 @@ verify_viewer() {
         --data-urlencode "csrf_token=$csrf" --data-urlencode "username=$user" \
         --data-urlencode "password@-" "$VIEWER_URL/login") || code=000
     case $code in
-        302\ *) ok "Logged in to the viewer as $user" ;;
+        302\ *) ok "Logged in to the viewer as the admin, $user" ;;
         401*)
-            problem "The viewer turned down that password for $user" \
+            problem "The viewer turned down that password for the admin login $user" \
                 "To set a new one, run install.sh and answer n to keeping the login."
             return 1
             ;;
@@ -1410,6 +1551,78 @@ verify_viewer() {
         ok "Logging out works"
     else
         problem "Logging out of the viewer didn't work (HTTP $code)"
+    fi
+}
+
+# Log in as the everyday login this run created, with a cookie jar of its
+# own: it must see the trip list, and /admin must refuse it. One login
+# attempt, because the lockout counts failures per IP address.
+verify_everyday_login() {
+    local user=$1 jar file page csrf code
+    jar=$(mktemp)
+    file=$(mktemp)
+    TMP_FILES+=("$jar" "$file")
+
+    page=$(curl -s -m 10 -c "$jar" -b "$jar" "$VIEWER_URL/login") || page=
+    csrf=$(csrf_from "$page")
+    code=$(printf '%s' "$EVERYDAY_PASSWORD" | curl -s -m 30 -o /dev/null \
+        -w '%{http_code} %{redirect_url}' -c "$jar" -b "$jar" \
+        --data-urlencode "csrf_token=$csrf" --data-urlencode "username=$user" \
+        --data-urlencode "password@-" "$VIEWER_URL/login") || code=000
+    case $code in
+        302\ *) ok "Logged in to the viewer as the everyday login $user" ;;
+        401*)
+            problem "The viewer turned down the password for the everyday login $user" \
+                "It was created a moment ago. Reset it on the admin page ($VIEWER_URL/admin)."
+            return 1
+            ;;
+        429*)
+            problem "The viewer has locked this server out after too many wrong passwords" \
+                "Wait 15 minutes, or clear it ('Locked out of the viewer' in DEPLOY_DEBIAN.md)."
+            return 1
+            ;;
+        *)
+            problem "Logging in to the viewer as the everyday login $user failed (HTTP ${code%% *})"
+            return 1
+            ;;
+    esac
+
+    code=$(http_fetch "$file" -b "$jar" "$VIEWER_URL/")
+    if [[ $code == 200 ]]; then
+        ok "The everyday login sees the trip list"
+    else
+        problem "The trip list didn't load for the everyday login $user (HTTP $code)" \
+            "Its log: docker compose logs mileage-viewer"
+    fi
+    code=$(http_status -b "$jar" "$VIEWER_URL/admin")
+    if [[ $code == 403 ]]; then
+        ok "The admin page refuses the everyday login (403)"
+    elif [[ $code == 200 ]]; then
+        problem "The everyday login $user could open the admin page" \
+            "Only the admin may. Its log: docker compose logs mileage-viewer"
+    else
+        problem "The admin page answered the everyday login $user with HTTP $code instead of 403"
+    fi
+
+    # Leave no session behind. Logging out was already checked for the admin.
+    page=$(cat "$file")
+    csrf=$(csrf_from "$page")
+    curl -s -m 10 -o /dev/null -c "$jar" -b "$jar" \
+        --data-urlencode "csrf_token=$csrf" "$VIEWER_URL/logout" || true
+}
+
+# --check: say which everyday logins exist. Information only, never a
+# problem; if the viewer isn't running, another check says so.
+report_everyday_logins() {
+    [[ $(container_state mileage-viewer) == running ]] || return 0
+    if ! list_everyday running; then
+        note "Couldn't list the everyday logins. If this install predates them," \
+            "run install.sh to rebuild the viewer."
+    elif (( ${#EVERYDAY_LOGINS[@]} )); then
+        ok "Everyday logins: $(everyday_text)"
+    else
+        note "No everyday logins yet. The admin adds them on the admin page:" \
+            "$VIEWER_URL/admin"
     fi
 }
 
@@ -2881,7 +3094,16 @@ summary() {
 
     local host=${BIND_ADDR:-$(default_addr)}
     printf '%sThe server is installed and working.%s\n' "$GREEN" "$PLAIN"
-    printf 'The viewer is at http://%s:8091/\n\n' "${host:-<this server>}"
+    local admin
+    admin=$(env_raw viewer.env VIEWER_USERNAME)
+    printf 'The viewer is at http://%s:8091/\n' "${host:-<this server>}"
+    printf 'The admin login is %s (kept in %s/viewer.env).\n' "${admin:-the one in viewer.env}" "$SCRIPT_DIR"
+    if (( ${#EVERYDAY_LOGINS[@]} )); then
+        printf 'Everyday logins: %s\n' "$(everyday_text)"
+    else
+        printf 'There are no everyday logins yet.\n'
+    fi
+    printf 'The admin adds, turns off and resets everyday logins at http://%s:8091/admin\n\n' "${host:-<this server>}"
     printf 'The upload token is INGEST_AUTH_TOKEN in %s/.env; keep it private.\n\n' "$SCRIPT_DIR"
     # setup.sh installs this bundle before invoking us. It also identifies
     # release installs when install.sh is rerun directly, without the wrapper.
@@ -2947,6 +3169,7 @@ main() {
         ask_root_options
         build_images
         setup_viewer_login
+        setup_everyday_login
         start_services
     else
         section "Services"
