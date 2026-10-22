@@ -775,10 +775,10 @@ matching trip and won't appear in exports.)
 
 Both services are **LAN-only by design**. Ingest has a bearer token; the
 viewer has admin and everyday session logins, with roles checked by the
-server. Neither is safe to port-forward: the admin session cookie and ingest
-token travel over plain HTTP, so anyone who can observe the traffic can read
-or replay them. The logins are defence in depth against other devices on your
-network, not a substitute for TLS.
+server. Neither is safe to port-forward: all viewer session cookies (admin and
+everyday) and the ingest token travel over plain HTTP, so anyone who can observe
+the traffic can read or replay them. The logins are defence in depth against
+other devices on your network, not a substitute for TLS.
 
 **Give the server a static IP or DHCP reservation first.** The T-Beam
 has the upload address compiled in, so a lease change silently breaks

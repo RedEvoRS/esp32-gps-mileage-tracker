@@ -412,8 +412,14 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 - Viewer auth: `viewer.env` holds the admin `VIEWER_USERNAME`, scrypt
   `VIEWER_PASSWORD_HASH` and `VIEWER_SECRET_KEY`; rerun `install.sh` to change
   the admin password. Everyday password hashes are in the `users` table in
-  `annotations.db`. `ENDPOINT_ROLES` is checked server-side on every request;
-  undeclared endpoints are denied.
+  `annotations.db`. Keep `viewer.env` separate from `.env`: it keeps
+  `INGEST_AUTH_TOKEN` out of the viewer, and its single-quoted hash survives
+  Compose interpolation. Everything except `/health` and `/login` requires a
+  session. Sessions carry HMAC tags. The admin's tag is an HMAC of the
+  `viewer.env` password hash, so a new hash logs the admin out; an everyday
+  login's tag covers its username, hash and `session_version`, so reset,
+  disable, enable or remove logs it out at once. `ENDPOINT_ROLES` is checked
+  server-side on every request; undeclared endpoints are denied.
   `manage_users.py` manages everyday accounts. CSRF on POSTs; 5 failures locks
   an IP for 15 min via shared SQLite `login_attempts`. App fail-fasts if auth
   config is missing or the admin hash lost its `$` chars.

@@ -39,8 +39,10 @@ The ingest service (port 8090) requires the `INGEST_AUTH_TOKEN` bearer token
 (a shared upload secret) for trip and diagnostics uploads. The viewer (8091)
 has an admin login in `viewer.env` and everyday logins in `annotations.db`.
 The admin can remove or restore trips, manage logins, review and close years;
-everyday logins can browse, annotate and export trips. The server checks the
-current role on each request. Every private endpoint declares its permitted
+everyday logins can browse the trip list and map, annotate trips, look up
+places, merge and undo merges, export CSV and XLSX, view Device health, and
+change their own password. The server checks the current role on each request.
+Every private endpoint declares its permitted
 roles; undeclared endpoints are denied. Passwords are stored as hashes. These controls
 help keep casual LAN users without credentials from uploading data or viewing
 trips. The viewer checks cross-site request forgery (CSRF) tokens as before,
