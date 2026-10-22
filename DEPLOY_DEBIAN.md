@@ -19,7 +19,7 @@ T-Beam V1.2's last firmware and instructions are on the frozen
 Assumes: Debian 13, a non-root user with sudo, SSH reachable.
 Placeholders: `<user>` = your Debian login, `<host>` = server IP or hostname.
 Replace the angle-bracket placeholders before running commands. The server
-SSH login is separate from the viewer login you create below and from the
+SSH login is separate from the viewer's admin and everyday logins and from the
 upload token the board uses.
 
 For the supplied automatic backups, the server login currently needs
@@ -38,10 +38,11 @@ personal tracker firmware on the server. No source clone is needed.
 The PC connected to the board then runs the flash script from
 [README Step 2](README.md#step-2--flash-the-tracker).
 
-`install.sh` configures the LAN bind address, timezone, viewer login,
-backups and optional alert/dashboard outputs, and builds/starts the
-services. It tests a sample upload, viewer login, list, map and both
-exports, then removes the sample. It asks for sudo when needed; run
+`install.sh` configures the LAN bind address, timezone, admin login, optional
+everyday login, backups and optional alert/dashboard outputs, and builds/starts
+the services. It tests a sample upload, admin login, list, map and both
+exports, then removes the sample. It also tests the everyday login when that
+login is added during this run and its password is supplied. It asks for sudo when needed; run
 setup as your normal login. A failure stops the process: fix the reported
 problem and rerun. Existing valid settings are checked and can be kept.
 The rest of this runbook explains those steps and the manual alternatives.
@@ -51,7 +52,8 @@ next by `setup.sh` (or the command to run it later), then README Steps 2–3
 for flashing on the PC, the first drive, Device health and the one-time
 cleanup flash. Manual source installs get `secrets.h` guidance instead.
 The summary identifies `INGEST_AUTH_TOKEN` in the install directory's `.env`
-without printing its value.
+without printing its value. It names the admin login, lists everyday logins
+when present, and points to `/admin` to manage them.
 
 To recheck later without changing configuration:
 
@@ -59,8 +61,9 @@ To recheck later without changing configuration:
 bash ~/mileage-tracker/install.sh --check
 ```
 
-This uploads and removes a temporary test trip and can test the viewer
-login; it is not a read-only check. For unattended installs, `setup.sh --yes` skips wrapper prompts **and skips the firmware builder**. The inner
+This uploads and removes a temporary test trip and can test the admin login;
+when the viewer is running, it lists everyday login names for information.
+It is not a read-only check. For unattended installs, `setup.sh --yes` skips wrapper prompts **and skips the firmware builder**. The inner
 installer still needs its `INSTALL_*` presets for unanswered questions;
 missing answers fail. The base presets are:
 
@@ -68,9 +71,18 @@ missing answers fail. The base presets are:
   bind address. `all` deliberately publishes on every interface.
 - `INSTALL_DISPLAY_TZ`: an IANA timezone such as `Europe/London`, needed if
   `.env` has no valid zone.
-- `INSTALL_VIEWER_USER` and `INSTALL_VIEWER_PASSWORD`: the new viewer login,
+- `INSTALL_VIEWER_USER` and `INSTALL_VIEWER_PASSWORD`: the admin login,
   needed on first install or when replacing it. The password must have at
-  least eight characters. A supplied password also tests the login.
+  least eight characters. A supplied password also tests the admin login.
+- `INSTALL_ADD_EDITOR=y` or `n`: whether to add an optional everyday login.
+  With an existing everyday login, the installer keeps it and defaults to
+  not adding another. With no terminal and no preset, this optional step is
+  skipped.
+- `INSTALL_EDITOR_USER` and `INSTALL_EDITOR_PASSWORD`: the username and
+  password for the everyday login when adding one. The password must have at
+  least eight characters; a preset password is used to test that login too.
+  If the username already exists, the installer keeps that login and does not
+  change its password.
 - `INSTALL_WAIT_ONLINE=y` or `n`: answers whether to make Docker wait for the
   network at boot, if the installer finds a supported network-wait service
   that is not already configured.
@@ -95,10 +107,10 @@ history. Sudo must already work without a prompt for the unattended run
 (for example, authenticate with `sudo -v` in this shell first):
 
 ```bash
-read -rs -p 'Viewer password (at least 8 characters): ' VIEWER_PASSWORD; echo
+read -rs -p 'Admin password (at least 8 characters): ' VIEWER_PASSWORD; echo
 env INSTALL_BIND_ADDR='<host>' \
   INSTALL_DISPLAY_TZ=Europe/London \
-  INSTALL_VIEWER_USER='<viewer-user>' \
+  INSTALL_VIEWER_USER='<admin>' \
   INSTALL_VIEWER_PASSWORD="$VIEWER_PASSWORD" \
   INSTALL_WAIT_ONLINE=y \
   INSTALL_BACKUPS=n \
@@ -108,7 +120,7 @@ unset VIEWER_PASSWORD
 ```
 
 Here `<host>` must be the server's LAN IP, not its hostname, and
-`<viewer-user>` is the viewer username you choose (not your Debian login). The CI installer job in
+`<admin>` is the admin username you choose (not your Debian login). The CI installer job in
 [audit-tests.yml](.github/workflows/audit-tests.yml) exercises these base
 presets with backups enabled too. See `bash setup.sh --help` for
 release/local-bundle options. Run the firmware builder interactively later.
@@ -435,7 +447,7 @@ Replace `<host>` with the server's LAN **IP address**, not a hostname. Find
 it with `ip -4 addr show` and give it a static IP or DHCP reservation before
 starting the services. With `BIND_ADDR` blank, Docker publishes their ports
 on every interface, and UFW does not restrict those ports. Setting the LAN
-address now keeps the first tests and viewer login on that interface too;
+address now keeps the first tests and admin sign-in check on that interface too;
 Step 7 explains how to verify the mapping.
 
 Lock it down and confirm it's not world-readable:
@@ -465,9 +477,11 @@ new zone.
 
 ## Step 4b — Create `viewer.env` and set the viewer login
 
-The viewer requires a login. Its credentials live in a **separate** file from
-`.env` on purpose: the viewer has no business holding the ingest token, and
-single-quoting the hash in `viewer.env` preserves its `$` separators.
+The admin login lives in `viewer.env`. Everyday logins for whoever annotates
+trips live in the viewer database and can be added on `/admin`, by `install.sh`,
+or with `manage_users.py`. Keep `viewer.env` **separate** from `.env`: the
+viewer has no business holding the ingest token, and single-quoting the hash
+preserves its `$` separators.
 Compose interpolates unquoted and double-quoted values, including values
 in an `env_file`; follow the quoting in the example below.
 
@@ -477,8 +491,9 @@ cp viewer.env.example viewer.env
 chmod 600 viewer.env
 ```
 
-Generate the password hash. You'll be prompted; the password isn't echoed and
-the plaintext is never written to disk or into the container environment:
+Generate the admin password hash. You'll be prompted; the password isn't
+echoed and the plaintext is never written to disk or into the container
+environment:
 
 ```bash
 docker run --rm -it python:3.12-slim sh -c \
@@ -502,7 +517,7 @@ nano viewer.env
 ```
 
 ```
-VIEWER_USERNAME=<username>
+VIEWER_USERNAME=<admin>
 VIEWER_PASSWORD_HASH='scrypt:32768:8:1$RxK2mQ...$8f3c1e...'
 VIEWER_SECRET_KEY=<the openssl rand output>
 ```
@@ -516,6 +531,16 @@ VIEWER_SECRET_KEY=<the openssl rand output>
 it logs you out everywhere, and it has to be identical across both gunicorn
 workers, which is why it's configured rather than generated at startup.
 
+These values configure the admin, not an everyday account. After the viewer
+image is built in Step 5, add an optional everyday login from this directory.
+The password is read from standard input by `manage_users.py`:
+
+```bash
+read -rs -p 'Everyday password: ' new_password; printf '\n'
+printf '%s\n' "$new_password" | docker compose run --rm --no-deps -T mileage-viewer python manage_users.py add '<user>'
+unset new_password
+```
+
 ---
 
 ## Step 5 — Build and start
@@ -524,11 +549,12 @@ workers, which is why it's configured rather than generated at startup.
 
 The server release is `server/VERSION` (`v0.01` initially), independent of the
 ESP32 firmware version. Release users keep the published version. For
-maintainer source deployments, bump that file in its own commit before each
-build deployed to the real server, using `v<major>.<two-digit minor>` (major 0-99).
-Build from the clean commit; after verifying deployment, tag that exact commit
-`srv-v0.NN`, for example `srv-v0.02` for release `v0.02` (`srv-v0.01` for the
-initial release). These tags identify server releases separately from firmware.
+maintainer source deployments, bump that file in the PR that ships the change;
+do not open a separate version-only PR. Use `v<major>.<two-digit minor>`
+(major 0-99). Build from the clean merged commit; after verifying deployment,
+tag that exact merged commit `srv-v0.NN`, for example `srv-v0.02` for release
+`v0.02` (`srv-v0.01` for the initial release). These tags identify server
+releases separately from firmware.
 Do not tag dirty builds as releases: a tag cannot preserve uncommitted code.
 
 `python3 stamp_version.py`, run in the server folder, prints the release plus
@@ -680,12 +706,17 @@ in `viewer.env` and `docker compose up -d mileage-viewer`.
 http://<host>:8091/
 ```
 
-You should land on a login page. Sign in with the username and password from
-Step 4b. The trip should then be listed. Click **Map / Edit** → the track
+You should land on a login page. Sign in with the admin username and password
+from Step 4b. The trip should then be listed. Click **Map / Edit** → the track
 draws on an OSM map. Tag it business/personal and add a note → reload → the
 annotation persists. Then hit **Export CSV** and **Export XLSX** and confirm
 both download with the annotation joined in. Finally click **Log out** and
 confirm you're bounced back to the login page.
+
+If you added an everyday login, sign out and sign in with it too. It should
+see the same trip and normal trip actions; opening `/admin` as that login
+should return `403`. The installer checks this for an everyday login it
+created during that run.
 
 If a long stop split a drive, open **Map / Edit** on the earlier trip, save
 any edits, then use **Merge with next trip**. Only the next trip from the
@@ -723,7 +754,7 @@ list warning still offers Undo. All merge/Undo changes use authenticated,
 CSRF-protected POSTs. See [Merge recordings from one drive](server/README.md#merge-recordings-from-one-drive)
 for the annotation and timing details.
 
-> Deliberately fail the password five times and you'll be locked out of that
+> Deliberately fail a login password five times and you'll be locked out of that
 > browser's IP for 15 minutes — including with the *correct* password. If you
 > trip this during setup, clear it with:
 > `docker compose exec mileage-viewer python -c "import sqlite3;c=sqlite3.connect('/db/annotations.db');c.execute('DELETE FROM login_attempts');c.commit()"`
@@ -743,10 +774,11 @@ matching trip and won't appear in exports.)
 ## Step 7 — Firewall and network
 
 Both services are **LAN-only by design**. Ingest has a bearer token; the
-viewer has a session login. Neither is safe to port-forward: both the session
-cookie and the ingest token travel over plain HTTP, so anyone who can observe
-the traffic can replay them. The login is defence in depth against other
-devices on your network, not a substitute for TLS.
+viewer has admin and everyday session logins, with roles checked by the
+server. Neither is safe to port-forward: the admin session cookie and ingest
+token travel over plain HTTP, so anyone who can observe the traffic can read
+or replay them. The logins are defence in depth against other devices on your
+network, not a substitute for TLS.
 
 **Give the server a static IP or DHCP reservation first.** The T-Beam
 has the upload address compiled in, so a lease change silently breaks
@@ -1755,15 +1787,15 @@ flash fallback holds about 5–6 hours of driving, then recording stops.
 **Compose says `INGEST_AUTH_TOKEN` is unset** — `.env` must sit next to
 `docker-compose.yml` in `~/mileage-tracker/`, not inside `mileage-ingest/`.
 
-**Viewer container exits immediately at startup** — it fail-fasts on bad auth
-config rather than starting with the login broken. The log says exactly which
-value is wrong:
+**Viewer container exits immediately at startup** — it fail-fasts on bad admin
+auth configuration rather than starting with the login broken. The log says
+exactly which value is wrong:
 
 ```bash
 docker compose logs mileage-viewer --tail 20
 ```
 
-Usual causes: `viewer.env` not created, or the password hash lost its `$`
+Usual causes: `viewer.env` not created, or the admin password hash lost its `$`
 characters to shell expansion (fix by single-quoting it).
 
 **Locked out of the viewer** — 5 bad passwords locks the IP for 15 minutes.
@@ -1774,9 +1806,41 @@ docker compose exec mileage-viewer python -c \
   "import sqlite3;c=sqlite3.connect('/db/annotations.db');c.execute('DELETE FROM login_attempts');c.commit()"
 ```
 
-**Forgot the viewer password** — regenerate a hash (Step 4b), replace it in
-`viewer.env`, then `docker compose up -d mileage-viewer`. Every browser that
-was logged in has to sign in again; your annotations are untouched.
+**Forgot the admin password** — rerun `bash install.sh`. When asked whether to
+keep the existing login, answer `n`, then set the admin username and password
+again. Alternatively, regenerate an admin password hash using Step 4b,
+replace `VIEWER_PASSWORD_HASH` in `viewer.env`, and run
+`docker compose up -d mileage-viewer`. The admin's existing sessions end;
+everyday logins and their passwords are unchanged.
+
+**Forgot an everyday password** — an admin can reset it on `/admin`. From
+`~/mileage-tracker`, the CLI can also reset it; `manage_users.py` reads the new
+password from standard input:
+
+```bash
+read -rs -p 'New everyday password: ' new_password; printf '\n'
+printf '%s\n' "$new_password" | docker compose run --rm --no-deps -T mileage-viewer python manage_users.py reset-password '<user>'
+unset new_password
+```
+
+**Nobody can log in** — from `~/mileage-tracker`, list everyday accounts and
+check whether they are enabled:
+
+```bash
+docker compose run --rm --no-deps -T mileage-viewer python manage_users.py list
+```
+
+For a disabled everyday login, enable it:
+
+```bash
+docker compose run --rm --no-deps -T mileage-viewer python manage_users.py enable '<user>'
+```
+
+If no everyday login can be used, `add '<user>'` creates one. `add` and
+`reset-password` use the same hidden prompt and stdin pattern above. This
+restores everyday access to the trip list and its allowed actions; it does not
+restore the admin login. For a lost admin password, use the admin recovery
+steps above.
 
 **Containers missing after a reboot, log says `cannot assign requested
 address`** — Docker started before the network brought up the `BIND_ADDR` IP,

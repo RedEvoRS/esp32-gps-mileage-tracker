@@ -57,7 +57,8 @@ source copy preserves private configuration/data; the builder replaces its
 own output. See the [update procedure](../DEPLOY_DEBIAN.md#updating).
 
 `install.sh --check` leaves configuration unchanged but uploads and removes
-a temporary test trip and can test the viewer login. Automatic backups
+a temporary test trip, can test the admin login, and lists existing everyday
+logins for information. Automatic backups
 currently require the server login's numeric user ID to be **1000**
 (`id -u`); the installer skips backups for other IDs. See
 [the deployment prerequisites](../DEPLOY_DEBIAN.md).
@@ -119,7 +120,7 @@ by the `mileage-viewer` service, which reads these files independently.
     ├── .env.example           # Template for .env
     ├── .env                   # Upload token and BIND_ADDR (created by you or install.sh, never committed)
     ├── viewer.env.example     # Template for viewer.env
-    ├── viewer.env             # The viewer login (created by you or install.sh, never committed)
+    ├── viewer.env             # The admin login (created by you or install.sh, never committed)
     ├── monitor.env.example    # Disabled defaults; template for private monitor.env
     ├── mileage-monitor/       # monitor.py, gelf.py, prometheus.py, loki.py + Dockerfile; stdlib only
     ├── grafana/               # Importable Prometheus/Grafana/Loki starter files; no bundled services
@@ -239,10 +240,11 @@ Both `/health` endpoints keep their `status` and `service` fields and add
 `version`. They need no login: anyone who can reach ports 8090/8091 on the LAN
 can read the build version. Keep the documented LAN-only binding in place.
 
-For maintainer source deployments, before **each deployment to the real
-server**, bump `server/VERSION` in its own commit (`v<major>.<two-digit minor>`, major 0-99, for example `v0.02`).
-Build from that clean commit, then tag the exact deployed commit `srv-v0.NN`
-(for example `srv-v0.02`) after verifying the deployment. The initial release
+For maintainer source deployments, bump `server/VERSION` in the PR that ships
+the change; do not open a separate version-only PR. Use
+`v<major>.<two-digit minor>` (major 0-99, for example `v0.02`). After the PR
+merges and you verify the deployment, tag that exact merged commit `srv-v0.NN`
+(for example `srv-v0.02`). The initial release
 uses `srv-v0.01`. These server tags are separate from firmware tags. Do not
 tag a dirty build as a release: its uncommitted changes cannot be recovered
 from a Git tag.
@@ -284,9 +286,10 @@ are for maintainers deploying source changes.
 ## First-Time Setup
 
 The primary route is release setup above. For an already copied source
-tree, run `bash install.sh` from this directory. It sets up both
-services, the viewer login and backups, checks each step, and tests an
-upload end to end ([deployment overview](../DEPLOY_DEBIAN.md#the-quick-way-setupsh)). The steps below
+tree, run `bash install.sh` from this directory. It sets up both services and
+backups, asks for the admin login and offers an optional everyday login,
+checks each step, and tests an upload end to end
+([deployment overview](../DEPLOY_DEBIAN.md#the-quick-way-setupsh)). The steps below
 set up both services by hand, in the order Compose needs them, all run
 from this folder. Docker has to be installed first (`DEPLOY_DEBIAN.md`
 Step 1).
@@ -311,7 +314,7 @@ Step 1).
 
    Copy the output and set `INGEST_AUTH_TOKEN` in `.env` to that value.
    You'll use the same token in the tracker firmware later. This token is
-   separate from your SSH login and the viewer's username/password.
+   separate from your SSH login and the viewer's admin or everyday login.
 
 4. In `.env`, set `DISPLAY_TZ` to the IANA timezone where you drive, for
    example `DISPLAY_TZ=Europe/London`. Both services refuse to start without
@@ -325,7 +328,7 @@ Step 1).
    UFW does not restrict Docker-published ports. See
    [network setup](../DEPLOY_DEBIAN.md#step-7--firewall-and-network).
 
-6. Create `viewer.env` and set the viewer login, as described under
+6. Create `viewer.env` and set the admin login, as described under
    [Viewer Login](#viewer-login) below. Compose won't build or start
    anything, either service, until `viewer.env` exists.
 
@@ -494,6 +497,29 @@ trip's local end month: that year, plus the year before for a January
 folder. `DEPLOY_DEBIAN.md` → Troubleshooting says how to rebuild the
 summary from its GPX.
 
+### Admin year review and close
+
+The admin-only `/admin/year/<YYYY>` page is linked from the trip list after
+selecting a year, or from the year list on `/admin`, which shows whether each
+year is open or closed. The review page brings together that year's category
+totals (calculated the same way as exports), trips without a category, business
+trips missing a purpose note or destination, unreadable trips, removed trips
+and their reasons, and edits made after the year ended. It also shows that
+year's own close and reopen history. The review includes edits made at or
+after local January 1 of the following year.
+
+A trip belongs to the year shown by its local start time. An unreadable trip
+is assigned by its storage folder; a January folder can be listed under the
+previous year. A trip with no usable time is not locked by any year.
+
+The admin closes or reopens a year on its review page using a confirmation
+checkbox. Both actions appear in change history. While a year
+is closed, neither role can annotate, merge, undo a merge, remove or restore
+a trip in that year. A merge that would include a trip from a closed year is
+refused. The trip page identifies the closed year and who closed it, and the
+trip list shows **Closed for edits**. Viewing trips, exporting, and place
+lookup continue to work.
+
 Endpoint coordinates come from the first and last recorded GPX track points,
 so they are also available for existing summaries. They describe the raw
 recording, including any final stationary samples; they are not geocoded
@@ -506,6 +532,32 @@ categories and notes. Existing categories remain business / personal / other.
 
 The viewer mounts `./data` **read-only** — it never modifies GPX or
 summary files. The only thing it writes is the annotations database.
+
+### Remove trips and review changes
+
+The admin removes a trip from the log with a required reason; unreadable trips
+can also be removed. It disappears from the trip list, totals, CSV/XLSX
+exports and merge suggestions for both roles. The GPX and JSON source files
+stay in `./data`; removal is a reversible record in `annotations.db`, not a
+file deletion. On `/admin/removed`, the admin can see each reason, who removed
+it and when, then restore the trip. The admin's trip page shows a **Removed
+from the log** notice and a Restore button; an everyday login using the old
+trip address gets a 404. Permanently deleting source files remains a separate
+shell operation.
+
+The viewer has no real-delete button because it cannot write to the read-only
+`./data` mount, it could not undo a source-file deletion, and the session cookie
+crosses the LAN over plain HTTP. Keeping the original GPS record also
+preserves the source data behind a mileage record.
+
+The admin-only `/admin/history` page lists changes newest first, 50 per page,
+and can filter to one trip. Annotation saves, merges, undo merges, removals
+and restores record the login, UTC time, action and relevant before/after
+values; year closes and reopens are also recorded. The page displays times in
+`DISPLAY_TZ`. Trips changed before history began are labeled as predating the
+history; they have no backfilled change entries. CSV and XLSX append `last_edited_by` and
+`last_edited_at` after the existing trip columns, so earlier column positions
+stay the same. CSV's existing `row_type` marker follows them.
 
 ### Merge recordings from one drive
 
@@ -546,6 +598,11 @@ and saving it first. Copy any text you want to retain before clearing it.
 saved on those trips when they were merged. Confirm the checkbox first:
 annotation edits made to the merged trip are removed by Undo. Undo of a chain
 restores all original recordings, rather than just its most recent pair.
+
+An admin removes a merged trip as a whole; an original part cannot be removed
+on its own. Undo merge is refused while the merged trip is removed from the
+log. A merge that would include a trip from a closed year is refused, and a
+closed year blocks edits to trips in that year.
 
 Merging never edits or deletes anything under `./data`. The viewer adds
 `trip_merges` (merged annotation and cached summary), `trip_merge_parts`
@@ -649,8 +706,29 @@ that cooldown. Do not clear the gate while a lookup is running.
 
 ## Viewer Login
 
-The viewer requires a login. Credentials live in `viewer.env` (separate
-from `.env`, so the viewer never holds a copy of the ingest token):
+The viewer has two roles. The existing login in `viewer.env` is the admin
+login; everyday logins for whoever annotates trips are stored in
+`annotations.db`. The admin login stays outside that database, so losing the
+viewer database does not remove the admin credentials.
+
+| Permission | Everyday login | Admin login |
+|---|---|---|
+| Trip list, map, annotations, place lookup, merge and undo merge | Yes | Yes |
+| CSV/XLSX export and Device health | Yes | Yes |
+| Change own password | Yes, on `/account/password` | Through `install.sh` |
+| Remove/restore trips | No | Yes |
+| Manage everyday logins | No | Yes |
+| Change history and year review | No | Yes |
+| Close or reopen a year | No | Yes |
+
+The admin page at `/admin` identifies the admin as **Admin (set in
+viewer.env)** and lists everyday logins. The admin can add, reset, disable,
+enable or remove an everyday login there. The admin account itself is not
+managed on that page. Everyday logins can also be added by `install.sh` or
+`manage_users.py`.
+
+The admin credentials live in `viewer.env` (separate from `.env`, so the
+viewer never holds a copy of the ingest token):
 
     cp viewer.env.example viewer.env
     chmod 600 viewer.env
@@ -668,20 +746,51 @@ Generate a session key:
 
     openssl rand -hex 32
 
-Put both in `viewer.env`, **single-quoting the hash** (it contains `$`,
-which shell and Compose expansion will otherwise eat):
+Put the admin username, hash and session key in `viewer.env`,
+**single-quoting the hash** (it contains `$`, which shell and Compose
+expansion will otherwise eat):
 
-    VIEWER_USERNAME=<username>
+    VIEWER_USERNAME=<admin>
     VIEWER_PASSWORD_HASH='scrypt:32768:8:1$RxK2...'
     VIEWER_SECRET_KEY=<the openssl output>
 
-How it behaves:
+The username and hash above are for the admin. The admin password is changed
+by rerunning `install.sh`. Everyday logins have their own passwords and can
+change them at `/account/password` after entering the current password.
 
-- Every route except `/health` needs a session. `/health` stays open
+To add or manage an everyday login from the server, run the CLI in the viewer
+container. `list` shows each account as enabled or disabled; it never prints
+passwords or hashes. The admin page is the other way to manage these accounts.
+
+```bash
+docker compose run --rm --no-deps -T mileage-viewer python manage_users.py list
+```
+
+The CLI commands are `list`, `add <user>`, `reset-password <user>`,
+`disable <user>`, `enable <user>` and `remove <user>`. `add` and
+`reset-password` read the new password from standard input, not from an
+argument or environment variable. For example, prompt for it without echoing
+it, then pipe it to the CLI:
+
+```bash
+read -rs -p 'Everyday password: ' new_password; printf '\n'
+printf '%s\n' "$new_password" | docker compose run --rm --no-deps -T mileage-viewer python manage_users.py add '<user>'
+unset new_password
+```
+
+Usernames are 1–64 ASCII letters or digits, periods, underscores, at signs
+or hyphens. An everyday username cannot match the admin username, ignoring
+case. Passwords must be 8–1024 characters. The commands return 0 for success,
+1 for an operational error, 2 for usage or an unknown command, 3 for invalid input,
+4 when the login does not exist, and 5 when `add` finds that it already exists.
+
+How authentication behaves:
+
+- Every route except `/login` and `/health` needs a session. `/health` stays open
   for Docker's healthcheck. It exposes the server version without a login to
   anyone who can reach the port on the LAN; it contains no trip or device data.
 - Session cookie is HttpOnly, SameSite=Lax, 30-day lifetime.
-- The annotate and logout forms carry CSRF tokens.
+- All state-changing forms carry CSRF tokens.
 - Five bad passwords from one IP locks that IP out for 15 minutes. The
   counter is in SQLite, not process memory, so both gunicorn workers
   share one view of it and it survives restarts.
@@ -694,10 +803,12 @@ How it behaves:
 everywhere, and it has to be identical across workers — which is why
 it's configured rather than randomly generated at startup.
 
-To change the password later: regenerate the hash, update `viewer.env`,
-then `docker compose up -d mileage-viewer`. That logs out every
-existing session, so anyone still logged in has to sign in again with
-the new password.
+To change the admin password, rerun `bash install.sh` and answer `n` when it
+asks whether to keep the existing login. You can also use the hash-generation
+steps above, replace `VIEWER_PASSWORD_HASH` in `viewer.env`, and run
+`docker compose up -d mileage-viewer`. Changing a password invalidates the
+existing sessions for that login; a self-service password change keeps its
+current session and ends the login's other sessions.
 
 ## Timezone
 
@@ -767,7 +878,13 @@ annotations persist in the `viewer-db` volume.
 
 Back up the trip files in `./data` and the viewer's `annotations.db` in the
 `viewer-db` volume. Annotations hold the business/personal tags, purposes and
-destinations; they cannot be rebuilt from the trips. Backups also preserve
+destinations; they cannot be rebuilt from the trips. The database also holds
+everyday login names and password hashes, trip removals, change history and
+closed-year state. These records are included in the normal database backup
+and restore. The admin login remains in `viewer.env`. Restoring an earlier
+snapshot restores everyday logins and password hashes as they were at that
+time, so a password reset or account removal made later can be undone by a
+restore. Backups also preserve
 `data/diagnostics/events.db` (device history and current health) and, when its
 `monitor-state` volume exists, `/state/monitor.db` (alert delivery state and
 export cursors).

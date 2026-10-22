@@ -12,7 +12,8 @@ The lab has systemd and a nested Docker daemon, no host Docker socket or
 published ports. It runs setup fresh and again over a modified public file,
 checks all private-path exclusions, checks service versions, and exercises
 backup/check/restore with a populated synthetic file. Existing `install.sh`
-checks supply upload, login, exports and backup-timer assertions. The lab
+checks supply upload, the admin and everyday logins, exports and backup-timer
+assertions. The lab
 wrapper removes its container, anonymous volumes and unique lab image on exit.
 The nested Docker 29 image store uses native overlayfs on fresh anonymous
 `/var/lib/docker` and `/var/lib/containerd` volumes. This avoids nesting
@@ -48,9 +49,11 @@ change, a shortage fails clearly before creating the lab. Hosted-tool
 reclamation and real runner headroom still need the next Actions run;
 local Docker Desktop is not a measurement of the GitHub VM's free space.
 
-Only relevant changes enable the expensive builder step. A plain Git diff
-uses the PR base/head or push before/after SHAs; manual dispatch enables it
-too. `firmware-compile` exports only its synthetic Stage 4 app and provenance,
+Only relevant PR changes enable the expensive builder step; manual dispatch
+also enables it. A push to main runs only the PII scan and does not run the
+builder. A new push to a PR cancels its older run, while main runs are not
+cancelled. `firmware-compile` exports only its synthetic Stage 4 app and
+provenance,
 with one-day artifact retention. Builder parity requires the same full commit,
 FQBN and embedded version and permits a size difference of at most 1% or
 4 KiB, whichever is larger. Different compiled settings prevent assuming

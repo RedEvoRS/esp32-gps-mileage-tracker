@@ -399,7 +399,7 @@ numeric measurements and fixed enumerated values in context.
 - **#118:** authenticated ingest endpoint, SQLite storage, GPX contact updates,
   snapshot ordering, and packaging the shared Python code into both services.
 - **#119:** shipped Device health at `/device-health`, with current conditions
-  and paginated history behind the viewer login.
+  and paginated history behind an authenticated viewer session.
 - **#120:** shipped independent monitor service and optional ntfy fault notifications.
 - **#121:** shipped server-side device-silence detection; heartbeat integration is #125.
 - **#122:** implemented board-independent EventLog and host fault tests: bounded

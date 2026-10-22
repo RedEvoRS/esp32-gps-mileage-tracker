@@ -37,11 +37,15 @@ the actual bindings, including optional services.
 
 The ingest service (port 8090) requires the `INGEST_AUTH_TOKEN` bearer token
 (a shared upload secret) for trip and diagnostics uploads. The viewer (8091)
-uses a session login, normally set up with a scrypt password hash. These help
-keep casual LAN users without credentials from uploading data or viewing trips.
-The viewer checks cross-site request forgery (CSRF) tokens to block other sites
-from submitting actions through your browser, and slows password guessing by
-locking a source IP for 15 minutes after five failed logins.
+has an admin login in `viewer.env` and everyday logins in `annotations.db`.
+The admin can remove or restore trips, manage logins, review and close years;
+everyday logins can browse, annotate and export trips. The server checks the
+current role on each request. Every private endpoint declares its permitted
+roles; undeclared endpoints are denied. Passwords are stored as hashes. These controls
+help keep casual LAN users without credentials from uploading data or viewing
+trips. The viewer checks cross-site request forgery (CSRF) tokens as before,
+and slows password guessing by locking a source IP for 15 minutes after five
+failed logins.
 
 Both services' `/health` endpoints are unauthenticated and report status,
 service name and server version, without trip or device data. The viewer's
@@ -51,8 +55,12 @@ self-hosted ntfy notifications (8092) deny anonymous access by default.
 
 These controls do not encrypt traffic. Uploads, the viewer and metrics use plain
 HTTP: anyone on the LAN who can sniff that traffic can read tokens, trip data,
-login credentials and viewer sessions, and reuse stolen credentials. Cookies
-are HttpOnly and SameSite=Lax, but are not Secure by default. See the existing
+login credentials and viewer sessions, and reuse stolen credentials. The
+admin's session cookie also crosses the LAN over plain HTTP; this is one reason
+trip removal stays reversible and leaves the source files intact. Cookies are
+HttpOnly and SameSite=Lax, but are not Secure by default. Everyday password
+hashes also live in `annotations.db` and are included in its backups; protect
+those backups as trip data. See the existing
 [TLS reverse-proxy note](server/README.md#security-notes); configuring a proxy
 with Transport Layer Security (TLS) and its cookie setting is your responsibility.
 It does not change the firmware's plain-HTTP upload connection.

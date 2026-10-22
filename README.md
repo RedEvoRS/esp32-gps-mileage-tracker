@@ -126,8 +126,9 @@ checked against the car's odometer before a release pass mark is set.
 ## Setting it up
 
 Replace angle-bracket placeholders, including the brackets, with your values.
-`<user>@<host>` is your server SSH login and address; the viewer login and
-board upload token are separate credentials.
+`<user>@<host>` is your server SSH login and address. The viewer has an admin
+login and may also have an optional everyday login; both are separate from
+the board upload token.
 
 The one-liners download scripts and the source bundle from **this repo's
 GitHub releases**, and the flash scripts download **esptool from Espressif's
@@ -161,7 +162,8 @@ bash setup.sh
 
 It verifies the release bundle, copies it into `~/mileage-tracker`, and runs
 `install.sh` to configure, build and check the server. Answer its LAN address,
-timezone, viewer login, backup and optional notification questions. Docker's
+timezone, admin login, optional everyday login, backup and optional
+notification questions. Docker's
 published ports bypass UFW: choose the server's LAN address for `BIND_ADDR`,
 not all interfaces. See the [deployment runbook](DEPLOY_DEBIAN.md).
 
@@ -265,9 +267,10 @@ Trips ended by the stop timer or lost GPS are discarded if shorter than
 30 seconds of driving or about a tenth of a mile. Car power-off keeps short
 trips that have started.
 
-Open `http://<host>:8091/` and sign in with the viewer login. Check the trip,
-then open **Device health** and check for a newly received **current status
-snapshot**. A listed device or recent trip contact alone does not prove
+Open `http://<host>:8091/` and sign in with the admin login. You can add an
+optional everyday login during setup for whoever annotates trips. Check the
+trip, then open **Device health** and check for a newly received
+**current status snapshot**. A listed device or recent trip contact alone does not prove
 that diagnostics enrollment succeeded. See
 [detailed checks](firmware/README.md#check-recording-and-uploads) and
 [car installation](firmware/README.md#put-it-in-the-car).

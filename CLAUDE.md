@@ -77,11 +77,12 @@ server/
   docker-compose.yml     Default ports 8090 + 8091; optional ntfy 8092 and monitor 8093
   .dockerignore          Default-deny runtime allowlist; excludes secrets and data
   .env.example           Copy to .env, set INGEST_AUTH_TOKEN and BIND_ADDR
-  viewer.env.example     Copy to viewer.env, set the viewer login
+  viewer.env.example     Copy to viewer.env, set the admin login
   monitor.env.example    Disabled defaults; private monitor.env selected via MONITOR_ENV_FILE
   install.sh             First-time install with checks; --check re-verifies
   mileage-ingest/        Flask ingest (app.py), diagnostics SQLite (diag_store.py), Dockerfile
-  mileage-viewer/        Flask trip viewer/export + Device health (app.py, geocoding.py, static/)
+  mileage-viewer/        Flask trip viewer/export + Device health
+                        (app.py, users.py, manage_users.py, trip_log.py, geocoding.py, static/)
   mileage-monitor/       Stdlib monitor.py, gelf.py, prometheus.py, loki.py; own state volume
   grafana/               Importable Prometheus scrape config, dashboard, alert examples
   ntfy/server.yml        Optional self-hosted ntfy; deny-all access, ntfy-state volume
@@ -128,7 +129,10 @@ names no issue numbers on purpose, because they go stale; keep it that way.
 
 ## Tests
 
-CI runs these on PRs; the PII/tools job is skipped for Dependabot PRs:
+CI runs all checks on PRs and manual runs; pushes to main run only the PII
+scan. Strict up-to-date required checks mean main receives exactly the files
+tested on the PR. A new push to a PR cancels its older run; main runs are not
+cancelled. The PII/tools job is skipped for Dependabot PRs:
 - PII: `python tools/check_pii.py` (add `--commits origin/main..HEAD`
   before pushing) and `python -m unittest discover -s tools`.
   The scanner checks positions and new commit dates; commit with TZ=UTC.
@@ -293,8 +297,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   `unversioned`. Viewer header (footer on login/error pages), Device health
   and unauthenticated `/health` expose it on the LAN; `install.sh --check`
   warns on service mismatches.
-  Each real deployment bumps VERSION in its own commit and tags the deployed
-  commit `srv-v0.NN` (see DEPLOY_DEBIAN.md).
+  Bump VERSION in the PR that ships the change (no separate PR); after
+  deployment is verified, tag the merged commit `srv-v0.NN` (see DEPLOY_DEBIAN.md).
 - Ingest port: 8090, bearer token auth, GPX body in → raw `.gpx` + derived
   `.json` summary out (atomic writes); distance = haversine over moving
   steps only (speed > 2 mph at either end), HDOP > 5 and > 60 m/s jumps
@@ -320,8 +324,10 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   after commit. GPX successes refresh contact only for a valid device header;
   diagnostics failure never changes their response. See `DIAGNOSTICS.md` for
   schema/unknown-condition semantics.
-- Viewer port: 8091, session login (LAN-only), reads `./data` read-only, owns
-  `annotations.db` (SQLite) in the `viewer-db` volume. Optional `geocoding.py`
+- Viewer port: 8091, admin/everyday session logins (LAN-only), reads `./data`
+  read-only, owns `annotations.db` (SQLite) in `viewer-db`. Removal only marks
+  a trip in that DB; it never touches `./data`. The DB includes `users`,
+  `trip_removals`, `trip_history` and `tax_years`. Optional `geocoding.py`
   sends a selected endpoint to an explicitly configured provider only on an
   authenticated, CSRF-protected click and caches suggestions in that database.
   Configurable interval, default 1.1 s.
@@ -403,13 +409,14 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 - Port binding: `BIND_ADDR` in `.env` sets the host IP published ports bind
   on (unset = all interfaces). UFW does not filter Docker-published ports,
   so the bind address is the LAN-only control (`DEPLOY_DEBIAN.md` Step 7)
-- Viewer auth: `viewer.env` (separate from `.env` — keeps the ingest token out
-  of the viewer and survives Compose interpolation) holds `VIEWER_USERNAME`,
-  scrypt `VIEWER_PASSWORD_HASH`, `VIEWER_SECRET_KEY`. Everything except
-  `/health` requires a session; CSRF on POSTs; 5 failures locks an IP for
-  15 min via a `login_attempts` table (SQLite, so it's shared across workers).
-  Sessions carry an HMAC of the password hash, so a new hash logs everyone out.
-  App fail-fasts if auth config is missing or the hash lost its `$` chars.
+- Viewer auth: `viewer.env` holds the admin `VIEWER_USERNAME`, scrypt
+  `VIEWER_PASSWORD_HASH` and `VIEWER_SECRET_KEY`; rerun `install.sh` to change
+  the admin password. Everyday password hashes are in the `users` table in
+  `annotations.db`. `ENDPOINT_ROLES` is checked server-side on every request;
+  undeclared endpoints are denied.
+  `manage_users.py` manages everyday accounts. CSRF on POSTs; 5 failures locks
+  an IP for 15 min via shared SQLite `login_attempts`. App fail-fasts if auth
+  config is missing or the admin hash lost its `$` chars.
 - Timezone: stored UTC, displayed/exported in `DISPLAY_TZ` via `ZoneInfo`,
   DST-aware — never a fixed offset. No default: `install.sh` asks for it and
   writes it to `.env`, Compose passes it to **both** services (viewer
