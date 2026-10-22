@@ -140,7 +140,7 @@ def configure(install, private, noninteractive):
     install, private = Path(install), Path(private)
     if not (install / "firmware-src/firmware/04_trip_logger/04_trip_logger.ino").is_file():
         raise ValueError("Missing firmware-src/ bundle; run piece 1 first")
-    print("The first run downloads about 1-2 GB of toolchain data; later builds reuse the image.", flush=True)
+    print("The first run downloads about 1.8 GB of toolchain data (image about 2.7 GB; allow 10 GiB free for the first build); later builds reuse the image.", flush=True)
     if not yes("Continue with the toolchain download/build?", noninteractive, "TRACKER_ACCEPT_DOWNLOAD"):
         raise ValueError("Download not accepted (non-interactive: TRACKER_ACCEPT_DOWNLOAD=yes)")
     host = env_value(install / ".env", "BIND_ADDR")

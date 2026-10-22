@@ -107,7 +107,8 @@ with the IRS.
   SSH access, a normal login with sudo, and **Docker Engine with Compose v2**
   already usable by that login. [Deployment Steps 0–1](DEPLOY_DEBIAN.md#step-0--confirm-ssh-works)
   cover preparation. Allow space for Docker images and trips; the firmware
-  builder needs about 2 GB extra. Automatic backups currently require the
+  builder image uses about 2.7 GB extra; allow 10 GiB free for its first build.
+  Automatic backups currently require the
   server login's numeric user ID to be 1000; see [backups](DEPLOY_DEBIAN.md#step-10--backups).
 - **A Windows, macOS or Linux PC**, a **USB-C data cable**, and OpenSSH
   (`ssh` and `scp`) access to the server. macOS/Linux also need Bash, curl,
@@ -158,7 +159,8 @@ published ports bypass UFW: choose the server's LAN address for `BIND_ADDR`,
 not all interfaces. See the [deployment runbook](DEPLOY_DEBIAN.md).
 
 **Accept “Build your tracker firmware now”** to prepare Step 2. The builder
-asks before its first **~1–2 GB toolchain download**; later builds reuse it.
+asks before its first **toolchain download of about 1.8 GB** (about 2.7 GB
+installed image); later builds reuse it.
 Enter your WiFi settings, a name for the board (`DEVICE_ID`, default
 `tbeam-01`), and confirm the server address and port (default 8090). It reads
 the upload token from the server's `.env`. For a new device it also checks

@@ -146,7 +146,9 @@ bash setup.sh
 
 Docker Engine and Compose v2 must already be usable without sudo (Step 1).
 The wrapper also checks curl, tar, sha256sum and at least 1 GiB of free space;
-allow about 2 GB extra for the firmware builder plus room for trip data.
+allow about 2.7 GB extra for the firmware builder image plus room for trip data.
+Keep at least 10 GiB free for its first build, which extracts all chips before
+pruning.
 The builder image is linux/amd64; other server architectures require Docker
 amd64 emulation (see the [builder README](server/firmware-builder/README.md)).
 
@@ -162,7 +164,8 @@ does not filter Docker-published ports; see [Step 7](#step-7--firewall-and-netwo
 Backups and optional notification outputs are explained in Steps 10–11.
 
 Accept the firmware-build offer to continue to the board. The builder asks
-before a first ~1–2 GB toolchain download (cached for later builds), prompts
+before its first toolchain download of about 1.8 GB (about 2.7 GB installed
+image, reused for later builds), prompts
 for WiFi settings, device ID and server address/port, and reads the upload
 token from `.env`. For a new device it reads the server's diagnostics
 revision and asks you to confirm fresh SD state and an unused board

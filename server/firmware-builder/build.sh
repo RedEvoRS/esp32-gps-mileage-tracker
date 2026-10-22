@@ -22,7 +22,7 @@ Requires Docker, Python 3, flock, and the installed firmware-src/ bundle.
 Non-interactive settings: TRACKER_WIFI_SSID, TRACKER_WIFI_PASSWORD,
 TRACKER_WIFI_BSSID (optional), TRACKER_DEVICE_ID, TRACKER_SERVER_HOST,
 TRACKER_SERVER_PORT (default 8090). Token is read only from .env.
-TRACKER_ACCEPT_DOWNLOAD=yes accepts the first ~1-2 GB toolchain download.
+TRACKER_ACCEPT_DOWNLOAD=yes accepts the first download (about 1.8 GB; image about 2.7 GB).
 TRACKER_FRESH_SD=yes AND TRACKER_NEW_BOARD=yes explicitly authorize ID 1;
 otherwise builds normal firmware. Never infer fresh state from a failed read.
 For isolated fake-install tests only: --test-data-dir DIR reads a fake

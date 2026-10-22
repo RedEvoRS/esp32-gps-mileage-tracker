@@ -6,6 +6,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -37,6 +39,48 @@ class FirmwareBuilderTests(unittest.TestCase):
 
     def test_ci_pins_and_consumers_match(self):
         self.assertEqual(checker.check_repository(), [])
+
+    def install_layer(self):
+        dockerfile = (HERE / "Dockerfile").read_text()
+        # Ignore comments before joining Dockerfile continuation lines.
+        lines = [line for line in dockerfile.splitlines() if not line.lstrip().startswith("#")]
+        instructions = re.split(r"\n(?=[A-Z]+ )", "\n".join(lines).replace("\\\n", ""))
+        return next(part for part in instructions if "arduino-cli core install" in part)
+
+    def test_tool_pruning_is_in_install_layer(self):
+        layer = self.install_layer()
+        self.assertIn("esp-x32|esp32s3-libs|esptool_py", layer)
+        for token in ("for tool in /opt/arduino/packages/esp32/tools/*",
+                      'rm -rf -- "$tool"', "/opt/arduino/packages/arduino/tools/dfu-util",
+                      "rm -rf /opt/arduino/staging/*"):
+            self.assertIn(token, layer)
+            self.assertGreater(layer.index(token), layer.index("arduino-cli core install"))
+
+    @unittest.skipUnless(shutil.which("sh"), "POSIX sh required for Dockerfile pruning execution")
+    def test_pruning_keeps_complete_s3_packages_and_removes_unused_bytes(self):
+        arduino = self.root / "arduino"
+        tools = arduino / "packages/esp32/tools"
+        kept = {"esp-x32", "esp32s3-libs", "esptool_py"}
+        removed = {"esp-rv32", "esp32-libs", "esp32c3-libs", "esp32c5-libs", "esp32c6-libs",
+                   "esp32h2-libs", "esp32p4-libs", "esp32p4_es-libs", "esp32s2-libs",
+                   "xtensa-esp-elf-gdb", "riscv32-esp-elf-gdb", "openocd-esp32", "mkspiffs",
+                   "mklittlefs", "future-chip-libs"}
+        others = ["packages/arduino/tools/dfu-util", "packages/builtin/tools/ctags",
+                  "packages/builtin/tools/serial-discovery", "staging/packages", "staging/libraries"]
+        for path in [tools / name for name in kept | removed] + [arduino / name for name in others]:
+            (path / "version/nested").mkdir(parents=True)
+            (path / "version/nested/payload").write_bytes(b"must keep complete packages")
+        layer = self.install_layer()
+        prune = layer[layer.index("for tool in "):].replace("/opt/arduino", arduino.as_posix())
+        subprocess.run(["sh", "-eu", "-c", prune], check=True, capture_output=True, text=True)
+        self.assertEqual({p.name for p in tools.iterdir()}, kept)
+        for name in kept:
+            self.assertEqual((tools / name / "version/nested/payload").read_bytes(),
+                             b"must keep complete packages")
+        self.assertFalse((arduino / "packages/arduino/tools/dfu-util").exists())
+        self.assertEqual(list((arduino / "staging").iterdir()), [])
+        self.assertTrue((arduino / "packages/builtin/tools/ctags/version/nested/payload").is_file())
+        self.assertTrue((arduino / "packages/builtin/tools/serial-discovery/version/nested/payload").is_file())
 
     def test_pin_drift_fails(self):
         workflow = (checker.ROOT / ".github/workflows/audit-tests.yml").read_text()

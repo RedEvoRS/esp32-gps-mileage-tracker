@@ -292,7 +292,7 @@ class ReleaseSetup(unittest.TestCase):
         self.addCleanup(os.close, master)
         answers = [(b"Copy this release and run the server installer? [y/N]:", b"y\n"),
                    (b"Installer test answer:", b"from-tty\n"),
-                   (b"Build your tracker firmware now (about 2 GB extra disk)? [y/N]:", b"y\n"),
+                   (b"Build your tracker firmware now (about 2.7 GB image; 10 GiB free for first build)? [y/N]:", b"y\n"),
                    (b"Builder test answer:", b"build-from-tty\n"),
                    (b"(correct user@host if needed):", b"user@chosen.invalid\n")]
         output = b""
