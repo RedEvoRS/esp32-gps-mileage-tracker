@@ -200,7 +200,7 @@ HELP
     available=$(df -Pk -- "$parent" | awk 'NR==2 {print $4}')
     [[ $available =~ ^[0-9]+$ ]] || fail 'Could not measure free disk space. Check: df -h'
     (( available >= 1048576 )) || fail 'Less than 1 GiB free at the install directory. Free space or select --dir on a larger disk; check df -h.'
-    printf 'Free disk: %s KiB. The firmware builder image needs about 2.7 GB beyond the server; allow 10 GiB free for its first build.\n' "$available"
+    printf 'Free disk: %s GiB. The firmware builder image needs about 2.7 GB beyond the server; allow 10 GiB free for its first build.\n' "$((available / 1048576))"
     if (( available < 10485760 )); then printf 'Warning: free at least 10 GiB before the first firmware build (download, extraction and image export).\n'; fi
 
     # Global within main for the EXIT trap, which also runs after main returns.
