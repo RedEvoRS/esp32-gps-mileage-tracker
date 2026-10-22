@@ -7,6 +7,7 @@ the compiler may repeat a source line containing credentials.
 import csv
 from contextlib import closing
 import hashlib
+import io
 import ipaddress
 import json
 import os
@@ -112,20 +113,24 @@ def secrets_header(settings, enroll=False, high_water=None):
 
 def ask(prompt, default="", secret=False):
     import termios  # Only interactive Linux builds need terminal controls.
-    with open("/dev/tty", "r+", encoding="utf-8", buffering=1) as tty:
+    # A tty cannot seek; text-mode open(..., "r+") requires a seekable
+    # buffered stream. Wrap the unbuffered device directly instead.
+    with io.TextIOWrapper(io.FileIO("/dev/tty", "r+"), encoding="utf-8",
+                          line_buffering=True, write_through=True) as tty:
         tty.write(prompt + (f" [{default}]" if default else "") + ": ")
-        old = termios.tcgetattr(tty) if secret else None
+        fd = tty.fileno()
+        old = termios.tcgetattr(fd) if secret else None
         try:
             if secret:
-                new = termios.tcgetattr(tty)
+                new = termios.tcgetattr(fd)
                 new[3] &= ~termios.ECHO
-                termios.tcsetattr(tty, termios.TCSADRAIN, new)
+                termios.tcsetattr(fd, termios.TCSADRAIN, new)
             answer = tty.readline()
             if not answer:
                 raise ValueError("Terminal input ended")
         finally:
             if secret:
-                termios.tcsetattr(tty, termios.TCSADRAIN, old)
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
                 tty.write("\n")
         return answer.rstrip("\r\n") or default
 
