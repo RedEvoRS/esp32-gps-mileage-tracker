@@ -144,6 +144,9 @@ static constexpr size_t   TRKPT_LINE_BYTES = 256;            // includes termina
 // Fix-loss heuristic: gap this long between valid fixes starts a new
 // <trkseg> so viewers don't draw a straight line across a tunnel.
 static constexpr uint32_t SEG_GAP_MS      = 5000;
+// An unconfirmed start gets one arming window plus the normal gap margin.
+// No file exists yet; release ARMING so battery idle power-off can run.
+static constexpr uint32_t ARM_FIX_LOSS_MS = ARM_MS + SEG_GAP_MS;
 
 // If a trip is ACTIVE/COOLDOWN and we go this long without ANY valid fix
 // (parked in a garage, GPS failure), finalize the trip rather than leave
@@ -421,6 +424,7 @@ static bool      gFullWarned = false;
 static uint32_t  gIdleSince = 0;        // last time we were NOT (on battery + IDLE)
 static double    gTripMeters = 0;
 static size_t    gTripBytes = 0;        // committed prologue + trackpoint bytes
+static bool      gTripContinuation = false; // piece started by a size split
 
 // Fixes seen while ARMING, so the first ~10 s of a trip isn't lost.
 // One fix per 1 Hz epoch makes a 10 s arm window 10-11 fixes; 16 slots is
@@ -847,7 +851,8 @@ static bool tripStorageLow(uint32_t now) {
 // trip file can't be created and written. The caller must then stay IDLE:
 // carrying on as ACTIVE would let FILE_APPEND create a file with no
 // prologue, which uploads as invalid GPX and is rejected forever.
-static bool beginTrip(const Fix& fx) {
+static bool beginTrip(const Fix& fx, bool continuation = false) {
+    gTripContinuation = false;
     fs::FS& storage = *gTripFS;
     gTripMeters = 0;
     gMaxSpeedMps = fx.speedMps;
@@ -911,6 +916,7 @@ static bool beginTrip(const Fix& fx) {
     gCoolT0 = fx.monoMs;
     gFsCheckT0 = fx.monoMs;
     gFullWarned = false;
+    gTripContinuation = continuation;
     Serial.printf("Trip started: %s\n", gTripPath);
     return true;
 }
@@ -970,7 +976,7 @@ static bool repairIfNeeded(fs::FS& storage, const char* path);
 // A size split keeps FINALIZING until its next piece has a valid prologue.
 static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
     fs::FS& storage = *gTripFS;
-    if (gTripPath[0] == 0) { gState = nextState; return; }
+    if (gTripPath[0] == 0) { gTripContinuation = false; gState = nextState; return; }
 
     // Duration runs to the last moving fix: the 5 min parked cooldown (or
     // the wait before a fix-loss finalize) that ends every trip would
@@ -980,7 +986,10 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
                  (gTripMeters < MIN_TRIP_METERS);
 
     FS_LOCK();
-    if (discardIfMicro && micro) {
+    // A successful continuation starts with the shared boundary fix (pending
+    // if untimed). Keep even a stopped tail, including a lone boundary point,
+    // so per-piece thresholds never discard recorded points from a split trip.
+    if (discardIfMicro && micro && !gTripContinuation) {
         Serial.printf("Discarding micro-trip (%.0f m, %lu ms)\n",
                       gTripMeters, (unsigned long)tripMs);
         storage.remove(gTripPath);
@@ -1025,6 +1034,7 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
 
     gPendCount = gPendHead = 0;
     gTripWriteFailed = false;
+    gTripContinuation = false;
     gState = nextState;
     if (nextState == IDLE) gDisplayTripFinalized = true;
     gNetRetryNow.store(true);   // after the file is closed and no longer active
@@ -1110,7 +1120,7 @@ static void tripFsmOnFix(const Fix& fx) {
             // a distance step. Reuse startup without the 10 s arming wait.
             armBufReset();
             armBufPush(fx);
-            if (roomForNewTrip(now) && beginTrip(fx)) {
+            if (roomForNewTrip(now) && beginTrip(fx, /*continuation=*/true)) {
                 gState = resumeState;
                 if (resumeState == COOLDOWN) gCoolT0 = coolT0;
             } else {
@@ -1785,6 +1795,12 @@ static void confirmVbusOff() {
     Serial.println("VBUS off for 10 s -- car off: finalizing trip, staying awake.");
     gVbusLost = true;
     if (gTripPath[0]) endTrip(/*discardIfMicro=*/false);
+    else if (gState == ARMING) {
+        // A confirmed car-off also cancels a start that never opened a file.
+        gState = IDLE;
+        armBufReset();
+        gPendCount = gPendHead = 0;
+    }
 }
 
 // =================================================================
@@ -1990,8 +2006,9 @@ static bool uploadFile(fs::FS& storage, const char* path) {
     // file's fault, so those stay queued.
     bool rejected = (code == 400 || code == 413);
     bool setAside = false;
+    bool deleted = false;
     if (ok) {
-        storage.remove(path);
+        deleted = storage.remove(path);
     } else if (rejected) {
         String bad = String(path) + ".bad";
         setAside = storage.rename(path, bad.c_str());
@@ -1999,7 +2016,12 @@ static bool uploadFile(fs::FS& storage, const char* path) {
     FS_UNLOCK();
 
     debugUpload(code);
-    if (ok) {
+    if (ok && !deleted) {
+        // HTTP success still clears upload backoff; the queued copy may retry.
+        Serial.printf("Upload %s (%u B, %.1f s) -> HTTP 200, but deleting the local file failed "
+                      "(will re-upload; the server ignores identical copies)\n",
+                      path, (unsigned)sz, secs);
+    } else if (ok) {
         Serial.printf("Upload %s (%u B, %.1f s) -> HTTP 200 (deleted)\n",
                       path, (unsigned)sz, secs);
     } else if (rejected) {
@@ -3128,6 +3150,13 @@ void loop() {
     serviceGpsConfiguration();
     serviceDebugRf();
     serviceRuntimeDiagnostics(); // before fix-loss finalization and PMU shutdown
+
+    // ARMING must also expire when no next fix arrives to drive the FSM.
+    if (gState == ARMING && millis() - gLastFixMonoMs > ARM_FIX_LOSS_MS) {
+        gState = IDLE;
+        armBufReset();
+        gPendCount = gPendHead = 0;
+    }
 
     // Fix-loss watchdog: a recording trip with no valid fix at all for
     // FIX_LOSS_END_MS (parked indoors, antenna failure) is finalized so

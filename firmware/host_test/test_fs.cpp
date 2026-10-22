@@ -1851,6 +1851,113 @@ int main(int argc, char** argv) {
         }
     }
 
+    printf("T61 losing all fixes during arming releases battery idle power-off\n");
+    {
+        resetWorld(); drive(15, 3);
+        CHECK(gState == ARMING && gArmCount == 3 && !gTripPath[0], "armed without a trip file");
+        // Already confirmed on battery: isolate the fix-loss watchdog.
+        PMU.vbusIn = false; gVbusLost = true;
+        // The empty UART poll in loop() advances the stub clock by 1 ms.
+        g_millis = gLastFixMonoMs + ARM_MS + SEG_GAP_MS - 1;
+        loop();
+        CHECK(gState == ARMING, "arming remains at the exact fix-loss bound");
+        ++g_millis; loop();
+        CHECK(gState == IDLE && gArmCount == 0 && gArmHead == 0 &&
+              gPendCount == 0 && gPendHead == 0 && !gTripPath[0],
+              "silent GPS past the bound clears arming and pending points");
+        uint32_t idleSince = gIdleSince;
+        loopFor(1000);
+        CHECK(gIdleSince == idleSince, "battery idle timer runs after arming fix loss");
+        loopFor(IDLE_BATT_SLEEP_MS);
+        CHECK(PMU.shutdownCalls == 1, "arming fix loss allows battery idle power-off");
+    }
+
+    printf("T62 confirmed VBUS loss cancels arming without a trip file\n");
+    {
+        resetWorld(); drive(15, 3);
+        vbus(false); loop();
+        CHECK(gState == ARMING && gVbusOffPending && !gTripPath[0], "VBUS loss starts confirmation while armed");
+        loopFor(VBUS_OFF_CONFIRM_MS - 100);
+        CHECK(gState == ARMING && !gVbusLost, "unconfirmed VBUS loss leaves arming alone");
+        loopFor(100);
+        CHECK(gVbusLost && gState == IDLE && gArmCount == 0 && gArmHead == 0 &&
+              gPendCount == 0 && gPendHead == 0 && tripFiles().empty(),
+              "confirmed VBUS loss clears arming even without a file or another fix");
+        uint32_t idleSince = gIdleSince;
+        loopFor(1000);
+        CHECK(gIdleSince == idleSince, "battery idle timer runs after VBUS cancels arming");
+        loopFor(IDLE_BATT_SLEEP_MS);
+        CHECK(PMU.shutdownCalls == 1, "VBUS loss during arming allows battery idle power-off");
+    }
+
+    printf("T63 a size-split moving tail survives normal cooldown\n");
+    {
+        for (bool timed : {false, true}) {
+            resetWorld(); SD.cardPresent = true; g_sdDisk.capacity = 32 * 1024 * 1024;
+            setup(); gClockSet = timed; drive(15, 40);
+            std::string first = gTripPath;
+            size_t reserve = (gPendCount + 1) * (TRKPT_LINE_BYTES - 1) + strlen(GPX_EPILOGUE);
+            padTripTo(TRIP_SPLIT_BYTES - reserve - 1);
+            drive(5, 1);
+            std::string tail = gTripPath;
+            CHECK(gState == ACTIVE && tail != first, "size split starts a continuation without arming");
+            drive(5, 5);
+            CHECK(gTripMeters > 20 && gTripMeters < MIN_TRIP_METERS &&
+                  gLastMoveMs - gTripT0 < MIN_TRIP_MS, "tail is moving but below both micro-trip thresholds");
+            drive(0, kCooldownSeconds + 1);
+            CHECK(gState == IDLE && g_sdDisk.files.count(tail) &&
+                  wellFormedShape(g_sdDisk.files.at(tail)) &&
+                  count(g_sdDisk.files.at(tail), "<trkpt ") == kCooldownSeconds + 7,
+                  "short moving continuation is kept with all recorded points after cooldown");
+            CHECK(g_sdDisk.files.count(tail) &&
+                  times(g_sdDisk.files.at(tail)).size() == (timed ? kCooldownSeconds + 7 : 0),
+                  "continuation also preserves buffered untimed points without inventing UTC");
+            size_t kept = g_sdDisk.files.size();
+            drive(5, 12); drive(0, kCooldownSeconds + 1);
+            CHECK(gState == IDLE && g_sdDisk.files.size() == kept,
+                  "next normal short trip is still discarded after the continuation ends");
+        }
+    }
+
+    printf("T64 a stopped split continuation keeps its recorded boundary and tail\n");
+    {
+        resetWorld(); SD.cardPresent = true; g_sdDisk.capacity = 32 * 1024 * 1024;
+        setup(); drive(15, 40); drive(0, 1);
+        padTripTo(TRIP_SPLIT_BYTES - (TRKPT_LINE_BYTES - 1) - strlen(GPX_EPILOGUE) - 1);
+        drive(0, 1);
+        std::string tail = gTripPath;
+        drive(0, kCooldownSeconds - 1);
+        CHECK(gState == IDLE && g_sdDisk.files.count(tail) &&
+              wellFormedShape(g_sdDisk.files.at(tail)) &&
+              count(g_sdDisk.files.at(tail), "<trkpt ") == kCooldownSeconds,
+              "stopped continuation retains the shared boundary and subsequent recorded fixes");
+    }
+
+    printf("T65 HTTP 200 reports a failed local delete honestly\n");
+    {
+        for (bool sd : {false, true}) {
+            resetWorld(); SD.cardPresent = sd; g_sdDisk.capacity = 32 * 1024 * 1024;
+            setup(); drive(15, 40);
+            std::string path = gTripPath;
+            endTrip(false);
+            fs::FS& storage = *gTripFS;
+            FakeDisk& disk = sd ? g_sdDisk : g_disk;
+            std::string complete = disk.files.at(path);
+            Serial.log.clear(); disk.failRemoves = 1;
+            CHECK(uploadFile(storage, path.c_str()) && g_httpRequests == 1 &&
+                  g_httpLastBody == complete && disk.files.at(path) == complete && hasPending(),
+                  "HTTP success stays success with identical bytes still queued after delete failure");
+            CHECK(logHas(("Upload " + path).c_str()) &&
+                  logHas("-> HTTP 200, but deleting the local file failed (will re-upload; the server ignores identical copies)") &&
+                  !logHas("(deleted)"), "delete failure log tells the truth without claiming deletion");
+            CHECK(g_lockDepth == 0 && disk.openHandles == 0, "failed deletion releases the filesystem lock and file");
+            Serial.log.clear();
+            CHECK(uploadFile(storage, path.c_str()) && g_httpRequests == 2 &&
+                  !disk.files.count(path) && logHas("HTTP 200 (deleted)") &&
+                  !logHas("deleting the local file failed"), "next successful delete retains the normal success message");
+        }
+    }
+
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
     return g_fail ? 1 : 0;
 }
