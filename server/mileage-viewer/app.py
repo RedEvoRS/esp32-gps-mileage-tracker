@@ -22,9 +22,10 @@ Design notes:
     Both components are strictly validated to prevent path traversal.
 
 Authentication:
-  - Every route except /health requires a logged-in session. Credentials
-    come from the environment (VIEWER_USERNAME + VIEWER_PASSWORD_HASH);
-    the plaintext password is never stored anywhere.
+  - The environment login is the admin; everyday editor logins live in
+    annotations.db. Roles are resolved from current server state on every
+    request. All registered private endpoints declare their allowed roles.
+    Passwords are stored only as hashes, never as plaintext.
   - Sessions are signed with VIEWER_SECRET_KEY. That key MUST be supplied
     from the environment and be stable: gunicorn runs multiple workers,
     and a per-process random key would mean a session minted by worker A
@@ -56,6 +57,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from flask import (
     Flask,
+    g,
     abort,
     jsonify,
     redirect,
@@ -66,7 +68,7 @@ from flask import (
     url_for,
 )
 from openpyxl import Workbook
-from werkzeug.security import check_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.exceptions import HTTPException
 
 # Support source-tree importlib tests and the container's flat /app layout.
@@ -79,6 +81,7 @@ from common.version import server_version
 from common.diagnostics import CatalogError, load_catalog
 from geocoding import Geocoder, GeocodeError
 import trip_merges
+import users
 
 try:
     DIAGNOSTICS_CATALOG = load_catalog()
@@ -141,6 +144,25 @@ LOCKOUT_MINUTES = 15
 # /health stays open for Docker and reports the public server build version.
 # Everything else -- including /static and GPX files -- needs a session.
 PUBLIC_ENDPOINTS = {"health", "login"}
+
+# Keep all role decisions here. New endpoints are denied until declared.
+ENDPOINT_ROLES = {
+    "static": {"admin", "editor"},
+    "index": {"admin", "editor"},
+    "trip_view": {"admin", "editor"},
+    "trip_gpx": {"admin", "editor"},
+    "annotate": {"admin", "editor"},
+    "lookup_place": {"admin", "editor"},
+    "merge_trip": {"admin", "editor"},
+    "split_trip": {"admin", "editor"},
+    "export_csv": {"admin", "editor"},
+    "export_xlsx": {"admin", "editor"},
+    "device_health": {"admin", "editor"},
+    "logout": {"admin", "editor"},
+    "admin": {"admin"},
+    "account_password": {"admin", "editor"},
+}
+DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32))
 
 
 def _startup_check():
@@ -225,6 +247,7 @@ def init_db():
         columns = {row[1] for row in conn.execute("PRAGMA table_info(annotations)")}
         if "destination" not in columns:
             conn.execute("ALTER TABLE annotations ADD COLUMN destination TEXT NOT NULL DEFAULT ''")
+        users.init_schema(conn)
         Geocoder.init_schema(conn)
         trip_merges.init_schema(conn)
         # Failed-login tracking. This lives in SQLite, not in a module
@@ -372,11 +395,26 @@ def _password_tag():
 
 
 def _is_logged_in():
-    return (
-        bool(VIEWER_USERNAME)
-        and session.get("user") == VIEWER_USERNAME
-        and _safe_equal(session.get("pw_tag", ""), _password_tag())
-    )
+    # The cookie identifies a session, never grants a role on its own.
+    g.role = None
+    g.user = None
+    if session.get("kind") == "editor":
+        username = session.get("user", "")
+        try:
+            users.validate_username(username, VIEWER_USERNAME)
+        except users.UserError:
+            return False
+        user = users.get_user(DB_PATH, username)
+        if (user is not None and not user["disabled"]
+                and _safe_equal(session.get("pw_tag", ""), users.session_tag(VIEWER_SECRET_KEY, user))):
+            g.role, g.user = "editor", user["username"]
+            return True
+        return False
+    if (bool(VIEWER_USERNAME) and session.get("user") == VIEWER_USERNAME
+            and _safe_equal(session.get("pw_tag", ""), _password_tag())):
+        g.role, g.user = "admin", VIEWER_USERNAME
+        return True
+    return False
 
 
 def _valid_csrf():
@@ -412,10 +450,18 @@ def _require_login():
 
 
 @app.before_request
+def _require_role():
+    if request.endpoint in PUBLIC_ENDPOINTS or request.endpoint is None:
+        return None
+    if g.role not in ENDPOINT_ROLES.get(request.endpoint, set()):
+        abort(403)
+
+
+@app.before_request
 def _csrf_protect():
     """Reject state-changing requests without a matching session token.
 
-    Registered after _require_login, so it only ever sees authenticated
+    Registered after _require_login and _require_role, so it only ever sees authenticated
     requests. /login validates its own token inside the view, where it can
     show a friendly message instead of a bare 400.
     """
@@ -877,6 +923,14 @@ THEME_HEAD = """
 
 THEME_BUTTON = '<button type="button" class="theme-toggle" data-theme-toggle>Theme: Auto</button>'
 
+ACCOUNT_BUTTON = """
+{% if g.role %}
+<span class="account-name">{{ g.user }} ({{ 'Admin' if g.role == 'admin' else 'Everyday' }})</span>
+{% if g.role == 'admin' %}<a class="account-link" href="{{ url_for('admin') }}">Admin</a>
+{% else %}<a class="account-link" href="{{ url_for('account_password') }}">Change password</a>{% endif %}
+{% endif %}
+"""
+
 DEVICE_HEALTH_BUTTON = """
 {% if request.endpoint == 'device_health' %}
 <span class="device-health" aria-current="page">Device health</span>
@@ -948,14 +1002,14 @@ BASE_CSS = THEME_CSS + """
                     justify-content: flex-end; margin-left: auto; }
   .header-version { color: var(--header-text); opacity: .85; font-size: 12px; white-space: nowrap; }
   header form.logout { margin: 0; }
-  header form.logout button, header .theme-toggle, header .device-health {
+  header form.logout button, header .theme-toggle, header .device-health, header .account-link {
            background: var(--header-button-bg); color: var(--header-button-text);
            border: 1px solid var(--header-button-border); padding: 5px 12px;
            border-radius: 5px; font: 13px/1.4 system-ui, sans-serif; white-space: nowrap; }
-  header form.logout button, header .theme-toggle, header a.device-health { cursor: pointer; }
-  header form.logout button:hover, header .theme-toggle:hover, header a.device-health:hover {
+  header form.logout button, header .theme-toggle, header a.device-health, header .account-link { cursor: pointer; }
+  header form.logout button:hover, header .theme-toggle:hover, header a.device-health:hover, header .account-link:hover {
            background: var(--header-button-hover); }
-  header form.logout button:focus-visible, header .theme-toggle:focus-visible, header a.device-health:focus-visible {
+  header form.logout button:focus-visible, header .theme-toggle:focus-visible, header a.device-health:focus-visible, header .account-link:focus-visible {
            outline: 2px solid var(--header-text); outline-offset: 3px; }
   header .device-health[aria-current="page"] {
            background: var(--header-text); color: var(--header-bg); }
@@ -991,7 +1045,7 @@ BASE_CSS = THEME_CSS + """
   .leaflet-control-attribution a { color: var(--map-link); }
   form.annotate { margin-top: 18px; max-width: 520px; }
   label { display: block; margin: 10px 0 4px; font-weight: 600; font-size: 14px; }
-  select, textarea, input[type=text] { width: 100%; padding: 8px; font-size: 14px; box-sizing: border-box;
+  select, textarea, input[type=text], input[type=password] { width: 100%; padding: 8px; font-size: 14px; box-sizing: border-box;
       background: var(--input-bg); color: var(--input-text);
       border: 1px solid var(--input-border); border-radius: 4px; }
 """
@@ -1005,12 +1059,33 @@ VERSION_FOOTER = '<footer class="server-version">Server {{ server_version }}</fo
 VERSION_HEADER = '<div class="header-version">Server {{ server_version }}</div>'
 
 
+ACCOUNT_HEADER = """
+{% if g.role %}<header><a href="{{ url_for('index') }}">Trips</a><div class="header-actions">
+""" + VERSION_HEADER + DEVICE_HEALTH_BUTTON + ACCOUNT_BUTTON + THEME_BUTTON + """
+<form class="logout" method="post" action="{{ url_for('logout') }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Log out</button>
+</form></div></header>{% endif %}
+"""
+
+ACCOUNT_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }}</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """</style></head><body>
+""" + ACCOUNT_HEADER + """<main class="wrap"><h1>{{ title }}</h1>
+{% if title == 'Admin' %}<p>{{ admin_username }}: Admin (set in viewer.env)</p>
+<table><tr><th>Everyday login</th><th>Status</th><th>Created</th></tr>
+{% for user in logins %}<tr><td>{{ user.username }}</td><td>{{ 'disabled' if user.disabled else 'enabled' }}</td>
+<td>{{ fmt_date(user.created_at) }}</td></tr>{% endfor %}</table>
+{% else %}<p>The admin password lives in viewer.env. Rerun <code>bash install.sh</code> and answer n to keeping the login to change it.</p>{% endif %}
+</main></body></html>
+"""
+
+
 ERROR_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>{{ error.name }}</title>
 """ + THEME_HEAD + """<style>""" + BASE_CSS + """</style></head><body>
-<main class="wrap"><h1>{{ error.code }} {{ error.name }}</h1>
+""" + ACCOUNT_HEADER + """<main class="wrap"><h1>{{ error.code }} {{ error.name }}</h1>
 <p>{{ error.description }}</p></main>
-""" + VERSION_FOOTER + """</body></html>
+{% if not g.role %}""" + VERSION_FOOTER + """{% endif %}</body></html>
 """
 
 
@@ -1067,7 +1142,7 @@ LIST_HTML = """
 """ + THEME_HEAD + """<style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index') }}">🚗 Mileage Tracker</a>
   <div class="header-actions">
-    """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + THEME_BUTTON + """
+    """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + ACCOUNT_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit">Log out</button>
@@ -1146,7 +1221,7 @@ TRIP_HTML = """
 <style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index', year=year or '') }}">← {{ year or 'All' }} trips</a>
   <div class="header-actions">
-    """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + THEME_BUTTON + """
+    """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + ACCOUNT_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit">Log out</button>
@@ -1313,7 +1388,7 @@ DEVICE_HEALTH_HTML = """
 </style></head><body>
 <header><a href="{{ url_for('index') }}">← Trips</a>
   <div class="header-actions">
-    """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + THEME_BUTTON + """
+    """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + ACCOUNT_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit">Log out</button>
@@ -1453,13 +1528,25 @@ def login():
         # Always run the hash comparison, even when the username is wrong,
         # so response time doesn't reveal whether the username exists.
         name_ok = _safe_equal(username, VIEWER_USERNAME)
-        pass_ok = check_password_hash(VIEWER_PASSWORD_HASH, password)
+        user = None if name_ok else users.get_user(DB_PATH, username)
+        chosen_hash = VIEWER_PASSWORD_HASH if name_ok else (user["password_hash"] if user else DUMMY_PASSWORD_HASH)
+        pass_ok = check_password_hash(chosen_hash, password)
+        editor_ok = user is not None and not user["disabled"]
+        if editor_ok:
+            try:
+                users.validate_username(user["username"], VIEWER_USERNAME)
+            except users.UserError:
+                editor_ok = False
 
-        if name_ok and pass_ok:
+        if pass_ok and (name_ok or editor_ok):
             _clear_failures(ip)
             session.clear()  # new session id on privilege change
             session["user"] = VIEWER_USERNAME
             session["pw_tag"] = _password_tag()
+            if not name_ok:
+                session["kind"] = "editor"
+                session["user"] = user["username"]
+                session["pw_tag"] = users.session_tag(VIEWER_SECRET_KEY, user)
             session["csrf"] = secrets.token_urlsafe(32)
             session.permanent = True
             return redirect(_safe_next(request.args.get("next")) or url_for("index"))
@@ -1470,6 +1557,17 @@ def login():
         return render_template_string(LOGIN_HTML, error=error), 401
 
     return render_template_string(LOGIN_HTML, error=error)
+
+
+@app.route("/admin")
+def admin():
+    return render_template_string(ACCOUNT_HTML, title="Admin", admin_username=VIEWER_USERNAME,
+                                  logins=users.list_users(DB_PATH))
+
+
+@app.route("/account/password")
+def account_password():
+    return render_template_string(ACCOUNT_HTML, title="Change password")
 
 
 @app.route("/logout", methods=["POST"])

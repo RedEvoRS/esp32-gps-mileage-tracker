@@ -260,18 +260,18 @@ class ServiceVersions(unittest.TestCase):
         self.assertIn("<dt>Server</dt><dd>v0.01+abcdef1234</dd>", html)
         self.assertIn("No health snapshot received", html)
 
-    def test_footer_on_http_errors_preserves_status_and_headers(self):
+    def test_version_on_http_errors_preserves_status_and_headers(self):
         client = self.viewer.app.test_client()
         with client.session_transaction() as session:
             session.update(user="driver", pw_tag=self.viewer._password_tag())
         with patch.dict(os.environ, SERVER_VERSION="v0.01"):
             response = client.get("/trip/2026-10/missing")
             self.assertEqual(response.status_code, 404)
-            self.assert_footer_version(response.text, "v0.01")
+            self.assert_header_version(response.text, "v0.01")
             response = client.put("/health")
             self.assertEqual(response.status_code, 405)
             self.assertIn("GET", response.headers["Allow"])
-            self.assert_footer_version(response.text, "v0.01")
+            self.assert_header_version(response.text, "v0.01")
             with patch.object(self.viewer, "read_diagnostics", return_value={"state": "unavailable"}):
                 response = client.get("/device-health")
             self.assertEqual(response.status_code, 503)
