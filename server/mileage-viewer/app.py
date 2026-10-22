@@ -169,6 +169,8 @@ ENDPOINT_ROLES = {
     "admin": {"admin"},
     "admin_removed": {"admin"},
     "admin_history": {"admin"},
+    "close_year": {"admin"},
+    "reopen_year": {"admin"},
     "remove_trip": {"admin"},
     "restore_trip": {"admin"},
     "account_password": {"admin", "editor"},
@@ -793,6 +795,12 @@ def fmt_date(iso):
     return dt.strftime("%Y-%m-%d %H:%M %Z") if dt else "—"
 
 
+def fmt_day(iso):
+    """A stored UTC timestamp's date in the display timezone."""
+    dt = _to_local(_parse(iso))
+    return dt.strftime("%Y-%m-%d") if dt else "—"
+
+
 def _trip_date_anchor(trip):
     """Year/sort anchor; a partial trip's observed date is not its start."""
     if _parse(trip.get("start_time")):
@@ -977,11 +985,16 @@ def history_filters():
     return int(raw_page), trip or None
 
 
+def valid_year(raw_year):
+    """A four-digit calendar year (not 0000) as an int, else 400."""
+    if not re.fullmatch(r"[0-9]{4}", raw_year or "") or int(raw_year) == 0:
+        abort(400, description="Year must be a four-digit calendar year.")
+    return int(raw_year)
+
+
 def selected_year():
     raw_year = request.args.get("year", "")
-    if raw_year and (not re.fullmatch(r"[0-9]{4}", raw_year) or int(raw_year) == 0):
-        abort(400, description="Year must be a four-digit calendar year.")
-    return int(raw_year) if raw_year else None
+    return valid_year(raw_year) if raw_year else None
 
 
 def _may_start_in(ym, year):
@@ -994,6 +1007,24 @@ def _may_start_in(ym, year):
     return ym.startswith(f"{year}-") or ym == f"{year + 1}-01"
 
 
+def _folder_years(ym):
+    """The years a trip with an unreadable summary may belong to, by folder."""
+    folder_year = int(ym[:4])
+    return {folder_year, folder_year - 1} if ym.endswith("-01") else {folder_year}
+
+
+def _trip_local_year(trip):
+    """The year the list and exports file a readable trip under, or None."""
+    local = _to_local(_parse(_trip_date_anchor(trip)))
+    return local.year if local else None
+
+
+def year_members(trips, unreadable, year):
+    """The trips of one local year: the single rule behind list, exports and review."""
+    return ([t for t in trips if _trip_local_year(t) == year],
+            [t for t in unreadable if _may_start_in(t["ym"], year)])
+
+
 def selected_trips(include_history=False):
     """Use local start year, or first recorded time for partly timed trips.
 
@@ -1002,17 +1033,11 @@ def selected_trips(include_history=False):
     """
     year = selected_year()
     trips, unreadable = load_trips()
-    years = set()
-    selected = []
-    for trip in trips:
-        local = _to_local(_parse(_trip_date_anchor(trip)))
-        if local:
-            years.add(local.year)
-        if year is None or (local and local.year == year):
-            selected.append(trip)
+    years = {y for y in map(_trip_local_year, trips) if y}
+    selected = trips
     if year:
         years.add(year)
-        unreadable = [t for t in unreadable if _may_start_in(t["ym"], year)]
+        selected, unreadable = year_members(trips, unreadable, year)
     if include_history:
         with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
             conn.row_factory = sqlite3.Row
@@ -1033,8 +1058,78 @@ def mileage_totals(trips):
     return {category: round(miles, 3) for category, miles in totals.items()}
 
 
+# ---------------------------------------------------------------------
+# Closed years
+# ---------------------------------------------------------------------
+
+
+def _recording_years(key):
+    """Years the original recording filed under key may belong to.
+
+    A merged trip hides its parts from the loaded lists, so a part's year has
+    to come from its own summary file, by the same rule as any other trip.
+    """
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}/[A-Za-z0-9_-]+", key or ""):
+        return set()
+    summary, problem = read_summary(DATA_ROOT / f"{key}.json")
+    if problem:
+        return _folder_years(key.split("/")[0])
+    year = _trip_local_year(summary)
+    return {year} if year else set()
+
+
+def trip_years(trip):
+    """Every year a trip counts as belonging to, for the closed-year lock.
+
+    A readable trip belongs to exactly the year the list and exports file it
+    under. An unreadable one goes by its folder: either candidate year counts.
+    A merged trip also counts as belonging to the year of each of its parts,
+    so a merge can't be used to edit a trip in a closed year. A trip with no
+    date anchor has no year here, so it is never locked: the list and the
+    exports file it only under "All years" either.
+    """
+    if "problem" in trip:
+        years = _folder_years(trip["ym"])
+    else:
+        year = _trip_local_year(trip)
+        years = {year} if year else set()
+    for part in trip.get("parts", ()):
+        years |= _recording_years(part)
+    return years
+
+
+def locked_year(trip, closed):
+    """The earliest closed year the trip belongs to, or None. closed: closed_years()."""
+    hit = trip_years(trip) & closed.keys()
+    return min(hit) if hit else None
+
+
+def _abort_if_year_closed(closed, *trips):
+    """409 for an edit that touches a trip in a closed year."""
+    for trip in trips:
+        year = locked_year(trip, closed)
+        if year:
+            abort(409, description=(
+                f"{year} is closed for edits. The admin can reopen it on the year review page."))
+
+
+def _abort_if_key_in_closed_year(conn, *keys):
+    """The same refusal for routes that only have the trip's canonical key.
+
+    Caller holds its BEGIN IMMEDIATE transaction and has set conn.row_factory
+    to sqlite3.Row. A key that matches no trip is left to the route's own
+    404/409, and with no closed year nothing is loaded.
+    """
+    closed = trip_log.closed_years(conn)
+    if not closed:
+        return
+    trips, unreadable = load_trips(conn, include_removed=True)
+    by_key = {t["trip_key"]: t for t in trips + unreadable}
+    _abort_if_year_closed(closed, *(by_key[key] for key in keys if key in by_key))
+
+
 app.jinja_env.globals.update(
-    fmt_date=fmt_date, fmt_trip_date=fmt_trip_date, fmt_duration=fmt_duration,
+    fmt_date=fmt_date, fmt_day=fmt_day, fmt_trip_date=fmt_trip_date, fmt_duration=fmt_duration,
     fmt_speed=fmt_speed, csrf_token=_csrf_token
 )
 
@@ -1381,6 +1476,7 @@ LIST_HTML = """
       </select>
       <button class="btn" type="submit">Apply</button>
     </form>
+    {% if year_closed %}<span class="tag other">Closed for edits</span>{% endif %}
     <a class="btn" href="{{ url_for('export_csv', year=year or '') }}">Export CSV</a>
     <a class="btn secondary" href="{{ url_for('export_xlsx', year=year or '') }}">Export XLSX</a>
     <span class="muted">{{ trips|length }} trip(s) · {{ "%.3f"|format(totals.all) }} mi total</span>
@@ -1434,13 +1530,19 @@ TRIP_HTML = """
   <p class="muted">{% if last_edited.pre_history %}Edited before the change history began ({{ fmt_date(last_edited.at) }})
     {% else %}Last edited by {{ last_edited.actor }} on {{ fmt_date(last_edited.at) }}{% endif %}</p>
   {% endif %}
+  {% if year_lock %}
+  <div class="warn" role="status">{{ year_lock.year }} is closed for edits (closed by {{ year_lock.closed_by }} on {{ fmt_day(year_lock.closed_at) }}).
+    Nobody can change, merge, remove or restore this trip until the admin reopens {{ year_lock.year }} on the year review page.</div>
+  {% endif %}
   {% if removal %}
   <div class="warn" role="status">
     <b>Removed from the log</b> by {{ removal.removed_by }} on {{ fmt_date(removal.removed_at) }}: {{ removal.reason }}
+    {% if not year_lock %}
     <form method="post" action="{{ url_for('restore_trip', ym=t.ym, trip_id=t.id, year=year or '') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button class="btn" type="submit">Restore to the log</button>
     </form>
+    {% endif %}
   </div>
   {% endif %}
   {% if t.get('timing_status') == 'partial' %}
@@ -1497,6 +1599,11 @@ TRIP_HTML = """
     {% endif %}
   </section>
 
+  {% if year_lock %}
+  {% if t.get('parts') %}
+  <p>Merged from {{ t.parts|length }} recordings. Source GPX files: <code>{{ t.gpx_file }}</code></p>
+  {% endif %}
+  {% else %}
   <section aria-labelledby="merge-heading">
     <h3 id="merge-heading">Join a split drive</h3>
     {% if t.get('parts') %}
@@ -1531,7 +1638,14 @@ TRIP_HTML = """
       with the next start no more than 15 minutes after this recording ends.</p>
     {% endif %}
   </section>
+  {% endif %}
 
+  {% if year_lock %}
+  <section aria-labelledby="annotation-heading">
+    <h3 id="annotation-heading">Purpose, destination and note</h3>
+    <p>{{ t.category or '—' }}, {{ t.destination or '—' }}, {{ t.purpose_note or '—' }}</p>
+  </section>
+  {% else %}
   <form class="annotate" method="post"
         action="{{ url_for('annotate', ym=t.ym, trip_id=t.id, year=year or '') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -1553,7 +1667,8 @@ TRIP_HTML = """
     <textarea name="purpose_note" id="purpose_note" rows="3">{{ t.purpose_note or "" }}</textarea>
     <p><button class="btn" type="submit">Save</button></p>
   </form>
-  {% if g.role == 'admin' %}
+  {% endif %}
+  {% if g.role == 'admin' and not year_lock %}
   <section aria-labelledby="remove-heading">
     <h3 id="remove-heading">Remove from log</h3>
     <p>Takes this trip out of the trip list, totals and exports for everyone. The GPX and
@@ -1907,6 +2022,10 @@ def _history_summary(row):
         return "Removed from the log: " + str(details.get("reason", ""))
     if action == "restore":
         return "Restored to the log. Removal reason: " + str(details.get("reason", ""))
+    if action == "year_close":
+        return "Closed for edits."
+    if action == "year_reopen":
+        return "Reopened for edits."
     label = action.replace("_", " ").capitalize()
     return f"{label}: {json.dumps(details, ensure_ascii=False, sort_keys=True)}"
 
@@ -1986,6 +2105,35 @@ def admin_history():
     )
 
 
+def _change_year(raw_year, closing_it):
+    """Close or reopen a year: a tax_years row and its history row, in one transaction."""
+    year = valid_year(raw_year)
+    if request.form.get("confirm") != "yes":
+        abort(400, description=f"Confirm {'closing' if closing_it else 'reopening'} {year}.")
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        is_closed = year in trip_log.closed_years(conn)
+        if is_closed == closing_it:
+            abort(409, description=f"{year} is already {'closed' if closing_it else 'open'}.")
+        if closing_it:
+            trip_log.close_year(conn, year, g.user)
+        else:
+            trip_log.reopen_year(conn, year)
+        trip_log.record(conn, f"year/{year}", "year_close" if closing_it else "year_reopen", {},
+                        actor=g.user, actor_role=g.role)
+    return redirect(url_for("index", year=year))
+
+
+@app.route("/admin/year/<year>/close", methods=["POST"])
+def close_year(year):
+    return _change_year(year, True)
+
+
+@app.route("/admin/year/<year>/reopen", methods=["POST"])
+def reopen_year(year):
+    return _change_year(year, False)
+
+
 @app.route("/trip/<ym>/<trip_id>/remove", methods=["POST"])
 def remove_trip(ym, trip_id):
     year = selected_year()
@@ -2003,8 +2151,10 @@ def remove_trip(ym, trip_id):
         if trip_log.removal(conn, key):
             abort(409, description="This trip is already removed from the log.")
         trips, unreadable = load_trips(conn, include_removed=True)
-        if not any(trip["trip_key"] == key for trip in trips + unreadable):
+        trip = next((t for t in trips + unreadable if t["trip_key"] == key), None)
+        if trip is None:
             abort(404)
+        _abort_if_year_closed(trip_log.closed_years(conn), trip)
         trip_log.add_removal(conn, key, reason, g.user)
         trip_log.record(conn, key, "remove", {"reason": reason}, actor=g.user, actor_role=g.role)
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
@@ -2015,11 +2165,13 @@ def restore_trip(ym, trip_id):
     year = selected_year()
     _safe_trip_paths(ym, trip_id)
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
         key = trip_merges.canonical_key(conn, f"{ym}/{trip_id}")
         removal = trip_log.removal(conn, key)
         if not removal:
             abort(409, description="This trip is not removed from the log.")
+        _abort_if_key_in_closed_year(conn, key)
         trip_log.delete_removal(conn, key)
         trip_log.record(conn, key, "restore", {"reason": removal["reason"]},
                         actor=g.user, actor_role=g.role)
@@ -2066,9 +2218,11 @@ def logout():
 @app.route("/")
 def index():
     trips, unreadable, year, years = selected_trips()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        year_closed = year in trip_log.closed_years(conn)
     return render_template_string(
         LIST_HTML, trips=trips, unreadable=unreadable, year=year, years=years,
-        totals=mileage_totals(trips), timezone=DISPLAY_TZ_NAME,
+        totals=mileage_totals(trips), timezone=DISPLAY_TZ_NAME, year_closed=year_closed,
     )
 
 
@@ -2098,9 +2252,13 @@ def trip_view(ym, trip_id):
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         conn.row_factory = sqlite3.Row
         last_edited = _last_edited(conn, t)
+        closed = trip_log.closed_years(conn)
+    lock_year = locked_year(t, closed) if closed else None
+    year_lock = {"year": lock_year, **closed[lock_year]} if lock_year else None
     if t.get("removal"):
         return render_template_string(TRIP_HTML, t=t, removal=t["removal"], categories=CATEGORIES,
-                                      year=year, geocoder_enabled=False, last_edited=last_edited)
+                                      year=year, geocoder_enabled=False, last_edited=last_edited,
+                                      year_lock=year_lock)
     merge_next, merge_block_reason = trip_merges.next_trip(t, trips, unreadable)
     places = {}
     if GEOCODER.enabled:
@@ -2113,7 +2271,7 @@ def trip_view(ym, trip_id):
     return render_template_string(TRIP_HTML, t=t, categories=CATEGORIES, year=year,
                                   geocoder_enabled=GEOCODER.enabled, places=places, merge_next=merge_next,
                                   merge_block_reason=merge_block_reason,
-                                  last_edited=last_edited,
+                                  last_edited=last_edited, year_lock=year_lock,
                                   merge_conflict=bool(merge_next and trip_merges.annotated(t) and trip_merges.annotated(merge_next)))
 
 
@@ -2176,6 +2334,7 @@ def annotate(ym, trip_id):
         if canonical != key:
             abort(409, description="This part has been merged. Reopen the merged trip before editing.")
         _abort_if_removed(conn, key)
+        _abort_if_key_in_closed_year(conn, key)
         merged = conn.execute("SELECT * FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
         after = {"category": category, "purpose_note": note, "destination": destination}
         if merged:
@@ -2232,11 +2391,14 @@ def merge_trip(ym, trip_id):
         current = next((t for t in trips if t["trip_key"] == f"{ym}/{trip_id}"), None)
         if current is None:
             abort(409, description="Trip changed or is unavailable. Reopen the trip list.")
+        closed = trip_log.closed_years(conn)
+        _abort_if_year_closed(closed, current)
         following, block_reason = trip_merges.next_trip(current, trips, unreadable)
         if block_reason:
             abort(409, description=block_reason)
         if following is None or request.form.get("next_trip") != following["trip_key"]:
             abort(409, description="Only the next trip from the same device within 15 minutes can be merged. Reopen this trip.")
+        _abort_if_year_closed(closed, following)
         if not current["has_gpx"] or not following["has_gpx"]:
             abort(409, description="Both recordings are required to merge.")
         if trip_merges.annotated(current) and trip_merges.annotated(following):
@@ -2283,11 +2445,13 @@ def split_trip(ym, trip_id):
         abort(400, description="Confirm restoring original annotations and removing the merged annotation.")
     key = f"{ym}/{trip_id}"
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
         _abort_if_removed(conn, key)
         keys = trip_merges.parts(conn, key)
         if not keys:
             abort(409, description="This merge no longer exists. Reopen the trip list.")
+        _abort_if_key_in_closed_year(conn, key)
         conn.execute("DELETE FROM trip_merge_aliases WHERE merge_key=?", (key,))
         conn.execute("DELETE FROM trip_merge_parts WHERE merge_key=?", (key,))
         conn.execute("DELETE FROM trip_merges WHERE trip_key=?", (key,))

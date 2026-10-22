@@ -91,6 +91,8 @@ class ViewerRolesTests(unittest.TestCase):
             'admin': ('/admin', 'GET', 200),
             'admin_removed': ('/admin/removed', 'GET', 200),
             'admin_history': ('/admin/history', 'GET', 200),
+            'close_year': ('/admin/year/2026/close', 'POST', 400),
+            'reopen_year': ('/admin/year/2026/reopen', 'POST', 400),
             'remove_trip': ('/trip/2026-01/drive/remove', 'POST', 400),
             'restore_trip': ('/trip/2026-01/drive/restore', 'POST', 409),
             'account_password': ('/account/password', 'GET', 200),
@@ -115,7 +117,8 @@ class ViewerRolesTests(unittest.TestCase):
                     if role is None:
                         expected = (200 if endpoint == 'health' or (endpoint == 'login' and method == 'GET')
                                     else (302 if method == 'GET' else 401))
-                    elif endpoint in {'admin', 'admin_removed', 'admin_history', 'remove_trip', 'restore_trip'} and role == 'editor':
+                    elif endpoint in {'admin', 'admin_removed', 'admin_history', 'close_year', 'reopen_year',
+                                      'remove_trip', 'restore_trip'} and role == 'editor':
                         expected = 403
                     response = self.client.open(path, method=method, data={'csrf_token': 'known-token'})
                     self.assertEqual(response.status_code, expected)

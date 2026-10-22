@@ -1,4 +1,4 @@
-"""Viewer-owned log records for removals and changes to the trip log.
+"""Viewer-owned log records for removals, closed years and changes to the trip log.
 
 A removal is a row in annotations.db, never a change to ./data. The GPX and
 JSON files stay exactly as ingest wrote them (and the viewer mounts ./data
@@ -29,6 +29,11 @@ def init_schema(conn):
     )""")
     conn.execute("CREATE INDEX IF NOT EXISTS trip_history_trip_at ON trip_history (trip_key, at)")
     conn.execute("CREATE INDEX IF NOT EXISTS trip_history_at ON trip_history (at)")
+    # A row means the year is closed for edits; reopening deletes it. The
+    # history rows (trip_key "year/<YYYY>") keep the record of who and when.
+    conn.execute("""CREATE TABLE IF NOT EXISTS tax_years (
+        year INTEGER PRIMARY KEY, closed_by TEXT NOT NULL, closed_at TEXT NOT NULL
+    )""")
 
 
 def removal(conn, key):
@@ -54,6 +59,21 @@ def add_removal(conn, key, reason, removed_by):
 
 def delete_removal(conn, key):
     conn.execute("DELETE FROM trip_removals WHERE trip_key=?", (key,))
+
+
+def closed_years(conn):
+    """Every closed year, as {year: {"closed_by", "closed_at"}}."""
+    return {r[0]: {"closed_by": r[1], "closed_at": r[2]}
+            for r in conn.execute("SELECT year, closed_by, closed_at FROM tax_years")}
+
+
+def close_year(conn, year, closed_by):
+    conn.execute("INSERT INTO tax_years (year, closed_by, closed_at) VALUES (?, ?, ?)",
+                 (year, closed_by, now_utc()))
+
+
+def reopen_year(conn, year):
+    conn.execute("DELETE FROM tax_years WHERE year=?", (year,))
 
 
 def record(conn, trip_key, action, details, *, actor, actor_role):
