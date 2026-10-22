@@ -188,15 +188,14 @@ yourself, work through these steps in order:
 4. Install the three libraries:
    [Install required libraries](#install-required-libraries).
 5. Apply the [board settings](#board-settings).
-6. Stage 4 only: create `secrets.h` and run the version stamp. Stages 1-3
+6. Stage 4 only: create `secrets.h` and run the version stamp. Stages 1–3
    compile without `secrets.h`, but Stage 4 won't compile without it. Follow
    [Before flashing](#stage-4-the-trip-logger) and
    [Upload a sketch](#upload-a-sketch-and-read-its-messages). Run the version
    stamp before every Stage 4 build.
-7. Compile and upload the sketch.
-
-Back up the factory flash before your first upload: see
-[Back up the factory flash first](#back-up-the-factory-flash-first).
+7. Before the first upload to a new board,
+   [back up the factory flash](#back-up-the-factory-flash-first). Then
+   compile and [upload the sketch](#upload-a-sketch-and-read-its-messages).
 
 ## T-Beam Supreme bring-up
 
@@ -420,7 +419,7 @@ arduino-cli lib install XPowersLib@0.3.3 TinyGPSPlus@1.0.3 U8g2@2.36.18
 arduino-cli compile --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled firmware/03_gps_test
 ```
 
-Replace `03_gps_test` with the sketch you want. Stages 1-3 need nothing
+Replace `03_gps_test` with the sketch you want. Stages 1–3 need nothing
 else. For Stage 4, first create `secrets.h` and run the version stamp (see
 [Before flashing](#stage-4-the-trip-logger)), then add one more option to
 the compile command:
