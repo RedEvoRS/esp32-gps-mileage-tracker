@@ -1033,7 +1033,7 @@ check_port_free() {
     if [[ -n $taken ]]; then
         die "Port $port is already in use (${taken//$'\n'/, }), so $svc can't start." \
             "See what has it: sudo ss -tlnp 'sport = :$port'" \
-            "Stop that program, or change the port mapping in docker-compose.yml."
+            "Stop or reconfigure that program to free the port, then rerun install.sh."
     fi
 }
 

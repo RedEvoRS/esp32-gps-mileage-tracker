@@ -14,8 +14,11 @@ card, and uploads the stored trips over your home WiFi when you park.
 The server side is two small Flask services on the LAN. One accepts the
 uploads and computes trip distance. The other shows each trip on a map,
 records its business purpose, and exports the log as CSV or XLSX. Tracks and
-annotations stay on the local network; the only outside request is for
-OpenStreetMap tiles when the viewer draws a map.
+annotations stay on the local network by default. The viewer requests
+OpenStreetMap tiles when it draws a map. If you enable place lookup, it also
+sends the clicked trip endpoint to the provider you configure, which may be
+outside your network. The tracker asks an internet time server for the time
+when GPS time is unavailable.
 
 ## Where it's at
 
@@ -35,8 +38,10 @@ Uploads with debug mode off and server-down retry were also verified on
 (401/413/5xx) remain untested on the Supreme.
 
 Still to check on the road: the everyday (production) screen, the board's
-current draw while switched off, and a few car-power cases. Project progress
-is tracked in GitHub issues.
+current draw while switched off, and a few car-power cases. Distance accuracy
+still needs a pass mark based on comparisons with the car's odometer, followed
+by a week of normal driving on the exact firmware intended for release.
+Project progress is tracked in GitHub issues.
 
 **Have the older T-Beam V1.2?** This project started on the LilyGO TTGO
 T-Beam V1.2 (ESP32 + NEO-M8N) and no longer supports it. Its last firmware
@@ -71,8 +76,9 @@ describes the whole framework and lists every code.
 
 The logger decides on its own when a trip starts and stops. Going faster than 5 mph for 10 seconds starts one; staying under
 2 mph for 5 minutes ends it, allowing longer red lights without splitting
-a drive. Anything shorter than 30 seconds or about a tenth
-of a mile gets thrown away.
+a drive. When the stop timer or five minutes without a GPS fix ends a trip,
+it is discarded if shorter than 30 seconds of driving or about a tenth of a
+mile. Switching the car off keeps even a short trip that has started.
 
 The firmware writes each GPS point to the microSD card (or the internal
 flash fallback) and closes the file right after to limit data loss if
@@ -89,9 +95,10 @@ The server adds up distance point to point, with a few corrections. Wobble
 while you're parked doesn't count (at least one end of a step must be over
 2 mph), bad fixes and physically impossible jumps get skipped, and a gap in
 coverage like a tunnel or a parking garage gets filled with a straight line.
-A straight line is the shortest way between two points, so if the number is
-wrong, it's wrong in the low direction, which is the side you want to err on
-with the IRS.
+That gap estimate is the shortest path between the measured endpoints, so it
+can miss road distance through the gap. The total is still an estimate: GPS
+position noise can add distance even on accepted points. Accuracy is being
+checked against the car's odometer before a release pass mark is set.
 
 ## What you need
 
@@ -250,10 +257,13 @@ download mode, press RESET with BOOT released. See the
 
 Fit the FAT32 card with the board switched off. Take a drive of a few minutes
 outdoors, with the GPS antenna facing the sky and the battery fitted. Trips
-start after 10 seconds above 5 mph; drives shorter than 30 seconds or about
-a tenth of a mile are discarded. Park within home WiFi range and allow three
-minutes stopped for the trip to finish, plus time for uploads/retries. The
-battery keeps the board running after the car USB turns off.
+start after 10 seconds above 5 mph. Park within home WiFi range. If USB stays
+powered, allow five minutes below 2 mph for the trip to finish, plus time for
+uploads/retries. Switching the car off ends the trip sooner, once USB loss is
+confirmed after 10 seconds; the battery keeps the board running to upload.
+Trips ended by the stop timer or lost GPS are discarded if shorter than
+30 seconds of driving or about a tenth of a mile. Car power-off keeps short
+trips that have started.
 
 Open `http://<host>:8091/` and sign in with the viewer login. Check the trip,
 then open **Device health** and check for a newly received **current status
@@ -388,8 +398,8 @@ server/
 DEPLOY_DEBIAN.md    deployment walkthrough
 ```
 
-The `AUDIT_*` and `CODE_REVIEW_*` files at the top level are past code
-reviews, kept for the record.
+Past code reviews are kept in [docs/history/](docs/history/); its
+[README](docs/history/README.md) explains the historical records.
 
 ## A couple of notes
 

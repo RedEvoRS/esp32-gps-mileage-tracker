@@ -1,13 +1,7 @@
 # Firmware
 
-Stage 4 records an early BOOT battery reading and one INFO battery sample
-before clean PMU power-off, then uploads them with the existing diagnostics.
-Update the server to catalog v6 **before** installing this firmware; older
-firmware remains compatible with the new server. No meter or new viewer UI is
-needed. The read-only helper and interpretation guide are in
-[Reading parked battery drain](../DIAGNOSTICS.md#reading-parked-battery-drain-without-a-meter).
-Collect at least three parked intervals of eight hours or longer; voltage and
-PMU percentage give rough estimates, not a measured off-state current.
+This folder contains the board firmware and the sketches used to check the
+hardware before installing the trip logger.
 
 The firmware targets the **LilyGO T-Beam Supreme with u-blox MAX-M10S GPS**
 (not the L76K version), using a **SanDisk 32 GB Max Endurance microSD card**
@@ -95,6 +89,17 @@ Scripts run from a development checkout label the banner `development
 checkout`; downloaded release scripts show their release tag.
 
 ### First install, update and cleanup
+
+When updating, install the new server **before** building and flashing the
+firmware. The trip logger (Stage 4) records a battery reading in its `BOOT`
+startup event and an `INFO` (informational severity) battery event before a
+clean power-off. These need version 6 or later of the server's diagnostic
+catalog, the list of events the server accepts; updating the server first
+covers that requirement. Older firmware still works with the updated server.
+The [parked battery drain guide](../DIAGNOSTICS.md#reading-parked-battery-drain-without-a-meter)
+explains the read-only helper. Collect at least three parked intervals of
+eight hours or longer; voltage and battery percentage give rough estimates,
+not a measured off-state current.
 
 Before power-up, attach both antennas and fit the 18650 with correct polarity;
 see [hardware preparation](#before-the-first-power-up). Fit the FAT32 card
@@ -412,8 +417,18 @@ unless you select a version.
 
 ### Upload a sketch and read its messages
 
-Before compiling Stage 4, run `python tools/stamp_firmware_version.py` from
-the repository root. It combines `firmware/VERSION` with the ten-character Git
+The build-from-source route also needs **Python 3**. Install it if needed,
+then check `python --version` in a terminal (on macOS/Linux, try
+`python3 --version`). The output must say Python 3. Before compiling Stage 4,
+run this from the repository root:
+
+```bash
+python tools/stamp_firmware_version.py
+# If your Python 3 command is python3, use this instead:
+python3 tools/stamp_firmware_version.py
+```
+
+It combines `firmware/VERSION` with the ten-character Git
 commit, for example `v0.05+3f9a1c07be`, adding `-dirty` for tracked edits.
 Without usable Git, it uses the release archive's `firmware/COMMIT`; a missing,
 invalid or unexpanded hash warns and uses `firmware/VERSION` alone.
@@ -778,8 +793,10 @@ How it behaves once flashed:
 
 - **Trip detection:** logging starts after you sustain >5 mph for
   10 s and ends after you're below 2 mph for 5 minutes, tolerating
-  longer stops in traffic. Trips shorter than ~30 s (not counting
-  the 5 minutes parked at the end) or 0.1 mi are discarded as noise.
+  longer stops in traffic. When the stop timer or lost-GPS watchdog ends a
+  trip, it discards trips shorter than ~30 s (not counting the parked wait)
+  or 0.1 mi as noise. Confirmed USB loss when the car switches off, or a
+  clean board power-off, keeps even a short trip that has started.
   Speed must also pass the GPS receiver's accuracy check: a checksum-valid
   NAV-PVT received within 1.5 s, with `gnssFixOK`, a 3D or combined fix,
   and `sAcc` at most 0.5 m/s plus `hAcc` at most 5 m when starting,
@@ -905,6 +922,12 @@ Watch the Serial Monitor (115200) for state transitions:
 2026-10-21 (UTC), the serial log showed
 `Upload /trips/t000006.gpx (142443 B, 2.7 s) -> HTTP 200 (deleted)`.
 The local SD file was deleted, and the trip appeared in the viewer.
+If the server accepts a trip but the board can't delete its local copy (a
+failing card, for example), the line instead reads
+`-> HTTP 200, but deleting the local file failed (will re-upload; the server ignores identical copies)`.
+The trip is safely on the server; the copy is uploaded again at the next
+chance, and the server answers identical copies with 200 without storing a
+duplicate.
 
 Server-down retry was verified on 2026-10-21 (UTC): the trip stayed queued
 after two `HTTP -1` failures and uploaded with HTTP 200 after ingest
@@ -1038,9 +1061,12 @@ cycle to appear, and an upload age stops counting at 999 s.
 Things to know:
 
 - With debug off, the production screen shows a status card for 30 seconds
-  at every normal power-on, within a couple of seconds and without waiting
-  for a GPS fix. A dark screen at power-on therefore means something is
-  wrong (see E6001 in `DIAGNOSTICS.md`), not just that the GPS is still searching.
+  once normal startup completes, usually within a couple of seconds, without
+  waiting for a GPS fix. The first boot after a first install can take longer
+  while internal storage is prepared; boot-time trip repair can also delay it.
+  If it stays dark, check the serial startup log or **Device health** to
+  distinguish a slow or degraded start from an OLED communication fault
+  (diagnostic code E6001).
   It shows `Sats: N` for satellites **heard** (`Sats: --` until heard or when
   stale), then `OK` or only active warning-and-above `E####` codes. The satellite
   count and codes update while any status card is visible, without extending
@@ -1074,8 +1100,9 @@ Things to know:
   It keeps two-pixel panel margins and separated rows; `+N` fits through
   two digits. Full metrics, pixel positions and unchanged policy are in
   [DIAGNOSTICS.md](../DIAGNOSTICS.md#production-fonts-and-pixel-layout).
-  The revised font layout and current consumption still need bench acceptance.
-  The production screen has not been road-tested.
+  The revised layout was approved on the bench on **2026-10-21**. Daylight
+  readability is accepted as a limit of this panel; OLED current was
+  deliberately not measured. Production-card behavior still needs road checks.
 - A question mark, such as `Speed 3.3? mph`, means the displayed speed
   failed the accuracy check; it cannot start or extend a trip and the
   point is omitted from the GPX.
@@ -1115,9 +1142,11 @@ Things to know:
   If that setup cannot be confirmed, boot continues with a serial warning;
   the display or sensors may be unavailable. These readings do not change
   the guard's offset or thresholds. The line and probes are debug-only.
-- The screen can't stop logging. If it's missing or an I2C write fails,
-  the serial log says `WARNING: debug OLED I2C failed` once and the
-  screen stays off until the next boot.
+- The screen can't stop logging. If it is missing or an I2C write fails,
+  the affected display stays off until the next boot. The debug display
+  prints `WARNING: debug OLED I2C failed` once. A production-display failure
+  records the OLED communication fault (E6001) for **Device health**, with no
+  guaranteed serial warning while debug is off.
 - It uses maximum SH1106 contrast (`DEBUG_OLED_CONTRAST = 255`). The old
   setting (`16`) was unreadable outdoors on the first road test
   (2026-10-19). Full contrast speeds OLED burn-in and draws a little more
@@ -1125,9 +1154,10 @@ Things to know:
   sideways a few pixels each minute to limit burn-in and switches off
   before the board powers down. The production display has its own
   burn-in rules (see the display policy in `DIAGNOSTICS.md`).
-- Not yet checked on the board: the screen's supply rail and current
-  draw, whether full contrast is readable in daylight, and which GSV
-  talkers the MAX-M10S actually sends.
+- The OLED's ALDO1 supply is set to 3.3 V at trusted PMU startup. Daylight
+  readability is accepted as a panel limit, and OLED current was deliberately
+  not measured. The road checks still include which satellite-message
+  sources (GSV talkers) the MAX-M10S actually sends.
 
 Bench check for the heard count: after a cold start under open sky, `R`
 should rise as signals arrive and `U` should rise when the receiver gets
@@ -1279,18 +1309,19 @@ for the API, on-disk format, quota and recovery rules. Run
 `bash firmware/host_test/run.sh` for fault tests and the exported-event check
 against the server's stdlib protocol validator.
 
-### Network stack shakedown (issue #6)
+<a id="network-stack-shakedown-issue-6"></a>
+
+### Network stack shakedown
 
 This section is for validating the firmware on hardware. You don't need it
 to build or use the tracker.
 
-The network task reserves 12,288 bytes; issue #6 records how much stays free. During
-and after the real SD uploads on 2026-10-21 (UTC), the debug build's
-minimum free stack was **7,436 bytes**, with GPS logging active. This
-measures the successful-upload path; it does not establish headroom for
-server errors, server-down retries, LittleFS uploads or debug mode off.
-Trip uploads with debug mode off and server-down retry were verified
-separately; those results do not establish their heap/stack headroom.
+The network task reserves 12,288 bytes. During and after the real SD uploads
+on 2026-10-21 (UTC), the debug build's minimum free stack was **7,436 bytes**,
+with GPS logging active. The server-down/recovery run that day recorded
+**7,556 bytes** free. Those measurements justified keeping the 12,288-byte
+allocation. LittleFS uploads and HTTP 401/413/5xx server responses remain
+unmeasured on the Supreme; successful paths do not prove their headroom.
 Serial diagnostics report the task's lifetime minimum free stack at startup,
 after each GPX HTTP upload (including failures), and after each network cycle.
 Diagnostic requests sample the watermark silently between batches.
@@ -1305,19 +1336,34 @@ upload times, and lowest `Net stack ... minimum free` value. Each `Upload`
 line prints the file's size and how long it took. Size over time is the
 link speed. The server's worker timeout (900 s) allows a full 8 MiB trip
 piece at 10 kB/s (~839 s), with a margin for handling it. A warning at
-less than 2,048 bytes raises E1007 and means the allocation needs review; this
-margin follows #6 and leaves room to investigate before exhausting the stack.
+less than 2,048 bytes raises the low network-stack diagnostic (E1007) and
+means the allocation needs review. This margin leaves room to investigate
+before exhausting the stack.
 The lifetime watermark cannot increase, so E1007 normally remains active until
 reboot (the next boot starts unknown). Absence of a warning
-is not proof that every path has been exercised. Keep issue #6 open until these measurements are
-recorded and the final allocation is justified. Host tests check diagnostics
-only and cannot measure ESP32 stack use.
+is not proof that every path has been exercised. Record the remaining
+measurements before making claims about those paths. Host tests check
+diagnostics only and cannot measure ESP32 stack use.
 
 ### Check recording and uploads
 
-Open **Tools → Serial Monitor** in the Arduino IDE and set its speed to
-**115200** baud. With the board in the case (screen on the left, USB-C on
-the right), **RESET** is the left of the close pair of buttons along the
+Start with the viewer; no Arduino IDE is needed. Take a drive of a few
+minutes outdoors, then park within home WiFi range. With USB still powered,
+wait five minutes below 2 mph to finish the trip, plus time for uploads and
+retries. If the car's USB turns off, the trip ends after USB loss is confirmed
+for 10 seconds, and the battery keeps the board awake to upload.
+
+Open `http://<host>:8091/` and sign in. Check that the trip appears, then open
+**Device health** for the last contact, active faults and a newly received
+**current status snapshot**. Trip contact alone does not prove diagnostics
+enrollment succeeded. If nothing arrives, check the server is running and
+the board is within range of the configured 2.4 GHz WiFi; serial logging can
+help narrow down startup, GPS or upload failures.
+
+For optional serial checks, the following instructions use the Arduino IDE;
+install it if you used only the flash script. Open **Tools → Serial Monitor**
+and set its speed to **115200** baud. With the board in the case (screen on
+the left, USB-C on the right), **RESET** is the left of the close pair along the
 bottom edge; press it to see the startup messages again. Opening the
 Serial Monitor can itself restart the board, so messages may show twice.
 Do this before a test drive, not during a trip.
@@ -1333,10 +1379,11 @@ Do this before a test drive, not during a trip.
      retries by itself; the message says why. See
      [Stage 4 on the Supreme](#stage-4-the-trip-logger).
 2. Take it for a drive of a few minutes, powered from a laptop with the
-   Serial Monitor open. (Anything under 30 seconds or a tenth of a mile is
-   thrown away as noise.) GPS doesn't work indoors, and the first fix after
-   the battery was out can take a minute outside. After 10 seconds above
-   5 mph you'll see `Trip started`.
+   Serial Monitor open. (When the stop timer or lost GPS ends a trip, anything
+   under 30 seconds of driving or a tenth of a mile is discarded; car power-off
+   keeps short trips that have started.) GPS doesn't work indoors, and the
+   first fix after the battery was out can take a minute outside. After
+   10 seconds above 5 mph you'll see `Trip started`.
 3. Park at home and wait. Five minutes below 2 mph ends the trip
    (`Trip finalized`). The board then tries your WiFi and uploads it:
    `Upload ... -> HTTP 200 (deleted)`. The file is deleted from the board

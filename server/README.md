@@ -175,7 +175,10 @@ include code, catalog title/recovery and device label, with no links or context.
 E7001, "No contact for N days", defaults to seven days of **server receipt
 time**, including identified GPX uploads. It bypasses the device-fault severity
 filter and hold, shares reminders/cap, and resolves on newer contact. There is
-no watchlist; all devices remain monitored. Firmware heartbeat work is #125.
+no watchlist; all devices remain monitored. After 24 hours without contact,
+the tracker tries a heartbeat during its existing awake opportunities; it
+does not wake just to send one. A tracker parked away from WiFi can therefore
+still trigger a silence notification.
 
 The bundled ntfy is locked down with `auth-default-access: deny-all`; create a
 local user, grant only the alert topic, and give the monitor its access token.
@@ -189,8 +192,10 @@ An existing self-hosted ntfy can be selected with `NTFY_URL` instead.
 
 Optionally, the monitor also sends diagnostics as GELF to a Graylog you run
 elsewhere (`GRAYLOG_*` in `monitor.env`, off by default; nothing here installs
-Graylog). It forwards every diagnostic event once and each change in a
-device/code condition's state (active/clear/unknown, plus E7001 silence), and
+Graylog). It forwards diagnostic events at least once, with duplicates possible
+after an interrupted send or restoring an older diagnostics database. It also
+forwards each change in a device/code condition's state (active/clear/unknown,
+plus the no-contact fault E7001), and
 Graylog's own Event Definitions do the alerting. GELF HTTP is preferred (each
 message confirmed); GELF TCP with optional TLS also works. Graylog outages back
 off independently and never affect ntfy. Setup: DEPLOY_DEBIAN.md Step 11d.
@@ -212,7 +217,9 @@ independent cursor, retry state and timestamp order per stream; a failed Loki
 push does not stop ntfy or Graylog. Permanent HTTP 4xx rejections (except 408
 and 429) skip the batch and advance its cursors, so rejected history is not
 retried. JSON lines use only current catalog fields and bounded context, with
-`job`, validated `device_id` and catalog `severity` as the only labels.
+`job`, validated `device_id` and catalog `severity` as the only labels set by
+the monitor. Loki 3 can add its own `service_name` label and `detected_level`
+metadata to query results.
 Importable panel and LogQL alert examples are in `grafana/`; see
 DEPLOY_DEBIAN.md Step 11f.
 
@@ -296,6 +303,7 @@ Step 1).
    the real auth token:
 
        cp .env.example .env
+       chmod 600 .env
 
 3. Generate a strong random auth token and put it in `.env`:
 
@@ -305,11 +313,23 @@ Step 1).
    You'll use the same token in the tracker firmware later. This token is
    separate from your SSH login and the viewer's username/password.
 
-4. Create `viewer.env` and set the viewer login, as described under
+4. In `.env`, set `DISPLAY_TZ` to the IANA timezone where you drive, for
+   example `DISPLAY_TZ=Europe/London`. Both services refuse to start without
+   it; ingest uses it to choose month folders and the viewer uses it for
+   displayed/exported times. See [Timezone](#timezone).
+
+5. Before starting either service, set `BIND_ADDR` in `.env` to the server's
+   stable LAN IP address (`BIND_ADDR=<host>`; replace `<host>` with the IP,
+   not a hostname). Find it with `ip -4 addr show` and arrange a static IP or
+   DHCP reservation. Leaving this blank publishes ports on every interface;
+   UFW does not restrict Docker-published ports. See
+   [network setup](../DEPLOY_DEBIAN.md#step-7--firewall-and-network).
+
+6. Create `viewer.env` and set the viewer login, as described under
    [Viewer Login](#viewer-login) below. Compose won't build or start
    anything, either service, until `viewer.env` exists.
 
-5. Build and start both services:
+7. Build and start both services:
 
        SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
 
@@ -319,20 +339,21 @@ Step 1).
    containers running. `install.sh` sets it automatically; this works with
    Compose 2.38 as well as newer versions.
 
-6. Verify the service is responding:
+8. Set `H` to that same server LAN IP and verify the service is responding.
+   This also works if an existing install publishes on all interfaces:
 
-       curl http://localhost:8090/health
+       H='<host>'
+       curl "http://$H:8090/health"
 
    You should see `{"service":"mileage-ingest","status":"ok","version":"v0.01+abcdef1234"}`.
 
-7. Test an authenticated upload with the sample trip, `sample.gpx`, which
+9. Test an authenticated upload with the sample trip, `sample.gpx`, which
    is in this folder:
 
        TOKEN=$(grep '^INGEST_AUTH_TOKEN=' .env | cut -d= -f2-)
-       curl -X POST http://localhost:8090/upload \
+       curl -X POST "http://$H:8090/upload" \
          -H "Authorization: Bearer $TOKEN" \
          -H "Content-Type: application/gpx+xml" \
-         -H "X-Device-Id: tbeam-01" \
          -H "X-Trip-Id: 2026-04-14T13-45-22" \
          --data-binary @sample.gpx
 
@@ -341,15 +362,13 @@ Step 1).
    `.../2026-04-14T13-45-22.json`. Delete both afterwards so the test
    trip doesn't end up in your mileage log.
 
+   Leave out `X-Device-Id` for this synthetic upload. Adding it registers a
+   device for diagnostics monitoring; deleting the trip files does not remove
+   that device, which would later be reported as silent.
+
    The `^INGEST_AUTH_TOKEN=` match above reads only the setting, not
    comments that mention its name. It assumes the unquoted hexadecimal
    token generated in step 3.
-
-8. Bind the two default ports to the server's LAN IP by setting `BIND_ADDR` in
-   `.env`, then run `docker compose up -d` again. UFW rules don't
-   restrict Docker-published ports, so this is the setting that keeps
-   them off other interfaces. After this, `localhost` no longer answers;
-   curl the LAN IP instead. Details are in `DEPLOY_DEBIAN.md` Step 7.
 
 ## Daily Operation
 
@@ -819,8 +838,10 @@ See [DIAGNOSTICS.md](../DIAGNOSTICS.md) for the full protocol and ordering rules
 `X-Device-Id` headers on successful GPX uploads refresh contact, even before
 firmware sends diagnostics. Missing/invalid headers create no diagnostic device;
 GPX creator is never used to guess one. Diagnostics failures do not fail GPX.
-The viewer's `/device-health` page shipped in #119. The backup procedure above
-preserves diagnostics through SQLite snapshots rather than copying the live file.
+Open **Device health** in the viewer header after signing in to see current
+status, active faults and event history at `/device-health`. The backup
+procedure above preserves diagnostics through SQLite snapshots rather than
+copying the live file.
 
 Build both images from this directory with
 `SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose build`. Both service
