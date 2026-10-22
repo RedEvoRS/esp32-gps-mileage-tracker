@@ -793,7 +793,10 @@ How authentication behaves:
 - All state-changing forms carry CSRF tokens.
 - Five bad passwords from one IP locks that IP out for 15 minutes. The
   counter is in SQLite, not process memory, so both gunicorn workers
-  share one view of it and it survives restarts.
+  share one view of it and it survives restarts. The count is per IP across
+  all usernames. A successful login, or your own password change, clears
+  only the failures typed against that same username, so an everyday login
+  can't reset guesses at the admin password.
 - The service **refuses to start** if the username, hash, or secret key
   is missing or malformed — a viewer that silently comes up with auth
   broken is worse than one that doesn't come up, because you'd never

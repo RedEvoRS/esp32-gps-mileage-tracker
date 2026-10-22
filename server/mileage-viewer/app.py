@@ -282,6 +282,19 @@ def init_db():
             )
             """
         )
+        # Which usernames the failures in login_attempts.fails were against.
+        # A success may only subtract its own username's share; login_attempts
+        # stays the per-IP count and lock, so clearing it unlocks everyone.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS login_attempt_names (
+                ip    TEXT NOT NULL,
+                name  TEXT NOT NULL,
+                fails INTEGER NOT NULL,
+                PRIMARY KEY (ip, name)
+            )
+            """
+        )
 
 
 def get_annotations():
@@ -341,9 +354,19 @@ def _lock_seconds_remaining(ip):
     return int(remaining) if remaining > 0 else 0
 
 
-def _record_failure(ip):
-    """Count a bad password and lock the IP once it hits MAX_FAILS."""
+def _failure_name(username):
+    # Case-insensitive, and bounded so a flood of long names can't grow a row.
+    return (username or "").casefold()[:128]
+
+
+def _record_failure(ip, username=""):
+    """Count a bad password and lock the IP once it hits MAX_FAILS.
+
+    The lock and total are per IP, whichever username was tried; the name
+    is kept only so a later success can subtract its own failures.
+    """
     now = datetime.now(timezone.utc)
+    name = _failure_name(username)
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
         # Reserve the writer before reading: workers must not both read
         # the same count, then overwrite each other's increment.
@@ -351,6 +374,11 @@ def _record_failure(ip):
         row = conn.execute(
             "SELECT fails, locked_until FROM login_attempts WHERE ip = ?", (ip,)
         ).fetchone()
+        if not row:
+            # Name counts only describe a login_attempts row. A manual
+            # DELETE FROM login_attempts leaves them behind; drop them so
+            # they can't be subtracted from failures counted after the unlock.
+            conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
         # Another request may have established the lock while this request
         # was checking its password. Its failure must not clear that lock.
         if row and row[1] and datetime.fromisoformat(row[1]) > now:
@@ -359,8 +387,16 @@ def _record_failure(ip):
         if fails >= MAX_FAILS:
             locked_until = (now + timedelta(minutes=LOCKOUT_MINUTES)).isoformat()
             fails = 0  # start a fresh count once the lock expires
+            conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
         else:
             locked_until = None
+            conn.execute(
+                """
+                INSERT INTO login_attempt_names (ip, name, fails) VALUES (?, ?, 1)
+                ON CONFLICT(ip, name) DO UPDATE SET fails = fails + 1
+                """,
+                (ip, name),
+            )
         conn.execute(
             """
             INSERT INTO login_attempts (ip, fails, locked_until)
@@ -373,9 +409,36 @@ def _record_failure(ip):
         )
 
 
-def _clear_failures(ip):
+def _clear_failures(ip, username):
+    """Forget this IP's failures against `username` only.
+
+    Anyone who holds one valid login could otherwise reset the count between
+    guesses at another account's password. Failures against other names (or
+    unknown ones) keep counting toward the IP's lock.
+    """
+    name = _failure_name(username)
     with closing(sqlite3.connect(DB_PATH)) as conn, conn:
-        conn.execute("DELETE FROM login_attempts WHERE ip = ?", (ip,))
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT fails, locked_until FROM login_attempts WHERE ip = ?", (ip,)
+        ).fetchone()
+        if not row:
+            conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
+            return
+        if row[1] and datetime.fromisoformat(row[1]) > datetime.now(timezone.utc):
+            return  # a lock set by a concurrent request stands
+        own = conn.execute(
+            "SELECT fails FROM login_attempt_names WHERE ip = ? AND name = ?", (ip, name)
+        ).fetchone()
+        if not own:
+            return
+        conn.execute("DELETE FROM login_attempt_names WHERE ip = ? AND name = ?", (ip, name))
+        fails = max(0, row[0] - own[0])
+        if fails:
+            conn.execute("UPDATE login_attempts SET fails = ? WHERE ip = ?", (fails, ip))
+        else:
+            conn.execute("DELETE FROM login_attempts WHERE ip = ?", (ip,))
+            conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
 
 
 def _safe_equal(a, b):
@@ -1920,7 +1983,7 @@ def login():
                 editor_ok = False
 
         if pass_ok and (name_ok or editor_ok):
-            _clear_failures(ip)
+            _clear_failures(ip, VIEWER_USERNAME if name_ok else user["username"])
             session.clear()  # new session id on privilege change
             session["user"] = VIEWER_USERNAME
             session["pw_tag"] = _password_tag()
@@ -1932,7 +1995,7 @@ def login():
             session.permanent = True
             return redirect(_safe_next(request.args.get("next")) or url_for("index"))
 
-        _record_failure(ip)
+        _record_failure(ip, username)
         app.logger.warning("Failed login for %r from %s", username[:40], ip)
         error = "Incorrect username or password."
         return render_template_string(LOGIN_HTML, error=error), 401
@@ -2443,7 +2506,7 @@ def account_password():
         valid = check_password_hash(user["password_hash"] if user else DUMMY_PASSWORD_HASH,
                                     request.form.get("current_password", ""))
         if not valid or user is None:
-            _record_failure(ip)
+            _record_failure(ip, g.user)
             session["account_message"] = "Incorrect current password."
         else:
             try:
@@ -2451,7 +2514,7 @@ def account_password():
                 updated = users.change_user(DB_PATH, "reset-password", g.user, password, VIEWER_USERNAME,
                                              expected_tag=session["pw_tag"], secret_key=VIEWER_SECRET_KEY)
                 session["pw_tag"] = users.session_tag(VIEWER_SECRET_KEY, updated)
-                _clear_failures(ip)
+                _clear_failures(ip, g.user)
                 session["account_message"] = "Password changed. Other sessions for this login have ended."
             except users.UserError as exc:
                 session["account_message"] = str(exc)

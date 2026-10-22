@@ -9,8 +9,10 @@ import importlib.util
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -121,7 +123,8 @@ class ViewerAuth(unittest.TestCase):
     def setUp(self):
         self.c = view.app.test_client()
         # Each test gets a fresh lockout counter.
-        view._clear_failures("127.0.0.1")
+        with closing(sqlite3.connect(view.DB_PATH)) as conn, conn:
+            conn.execute("DELETE FROM login_attempts")
 
     def with_session(self, **values):
         with self.c.session_transaction() as s:
