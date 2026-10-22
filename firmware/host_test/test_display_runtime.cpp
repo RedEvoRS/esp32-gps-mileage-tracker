@@ -233,7 +233,7 @@ int main() {
     for (int i = 0; i < 100; ++i) { beginProductionDisplay(); serviceProductionDisplay(); serviceRuntimeDiagnostics(); }
     assert(transfers == 1 && codeRows(take(), 6001).empty());
     // A disconnected display cannot stop a real drive or alter GPX writes.
-    run(15, 40); run(0, 185);
+    run(15, 40); run(0, kCooldownSeconds + 5);
     assert(gState == IDLE && !g_sdDisk.files.empty());
     bool completeTrip = false;
     for (const auto& file : g_sdDisk.files)

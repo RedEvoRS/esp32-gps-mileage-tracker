@@ -348,7 +348,7 @@ def _step(a, b, require_time=False):
       - an impossible jump (> MAX_PLAUSIBLE_MPS): a bad fix, not driving;
       - neither end moving: the vehicle was stopped, so the step is GPS
         scatter. A parked receiver wanders a few metres a minute, and the
-        firmware keeps logging through every red light and the 3-minute
+        firmware keeps logging through every red light and the 5-minute
         end-of-trip cooldown, so counting these inflated business miles.
     Movement comes from the device's Doppler speed where present, falling
     back to distance/time. With require_time (bridging a GPS gap), a step
@@ -389,7 +389,7 @@ def summarize(parsed):
     whole gap's distance.
 
     end_time is the last fix where the vehicle was moving, so the
-    firmware's 3-minute stationary cooldown doesn't stretch every trip;
+    firmware's 5-minute stationary cooldown doesn't stretch every trip;
     the final timestamp in the file is kept as recorded_until. Max speed
     prefers the device-reported speed, else distance/time. Average speed
     is total distance over start..end only when every point is timed.
