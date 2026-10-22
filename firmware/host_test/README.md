@@ -84,7 +84,7 @@ sources that require that optional library.
 
 - `test_gps` **[TinyGPSPlus]**: real GPS sentence parsing through the sketch's loop, one point per second, receiver configuration/replies, fix-quality gates, gaps, UTC (universal time) timestamps/clock corrections and debug-mode GPX parity.
 - `test_gps_antenna`: antenna-warning evidence, hold times, missing/stale observations, recovery and timer wraparound.
-- `test_debug_status` **[TinyGPSPlus]**: real satellite-message parsing, satellite deduplication/freshness and bounded screen/serial formatting.
+- `test_debug_status` **[TinyGPSPlus]**: real satellite-message parsing, satellite deduplication/freshness and bounded screen/serial formatting, including release-version fit/omit cases in the top row.
 
 **Diagnostics and delivery**
 
@@ -107,7 +107,7 @@ a single rejected event so it cannot block the queue. See
 - `test_debug_display`: simulated OLED (small screen) bus failures during initialization/drawing and safe display disablement.
 - `test_display_model`: status-card timing, motion/fault queues and debug suppression, at default and 10-second durations (two builds).
 - `test_production_display_layout`: text bounds/spacing from checked-in glyph metrics (character sizes), including worst-case satellite counts/error codes.
-- `test_production_display`: renderer initialization, drawing/power-save bus failures and disablement.
+- `test_production_display`: renderer initialization, drawing/power-save bus failures and disablement, plus the Debug ON card's full 32-character version wrapped across two small-text lines (no version on Debug OFF).
 - `test_display_runtime` **[TinyGPSPlus]**: sketch integration, button/debounce behavior, runtime debug switching, fault cards and continued logging with a failed display.
 
 **Power management and peripheral bus**
@@ -127,7 +127,7 @@ a single rejected event so it cannot block the queue. See
 
 **Python checks**
 
-- `check_display_fonts.py` **[U8g2]**: compare installed font glyph metrics with checked-in metrics.
+- `check_display_fonts.py` **[U8g2]**: compare installed font glyph metrics with checked-in metrics and check that every valid version character fits the Debug ON card without overlapping its heading.
 - `check_event_log_protocol.py`: validate C++ event exports and catalog/context boundaries against the real server protocol.
 - `check_battery_events_protocol.py`: validate actual boot/shutdown battery-event exports.
 - `check_event_upload_protocol.py`: validate requests and post/replay them through the real ingest app's disposable Flask test client/SQLite databases; no sockets or live server.

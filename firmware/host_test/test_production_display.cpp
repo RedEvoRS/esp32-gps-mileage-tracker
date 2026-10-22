@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cstdio>
+#define FIRMWARE_VERSION_BASE "v1234567890123456789012345678901"
 #include "production_display.h"
 static unsigned cases = 0;
 static void reset() {
@@ -23,6 +24,19 @@ int main() {
     reset(); beginProductionDisplay();
     assert(gProductionDisplayReady && gProductionOled.sleeps == 1);
     assert(Wire.timeout == 10 && Wire.sda == 17 && Wire.scl == 18 && Wire.address == 0x3c);
+    drawDebugModeFeedback(true);
+    assert(gProductionOled.text.size() == 3);
+    assert(gProductionOled.text[0].value == "Debug ON");
+    assert(gProductionOled.text[0].font == u8g2_font_helvB14_tr);
+    const auto& first = gProductionOled.text[1];
+    const auto& second = gProductionOled.text[2];
+    assert(first.value.size() == 21 && second.value.size() == 11);
+    assert(first.value + second.value == firmware::kVersion);
+    assert(first.x == 8 && first.y == 52 && second.x == 8 && second.y == 62);
+    assert(first.font == u8g2_font_5x8_tf && second.font == u8g2_font_5x8_tf);
+    drawDebugModeFeedback(false);
+    assert(gProductionOled.text.size() == 1 && gProductionOled.text[0].value == "Debug OFF");
+    ++cases;
     auto card = display::statusCard(12, nullptr, 0);
     drawProductionDisplay(card); unsigned ends = Wire.ends;
     assert(gProductionOled.baseline && gProductionOled.text.size() == 2);

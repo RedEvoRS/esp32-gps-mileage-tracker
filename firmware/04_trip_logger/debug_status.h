@@ -15,6 +15,7 @@ struct DebugNetwork {
 
 struct DebugStatus {
     const char* state = "IDLE";
+    const char* version = nullptr;
     uint32_t now = 0;
     int heard = -1, used = -1, agcPct = -1;
     bool fix = false;
@@ -45,6 +46,16 @@ static inline void debugCount(int value, char* out, size_t n) {
 static inline void formatDebugStatus(const DebugStatus& s, char lines[8][22]) {
     unsigned up = s.now / 1000;
     snprintf(lines[0], 22, "%.10s %uh%02um", s.state, up / 3600, up / 60 % 60);
+    if (s.version && *s.version) {
+        size_t release = strcspn(s.version, "+");
+        size_t status = strlen(lines[0]);
+        if (release && status + 1 + release <= 21) {
+            size_t start = 21 - release;
+            memset(lines[0] + status, ' ', start - status);
+            memcpy(lines[0] + start, s.version, release);
+            lines[0][21] = '\0';
+        }
+    }
     char heard[4], used[4], agc[4], age[5], hdop[5];
     debugCount(s.heard, heard, sizeof heard);
     debugCount(s.used, used, sizeof used);

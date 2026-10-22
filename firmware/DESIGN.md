@@ -52,6 +52,14 @@ logging active; the allocation was retained. `uploadFile()` uses plain
 HTTP with `WiFiClient`, without Transport Layer Security (TLS). A future
 TLS path would need its own stack measurement.
 
+## Firmware identity on the debug screen
+
+The live debug page's top row keeps state and uptime intact, adding the
+release version at the right only if all text fits in 21 characters with
+a separating space. The `Debug ON` card shows the full version, including
+its commit, in the 5x8 font on up to two lines; `Debug OFF` has no version.
+`debug_status.h` receives the version as data and stays independent of Arduino.
+
 ## Trip lifecycle favors conservative mileage
 
 `TripState` defines five states, advanced by `tripFsmOnFix()`:
