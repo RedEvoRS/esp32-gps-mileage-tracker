@@ -15,7 +15,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo 'tester ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/tester \
     && mkdir -p /etc/docker /srv/offhost \
     && chown tester:tester /srv/offhost \
-    && printf '{"storage-driver":"vfs"}\n' > /etc/docker/daemon.json \
     && systemctl enable docker
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]

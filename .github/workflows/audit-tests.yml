@@ -225,6 +225,10 @@ jobs:
     env:
       PASSWORD: correct-horse-battery
     steps:
+      - name: Disk at installer job start
+        run: |
+          df -h /
+          docker system df
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -409,6 +413,31 @@ jobs:
           grep -q 'mileage-viewer is stopped (exit code 0)' stopped.log
           grep -q 'docker compose up -d' stopped.log
           ! grep -q 'missing or mangled setting in viewer.env' stopped.log
+      - name: Release the completed source-copy install and unused runner tools
+        env:
+          RUN_BUILDER: ${{ needs.firmware-compile.outputs.builder }}
+        run: |
+          before=$(df -B1 --output=avail / | tail -n 1)
+          sudo systemctl disable --now "mileage-backup@$TEST_USER.timer"
+          sudo systemctl stop "mileage-backup@$TEST_USER.service"
+          sudo bash tools/ci-install/clean-project.sh "$(dirname "$INSTALLER")"
+          # This job has exclusive use of this disposable runner's build cache.
+          docker builder prune --all --force
+          source_after=$(df -B1 --output=avail / | tail -n 1)
+          echo "Source-copy project and build cache freed $((source_after - before)) bytes"
+          # These hosted tools are unused by the shell/Python/Docker lab. Do
+          # this before cache restore so its archive never competes with them.
+          if [[ "$RUN_BUILDER" == true ]]; then
+            sudo du -sch /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+              /opt/hostedtoolcache/CodeQL /usr/local/share/boost 2>/dev/null || true
+            sudo rm -rf -- /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+              /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          fi
+          after=$(df -B1 --output=avail / | tail -n 1)
+          echo "Unused hosted tools freed $((after - source_after)) bytes"
+          echo "Total freed: $((after - before)) bytes"
+          df -h /
+          docker system df
       - name: Build the exact release assets from this commit
         run: bash tools/build_release_bundle.sh ci "$RUNNER_TEMP/two-piece-assets"
       - name: Restore public builder toolchain image
@@ -418,7 +447,7 @@ jobs:
         with:
           path: ${{ runner.temp }}/two-piece-cache
           # Exact public inputs only; never cache personal firmware or settings.
-          key: linux-amd64-builder-v1-${{ hashFiles('server/firmware-builder/Dockerfile', 'server/firmware-builder/pins.env') }}
+          key: linux-amd64-builder-v2-${{ hashFiles('server/firmware-builder/Dockerfile', 'server/firmware-builder/pins.env') }}
       - name: Download Stage 4 reference
         if: needs.firmware-compile.outputs.builder == 'true'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -428,9 +457,26 @@ jobs:
       - name: Debian 13 bundle install, update, backup/restore and optional builder parity
         env:
           RUN_BUILDER: ${{ needs.firmware-compile.outputs.builder }}
+          SAVE_BUILDER_CACHE: ${{ steps.builder-cache.outputs.cache-hit != 'true' }}
         run: |
+          df -h /
+          docker system df
+          # Measured cold lab peak: about 16 GiB including the outer image.
+          # Budget 18 GiB and retain at least 4 GiB for runner/log variation.
+          min_gib=6
+          if [[ "$RUN_BUILDER" == true ]]; then min_gib=22; fi
+          available=$(df -B1 --output=avail / | tail -n 1)
+          if ((available < min_gib * 1024 * 1024 * 1024)); then
+            echo "::error::Lab needs $min_gib GiB free after cleanup; only $available bytes available"
+            exit 1
+          fi
           bash tools/ci-install/lab.sh "$RUNNER_TEMP/two-piece-assets" \
             "$RUNNER_TEMP/two-piece-cache" "$RUNNER_TEMP/stage4-reference"
+      - name: Disk after the lab (including failure)
+        if: always()
+        run: |
+          df -h /
+          docker system df
 
   # Optional check: do not add this job to branch protection's five required checks.
   flash-windows:

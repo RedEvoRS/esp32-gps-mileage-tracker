@@ -4,11 +4,12 @@ set -euo pipefail
 test "$(cat /etc/hostname)" = two-piece-ci
 # shellcheck source=/dev/null
 test "$(. /etc/os-release; echo "$ID:$VERSION_ID")" = debian:13
+trap 'rm -f /cache/builder.tar.gz.partial' EXIT
 for _ in {1..60}; do
     if systemctl is-active --quiet docker && docker info >/dev/null 2>&1; then break; fi
     sleep 1
 done
-docker info >/dev/null
+docker info --format 'Nested Docker: {{.ServerVersion}} / {{.Driver}}'
 install_dir=$(getent passwd tester | cut -d: -f6)/mileage-tracker
 bundle=$(find /assets -maxdepth 1 -name 'mileage-tracker-*.tar.gz' -print -quit)
 test -n "$bundle"
@@ -71,18 +72,33 @@ check
 echo 'Bundle install/update, private preservation, versions and populated restore passed.'
 
 if [[ ${1:-} == builder ]]; then
+    # All server acceptance checks are complete. Release their containers,
+    # volumes, images and download/build cache before the toolchain build.
+    systemctl disable --now "mileage-backup@$(id -un tester).timer"
+    systemctl stop "mileage-backup@$(id -un tester).service"
+    as_user bash /tests/tools/ci-install/clean-project.sh "$install_dir"
+    docker builder prune --all --force
+    bash /tests/tools/ci-install/disk.sh before-builder
     # Preservation is already proven. Publishing reserves this directory for
     # current/cleanup only, so remove the synthetic marker and its empty dir.
     as_user rm "$install_dir/firmware-out/ci-sentinel"
     as_user rmdir "$install_dir/firmware-out"
     # The cached image contains public toolchain files only, never firmware.
     export TRACKER_BUILDER_IMAGE=two-piece-ci-builder:cache
-    if [[ -f /cache/builder.tar ]]; then docker load -i /cache/builder.tar; fi
+    if [[ -f /cache/builder.tar.gz ]]; then
+        docker load -i /cache/builder.tar.gz
+        rm /cache/builder.tar.gz
+        bash /tests/tools/ci-install/disk.sh after-cache-load
+    fi
     export TRACKER_ACCEPT_DOWNLOAD=yes TRACKER_WIFI_SSID=ci-network
     export TRACKER_WIFI_PASSWORD=ci-password TRACKER_DEVICE_ID=ci-device
     export TRACKER_SERVER_HOST=tracker.invalid TRACKER_SERVER_PORT=8090
     export TRACKER_NEW_BOARD=no TRACKER_FRESH_SD=no
     as_user bash "$install_dir/firmware-builder/build.sh" --non-interactive --install-dir "$install_dir"
+    # BuildKit's download mount and intermediate records are no longer
+    # needed; retain only the tagged public image before archiving it.
+    docker builder prune --all --force
+    bash /tests/tools/ci-install/disk.sh after-builder
     python3 /tests/tools/compare_firmware.py "$install_dir" /reference
     # Run the flash script's actual validator and offset selector, no esptool.
     sed -n '/# BEGIN PURE HELPERS/,/# END PURE HELPERS/p' /assets/flash.sh > /tmp/flash-helpers.sh
@@ -91,5 +107,13 @@ if [[ ${1:-} == builder ]]; then
     flash_validate "$install_dir/firmware-out/current" true
     test "$(flash_parts "$install_dir/firmware-out/current" false | cut -f1)" = app
     echo 'Builder normal manifest and app-only flash selection passed.'
-    if [[ ! -f /cache/builder.tar ]]; then docker save "$TRACKER_BUILDER_IMAGE" -o /cache/builder.tar; fi
+    if [[ ${SAVE_BUILDER_CACHE:-true} == true ]]; then
+        # Stream compression: never hold an uncompressed tar beside the
+        # image. pipefail prevents publishing a partial failed save.
+        docker save "$TRACKER_BUILDER_IMAGE" | gzip -1 > /cache/builder.tar.gz.partial
+        mv /cache/builder.tar.gz.partial /cache/builder.tar.gz
+        bash /tests/tools/ci-install/disk.sh after-cache-save
+    fi
+    docker image rm "$TRACKER_BUILDER_IMAGE"
+    docker builder prune --all --force
 fi
