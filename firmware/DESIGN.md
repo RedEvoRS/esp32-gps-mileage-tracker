@@ -68,7 +68,7 @@ TLS path would need its own stack measurement.
 - **COOLDOWN:** trusted fixes still enter the file, but add no distance or
   moving duration. Three consecutive trusted fixes above `END_MPS` resume
   ACTIVE. Any other fix resets the count. The original `COOL_MS`
-  (180-second) deadline stays in force while gathering those three fixes;
+  (300-second) deadline stays in force while gathering those three fixes;
   expiry takes precedence over resuming. The confirming fix becomes a new
   distance baseline, without bridging across cooldown or rejected fixes.
 - **FINALIZING:** `endTrip()` runs in the same FSM pass that requests it,
@@ -101,7 +101,11 @@ last moving fix, excluding the final parked cooldown. Confirmed Universal
 Serial Bus (USB) loss and size splits keep short pieces. Separately, `loop()`
 ends a recording trip after more than five minutes without any valid RMC fix,
 including when no next fix arrives to drive the FSM. Rejected speeds still
-count as received fixes for this watchdog (`gLastFixMonoMs`).
+count as received fixes for this watchdog (`gLastFixMonoMs`). Its
+five-minute interval equals `COOL_MS`, but the clocks are independent:
+cooldown starts on the first stopped or rejected fix (`gCoolT0`) and is
+checked on each fix; the watchdog starts at the last valid RMC and runs
+even without another fix. Neither requires cooldown to expire first.
 
 The power-management unit (PMU) supplies the USB bus-voltage (VBUS) state.
 `observeVbusChange()` and `confirmVbusOff()` require a ten-second loss and

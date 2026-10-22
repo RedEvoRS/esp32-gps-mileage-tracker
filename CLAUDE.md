@@ -220,7 +220,7 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   and time, with `.sssZ` for nonzero centiseconds or whole seconds otherwise;
   invalid/missing RMC epochs stay untimed, including buffered points after
   a system-clock sync
-- Trip detection: start >5 mph for 10s; end <2 mph for 3 min. NAV-PVT
+- Trip detection: start >5 mph for 10s; end <2 mph for 5 min. NAV-PVT
   speed/horizontal accuracy must be <=0.5 m/s / 5 m to start,
   <=1.0 m/s / 10 m during a trip. Limits were kept after the recorded
   road-test calibration; parking-garage behaviour remains unverified.

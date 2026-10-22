@@ -70,8 +70,8 @@ phone through a self-hosted ntfy service. [DIAGNOSTICS.md](DIAGNOSTICS.md)
 describes the whole framework and lists every code.
 
 The logger decides on its own when a trip starts and stops. Going faster than 5 mph for 10 seconds starts one; staying under
-2 mph for 3 minutes ends it, which is long enough that a red light doesn't
-chop one drive into six. Anything shorter than 30 seconds or about a tenth
+2 mph for 5 minutes ends it, allowing longer red lights without splitting
+a drive. Anything shorter than 30 seconds or about a tenth
 of a mile gets thrown away.
 
 The firmware writes each GPS point to the microSD card (or the internal

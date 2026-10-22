@@ -214,7 +214,7 @@ static void gpsFixGapRegressions() {
     assert(gState == ACTIVE && gHaveLastFix); assert(take().empty());
     const uint32_t trusted = gLastFix.monoMs;
     // Status-A fixes too inaccurate even for a trip must still prevent E3005
-    // and allow the parked cooldown to finish before the five-minute watchdog.
+    // and allow the parked cooldown to finish while the watchdog keeps resetting.
     for (uint32_t gap = 1000; gap <= COOL_MS + 1000; gap += 1000) {
         diagnosticFix(trusted + gap, 10001);
         assert(!gSpeedFallback && !gLatestSpeedTrusted && gLastFix.monoMs == trusted);
@@ -460,7 +460,7 @@ int main(int argc, char**) {
     // upload: only the boot notice, with no fault events.
     faultWorld(); PmuStartupResult clean; clean.ready = true; clean.attempts = 1;
     submitJournalBoot(gJournal, ESP_RST_POWERON, clean, millis());
-    run(15, 40); run(0, 185); assert(gState == IDLE);
+    run(15, 40); run(0, kCooldownSeconds + 5); assert(gState == IDLE);
     assert(uploadPending(SD)); auto happy = take();
     assert(happy.size() == 1); has(happy[0], "\"code\":1000,");
     assert(gJournal.stats().dropped == 0 && g_lockDepth == 0);

@@ -88,7 +88,7 @@ three rules, all in `summarize()`:
   so bridging can only undercount, and leaving the gap out lost real miles.
   A bridge needs timestamps at both ends and a plausible speed.
 
-For completely timed trips, `end_time` is the last moving fix, so the firmware's 3-minute cooldown
+For completely timed trips, `end_time` is the last moving fix, so the firmware's 5-minute cooldown
 doesn't stretch every trip; `recorded_until` keeps the final timestamp.
 Summary version 3 records `timing_status` as `complete`, `partial`, or
 `untimed`. A partly timed trip retains its distance, but full-trip

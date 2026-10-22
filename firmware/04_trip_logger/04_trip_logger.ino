@@ -6,7 +6,7 @@
 // adds the four pieces that make it a mileage tracker:
 //
 //   1. A trip state machine that auto-detects start (>5 mph for 10 s)
-//      and end (<2 mph for 3 min), with hysteresis so stop-and-go
+//      and end (<2 mph for 5 min), with hysteresis so stop-and-go
 //      traffic doesn't split one drive into many.
 //   2. GPX logging to microSD (LittleFS fallback) -- one line per timed fix,
 //      file.close() after every write to limit power-cut data loss.
@@ -126,7 +126,7 @@ static constexpr uint32_t SD_SETTLE_MS = 250;
 static constexpr float    START_MPS       = 2.235f;          // 5 mph
 static constexpr float    END_MPS         = 0.894f;          // 2 mph
 static constexpr uint32_t ARM_MS          = 10UL  * 1000;    // sustain to start
-static constexpr uint32_t COOL_MS         = 180UL * 1000;    // sustain to end
+static constexpr uint32_t COOL_MS         = 300UL * 1000;    // sustain to end
 // First guesses: calibrate from drive/indoor logs; err low on mileage.
 static constexpr float    SPEED_ACC_ARM_MPS = 0.5f;
 static constexpr float    SPEED_ACC_TRIP_MPS = 1.0f;
@@ -972,7 +972,7 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
     fs::FS& storage = *gTripFS;
     if (gTripPath[0] == 0) { gState = nextState; return; }
 
-    // Duration runs to the last moving fix: the 3 min parked cooldown (or
+    // Duration runs to the last moving fix: the 5 min parked cooldown (or
     // the wait before a fix-loss finalize) that ends every trip would
     // otherwise pass MIN_TRIP_MS on its own. A stop mid-trip still counts.
     uint32_t tripMs = gLastMoveMs - gTripT0;
