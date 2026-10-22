@@ -12,3 +12,4 @@ server/.env.example text eol=lf
 server/viewer.env.example text eol=lf
 # Commit archives carry provenance even when the server has no Git metadata.
 server/COMMIT text eol=lf export-subst
+firmware/COMMIT text eol=lf export-subst

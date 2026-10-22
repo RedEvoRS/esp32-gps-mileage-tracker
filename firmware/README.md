@@ -267,6 +267,8 @@ unless you select a version.
 Before compiling Stage 4, run `python tools/stamp_firmware_version.py` from
 the repository root. It combines `firmware/VERSION` with the ten-character Git
 commit, for example `v0.05+3f9a1c07be`, adding `-dirty` for tracked edits.
+Without usable Git, it uses the release archive's `firmware/COMMIT`; a missing,
+invalid or unexpanded hash warns and uses `firmware/VERSION` alone.
 There is one firmware; runtime debug mode does not change the version.
 Without the generated header, Device health shows `unversioned`. Run the
 script before every build; an old header keeps its old version.
@@ -312,6 +314,7 @@ For the next road build:
 4. Publish a GitHub release from the tag, titled `Supreme firmware v0.06 (beta)`,
    as a full release marked **Latest**:
    `gh release create fw-v0.06 --verify-tag --latest --title "..." --notes-file notes.md`.
+   Publishing triggers the source bundle and checksum asset upload; `srv-v*` releases get the same bundle.
    Don't mark it pre-release: a pre-release can't be Latest, and the frozen
    "T-Beam V1.2 final" release would then look like the current firmware.
    Copy the previous release's notes and update them: what's new, what works
