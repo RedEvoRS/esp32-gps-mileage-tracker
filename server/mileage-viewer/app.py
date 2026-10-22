@@ -12,6 +12,7 @@ provides a small web UI to:
   - select a local calendar year and export trips and totals to CSV or XLSX
   - inspect device health and diagnostic history at /device-health
   - (admin) remove a trip from the log and restore it, at /admin/removed
+  - (admin) review a year's log and close or reopen it for edits, at /admin/year/<YYYY>
 
 Design notes:
   - The GPX/JSON files are the immutable source of truth and are mounted
@@ -23,6 +24,9 @@ Design notes:
     never a change under the data root: the files stay, and a restore is
     deleting the row. _load_trips() is the one place removed trips leave the
     log, so the list, totals, exports and merge suggestions all agree.
+  - A closed year is a tax_years row. While it exists, annotate, merge,
+    undo merge, remove and restore refuse trips in that year (409) for both
+    roles; viewing, exports and place lookup are untouched.
   - Trips are identified in URLs by <ym>/<id> (e.g. 2026-04/2026-04-14...).
     Both components are strictly validated to prevent path traversal.
 
@@ -169,6 +173,7 @@ ENDPOINT_ROLES = {
     "admin": {"admin"},
     "admin_removed": {"admin"},
     "admin_history": {"admin"},
+    "admin_year": {"admin"},
     "close_year": {"admin"},
     "reopen_year": {"admin"},
     "remove_trip": {"admin"},
@@ -1009,6 +1014,8 @@ def _may_start_in(ym, year):
 
 def _folder_years(ym):
     """The years a trip with an unreadable summary may belong to, by folder."""
+    if not YM_RE.match(ym):
+        return set()  # not an ingest folder: no evidence of a year
     folder_year = int(ym[:4])
     return {folder_year, folder_year - 1} if ym.endswith("-01") else {folder_year}
 
@@ -1333,6 +1340,13 @@ ACCOUNT_HTML = """
 {% if title == 'Admin' %}<p>{{ admin_username }}: Admin (set in viewer.env)</p>
 <p><a class="btn secondary" href="{{ url_for('admin_removed') }}">Removed trips</a></p>
 <p><a class="btn secondary" href="{{ url_for('admin_history') }}">Change history</a></p>
+<h2>Year review</h2>
+<p class="muted">Check a year's log before filing, then close it so nothing in it changes by accident.</p>
+<table class="year-table"><tr><th>Year</th><th>Status</th><th></th></tr>
+{% for item in year_list %}<tr><td>{{ item.year }}</td>
+<td>{% if item.closed %}Closed by {{ item.closed.closed_by }} on {{ fmt_day(item.closed.closed_at) }}{% else %}Open{% endif %}</td>
+<td><a class="btn secondary" href="{{ url_for('admin_year', year=item.year) }}">Review {{ item.year }}</a></td></tr>
+{% else %}<tr><td colspan="3" class="muted">No trips yet.</td></tr>{% endfor %}</table>
 <h2>Everyday logins</h2><div class="login-table">
 <table><tr><th>Everyday login</th><th>Status</th><th>Created ({{ timezone }})</th><th>Actions</th></tr>
 {% for user in logins %}<tr><td>{{ user.username }}</td><td>{{ 'disabled' if user.disabled else 'enabled' }}</td>
@@ -1477,6 +1491,7 @@ LIST_HTML = """
       <button class="btn" type="submit">Apply</button>
     </form>
     {% if year_closed %}<span class="tag other">Closed for edits</span>{% endif %}
+    {% if year and g.role == 'admin' %}<a class="btn secondary" href="{{ url_for('admin_year', year=year) }}">{{ year }} year review</a>{% endif %}
     <a class="btn" href="{{ url_for('export_csv', year=year or '') }}">Export CSV</a>
     <a class="btn secondary" href="{{ url_for('export_xlsx', year=year or '') }}">Export XLSX</a>
     <span class="muted">{{ trips|length }} trip(s) · {{ "%.3f"|format(totals.all) }} mi total</span>
@@ -1930,6 +1945,7 @@ def admin():
         return redirect(url_for("admin"))
     return render_template_string(ACCOUNT_HTML, title="Admin", admin_username=VIEWER_USERNAME,
                                   logins=users.list_users(DB_PATH), timezone=DISPLAY_TZ_NAME,
+                                  year_list=_year_list(),
                                   message=session.pop("account_message", None))
 
 
@@ -2105,6 +2121,215 @@ def admin_history():
     )
 
 
+def _year_list():
+    """The years the admin can review, newest first, each with its closed record."""
+    trips, unreadable = load_trips(include_removed=True)
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        closed = trip_log.closed_years(conn)
+    years = {y for y in map(_trip_local_year, trips) if y} | closed.keys()
+    for trip in unreadable:
+        years |= _folder_years(trip["ym"])
+    return [{"year": year, "closed": closed.get(year)} for year in sorted(years, reverse=True)]
+
+
+YEAR_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ year }} year review</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """
+.review-table { overflow-x: auto; }
+.review-table td { vertical-align: top; overflow-wrap: anywhere; }
+</style></head><body>
+""" + ACCOUNT_HEADER + """<main class="wrap">
+{% macro trip_link(t) %}<a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{% if t.problem %}{{ t.trip_key }}{% else %}{{ fmt_trip_date(t) }}{% endif %}</a>{% endmacro %}
+<h1>{{ year }} year review</h1>
+<p class="muted">Times shown in {{ timezone }}. A trip belongs to the year it starts in (or, if partly timed, its
+first recorded time), the same as the trip list and exports.</p>
+<div class="toolbar">
+  <a class="btn secondary" href="{{ url_for('index', year=year) }}">{{ year }} trips</a>
+  <a class="btn" href="{{ url_for('export_csv', year=year) }}">Export CSV</a>
+  <a class="btn secondary" href="{{ url_for('export_xlsx', year=year) }}">Export XLSX</a>
+</div>
+
+<section aria-labelledby="status-heading">
+<h2 id="status-heading">Status</h2>
+{% if closed %}
+<p><span class="tag other">Closed for edits</span> by {{ closed.closed_by }} on {{ fmt_date(closed.closed_at) }}.
+Nobody can annotate, merge, undo a merge, remove or restore a trip in {{ year }} until you reopen it.
+Viewing and exporting still work.</p>
+<form method="post" action="{{ url_for('reopen_year', year=year) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<label><input type="checkbox" name="confirm" value="yes" required> Confirm reopening {{ year }}</label>
+<button class="btn secondary" type="submit">Reopen {{ year }}</button></form>
+{% else %}
+<p>{{ year }} is open. Close it once its return is filed, so its trips can't change by accident.</p>
+<form method="post" action="{{ url_for('close_year', year=year) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<label><input type="checkbox" name="confirm" value="yes" required> Confirm closing {{ year }} for edits</label>
+<button class="btn" type="submit">Close {{ year }}</button></form>
+{% endif %}
+</section>
+
+<section aria-labelledby="totals-heading">
+<h2 id="totals-heading">Totals by category</h2>
+<p class="muted">The same figures as the {{ year }} CSV and XLSX exports.</p>
+<div class="review-table"><table>
+<thead><tr><th>Category</th><th>Trips</th><th>Miles</th></tr></thead>
+<tbody>{% for category, miles in totals.items() %}<tr>
+<td>{{ category }}</td><td>{{ counts[category] }}</td><td>{{ "%.3f"|format(miles) }}</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+
+<section aria-labelledby="uncategorized-heading">
+<h2 id="uncategorized-heading">Trips with no category ({{ uncategorized|length }})</h2>
+<div class="review-table"><table>
+<thead><tr><th>Trip</th><th>Distance</th></tr></thead>
+<tbody>{% for t in uncategorized %}<tr><td>{{ trip_link(t) }}</td><td>{{ "%.2f"|format(t.distance_miles or 0) }} mi</td></tr>
+{% else %}<tr><td colspan="2" class="muted">Every trip has a category.</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+
+<section aria-labelledby="incomplete-heading">
+<h2 id="incomplete-heading">Business trips missing a note or destination ({{ incomplete|length }})</h2>
+<div class="review-table"><table>
+<thead><tr><th>Trip</th><th>Distance</th><th>Missing</th></tr></thead>
+<tbody>{% for item in incomplete %}<tr><td>{{ trip_link(item.trip) }}</td>
+<td>{{ "%.2f"|format(item.trip.distance_miles or 0) }} mi</td><td>{{ item.missing|join(' and ') }}</td></tr>
+{% else %}<tr><td colspan="3" class="muted">Every business trip has a purpose note and a destination.</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+
+<section aria-labelledby="unreadable-heading">
+<h2 id="unreadable-heading">Trips whose summary can't be read ({{ unreadable|length }})</h2>
+<p class="muted">Their miles can't be counted, so the totals above may be short.</p>
+<div class="review-table"><table>
+<thead><tr><th>Trip</th><th>Problem</th></tr></thead>
+<tbody>{% for t in unreadable %}<tr><td>{{ trip_link(t) }}</td><td>{{ t.problem }}</td></tr>
+{% else %}<tr><td colspan="2" class="muted">All summaries can be read.</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+
+<section aria-labelledby="removed-heading">
+<h2 id="removed-heading">Removed trips ({{ removed|length }})</h2>
+<div class="review-table"><table>
+<thead><tr><th>Trip</th><th>Reason</th><th>Removed by</th><th>Removed at ({{ timezone }})</th></tr></thead>
+<tbody>{% for t in removed %}<tr><td>{{ trip_link(t) }}</td><td>{{ t.removal.reason }}</td>
+<td>{{ t.removal.removed_by }}</td><td>{{ fmt_date(t.removal.removed_at) }}</td></tr>
+{% else %}<tr><td colspan="4" class="muted">No trips were removed.</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+
+<section aria-labelledby="late-heading">
+<h2 id="late-heading">Edits after the year ended ({{ edits|length }})</h2>
+<p class="muted">Changes to a {{ year }} trip made on or after {{ year_end }} ({{ timezone }}), and
+every time {{ year }} was closed or reopened.</p>
+<div class="review-table"><table>
+<thead><tr><th>When ({{ timezone }})</th><th>Actor</th><th>Action</th><th>Trip</th><th>Change</th></tr></thead>
+<tbody>{% for row in edits %}<tr>
+<td>{{ fmt_date(row.at) }}</td><td>{{ row.actor }}<br><span class="muted">{{ row.actor_role }}</span></td>
+<td>{{ row.action_label }}</td><td><a href="{{ row.trip_url }}">{{ row.trip_label }}</a></td><td>{{ row.summary }}</td>
+</tr>{% else %}<tr><td colspan="5" class="muted">No edits after the year ended.</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+</main></body></html>
+"""
+
+
+def _late_edit_rows(conn, year, trips):
+    """History rows that touch one of trips on or after local Jan 1 00:00 of year + 1.
+
+    trips are every trip of the year (removed ones too). A trip is touched
+    through its own key, its parts and its merge aliases, like its own
+    history. The year's close/reopen rows come along whatever their date.
+    One pass over the rows after the boundary serves all the trips, instead
+    of one history scan per trip.
+    """
+    keys = set()
+    aliases = {}
+    for alias_key, merge_key in conn.execute("SELECT alias_key, merge_key FROM trip_merge_aliases"):
+        aliases.setdefault(merge_key, []).append(alias_key)
+    for trip in trips:
+        keys.add(trip["trip_key"])
+        keys.update(trip.get("parts", ()))
+        keys.update(aliases.get(trip["trip_key"], ()))
+    rows = {}
+    try:
+        boundary = datetime(year + 1, 1, 1, tzinfo=DISPLAY_TZ).astimezone(timezone.utc)
+    except ValueError:  # year 9999: nothing can happen after it
+        boundary = None
+    if boundary:
+        # The string compare only narrows the scan (a day of margin); the
+        # real comparison below is on parsed instants.
+        for raw in conn.execute(
+            "SELECT id, trip_key, actor, actor_role, at, action, details FROM trip_history WHERE at >= ?",
+            ((boundary - timedelta(days=1)).isoformat(),),
+        ):
+            row = _history_row_dict(raw)
+            if _history_order(row["at"]) < boundary:
+                continue
+            try:
+                details = json.loads(row["details"])
+            except (TypeError, ValueError):
+                details = {}
+            row["parsed_details"] = details
+            touched = row["trip_key"] in keys or (
+                row["action"] in ("merge", "split") and set(details.get("parts") or ()) & keys)
+            if touched:
+                rows[row["id"]] = row
+    for raw in conn.execute(
+        "SELECT id, trip_key, actor, actor_role, at, action, details FROM trip_history WHERE trip_key=?",
+        (f"year/{year}",),
+    ):
+        row = _history_row_dict(raw)
+        try:
+            row["parsed_details"] = json.loads(row["details"])
+        except (TypeError, ValueError):
+            row["parsed_details"] = {}
+        rows[row["id"]] = row
+    result = sorted(rows.values(), key=lambda r: (_history_order(r["at"]), r["id"]), reverse=True)
+    for row in result:
+        row["action_label"] = _history_action_label(row["action"])
+        row["summary"] = _history_summary(row)
+        row["trip_url"], row["trip_label"] = _history_trip_link(conn, row)
+    return result
+
+
+@app.route("/admin/year/<year>")
+def admin_year(year):
+    year = valid_year(year)
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        # Serialize the merge-cache refresh in _load_trips, like load_trips().
+        conn.execute("BEGIN IMMEDIATE")
+        trips, unreadable = _load_trips(conn, include_removed=True)
+        closed = trip_log.closed_years(conn).get(year)
+        # Totals and the problem lists come from the same selection the list
+        # and exports use, applied to the log without its removed trips.
+        live = [t for t in trips if "removal" not in t]
+        live_unreadable = [t for t in unreadable if "removal" not in t]
+        members, broken = year_members(live, live_unreadable, year)
+        gone, gone_unreadable = year_members(
+            [t for t in trips if "removal" in t], [t for t in unreadable if "removal" in t], year)
+        edits = _late_edit_rows(conn, year, members + broken + gone + gone_unreadable)
+    totals = mileage_totals(members)
+    counts = {category: 0 for category in totals}
+    counts["all"] = len(members)
+    for t in members:
+        counts[t.get("category") if t.get("category") in CATEGORIES else "unclassified"] += 1
+    incomplete = []
+    for t in members:
+        if t.get("category") == "business":
+            missing = [label for label, field in (("purpose note", "purpose_note"), ("destination", "destination"))
+                       if not (t.get(field) or "").strip()]
+            if missing:
+                incomplete.append({"trip": t, "missing": missing})
+    removed = sorted(gone + gone_unreadable, key=lambda t: t["removal"]["removed_at"], reverse=True)
+    return render_template_string(
+        YEAR_HTML, year=year, closed=closed, totals=totals, counts=counts, edits=edits,
+        uncategorized=[t for t in members if t.get("category") not in CATEGORIES],
+        incomplete=incomplete, unreadable=broken, removed=removed, timezone=DISPLAY_TZ_NAME,
+        year_end=f"{year + 1}-01-01 00:00",
+    )
+
+
 def _change_year(raw_year, closing_it):
     """Close or reopen a year: a tax_years row and its history row, in one transaction."""
     year = valid_year(raw_year)
@@ -2121,7 +2346,7 @@ def _change_year(raw_year, closing_it):
             trip_log.reopen_year(conn, year)
         trip_log.record(conn, f"year/{year}", "year_close" if closing_it else "year_reopen", {},
                         actor=g.user, actor_role=g.role)
-    return redirect(url_for("index", year=year))
+    return redirect(url_for("admin_year", year=year))
 
 
 @app.route("/admin/year/<year>/close", methods=["POST"])
