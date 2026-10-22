@@ -48,7 +48,11 @@ standalone esptool supports Windows x64, macOS Intel/Apple Silicon, and
 Linux x86-64, ARM64 and ARMv7. Other platforms need a compatible standalone
 esptool supplied with `-Esptool` / `--esptool`. Native USB needs no Windows
 driver. On Linux your login needs serial-port access (on Debian/Ubuntu,
-join `dialout` and log out/in). Check `ssh <user>@<host>` works from this PC.
+join `dialout` and log out/in). Check `ssh <user>@<host>` or `ssh <alias>`
+works from this PC. Windows prefers the `scp.exe` in Windows OpenSSH over
+PATH, including Git Bash's msys `scp`, which cannot use the Windows SSH
+agent. If a copy fails with "Connection closed", retry from a normal
+PowerShell window with Windows OpenSSH and your SSH agent available.
 
 Use the commands printed by setup for its release. The latest-release forms are:
 
@@ -79,10 +83,16 @@ bash flash.sh --server '<user>@<host>' --first-install
 Replace placeholders first. Omit `-Port` to choose from detected ports.
 `-InstallDir '~/mileage-tracker'` / `--install-dir '~/mileage-tracker'` selects
 the remote installation (use your actual path if nondefault). Remote paths
-must be simple absolute or `~/` paths without spaces; SSH targets must be
-`user@host` with a hostname or IPv4 address, rather than an IPv6 literal. For help run
+must be simple absolute or `~/` paths without spaces. SSH targets accept
+`<user>@<host>` (hostname or IPv4) or a bare `<alias>` from your PC's SSH
+config: use `-Server '<alias>'` / `--server '<alias>'`. Only letters, digits,
+underscores, dots and hyphens are allowed, with a letter, digit or underscore
+at the start of each component. Whitespace, shell characters and IPv6
+literals are rejected. For help run
 `powershell.exe -ExecutionPolicy Bypass -File .\flash.ps1 -Help` or
 `bash flash.sh --help`. PowerShell 7 can use `pwsh` instead of `powershell.exe`.
+Scripts run from a development checkout label the banner `development
+checkout`; downloaded release scripts show their release tag.
 
 ### First install, update and cleanup
 
@@ -96,11 +106,20 @@ Server output directories/files are owner-only (0700/0600); binaries contain
 your WiFi password and upload token. The PC's temporary firmware copy is
 private and removed on exit; keep any manually copied binaries private too.
 
-For **every script flash**, enter download mode as prompted: hold BOOT,
-plug USB in (or tap RESET), wait 2–3 seconds, release BOOT. Select the port;
-its name can change in download mode. See [download mode](#download-mode)
-for factory-firmware and battery details. Press RESET with BOOT released
-after flashing to run the program.
+Choose first install or update before connecting. **First installs always
+use manual download mode**, because the factory board's state is unknown:
+hold BOOT, plug USB in (or tap RESET), wait 2–3 seconds, release BOOT, then
+select the port. See [download mode](#download-mode) for factory-firmware
+and battery details.
+
+**Updates and cleanup try automatic USB reset into download mode first.**
+Select the running board's port; the script confirms the chip with esptool's
+automatic reset and leaves it in download mode for the app-only write. If
+that attempt fails, follow the manual button instructions, then enter the
+new port if it changed (or press Enter to keep it). The script retries chip
+confirmation once without automatic reset and stops if that also fails.
+After writing, it requests a hard reset to run the program; press RESET
+with BOOT released only if the board stays in download mode.
 
 - **First install on a factory board:** use `-FirstInstall` / `--first-install`,
   or answer yes at the first-install prompt. The script reads all 8 MB of

@@ -10,6 +10,15 @@ tracker_flash() (
     # https://github.com/espressif/esptool/releases/tag/v5.6.0
 
     # BEGIN PURE HELPERS (also exercised by tools/test_flash_scripts.py)
+    flash_server_valid() {
+        # Same ASCII scp allowlist as PowerShell, including legacy shell mode.
+        [[ $1 =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*(@[a-zA-Z0-9_][a-zA-Z0-9_.-]*)?$ ]]
+    }
+    flash_label() {
+        # Packaging replaces every literal placeholder; assemble this comparison.
+        if [ "$1" = '@''RELEASE_TAG''@' ]; then printf 'development checkout'
+        else printf 'release %s' "$1"; fi
+    }
     flash_hash() {
         if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d ' ' -f1
         else shasum -a 256 "$1" | cut -d ' ' -f1; fi
@@ -73,6 +82,10 @@ tracker_flash() (
         if [ "$dry" = true ]; then printf 'DRY RUN:'; printf ' %q' "$esptool" "$@"; printf '\n'
         else "$esptool" "$@"; fi
     }
+    flash_download_mode() {
+        printf 'Download mode: hold BOOT, plug in USB (or tap RESET), wait 2-3 seconds, release BOOT.\n'
+        if [ "$dry" != true ]; then flash_prompt 'Enter download mode, then press Enter: ' >/dev/null; fi
+    }
     flash_tool() {
         local platform archive expected cache unpack
         case "$(uname -s)-$(uname -m)" in
@@ -99,7 +112,7 @@ tracker_flash() (
     # The literal tilde belongs to the remote user's home, not this computer.
     # shellcheck disable=SC2088
     local server='' install_dir='~/mileage-tracker' cleanup=false first=false port='' path='' dry=false esptool='' backup_dir='' skip_backup=false
-    local temp='' tool_temp='' value version major before after chip read_flash write_flash hard_reset='hard-reset'
+    local temp='' tool_temp='' value version major before after chip read_flash write_flash hard_reset='hard-reset' auto_reset='default-reset'
     local mode_flag=--flash-mode freq_flag=--flash-freq size_flag=--flash-size
     local erase_flash=erase-flash
     trap 'if [ -n "$temp" ]; then rm -rf -- "$temp"; fi; if [ -n "$tool_temp" ]; then rm -rf -- "$tool_temp"; fi' EXIT
@@ -108,17 +121,21 @@ tracker_flash() (
     while [ "$#" -gt 0 ]; do
         case $1 in
             --help|-h) cat <<'HELP'
-Usage: bash flash.sh [--server <user>@<host>] [--install-dir ~/mileage-tracker]
+Usage: bash flash.sh [--server <user>@<host>|<alias>] [--install-dir ~/mileage-tracker]
   [--path <folder>] [--cleanup] [--first-install] [--port <port>] [--dry-run]
   [--esptool <executable>] [--backup-dir <folder>] [--skip-backup] [--help]
 Requires bash, curl, tar, jq, and OpenSSH scp (unless --path). No Python required.
+SSH targets accept user@host or a bare SSH config alias (letters, digits, _, ., -;
+start each component with a letter, digit or _; no spaces or shell characters).
 Install jq: Debian/Ubuntu: sudo apt install jq; macOS: brew install jq.
 Review before running: curl -fsSL <release-url>/flash.sh -o flash.sh; less flash.sh
 Then: bash flash.sh --server '<user>@<host>'
 Prompts use /dev/tty, including when curl is piped to bash.
 --dry-run verifies firmware and esptool but never opens a serial device.
 Default update and --cleanup write only the app and never erase settings or trips.
+They try automatic USB download mode first; if it fails, follow the BOOT/RESET prompt.
 --first-install: verified double 8 MB backup, type ERASE, erase all flash, write four parts.
+First installs always use the manual BOOT/RESET download-mode prompt.
 Use only for a new/factory board. Internal settings and trips are wiped; SD is untouched.
 --first-install --skip-backup: re-provision a board already backed up; still type ERASE.
 Dry run prints the backup/erase/write plan without requesting confirmation.
@@ -153,8 +170,8 @@ HELP
             cp "$path/$value" "$temp/payload/$value"
         done
     else
-        [ -n "$server" ] || server=$(flash_prompt 'SSH server (<user>@<host>): ')
-        [[ $server =~ ^[a-zA-Z0-9_.-]+@[a-zA-Z0-9_.-]+$ ]] || flash_die 'Use an SSH server in user@host form.'
+        [ -n "$server" ] || server=$(flash_prompt 'SSH server (<user>@<host> or <alias>): ')
+        flash_server_valid "$server" || flash_die 'Use user@host or a bare SSH config alias: letters, digits, _, . and - only; start each component with a letter, digit or _. No whitespace or shell characters.'
         # Restrict remote paths to avoid shell interpretation with older scp.
         [[ $install_dir =~ ^(~/|/)[a-zA-Z0-9_./-]+$ ]] && [[ $install_dir != *'/../'* ]] || flash_die 'Install directory must be a simple absolute or ~/ path.'
         value=current; [ "$cleanup" != true ] || value=cleanup
@@ -168,14 +185,17 @@ HELP
     before='no-reset'; after='no-reset'; chip='chip-id'; read_flash='read-flash'; write_flash='write-flash'
     if [ "$major" = 4 ]; then
         before=no_reset; after=no_reset; chip=chip_id; read_flash=read_flash; write_flash=write_flash
-        hard_reset=hard_reset
+        hard_reset=hard_reset; auto_reset=default_reset
         mode_flag=--flash_mode; freq_flag=--flash_freq; size_flag=--flash_size
         erase_flash=erase_flash
     fi
-    printf 'Tracker flash (release %s). Keep the LoRa antenna attached; use a USB data cable.\n' "$RELEASE_TAG"
-    printf 'Download mode: hold BOOT, plug in USB (or tap RESET), wait 2-3 seconds, release BOOT.\n'
+    printf 'Tracker flash (%s). Keep the LoRa antenna attached; use a USB data cable.\n' "$(flash_label "$RELEASE_TAG")"
     printf 'Close serial monitors. The port can change in download mode.\n'
-    if [ "$dry" != true ]; then flash_prompt 'Enter download mode, then press Enter: ' >/dev/null; fi
+    if [ "$first" != true ] && [ "$cleanup" != true ] && [ "$dry" != true ]; then
+        value=$(flash_prompt 'First install on a factory board? Backup, full erase, then write four parts? [y/N]: ')
+        case $value in y|Y|yes|YES) first=true ;; esac
+    fi
+    if [ "$first" = true ]; then flash_download_mode; fi
     local ports=() candidate choice=''
     for candidate in /dev/cu.usbmodem* /dev/ttyACM*; do [ ! -e "$candidate" ] || ports+=("$candidate"); done
     if [ -z "$port" ]; then
@@ -185,10 +205,20 @@ HELP
     fi
     port=$(flash_choose_port "$port" "$choice" "${ports[@]}") || flash_die 'Invalid port choice.'
     local common=(--chip esp32s3 --port "$port" --before "$before" --after "$after")
-    flash_command "${common[@]}" "$chip" || flash_die 'Chip confirmation failed. On Linux check port permissions: Debian/Ubuntu use the dialout group; log out/in after joining. Close serial monitors and retry download mode.'
-    if [ "$first" != true ] && [ "$cleanup" != true ] && [ "$dry" != true ]; then
-        value=$(flash_prompt 'First install on a factory board? Backup, full erase, then write four parts? [y/N]: ')
-        case $value in y|Y|yes|YES) first=true ;; esac
+    # Installed Stage 4 supports automatic USB download mode. Factory state is
+    # unknown, so first installs stay manual. The write still uses hard-reset.
+    if [ "$first" != true ]; then
+        printf 'Trying automatic USB reset into download mode.\n'
+        if ! flash_command --chip esp32s3 --port "$port" --before "$auto_reset" --after "$after" "$chip"; then
+            printf 'Automatic download-mode attempt failed. Close serial monitors and check the USB cable and port.\n'
+            flash_download_mode
+            value=$(flash_prompt "Port after entering download mode [$port] (Enter to keep): ")
+            port=${value:-$port}
+            common=(--chip esp32s3 --port "$port" --before "$before" --after "$after")
+            flash_command "${common[@]}" "$chip" || flash_die 'Chip confirmation failed. On Linux check port permissions: Debian/Ubuntu use the dialout group; log out/in after joining. Close serial monitors and retry download mode.'
+        fi
+    else
+        flash_command "${common[@]}" "$chip" || flash_die 'Chip confirmation failed. On Linux check port permissions: Debian/Ubuntu use the dialout group; log out/in after joining. Close serial monitors and retry download mode.'
     fi
     if [ "$first" = true ]; then
         if [ "$skip_backup" != true ]; then
@@ -226,7 +256,7 @@ HELP
     local name offset file digest
     while IFS=$'\t' read -r name offset file digest; do args+=("$offset" "$temp/payload/$file"); done < <(flash_parts "$temp/payload" "$first")
     flash_command "${args[@]}"
-    printf 'Press RESET once with BOOT released (hard reset) to run the sketch.\n'
+    printf 'The write requests a hard reset to run the sketch. If it stays in download mode, press RESET once with BOOT released.\n'
     if [ "$first" = true ]; then
         printf 'Expect on the serial console: LittleFS partition is fully erased; provisioning trip storage.\n'
         printf 'Then: Setup complete. Logging trips.\n'

@@ -39,6 +39,27 @@ function Save-Fixture($Manifest) {
     $Manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $folder 'manifest.json') -Encoding ASCII
 }
 try {
+    foreach ($target in @('alias', 'alias-1.example', '_alias', 'user@host', 'user.name-1@127.0.0.1')) {
+        Assert-Equal (Test-FlashServer $target) $true
+    }
+    foreach ($target in @('', '-alias', '-user@host', 'user@-host', 'user@@host', '@host', 'user@',
+        ' alias', 'alias ', "alias`n", "alias`r", "alias`t", 'user host', 'host:22', '[::1]',
+        'alias/path', 'alias\path', '$(id)', '`id`', 'alias;id', 'alias&', 'alias|id',
+        'alias*', 'alias?', 'alias"', "alias'", 'alias%value', 'alias=value')) {
+        Assert-Equal (Test-FlashServer $target) $false
+    }
+    Assert-Equal (Get-FlashLabel ('@' + 'RELEASE_TAG' + '@')) 'development checkout'
+    Assert-Equal (Get-FlashLabel 'v0.00-test') 'release v0.00-test'
+    $savedSystemRoot = $env:SystemRoot
+    try {
+        $env:SystemRoot = $folder
+        Assert-Equal (Get-FlashScp) 'scp'
+        $openSsh = Join-Path $folder 'System32\OpenSSH'
+        [IO.Directory]::CreateDirectory($openSsh) | Out-Null
+        $nativeScp = Join-Path $openSsh 'scp.exe'
+        [IO.File]::WriteAllText($nativeScp, '')
+        Assert-Equal (Get-FlashScp) $nativeScp
+    } finally { $env:SystemRoot = $savedSystemRoot }
     $m = New-Fixture
     Save-Fixture $m
     $validated = Test-FlashManifest $folder $false
@@ -133,6 +154,9 @@ $global:LASTEXITCODE = 0
                 Assert-Equal ([regex]::Matches($writeLine, '\.bin').Count) $expectedCount
                 Assert-Equal ($transcript -match '--erase-all') $false
                 $commands = @($transcript -split '\r?\n' | Where-Object { $_ -match '^DRY RUN:.*--chip' })
+                Assert-Equal ($transcript.Contains('Tracker flash (development checkout).')) $true
+                Assert-Equal ($commands[0] -match "'--before' '$(if ($mode -eq 'first') { 'no-reset' } else { 'default-reset' })'") $true
+                Assert-Equal ($writeLine -match "'--before' 'no-reset' '--after' 'hard-reset'") $true
                 Assert-Equal (@($commands | Where-Object { $_ -match 'erase-flash' }).Count) $(if ($mode -eq 'first') { 1 } else { 0 })
                 if ($mode -eq 'first') {
                     Assert-Equal ($commands[-2] -match 'erase-flash') $true
@@ -142,6 +166,40 @@ $global:LASTEXITCODE = 0
                 }
                 Assert-Equal (@(Get-ChildItem $folder -Directory -Filter 'tracker-flash-*').Count) 0
             }
+            # Apply the release builder's global byte replacement to the whole
+            # script: the comparison must still identify a stamped release.
+            $releaseScript = Join-Path $folder 'release-flash.ps1'
+            [IO.File]::WriteAllText($releaseScript, $source.Replace(('@' + 'RELEASE_TAG' + '@'), 'v0.00-test'))
+            $transcript = (& $releaseScript @options 6>&1 | Out-String -Width 32767)
+            Assert-Equal ($transcript.Contains('Tracker flash (release v0.00-test).')) $true
+            # Exercise the real SSH-copy branch with a function test double.
+            # No executable scp/ssh is allowed to run in these tests.
+            function scp {
+                Assert-Equal $args[0] '-rq'
+                Assert-Equal $args[1] 'alias:~/mileage-tracker/firmware-out/current/'
+                $destination = $args[2]
+                if ($env:FLASH_TEST_COPY_FAILURE -eq '1') { Write-Error 'Synthetic Connection closed'; $global:LASTEXITCODE = 1; return }
+                [IO.Directory]::CreateDirectory($destination) | Out-Null
+                foreach ($file in @('manifest.json', 'bootloader.bin', 'partitions.bin', 'boot_app0.bin', 'app.bin')) {
+                    [IO.File]::Copy((Join-Path $folder $file), (Join-Path $destination $file))
+                }
+                $global:LASTEXITCODE = 0
+            }
+            $scpResolver = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-FlashScp' }, $true)
+            $copyScript = Join-Path $folder 'copy-flash.ps1'
+            [IO.File]::WriteAllText($copyScript, $source.Replace($scpResolver.Extent.Text, "function Get-FlashScp { return 'scp' }"))
+            try {
+                $null = & $copyScript -Server alias -Port COMx -Esptool $Esptool -DryRun 6>&1
+                $env:FLASH_TEST_COPY_FAILURE = '1'
+                $copyError = ''
+                try { $null = & $copyScript -Server alias -Port COMx -Esptool $Esptool -DryRun 6>&1 2>&1 } catch { $copyError = $_.Exception.Message }
+                Assert-Equal ($copyError.Contains('Firmware copy failed.')) $true
+                Assert-Equal ($copyError.Contains('Git Bash')) $true
+                Assert-Equal (@(Get-ChildItem $folder -Directory -Filter 'tracker-flash-*').Count) 0
+            } finally {
+                Remove-Item Function:\scp
+                Remove-Item Env:\FLASH_TEST_COPY_FAILURE -ErrorAction SilentlyContinue
+            }
             # Run the entire real flow with fake esptool and queued Read-Host
             # answers. Actual erase/write commands can only reach this fake.
             @'
@@ -149,6 +207,17 @@ $toolArgs = @($args)
 @{ Arguments = [string[]]$toolArgs } | ConvertTo-Json -Compress | Add-Content -LiteralPath $env:FLASH_TEST_LOG
 $global:LASTEXITCODE = 0
 if (($toolArgs -join ',') -eq 'version') { Write-Output ('esptool v' + $env:FLASH_TEST_MAJOR + '.6.0'); return }
+if ('chip-id' -in $toolArgs -or 'chip_id' -in $toolArgs) {
+    if ($env:FLASH_TEST_FAILURE -eq 'stderr') { Write-Error 'Synthetic diagnostic with a successful exit' }
+    if ($env:FLASH_TEST_FAILURE -eq 'chip' -or
+        ($env:FLASH_TEST_FAILURE -eq 'auto' -and ('default-reset' -in $toolArgs -or 'default_reset' -in $toolArgs))) {
+        Write-Error 'Synthetic connection failure on stderr'
+        $global:LASTEXITCODE = 1; return
+    }
+}
+if (('write-flash' -in $toolArgs -or 'write_flash' -in $toolArgs) -and $env:FLASH_TEST_FAILURE -eq 'write') {
+    $global:LASTEXITCODE = 1; return
+}
 if ('read-flash' -in $toolArgs -or 'read_flash' -in $toolArgs) {
     if ($env:FLASH_TEST_FAILURE -eq 'read') { $global:LASTEXITCODE = 1; return }
     $stream = [IO.File]::Create($toolArgs[-1])
@@ -175,19 +244,20 @@ if (('erase-flash' -in $toolArgs -or 'erase_flash' -in $toolArgs) -and $env:FLAS
                 $settings = @{ Path = $folder; Port = 'COMx'; Esptool = $Esptool; BackupDir = (Join-Path $folder 'backups') }
                 foreach ($key in $Options.Keys) { $settings[$key] = $Options[$key] }
                 $rejected = $false
-                try { $null = & $scriptPath @settings 6>&1 } catch { $rejected = $true }
+                $transcript = ''; $errorMessage = ''
+                try { $transcript = (& $scriptPath @settings 6>&1 2>&1 | Out-String -Width 32767) } catch { $rejected = $true; $errorMessage = $_.Exception.Message }
                 $commands = @(Get-Content -LiteralPath $env:FLASH_TEST_LOG | ForEach-Object {
                     $_ | ConvertFrom-Json
                 })
                 Assert-Equal (@(Get-ChildItem $folder -Directory -Filter 'tracker-flash-*').Count) 0
-                return [pscustomobject]@{ Rejected = $rejected; Commands = $commands }
+                return [pscustomobject]@{ Rejected = $rejected; Commands = $commands; Transcript = $transcript; ErrorMessage = $errorMessage }
             }
             $m = New-Fixture; Save-Fixture $m
             foreach ($major in @(4, 5)) {
                 $suffix = '-flash'; if ($major -eq 4) { $suffix = '_flash' }
                 foreach ($scenario in @(
                     @{ Options = @{ FirstInstall = $true }; Replies = @('', 'ERASE'); Reads = 2 },
-                    @{ Options = @{}; Replies = @('', 'yes', 'ERASE'); Reads = 2 },
+                    @{ Options = @{}; Replies = @('yes', '', 'ERASE'); Reads = 2 },
                     @{ Options = @{ FirstInstall = $true; SkipBackup = $true }; Replies = @('', 'ERASE'); Reads = 0 }
                 )) {
                     $run = Invoke-MockedFlash $scenario.Options $scenario.Replies '' $major
@@ -196,6 +266,7 @@ if (('erase-flash' -in $toolArgs -or 'erase_flash' -in $toolArgs) -and $env:FLAS
                     Assert-Equal ($run.Commands[-1].Arguments -contains ('write' + $suffix)) $true
                     Assert-Equal (@($run.Commands | Where-Object { $_.Arguments -contains ('read' + $suffix) }).Count) $scenario.Reads
                     Assert-Equal (@($run.Commands[-1].Arguments | Where-Object { $_ -match '\.bin$' }).Count) 4
+                    Assert-Equal (@($run.Commands | Where-Object { 'default-reset' -in $_.Arguments -or 'default_reset' -in $_.Arguments }).Count) 0
                 }
             }
             foreach ($skip in @($false, $true)) {
@@ -216,11 +287,44 @@ if (('erase-flash' -in $toolArgs -or 'erase_flash' -in $toolArgs) -and $env:FLAS
             Assert-Equal $run.Rejected $true
             Assert-Equal (@($run.Commands | Where-Object { 'write-flash' -in $_.Arguments }).Count) 0
             $m.kind = 'normal'; Save-Fixture $m
-            foreach ($scenario in @(@{ Options = @{}; Replies = @('', 'no') }, @{ Options = @{ Cleanup = $true }; Replies = @('') })) {
-                $run = Invoke-MockedFlash $scenario.Options $scenario.Replies
-                Assert-Equal $run.Rejected $false
-                Assert-Equal (@($run.Commands | Where-Object { 'erase-flash' -in $_.Arguments -or 'read-flash' -in $_.Arguments }).Count) 0
-                Assert-Equal (@($run.Commands[-1].Arguments | Where-Object { $_ -match '\.bin$' }).Count) 1
+            foreach ($major in @(4, 5)) {
+                $auto = 'default-reset'; $noReset = 'no-reset'; $hardReset = 'hard-reset'; $chip = 'chip-id'; $write = 'write-flash'
+                if ($major -eq 4) { $auto = 'default_reset'; $noReset = 'no_reset'; $hardReset = 'hard_reset'; $chip = 'chip_id'; $write = 'write_flash' }
+                foreach ($cleanup in @($false, $true)) {
+                    $replies = @(); if (-not $cleanup) { $replies = @('no') }
+                    $modeOptions = @{}; if ($cleanup) { $modeOptions.Cleanup = $true }
+                    $run = Invoke-MockedFlash $modeOptions $replies '' $major
+                    Assert-Equal $run.Rejected $false
+                    Assert-Equal $run.Commands.Count 3
+                    Assert-Equal ($run.Commands[1].Arguments -contains $auto) $true
+                    Assert-Equal ($run.Transcript -match 'Download mode: hold BOOT') $false
+                    Assert-Equal ($run.Commands[-1].Arguments -contains $noReset) $true
+                    Assert-Equal ($run.Commands[-1].Arguments -contains $hardReset) $true
+                    Assert-Equal (@($run.Commands[-1].Arguments | Where-Object { $_ -match '\.bin$' }).Count) 1
+                    Assert-Equal $global:flashTestAnswers.Count 0
+                    foreach ($failure in @('auto', 'chip')) {
+                        $run = Invoke-MockedFlash $modeOptions ($replies + @('', 'COMy')) $failure $major
+                        Assert-Equal $run.Rejected ($failure -eq 'chip')
+                        Assert-Equal ($run.Commands[1].Arguments -contains $auto) $true
+                        Assert-Equal ($run.Commands[2].Arguments -contains $chip) $true
+                        Assert-Equal ($run.Commands[2].Arguments -contains $noReset) $true
+                        Assert-Equal ($run.Commands[2].Arguments -contains 'COMy') $true
+                        Assert-Equal (@($run.Commands | Where-Object { $write -in $_.Arguments }).Count) $(if ($failure -eq 'chip') { 0 } else { 1 })
+                        if ($failure -eq 'auto') {
+                            Assert-Equal ($run.Commands[-1].Arguments -contains 'COMy') $true
+                            Assert-Equal (@($run.Commands[-1].Arguments | Where-Object { $_ -match '\.bin$' }).Count) 1
+                        }
+                        Assert-Equal $global:flashTestAnswers.Count 0
+                    }
+                    $run = Invoke-MockedFlash $modeOptions $replies 'write' $major
+                    Assert-Equal $run.Rejected $true
+                    Assert-Equal $run.Commands.Count 3
+                    Assert-Equal $global:flashTestAnswers.Count 0
+                    $run = Invoke-MockedFlash $modeOptions $replies 'stderr' $major
+                    Assert-Equal $run.Rejected $false
+                    Assert-Equal $run.Commands.Count 3
+                    Assert-Equal $global:flashTestAnswers.Count 0
+                }
             }
             foreach ($invalid in @(@{ SkipBackup = $true }, @{ Cleanup = $true; FirstInstall = $true })) {
                 $run = Invoke-MockedFlash $invalid @('')

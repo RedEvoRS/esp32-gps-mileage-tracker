@@ -191,7 +191,8 @@ printed by Step 1 when selecting a specific release or installation directory.
 irm https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases/latest/download/flash.ps1 | iex
 ```
 
-It asks for `<user>@<host>`. To inspect it and supply `-Server`, save it first
+It asks for `<user>@<host>` or a bare SSH config alias, `<alias>`, from your
+PC's SSH config. To inspect it and supply `-Server`, save it first
 (the `irm | iex` form cannot pass script arguments):
 
 ```powershell
@@ -199,6 +200,12 @@ Invoke-WebRequest https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases
 Get-Content .\flash.ps1
 powershell.exe -ExecutionPolicy Bypass -File .\flash.ps1 -Server '<user>@<host>'
 ```
+
+You can also use `-Server '<alias>'`. The script prefers Windows OpenSSH's
+`scp.exe`, so launching PowerShell from Git Bash does not select Git's msys
+`scp` when Windows OpenSSH is installed. If copying fails with "Connection
+closed", retry in a normal PowerShell window and check that Windows OpenSSH
+and your SSH agent are available there.
 
 **macOS/Linux Terminal:**
 
@@ -215,17 +222,25 @@ bash flash.sh --server '<user>@<host>'
 ```
 
 The script copies your private firmware over SSH and checks its hashes.
-Follow its download-mode prompt: hold **BOOT**, plug in USB (or tap
-**RESET**), wait 2–3 seconds, release BOOT, then select the port (`COMx` on
-Windows; it can change in download mode).
+Both scripts accept `<user>@<host>` or `<alias>` (`--server '<alias>'` on
+macOS/Linux). Targets allow letters, digits, underscores, dots and hyphens;
+each component must start with a letter, digit or underscore. Spaces, IPv6
+literals and shell characters are rejected.
 
 **For the first install on a factory board, answer yes to first install.**
+Follow its manual download-mode prompt: hold **BOOT**, plug in USB (or tap
+**RESET**), wait 2–3 seconds, release BOOT, then select the port (`COMx` on
+Windows; it can change in download mode).
 The script reads the full 8 MB factory flash twice and checks the copies
 match. Keep the backup privately outside the repo; it may contain device
 keys. You must then type **`ERASE`**: this erases all internal flash,
 including settings and any internal trips, before writing all four firmware
-parts. The SD card is untouched. Updates use the default app-only path.
-Press RESET with BOOT released after flashing. See the
+parts. The SD card is untouched. Updates use the default app-only path:
+select the running board's port and the script first tries automatic USB
+reset into download mode. If that fails, follow the BOOT/RESET instructions
+and enter the new port if it changed. Cleanup uses the same automatic attempt.
+After writing, the script requests a hard reset; if the board stays in
+download mode, press RESET with BOOT released. See the
 [firmware guide](firmware/README.md#flash-from-the-server-build) for details.
 
 <a id="4-check-it-works"></a>
@@ -261,8 +276,8 @@ bash flash.sh --server '<user>@<host>' --cleanup
 
 This selects `firmware-out/cleanup/`, removes the one-use enrollment values,
 and writes only the app. It preserves the board's settings, trip counter,
-SD diagnostics metadata and queued trips. Follow the download-mode prompt
-again. [Enrollment and recovery](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
+SD diagnostics metadata and queued trips. It tries automatic download mode,
+with button instructions if needed. [Enrollment and recovery](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
 explains why those values must be removed.
 
 ## Updating
