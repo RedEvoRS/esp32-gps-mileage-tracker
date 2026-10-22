@@ -1890,6 +1890,49 @@ int main(int argc, char** argv) {
         CHECK(PMU.shutdownCalls == 1, "VBUS loss during arming allows battery idle power-off");
     }
 
+    printf("T63 a size-split moving tail survives normal cooldown\n");
+    {
+        for (bool timed : {false, true}) {
+            resetWorld(); SD.cardPresent = true; g_sdDisk.capacity = 32 * 1024 * 1024;
+            setup(); gClockSet = timed; drive(15, 40);
+            std::string first = gTripPath;
+            size_t reserve = (gPendCount + 1) * (TRKPT_LINE_BYTES - 1) + strlen(GPX_EPILOGUE);
+            padTripTo(TRIP_SPLIT_BYTES - reserve - 1);
+            drive(5, 1);
+            std::string tail = gTripPath;
+            CHECK(gState == ACTIVE && tail != first, "size split starts a continuation without arming");
+            drive(5, 5);
+            CHECK(gTripMeters > 20 && gTripMeters < MIN_TRIP_METERS &&
+                  gLastMoveMs - gTripT0 < MIN_TRIP_MS, "tail is moving but below both micro-trip thresholds");
+            drive(0, kCooldownSeconds + 1);
+            CHECK(gState == IDLE && g_sdDisk.files.count(tail) &&
+                  wellFormedShape(g_sdDisk.files.at(tail)) &&
+                  count(g_sdDisk.files.at(tail), "<trkpt ") == kCooldownSeconds + 7,
+                  "short moving continuation is kept with all recorded points after cooldown");
+            CHECK(g_sdDisk.files.count(tail) &&
+                  times(g_sdDisk.files.at(tail)).size() == (timed ? kCooldownSeconds + 7 : 0),
+                  "continuation also preserves buffered untimed points without inventing UTC");
+            size_t kept = g_sdDisk.files.size();
+            drive(5, 12); drive(0, kCooldownSeconds + 1);
+            CHECK(gState == IDLE && g_sdDisk.files.size() == kept,
+                  "next normal short trip is still discarded after the continuation ends");
+        }
+    }
+
+    printf("T64 a stopped split continuation keeps its recorded boundary and tail\n");
+    {
+        resetWorld(); SD.cardPresent = true; g_sdDisk.capacity = 32 * 1024 * 1024;
+        setup(); drive(15, 40); drive(0, 1);
+        padTripTo(TRIP_SPLIT_BYTES - (TRKPT_LINE_BYTES - 1) - strlen(GPX_EPILOGUE) - 1);
+        drive(0, 1);
+        std::string tail = gTripPath;
+        drive(0, kCooldownSeconds - 1);
+        CHECK(gState == IDLE && g_sdDisk.files.count(tail) &&
+              wellFormedShape(g_sdDisk.files.at(tail)) &&
+              count(g_sdDisk.files.at(tail), "<trkpt ") == kCooldownSeconds,
+              "stopped continuation retains the shared boundary and subsequent recorded fixes");
+    }
+
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
     return g_fail ? 1 : 0;
 }

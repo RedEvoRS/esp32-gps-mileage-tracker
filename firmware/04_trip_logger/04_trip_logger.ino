@@ -424,6 +424,7 @@ static bool      gFullWarned = false;
 static uint32_t  gIdleSince = 0;        // last time we were NOT (on battery + IDLE)
 static double    gTripMeters = 0;
 static size_t    gTripBytes = 0;        // committed prologue + trackpoint bytes
+static bool      gTripContinuation = false; // piece started by a size split
 
 // Fixes seen while ARMING, so the first ~10 s of a trip isn't lost.
 // One fix per 1 Hz epoch makes a 10 s arm window 10-11 fixes; 16 slots is
@@ -850,7 +851,8 @@ static bool tripStorageLow(uint32_t now) {
 // trip file can't be created and written. The caller must then stay IDLE:
 // carrying on as ACTIVE would let FILE_APPEND create a file with no
 // prologue, which uploads as invalid GPX and is rejected forever.
-static bool beginTrip(const Fix& fx) {
+static bool beginTrip(const Fix& fx, bool continuation = false) {
+    gTripContinuation = false;
     fs::FS& storage = *gTripFS;
     gTripMeters = 0;
     gMaxSpeedMps = fx.speedMps;
@@ -914,6 +916,7 @@ static bool beginTrip(const Fix& fx) {
     gCoolT0 = fx.monoMs;
     gFsCheckT0 = fx.monoMs;
     gFullWarned = false;
+    gTripContinuation = continuation;
     Serial.printf("Trip started: %s\n", gTripPath);
     return true;
 }
@@ -973,7 +976,7 @@ static bool repairIfNeeded(fs::FS& storage, const char* path);
 // A size split keeps FINALIZING until its next piece has a valid prologue.
 static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
     fs::FS& storage = *gTripFS;
-    if (gTripPath[0] == 0) { gState = nextState; return; }
+    if (gTripPath[0] == 0) { gTripContinuation = false; gState = nextState; return; }
 
     // Duration runs to the last moving fix: the 5 min parked cooldown (or
     // the wait before a fix-loss finalize) that ends every trip would
@@ -983,7 +986,10 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
                  (gTripMeters < MIN_TRIP_METERS);
 
     FS_LOCK();
-    if (discardIfMicro && micro) {
+    // A successful continuation starts with the shared boundary fix (pending
+    // if untimed). Keep even a stopped tail, including a lone boundary point,
+    // so per-piece thresholds never discard recorded points from a split trip.
+    if (discardIfMicro && micro && !gTripContinuation) {
         Serial.printf("Discarding micro-trip (%.0f m, %lu ms)\n",
                       gTripMeters, (unsigned long)tripMs);
         storage.remove(gTripPath);
@@ -1028,6 +1034,7 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
 
     gPendCount = gPendHead = 0;
     gTripWriteFailed = false;
+    gTripContinuation = false;
     gState = nextState;
     if (nextState == IDLE) gDisplayTripFinalized = true;
     gNetRetryNow.store(true);   // after the file is closed and no longer active
@@ -1113,7 +1120,7 @@ static void tripFsmOnFix(const Fix& fx) {
             // a distance step. Reuse startup without the 10 s arming wait.
             armBufReset();
             armBufPush(fx);
-            if (roomForNewTrip(now) && beginTrip(fx)) {
+            if (roomForNewTrip(now) && beginTrip(fx, /*continuation=*/true)) {
                 gState = resumeState;
                 if (resumeState == COOLDOWN) gCoolT0 = coolT0;
             } else {
