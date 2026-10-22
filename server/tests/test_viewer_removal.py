@@ -121,11 +121,16 @@ class ViewerRemovalTests(unittest.TestCase):
         self.assertIn("0.000 mi total", listing)
         self.assertFalse(self.viewer.load_trips()[0])
         self.assertFalse([r for r in self.exported_csv() if r["row_type"] == "trip"])
-        workbook = load_workbook(io.BytesIO(self.admin.get("/export.xlsx").data))
-        try:
-            self.assertEqual(workbook["Mileage"].max_row, 1)
-        finally:
-            workbook.close()
+        for client in (self.admin, self.editor):
+            client_listing = client.get("/").get_data(as_text=True)
+            self.assertNotIn(f"/trip/{key}", client_listing)
+            csv_rows = list(csv.DictReader(io.StringIO(client.get("/export.csv").data.decode("utf-8"))))
+            self.assertFalse([row for row in csv_rows if row["row_type"] == "trip"])
+            workbook = load_workbook(io.BytesIO(client.get("/export.xlsx").data))
+            try:
+                self.assertEqual(workbook["Mileage"].max_row, 1)
+            finally:
+                workbook.close()
         removed_page = self.admin.get("/admin/removed").get_data(as_text=True)
         self.assertIn(key, removed_page)
         self.assertIn("Duplicate test upload", removed_page)
@@ -138,16 +143,19 @@ class ViewerRemovalTests(unittest.TestCase):
         self.assertEqual(self.editor.get("/admin/removed").status_code, 403)
         self.assertEqual(self.editor.post(f"/trip/{key}/remove", data={"csrf_token": "test-csrf", "reason": "x"}).status_code, 403)
         self.assertEqual(self.editor.post(f"/trip/{key}/restore", data={"csrf_token": "test-csrf"}).status_code, 403)
-        for action, data in (("annotate", {"category": "business"}),
-                             ("merge", {"next_trip": "2026-01/next"}),
-                             ("split", {"confirm": "yes"}),
-                             ("lookup-place", {"endpoint": "start"})):
-            response = self.editor.post(f"/trip/{key}/{action}", data={"csrf_token": "test-csrf", **data})
-            self.assertEqual(response.status_code, 409, action)
+        for client in (self.admin, self.editor):
+            for action, data in (("annotate", {"category": "business"}),
+                                 ("merge", {"next_trip": "2026-01/next"}),
+                                 ("split", {"confirm": "yes"}),
+                                 ("lookup-place", {"endpoint": "start"})):
+                response = client.post(f"/trip/{key}/{action}", data={"csrf_token": "test-csrf", **data})
+                self.assertEqual(response.status_code, 409, action)
 
         restored = self.post(f"/trip/{key}/restore")
         self.assertEqual(restored.status_code, 302)
-        self.assertIn(key, self.admin.get("/").get_data(as_text=True))
+        restored_listing = self.admin.get("/").get_data(as_text=True)
+        self.assertIn(key, restored_listing)
+        self.assertIn("1.250 mi total", restored_listing)
         self.assertEqual([r["trip_id"] for r in self.exported_csv() if r["row_type"] == "trip"], ["drive"])
         self.assertEqual(self.data_hash(), original_hash)
 
@@ -188,7 +196,12 @@ class ViewerRemovalTests(unittest.TestCase):
         self.assertEqual(self.post(f"/trip/{second}/remove", reason="Duplicate test upload").status_code, 302)
         page = self.admin.get(f"/trip/{first}").get_data(as_text=True)
         self.assertNotIn("Merge with next trip", page)
+        editor_page = self.editor.get(f"/trip/{first}").get_data(as_text=True)
+        self.assertNotIn("Merge with next trip", editor_page)
         self.assertEqual(self.admin.post(f"/trip/{first}/merge", data={
+            "csrf_token": "test-csrf", "next_trip": second,
+        }).status_code, 409)
+        self.assertEqual(self.editor.post(f"/trip/{first}/merge", data={
             "csrf_token": "test-csrf", "next_trip": second,
         }).status_code, 409)
 
@@ -200,11 +213,23 @@ class ViewerRemovalTests(unittest.TestCase):
             page = self.admin.get("/").get_data(as_text=True)
         self.assertIn("file(s) can't be read", page)
         self.assertIn("broken.json", page)
-        self.assertEqual([r["trip_id"] for r in self.exported_csv() if r["row_type"] == "unreadable"], ["broken"])
-        self.assertEqual(self.post(f"/trip/{key}/remove", reason="Unreadable test file").status_code, 302)
-        self.assertNotIn("file(s) can't be read", self.admin.get("/").get_data(as_text=True))
-        self.assertFalse([r for r in self.exported_csv() if r["row_type"] == "unreadable"])
-        removed_page = self.admin.get("/admin/removed").get_data(as_text=True)
+        with self.assertLogs(self.viewer.app.logger, "WARNING"):
+            unreadable_rows = self.exported_csv()
+        self.assertEqual([r["trip_id"] for r in unreadable_rows if r["row_type"] == "unreadable"], ["broken"])
+        with self.assertLogs(self.viewer.app.logger, "WARNING"):
+            removed = self.post(f"/trip/{key}/remove", reason="Unreadable test file")
+        self.assertEqual(removed.status_code, 302)
+        with self.assertLogs(self.viewer.app.logger, "WARNING"):
+            self.assertNotIn("file(s) can't be read", self.admin.get("/").get_data(as_text=True))
+            self.assertFalse([r for r in self.exported_csv() if r["row_type"] == "unreadable"])
+        with self.assertLogs(self.viewer.app.logger, "WARNING"):
+            workbook = load_workbook(io.BytesIO(self.admin.get("/export.xlsx").data))
+        try:
+            self.assertNotIn("Unreadable trips", workbook.sheetnames)
+        finally:
+            workbook.close()
+        with self.assertLogs(self.viewer.app.logger, "WARNING"):
+            removed_page = self.admin.get("/admin/removed").get_data(as_text=True)
         self.assertIn("2026-01", removed_page)
         self.assertIn("unreadable", removed_page)
         self.assertEqual(self.post(f"/trip/{key}/restore").status_code, 302)

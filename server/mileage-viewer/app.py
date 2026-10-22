@@ -96,6 +96,7 @@ except CatalogError as exc:
 DIAGNOSTICS_CODES = {row["code"]: row for row in DIAGNOSTICS_CATALOG["codes"]}
 DIAGNOSTICS_SEVERITIES = ("info", "warning", "error", "critical")
 DIAGNOSTICS_PAGE_SIZE = 50
+TRIP_HISTORY_PAGE_SIZE = 50
 
 
 # ---------------------------------------------------------------------
@@ -167,6 +168,7 @@ ENDPOINT_ROLES = {
     "logout": {"admin", "editor"},
     "admin": {"admin"},
     "admin_removed": {"admin"},
+    "admin_history": {"admin"},
     "remove_trip": {"admin"},
     "restore_trip": {"admin"},
     "account_password": {"admin", "editor"},
@@ -862,6 +864,119 @@ def _to_local(dt):
     return dt.astimezone(DISPLAY_TZ)
 
 
+def _history_trip_keys(conn, trip_key, parts=()):
+    """Keys that identify the current trip and its live merge aliases."""
+    canonical = trip_merges.canonical_key(conn, trip_key)
+    keys = {trip_key, canonical, *parts}
+    if not parts:
+        keys.update(trip_merges.parts(conn, canonical))
+    for (alias_key,) in conn.execute("SELECT alias_key FROM trip_merge_aliases"):
+        if trip_merges.canonical_key(conn, alias_key) == canonical:
+            keys.add(alias_key)
+    return canonical, keys
+
+
+def _history_row_dict(row):
+    fields = ("id", "trip_key", "actor", "actor_role", "at", "action", "details")
+    return dict(row) if isinstance(row, sqlite3.Row) else dict(zip(fields, row))
+
+
+def _history_order(value):
+    stamp = _parse(value)
+    if stamp is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(timezone.utc)
+
+
+def _related_history_rows(conn, trip_key, parts=()):
+    """History rows for a trip, its parts, aliases, and merge/split events."""
+    _, keys = _history_trip_keys(conn, trip_key, parts)
+    rows_by_id = {}
+    ordered_keys = sorted(keys)
+    # A merge can contain many recordings. Keep each IN list below SQLite's
+    # conservative parameter limit instead of relying on a build-time limit.
+    for start in range(0, len(ordered_keys), 400):
+        chunk = ordered_keys[start:start + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            f"SELECT id, trip_key, actor, actor_role, at, action, details FROM trip_history "
+            f"WHERE trip_key IN ({placeholders})", chunk,
+        ):
+            item = _history_row_dict(row)
+            rows_by_id[item["id"]] = item
+    for row in conn.execute(
+        "SELECT id, trip_key, actor, actor_role, at, action, details FROM trip_history "
+        "WHERE action IN ('merge', 'split')"
+    ):
+        item = _history_row_dict(row)
+        try:
+            details = json.loads(item["details"])
+        except (TypeError, ValueError):
+            details = {}
+        item["parsed_details"] = details
+        if set(details.get("parts") or ()) & keys:
+            rows_by_id[item["id"]] = item
+    result = list(rows_by_id.values())
+    for item in result:
+        if "parsed_details" not in item:
+            try:
+                item["parsed_details"] = json.loads(item["details"])
+            except (TypeError, ValueError):
+                item["parsed_details"] = {}
+    result.sort(key=lambda item: (_history_order(item["at"]), item["id"]), reverse=True)
+    return result
+
+
+def _last_edited(conn, trip):
+    """Find the latest edit across a trip's current and historical merge keys."""
+    rows = _related_history_rows(conn, trip["trip_key"], trip.get("parts", ()))
+    if rows:
+        row = rows[0]
+        return {"actor": row["actor"], "actor_role": row["actor_role"],
+                "at": row["at"], "pre_history": False}
+    _, keys = _history_trip_keys(conn, trip["trip_key"], trip.get("parts", ()))
+    ordered_keys = sorted(keys)
+    fallback = []
+    for table in ("annotations", "trip_merges"):
+        for start in range(0, len(ordered_keys), 400):
+            chunk = ordered_keys[start:start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            fallback.extend(row[0] for row in conn.execute(
+                f"SELECT updated_at FROM {table} WHERE trip_key IN ({placeholders}) "
+                "AND updated_at IS NOT NULL AND updated_at != ''", chunk,
+            ))
+    fallback = [stamp for stamp in fallback if _parse(stamp)]
+    if not fallback:
+        return None
+    at = max(fallback, key=_history_order)
+    return {"actor": None, "actor_role": None, "at": at, "pre_history": True}
+
+
+def _set_export_last_edited(conn, trip):
+    info = _last_edited(conn, trip)
+    trip["last_edited"] = info
+    trip["last_edited_by"] = (info["actor"] if info and not info["pre_history"] else
+                              "unknown" if info else "")
+    trip["last_edited_at"] = fmt_local_iso(info["at"]) if info else ""
+
+
+def history_filters():
+    """Validate bounded paging and a single optional canonical trip key."""
+    if set(request.args) - {"page", "trip"} or any(
+        len(request.args.getlist(key)) != 1 for key in request.args
+    ):
+        abort(400)
+    raw_page = request.args.get("page", "1")
+    if not re.fullmatch(r"[1-9][0-9]{0,6}", raw_page):
+        abort(400)
+    trip = request.args.get("trip", "")
+    if trip and not re.fullmatch(r"[0-9]{4}-[0-9]{2}/[A-Za-z0-9_-]+", trip):
+        abort(400)
+    return int(raw_page), trip or None
+
+
 def selected_year():
     raw_year = request.args.get("year", "")
     if raw_year and (not re.fullmatch(r"[0-9]{4}", raw_year) or int(raw_year) == 0):
@@ -879,7 +994,7 @@ def _may_start_in(ym, year):
     return ym.startswith(f"{year}-") or ym == f"{year + 1}-01"
 
 
-def selected_trips():
+def selected_trips(include_history=False):
     """Use local start year, or first recorded time for partly timed trips.
 
     Returns (trips, unreadable, year, years). Unreadable trips have no
@@ -898,6 +1013,11 @@ def selected_trips():
     if year:
         years.add(year)
         unreadable = [t for t in unreadable if _may_start_in(t["ym"], year)]
+    if include_history:
+        with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+            conn.row_factory = sqlite3.Row
+            for trip in selected + unreadable:
+                _set_export_last_edited(conn, trip)
     return selected, unreadable, year, sorted(years, reverse=True)
 
 
@@ -1117,6 +1237,7 @@ ACCOUNT_HTML = """
 {% if message %}<p role="status">{{ message }}</p>{% endif %}
 {% if title == 'Admin' %}<p>{{ admin_username }}: Admin (set in viewer.env)</p>
 <p><a class="btn secondary" href="{{ url_for('admin_removed') }}">Removed trips</a></p>
+<p><a class="btn secondary" href="{{ url_for('admin_history') }}">Change history</a></p>
 <h2>Everyday logins</h2><div class="login-table">
 <table><tr><th>Everyday login</th><th>Status</th><th>Created ({{ timezone }})</th><th>Actions</th></tr>
 {% for user in logins %}<tr><td>{{ user.username }}</td><td>{{ 'disabled' if user.disabled else 'enabled' }}</td>
@@ -1309,6 +1430,10 @@ TRIP_HTML = """
 </header>
 <div class="wrap">
   <h2>{{ fmt_trip_date(t) }}</h2>
+  {% if last_edited %}
+  <p class="muted">{% if last_edited.pre_history %}Edited before the change history began ({{ fmt_date(last_edited.at) }})
+    {% else %}Last edited by {{ last_edited.actor }} on {{ fmt_date(last_edited.at) }}{% endif %}</p>
+  {% endif %}
   {% if removal %}
   <div class="warn" role="status">
     <b>Removed from the log</b> by {{ removal.removed_by }} on {{ fmt_date(removal.removed_at) }}: {{ removal.reason }}
@@ -1734,6 +1859,133 @@ def admin_removed():
     return render_template_string(REMOVED_HTML, entries=entries, timezone=DISPLAY_TZ_NAME)
 
 
+HISTORY_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Change history</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """
+.history-table { overflow-x: auto; }
+.history-table td { vertical-align: top; overflow-wrap: anywhere; }
+</style></head><body>
+""" + ACCOUNT_HEADER + """<main class="wrap"><h1>Change history</h1>
+<p class="muted">Times shown in {{ timezone }}. Newest changes appear first.</p>
+<form method="get" class="toolbar">
+  <label for="trip">Trip key (YYYY-MM/ID)</label>
+  <input type="text" id="trip" name="trip" value="{{ trip_filter or '' }}" maxlength="80">
+  <button class="btn" type="submit">Filter</button>
+  {% if trip_filter %}<a class="btn secondary" href="{{ url_for('admin_history') }}">Clear</a>{% endif %}
+</form>
+<div class="history-table"><table>
+<thead><tr><th>When ({{ timezone }})</th><th>Actor</th><th>Action</th><th>Trip</th><th>Change</th></tr></thead>
+<tbody>{% for row in rows %}<tr class="history-row">
+  <td>{{ fmt_date(row.at) }}</td><td>{{ row.actor }}<br><span class="muted">{{ row.actor_role }}</span></td>
+  <td>{{ row.action_label }}</td><td><a href="{{ row.trip_url }}">{{ row.trip_label }}</a></td><td>{{ row.summary }}</td>
+</tr>{% else %}<tr><td colspan="5" class="muted">No changes in this selection.</td></tr>{% endfor %}</tbody>
+</table></div>
+<div class="toolbar" aria-label="History pages">
+  {% if has_newer %}<a class="btn secondary" href="{{ url_for('admin_history', page=page - 1, trip=trip_filter) }}">Newer</a>{% endif %}
+  <span class="muted">Page {{ page }} · {{ total }} change(s)</span>
+  {% if has_older %}<a class="btn secondary" href="{{ url_for('admin_history', page=page + 1, trip=trip_filter) }}">Older</a>{% endif %}
+</div></main></body></html>
+"""
+
+
+def _history_summary(row):
+    details = row["parsed_details"]
+    action = row["action"]
+    if action == "annotate":
+        before, after = details.get("before", {}), details.get("after", {})
+        labels = (("category", "Purpose"), ("purpose_note", "Note"), ("destination", "Destination"))
+        changes = [f"{label}: {before.get(field) or 'unset'} → {after.get(field) or 'unset'}"
+                   for field, label in labels if before.get(field) != after.get(field)]
+        return "; ".join(changes) or "Annotation saved"
+    if action == "merge":
+        merged = ", ".join(details.get("merged_from", ()))
+        source = details.get("annotation_from")
+        return f"Merged {merged}; kept annotation from {source}."
+    if action == "split":
+        return "Restored original recordings: " + ", ".join(details.get("parts", ())) + "."
+    if action == "remove":
+        return "Removed from the log: " + str(details.get("reason", ""))
+    if action == "restore":
+        return "Restored to the log. Removal reason: " + str(details.get("reason", ""))
+    label = action.replace("_", " ").capitalize()
+    return f"{label}: {json.dumps(details, ensure_ascii=False, sort_keys=True)}"
+
+
+def _history_action_label(action):
+    return {
+        "annotate": "Annotation saved", "merge": "Merge", "split": "Undo merge",
+        "remove": "Removed from log", "restore": "Restored to log",
+        "year_close": "Year closed", "year_reopen": "Year reopened",
+    }.get(action, action.replace("_", " ").capitalize())
+
+
+def _history_trip_link(conn, row):
+    key = row["trip_key"]
+    details = row["parsed_details"]
+    year_key = re.fullmatch(r"year/([0-9]{4})", key)
+    if year_key:
+        year = int(year_key.group(1))
+        return url_for("index", year=year), f"Year {year}"
+    target = key
+    parts = details.get("parts") or ()
+    if parts:
+        target = parts[0]
+    else:
+        canonical = trip_merges.canonical_key(conn, key)
+        if canonical != key:
+            target = canonical
+        else:
+            old_merge = conn.execute(
+                "SELECT details FROM trip_history WHERE trip_key=? AND action IN ('merge', 'split') "
+                "ORDER BY at DESC, id DESC LIMIT 1", (key,),
+            ).fetchone()
+            if old_merge:
+                try:
+                    old_parts = json.loads(old_merge[0]).get("parts") or ()
+                except (TypeError, ValueError):
+                    old_parts = ()
+                if old_parts:
+                    target = old_parts[0]
+    match = re.fullmatch(r"([0-9]{4}-[0-9]{2})/([A-Za-z0-9_-]+)", target)
+    if not match:
+        return url_for("index"), key
+    return url_for("trip_view", ym=match.group(1), trip_id=match.group(2)), key
+
+
+@app.route("/admin/history")
+def admin_history():
+    page, trip_filter = history_filters()
+    offset = (page - 1) * TRIP_HISTORY_PAGE_SIZE
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+        conn.row_factory = sqlite3.Row
+        if trip_filter:
+            canonical = trip_merges.canonical_key(conn, trip_filter)
+            parts = trip_merges.parts(conn, canonical)
+            history_rows = _related_history_rows(conn, canonical, parts)
+            total = len(history_rows)
+            history_rows = history_rows[offset:offset + TRIP_HISTORY_PAGE_SIZE]
+        else:
+            total = conn.execute("SELECT count(*) FROM trip_history").fetchone()[0]
+            history_rows = [_history_row_dict(row) for row in conn.execute(
+                "SELECT id, trip_key, actor, actor_role, at, action, details FROM trip_history "
+                "ORDER BY at DESC, id DESC LIMIT ? OFFSET ?", (TRIP_HISTORY_PAGE_SIZE, offset),
+            )]
+            for row in history_rows:
+                try:
+                    row["parsed_details"] = json.loads(row["details"])
+                except (TypeError, ValueError):
+                    row["parsed_details"] = {}
+        for row in history_rows:
+            row["action_label"] = _history_action_label(row["action"])
+            row["summary"] = _history_summary(row)
+            row["trip_url"], row["trip_label"] = _history_trip_link(conn, row)
+    return render_template_string(
+        HISTORY_HTML, rows=history_rows, page=page, total=total,
+        has_newer=page > 1, has_older=offset + len(history_rows) < total,
+        trip_filter=trip_filter, timezone=DISPLAY_TZ_NAME,
+    )
+
+
 @app.route("/trip/<ym>/<trip_id>/remove", methods=["POST"])
 def remove_trip(ym, trip_id):
     year = selected_year()
@@ -1754,6 +2006,7 @@ def remove_trip(ym, trip_id):
         if not any(trip["trip_key"] == key for trip in trips + unreadable):
             abort(404)
         trip_log.add_removal(conn, key, reason, g.user)
+        trip_log.record(conn, key, "remove", {"reason": reason}, actor=g.user, actor_role=g.role)
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
 
 
@@ -1764,9 +2017,12 @@ def restore_trip(ym, trip_id):
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         key = trip_merges.canonical_key(conn, f"{ym}/{trip_id}")
-        if not trip_log.removal(conn, key):
+        removal = trip_log.removal(conn, key)
+        if not removal:
             abort(409, description="This trip is not removed from the log.")
         trip_log.delete_removal(conn, key)
+        trip_log.record(conn, key, "restore", {"reason": removal["reason"]},
+                        actor=g.user, actor_role=g.role)
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
 
 
@@ -1839,9 +2095,12 @@ def trip_view(ym, trip_id):
         ))
     if t["trip_key"] != f"{ym}/{trip_id}":
         return redirect(url_for("trip_view", ym=t["ym"], trip_id=t["id"], year=year or ""))
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+        conn.row_factory = sqlite3.Row
+        last_edited = _last_edited(conn, t)
     if t.get("removal"):
         return render_template_string(TRIP_HTML, t=t, removal=t["removal"], categories=CATEGORIES,
-                                      year=year, geocoder_enabled=False)
+                                      year=year, geocoder_enabled=False, last_edited=last_edited)
     merge_next, merge_block_reason = trip_merges.next_trip(t, trips, unreadable)
     places = {}
     if GEOCODER.enabled:
@@ -1854,6 +2113,7 @@ def trip_view(ym, trip_id):
     return render_template_string(TRIP_HTML, t=t, categories=CATEGORIES, year=year,
                                   geocoder_enabled=GEOCODER.enabled, places=places, merge_next=merge_next,
                                   merge_block_reason=merge_block_reason,
+                                  last_edited=last_edited,
                                   merge_conflict=bool(merge_next and trip_merges.annotated(t) and trip_merges.annotated(merge_next)))
 
 
@@ -1909,25 +2169,37 @@ def annotate(ym, trip_id):
     note = request.form.get("purpose_note", "").strip()
     destination = request.form.get("destination", "").strip()
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
         key = f"{ym}/{trip_id}"
         canonical = trip_merges.canonical_key(conn, key)
         if canonical != key:
             abort(409, description="This part has been merged. Reopen the merged trip before editing.")
         _abort_if_removed(conn, key)
-        merged = conn.execute("SELECT 1 FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
+        merged = conn.execute("SELECT * FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
+        after = {"category": category, "purpose_note": note, "destination": destination}
         if merged:
-            conn.execute("""UPDATE trip_merges SET category=?, purpose_note=?, destination=?, updated_at=?
-                            WHERE trip_key=?""",
-                         (category, note, destination, datetime.now(timezone.utc).isoformat(), key))
+            before = {field: merged[field] or "" for field in trip_merges.ANNOTATION_FIELDS}
         else:
             if not (DATA_ROOT / (key + ".json")).exists():
                 abort(404)
-            conn.execute("""INSERT INTO annotations (trip_key, category, purpose_note, destination, updated_at)
-                VALUES (?, ?, ?, ?, ?) ON CONFLICT(trip_key) DO UPDATE SET
-                category=excluded.category, purpose_note=excluded.purpose_note,
-                destination=excluded.destination, updated_at=excluded.updated_at""",
-                         (key, category, note, destination, datetime.now(timezone.utc).isoformat()))
+            annotation = conn.execute("SELECT * FROM annotations WHERE trip_key=?", (key,)).fetchone()
+            before = ({field: annotation[field] or "" for field in trip_merges.ANNOTATION_FIELDS}
+                      if annotation else {field: "" for field in trip_merges.ANNOTATION_FIELDS})
+        if before != after:
+            stamp = trip_log.now_utc()
+            if merged:
+                conn.execute("""UPDATE trip_merges SET category=?, purpose_note=?, destination=?, updated_at=?
+                                WHERE trip_key=?""",
+                             (category, note, destination, stamp, key))
+            else:
+                conn.execute("""INSERT INTO annotations (trip_key, category, purpose_note, destination, updated_at)
+                    VALUES (?, ?, ?, ?, ?) ON CONFLICT(trip_key) DO UPDATE SET
+                    category=excluded.category, purpose_note=excluded.purpose_note,
+                    destination=excluded.destination, updated_at=excluded.updated_at""",
+                             (key, category, note, destination, stamp))
+            trip_log.record(conn, key, "annotate", {"before": before, "after": after},
+                            actor=g.user, actor_role=g.role)
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
 
 
@@ -1986,13 +2258,19 @@ def merge_trip(ym, trip_id):
                              (old["trip_key"], key))
             conn.execute("DELETE FROM trip_merge_parts WHERE merge_key=?", (old["trip_key"],))
             conn.execute("DELETE FROM trip_merges WHERE trip_key=?", (old["trip_key"],))
+        stamp = trip_log.now_utc()
         conn.execute("""INSERT INTO trip_merges
             (trip_key, summary, fingerprint, category, purpose_note, destination, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)""",
                      (key, json.dumps(summary), stamp, *(annotation.get(f, "") for f in trip_merges.ANNOTATION_FIELDS),
-                      datetime.now(timezone.utc).isoformat()))
+                      stamp))
         conn.executemany("INSERT INTO trip_merge_parts (part_key, merge_key, position) VALUES (?, ?, ?)",
                          [(part, key, index) for index, part in enumerate(keys)])
+        trip_log.record(conn, key, "merge", {
+            "parts": keys,
+            "merged_from": [current["trip_key"], following["trip_key"]],
+            "annotation_from": annotation["trip_key"],
+        }, actor=g.user, actor_role=g.role)
     ym, trip_id = key.split("/")
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
 
@@ -2013,6 +2291,7 @@ def split_trip(ym, trip_id):
         conn.execute("DELETE FROM trip_merge_aliases WHERE merge_key=?", (key,))
         conn.execute("DELETE FROM trip_merge_parts WHERE merge_key=?", (key,))
         conn.execute("DELETE FROM trip_merges WHERE trip_key=?", (key,))
+        trip_log.record(conn, key, "split", {"parts": keys}, actor=g.user, actor_role=g.role)
     first_ym, first_id = keys[0].split("/")
     return redirect(url_for("trip_view", ym=first_ym, trip_id=first_id, year=year or ""))
 
@@ -2044,6 +2323,8 @@ EXPORT_COLUMNS = [
     ("timed_from", lambda t: fmt_local_iso(t.get("timed_from"))),
     ("recorded_until", lambda t: fmt_local_iso(t.get("recorded_until"))),
     ("year_basis", year_basis),
+    ("last_edited_by", lambda t: t.get("last_edited_by", "")),
+    ("last_edited_at", lambda t: t.get("last_edited_at", "")),
 ]
 
 
@@ -2124,7 +2405,10 @@ def _xlsx_literal_text(row):
             cell.data_type = "s"
 
 
-UNREADABLE_COLUMNS = ("trip_id", "gpx_file", "category", "purpose_note", "destination")
+UNREADABLE_COLUMNS = (
+    "trip_id", "gpx_file", "category", "purpose_note", "destination",
+    "last_edited_by", "last_edited_at",
+)
 
 
 def _unreadable_values(t):
@@ -2139,12 +2423,14 @@ def _unreadable_values(t):
         "category": t["category"],
         "purpose_note": t["purpose_note"],
         "destination": t["destination"],
+        "last_edited_by": t.get("last_edited_by", ""),
+        "last_edited_at": t.get("last_edited_at", ""),
     }
 
 
 @app.route("/export.csv")
 def export_csv():
-    trips, unreadable, year, _ = selected_trips()
+    trips, unreadable, year, _ = selected_trips(include_history=True)
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow([name for name, _ in EXPORT_COLUMNS] + ["row_type"])
@@ -2172,7 +2458,7 @@ def export_csv():
 
 @app.route("/export.xlsx")
 def export_xlsx():
-    trips, unreadable, year, _ = selected_trips()
+    trips, unreadable, year, _ = selected_trips(include_history=True)
     wb = Workbook()
     ws = wb.active
     ws.title = "Mileage"

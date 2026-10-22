@@ -1,10 +1,12 @@
-"""Viewer-owned log records: which trips the admin removed from the log.
+"""Viewer-owned log records for removals and changes to the trip log.
 
 A removal is a row in annotations.db, never a change to ./data. The GPX and
 JSON files stay exactly as ingest wrote them (and the viewer mounts ./data
-read-only), so a removal can always be undone by deleting its row.
+read-only), so a removal can always be undone by deleting its row. History
+rows share the same database and transaction as the change they describe.
 """
 
+import json
 from datetime import datetime, timezone
 
 
@@ -20,6 +22,13 @@ def init_schema(conn):
         trip_key TEXT PRIMARY KEY, reason TEXT NOT NULL,
         removed_by TEXT NOT NULL, removed_at TEXT NOT NULL
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS trip_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, trip_key TEXT NOT NULL,
+        actor TEXT NOT NULL, actor_role TEXT NOT NULL, at TEXT NOT NULL,
+        action TEXT NOT NULL, details TEXT NOT NULL
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS trip_history_trip_at ON trip_history (trip_key, at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS trip_history_at ON trip_history (at)")
 
 
 def removal(conn, key):
@@ -45,3 +54,13 @@ def add_removal(conn, key, reason, removed_by):
 
 def delete_removal(conn, key):
     conn.execute("DELETE FROM trip_removals WHERE trip_key=?", (key,))
+
+
+def record(conn, trip_key, action, details, *, actor, actor_role):
+    """Write one change in the caller's transaction, with caller identity."""
+    conn.execute(
+        """INSERT INTO trip_history (trip_key, actor, actor_role, at, action, details)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (trip_key, actor, actor_role, now_utc(), action,
+         json.dumps(details, ensure_ascii=False, sort_keys=True)),
+    )
