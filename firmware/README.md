@@ -34,8 +34,9 @@ See the [top-level README](../README.md) for the complete setup sequence.
 This is the primary install/update route. Complete
 [server setup](../README.md#step-1--set-up-the-server) first and accept its
 firmware-build prompt. No Arduino IDE, Python or ESP32 toolchain is needed
-on the PC connected to the board. The server's container downloads about
-1–2 GB of tools on the first build and reuses them later; see the
+on the PC connected to the board. The server's container downloads
+about 1.8 GB of tools on the first build, keeps an image of about 2.7 GB,
+and reuses it later (allow 10 GiB free for the first build); see the
 [builder guide](../server/firmware-builder/README.md).
 
 ### PC prerequisites and commands

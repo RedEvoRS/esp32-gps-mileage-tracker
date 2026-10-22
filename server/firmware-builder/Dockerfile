@@ -21,6 +21,17 @@ RUN --mount=type=cache,id=mileage-arduino-downloads,target=/opt/arduino/staging,
     && arduino-cli core update-index --additional-urls "$ESP32_INDEX_URL" \
     && arduino-cli core install "esp32:esp32@$ESP32_CORE_VERSION" --additional-urls "$ESP32_INDEX_URL" \
     && arduino-cli lib update-index \
-    && arduino-cli lib install "XPowersLib@$XPOWERS_VERSION" "TinyGPSPlus@$TINYGPS_VERSION" "U8g2@$U8G2_VERSION"
+    && arduino-cli lib install "XPowersLib@$XPOWERS_VERSION" "TinyGPSPlus@$TINYGPS_VERSION" "U8g2@$U8G2_VERSION" \
+    # Stage 4's S3 recipes need only Xtensa, S3 SDK libraries and elf2image.
+    # Prune in this layer: a later RUN would retain the installed bytes.
+    && for tool in /opt/arduino/packages/esp32/tools/*; do \
+         case "${tool##*/}" in \
+           esp-x32|esp32s3-libs|esptool_py) ;; \
+           *) rm -rf -- "$tool" ;; \
+         esac; \
+       done \
+    # DFU flashing is done on the PC, never by this offline compiler image.
+    && rm -rf /opt/arduino/packages/arduino/tools/dfu-util \
+    && rm -rf /opt/arduino/staging/*
 COPY builder.py /opt/builder/builder.py
 ENTRYPOINT ["python3", "/opt/builder/builder.py"]
