@@ -579,7 +579,8 @@ the card's directory order, not trip number: `t000001.gpx` (16 KB, 0.8 s),
 then `t000005.gpx` (176 KB, 9.1 s), then `t000004.gpx` (158 KB, 3.1 s).
 Each line read `Upload /trips/<file> (<bytes> B, <seconds> s) -> HTTP 200 (deleted)`.
 
-The current trip finalized at 04:35:09Z after three minutes below 2 mph:
+That trip finalized at 04:35:09Z after the then-current three-minute
+cooldown below 2 mph (the current cooldown is five minutes):
 `Trip finalized: /trips/t000006.gpx (11.40 mi)`. It uploaded at 04:36:41Z
 (142 KB, 2.7 s, HTTP 200, deleted). Ingest logged acceptance and HTTP 200
 for all four trips, and stored each as `data/YYYY-MM/<trip>.gpx` plus
@@ -757,9 +758,11 @@ repeating erases.
 How it behaves once flashed:
 
 - **Trip detection:** logging starts after you sustain >5 mph for
-  10 s and ends after you're below 2 mph for 3 minutes (stop-and-go
-  traffic won't split a drive). Trips shorter than ~30 s (not counting
-  the 3 minutes parked at the end) or 0.1 mi are discarded as noise.
+  10 s and ends after you're below 2 mph for 5 minutes. A stop under five
+  minutes with the engine on joins the driving either side; ignition-switched USB still ends the trip
+  about 10 s after switch-off. Timer-ended trips close and can upload two
+  minutes later, with up to about 120 extra stopped points (~14 KB).
+  Trips shorter than ~30 s (not counting the 5 minutes parked at the end) or 0.1 mi are discarded as noise.
   Speed must also pass the GPS receiver's accuracy check: a checksum-valid
   NAV-PVT received within 1.5 s, with `gnssFixOK`, a 3D or combined fix,
   and `sAcc` at most 0.5 m/s plus `hAcc` at most 5 m when starting,
@@ -768,10 +771,10 @@ How it behaves once flashed:
   arrival window tolerates either message order at 1 Hz, so the latest
   sample may belong to the previous epoch; it does not change GPX times.
   Rejected speeds count as stopped: arming resets, or an active trip enters
-  its normal three-minute cooldown. Rejected points enter neither GPX nor
+  its normal five-minute cooldown. Rejected points enter neither GPX nor
   the distance total, and distance never bridges across them. Leaving
   cooldown requires three consecutive trusted fixes above 2 mph; any other
-  fix resets that count, while the original three-minute deadline keeps
+  fix resets that count, while the original five-minute deadline keeps
   running. Trusted cooldown fixes still enter GPX but add no distance or
   moving duration. The third moving fix resumes ACTIVE and establishes a
   new distance baseline, without bridging across cooldown. A gap over
@@ -1312,11 +1315,12 @@ Do this before a test drive, not during a trip.
    thrown away as noise.) GPS doesn't work indoors, and the first fix after
    the battery was out can take a minute outside. After 10 seconds above
    5 mph you'll see `Trip started`.
-3. Park at home and wait. Three minutes below 2 mph ends the trip
+3. Park at home and wait. Five minutes below 2 mph ends the trip
    (`Trip finalized`). The board then tries your WiFi and uploads it:
    `Upload ... -> HTTP 200 (deleted)`. The file is deleted from the board
-   only after the server has accepted it. On 2026-10-21 (UTC), the trip
-   finalized at 04:35:09Z and uploaded at 04:36:41Z. A scan at 04:35:35Z
+   only after the server has accepted it. With the former three-minute
+   cooldown on 2026-10-21 (UTC), the trip finalized at 04:35:09Z and uploaded
+   at 04:36:41Z. A scan at 04:35:35Z
    missed the access point and scheduled a retry in 60 s, so allow time
    for retries at the edge of WiFi range. Older finished trips can upload
    while the current trip is still recording; this happened on that drive.

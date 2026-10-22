@@ -76,13 +76,13 @@ sources that require that optional library.
 
 **Storage and trip lifecycle**
 
-- `test_fs`: GPX (GPS track) file writing, trip states, buffered gaps/untimed points, write/full-store failures, safe first-use formatting, upload queues/retries, boot/shutdown recovery, microSD selection/flash fallback, FAT (card filesystem) interrupted-repair recovery and trip splitting at the size limit.
+- `test_fs`: GPX (GPS track) file writing, trip states, buffered gaps/untimed points, write/full-store failures, safe first-use formatting, upload queues/retries, boot/shutdown recovery, the unchanged ten-second USB-loss exit and micro-trip duration rule, microSD selection/flash fallback, FAT (card filesystem) interrupted-repair recovery and trip splitting at the size limit.
 - `test_journal`: diagnostic journal integration with SD, LittleFS (internal-flash filesystem) and RAM fallback, quotas, trip priority, lock contention, shutdown sealing and remount recovery.
 - `test_journal_vfs`: production filesystem adapter using temporary host files, including sync/close/list errors and path isolation.
 
 **GPS input and signal health**
 
-- `test_gps` **[TinyGPSPlus]**: real GPS sentence parsing through the sketch's loop, one point per second, receiver configuration/replies, fix-quality gates, gaps, UTC (universal time) timestamps/clock corrections and debug-mode GPX parity.
+- `test_gps` **[TinyGPSPlus]**: real GPS sentence parsing through the sketch's loop, one point per second, receiver configuration/replies, fix-quality gates, a 182-second mid-drive stop, the five-minute stopped/fix-loss deadlines and exactly-once finalization, gaps, UTC (universal time) timestamps/clock corrections and debug-mode GPX parity.
 - `test_gps_antenna`: antenna-warning evidence, hold times, missing/stale observations, recovery and timer wraparound.
 - `test_debug_status` **[TinyGPSPlus]**: real satellite-message parsing, satellite deduplication/freshness and bounded screen/serial formatting.
 

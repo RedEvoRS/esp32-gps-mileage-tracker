@@ -460,7 +460,7 @@ int main(int argc, char**) {
     // upload: only the boot notice, with no fault events.
     faultWorld(); PmuStartupResult clean; clean.ready = true; clean.attempts = 1;
     submitJournalBoot(gJournal, ESP_RST_POWERON, clean, millis());
-    run(15, 40); run(0, 185); assert(gState == IDLE);
+    run(15, 40); run(0, COOL_MS / 1000 + 5); assert(gState == IDLE);
     assert(uploadPending(SD)); auto happy = take();
     assert(happy.size() == 1); has(happy[0], "\"code\":1000,");
     assert(gJournal.stats().dropped == 0 && g_lockDepth == 0);

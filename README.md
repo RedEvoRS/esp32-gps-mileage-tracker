@@ -70,9 +70,10 @@ phone through a self-hosted ntfy service. [DIAGNOSTICS.md](DIAGNOSTICS.md)
 describes the whole framework and lists every code.
 
 The logger decides on its own when a trip starts and stops. Going faster than 5 mph for 10 seconds starts one; staying under
-2 mph for 3 minutes ends it, which is long enough that a red light doesn't
-chop one drive into six. Anything shorter than 30 seconds or about a tenth
-of a mile gets thrown away.
+2 mph for 5 minutes ends it. A stop under 5 minutes with the engine on joins
+the driving either side. Ignition-switched USB still ends a trip about
+10 seconds after switch-off. Trips shorter than 30 seconds (excluding the
+final stopped wait) or about a tenth of a mile get thrown away.
 
 The firmware writes each GPS point to the microSD card (or the internal
 flash fallback) and closes the file right after to limit data loss if

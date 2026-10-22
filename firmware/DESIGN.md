@@ -68,7 +68,7 @@ TLS path would need its own stack measurement.
 - **COOLDOWN:** trusted fixes still enter the file, but add no distance or
   moving duration. Three consecutive trusted fixes above `END_MPS` resume
   ACTIVE. Any other fix resets the count. The original `COOL_MS`
-  (180-second) deadline stays in force while gathering those three fixes;
+  (300-second) deadline stays in force while gathering those three fixes;
   expiry takes precedence over resuming. The confirming fix becomes a new
   distance baseline, without bridging across cooldown or rejected fixes.
 - **FINALIZING:** `endTrip()` runs in the same FSM pass that requests it,
@@ -101,7 +101,21 @@ last moving fix, excluding the final parked cooldown. Confirmed Universal
 Serial Bus (USB) loss and size splits keep short pieces. Separately, `loop()`
 ends a recording trip after more than five minutes without any valid RMC fix,
 including when no next fix arrives to drive the FSM. Rejected speeds still
-count as received fixes for this watchdog (`gLastFixMonoMs`).
+count as received fixes for this watchdog (`gLastFixMonoMs`). Both thresholds
+are 300 seconds, but cooldown is measured from entry and checked on each
+valid fix (`>=`); fix loss is measured from the last valid RMC and checked
+in the loop (`>`). With continuous stopped fixes, cooldown closes on the
+first fix at or after its deadline. If fixes disappear during cooldown,
+the watchdog closes on the first loop more than 300 seconds after the last
+valid RMC, even if the cooldown deadline has passed. Either path returns
+to IDLE, preventing the other from finalizing the same trip again.
+
+A stop under five minutes with the engine on joins the driving either side.
+Timer-ended trips close and become available to upload two minutes later
+than with the former three-minute cooldown, with up to about 120 additional
+stopped points (roughly 14 KB). Duration still ends at the last moving fix;
+the micro-trip thresholds are unchanged. Ignition-switched USB still ends
+a trip about ten seconds after switch-off, independently of cooldown.
 
 The power-management unit (PMU) supplies the USB bus-voltage (VBUS) state.
 `observeVbusChange()` and `confirmVbusOff()` require a ten-second loss and

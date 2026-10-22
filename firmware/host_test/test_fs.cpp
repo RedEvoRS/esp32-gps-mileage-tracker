@@ -200,13 +200,13 @@ int main(int argc, char** argv) {
     printf("T1 normal trip\n");
     {
         resetWorld();
-        drive(0, 5); drive(15, 75); drive(0, 200);
+        drive(0, 5); drive(15, 75); drive(0, COOL_MS / 1000 + 20);
         auto v = tripFiles();
         CHECK(gState == IDLE && v.size() == 1, "one finalized trip, FSM idle");
         if (v.size() == 1) {
             auto& d = g_disk.files[v[0]];
             CHECK(wellFormedShape(d), "complete, well-formed shape");
-            CHECK(count(d, "<trkpt ") == 75 + 181, "all fixes recorded (ARMING, driving, 181 cooldown)");
+            CHECK(count(d, "<trkpt ") == 75 + COOL_MS / 1000 + 1, "all fixes recorded (ARMING, driving, full cooldown)");
         }
         dump("T1");
     }
@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
         CHECK(gState != ACTIVE && gTripPath[0] == 0, "stays out of ACTIVE, no active path");
         CHECK(tripFiles().empty(), "no file left behind");
         CHECK(logHas("could not create trip file"), "logged loudly");
-        drive(15, 40); drive(0, 200);
+        drive(15, 40); drive(0, COOL_MS / 1000 + 20);
         auto v = tripFiles();
         CHECK(v.size() == 1 && wellFormedShape(g_disk.files[v[0]]), "re-arms and records a valid trip");
         dump("T2");
@@ -246,7 +246,7 @@ int main(int argc, char** argv) {
         auto v = tripFiles();
         CHECK(v.size() == 1 && wellFormedShape(g_disk.files[v[0]]), "file trimmed and closed: valid");
         CHECK(!g_disk.files.count("/trips/t000001.gpx.fix"), "no .fix left over");
-        drive(15, 40); drive(0, 200);
+        drive(15, 40); drive(0, COOL_MS / 1000 + 20);
         CHECK(tripFiles().size() == 2, "next trip starts normally");
         dump("T4");
     }
@@ -276,7 +276,7 @@ int main(int argc, char** argv) {
     printf("T6 epilogue write doesn't land\n");
     {
         resetWorld();
-        drive(15, 40); drive(0, 180);
+        drive(15, 40); drive(0, COOL_MS / 1000);
         CHECK(gState == COOLDOWN, "about to finalize");
         g_disk.flushesBeforeFail = 1;            // the last point lands...
         g_disk.failFlushes = 1;                  // ...the epilogue doesn't
@@ -300,7 +300,7 @@ int main(int argc, char** argv) {
     printf("T8 micro-trip still discarded\n");
     {
         resetWorld();
-        drive(3, 12); drive(0, 200);
+        drive(3, 12); drive(0, COOL_MS / 1000 + 20);
         CHECK(tripFiles().empty() && logHas("Discarding micro-trip"), "discarded");
     }
 
@@ -342,7 +342,7 @@ int main(int argc, char** argv) {
         CHECK(tripFiles().empty() && gTripPath[0] == 0, "nothing recorded, no file created");
         CHECK(warns >= 2 && warns <= 4, "warns about once a minute, not on every fix");
         g_disk.capacity = 1 << 22;                     // uploads freed space
-        drive(15, 40); drive(0, 200);
+        drive(15, 40); drive(0, COOL_MS / 1000 + 20);
         auto v = tripFiles();
         CHECK(v.size() == 1 && wellFormedShape(g_disk.files[v[0]]), "records again once there's room");
     }
@@ -354,25 +354,36 @@ int main(int argc, char** argv) {
         vbus(false); drive(15, 2); vbus(true);      // 2 s brown-out
         drive(15, 30);
         vbus(false); drive(0, 1); vbus(true);       // start-stop restart at a light
-        drive(15, 30); drive(0, 200);
+        drive(15, 30); drive(0, COOL_MS / 1000 + 20);
         auto v = tripFiles();
         CHECK(v.size() == 1 && wellFormedShape(g_disk.files[v[0]]), "one trip, not three");
         CHECK(logCount("dipped and came back") == 2 && !logHas("car off"), "both dips ignored");
         CHECK(!gVbusLost, "still on USB power");
     }
 
-    printf("T13 car switched off: trip finalized after 10 s (F10)\n");
-    {
+    printf("T13 USB loss ends ACTIVE/COOLDOWN trips at 10 s regardless of cooldown\n");
+    for (int stoppedSeconds : {0, 5, 120}) {
         resetWorld();
-        drive(15, 40); drive(0, 5);
-        vbus(false);
+        drive(15, 40); drive(0, stoppedSeconds);
+        vbus(false); pollPmu();
+        const auto offT0 = gVbusOffT0;
         drive(0, 9);
-        CHECK(gTripPath[0] != 0, "not yet at 9 s");
-        drive(0, 2);
+        CHECK(gTripPath[0] != 0 && gVbusOffPending, "USB loss has not finalized at 9 s");
+        drive(0, 1);
         auto v = tripFiles();
-        CHECK(gTripPath[0] == 0 && gVbusLost, "finalized at 10 s, on battery");
+        CHECK(g_millis - offT0 == 10000 && gTripPath[0] == 0 && gState == IDLE && gVbusLost,
+              "USB loss finalizes at exactly 10 s, well before the five-minute cooldown");
         CHECK(v.size() == 1 && wellFormedShape(g_disk.files[v[0]]), "file complete");
-        CHECK(logHas("car off"), "logged");
+        drive(0, 2);
+        CHECK(logCount("Trip finalized:") == 1 && logCount("car off") == 1,
+              "USB loss finalizes exactly once");
+    }
+    {
+        resetWorld(); drive(15, 12);
+        vbus(false); pollPmu(); drive(0, 10);
+        auto v = tripFiles();
+        CHECK(gState == IDLE && v.size() == 1 && wellFormedShape(g_disk.files[v[0]]) &&
+              !logHas("Discarding micro-trip"), "USB-loss exit still keeps a genuine sub-30-second drive");
     }
 
     printf("T14 missed INSERT interrupt: level re-read before acting (F10)\n");
@@ -400,7 +411,7 @@ int main(int argc, char** argv) {
     printf("T16 rejected uploads are set aside, not retried forever (F6)\n");
     {
         resetWorld();
-        drive(15, 40); drive(0, 200);
+        drive(15, 40); drive(0, COOL_MS / 1000 + 20);
         auto v = tripFiles();
         std::string path = v.empty() ? "" : v[0], content = g_disk.files[path];
         g_httpCode = 500; uploadPending();
@@ -421,11 +432,11 @@ int main(int argc, char** argv) {
         fsckAllTrips(LittleFS);
         CHECK(g_disk.files[path + ".bad"] == content, "fsck leaves it alone");
 
-        drive(15, 40); drive(0, 200);              // next trip: 413
+        drive(15, 40); drive(0, COOL_MS / 1000 + 20);              // next trip: 413
         g_httpCode = 413; uploadPending();
         CHECK(tripFiles().size() == 2 && !hasPending(), "413: set aside as .bad too");
 
-        drive(15, 40); drive(0, 200);              // next trip: accepted
+        drive(15, 40); drive(0, COOL_MS / 1000 + 20);              // next trip: accepted
         g_httpCode = 200; uploadPending();
         CHECK(tripFiles().size() == 2 && !hasPending(), "200: uploaded and deleted");
     }
@@ -868,8 +879,8 @@ int main(int argc, char** argv) {
     printf("T32 network task: stops between files, ends a cut-off body, starts nothing when held (#3)\n");
     {
         resetWorld();
-        drive(15, 40); drive(0, 200);
-        drive(15, 40); drive(0, 200);
+        drive(15, 40); drive(0, COOL_MS / 1000 + 20);
+        drive(15, 40); drive(0, COOL_MS / 1000 + 20);
         CHECK(tripFiles().size() == 2, "two trips queued");
         g_httpHook = [] { gNetHold = true; };        // sleep asked for mid-upload
         uploadPending();
@@ -978,16 +989,16 @@ int main(int argc, char** argv) {
     printf("T35 the parked cooldown doesn't count toward the 30 s minimum (#58)\n");
     {
         resetWorld();
-        drive(15, 20); drive(0, 181);                // 19 s moving, ~285 m
+        drive(15, 20); drive(0, COOL_MS / 1000 + 1);                // 19 s moving, ~285 m
         CHECK(gState == IDLE && tripFiles().empty() && logHas("Discarding micro-trip"),
               "20 s drive, then the cooldown: discarded");
 
         resetWorld();
-        drive(15, 31); drive(0, 181);                // 30 s, first to last moving fix
+        drive(15, 31); drive(0, COOL_MS / 1000 + 1);                // 30 s, first to last moving fix
         CHECK(tripFiles().size() == 1, "30 s drive: kept");
 
         resetWorld();                                // 11 s, a 60 s stop, 12 s more
-        drive(15, 12); drive(0, 60); drive(15, 12); drive(0, 181);
+        drive(15, 12); drive(0, 60); drive(15, 12); drive(0, COOL_MS / 1000 + 1);
         CHECK(tripFiles().size() == 1, "a stop mid-trip still counts toward the 30 s");
 
         resetWorld();
@@ -1253,9 +1264,9 @@ int main(int argc, char** argv) {
 
         resetWorld();
         gClockSet = false;
-        drive(15, 100); drive(0, 200);
+        drive(15, 100); drive(0, COOL_MS / 1000 + 20);
         CHECK(gState == IDLE && tripFiles().size() == 1 &&
-              count(g_disk.files.begin()->second, "<trkpt ") == 281,
+              count(g_disk.files.begin()->second, "<trkpt ") == 100 + COOL_MS / 1000 + 1,
               "untimed spills also preserve cooldown fixes until normal finalize");
 
         for (bool failOpen : {false, true}) {
@@ -1824,9 +1835,9 @@ int main(int argc, char** argv) {
         CHECK(gState == COOLDOWN && first != gTripPath && gCoolT0 == coolT0 &&
               gTripMeters == 0 && gMaxSpeedMps == 0 && gTripT0 == gLastFix.monoMs,
               "stationary split keeps the original cooldown deadline and resets per-piece stats");
-        drive(0, 79);
+        drive(0, COOL_MS / 1000 - 101);
         CHECK(gState == IDLE && gTripPath[0] == 0,
-              "original three-minute cooldown still ends the trip after a split");
+              "original five-minute cooldown still ends the trip after a split");
     }
 
     printf("T60 failed split startup leaves the old piece safe and stops recording\n");

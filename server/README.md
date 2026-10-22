@@ -88,8 +88,10 @@ three rules, all in `summarize()`:
   so bridging can only undercount, and leaving the gap out lost real miles.
   A bridge needs timestamps at both ends and a plausible speed.
 
-For completely timed trips, `end_time` is the last moving fix, so the firmware's 3-minute cooldown
-doesn't stretch every trip; `recorded_until` keeps the final timestamp.
+For completely timed trips, `end_time` is the last moving fix, so the firmware's
+5-minute cooldown doesn't stretch every trip; `recorded_until` keeps the final
+timestamp. Stops under five minutes with the engine on join the driving either
+side; ignition-switched USB still ends a trip about 10 seconds after switch-off.
 Summary version 3 records `timing_status` as `complete`, `partial`, or
 `untimed`. A partly timed trip retains its distance, but full-trip
 `start_time`, `end_time`, `duration_seconds`, and `avg_speed_mph` are null.

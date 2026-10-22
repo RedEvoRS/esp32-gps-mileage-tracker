@@ -399,12 +399,12 @@ int main(int argc, char** argv) {
     printf("G4 default M8N output -> one point per second (F2)\n");
     {
         resetWorld();
-        run(0, 5); run(15, 60); run(0, 200);
+        run(0, 5); run(15, 60); run(0, COOL_MS / 1000 + 20);
         auto v = tripFiles();
         CHECK(v.size() == 1 && gState == IDLE, "one finalized trip");
         if (v.size() == 1) {
             auto pts = trkpts(g_disk.files[v[0]]);
-            CHECK(pts.size() == 60 + 181, "60 moving + 181 cooldown points, no duplicates");
+            CHECK(pts.size() == 60 + COOL_MS / 1000 + 1, "60 moving + full cooldown points, no duplicates");
             CHECK(!pts.empty() && field(pts[0], "time") == "2026-04-14T14:30:05Z",
                   "trip starts at the first moving second (ARMING buffer intact)");
             bool distinct = true;
@@ -436,9 +436,9 @@ int main(int argc, char** argv) {
     printf("G5 GGA before RMC\n");
     {
         resetWorld();
-        run(0, 5, true, true); run(15, 60, true, true); run(0, 200, true, true);
+        run(0, 5, true, true); run(15, 60, true, true); run(0, COOL_MS / 1000 + 20, true, true);
         auto v = tripFiles();
-        CHECK(v.size() == 1 && trkpts(g_disk.files[v[0]]).size() == 60 + 181, "still one point per second");
+        CHECK(v.size() == 1 && trkpts(g_disk.files[v[0]]).size() == 60 + COOL_MS / 1000 + 1, "still one point per second");
     }
 
     printf("G6 no fix\n");
@@ -858,12 +858,12 @@ int main(int argc, char** argv) {
         CHECK(gState == ARMING && gArmCount == 5, "reliable speeds start the normal arming window");
         run(15, 1, true, false, 501);
         CHECK(gState == IDLE && !gArmCount, "untrusted arming fix resets the whole window");
-        run(15, 60, true, false, 500); run(0, 200, true, false, 1000);
+        run(15, 60, true, false, 500); run(0, COOL_MS / 1000 + 20, true, false, 1000);
         auto files = tripFiles();
         CHECK(files.size() == 1 && gState == IDLE && gTripMeters > 850 && gTripMeters < 910,
               "small-sAcc drive arms, accumulates its usual distance and finalizes");
-        if (files.size() == 1) CHECK(trkpts(g_disk.files[files[0]]).size() == 241,
-                                    "all 60 moving and 181 trusted cooldown points are preserved");
+        if (files.size() == 1) CHECK(trkpts(g_disk.files[files[0]]).size() == 60 + COOL_MS / 1000 + 1,
+                                    "all 60 moving and full trusted cooldown points are preserved");
         CHECK(logCount("fallback") == 0, "continuous PVT prevents fallback throughout the drive");
         dump("G22");
     }
@@ -877,14 +877,14 @@ int main(int argc, char** argv) {
         run(4.65f, 1, true, false, 2500);
         CHECK(gState == COOLDOWN && trkpts(g_disk.files[path]).size() == 60 && gTripMeters == meters,
               "first untrusted moving fix enters cooldown without writing or counting it");
-        run(4.65f, 179, true, false, 2500);
+        run(4.65f, COOL_MS / 1000 - 1, true, false, 2500);
         CHECK(gState == COOLDOWN && gTripMeters == meters && gLastFix.monoMs == lastAccepted &&
               gLastFixMonoMs > lastAccepted,
               "rejected fixes advance fix receipt time but never the last accepted position");
         run(4.65f, 1, true, false, 2500);
         CHECK(gState == IDLE && trkpts(g_disk.files[path]).size() == 60 &&
               g_disk.files[path].find("</gpx>") != std::string::npos,
-              "three-minute untrusted stretch finalizes the trip through normal cooldown");
+              "five-minute untrusted stretch finalizes the trip through normal cooldown");
         dump("G23");
     }
 
@@ -933,9 +933,9 @@ int main(int argc, char** argv) {
         ++g_millis; serviceGpsSpeedFallback(); gpsLoops();
         CHECK(gSpeedFallback && logCount("WARNING: GPS NAV-PVT unavailable") == 1,
               "missing NAV-PVT logs exactly one warning on fallback entry");
-        gT = 16; run(15, 60); run(0, 200);
+        gT = 16; run(15, 60); run(0, COOL_MS / 1000 + 20);
         auto files = tripFiles();
-        CHECK(files.size() == 1 && trkpts(g_disk.files[files[0]]).size() == 241 && gState == IDLE &&
+        CHECK(files.size() == 1 && trkpts(g_disk.files[files[0]]).size() == 60 + COOL_MS / 1000 + 1 && gState == IDLE &&
               logCount("WARNING: GPS NAV-PVT unavailable") == 1,
               "RMC-only fallback preserves the legacy trip and every point without warning spam");
         GPSSerial.rx += navPvt(999, 2500); loop(); gpsLoops();
@@ -1028,14 +1028,14 @@ int main(int argc, char** argv) {
         run(0, 1, true, false, 100);
         const auto coolT0 = gCoolT0;
         // Two trusted noisy fixes every ten seconds never confirm movement.
-        for (int i = 0; i < 18; ++i) {
+        for (int i = 0; i < int(COOL_MS / 10000); ++i) {
             run(1.4f, 2, true, false, 400, false, 3, 1, 9000);
             run(0, 8, true, false, 400, false, 3, 1, 9000);
         }
         CHECK(gState == IDLE && gLastFixMonoMs - coolT0 == COOL_MS &&
               gCoolT0 == coolT0 && gTripMeters == meters && gLastMoveMs == lastMove,
-              "garage noise finalizes at the original three-minute deadline with unchanged distance/duration");
-        CHECK(trkpts(g_disk.files[path]).size() == 241 && g_disk.files[path].find("</gpx>") != std::string::npos,
+              "garage noise finalizes at the original five-minute deadline with unchanged distance/duration");
+        CHECK(trkpts(g_disk.files[path]).size() == 60 + COOL_MS / 1000 + 1 && g_disk.files[path].find("</gpx>") != std::string::npos,
               "all trusted cooldown fixes including noisy ones are still written");
         dump("G31");
     }
@@ -1131,6 +1131,92 @@ int main(int argc, char** argv) {
             exact &= field(pts[i], "time") == (i == 20 ? "2026-04-14T14:30:20.500Z" : "");
         CHECK(exact, "both timed-fix flush and trip-end flush preserve missing times and point order");
         dump((std::string("G35_") + talker).c_str());
+    }
+
+    printf("G36 182-second red light stays in one trip\n");
+    {
+        resetWorld(); run(15, 60, true, false, 100);
+        const std::string path = gTripPath;
+        const auto lastMove = gLastMoveMs;
+        const double meters = gTripMeters;
+        run(0, 182, true, false, 100);
+        CHECK(gState == COOLDOWN && path == gTripPath && gLastMoveMs == lastMove &&
+              gTripMeters == meters && logCount("Trip finalized:") == 0,
+              "182 seconds stopped preserves the original trip without adding movement");
+        run(15, 2, true, false, 100);
+        CHECK(gState == COOLDOWN && gResumeFixes == 2, "two trusted moving fixes still cannot resume");
+        run(15, 60, true, false, 100);
+        CHECK(gState == ACTIVE && path == gTripPath && tripFiles().size() == 1 &&
+              gTripMeters > meters + 850, "three fixes resume the same trip and driving distance continues");
+        run(0, 301, true, false, 100);
+        CHECK(gState == IDLE && tripFiles().size() == 1 && logCount("Trip finalized:") == 1,
+              "the whole drive produces exactly one finalized trip");
+        dump("G36");
+    }
+
+    printf("G37 stopped fixes close at five minutes with last-moving duration\n");
+    {
+        resetWorld(); run(15, 60, true, false, 100);
+        const std::string path = gTripPath;
+        const auto lastMove = gLastMoveMs, tripT0 = gTripT0;
+        const double meters = gTripMeters;
+        run(0, 300, true, false, 100);
+        const auto coolT0 = gCoolT0;
+        CHECK(gState == COOLDOWN && gLastFixMonoMs == coolT0 + 299000,
+              "stopped fixes do not end the trip before 300 seconds from cooldown entry");
+        run(0, 1, true, false, 100);
+        CHECK(gState == IDLE && gLastFixMonoMs == coolT0 + 300000 &&
+              gLastMoveMs == lastMove && gTripT0 == tripT0 && lastMove - tripT0 == 59000 &&
+              gTripMeters == meters && logCount("Trip finalized:") == 1,
+              "fix at exactly five minutes finalizes with the original 59-second moving duration");
+        const auto data = g_disk.files.at(path);
+        run(0, 2, true, false, 100);
+        CHECK(gState == IDLE && g_disk.files.at(path) == data &&
+              logCount("Trip finalized:") == 1 && logCount("No GPS fix for 5 min") == 0,
+              "stop just over five minutes leaves one closed file and no watchdog finalization");
+        dump("G37");
+    }
+
+    printf("G38 cooldown plus indoor fix loss finalizes exactly once\n");
+    for (int stoppedSeconds : {1, 121}) {
+        resetWorld(); run(15, 60, true, false, 100);
+        const std::string path = gTripPath;
+        const auto lastMove = gLastMoveMs, tripT0 = gTripT0;
+        const double meters = gTripMeters;
+        run(0, stoppedSeconds, true, false, 100);
+        const auto coolT0 = gCoolT0, lastRmc = gLastFixMonoMs;
+        // No next fix drives cooldown. The independent watchdog retains its
+        // strict > boundary, measured from the LAST RMC, not cooldown entry.
+        g_millis = coolT0 + 300000 - 1; loop();
+        CHECK(gState == COOLDOWN, "cooldown alone does not finalize without another valid RMC");
+        g_millis = lastRmc + 300000 - 1; loop(); // available() advances the stub clock by 1 ms
+        CHECK(gState == COOLDOWN && gLastFixMonoMs == lastRmc,
+              "fix-loss watchdog keeps the trip open at exactly 300 seconds since last RMC");
+        loop();
+        CHECK(gState == IDLE && !gTripPath[0] && logCount("No GPS fix for 5 min") == 1 &&
+              logCount("Trip finalized:") == 1 && gLastMoveMs == lastMove &&
+              gTripT0 == tripT0 && gTripMeters == meters,
+              "first loop beyond fix-loss deadline ends once without extending movement or duration");
+        const auto data = g_disk.files.at(path);
+        loop(); run(0, 2, true, false, 100);
+        CHECK(gState == IDLE && g_disk.files.at(path) == data && logCount("Trip finalized:") == 1,
+              "later loops and returning stopped fixes cannot finalize the same trip again");
+        dump(stoppedSeconds == 1 ? "G38_immediate" : "G38_delayed");
+    }
+
+    printf("G39 returning fix at both expired deadlines finalizes once\n");
+    {
+        resetWorld(); run(15, 60, true, false, 100); run(0, 1, true, false, 100);
+        g_millis = gLastFixMonoMs + 300001;
+        // UART processing precedes the watchdog: a returning stopped fix
+        // takes the overdue cooldown exit before the loop checks fix loss.
+        GPSSerial.rx += sentences({gT, gLat, gLon, 0, true})[0]; loop();
+        CHECK(gState == IDLE && !gTripPath[0] && logCount("Trip finalized:") == 1 &&
+              logCount("No GPS fix for 5 min") == 0,
+              "returning RMC takes cooldown exit and leaves no recording trip for the watchdog");
+        loop();
+        CHECK(logCount("Trip finalized:") == 1, "next loop cannot finalize twice");
+        dump("G39");
     }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
