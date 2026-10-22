@@ -584,6 +584,17 @@ can be supplied via `SSL_CERT_FILE` pointing to a CA bundle mounted inside the
 container; certificate verification is never disabled. Lookup requests prefer
 English names (`accept-language=en`).
 
+Suggestions are formatted as a standard address, not the provider's long
+`display_name`. In the US that is `<house number> <road>, <city>, <ST> <postcode>`,
+for example `123 Example Road, Sampletown, ST 00000`, with the two-letter state.
+A business or airport name goes first when the provider returns one. Elsewhere the
+state and country are spelled out. Neighbourhood, suburb and county names are always
+left out, and so is the country for US addresses. Any part the provider doesn't
+return is skipped. If the provider returns no structured address, the viewer shows
+its `display_name` instead. After upgrading to this format, a suggestion cached in
+the old format is looked up again the next time you click it. Destinations you
+already saved are never changed.
+
 **Do not configure the public `nominatim.openstreetmap.org` service.** Its
 [usage policy](https://operations.osmfoundation.org/policies/nominatim/) excludes
 vehicle-tracking applications and says not to submit confidential material.

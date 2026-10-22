@@ -34,6 +34,8 @@ class Geocoder:
     INTERVAL = 1.1
     LEASE = 60
     RESPONSE_BUDGET = 10
+    # Bump when the label format changes so older cached labels are not served.
+    LABEL_FORMAT = 2
 
     def __init__(self, db_path):
         self.db_path = db_path
@@ -96,7 +98,8 @@ class Geocoder:
                 and -90 <= latitude <= 90 and -180 <= longitude <= 180):
             raise GeocodeError("This recording has no valid endpoint to look up.", 422)
         # Exact numeric positions; no rounding that could select a neighbour.
-        raw = f"{self.url}\n{float(latitude)!r}\n{float(longitude)!r}"
+        raw = (f"{self.url}\nlabel-format-{self.LABEL_FORMAT}"
+               f"\n{float(latitude)!r}\n{float(longitude)!r}")
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def cached(self, latitude, longitude):
@@ -155,7 +158,7 @@ class Geocoder:
     def _fetch(self, latitude, longitude):
         query = urlencode({
             "lat": latitude, "lon": longitude, "format": "jsonv2",
-            "zoom": 18, "addressdetails": 0, "accept-language": "en",
+            "zoom": 18, "addressdetails": 1, "accept-language": "en",
         })
         req = Request(self.url + "?" + query, headers={
             "User-Agent": self.user_agent, "Accept": "application/json",
@@ -197,7 +200,7 @@ class Geocoder:
                 return ""
             if response.code != 200:
                 raise ValueError("unexpected status")
-            label = data.get("display_name")
+            label = self._format_label(data)
             if ("error" in data or not isinstance(label, str) or not label.strip()
                     or len(label) > self.MAX_LABEL
                     or any(ord(c) < 32 or ord(c) == 127 for c in label)):
@@ -205,6 +208,37 @@ class Geocoder:
             return label.strip()
         except (OSError, URLError, HTTPException, ValueError, UnicodeError, RecursionError):
             raise GeocodeError("The address provider is unavailable. Try again later.") from None
+
+    @staticmethod
+    def _format_label(data):
+        """Standard address from the structured fields, else display_name."""
+        fallback = data.get("display_name")
+        address = data.get("address")
+        if not isinstance(address, dict):
+            return fallback
+
+        def text(source, key):
+            value = source.get(key)
+            return value.strip() if isinstance(value, str) and value.strip() else ""
+
+        number, road = text(address, "house_number"), text(address, "road")
+        city = next((text(address, k) for k in
+                     ("city", "town", "village", "hamlet", "municipality")
+                     if text(address, k)), "")
+        street = f"{number} {road}".strip() if road else ""
+        if not street and not city:
+            return fallback
+        state, postcode = text(address, "state"), text(address, "postcode")
+        if text(address, "country_code").lower() == "us":
+            code = text(address, "ISO3166-2-lvl4")
+            if code.startswith("US-") and len(code) == 5 and code[3:].isalpha():
+                state = code[3:].upper()
+            tail = [city, f"{state} {postcode}".strip()]
+        else:
+            tail = [city, state, postcode, text(address, "country")]
+        name = text(data, "name")
+        lead = [] if name in {"", number, road, city} else [name]
+        return ", ".join(part for part in lead + [street] + tail if part)
 
     @staticmethod
     def _retry_delay(value):

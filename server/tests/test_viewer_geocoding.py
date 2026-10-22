@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import csv
+import hashlib
 import io
 import json
 import os
@@ -132,7 +133,7 @@ class EndpointPlaceTests(unittest.TestCase):
         self.assertEqual(urlsplit(path).path, "/reverse")
         self.assertEqual(parse_qs(urlsplit(path).query), {
             "lat": ["2.0"], "lon": ["4.0"], "format": ["jsonv2"],
-            "zoom": ["18"], "addressdetails": ["0"], "accept-language": ["en"],
+            "zoom": ["18"], "addressdetails": ["1"], "accept-language": ["en"],
         })
         self.assertEqual(headers["User-Agent"], "MileageTests/1.0")
         self.assertNotIn("Cookie", headers)
@@ -154,6 +155,86 @@ class EndpointPlaceTests(unittest.TestCase):
         self.assertIn("Use end suggestion as destination", html)
         self.assertIn("sends only that endpoint", html)
         self.assertNotIn(self.provider_url, html)
+
+    def clear_cache(self):
+        self.reset_gate()
+        with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn, conn:
+            conn.execute("DELETE FROM geocode_cache")
+
+    def label_for(self, body):
+        type(self).body = json.dumps(body).encode()
+        self.clear_cache()
+        return self.post().json["label"]
+
+    def test_address_formatted_as_standard_address(self):
+        us = {"country_code": "us", "house_number": "123", "road": "Example Road",
+              "quarter": "Q Quarter", "suburb": "Sub Suburb", "city": "Sampletown",
+              "county": "Sample County", "state": "Examplestate", "ISO3166-2-lvl4": "US-ZZ",
+              "postcode": "00000", "country": "United States"}
+        full = "123 Example Road, Sampletown, ZZ 00000"
+        self.assertEqual(self.label_for({
+            "display_name": "ignored", "name": "", "address": us}), full)
+        # Name only when distinct from house number, road and city.
+        self.assertEqual(self.label_for({"name": "Invented Depot", "address": us}),
+                         "Invented Depot, " + full)
+        for same in ("123", "Example Road", "Sampletown"):
+            self.assertEqual(self.label_for({"name": same, "address": us}), full)
+        self.assertEqual(self.label_for({"name": 5, "address": us}), full)
+        no_number = {k: v for k, v in us.items() if k != "house_number"}
+        self.assertEqual(self.label_for({"address": no_number}),
+                         "Example Road, Sampletown, ZZ 00000")
+        for bad in ({"ISO3166-2-lvl4": None}, {"ISO3166-2-lvl4": "ZZ"},
+                    {"ISO3166-2-lvl4": "US-C1"}, {"ISO3166-2-lvl4": "US-ZZZ"}):
+            self.assertEqual(self.label_for({"address": {**us, **bad}}),
+                             "123 Example Road, Sampletown, Examplestate 00000")
+        missing = {k: v for k, v in us.items() if k != "ISO3166-2-lvl4"}
+        self.assertEqual(self.label_for({"address": missing}),
+                         "123 Example Road, Sampletown, Examplestate 00000")
+        town = {k: v for k, v in us.items() if k != "city"} | {"town": "Sampleton"}
+        self.assertEqual(self.label_for({"address": town}), "123 Example Road, Sampleton, ZZ 00000")
+        no_post = {k: v for k, v in us.items() if k != "postcode"}
+        self.assertEqual(self.label_for({"address": no_post}), "123 Example Road, Sampletown, ZZ")
+        self.assertEqual(self.label_for({"address": {**us, "city": " ", "village": "Samplevale"}}),
+                         "123 Example Road, Samplevale, ZZ 00000")
+
+    def test_non_us_address_includes_country(self):
+        address = {"country_code": "gb", "house_number": "7", "road": "Example Road",
+                   "suburb": "Sub", "city": "Sampletown", "county": "Sample County",
+                   "state": "Examplestate", "postcode": "AB1 2CD", "country": "Exampleland"}
+        self.assertEqual(self.label_for({"address": address}),
+                         "7 Example Road, Sampletown, Examplestate, AB1 2CD, Exampleland")
+        del address["state"], address["house_number"]
+        self.assertEqual(self.label_for({"name": "Invented Hall", "address": address}),
+                         "Invented Hall, Example Road, Sampletown, AB1 2CD, Exampleland")
+
+    def test_address_fallbacks_and_type_validation(self):
+        shown = " Invented workshop, Example Road "
+        for body in ({"display_name": shown},
+                     {"display_name": shown, "address": "text"},
+                     {"display_name": shown, "address": []},
+                     {"display_name": shown, "address": {}},
+                     {"display_name": shown, "address": {"state": "Examplestate", "postcode": "00000"}},
+                     {"display_name": shown, "address": {"road": 5, "city": ["Sampletown"], "house_number": 1}}):
+            self.assertEqual(self.label_for(body), "Invented workshop, Example Road")
+        self.assertEqual(self.label_for({"address": {
+            "country_code": "us", "road": "Example Road", "house_number": 9,
+            "city": "Sampletown", "state": 4, "postcode": 12345}}),
+            "Example Road, Sampletown")
+        # Built labels still obey the label validation.
+        for address in ({"road": "a\nb", "city": "Sampletown"}, {"road": "x" * 1001}):
+            type(self).body = json.dumps({"address": address}).encode()
+            self.clear_cache()
+            self.assertEqual(self.post().status_code, 503)
+
+    def test_cache_key_includes_label_format(self):
+        geocoder = self.viewer.GEOCODER
+        old = hashlib.sha256(f"{geocoder.url}\n2.0\n4.0".encode()).hexdigest()
+        self.assertNotEqual(geocoder.key(2, 4), old)
+        with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn, conn:
+            conn.execute("INSERT INTO geocode_cache VALUES (?, ?, 0)", (old, "Old neighbourhood label"))
+        self.assertIsNone(geocoder.cached(2, 4))
+        self.assertEqual(self.post().json["label"], "Invented workshop, Example Road")
+        self.assertEqual(len(self.received), 1)
 
     def test_auth_csrf_and_invalid_endpoints_never_call_provider(self):
         self.assertEqual(self.viewer.app.test_client().post(self.route).status_code, 401)
