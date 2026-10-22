@@ -2,7 +2,9 @@
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -147,11 +149,63 @@ class FirmwareStamp(unittest.TestCase):
                     stamp.stamp(self.root)
                 self.assertEqual(target.read_bytes(), original)
 
-    def test_git_failure_does_not_write_fallback(self):
-        with patch.object(stamp, "git_version", side_effect=subprocess.CalledProcessError(1, "git")):
-            with self.assertRaises(subprocess.CalledProcessError):
-                stamp.stamp(self.root)
-        self.assertFalse((self.root / stamp.HEADER).exists())
+    def test_git_takes_precedence_over_archive_commit(self):
+        (self.root / stamp.COMMIT).write_text("a" * 40, encoding="ascii")
+        self.assertEqual(stamp.stamp(self.root), self.version)
+
+    def test_installed_layout_inside_unrelated_checkout(self):
+        installed = self.root / "firmware-src"
+        (installed / "tools").mkdir(parents=True)
+        (installed / "firmware/04_trip_logger").mkdir(parents=True)
+        script = installed / "tools/stamp_firmware_version.py"
+        shutil.copyfile(stamp.__file__, script)
+        (installed / stamp.VERSION).write_text("v0.05\n", encoding="ascii")
+        (installed / stamp.COMMIT).write_text("a" * 40 + "\n", encoding="ascii")
+        result = subprocess.run([sys.executable, str(script)], cwd=self.root,
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout, "v0.05+aaaaaaaaaa\n")
+        self.assertEqual(result.stderr, "")
+        self.assertIn('"v0.05+aaaaaaaaaa"',
+                      (installed / stamp.HEADER).read_text(encoding="ascii"))
+
+
+class ArchiveFirmwareStamp(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="firmware-archive-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / stamp.VERSION).parent.mkdir()
+        (self.root / stamp.VERSION).write_text("v1.00\n", encoding="ascii")
+
+    def test_archive_commit_without_git_metadata(self):
+        for commit in ("0123456789" * 4, "ABCDEF0123" * 4, "a" * 64):
+            with self.subTest(commit=commit):
+                (self.root / stamp.COMMIT).write_text(commit + "\r\n", encoding="ascii")
+                self.assertEqual(stamp.stamp(self.root), "v1.00+" + commit[:10].lower())
+
+    def test_archive_commit_when_git_executable_is_missing(self):
+        (self.root / stamp.COMMIT).write_text("b" * 40, encoding="ascii")
+        with patch.object(stamp.subprocess, "check_output", side_effect=FileNotFoundError):
+            self.assertEqual(stamp.stamp(self.root), "v1.00+bbbbbbbbbb")
+
+    def test_missing_invalid_or_unexpanded_commit_warns_and_uses_release(self):
+        for commit in (None, "$Format:%H$", "", "a" * 10, "g" * 40, "a" * 41, "non-ASCII: \u00e9"):
+            with self.subTest(commit=commit):
+                target = self.root / stamp.COMMIT
+                if commit is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    target.write_text(commit, encoding="utf-8")
+                warnings = []
+                self.assertEqual(stamp.git_version(self.root, warn=warnings.append), "v1.00")
+                self.assertEqual(len(warnings), 1)
+                self.assertIn("using VERSION alone", warnings[0])
+                if commit == "$Format:%H$":
+                    self.assertIn("unexpanded", warnings[0])
+                with patch.object(stamp.sys, "stderr") as stderr:
+                    self.assertEqual(stamp.stamp(self.root), "v1.00")
+                    self.assertTrue(stderr.write.called)
+                self.assertIn('"v1.00"', (self.root / stamp.HEADER).read_text(encoding="ascii"))
 
 
 if __name__ == "__main__":

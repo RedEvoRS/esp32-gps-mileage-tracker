@@ -1,16 +1,20 @@
-"""Stamp Stage 4 with firmware/VERSION and the Git commit before each compile.
+"""Stamp Stage 4 with firmware/VERSION and the commit before each compile.
 
 VERSION accepts surrounding whitespace (including LF or CRLF line endings).
+Without usable Git metadata, use an archive's firmware/COMMIT or VERSION alone.
 """
 
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
 HEADER = Path("firmware/04_trip_logger/firmware_version.h")
 VERSION = Path("firmware/VERSION")
+COMMIT = Path("firmware/COMMIT")
+COMMIT_HASH = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", re.ASCII | re.IGNORECASE)
 RELEASE = re.compile(r"v(0|[1-9][0-9]?)\.[0-9]{2}", re.ASCII)
 TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,31}", re.ASCII)
 
@@ -21,7 +25,10 @@ def validate_version(version):
         raise ValueError("firmware version exceeds the protocol token budget")
 
 
-def git_version(root):
+def git_version(root, warn=None):
+    if warn is None:
+        warn = lambda reason: print(f"Firmware version: {reason}", file=sys.stderr)
+    root = Path(root).resolve()
     try:
         release = (Path(root) / VERSION).read_text(encoding="ascii").strip()
     except (OSError, UnicodeError):
@@ -34,13 +41,34 @@ def git_version(root):
             ["git", *args], cwd=root, text=True, encoding="utf-8",
             stderr=subprocess.DEVNULL).strip()
 
-    commit = git("rev-parse", "--short=10", "HEAD")
-    if not re.fullmatch(r"[0-9a-f]{10}", commit):
-        raise ValueError("expected a ten-character Git commit")
-    # Includes staged changes, deletions and renames, but no untracked files
-    # (including untracked submodule content) or ignored build/secret files.
-    dirty = git("status", "--porcelain", "--untracked-files=no",
-                "--ignore-submodules=untracked")
+    try:
+        # Works in linked worktrees and firmware-src/tools, but must not
+        # borrow provenance from an unrelated checkout around a copied tree.
+        if Path(git("rev-parse", "--show-toplevel")).resolve() != root:
+            raise ValueError
+        git("ls-files", "--error-unmatch", VERSION.as_posix())
+        commit = git("rev-parse", "--short=10", "HEAD")
+        if not re.fullmatch(r"[0-9a-f]{10}", commit):
+            raise ValueError("expected a ten-character Git commit")
+        # Includes staged changes, deletions and renames, but no untracked files
+        # (including untracked submodule content) or ignored build/secret files.
+        dirty = git("status", "--porcelain", "--untracked-files=no",
+                    "--ignore-submodules=untracked")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        try:
+            commit = (root / COMMIT).read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError):
+            reason = "COMMIT missing or unreadable"
+        else:
+            if COMMIT_HASH.fullmatch(commit):
+                version = release + "+" + commit[:10].lower()
+                validate_version(version)
+                return version
+            reason = ("COMMIT has an unexpanded archive placeholder" if commit == "$Format:%H$"
+                      else "COMMIT is not a 40- or 64-hex hash")
+        warn("Git unavailable or not a usable repository checkout; " + reason
+             + "; using VERSION alone (no commit/dirty information)")
+        return release
     version = release + "+" + commit + ("-dirty" if dirty else "")
     validate_version(version)
     return version
