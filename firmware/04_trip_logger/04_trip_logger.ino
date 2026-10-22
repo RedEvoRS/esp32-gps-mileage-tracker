@@ -144,6 +144,9 @@ static constexpr size_t   TRKPT_LINE_BYTES = 256;            // includes termina
 // Fix-loss heuristic: gap this long between valid fixes starts a new
 // <trkseg> so viewers don't draw a straight line across a tunnel.
 static constexpr uint32_t SEG_GAP_MS      = 5000;
+// An unconfirmed start gets one arming window plus the normal gap margin.
+// No file exists yet; release ARMING so battery idle power-off can run.
+static constexpr uint32_t ARM_FIX_LOSS_MS = ARM_MS + SEG_GAP_MS;
 
 // If a trip is ACTIVE/COOLDOWN and we go this long without ANY valid fix
 // (parked in a garage, GPS failure), finalize the trip rather than leave
@@ -1785,6 +1788,12 @@ static void confirmVbusOff() {
     Serial.println("VBUS off for 10 s -- car off: finalizing trip, staying awake.");
     gVbusLost = true;
     if (gTripPath[0]) endTrip(/*discardIfMicro=*/false);
+    else if (gState == ARMING) {
+        // A confirmed car-off also cancels a start that never opened a file.
+        gState = IDLE;
+        armBufReset();
+        gPendCount = gPendHead = 0;
+    }
 }
 
 // =================================================================
@@ -3128,6 +3137,13 @@ void loop() {
     serviceGpsConfiguration();
     serviceDebugRf();
     serviceRuntimeDiagnostics(); // before fix-loss finalization and PMU shutdown
+
+    // ARMING must also expire when no next fix arrives to drive the FSM.
+    if (gState == ARMING && millis() - gLastFixMonoMs > ARM_FIX_LOSS_MS) {
+        gState = IDLE;
+        armBufReset();
+        gPendCount = gPendHead = 0;
+    }
 
     // Fix-loss watchdog: a recording trip with no valid fix at all for
     // FIX_LOSS_END_MS (parked indoors, antenna failure) is finalized so

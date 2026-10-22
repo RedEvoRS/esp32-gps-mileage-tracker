@@ -1851,6 +1851,45 @@ int main(int argc, char** argv) {
         }
     }
 
+    printf("T61 losing all fixes during arming releases battery idle power-off\n");
+    {
+        resetWorld(); drive(15, 3);
+        CHECK(gState == ARMING && gArmCount == 3 && !gTripPath[0], "armed without a trip file");
+        // Already confirmed on battery: isolate the fix-loss watchdog.
+        PMU.vbusIn = false; gVbusLost = true;
+        // The empty UART poll in loop() advances the stub clock by 1 ms.
+        g_millis = gLastFixMonoMs + ARM_MS + SEG_GAP_MS - 1;
+        loop();
+        CHECK(gState == ARMING, "arming remains at the exact fix-loss bound");
+        ++g_millis; loop();
+        CHECK(gState == IDLE && gArmCount == 0 && gArmHead == 0 &&
+              gPendCount == 0 && gPendHead == 0 && !gTripPath[0],
+              "silent GPS past the bound clears arming and pending points");
+        uint32_t idleSince = gIdleSince;
+        loopFor(1000);
+        CHECK(gIdleSince == idleSince, "battery idle timer runs after arming fix loss");
+        loopFor(IDLE_BATT_SLEEP_MS);
+        CHECK(PMU.shutdownCalls == 1, "arming fix loss allows battery idle power-off");
+    }
+
+    printf("T62 confirmed VBUS loss cancels arming without a trip file\n");
+    {
+        resetWorld(); drive(15, 3);
+        vbus(false); loop();
+        CHECK(gState == ARMING && gVbusOffPending && !gTripPath[0], "VBUS loss starts confirmation while armed");
+        loopFor(VBUS_OFF_CONFIRM_MS - 100);
+        CHECK(gState == ARMING && !gVbusLost, "unconfirmed VBUS loss leaves arming alone");
+        loopFor(100);
+        CHECK(gVbusLost && gState == IDLE && gArmCount == 0 && gArmHead == 0 &&
+              gPendCount == 0 && gPendHead == 0 && tripFiles().empty(),
+              "confirmed VBUS loss clears arming even without a file or another fix");
+        uint32_t idleSince = gIdleSince;
+        loopFor(1000);
+        CHECK(gIdleSince == idleSince, "battery idle timer runs after VBUS cancels arming");
+        loopFor(IDLE_BATT_SLEEP_MS);
+        CHECK(PMU.shutdownCalls == 1, "VBUS loss during arming allows battery idle power-off");
+    }
+
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
     return g_fail ? 1 : 0;
 }
