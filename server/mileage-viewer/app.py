@@ -11,6 +11,7 @@ provides a small web UI to:
     a free-text note and destination
   - select a local calendar year and export trips and totals to CSV or XLSX
   - inspect device health and diagnostic history at /device-health
+  - (admin) remove a trip from the log and restore it, at /admin/removed
 
 Design notes:
   - The GPX/JSON files are the immutable source of truth and are mounted
@@ -18,6 +19,10 @@ Design notes:
   - This service owns annotations.db (SQLite), including annotations and
     merge membership keyed by relative path "YYYY-MM/<id>". If that DB is lost, every
     trip still lists and maps fine -- annotations and merges are gone.
+  - Removing a trip from the log is a row in annotations.db (trip_removals),
+    never a change under the data root: the files stay, and a restore is
+    deleting the row. _load_trips() is the one place removed trips leave the
+    log, so the list, totals, exports and merge suggestions all agree.
   - Trips are identified in URLs by <ym>/<id> (e.g. 2026-04/2026-04-14...).
     Both components are strictly validated to prevent path traversal.
 
@@ -80,6 +85,7 @@ from common.version import server_version
 
 from common.diagnostics import CatalogError, load_catalog
 from geocoding import Geocoder, GeocodeError
+import trip_log
 import trip_merges
 import users
 
@@ -160,6 +166,9 @@ ENDPOINT_ROLES = {
     "device_health": {"admin", "editor"},
     "logout": {"admin", "editor"},
     "admin": {"admin"},
+    "admin_removed": {"admin"},
+    "remove_trip": {"admin"},
+    "restore_trip": {"admin"},
     "account_password": {"admin", "editor"},
 }
 DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32))
@@ -250,6 +259,7 @@ def init_db():
         users.init_schema(conn)
         Geocoder.init_schema(conn)
         trip_merges.init_schema(conn)
+        trip_log.init_schema(conn)
         # Failed-login tracking. This lives in SQLite, not in a module
         # global, because gunicorn runs 2 workers -- an in-memory counter
         # would give an attacker MAX_FAILS attempts per worker and would
@@ -564,17 +574,17 @@ def read_summary(json_path):
     }, None
 
 
-def load_trips(conn=None):
+def load_trips(conn=None, include_removed=False):
     if conn is not None:
-        return _load_trips(conn)
+        return _load_trips(conn, include_removed)
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         conn.row_factory = sqlite3.Row
         # Serialize cache refreshes with edits/merges across gunicorn workers.
         conn.execute("BEGIN IMMEDIATE")
-        return _load_trips(conn)
+        return _load_trips(conn, include_removed)
 
 
-def _load_trips(conn):
+def _load_trips(conn, include_removed=False):
     """Scan DATA_ROOT for trips and join annotations.
 
     Returns (trips, unreadable). trips is sorted by its date anchor descending,
@@ -583,6 +593,11 @@ def _load_trips(conn):
     trips whose summary read_summary() rejected or couldn't find, sorted
     by trip_key, retaining usable device/start identity but no mileage, plus
     problem. Their miles are unknown, so they're reported, never counted.
+
+    Trips the admin removed from the log are left out of both lists. With
+    include_removed (the admin's views) they stay, each carrying a "removal"
+    dict (reason, removed_by, removed_at); callers that feed totals, exports
+    or merge suggestions must not ask for them.
     """
     annotations = {r["trip_key"]: dict(r) for r in conn.execute("SELECT * FROM annotations")}
     trips, unreadable = [], []
@@ -616,6 +631,22 @@ def _load_trips(conn):
             trips.append(trip)
 
     trips, unreadable = trip_merges.apply_merges(conn, DATA_ROOT, trips, unreadable)
+    # Removal is keyed by the canonical key the list shows (a merged trip's
+    # merge key, a part never), so filtering here, after the merges, hides a
+    # merged trip as a whole. This is the only place that filters: the list,
+    # totals, exports and next_trip all take their input from this function.
+    # An unreadable trip that is removed also leaves next_trip's "an
+    # unreadable summary may fall between" guard. That is intended: removing
+    # it is how the admin clears that warning.
+    removed = trip_log.removals(conn)
+    if include_removed:
+        trips = [{**t, "removal": removed[t["trip_key"]]} if t["trip_key"] in removed else t
+                 for t in trips]
+        unreadable = [{**t, "removal": removed[t["trip_key"]]} if t["trip_key"] in removed else t
+                      for t in unreadable]
+    else:
+        trips = [t for t in trips if t["trip_key"] not in removed]
+        unreadable = [t for t in unreadable if t["trip_key"] not in removed]
     trips.sort(key=lambda t: _trip_date_anchor(t) or "", reverse=True)
     unreadable.sort(key=lambda t: t["trip_key"])
     return trips, unreadable
@@ -1085,6 +1116,7 @@ ACCOUNT_HTML = """
 """ + ACCOUNT_HEADER + """<main class="wrap"><h1>{{ title }}</h1>
 {% if message %}<p role="status">{{ message }}</p>{% endif %}
 {% if title == 'Admin' %}<p>{{ admin_username }}: Admin (set in viewer.env)</p>
+<p><a class="btn secondary" href="{{ url_for('admin_removed') }}">Removed trips</a></p>
 <h2>Everyday logins</h2><div class="login-table">
 <table><tr><th>Everyday login</th><th>Status</th><th>Created ({{ timezone }})</th><th>Actions</th></tr>
 {% for user in logins %}<tr><td>{{ user.username }}</td><td>{{ 'disabled' if user.disabled else 'enabled' }}</td>
@@ -1206,6 +1238,14 @@ LIST_HTML = """
           <button class="btn" type="submit">Undo merge (split back)</button>
         </form>
         {% endif %}
+        {% if g.role == 'admin' %}
+        <form method="post" action="{{ url_for('remove_trip', ym=u.ym, trip_id=u.id, year=year or '') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <label>Reason for removing it from the log
+            <input type="text" name="reason" maxlength="500" required></label>
+          <button class="btn secondary" type="submit">Remove from log</button>
+        </form>
+        {% endif %}
       </li>
       {% endfor %}
     </ul>
@@ -1269,6 +1309,15 @@ TRIP_HTML = """
 </header>
 <div class="wrap">
   <h2>{{ fmt_trip_date(t) }}</h2>
+  {% if removal %}
+  <div class="warn" role="status">
+    <b>Removed from the log</b> by {{ removal.removed_by }} on {{ fmt_date(removal.removed_at) }}: {{ removal.reason }}
+    <form method="post" action="{{ url_for('restore_trip', ym=t.ym, trip_id=t.id, year=year or '') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="btn" type="submit">Restore to the log</button>
+    </form>
+  </div>
+  {% endif %}
   {% if t.get('timing_status') == 'partial' %}
   <p class="muted">Partial timing: some points have no timestamp. Full-trip dates,
     duration and average speed are unknown. Recorded timestamps run from
@@ -1289,6 +1338,11 @@ TRIP_HTML = """
   <p class="muted">GPX file missing — cannot draw the track.</p>
   {% endif %}
 
+  {% if removal %}
+  <p class="muted">This trip is out of the trip list, totals and exports, and can't be edited
+    until it is restored. Its purpose, destination and note were: {{ t.category or '—' }},
+    {{ t.destination or '—' }}, {{ t.purpose_note or '—' }}.</p>
+  {% else %}
   <section aria-labelledby="places-heading">
     <h3 id="places-heading">Recorded endpoint places</h3>
     <p class="muted">Suggestions describe nearby mapped objects, not verified businesses or
@@ -1374,6 +1428,20 @@ TRIP_HTML = """
     <textarea name="purpose_note" id="purpose_note" rows="3">{{ t.purpose_note or "" }}</textarea>
     <p><button class="btn" type="submit">Save</button></p>
   </form>
+  {% if g.role == 'admin' %}
+  <section aria-labelledby="remove-heading">
+    <h3 id="remove-heading">Remove from log</h3>
+    <p>Takes this trip out of the trip list, totals and exports for everyone. The GPX and
+      summary files stay on the server, and you can restore the trip from the Removed trips page.</p>
+    <form method="post" action="{{ url_for('remove_trip', ym=t.ym, trip_id=t.id, year=year or '') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <label for="remove-reason">Reason (required)</label>
+      <textarea name="reason" id="remove-reason" rows="2" maxlength="500" required></textarea>
+      <p><button class="btn secondary" type="submit">Remove from log</button></p>
+    </form>
+  </section>
+  {% endif %}
+  {% endif %}
 </div>
 
 {% if geocoder_enabled %}
@@ -1625,6 +1693,83 @@ def admin():
                                   message=session.pop("account_message", None))
 
 
+REMOVED_HTML = """
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Removed trips</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """
+.removed-table { overflow-x: auto; }
+.removed-table td { vertical-align: top; }
+</style></head><body>
+""" + ACCOUNT_HEADER + """<main class="wrap"><h1>Removed trips</h1>
+<p class="muted">The original files remain on the server. Restoring a trip returns it to the list,
+totals, exports and merge suggestions.</p>
+<div class="removed-table"><table>
+<thead><tr><th>Date / folder</th><th>Distance</th><th>Reason</th><th>Removed by</th><th>Removed at ({{ timezone }})</th><th>Trip</th><th></th></tr></thead>
+<tbody>{% for entry in entries %}<tr>
+<td>{{ entry.date }}</td><td>{% if entry.unreadable %}unreadable{% else %}{{ "%.2f"|format(entry.distance or 0) }} mi{% endif %}</td>
+<td>{{ entry.removal.reason }}</td><td>{{ entry.removal.removed_by }}</td><td>{{ fmt_date(entry.removal.removed_at) }}</td>
+<td><a href="{{ url_for('trip_view', ym=entry.trip.ym, trip_id=entry.trip.id) }}">{{ entry.trip.trip_key }}</a></td>
+<td><form method="post" action="{{ url_for('restore_trip', ym=entry.trip.ym, trip_id=entry.trip.id) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button class="btn" type="submit">Restore</button></form></td>
+</tr>{% else %}<tr><td colspan="7" class="muted">No removed trips.</td></tr>{% endfor %}</tbody>
+</table></div></main></body></html>
+"""
+
+
+@app.route("/admin/removed")
+def admin_removed():
+    trips, unreadable = load_trips(include_removed=True)
+    entries = []
+    for trip in trips:
+        removal = trip.get("removal")
+        if removal:
+            entries.append({"trip": trip, "removal": removal,
+                            "date": fmt_trip_date(trip), "distance": trip.get("distance_miles"),
+                            "unreadable": False})
+    for trip in unreadable:
+        removal = trip.get("removal")
+        if removal:
+            entries.append({"trip": trip, "removal": removal, "date": trip["ym"],
+                            "distance": None, "unreadable": True})
+    entries.sort(key=lambda entry: entry["removal"]["removed_at"], reverse=True)
+    return render_template_string(REMOVED_HTML, entries=entries, timezone=DISPLAY_TZ_NAME)
+
+
+@app.route("/trip/<ym>/<trip_id>/remove", methods=["POST"])
+def remove_trip(ym, trip_id):
+    year = selected_year()
+    _safe_trip_paths(ym, trip_id)
+    reason = request.form.get("reason", "").strip()
+    if not 1 <= len(reason) <= 500:
+        abort(400, description="Reason must be between 1 and 500 characters.")
+    requested_key = f"{ym}/{trip_id}"
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        key = trip_merges.canonical_key(conn, requested_key)
+        if key != requested_key:
+            abort(409, description="This recording is part of a merged trip; remove the merged trip instead.")
+        if trip_log.removal(conn, key):
+            abort(409, description="This trip is already removed from the log.")
+        trips, unreadable = load_trips(conn, include_removed=True)
+        if not any(trip["trip_key"] == key for trip in trips + unreadable):
+            abort(404)
+        trip_log.add_removal(conn, key, reason, g.user)
+    return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
+
+
+@app.route("/trip/<ym>/<trip_id>/restore", methods=["POST"])
+def restore_trip(ym, trip_id):
+    year = selected_year()
+    _safe_trip_paths(ym, trip_id)
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        key = trip_merges.canonical_key(conn, f"{ym}/{trip_id}")
+        if not trip_log.removal(conn, key):
+            abort(409, description="This trip is not removed from the log.")
+        trip_log.delete_removal(conn, key)
+    return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
+
+
 @app.route("/account/password", methods=["GET", "POST"])
 def account_password():
     if request.method == "POST" and g.role == "editor":
@@ -1675,11 +1820,16 @@ def index():
 def trip_view(ym, trip_id):
     year = selected_year()
     _safe_trip_paths(ym, trip_id)
-    trips, unreadable = load_trips()
     key = f"{ym}/{trip_id}"
     with closing(sqlite3.connect(DB_PATH)) as conn:
         key = trip_merges.canonical_key(conn, key)
+        removed = trip_log.removal(conn, key)
+    # Load removed entries only when the admin opened one, so every normal
+    # trip page feeds the standard filtered lists to merge suggestions.
+    trips, unreadable = load_trips(include_removed=(g.role == "admin" and removed is not None))
     t = next((t for t in trips if t["trip_key"] == key or key in t.get("parts", [])), None)
+    if t is None:
+        t = next((u for u in unreadable if u["trip_key"] == key and u.get("removal")), None)
     if t is None:
         problem = next((u["problem"] for u in unreadable if u["trip_key"] == key), "the file is missing")
         abort(404, description=(
@@ -1689,6 +1839,9 @@ def trip_view(ym, trip_id):
         ))
     if t["trip_key"] != f"{ym}/{trip_id}":
         return redirect(url_for("trip_view", ym=t["ym"], trip_id=t["id"], year=year or ""))
+    if t.get("removal"):
+        return render_template_string(TRIP_HTML, t=t, removal=t["removal"], categories=CATEGORIES,
+                                      year=year, geocoder_enabled=False)
     merge_next, merge_block_reason = trip_merges.next_trip(t, trips, unreadable)
     places = {}
     if GEOCODER.enabled:
@@ -1709,6 +1862,8 @@ def lookup_place(ym, trip_id):
     # Coordinates and provider are always server-selected. This is not an
     # arbitrary geocoding proxy, even for an authenticated browser.
     _safe_trip_paths(ym, trip_id)
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        _abort_if_removed(conn, f"{ym}/{trip_id}")
     t = resolved_trip(ym, trip_id)
     endpoint = request.form.get("endpoint", "")
     if endpoint not in ("start", "end"):
@@ -1726,7 +1881,13 @@ def lookup_place(ym, trip_id):
 @app.route("/gpx/<ym>/<trip_id>")
 def trip_gpx(ym, trip_id):
     gpx_path, _ = _safe_trip_paths(ym, trip_id)
-    t = resolved_trip(ym, trip_id, allow_original=True)
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        removed = trip_log.removal(conn, trip_merges.canonical_key(conn, f"{ym}/{trip_id}"))
+    # The track of a removed trip is the admin's to look at, nobody else's;
+    # without this check the plain-file path below would still serve it.
+    if removed and g.role != "admin":
+        abort(404)
+    t = resolved_trip(ym, trip_id, allow_original=True, include_removed=bool(removed))
     if t and t.get("parts"):
         try:
             raw = trip_merges.combined_gpx(DATA_ROOT, t["parts"])
@@ -1753,6 +1914,7 @@ def annotate(ym, trip_id):
         canonical = trip_merges.canonical_key(conn, key)
         if canonical != key:
             abort(409, description="This part has been merged. Reopen the merged trip before editing.")
+        _abort_if_removed(conn, key)
         merged = conn.execute("SELECT 1 FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
         if merged:
             conn.execute("""UPDATE trip_merges SET category=?, purpose_note=?, destination=?, updated_at=?
@@ -1769,11 +1931,17 @@ def annotate(ym, trip_id):
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
 
 
-def resolved_trip(ym, trip_id, allow_original=False):
+def _abort_if_removed(conn, key):
+    """409 for anything that would change a trip the admin removed from the log."""
+    if trip_log.removal(conn, trip_merges.canonical_key(conn, key)):
+        abort(409, description="This trip is removed from the log. The admin has to restore it first.")
+
+
+def resolved_trip(ym, trip_id, allow_original=False, include_removed=False):
     key = f"{ym}/{trip_id}"
     with closing(sqlite3.connect(DB_PATH)) as conn:
         key = trip_merges.canonical_key(conn, key)
-    trips, _ = load_trips()
+    trips, _ = load_trips(include_removed=include_removed)
     t = next((t for t in trips if t["trip_key"] == key or key in t.get("parts", [])), None)
     if t is None and not allow_original:
         abort(404)
@@ -1787,6 +1955,7 @@ def merge_trip(ym, trip_id):
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
+        _abort_if_removed(conn, f"{ym}/{trip_id}")
         trips, unreadable = load_trips(conn)
         current = next((t for t in trips if t["trip_key"] == f"{ym}/{trip_id}"), None)
         if current is None:
@@ -1837,6 +2006,7 @@ def split_trip(ym, trip_id):
     key = f"{ym}/{trip_id}"
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
+        _abort_if_removed(conn, key)
         keys = trip_merges.parts(conn, key)
         if not keys:
             abort(409, description="This merge no longer exists. Reopen the trip list.")

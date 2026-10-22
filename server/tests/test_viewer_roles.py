@@ -88,7 +88,11 @@ class ViewerRolesTests(unittest.TestCase):
             'split_trip': ('/trip/2026-01/drive/split', 'POST', 400),
             'export_csv': ('/export.csv', 'GET', 200), 'export_xlsx': ('/export.xlsx', 'GET', 200),
             'device_health': ('/device-health', 'GET', 200), 'logout': ('/logout', 'POST', 302),
-            'admin': ('/admin', 'GET', 200), 'account_password': ('/account/password', 'GET', 200),
+            'admin': ('/admin', 'GET', 200),
+            'admin_removed': ('/admin/removed', 'GET', 200),
+            'remove_trip': ('/trip/2026-01/drive/remove', 'POST', 400),
+            'restore_trip': ('/trip/2026-01/drive/restore', 'POST', 409),
+            'account_password': ('/account/password', 'GET', 200),
         }
         endpoints = {rule.endpoint for rule in self.viewer.app.url_map.iter_rules()}
         self.assertEqual(endpoints, set(routes))
@@ -110,7 +114,7 @@ class ViewerRolesTests(unittest.TestCase):
                     if role is None:
                         expected = (200 if endpoint == 'health' or (endpoint == 'login' and method == 'GET')
                                     else (302 if method == 'GET' else 401))
-                    elif endpoint == 'admin' and role == 'editor':
+                    elif endpoint in {'admin', 'admin_removed', 'remove_trip', 'restore_trip'} and role == 'editor':
                         expected = 403
                     response = self.client.open(path, method=method, data={'csrf_token': 'known-token'})
                     self.assertEqual(response.status_code, expected)
