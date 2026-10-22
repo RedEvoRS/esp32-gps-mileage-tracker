@@ -2006,8 +2006,9 @@ static bool uploadFile(fs::FS& storage, const char* path) {
     // file's fault, so those stay queued.
     bool rejected = (code == 400 || code == 413);
     bool setAside = false;
+    bool deleted = false;
     if (ok) {
-        storage.remove(path);
+        deleted = storage.remove(path);
     } else if (rejected) {
         String bad = String(path) + ".bad";
         setAside = storage.rename(path, bad.c_str());
@@ -2015,7 +2016,12 @@ static bool uploadFile(fs::FS& storage, const char* path) {
     FS_UNLOCK();
 
     debugUpload(code);
-    if (ok) {
+    if (ok && !deleted) {
+        // HTTP success still clears upload backoff; the queued copy may retry.
+        Serial.printf("Upload %s (%u B, %.1f s) -> HTTP 200, but deleting the local file failed "
+                      "(will re-upload; the server ignores identical copies)\n",
+                      path, (unsigned)sz, secs);
+    } else if (ok) {
         Serial.printf("Upload %s (%u B, %.1f s) -> HTTP 200 (deleted)\n",
                       path, (unsigned)sz, secs);
     } else if (rejected) {

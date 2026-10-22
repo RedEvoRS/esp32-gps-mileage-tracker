@@ -1933,6 +1933,31 @@ int main(int argc, char** argv) {
               "stopped continuation retains the shared boundary and subsequent recorded fixes");
     }
 
+    printf("T65 HTTP 200 reports a failed local delete honestly\n");
+    {
+        for (bool sd : {false, true}) {
+            resetWorld(); SD.cardPresent = sd; g_sdDisk.capacity = 32 * 1024 * 1024;
+            setup(); drive(15, 40);
+            std::string path = gTripPath;
+            endTrip(false);
+            fs::FS& storage = *gTripFS;
+            FakeDisk& disk = sd ? g_sdDisk : g_disk;
+            std::string complete = disk.files.at(path);
+            Serial.log.clear(); disk.failRemoves = 1;
+            CHECK(uploadFile(storage, path.c_str()) && g_httpRequests == 1 &&
+                  g_httpLastBody == complete && disk.files.at(path) == complete && hasPending(),
+                  "HTTP success stays success with identical bytes still queued after delete failure");
+            CHECK(logHas(("Upload " + path).c_str()) &&
+                  logHas("-> HTTP 200, but deleting the local file failed (will re-upload; the server ignores identical copies)") &&
+                  !logHas("(deleted)"), "delete failure log tells the truth without claiming deletion");
+            CHECK(g_lockDepth == 0 && disk.openHandles == 0, "failed deletion releases the filesystem lock and file");
+            Serial.log.clear();
+            CHECK(uploadFile(storage, path.c_str()) && g_httpRequests == 2 &&
+                  !disk.files.count(path) && logHas("HTTP 200 (deleted)") &&
+                  !logHas("deleting the local file failed"), "next successful delete retains the normal success message");
+        }
+    }
+
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
     return g_fail ? 1 : 0;
 }
