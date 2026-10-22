@@ -488,6 +488,56 @@ categories and notes. Existing categories remain business / personal / other.
 The viewer mounts `./data` **read-only** — it never modifies GPX or
 summary files. The only thing it writes is the annotations database.
 
+### Merge recordings from one drive
+
+If a long stop split one drive into separate trips, open **Map / Edit** on
+the earlier trip, save any annotation edits, then choose **Merge with next
+trip**. The action is available only for the next trip from the same known
+device, with both GPX recordings present and a start no more than 15 minutes
+after the earlier trip's `recorded_until` (the final recorded timestamp).
+The limit is the named `MERGE_MAX_GAP` constant in `trip_merges.py`. Older
+summaries without that timestamp use `end_time`, the last moving point, as
+a conservative fallback. Upload/receipt times are never used. Overlapping
+recordings, unknown device identities or unknown start times cannot be merged.
+An unreadable summary blocks merging until repaired because its device and
+position in the sequence cannot be established safely.
+
+The merged trip replaces its parts in the list, map, both exports and totals.
+You can merge it with the next trip again to join a longer chain. Old trip
+page links lead to the current merged trip. The map draws every part with a
+visible break at unrecorded gaps. Mileage is recomputed over all points with
+the same parser and `summarize()` rules as ingest, including straight-line
+gap estimates and fix/movement filters; it is not the sum of the old rounded
+distances. Duration runs from the first part's start to the last moving point
+of the last part and includes the stop between recordings. Local calendar-year
+selection follows the merged start in `DISPLAY_TZ`.
+
+A merged trip has one saved purpose, note and destination. If only one trip
+has an annotation, that annotation is kept. If both do, merging is blocked:
+choose which to retain by clearing **all three fields** on the other trip
+and saving it first. Copy any text you want to retain before clearing it.
+**Undo merge (split back)** restores every original trip and the annotations
+saved on those trips when they were merged. Confirm the checkbox first:
+annotation edits made to the merged trip are removed by Undo. Undo of a chain
+restores all original recordings, rather than just its most recent pair.
+
+Merging never edits or deletes anything under `./data`. The viewer adds
+`trip_merges` (merged annotation and cached summary), `trip_merge_parts`
+(ordered original keys), and `trip_merge_aliases` (earlier merged links) to
+`annotations.db` in the `viewer-db` volume. Startup migrates existing databases
+in a serialized SQLite transaction so concurrent workers preserve existing
+annotations. The original annotation rows remain intact. Back up this database
+alongside the trip files: losing it also loses merges.
+
+The cached summary is refreshed only when a part's GPX/JSON size or modification
+time changes, or the shared summary-rule version changes. Ordinary list views
+read the cache without parsing every merged track. Both images ship the shared
+rules in `common/trip_summary.py` through the default-deny Docker build context.
+If a source disappears or becomes unreadable, the merged trip is flagged as
+unreadable and excluded from totals, rather than showing stale mileage. The
+list's warning includes Undo so the originals can still be restored. Merge,
+Undo and annotation changes require a logged-in session and CSRF-protected POSTs.
+
 ### Endpoint place suggestions
 
 The trip's **Map / Edit** page can suggest readable start/end places using a

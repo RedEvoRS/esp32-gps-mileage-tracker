@@ -15,9 +15,9 @@ provides a small web UI to:
 Design notes:
   - The GPX/JSON files are the immutable source of truth and are mounted
     read-only. This service never writes to them.
-  - The ONLY thing this service owns is annotations.db (SQLite), keyed by
-    each trip's relative path "YYYY-MM/<id>". If that DB is lost, every
-    trip still lists and maps fine -- only the annotations are gone.
+  - This service owns annotations.db (SQLite), including annotations and
+    merge membership keyed by relative path "YYYY-MM/<id>". If that DB is lost, every
+    trip still lists and maps fine -- annotations and merges are gone.
   - Trips are identified in URLs by <ym>/<id> (e.g. 2026-04/2026-04-14...).
     Both components are strictly validated to prevent path traversal.
 
@@ -78,6 +78,7 @@ from common.version import server_version
 
 from common.diagnostics import CatalogError, load_catalog
 from geocoding import Geocoder, GeocodeError
+import trip_merges
 
 try:
     DIAGNOSTICS_CATALOG = load_catalog()
@@ -207,7 +208,7 @@ def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     # closing() actually closes the connection on exit; sqlite3's own
     # context manager only commits/rolls back the transaction.
-    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         # Multiple Gunicorn workers can start together. Serialize the schema
         # check and migration so neither tries to add the same column twice.
         conn.execute("BEGIN IMMEDIATE")
@@ -225,6 +226,7 @@ def init_db():
         if "destination" not in columns:
             conn.execute("ALTER TABLE annotations ADD COLUMN destination TEXT NOT NULL DEFAULT ''")
         Geocoder.init_schema(conn)
+        trip_merges.init_schema(conn)
         # Failed-login tracking. This lives in SQLite, not in a module
         # global, because gunicorn runs 2 workers -- an in-memory counter
         # would give an attacker MAX_FAILS attempts per worker and would
@@ -511,7 +513,17 @@ def read_summary(json_path):
     }, None
 
 
-def load_trips():
+def load_trips(conn=None):
+    if conn is not None:
+        return _load_trips(conn)
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        # Serialize cache refreshes with edits/merges across gunicorn workers.
+        conn.execute("BEGIN IMMEDIATE")
+        return _load_trips(conn)
+
+
+def _load_trips(conn):
     """Scan DATA_ROOT for trips and join annotations.
 
     Returns (trips, unreadable). trips is sorted by its date anchor descending,
@@ -521,10 +533,8 @@ def load_trips():
     by trip_key, with the same keys minus the summary fields, plus
     problem. Their miles are unknown, so they're reported, never counted.
     """
-    annotations = get_annotations()
+    annotations = {r["trip_key"]: dict(r) for r in conn.execute("SELECT * FROM annotations")}
     trips, unreadable = [], []
-    if not DATA_ROOT.exists():
-        return trips, unreadable
 
     # A GPX with no summary next to it is a trip too. Ingest writes the GPX
     # first, so a failed or lost summary write leaves one behind. (A page
@@ -554,6 +564,7 @@ def load_trips():
         else:
             trips.append(trip)
 
+    trips, unreadable = trip_merges.apply_merges(conn, DATA_ROOT, trips, unreadable)
     trips.sort(key=lambda t: _trip_date_anchor(t) or "", reverse=True)
     unreadable.sort(key=lambda t: t["trip_key"])
     return trips, unreadable
@@ -1067,7 +1078,16 @@ LIST_HTML = """
     summary from its GPX, see DEPLOY_DEBIAN.md → Troubleshooting.
     <ul>
       {% for u in unreadable %}
-      <li><code>{{ u.trip_key }}.json</code>{% if not u.has_gpx %} (no GPX either){% endif %}: {{ u.problem }}</li>
+      <li><code>{{ u.trip_key }}{% if not u.get('parts') %}.json{% endif %}</code>{% if not u.has_gpx %} (no GPX either){% endif %}: {{ u.problem }}
+        {% if u.get('parts') %}
+        <form method="post" action="{{ url_for('split_trip', ym=u.ym, trip_id=u.id, year=year or '') }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <label><input type="checkbox" name="confirm" value="yes" required>
+            Restore original trips and annotations; remove the merged annotation.</label>
+          <button class="btn" type="submit">Undo merge (split back)</button>
+        </form>
+        {% endif %}
+      </li>
       {% endfor %}
     </ul>
   </div>
@@ -1179,6 +1199,38 @@ TRIP_HTML = """
     {% endif %}
   </section>
 
+  <section aria-labelledby="merge-heading">
+    <h3 id="merge-heading">Join a split drive</h3>
+    {% if t.get('parts') %}
+    <p>Merged from {{ t.parts|length }} recordings. Track breaks show unrecorded gaps;
+      mileage bridges gaps using the same straight-line estimate as ingest.</p>
+    <form method="post" action="{{ url_for('split_trip', ym=t.ym, trip_id=t.id, year=year or '') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <p><label><input type="checkbox" name="confirm" value="yes" required>
+        Restore each original trip and annotation, removing the current merged annotation.</label></p>
+      <button class="btn" type="submit">Undo merge (split back)</button>
+    </form>
+    {% endif %}
+    {% if merge_next and t.has_gpx and merge_next.has_gpx %}
+    <p>Next trip from this device: <a href="{{ url_for('trip_view', ym=merge_next.ym, trip_id=merge_next.id, year=year or '') }}">{{ fmt_trip_date(merge_next) }}</a>.
+      Its start is within 15 minutes of this recording's end.</p>
+    {% if merge_conflict %}
+    <p>Both trips have annotations. Clear the purpose, note and destination on one trip and save before merging.</p>
+    {% else %}
+    <form method="post" action="{{ url_for('merge_trip', ym=t.ym, trip_id=t.id, year=year or '') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="next_trip" value="{{ merge_next.trip_key }}">
+      <p>Save any annotation edits before merging. The saved annotation is kept;
+        each original annotation is preserved for Undo.</p>
+      <button class="btn" type="submit">Merge with next trip</button>
+    </form>
+    {% endif %}
+    {% else %}
+    <p class="muted">No eligible next trip. Both recordings need a known device and start time,
+      with the next start no more than 15 minutes after this recording ends.</p>
+    {% endif %}
+  </section>
+
   <form class="annotate" method="post"
         action="{{ url_for('annotate', ym=t.ym, trip_id=t.id, year=year or '') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -1218,7 +1270,7 @@ TRIP_HTML = """
     async: true,
     // Mileage maps need paths only. The GPX plugin renders waypoint
     // name/description as popup HTML, so never parse uploaded waypoints.
-    gpx_options: { parseElements: ['track', 'route'] },
+    gpx_options: { parseElements: ['track', 'route'], joinTrackSegments: false },
     marker_options: { startIconUrl: '', endIconUrl: '', shadowUrl: '' },
     polyline_options: { color: '#d9480f', weight: 4, opacity: 0.85 }
   }).on('loaded', function (e) {
@@ -1430,26 +1482,22 @@ def index():
 @app.route("/trip/<ym>/<trip_id>")
 def trip_view(ym, trip_id):
     year = selected_year()
-    gpx_path, json_path = _safe_trip_paths(ym, trip_id)
-    if not json_path.exists() and not gpx_path.exists():
-        abort(404)
-    summary, problem = read_summary(json_path)
-    if problem:
+    _safe_trip_paths(ym, trip_id)
+    trips, unreadable = load_trips()
+    key = f"{ym}/{trip_id}"
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        key = trip_merges.canonical_key(conn, key)
+    t = next((t for t in trips if t["trip_key"] == key or key in t.get("parts", [])), None)
+    if t is None:
+        problem = next((u["problem"] for u in unreadable if u["trip_key"] == key), "the file is missing")
         abort(404, description=(
             f"This trip's summary file can't be read ({problem}), so its "
             "miles can't be counted. The trip list and exports flag it. To "
             "rebuild it from the GPX, see DEPLOY_DEBIAN.md → Troubleshooting."
         ))
-    ann = get_annotations().get(f"{ym}/{trip_id}", {})
-    t = {
-        **summary,
-        "id": trip_id,
-        "ym": ym,
-        "category": ann.get("category", ""),
-        "purpose_note": ann.get("purpose_note", ""),
-        "destination": ann.get("destination", ""),
-        "has_gpx": gpx_path.exists(),
-    }
+    if t["trip_key"] != f"{ym}/{trip_id}":
+        return redirect(url_for("trip_view", ym=t["ym"], trip_id=t["id"], year=year or ""))
+    merge_next = trip_merges.next_trip(t, trips, unreadable)
     places = {}
     if GEOCODER.enabled:
         endpoints = track_endpoints(t)
@@ -1459,20 +1507,20 @@ def trip_view(ym, trip_id):
                     endpoints[f"{endpoint}_latitude"], endpoints[f"{endpoint}_longitude"]
                 )
     return render_template_string(TRIP_HTML, t=t, categories=CATEGORIES, year=year,
-                                  geocoder_enabled=GEOCODER.enabled, places=places)
+                                  geocoder_enabled=GEOCODER.enabled, places=places, merge_next=merge_next,
+                                  merge_conflict=bool(merge_next and trip_merges.annotated(t) and trip_merges.annotated(merge_next)))
 
 
 @app.route("/trip/<ym>/<trip_id>/lookup-place", methods=["POST"])
 def lookup_place(ym, trip_id):
     # Coordinates and provider are always server-selected. This is not an
     # arbitrary geocoding proxy, even for an authenticated browser.
-    gpx_path, _ = _safe_trip_paths(ym, trip_id)
-    if not gpx_path.exists():
-        abort(404)
+    _safe_trip_paths(ym, trip_id)
+    t = resolved_trip(ym, trip_id)
     endpoint = request.form.get("endpoint", "")
     if endpoint not in ("start", "end"):
         return jsonify(error="Choose the start or end endpoint."), 400
-    endpoints = track_endpoints({"ym": ym, "id": trip_id})
+    endpoints = track_endpoints(t)
     if f"{endpoint}_latitude" not in endpoints:
         return jsonify(error="This recording has no valid endpoint to look up."), 422
     try:
@@ -1485,6 +1533,13 @@ def lookup_place(ym, trip_id):
 @app.route("/gpx/<ym>/<trip_id>")
 def trip_gpx(ym, trip_id):
     gpx_path, _ = _safe_trip_paths(ym, trip_id)
+    t = resolved_trip(ym, trip_id, allow_original=True)
+    if t and t.get("parts"):
+        try:
+            raw = trip_merges.combined_gpx(DATA_ROOT, t["parts"])
+        except (OSError, ValueError):
+            abort(404, description="Merged track unavailable.")
+        return send_file(io.BytesIO(raw), mimetype="application/gpx+xml", download_name=t["id"] + ".gpx")
     if not gpx_path.exists():
         abort(404)
     return send_file(gpx_path, mimetype="application/gpx+xml")
@@ -1493,16 +1548,108 @@ def trip_gpx(ym, trip_id):
 @app.route("/trip/<ym>/<trip_id>/annotate", methods=["POST"])
 def annotate(ym, trip_id):
     year = selected_year()
-    _, json_path = _safe_trip_paths(ym, trip_id)
-    if not json_path.exists():
-        abort(404)
+    _safe_trip_paths(ym, trip_id)
     category = request.form.get("category", "").strip()
     if category not in CATEGORIES:
-        category = ""  # allow clearing the tag
+        category = ""
     note = request.form.get("purpose_note", "").strip()
     destination = request.form.get("destination", "").strip()
-    upsert_annotation(f"{ym}/{trip_id}", category, note, destination)
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        key = f"{ym}/{trip_id}"
+        canonical = trip_merges.canonical_key(conn, key)
+        if canonical != key:
+            abort(409, description="This part has been merged. Reopen the merged trip before editing.")
+        merged = conn.execute("SELECT 1 FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
+        if merged:
+            conn.execute("""UPDATE trip_merges SET category=?, purpose_note=?, destination=?, updated_at=?
+                            WHERE trip_key=?""",
+                         (category, note, destination, datetime.now(timezone.utc).isoformat(), key))
+        else:
+            if not (DATA_ROOT / (key + ".json")).exists():
+                abort(404)
+            conn.execute("""INSERT INTO annotations (trip_key, category, purpose_note, destination, updated_at)
+                VALUES (?, ?, ?, ?, ?) ON CONFLICT(trip_key) DO UPDATE SET
+                category=excluded.category, purpose_note=excluded.purpose_note,
+                destination=excluded.destination, updated_at=excluded.updated_at""",
+                         (key, category, note, destination, datetime.now(timezone.utc).isoformat()))
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
+
+
+def resolved_trip(ym, trip_id, allow_original=False):
+    key = f"{ym}/{trip_id}"
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        key = trip_merges.canonical_key(conn, key)
+    trips, _ = load_trips()
+    t = next((t for t in trips if t["trip_key"] == key or key in t.get("parts", [])), None)
+    if t is None and not allow_original:
+        abort(404)
+    return t
+
+
+@app.route("/trip/<ym>/<trip_id>/merge", methods=["POST"])
+def merge_trip(ym, trip_id):
+    year = selected_year()
+    _safe_trip_paths(ym, trip_id)
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        trips, unreadable = load_trips(conn)
+        current = next((t for t in trips if t["trip_key"] == f"{ym}/{trip_id}"), None)
+        if current is None:
+            abort(409, description="Trip changed or is unavailable. Reopen the trip list.")
+        following = trip_merges.next_trip(current, trips, unreadable)
+        if following is None or request.form.get("next_trip") != following["trip_key"]:
+            abort(409, description="Only the next trip from the same device within 15 minutes can be merged. Reopen this trip.")
+        if not current["has_gpx"] or not following["has_gpx"]:
+            abort(409, description="Both recordings are required to merge.")
+        if trip_merges.annotated(current) and trip_merges.annotated(following):
+            abort(409, description="Both trips have annotations. Clear one annotation before merging; original annotations are restored by Undo.")
+        keys = current.get("parts", [current["trip_key"]]) + following.get("parts", [following["trip_key"]])
+        try:
+            stamp = trip_merges.fingerprint(DATA_ROOT, keys)
+            summary = trip_merges.combined_summary(DATA_ROOT, keys)
+            if trip_merges.fingerprint(DATA_ROOT, keys) != stamp:
+                raise ValueError("Source changed")
+        except (OSError, ValueError):
+            abort(409, description="A recording is unavailable or changed. Reopen this trip.")
+        key = f"{current['ym']}/merge-{secrets.token_hex(12)}"
+        annotation = current if trip_merges.annotated(current) else following
+        for old in (current, following):
+            conn.execute("UPDATE trip_merge_aliases SET merge_key=? WHERE merge_key=?", (key, old["trip_key"]))
+            if old.get("parts"):
+                conn.execute("INSERT INTO trip_merge_aliases (alias_key, merge_key) VALUES (?, ?)",
+                             (old["trip_key"], key))
+            conn.execute("DELETE FROM trip_merge_parts WHERE merge_key=?", (old["trip_key"],))
+            conn.execute("DELETE FROM trip_merges WHERE trip_key=?", (old["trip_key"],))
+        conn.execute("""INSERT INTO trip_merges
+            (trip_key, summary, fingerprint, category, purpose_note, destination, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                     (key, json.dumps(summary), stamp, *(annotation.get(f, "") for f in trip_merges.ANNOTATION_FIELDS),
+                      datetime.now(timezone.utc).isoformat()))
+        conn.executemany("INSERT INTO trip_merge_parts (part_key, merge_key, position) VALUES (?, ?, ?)",
+                         [(part, key, index) for index, part in enumerate(keys)])
+    ym, trip_id = key.split("/")
+    return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
+
+
+@app.route("/trip/<ym>/<trip_id>/split", methods=["POST"])
+def split_trip(ym, trip_id):
+    year = selected_year()
+    _safe_trip_paths(ym, trip_id)
+    if request.form.get("confirm") != "yes":
+        abort(400, description="Confirm restoring original annotations and removing the merged annotation.")
+    key = f"{ym}/{trip_id}"
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        keys = trip_merges.parts(conn, key)
+        if not keys:
+            abort(409, description="This merge no longer exists. Reopen the trip list.")
+        conn.execute("DELETE FROM trip_merge_aliases WHERE merge_key=?", (key,))
+        conn.execute("DELETE FROM trip_merge_parts WHERE merge_key=?", (key,))
+        conn.execute("DELETE FROM trip_merges WHERE trip_key=?", (key,))
+    first_ym, first_id = keys[0].split("/")
+    return redirect(url_for("trip_view", ym=first_ym, trip_id=first_id, year=year or ""))
 
 
 # ---------------------------------------------------------------------
@@ -1542,6 +1689,13 @@ def track_endpoints(trip):
     waypoints. Invalid or absent tracks yield blanks rather than invented
     coordinates. These are recorded endpoints, not reverse-geocoded places.
     """
+    if trip.get("parts"):
+        start_ym, start_id = trip["parts"][0].split("/")
+        end_ym, end_id = trip["parts"][-1].split("/")
+        first = track_endpoints({"ym": start_ym, "id": start_id})
+        last = track_endpoints({"ym": end_ym, "id": end_id})
+        return {**{k: v for k, v in first.items() if k.startswith("start_")},
+                **{k: v for k, v in last.items() if k.startswith("end_")}}
     path, _ = _safe_trip_paths(trip["ym"], trip["id"])
     parser = expat.ParserCreate(namespace_separator="}")
     stack = []

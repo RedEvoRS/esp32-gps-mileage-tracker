@@ -607,6 +607,37 @@ annotation persists. Then hit **Export CSV** and **Export XLSX** and confirm
 both download with the annotation joined in. Finally click **Log out** and
 confirm you're bounced back to the login page.
 
+If a long stop split a drive, open **Map / Edit** on the earlier trip, save
+any edits, then use **Merge with next trip**. Only the next trip from the
+same device is eligible, and it must start within 15 minutes of the previous
+recording's final timestamp (`recorded_until`). Older summaries fall back to
+`end_time` (last movement), never upload time. Both GPX files and reliable
+start/device information are required; repair unreadable summaries first.
+You can repeat the action to build a chain. The merged trip replaces its parts
+in the list, map, CSV/XLSX exports and totals. Old part links lead to it. Map
+breaks show the unrecorded gaps; shared ingest rules recompute mileage using
+straight-line gap estimates and the existing movement/fix filters. Duration
+includes the intervening stop. Display and year selection still use `DISPLAY_TZ`.
+
+One saved annotation is kept. If both trips have annotations, the viewer blocks
+merging until you clear and save the purpose, note and destination of one trip;
+copy any text you want to retain first. **Undo merge (split back)**, after its
+confirmation checkbox, restores all original recordings and their annotations
+as saved at merge time. It removes edits to the merged annotation. A chain
+splits all the way back to its original recordings.
+
+The viewer keeps `./data` read-only. Merges, original-part membership, link
+aliases and cached summaries live in three additive tables in the existing
+`viewer-db` volume's `annotations.db`; startup migration serializes concurrent
+workers and retains existing rows. The normal database backup/restore includes
+these tables. Back up both the database and trip files, since trip files alone
+cannot restore merges. Cached summaries keep list views fast and refresh when
+source GPX/JSON file stamps or the shared rule version change. Missing or
+unreadable sources flag a merge as unreadable and exclude it from totals; the
+list warning still offers Undo. All merge/Undo changes use authenticated,
+CSRF-protected POSTs. See [Merge recordings from one drive](server/README.md#merge-recordings-from-one-drive)
+for the annotation and timing details.
+
 > Deliberately fail the password five times and you'll be locked out of that
 > browser's IP for 15 minutes — including with the *correct* password. If you
 > trip this during setup, clear it with:
@@ -872,7 +903,8 @@ Back up these files and databases:
 
 - **Trip files** in `~/mileage-tracker/data`, the raw GPX and its summary.
   The GPX cannot be regenerated; a summary can be rebuilt from its GPX.
-- **The annotations database** (business/personal, purpose, destination)
+- **The annotations database** (business/personal, purpose, destination,
+  merges and cached merged summaries)
   in the `viewer-db` Docker volume. It's easy to forget, and it's the
   record the IRS cares about. It can't be rebuilt from the trips.
 - **The diagnostics database** at `data/diagnostics/events.db`, containing

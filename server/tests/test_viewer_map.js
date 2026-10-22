@@ -51,7 +51,11 @@ const waypoint = {
     return [];
   },
 };
-const track = { getElementsByTagNameNS: () => [] };
+const segments = [{}, {}];
+const track = {
+  getElementsByTagNameNS: () => [],
+  getElementsByTagName: name => name === 'trkseg' ? segments : [],
+};
 const xml = {
   getElementsByTagName: name => {
     if (name === 'wpt') return [waypoint];
@@ -76,7 +80,9 @@ L.GPX.prototype._parse_segment = function(line, options, style, tag) {
 vm.runInContext(inlineMap, context);
 
 assert.equal(popups.length, 0, 'uploaded waypoint markup must never reach popup HTML');
-assert.deepEqual(geometry, ['trkpt'], 'the mileage track must still be rendered');
+assert.deepEqual(geometry, ['trkpt', 'trkpt'], 'both track segments must be rendered');
+assert.equal(activeOptions.gpx_options.joinTrackSegments, false,
+  'unrecorded gaps between merged parts must remain visible');
 assert.equal(activeLayer.get_name(), hostileName, 'metadata remains inert text');
 assert.equal(activeLayer.get_desc(), hostileDescription);
 
