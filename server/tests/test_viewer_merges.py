@@ -163,6 +163,18 @@ class ViewerMerges(unittest.TestCase):
         self.assertEqual(by_key[b]["destination"], "Test destination")
         self.assertEqual(original, {p.name: p.read_bytes() for p in self.month.iterdir()})
 
+    def test_new_merge_stores_the_source_fingerprint_so_the_next_load_reuses_it(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        with closing(sqlite3.connect(self.db)) as conn:
+            fingerprint, updated_at = conn.execute(
+                "SELECT fingerprint, updated_at FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
+        self.assertEqual(fingerprint, self.viewer.trip_merges.fingerprint(self.data, [a, b]))
+        self.assertNotEqual(fingerprint, updated_at)
+        with patch.object(self.viewer.trip_merges, "combined_summary", side_effect=AssertionError("rebuilt")):
+            self.assertEqual(self.client.get("/").status_code, 200)
+            self.assertEqual(len(self.viewer.load_trips()[0]), 1)
+
     def test_chain_and_old_merged_link_then_split_to_all_originals(self):
         a, b, c = self.trip("a", 0), self.trip("b", 120, .001), self.trip("c", 240, .002)
         self.annotate(a, "business", "Original A")

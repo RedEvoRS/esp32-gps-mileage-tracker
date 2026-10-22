@@ -2645,12 +2645,14 @@ def merge_trip(ym, trip_id):
                              (old["trip_key"], key))
             conn.execute("DELETE FROM trip_merge_parts WHERE merge_key=?", (old["trip_key"],))
             conn.execute("DELETE FROM trip_merges WHERE trip_key=?", (old["trip_key"],))
-        stamp = trip_log.now_utc()
+        # `stamp` is the source fingerprint apply_merges compares on every list
+        # load; the time of the merge needs its own name or the row looks stale.
+        merged_at = trip_log.now_utc()
         conn.execute("""INSERT INTO trip_merges
             (trip_key, summary, fingerprint, category, purpose_note, destination, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)""",
                      (key, json.dumps(summary), stamp, *(annotation.get(f, "") for f in trip_merges.ANNOTATION_FIELDS),
-                      stamp))
+                      merged_at))
         conn.executemany("INSERT INTO trip_merge_parts (part_key, merge_key, position) VALUES (?, ?, ?)",
                          [(part, key, index) for index, part in enumerate(keys)])
         trip_log.record(conn, key, "merge", {
