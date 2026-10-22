@@ -80,6 +80,26 @@ class ViewerMerges(unittest.TestCase):
     def split(self, key):
         return self.client.post(f"/trip/{key}/split", data={"csrf_token": "test-csrf", "confirm": "yes"})
 
+    def damage_summary(self, key, **fields):
+        path = self.data / (key + ".json")
+        summary = json.loads(path.read_text(encoding="utf-8"))
+        summary.update(distance_miles="damaged", **fields)
+        path.write_text(json.dumps(summary), encoding="utf-8")
+
+    def assert_export_sources(self, row_type, sheet, trip_id, files):
+        rows = list(csv.DictReader(io.StringIO(self.client.get("/export.csv").data.decode())))
+        row = next(r for r in rows if r["row_type"] == row_type)
+        self.assertEqual(row["trip_id"], trip_id)
+        self.assertEqual(row["gpx_file"], files)
+        book = load_workbook(io.BytesIO(self.client.get("/export.xlsx").data))
+        try:
+            headers, values = list(book[sheet].values)[:2]
+            row = dict(zip(headers, values))
+            self.assertEqual(row["trip_id"], trip_id)
+            self.assertEqual(row["gpx_file"], files)
+        finally:
+            book.close()
+
     def test_merge_recomputes_summary_map_exports_totals_cache_and_undo(self):
         a = self.trip("a", 0)
         b = self.trip("b", 180, .01)
@@ -102,6 +122,8 @@ class ViewerMerges(unittest.TestCase):
         self.assertEqual(t["start_time"], self.base.isoformat())
         self.assertEqual(t["end_time"], (self.base + timedelta(seconds=210)).isoformat())
         self.assertEqual(t["purpose_note"], "Test purpose")
+        self.assertEqual(t["trip_id"], "a")
+        self.assertEqual(t["gpx_file"], f"{a}.gpx; {b}.gpx")
         for old in (a, b):
             r = self.client.get(f"/trip/{old}")
             self.assertEqual(r.status_code, 302)
@@ -109,6 +131,11 @@ class ViewerMerges(unittest.TestCase):
             self.assertEqual(self.annotate(old, note="stale edit").status_code, 409)
         page = self.client.get(f"/trip/{key}").get_data(as_text=True)
         self.assertIn("Merged from 2 recordings", page)
+        self.assertIn("<title>Trip a</title>", page)
+        self.assertIn(f"{a}.gpx; {b}.gpx", page)
+        self.assertIn(f"{a}.gpx; {b}.gpx", self.client.get("/").get_data(as_text=True))
+        self.assertNotIn(key + ".gpx", page)
+        self.assert_export_sources("trip", "Mileage", "a", f"{a}.gpx; {b}.gpx")
         self.assertIn("joinTrackSegments: false", page)
         raw = self.client.get(f"/gpx/{key}").data
         self.assertEqual(len(ET.fromstring(raw).findall("./trk/trkseg")), 2)
@@ -157,6 +184,23 @@ class ViewerMerges(unittest.TestCase):
         self.assertEqual(self.viewer.load_trips()[0][0]["parts"], [a, b, c])
         self.assertIn(abc, self.client.get(f"/trip/{bc}").headers["Location"])
         self.assertEqual(self.split(abc).status_code, 302)
+
+    def test_chained_export_sources_keep_order_across_months(self):
+        self.base = datetime(2026, 4, 30, 23, 58, tzinfo=timezone.utc)
+        a, b, c = self.trip("a", 0), self.trip("b", 120), self.trip("c", 240)
+        next_month = self.data / "2026-05"
+        next_month.mkdir()
+        for key in (b, c):
+            for suffix in (".gpx", ".json"):
+                path = self.data / (key + suffix)
+                path.rename(next_month / path.name)
+        b, c = "2026-05/b", "2026-05/c"
+        ab = self.merged_key(self.merge(a, b))
+        abc = self.merged_key(self.merge(ab, c))
+        files = f"{a}.gpx; {b}.gpx; {c}.gpx"
+        self.assert_export_sources("trip", "Mileage", "a", files)
+        self.assertIn(files, self.client.get(f"/trip/{abc}").get_data(as_text=True))
+        self.assertIn(files, self.client.get("/").get_data(as_text=True))
 
     def test_annotations_conflict_requires_clearing_every_field(self):
         a, b = self.trip("a", 0), self.trip("b", 120, .001)
@@ -208,6 +252,85 @@ class ViewerMerges(unittest.TestCase):
         path.write_text("[]", encoding="utf-8")
         with self.assertLogs(self.viewer.app.logger, "WARNING"):
             self.assertEqual(self.merge(a, b).status_code, 409)
+            page = self.client.get(f"/trip/{a}").get_data(as_text=True)
+        self.assertIn("an unreadable summary has an unknown device", page)
+        self.assertNotIn("No eligible next trip", page)
+
+    def test_damaged_summary_from_another_device_does_not_block(self):
+        a, b = self.trip("a", 0), self.trip("b", 120)
+        damaged = self.trip("damaged", 90, device="other-device")
+        self.damage_summary(damaged)
+        with self.assertLogs(self.viewer.app.logger, "WARNING"):
+            page = self.client.get(f"/trip/{a}").get_data(as_text=True)
+            self.assertIn(">Merge with next trip</button>", page)
+            self.assertEqual(self.merge(a, b).status_code, 302)
+
+    def test_same_device_damaged_summary_outside_window_does_not_block(self):
+        a, b = self.trip("a", 0), self.trip("b", 120)
+        for name, seconds in (("before", -3600), ("after", 3600)):
+            self.damage_summary(self.trip(name, seconds))
+        with self.assertLogs(self.viewer.app.logger, "WARNING"):
+            page = self.client.get(f"/trip/{a}").get_data(as_text=True)
+            self.assertIn(">Merge with next trip</button>", page)
+            self.assertEqual(self.merge(a, b).status_code, 302)
+
+    def test_same_device_damaged_summary_in_window_explains_block(self):
+        a, b = self.trip("a", 0), self.trip("b", 120)
+        # Include overlap and equal starts: none proves the damaged trip is
+        # outside the chronological interval even if it starts before A ends.
+        for seconds in (0, 30, 90, 120):
+            with self.subTest(seconds=seconds):
+                self.damage_summary(self.trip("damaged", seconds))
+                with self.assertLogs(self.viewer.app.logger, "WARNING"):
+                    page = self.client.get(f"/trip/{a}").get_data(as_text=True)
+                    response = self.merge(a, b)
+                reason = "an unreadable summary from this device may fall between these recordings"
+                self.assertIn(reason, page)
+                self.assertNotIn("No eligible next trip", page)
+                self.assertNotIn(">Merge with next trip</button>", page)
+                self.assertEqual(response.status_code, 409)
+                self.assertIn(reason, response.get_data(as_text=True))
+
+    def test_damaged_summary_timestamp_id_bounds_adjacency_across_months(self):
+        a, b = self.trip("a", 0), self.trip("b", 120)
+        old = self.trip("2026-03-14T12-00-00Z", -31 * 86400)
+        self.damage_summary(old, start_time=None)
+        prior_month = self.data / "2026-03"
+        prior_month.mkdir()
+        for suffix in (".gpx", ".json"):
+            path = self.data / (old + suffix)
+            path.rename(prior_month / path.name)
+        with self.assertLogs(self.viewer.app.logger, "WARNING"):
+            page = self.client.get(f"/trip/{a}").get_data(as_text=True)
+        self.assertIn(">Merge with next trip</button>", page)
+        damaged = self.trip("2026-04-14T12-01-30Z", 90)
+        self.damage_summary(damaged, start_time="invalid")
+        with self.assertLogs(self.viewer.app.logger, "WARNING"):
+            response = self.merge(a, b)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("may fall between these recordings", response.get_data(as_text=True))
+
+    def test_same_device_damaged_summary_with_unusable_timing_blocks(self):
+        a, b = self.trip("a", 0), self.trip("b", 120)
+        for name in ("legacy-id", "2026-02-30T12-00-00Z"):
+            key = self.trip(name, 3600)
+            self.damage_summary(key, start_time=None)
+            with self.subTest(name=name), self.assertLogs(self.viewer.app.logger, "WARNING"):
+                response = self.merge(a, b)
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("may fall between these recordings", response.get_data(as_text=True))
+            (self.data / (key + ".json")).unlink()
+            (self.data / (key + ".gpx")).unlink()
+
+    def test_unidentified_damaged_device_blocks_even_with_old_timestamp(self):
+        a, b = self.trip("a", 0), self.trip("b", 120)
+        for device in (None, "", "unknown", {"invalid": "device"}):
+            key = self.trip("2026-03-14T12-00-00Z", -31 * 86400)
+            self.damage_summary(key, device_id=device)
+            with self.subTest(device=device), self.assertLogs(self.viewer.app.logger, "WARNING"):
+                response = self.merge(a, b)
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("unknown device", response.get_data(as_text=True))
 
     def test_malformed_tracks_are_refused_without_hiding_originals(self):
         a, b = self.trip("a", 0), self.trip("b", 120, .001)
@@ -241,7 +364,11 @@ class ViewerMerges(unittest.TestCase):
         trips, unreadable = self.viewer.load_trips()
         self.assertEqual(trips, [])
         self.assertEqual([t["trip_key"] for t in unreadable], [key])
-        self.assertIn("Undo merge (split back)", self.client.get("/").get_data(as_text=True))
+        page = self.client.get("/").get_data(as_text=True)
+        self.assertIn("Undo merge (split back)", page)
+        self.assertIn(f"{a}.gpx; {b}.gpx", page)
+        self.assertNotIn(key + ".gpx", page)
+        self.assert_export_sources("unreadable", "Unreadable trips", "a", f"{a}.gpx; {b}.gpx")
         self.assertEqual(self.split(key).status_code, 302)
 
     def test_old_schema_migrates_concurrently_preserving_rows(self):

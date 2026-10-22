@@ -4,7 +4,7 @@ import json
 import re
 import xml.etree.ElementTree as ET
 from xml.parsers import expat
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from common.trip_summary import parse_gpx, summarize, SUMMARY_VERSION, _parse_iso
 
@@ -113,6 +113,7 @@ def apply_merges(conn, data_root, trips, unreadable):
     """
     rows = conn.execute("SELECT * FROM trip_merges").fetchall()
     originals = {t["trip_key"]: t for t in trips}
+    identities = {t["trip_key"]: t for t in trips + unreadable}
     hidden = set()
     merged, broken = [], []
     for row in rows:
@@ -123,6 +124,11 @@ def apply_merges(conn, data_root, trips, unreadable):
         ym, trip_id = key.split("/")
         t = {"ym": ym, "id": trip_id, "trip_key": key, "parts": keys,
              "has_gpx": True, **{f: row[f] or "" for f in ANNOTATION_FIELDS}}
+        if keys:
+            first = identities.get(keys[0], {})
+            t.update(trip_id=first.get("trip_id") or keys[0].split("/")[1],
+                     gpx_file="; ".join(k + ".gpx" for k in keys),
+                     device_id=first.get("device_id"), start_time=first.get("start_time"))
         try:
             if not keys or any(k not in originals for k in keys):
                 raise ValueError("A merge part's summary is unavailable")
@@ -135,8 +141,7 @@ def apply_merges(conn, data_root, trips, unreadable):
                              (json.dumps(summary), stamp, key))
             else:
                 summary = json.loads(row["summary"])
-            t = {**summary, **t, "trip_id": trip_id,
-                 "device_id": originals[keys[0]].get("device_id"), "gpx_file": key + ".gpx"}
+            t = {**summary, **t, "start_time": summary.get("start_time")}
             merged.append(t)
         except (OSError, ValueError):
             broken.append({**t, "problem": "A merge part is missing or unreadable; restore it or undo the merge."})
@@ -144,32 +149,62 @@ def apply_merges(conn, data_root, trips, unreadable):
             [t for t in unreadable if t["trip_key"] not in hidden] + broken)
 
 
-def next_trip(trip, trips, unreadable):
-    """Only the chronological next visible trip for a known device is eligible.
+def _known_device(value):
+    return isinstance(value, str) and value.strip().lower() not in ("", "unknown")
 
-    Unknown timing for that device (or any unreadable summary with unknown
-    identity) prevents proving adjacency, so it conservatively blocks merging.
+
+def _unreadable_start(trip):
+    start = _parse_iso(trip.get("start_time"))
+    if start:
+        return start
+    # Firmware timestamp IDs are UTC. Month buckets and upload times cannot
+    # establish chronology. Legacy/non-timestamp IDs give no timing evidence.
+    key = trip.get("parts", [trip["trip_key"]])[0]
+    trip_id = key.split("/")[-1]
+    if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}Z", trip_id):
+        try:
+            return datetime.strptime(trip_id, "%Y-%m-%dT%H-%M-%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return None
+
+
+def next_trip(trip, trips, unreadable):
+    """Return (eligible next trip, blocking reason) for a known device.
+
+    Damage blocks adjacency only for an unidentified device or a same-device
+    trip whose start could fall between this trip and the next visible one.
     """
     device = trip.get("device_id")
     # Ingest uses the literal "unknown" when neither header nor GPX creator
     # identifies a device; two such recordings do not establish one device.
-    if not device or device.strip().lower() == "unknown" or unreadable:
-        return None
+    if not _known_device(device):
+        return None, ""
     same = [t for t in trips if t.get("device_id") == device]
     if any(not _parse_iso(t.get("start_time")) for t in same):
-        return None
+        return None, ""
     same.sort(key=lambda t: (_parse_iso(t["start_time"]), t["trip_key"]))
     index = next(i for i, t in enumerate(same) if t["trip_key"] == trip["trip_key"])
     if index + 1 == len(same):
-        return None
+        return None, ""
     candidate = same[index + 1]
     # Legacy summaries predate recorded_until. end_time is the best available
     # boundary; never substitute the upload time, which can be days later.
     end = _parse_iso(trip.get("recorded_until")) or _parse_iso(trip.get("end_time"))
     start = _parse_iso(candidate.get("start_time"))
     if end and timedelta(0) <= start - end <= MERGE_MAX_GAP:
-        return candidate
-    return None
+        current_start = _parse_iso(trip["start_time"])
+        for damaged in unreadable:
+            damaged_device = damaged.get("device_id")
+            if not _known_device(damaged_device):
+                return None, "Cannot establish the next trip: an unreadable summary has an unknown device. Repair the summary before merging."
+            if damaged_device != device:
+                continue
+            damaged_start = _unreadable_start(damaged)
+            if damaged_start is None or current_start <= damaged_start <= start:
+                return None, "Cannot establish the next trip: an unreadable summary from this device may fall between these recordings. Repair the summary before merging."
+        return candidate, ""
+    return None, ""
 
 
 def annotated(trip):

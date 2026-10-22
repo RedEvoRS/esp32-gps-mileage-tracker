@@ -499,10 +499,17 @@ The limit is the named `MERGE_MAX_GAP` constant in `trip_merges.py`. Older
 summaries without that timestamp use `end_time`, the last moving point, as
 a conservative fallback. Upload/receipt times are never used. Overlapping
 recordings, unknown device identities or unknown start times cannot be merged.
-An unreadable summary blocks merging until repaired because its device and
-position in the sequence cannot be established safely.
+An unreadable summary blocks merging when its device is unknown, or when it
+belongs to this device and could fall between these recordings. Usable start
+times or UTC timestamp trip IDs can rule out damage outside that interval;
+damage known to belong to another device does not block the action. The trip
+page explains when a damaged summary prevents establishing the next trip.
 
 The merged trip replaces its parts in the list, map, both exports and totals.
+For traceability, exported `trip_id` remains the first recording's trip ID;
+`gpx_file` lists every original relative GPX filename in order, joined with
+`; `. The list and trip page show those source filenames too. The merged URL
+is a viewer record key, not a file in the data directory.
 You can merge it with the next trip again to join a longer chain. Old trip
 page links lead to the current merged trip. The map draws every part with a
 visible break at unrecorded gaps. Mileage is recomputed over all points with

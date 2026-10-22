@@ -612,9 +612,14 @@ any edits, then use **Merge with next trip**. Only the next trip from the
 same device is eligible, and it must start within 15 minutes of the previous
 recording's final timestamp (`recorded_until`). Older summaries fall back to
 `end_time` (last movement), never upload time. Both GPX files and reliable
-start/device information are required; repair unreadable summaries first.
+start/device information are required. An unreadable summary blocks merging
+only if its device is unknown or it could be an intervening trip from this
+device; repair that summary first. The trip page explains this block.
 You can repeat the action to build a chain. The merged trip replaces its parts
-in the list, map, CSV/XLSX exports and totals. Old part links lead to it. Map
+in the list, map, CSV/XLSX exports and totals. Old part links lead to it.
+Export records remain traceable: `trip_id` is the first source trip ID and
+`gpx_file` lists all original relative GPX filenames in order, separated by
+`; `. Source filenames also appear on the list and trip page. Map
 breaks show the unrecorded gaps; shared ingest rules recompute mileage using
 straight-line gap estimates and the existing movement/fix filters. Duration
 includes the intervening stop. Display and year selection still use `DISPLAY_TZ`.

@@ -488,12 +488,13 @@ def _summary_problem(summary):
 
 
 def read_summary(json_path):
-    """Load a trip's summary JSON: (summary, None), or (None, why not).
+    """Load a summary: (summary, problem), retaining identity on rejected JSON.
 
     Ingest writes summaries atomically, so a bad one means disk damage or
     a hand edit. One bad file must not 500 the trip list and both exports,
     so callers leave its miles out and report the trip as unreadable.
     """
+    summary = None
     try:
         with open(json_path, "r", encoding="utf-8") as fh:
             summary = json.load(fh)
@@ -505,7 +506,11 @@ def read_summary(json_path):
         problem = _summary_problem(summary)
     if problem:
         app.logger.warning("Unreadable trip summary %s: %s", json_path, problem)
-        return None, problem
+        # Preserve only usable adjacency evidence, never rejected mileage or
+        # other summary values. Non-object/unparseable JSON has no identity.
+        identity = {field: summary[field] for field in ("device_id", "start_time")
+                    if isinstance(summary, dict) and isinstance(summary.get(field), str)}
+        return identity or None, problem
     return {
         field: summary[field]
         for field in SUMMARY_TEXT_FIELDS + SUMMARY_NUMBER_FIELDS
@@ -530,7 +535,7 @@ def _load_trips(conn):
     and each dict carries the summary fields plus: id, ym, trip_key,
     category, purpose_note, destination, has_gpx. unreadable holds the
     trips whose summary read_summary() rejected or couldn't find, sorted
-    by trip_key, with the same keys minus the summary fields, plus
+    by trip_key, retaining usable device/start identity but no mileage, plus
     problem. Their miles are unknown, so they're reported, never counted.
     """
     annotations = {r["trip_key"]: dict(r) for r in conn.execute("SELECT * FROM annotations")}
@@ -1078,7 +1083,7 @@ LIST_HTML = """
     summary from its GPX, see DEPLOY_DEBIAN.md → Troubleshooting.
     <ul>
       {% for u in unreadable %}
-      <li><code>{{ u.trip_key }}{% if not u.get('parts') %}.json{% endif %}</code>{% if not u.has_gpx %} (no GPX either){% endif %}: {{ u.problem }}
+      <li><code>{% if u.get('parts') %}{{ u.gpx_file }}{% else %}{{ u.trip_key }}.json{% endif %}</code>{% if not u.has_gpx %} (no GPX either){% endif %}: {{ u.problem }}
         {% if u.get('parts') %}
         <form method="post" action="{{ url_for('split_trip', ym=u.ym, trip_id=u.id, year=year or '') }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -1117,7 +1122,7 @@ LIST_HTML = """
         <th>Purpose</th><th>Destination</th><th>Note</th><th></th></tr>
     {% for t in trips %}
     <tr>
-      <td>{{ fmt_trip_date(t) }}{% if t.get('timing_status') == 'partial' %}<br><span class="muted">Partial timing</span>{% endif %}</td>
+      <td>{{ fmt_trip_date(t) }}{% if t.get('timing_status') == 'partial' %}<br><span class="muted">Partial timing</span>{% endif %}{% if t.get('parts') %}<br><code>{{ t.gpx_file }}</code>{% endif %}</td>
       <td>{{ "%.2f"|format(t.distance_miles or 0) }} mi</td>
       <td>{{ fmt_duration(t.duration_seconds) }}</td>
       <td>{{ fmt_speed(t.get('avg_speed_mph')) }}</td>
@@ -1135,7 +1140,7 @@ LIST_HTML = """
 """
 
 TRIP_HTML = """
-<!doctype html><html><head><meta charset="utf-8"><title>Trip {{ t.id }}</title>
+<!doctype html><html><head><meta charset="utf-8"><title>Trip {{ t.get('trip_id') or t.id }}</title>
 """ + THEME_HEAD + """
 <link rel="stylesheet" href="{{ url_for('static', filename='leaflet.css') }}">
 <style>""" + BASE_CSS + """</style></head><body>
@@ -1204,6 +1209,7 @@ TRIP_HTML = """
     {% if t.get('parts') %}
     <p>Merged from {{ t.parts|length }} recordings. Track breaks show unrecorded gaps;
       mileage bridges gaps using the same straight-line estimate as ingest.</p>
+    <p>Source GPX files: <code>{{ t.gpx_file }}</code></p>
     <form method="post" action="{{ url_for('split_trip', ym=t.ym, trip_id=t.id, year=year or '') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <p><label><input type="checkbox" name="confirm" value="yes" required>
@@ -1225,6 +1231,8 @@ TRIP_HTML = """
       <button class="btn" type="submit">Merge with next trip</button>
     </form>
     {% endif %}
+    {% elif merge_block_reason %}
+    <p class="warn" role="alert">{{ merge_block_reason }}</p>
     {% else %}
     <p class="muted">No eligible next trip. Both recordings need a known device and start time,
       with the next start no more than 15 minutes after this recording ends.</p>
@@ -1497,7 +1505,7 @@ def trip_view(ym, trip_id):
         ))
     if t["trip_key"] != f"{ym}/{trip_id}":
         return redirect(url_for("trip_view", ym=t["ym"], trip_id=t["id"], year=year or ""))
-    merge_next = trip_merges.next_trip(t, trips, unreadable)
+    merge_next, merge_block_reason = trip_merges.next_trip(t, trips, unreadable)
     places = {}
     if GEOCODER.enabled:
         endpoints = track_endpoints(t)
@@ -1508,6 +1516,7 @@ def trip_view(ym, trip_id):
                 )
     return render_template_string(TRIP_HTML, t=t, categories=CATEGORIES, year=year,
                                   geocoder_enabled=GEOCODER.enabled, places=places, merge_next=merge_next,
+                                  merge_block_reason=merge_block_reason,
                                   merge_conflict=bool(merge_next and trip_merges.annotated(t) and trip_merges.annotated(merge_next)))
 
 
@@ -1598,7 +1607,9 @@ def merge_trip(ym, trip_id):
         current = next((t for t in trips if t["trip_key"] == f"{ym}/{trip_id}"), None)
         if current is None:
             abort(409, description="Trip changed or is unavailable. Reopen the trip list.")
-        following = trip_merges.next_trip(current, trips, unreadable)
+        following, block_reason = trip_merges.next_trip(current, trips, unreadable)
+        if block_reason:
+            abort(409, description=block_reason)
         if following is None or request.form.get("next_trip") != following["trip_key"]:
             abort(409, description="Only the next trip from the same device within 15 minutes can be merged. Reopen this trip.")
         if not current["has_gpx"] or not following["has_gpx"]:
@@ -1769,8 +1780,8 @@ def _unreadable_values(t):
     unknown, so they stay blank rather than reading as zero.
     """
     return {
-        "trip_id": t["id"],
-        "gpx_file": f"{t['id']}.gpx" if t["has_gpx"] else "",
+        "trip_id": t.get("trip_id") or t["id"],
+        "gpx_file": t.get("gpx_file") or (f"{t['id']}.gpx" if t["has_gpx"] else ""),
         "category": t["category"],
         "purpose_note": t["purpose_note"],
         "destination": t["destination"],
