@@ -1,0 +1,80 @@
+# Throwaway stack for live_test.py: the real ingest and monitor images plus
+# Prometheus, Loki and Grafana. Everything is fake and bound to 127.0.0.1.
+# live_test.py writes prometheus.yml and the token file into LIVE_TEST_DIR.
+name: grafana-live-test
+
+services:
+  ingest:
+    build:
+      context: ../..
+      dockerfile: mileage-ingest/Dockerfile
+    environment:
+      INGEST_AUTH_TOKEN: live-test-ingest-token
+      DISPLAY_TZ: UTC
+    volumes:
+      - data:/data
+    ports:
+      - "127.0.0.1:18090:8090"
+
+  monitor:
+    build:
+      context: ../..
+      dockerfile: mileage-monitor/Dockerfile
+    environment:
+      MONITOR_ENABLED: "true"
+      # About 60 s, so the E7001 silence condition and the no-contact rule fire.
+      MONITOR_STALE_DAYS: "0.0007"
+      NOTIFY_ENABLED: "true"
+      NTFY_URL: http://fake-ntfy:8000/live-test
+      NTFY_TOKEN: live-test-ntfy-token
+      NOTIFY_HOLD_SECONDS: "0"
+      METRICS_ENABLED: "true"
+      METRICS_TOKEN: live-test-metrics-token-0123456789abcdef
+      LOKI_PUSH_URL: http://loki:3100/loki/api/v1/push
+    volumes:
+      - data:/data:ro
+      - monitor-state:/state
+    ports:
+      - "127.0.0.1:18093:8093"
+    depends_on: [ingest, loki, fake-ntfy]
+
+  # Accepts the monitor's ntfy POSTs so alert_decision lines are produced.
+  fake-ntfy:
+    image: python:3.12-slim
+    command:
+      - python
+      - -c
+      - |
+        import http.server as h
+        class H(h.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+        h.HTTPServer(("", 8000), H).serve_forever()
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    volumes:
+      - ${LIVE_TEST_DIR}/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ${LIVE_TEST_DIR}/mileage-tracker-token:/etc/prometheus/secrets/mileage-tracker-token:ro
+      - ../alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+    ports:
+      - "127.0.0.1:19090:9090"
+    depends_on: [monitor]
+
+  loki:
+    image: ${LOKI_IMAGE:-grafana/loki:3.7.9}
+    ports:
+      - "127.0.0.1:13100:3100"
+
+  grafana:
+    image: grafana/grafana:13.2.4
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: live-test-admin
+    ports:
+      - "127.0.0.1:13000:3000"
+    depends_on: [prometheus, loki]
+
+volumes:
+  data:
+  monitor-state:
