@@ -2415,6 +2415,20 @@ Viewing and exporting still work.</p>
 </table></div>
 </section>
 
+<section aria-labelledby="undated-heading">
+<h2 id="undated-heading">Undated trips ({{ undated|length }}, {{ "%.3f"|format(undated_miles) }} mi)</h2>
+<p class="muted">Trips with no usable start time (the GPS clock wasn't set, or the stored time can't be shown in
+{{ timezone }}). They count in no year: not in the totals above, not in this year's exports and not in the
+close, so a closed year doesn't lock them. They appear under "All years". Open each to categorize it or, as admin, remove it
+before you file.</p>
+<div class="review-table"><table>
+<thead><tr><th>Trip</th><th>Distance</th><th>Category</th></tr></thead>
+<tbody>{% for t in undated %}<tr><td><a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{{ t.trip_key }}</a></td>
+<td>{{ "%.2f"|format(t.distance_miles or 0) }} mi</td><td>{{ t.category or "—" }}</td></tr>
+{% else %}<tr><td colspan="3" class="muted">Every trip has a date.</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+
 <section aria-labelledby="uncategorized-heading">
 <h2 id="uncategorized-heading">Trips with no category ({{ uncategorized|length }})</h2>
 <div class="review-table"><table>
@@ -2559,8 +2573,12 @@ def admin_year(year):
             if missing:
                 incomplete.append({"trip": t, "missing": missing})
     removed = sorted(gone + gone_unreadable, key=lambda t: t["removal"]["removed_at"], reverse=True)
+    # No year owns these, so every year's review lists the same ones. They
+    # still count only under "All years"; this just stops them going unseen.
+    undated = [t for t in trips if "removal" not in t and _trip_local_year(t) is None]
     return render_template_string(
         YEAR_HTML, year=year, closed=closed, totals=totals, counts=counts, edits=edits,
+        undated=undated, undated_miles=sum(t.get("distance_miles") or 0 for t in undated),
         uncategorized=[t for t in members if t.get("category") not in CATEGORIES],
         incomplete=incomplete, unreadable=broken, removed=removed, timezone=DISPLAY_TZ_NAME,
         year_end=f"{year + 1}-01-01 00:00",

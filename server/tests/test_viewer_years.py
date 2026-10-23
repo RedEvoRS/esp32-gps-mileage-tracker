@@ -464,6 +464,35 @@ class YearReviewTests(YearTestBase):
             self.assertEqual(shown, exported[year])
         self.assertIn('href="/trip/2027-01/broken-jan?year=2026"', pages[2026])
 
+    def test_undated_trips_are_listed_with_count_and_miles_but_stay_out_of_every_year(self):
+        self.annotated_trip("dated", "2026-03-01T12:00:00Z", "business", 0.923)
+        undated = self.add_trip("clockless", "2026-03-02T12:00:00Z", miles=2.787,
+                                start_time=None, end_time=None, timing_status="untimed")
+        removed = self.add_trip("clockless-gone", "2026-03-03T12:00:00Z", miles=5,
+                                start_time=None, end_time=None, timing_status="untimed")
+        self.assertEqual(self.post(f"/trip/{removed}/remove", reason="test").status_code, 302)
+        for year in (2025, 2026):
+            with self.subTest(year=year):
+                page = self.review(year)
+                section = self.section(page, "undated")
+                self.assertIn("Undated trips (1, 2.787 mi)", section)
+                self.assertIn(f'href="/trip/{undated}?year={year}"', section)
+                self.assertNotIn("clockless-gone", section)
+        # The year rule itself is unchanged: totals and exports leave them out.
+        self.assertEqual(self.csv_rows("?year=2026")[-1]["distance_miles"], "0.923")
+        self.assertEqual([r["trip_id"] for r in self.csv_rows("?year=2026") if r["row_type"] == "trip"], ["dated"])
+        all_years = [r for r in self.csv_rows() if r["row_type"] == "trip"]
+        self.assertEqual({r["trip_id"] for r in all_years}, {"dated", "clockless"})
+        self.close_year(2026)
+        self.assertEqual(self.annotate(undated, category="business").status_code, 302)
+        self.assertIn("Undated trips (1, 2.787 mi)", self.section(self.review(2026), "undated"))
+
+    def test_review_without_undated_trips_says_so(self):
+        self.annotated_trip("dated", "2026-03-01T12:00:00Z", "business", 1)
+        section = self.section(self.review(2026), "undated")
+        self.assertIn("Undated trips (0, 0.000 mi)", section)
+        self.assertIn("Every trip has a date.", section)
+
     def test_removed_trips_with_reason_actor_and_time(self):
         key = self.add_trip("gone", "2026-03-01T12:00:00Z")
         other_year = self.add_trip("old", "2025-03-01T12:00:00Z")
