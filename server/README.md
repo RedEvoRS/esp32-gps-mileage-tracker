@@ -448,7 +448,12 @@ What it does:
 - **Annotate** — tag each trip business / personal / other and add a
   note (e.g. "Client visit — Acme Corp") and destination / place. Annotations are stored in a
   SQLite database in a separate `viewer-db` volume, kept apart from the
-  immutable trip files.
+  immutable trip files. A note or destination can hold up to 2,000
+  characters, and the viewer refuses (and says why) one that contains a
+  control character a spreadsheet can't store, which a paste from another
+  program sometimes brings along. The XLSX export drops such a character from
+  an older value and marks any value too long for one spreadsheet cell with
+  `[TRUNCATED: ...]`; the CSV keeps the full text.
 - **Export** — "Export CSV" / "Export XLSX" use the selected year and
   include annotations, recorded start/end latitude and longitude, and totals.
 - **Device health** — open `/device-health` from the navigation after login.
@@ -473,7 +478,8 @@ use `timed_from`, the first recorded timestamp in `DISPLAY_TZ`, so their miles
 remain in year totals and exports. The date is labeled **Timed from** and
 `year_basis` exports `first_recorded_time`. Their actual start may be in an
 earlier year, which the viewer states explicitly. Wholly undated trips appear
-only under All years. Direct exports
+only under All years; the admin year review lists them (count, miles and links) so
+they can be dealt with before closing a year. Direct exports
 accept `?year=2026`; omit `year` for all years. Empty years export headers
 and zero totals. Totals cover the recorded trips in the selection, not an
 odometer measurement of all vehicle use or a determination of deductibility.
@@ -502,9 +508,10 @@ summary from its GPX.
 The admin-only `/admin/year/<YYYY>` page is linked from the trip list after
 selecting a year, or from the year list on `/admin`, which shows whether each
 year is open or closed. The review page brings together that year's category
-totals (calculated the same way as exports), trips without a category, business
-trips missing a purpose note or destination, unreadable trips, removed trips
-and their reasons, and edits made after the year ended. It also shows that
+totals (calculated the same way as exports), undated trips (which count in no
+year), trips inside a merged trip (see below), trips without a category,
+business trips missing a purpose note or destination, unreadable trips, removed
+trips and their reasons, and edits made after the year ended. It also shows that
 year's own close and reopen history. The review includes edits made at or
 after local January 1 of the following year.
 
@@ -596,8 +603,19 @@ choose which to retain by clearing **all three fields** on the other trip
 and saving it first. Copy any text you want to retain before clearing it.
 **Undo merge (split back)** restores every original trip and the annotations
 saved on those trips when they were merged. Confirm the checkbox first:
-annotation edits made to the merged trip are removed by Undo. Undo of a chain
-restores all original recordings, rather than just its most recent pair.
+annotation edits made to the merged trip are removed by Undo. The change
+history records what was dropped (the merged trip's purpose, destination and
+note) and what each original trip got back. Undo of a chain restores all
+original recordings, rather than just its most recent pair.
+
+A merge draws a straight line across the gap between its recordings, so that
+stretch is already counted. If another recording from the same device, from
+inside that gap, is uploaded after the merge (the tracker was away from home
+when it was driven), the viewer would count the drive twice. The trip list
+marks such a trip **Inside a merged trip**, and the admin year review lists
+them in "Trips inside a merged trip". Totals and exports are not changed for
+you: open the merged trip and undo the merge (then merge the three recordings
+in order), or, as admin, remove the later recording.
 
 An admin removes a merged trip as a whole; an original part cannot be removed
 on its own. Undo merge is refused while the merged trip is removed from the
@@ -613,7 +631,10 @@ annotations. The original annotation rows remain intact. Back up this database
 alongside the trip files: losing it also loses merges.
 
 The cached summary is refreshed only when a part's GPX/JSON size or modification
-time changes, or the shared summary-rule version changes. Ordinary list views
+time changes. A change to the shared summary rules (`SUMMARY_VERSION`) does not
+rebuild it by itself, the same as the plain trips' stored summaries, which keep the
+rules of the day they were written; otherwise one release would total merged
+trips under new rules and everything else under old ones. Ordinary list views
 read the cache without parsing every merged track. Both images ship the shared
 rules in `common/trip_summary.py` through the default-deny Docker build context.
 If a source disappears or becomes unreadable, the merged trip is flagged as
@@ -831,9 +852,11 @@ There is no default zone. `install.sh` asks for one and writes it to
 
 `docker-compose.yml` passes that one value to **both** services. The viewer
 uses it to render times; the ingest service uses it to decide which
-`data/YYYY-MM/` folder a trip is filed under. Because both read the same
-line, a trip near a month boundary can't sit in one folder while
-displaying a date in another. `install.sh --check` confirms both running
+`data/YYYY-MM/` folder a trip is filed under. A trip is filed under the
+local month in which the drive **ends**, but dated and counted by its local
+**start** (see "Years are based on trip start" in the viewer section), so a
+drive that starts on December 31 and ends after midnight sits in the January
+folder and shows as December 31. `install.sh --check` confirms both running
 containers have the value `.env` holds.
 
 Use a named IANA zone (`America/Denver`, `Europe/London`), never a fixed
@@ -844,7 +867,16 @@ rather than guessing a zone or quietly falling back to UTC.
 
 After changing it, run `docker compose up -d` (a plain restart keeps the
 old value). Trips already filed stay in the month folder they were filed
-under; only the displayed and exported times change.
+under, but the zone decides more than how times read:
+
+- Displayed and exported times change.
+- **Which year a trip belongs to follows `DISPLAY_TZ` too.** A trip's year is
+  its local start date, worked out on every page load, so after a zone change
+  the trips near New Year can move to the neighbouring year. That includes a
+  year you already closed: its totals and exports change, and nothing records
+  that they did. Pick the right zone before you close a year, and if you must
+  change it afterwards, compare the closed year's exported totals before and
+  after.
 
 The containers' `TZ`, which only affects log timestamps, follows
 `DISPLAY_TZ` too (UTC if it's unset).
@@ -857,6 +889,12 @@ to the internet: the session cookie and the ingest token both travel over
 plain HTTP, so anyone able to observe the traffic can replay them. The
 login is defence in depth against other devices and people on your
 network, not a substitute for TLS.
+
+Every viewer response (login and error pages, static files and exports too)
+carries `Content-Security-Policy: frame-ancestors 'none'`, `X-Frame-Options: DENY`
+and `X-Content-Type-Options: nosniff`, so another web page on the same host
+or home domain can't show a viewer page in a frame and steer the admin's clicks
+onto its buttons. A reverse proxy must not remove these headers.
 
 If you ever do put a TLS reverse proxy in front, set
 `SESSION_COOKIE_SECURE=True` in `mileage-viewer/app.py`.
