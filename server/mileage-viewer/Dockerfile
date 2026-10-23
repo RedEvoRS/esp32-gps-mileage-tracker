@@ -27,6 +27,8 @@ EXPOSE 8091
 CMD ["gunicorn", \
      "--bind", "0.0.0.0:8091", \
      "--workers", "2", \
+     "--worker-class", "gthread", \
+     "--threads", "4", \
      "--access-logfile", "-", \
      "--error-logfile", "-", \
      "app:app"]
