@@ -45,7 +45,11 @@ newest_snapshot_with_trips() {
     while read -r name; do
         [[ -n $name ]] || continue
         [[ -n $newest ]] || newest=$name
-        info=$(rsync_remote -q "$REMOTE/snapshots/$name/INFO" "$scratch/INFO" > /dev/null 2>&1 \
+        # Fresh file each time: rsync skips a copy whose size and modification
+        # time match the previous INFO, and INFO files of neighbouring
+        # snapshots often do. The ssh must not eat the rest of the name list.
+        rm -f "$scratch/INFO"
+        info=$(rsync_remote -q "$REMOTE/snapshots/$name/INFO" "$scratch/INFO" < /dev/null > /dev/null 2>&1 \
             && cat "$scratch/INFO" || true)
         trips=$(sed -n 's/^trips=//p' <<< "$info")
         if [[ $trips != 0 ]]; then
