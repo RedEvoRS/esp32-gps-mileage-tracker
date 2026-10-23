@@ -58,6 +58,8 @@ import sqlite3
 import sys
 import json
 import math
+import unicodedata
+from urllib.parse import unquote, urlsplit
 from xml.parsers import expat
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -524,12 +526,42 @@ def _valid_csrf():
 def _safe_next(target):
     """Only allow same-site relative redirects after login.
 
-    Rejects absolute URLs and protocol-relative '//evil.com' so the login
-    form can't be used as an open redirect.
+    Rejects absolute URLs, protocol-relative '//evil.com', backslashes and
+    control characters (raw or percent-encoded). Werkzeug builds the Location
+    header with urlsplit(), which silently drops tabs and newlines, so
+    a tab after the first slash would otherwise become '//evil.com'. The result is
+    parsed the same way and must be a plain path with no scheme or host.
     """
-    if not target or not target.startswith("/") or target.startswith("//"):
+    if not target:
+        return None
+    for text in (target, unquote(target)):
+        if "\\" in text or any(unicodedata.category(c) == "Cc" or (c.isspace() and c != " ") for c in text):
+            return None
+    if not target.startswith("/") or target.startswith("//"):
+        return None
+    parts = urlsplit(target)
+    if parts.scheme or parts.netloc or not parts.path.startswith("/") or parts.path.startswith("//"):
         return None
     return target
+
+
+@app.after_request
+def _security_headers(response):
+    """Refuse framing (clickjacking) and content sniffing on every response.
+
+    A page from the same site (another app on this host, or the same home
+    domain) would otherwise be able to frame a viewer page under the admin's
+    session cookie and steer their clicks onto its real forms. An existing
+    Content-Security-Policy is kept: frame-ancestors is merged into it.
+    """
+    policy = response.headers.get("Content-Security-Policy", "")
+    directives = [d.strip() for d in policy.split(";")
+                  if d.strip() and d.strip().split()[0].lower() != "frame-ancestors"]
+    directives.append("frame-ancestors 'none'")
+    response.headers["Content-Security-Policy"] = "; ".join(directives)
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 @app.before_request
