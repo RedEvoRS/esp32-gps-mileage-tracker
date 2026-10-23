@@ -1261,6 +1261,18 @@ def year_members(trips, unreadable, year):
             [t for t in unreadable if _may_start_in(t["ym"], year)])
 
 
+def _flag_trips_inside_merges(trips):
+    """Give each trip a live merged trip already covers an "inside_merge" entry.
+
+    The list and the year review show it so the double count can be undone.
+    The totals and exports are not changed: which trips count is the
+    admin's call (undo the merge, or remove the later recording).
+    """
+    by_key = {t["trip_key"]: t for t in trips}
+    for key, cover in trip_merges.trips_inside_merges(trips).items():
+        by_key[key]["inside_merge"] = {"ym": cover["ym"], "id": cover["id"], "trip_key": cover["trip_key"]}
+
+
 def selected_trips(include_history=False):
     """Use local start year, or first recorded time for partly timed trips.
 
@@ -1269,6 +1281,7 @@ def selected_trips(include_history=False):
     """
     year = selected_year()
     trips, unreadable = load_trips()
+    _flag_trips_inside_merges(trips)
     years = {y for y in map(_trip_local_year, trips) if y}
     selected = trips
     if year:
@@ -1738,7 +1751,7 @@ LIST_HTML = """
         <th>Purpose</th><th>Destination</th><th>Note</th><th></th></tr>
     {% for t in trips %}
     <tr>
-      <td>{{ fmt_trip_date(t) }}{% if t.get('timing_status') == 'partial' %}<br><span class="muted">Partial timing</span>{% endif %}{% if t.get('parts') %}<br><code>{{ t.gpx_file }}</code>{% endif %}</td>
+      <td>{{ fmt_trip_date(t) }}{% if t.get('timing_status') == 'partial' %}<br><span class="muted">Partial timing</span>{% endif %}{% if t.get('inside_merge') %}<br><span class="tag other">Inside a merged trip</span> <a href="{{ url_for('trip_view', ym=t.inside_merge.ym, trip_id=t.inside_merge.id, year=year or '') }}">counted twice: undo that merge</a>{% endif %}{% if t.get('parts') %}<br><code>{{ t.gpx_file }}</code>{% endif %}</td>
       <td>{{ "%.2f"|format(t.distance_miles or 0) }} mi</td>
       <td>{{ fmt_duration(t.duration_seconds) }}</td>
       <td>{{ fmt_speed(t.get('avg_speed_mph')) }}</td>
@@ -2444,6 +2457,20 @@ before you file.</p>
 </table></div>
 </section>
 
+<section aria-labelledby="inside-merge-heading">
+<h2 id="inside-merge-heading">Trips inside a merged trip ({{ inside_merge|length }})</h2>
+<p class="muted">A merge joins its recordings with a straight line across the gap, so a recording from inside that
+gap that was uploaded after the merge is counted a second time. Open the merged trip and undo the merge
+(or, as admin, remove the later recording) so the drive is counted once.</p>
+<div class="review-table"><table>
+<thead><tr><th>Trip</th><th>Distance</th><th>Merged trip that covers it</th></tr></thead>
+<tbody>{% for item in inside_merge %}<tr><td>{{ trip_link(item.trip) }}</td>
+<td>{{ "%.2f"|format(item.trip.distance_miles or 0) }} mi</td>
+<td><a href="{{ url_for('trip_view', ym=item.merge.ym, trip_id=item.merge.id, year=year) }}">{{ item.merge.trip_key }}</a></td></tr>
+{% else %}<tr><td colspan="3" class="muted">No trip is covered by a merge.</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+
 <section aria-labelledby="uncategorized-heading">
 <h2 id="uncategorized-heading">Trips with no category ({{ uncategorized|length }})</h2>
 <div class="review-table"><table>
@@ -2591,9 +2618,11 @@ def admin_year(year):
     # No year owns these, so every year's review lists the same ones. They
     # still count only under "All years"; this just stops them going unseen.
     undated = [t for t in trips if "removal" not in t and _trip_local_year(t) is None]
+    covered = trip_merges.trips_inside_merges(live)
+    inside_merge = [{"trip": t, "merge": covered[t["trip_key"]]} for t in members if t["trip_key"] in covered]
     return render_template_string(
         YEAR_HTML, year=year, closed=closed, totals=totals, counts=counts, edits=edits,
-        undated=undated, undated_miles=sum(t.get("distance_miles") or 0 for t in undated),
+        inside_merge=inside_merge, undated=undated, undated_miles=sum(t.get("distance_miles") or 0 for t in undated),
         uncategorized=[t for t in members if t.get("category") not in CATEGORIES],
         incomplete=incomplete, unreadable=broken, removed=removed, timezone=DISPLAY_TZ_NAME,
         year_end=f"{year + 1}-01-01 00:00",

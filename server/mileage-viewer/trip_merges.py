@@ -247,5 +247,32 @@ def covering_merge(removed_trip, trips):
     return None
 
 
+def trips_inside_merges(trips):
+    """{trip_key: merged trip} for each unmerged trip a live merged trip already covers.
+
+    The merge joined its parts with a straight line across any gap, so a
+    same-device recording from inside that gap that was uploaded after the
+    merge is counted a second time. Same overlap rule as covering_merge(),
+    but each span is worked out once: this runs on every list page, and it
+    reads only the stored summaries, never a GPX file.
+    """
+    merged = [(t, recorded_span(t)) for t in trips if t.get("parts") and not t.get("removal")]
+    merged = [(t, span) for t, span in merged if span]
+    inside = {}
+    if not merged:
+        return inside
+    for trip in trips:
+        if trip.get("parts"):
+            continue
+        span = recorded_span(trip)
+        if span is None:
+            continue
+        for cover, other in merged:
+            if cover.get("device_id") == trip.get("device_id") and other[0] <= span[1] and span[0] <= other[1]:
+                inside[trip["trip_key"]] = cover
+                break
+    return inside
+
+
 def annotated(trip):
     return any(trip.get(f) for f in ANNOTATION_FIELDS)

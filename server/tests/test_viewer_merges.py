@@ -80,6 +80,35 @@ class ViewerMerges(unittest.TestCase):
     def split(self, key):
         return self.client.post(f"/trip/{key}/split", data={"csrf_token": "test-csrf", "confirm": "yes"})
 
+    def test_trip_uploaded_after_its_neighbours_were_merged_is_flagged_not_silent(self):
+        first, last = self.trip("a", 0), self.trip("c", 200)
+        merged = self.merged_key(self.merge(first, last))
+        self.assertEqual(self.client.get("/?year=2026").get_data(as_text=True).count("Inside a merged trip"), 0)
+        late = self.trip("b", 90)  # recorded between the two, uploaded after the merge
+        other_device = self.trip("other", 90, offset=.01, device="another-device")
+        after = self.trip("after", 5000)  # a separate drive later
+        page = self.client.get("/?year=2026").get_data(as_text=True)
+        self.assertEqual(page.count("Inside a merged trip"), 1)
+        self.assertIn(f'href="/trip/{merged}?year=2026"', page)
+        self.assertIn("counted twice: undo that merge", page)
+        # Only the overlapping same-device recording is flagged.
+        trips, _ = self.viewer.load_trips()
+        flagged = {t["trip_key"]: t for t in trips}
+        self.viewer._flag_trips_inside_merges(trips)
+        self.assertEqual({t["trip_key"] for t in trips if t.get("inside_merge")}, {late})
+        self.assertNotIn("inside_merge", flagged[other_device])
+        self.assertNotIn("inside_merge", flagged[after])
+        # The year review lists it too, with a pointer to the merged trip.
+        review = self.client.get("/admin/year/2026").get_data(as_text=True)
+        section = review[review.index('id="inside-merge-heading"'):]
+        section = section[:section.index("</section>")]
+        self.assertIn("Trips inside a merged trip (1)", section)
+        self.assertIn(f'href="/trip/{merged}?year=2026"', section)
+        # Undoing the merge clears the flag.
+        self.assertEqual(self.split(merged).status_code, 302)
+        self.assertNotIn("Inside a merged trip", self.client.get("/?year=2026").get_data(as_text=True))
+        self.assertIn("Trips inside a merged trip (0)", self.client.get("/admin/year/2026").get_data(as_text=True))
+
     def damage_summary(self, key, **fields):
         path = self.data / (key + ".json")
         summary = json.loads(path.read_text(encoding="utf-8"))
