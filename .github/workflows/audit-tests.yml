@@ -347,17 +347,20 @@ jobs:
       - name: Two --checks at once delete only their own test trips
         # Each run uploads under its own test ID and deletes only that
         # (#43). A trip under the old fixed ID, in the same month folder,
-        # has to come through byte for byte.
+        # has to come through byte for byte. Both trips are untimed: ingest
+        # ignores X-Trip-Id for a timed GPX, and files an untimed one under
+        # the current month.
         run: |
           dir=$(dirname "$INSTALLER")
           token=$(sudo sed -n 's/^INGEST_AUTH_TOKEN=//p' "$dir/.env" | tail -n 1)
-          sed 's/Test drive/Not the test drive/' "$dir/sample.gpx" > other.gpx
-          curl -fsS -H @<(printf 'Authorization: Bearer %s\n' "$token") \
+          sed -e 's/Test drive/Not the test drive/' -e 's#<time>[^<]*</time>##g' \
+            "$dir/sample.gpx" > other.gpx
+          stored=$(curl -fsS -H @<(printf 'Authorization: Bearer %s\n' "$token") \
             -H 'Content-Type: application/gpx+xml' \
             -H 'X-Device-Id: install-check' -H 'X-Trip-Id: install-check' \
-            --data-binary @other.gpx "http://$LAN_ADDR:8090/upload"
-          echo
-          old="$dir/data/2026-04/install-check"
+            --data-binary @other.gpx "http://$LAN_ADDR:8090/upload" | jq -r .stored_as)
+          echo "$stored"
+          old="$dir/data/${stored%.gpx}"
           before=$(sudo sha256sum "$old.gpx" "$old.json")
           pids=()
           for n in 1 2; do

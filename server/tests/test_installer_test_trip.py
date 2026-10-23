@@ -7,6 +7,7 @@ files the way the real one would, then runs upload_test_trip and the
 EXIT cleanup. Needs bash, jq and openssl, so it skips on Windows.
 """
 
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import shutil
@@ -24,7 +25,7 @@ HARNESS = textwrap.dedent("""\
     source <(sed '$d' "$INSTALL")
     MODE=check
     INGEST_URL=http://ingest.invalid
-    env_raw() { printf 'the-token'; }
+    env_raw() { if [[ $2 == DISPLAY_TZ ]]; then printf UTC; else printf 'the-token'; fi; }
     if [[ -n ${FAKE_HEX:-} ]]; then
         openssl() { printf '%s\\n' "$FAKE_HEX"; }
     fi
@@ -32,6 +33,9 @@ HARNESS = textwrap.dedent("""\
     curl() {
         echo upload >> curl.log
         printf '%s\\n' "$@" > curl.args
+        for arg; do
+            if [[ $arg == @/* ]]; then cp "${arg#@}" uploaded.gpx; fi
+        done
         if [[ -n ${FAKE_WRITE:-} ]]; then
             mkdir -p "${FAKE_WRITE%/*}"
             printf '%s' "$FAKE_CONTENT" > "$FAKE_WRITE.gpx"
@@ -48,6 +52,14 @@ HARNESS = textwrap.dedent("""\
                 return 1
             fi
             command rm "$@"
+        }
+    fi
+    # The clock moving into the next month while the request is in flight.
+    if [[ -n ${MONTH_AFTER:-} ]]; then
+        test_month() {
+            # Called in a subshell, so count calls in a file.
+            echo >> month.calls
+            if (( $(wc -l < month.calls) > 1 )); then printf '%s' "$MONTH_AFTER"; else date -u +%Y-%m; fi
         }
     fi
     cd "$WORK"
@@ -83,7 +95,8 @@ class InstallerTestTrip(unittest.TestCase):
         shutil.copy(SAMPLE, self.work / "sample.gpx")
         self.data = self.work / "data"
         self.data.mkdir()
-        self.month = self.data / "2026-04"
+        self.ym = datetime.now(timezone.utc).strftime("%Y-%m")
+        self.month = self.data / self.ym
         self.own = self.month / self.ID
 
     def add_trip(self, name, content):
@@ -97,13 +110,15 @@ class InstallerTestTrip(unittest.TestCase):
                              f"{content}{ext}")
 
     def run_check(self, code, body="", write=None, content="", hex_=HEX,
-                  rm_fails=False, remove=False, status=0, deny_search=False):
+                  rm_fails=False, remove=False, status=0, deny_search=False,
+                  month_after=""):
         env = dict(os.environ, INSTALL=str(INSTALL), WORK=str(self.work),
                    FAKE_HEX=hex_ or "", FAKE_CODE=code, FAKE_BODY=body,
                    FAKE_WRITE=str(write.relative_to(self.work)) if write else "",
                    FAKE_CONTENT=content, FAKE_RM_FAIL="1" if rm_fails else "",
                    REMOVE="1" if remove else "",
-                   DENY_SEARCH="1" if deny_search else "")
+                   DENY_SEARCH="1" if deny_search else "",
+                   MONTH_AFTER=month_after)
         try:
             proc = subprocess.run(["bash", "-c", HARNESS], env=env, text=True,
                                   capture_output=True, timeout=60)
@@ -120,8 +135,8 @@ class InstallerTestTrip(unittest.TestCase):
 
     def accepted(self):
         return ('{"status": "accepted", "trip_id": "%s", '
-                '"stored_as": "2026-04/%s.gpx", "distance_miles": 0.3}'
-                % (self.ID, self.ID))
+                '"stored_as": "%s/%s.gpx", "distance_miles": 0.3}'
+                % (self.ID, self.ym, self.ID))
 
     def test_existing_trip_at_the_test_path_is_not_touched(self):
         self.add_trip(self.ID, "someone else's trip")
@@ -178,10 +193,10 @@ class InstallerTestTrip(unittest.TestCase):
         # Still tracked, so the EXIT cleanup tries again, and when that
         # fails too it says so, says how to fix it, and exits non-zero.
         self.assertEqual(out["REMOVED"], "no", out["output"])
-        self.assertEqual(out["LEFT"], "data/2026-04/" + self.ID)
+        self.assertEqual(out["LEFT"], f"data/{self.ym}/" + self.ID)
         self.assertIn("Permission denied", out["output"])
         self.assertIn("The test trip is still on disk", out["output"])
-        self.assertRegex(out["output"], rf"rm -f \S*/data/2026-04/{self.ID}\.gpx ")
+        self.assertRegex(out["output"], rf"rm -f \S*/data/{self.ym}/{self.ID}\.gpx ")
         self.assertTrue(self.own.with_suffix(".gpx").exists())
 
     @unittest.skipIf(os.name != "nt" and os.geteuid() == 0,
@@ -193,7 +208,7 @@ class InstallerTestTrip(unittest.TestCase):
                              content=SAMPLE.read_text(), deny_search=True,
                              remove=True, status=1)
         self.assertEqual(out["REMOVED"], "no", out["output"])
-        self.assertEqual(out["LEFT"], "data/2026-04/" + self.ID)
+        self.assertEqual(out["LEFT"], f"data/{self.ym}/" + self.ID)
         self.assertIn("Permission denied", out["output"])
         self.assertIn("The test trip is still on disk", out["output"])
         for ext in (".gpx", ".json"):
@@ -211,6 +226,32 @@ class InstallerTestTrip(unittest.TestCase):
         args = (self.work / "curl.args").read_text().splitlines()
         self.assertIn("X-Trip-Id: " + self.ID, args)
         self.assertFalse(any(arg.startswith("X-Device-Id:") for arg in args))
+
+    def test_uploads_an_untimed_copy_so_ingest_uses_the_test_id(self):
+        # Ingest ignores X-Trip-Id for a timed GPX (the ID comes from the
+        # timestamps), so the copy that goes up must carry no times.
+        self.run_check("200", self.accepted())
+        sent = (self.work / "uploaded.gpx").read_text()
+        self.assertNotIn("<time", sent)
+        self.assertIn("<trkpt", sent)
+        self.assertEqual(sent.count("<trkpt"), SAMPLE.read_text().count("<trkpt"))
+        # sample.gpx itself is not changed.
+        self.assertIn("<time>", (self.work / "sample.gpx").read_text())
+
+    def test_untimed_upload_is_filed_in_the_current_display_month_not_april(self):
+        out = self.run_check("200", self.accepted(), write=self.own,
+                             content="x", remove=True)
+        self.assertEqual(out["REMOVED"], "yes", out["output"])
+        self.assertFalse((self.data / "2026-04").exists())
+
+    def test_a_month_turnover_during_the_request_still_finds_the_leftovers(self):
+        # A 5xx after the first file was written under the next month:
+        # cleanup follows it there, and only deletes this run's ID.
+        nxt = self.data / "2099-01"
+        out = self.run_check("500", "{}", write=nxt / self.ID, content="partial",
+                             month_after="2099-01", remove=True)
+        self.assertEqual(out["REMOVED"], "yes", out["output"])
+        self.assertFalse((nxt / (self.ID + ".gpx")).exists())
 
 
 if __name__ == "__main__":

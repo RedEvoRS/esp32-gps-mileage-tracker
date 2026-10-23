@@ -6,10 +6,19 @@
 # rsync-over-SSH target or a mounted share. The directory has to exist,
 # and an SSH target needs rsync installed on the far end and a key the
 # backup user can log in with unattended (DEPLOY_DEBIAN.md Step 10).
+# Backups copy there only if the folder holds a file named
+# .mileage-backup-target, which install.sh writes at setup (or you write
+# once with: bash backup.sh --mark-target). If a share isn't mounted when
+# the timer runs, its empty folder has no such file, so the backup fails
+# instead of quietly filling this machine's own disk.
 REMOTE=backup@nas.lan:/volume1/backups/mileage-tracker
 #REMOTE=/mnt/backup-share/mileage-tracker
 
-# Extra ssh options for an SSH REMOTE, e.g. a dedicated key.
+# Extra ssh options for an SSH REMOTE, e.g. a dedicated key. backup.sh adds
+# ServerAliveInterval=30, ServerAliveCountMax=4 and ConnectTimeout=30 unless
+# you set ServerAliveInterval here, so a NAS that vanishes mid-copy ends the
+# run in about two minutes instead of hanging it. (rsync itself gives up
+# after 10 minutes without any data moving.)
 #RSYNC_SSH="ssh -i /home/<user>/.ssh/mileage_backup"
 
 # Local snapshots. Default: ~/mileage-backups of the user the timer runs as.
@@ -23,10 +32,19 @@ REMOTE=backup@nas.lan:/volume1/backups/mileage-tracker
 KEEP_RECENT=14
 KEEP_MONTHLY=84
 
-# yes = prune the off-host copy the same way. Default no: this script
-# never prunes old remote snapshots. Protection from a compromised server
-# needs retention/snapshots enforced on the backup host or a restricted
-# account; ordinary write access can still delete or overwrite history.
+# yes = after each copy, apply the same retention rule (KEEP_RECENT newest,
+# plus the first of each of the newest KEEP_MONTHLY months) to the snapshot
+# names on the off-host copy, and delete the names it drops. It never makes
+# the off-host copy mirror the local folder, so a rebuilt server with few
+# local snapshots doesn't touch the history there. It also stays off, with a
+# warning in the log, while the off-host copy has a snapshot newer than this
+# server's newest, or snapshots the rule would keep but this server lacks
+# (a rebuilt server or a changed BACKUP_DIR); it resumes once this server has
+# them again (the warning shows the rsync command that copies them back), or
+# set this to no. Default no: this script then never prunes old remote
+# snapshots. Protection from a compromised server needs retention/snapshots
+# enforced on the backup host or a restricted account; ordinary write access
+# can still delete or overwrite history.
 REMOTE_PRUNE=no
 
 # Optional URL to GET after each successful backup, for a dead man's

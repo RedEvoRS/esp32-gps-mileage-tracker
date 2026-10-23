@@ -105,8 +105,12 @@ print(name)
 
 # Sets SNAPSHOT_REPORT to the checked container report, or 'missing'.
 # Missing is only allowed for optional DBs (and pre-restore safety copies).
+# With salvage=yes (restore's safety copies), a live file that can't be
+# read as a database (exit 4) is saved raw instead of stopping the
+# restore: SNAPSHOT_REPORT is 'unreadable' and the raw files are in
+# DEST-unreadable/.
 snapshot_db() {
-    local runner=$1 path=$2 dest=$3 optional=$4 status expected actual
+    local runner=$1 path=$2 dest=$3 optional=$4 salvage=${5:-no} status expected actual
     if "$runner" "$PY_SNAPSHOT" "$path" > "$dest" 2> "$dest.log"; then
         SNAPSHOT_REPORT=$(grep -E '^sha256=' "$dest.log" | tail -n 1 || true)
         expected=$(sed -E 's/^sha256=([0-9a-f]+) .*/\1/' <<< "$SNAPSHOT_REPORT")
@@ -121,24 +125,101 @@ snapshot_db() {
             rm "$dest" "$dest.log"
             SNAPSHOT_REPORT=missing
             log "$path: no database yet; skipped"
+        elif [[ $status -eq 4 && $salvage == yes ]]; then
+            rm -f "$dest" "$dest.log"
+            salvage_raw_db "$runner" "$path" "$dest-unreadable"
+            SNAPSHOT_REPORT=unreadable
         else
             die "could not snapshot $path; nothing more was restored or backed up"
         fi
     fi
 }
 
+# Copy a database file that SQLite can't read, and its -wal/-journal/-shm
+# sidecars, byte for byte into a new folder. Nothing else can safely hold
+# what the damaged file still has in it.
+salvage_raw_db() {
+    local runner=$1 path=$2 dir=$3 count
+    mkdir -p "$dir"
+    "$runner" "$PY_RAW_COPY" "$path" | tar -x -f - -C "$dir" --no-same-owner \
+        || die "$path can't be read as a database, and its raw files couldn't be saved either; nothing more was restored"
+    count=$(find "$dir" -type f | wc -l)
+    [[ $count -gt 0 ]] || die "$path can't be read as a database, and no raw file was found to save; nothing more was restored"
+    log "WARNING: the current $path can't be read as a database (it is damaged)."
+    log "WARNING: its raw files ($count) are saved in $dir. The restore replaces it."
+}
+
+# Delete a database file and its sidecars (inside the container's volume)
+# so a restore can write a clean copy: SQLite can't restore over a damaged
+# file, and a leftover journal could be replayed into the new one. Only
+# for a file that salvage_raw_db has already saved.
+remove_raw_db() {
+    local runner=$1 path=$2
+    "$runner" "$PY_REMOVE_DB" "$path" || die "could not clear the damaged $path"
+}
+
+# An unattended backup must not wait forever on a destination that
+# vanished mid-transfer: rsync gives up after 10 minutes without any I/O,
+# and an SSH connection is dropped after about two minutes of silence.
+# These are added to the ssh command from RSYNC_SSH (or plain `ssh`), unless
+# RSYNC_SSH already sets ServerAliveInterval. ssh uses the first value it
+# sees for an option, so options already in RSYNC_SSH win.
+RSYNC_TIMEOUT=600
+SSH_KEEPALIVE="-o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o ConnectTimeout=30"
+
 rsync_remote() {
-    if [[ -n $RSYNC_SSH ]]; then
-        rsync -e "$RSYNC_SSH" "$@"
-    else
-        rsync "$@"
-    fi
+    local ssh_cmd=${RSYNC_SSH:-ssh}
+    [[ $ssh_cmd == *ServerAliveInterval* ]] || ssh_cmd="$ssh_cmd $SSH_KEEPALIVE"
+    rsync --timeout="$RSYNC_TIMEOUT" -e "$ssh_cmd" "$@"
+}
+
+# A file at the top of the destination that says "this is the real backup
+# target". backup.sh refuses to copy without it, so an unmounted share or
+# disk (an empty folder on this machine's own disk) can't be mistaken for
+# the off-host copy. Written by install.sh or `backup.sh --mark-target`.
+TARGET_MARKER=.mileage-backup-target
+
+target_marked() {
+    rsync_remote --list-only "$REMOTE/$TARGET_MARKER" > /dev/null 2>&1
+}
+
+mark_target() {
+    local tmp
+    tmp=$(mktemp)
+    printf 'mileage-tracker backup destination\n' > "$tmp"
+    rsync_remote -t "$tmp" "$REMOTE/$TARGET_MARKER" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
 }
 
 list_snapshots() {
     [[ -d $SNAPSHOTS ]] || return 0
     find "$SNAPSHOTS" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
         | grep -E "$SNAPSHOT_RE" | LC_ALL=C sort || true
+}
+
+# The snapshot names on the off-host copy, oldest first. Fails if the
+# destination can't be listed (unreachable, no snapshots/ folder, timeout).
+list_remote_snapshots() {
+    local listing
+    if ! listing=$(rsync_remote --list-only "$REMOTE/snapshots/" 2> /dev/null); then
+        return 1
+    fi
+    awk '{ print $NF }' <<< "$listing" | grep -E "$SNAPSHOT_RE" | LC_ALL=C sort || true
+}
+
+# Retention for both the local and the off-host snapshots: reads names
+# (oldest first) on stdin and prints the ones to drop. Keeps the newest
+# KEEP_RECENT, plus the first snapshot of each of the newest KEEP_MONTHLY
+# months.
+retention_drops() {
+    awk -v recent="$KEEP_RECENT" -v monthly="$KEEP_MONTHLY" '
+        { name[NR] = $0; month = substr($0, 1, 7)
+          if (!(month in seen)) { seen[month] = 1; firsts[++months] = NR } }
+        END {
+            for (i = NR - recent + 1; i <= NR; i++) if (i >= 1) keep[i] = 1
+            for (j = months - monthly + 1; j <= months; j++) if (j >= 1) keep[firsts[j]] = 1
+            for (i = 1; i <= NR; i++) if (!(i in keep)) print name[i]
+        }'
 }
 
 require_commands() {
@@ -151,7 +232,8 @@ require_commands() {
 # Snapshot the database at argv[1] to stdout using SQLite's online backup
 # API, which is consistent even while the viewer is writing. Checks the
 # copy before sending it and reports its hash on stderr so the caller can
-# confirm nothing was lost on the way out. Exit 3 means no database yet.
+# confirm nothing was lost on the way out. Exit 3 means no database yet;
+# exit 4 means the file exists but isn't a readable database (damaged).
 PY_SNAPSHOT=$(cat <<'PY'
 import hashlib, os, sqlite3, sys, tempfile
 from pathlib import Path
@@ -164,13 +246,25 @@ except FileNotFoundError:
 fd, tmp = tempfile.mkstemp(suffix=".db")
 os.close(fd)
 try:
-    src = sqlite3.connect(Path(src_path).as_uri() + "?mode=ro", uri=True)
-    dst = sqlite3.connect(tmp)
-    src.backup(dst)
-    src.close()
-    check = dst.execute("PRAGMA integrity_check").fetchall()
-    if check != [("ok",)]:
-        sys.exit(f"snapshot failed integrity_check: {check}")
+    try:
+        src = sqlite3.connect(Path(src_path).as_uri() + "?mode=ro", uri=True)
+        dst = sqlite3.connect(tmp)
+        src.backup(dst)
+        src.close()
+        check = dst.execute("PRAGMA integrity_check").fetchall()
+        if check != [("ok",)]:
+            print(f"{src_path} failed integrity_check: {check}", file=sys.stderr)
+            sys.exit(4)
+    except sqlite3.DatabaseError as exc:
+        # Busy, locked and can't-open errors are OperationalError: the file
+        # may be fine, so those stay fatal. Corrupt and not-a-database aren't.
+        # A leftover journal that needs rolling back can't be read-only
+        # ("attempt to write a readonly database"): the file can't be read
+        # as it stands either.
+        if isinstance(exc, sqlite3.OperationalError) and "readonly" not in str(exc):
+            raise
+        print(f"{src_path} can't be read as a database: {exc}", file=sys.stderr)
+        sys.exit(4)
     has_table = dst.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='annotations'"
     ).fetchone()
@@ -191,6 +285,29 @@ finally:
 PY
 )
 
+# Write the database file at argv[1] and any -wal/-journal/-shm sidecars
+# to stdout as a tar stream, without opening them as a database.
+PY_RAW_COPY=$(cat <<'PY'
+import os, sys, tarfile
+path = sys.argv[1]
+with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as tar:
+    for suffix in ("", "-wal", "-journal", "-shm"):
+        if os.path.exists(path + suffix):
+            tar.add(path + suffix, arcname=os.path.basename(path) + suffix, recursive=False)
+PY
+)
+
+# Delete the database file at argv[1] and its -wal/-journal/-shm sidecars.
+PY_REMOVE_DB=$(cat <<'PY'
+import os, sys
+for suffix in ("", "-wal", "-journal", "-shm"):
+    try:
+        os.unlink(sys.argv[1] + suffix)
+    except FileNotFoundError:
+        pass
+PY
+)
+
 # Read a database from stdin, check it, and report what it holds.
 # argv[1] selects annotations/events/monitor. With argv[2], also copy it
 # over that path (the live database) using the backup API, then check it.
@@ -204,6 +321,14 @@ def describe(conn, label):
     if check != [("ok",)]:
         sys.exit(f"{label} failed integrity_check: {check}")
     if kind == "events":
+        # ingest creates the file before its first transaction commits, so a
+        # backup can catch it with no tables: that's "no diagnostics yet".
+        has_events = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+        ).fetchone()
+        if not has_events:
+            print(f"{label}: integrity ok, no diagnostics yet (no events table)")
+            return
         rows = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         print(f"{label}: integrity ok, {rows} events")
         return

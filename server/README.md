@@ -354,15 +354,18 @@ Step 1).
    is in this folder:
 
        TOKEN=$(grep '^INGEST_AUTH_TOKEN=' .env | cut -d= -f2-)
-       curl -X POST "http://$H:8090/upload" \
-         -H "Authorization: Bearer $TOKEN" \
+       printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -X POST "http://$H:8090/upload" \
+         -H @- \
          -H "Content-Type: application/gpx+xml" \
-         -H "X-Trip-Id: 2026-04-14T13-45-22" \
          --data-binary @sample.gpx
 
+   (`-H @-` reads the header from standard input. A token written into curl's
+   arguments can be read by any other account on this server while the command
+   runs.)
+
    You should see a JSON success response with a `distance_miles` value,
-   and find two files at `./data/2026-04/2026-04-14T13-45-22.gpx` and
-   `.../2026-04-14T13-45-22.json`. Delete both afterwards so the test
+   and find two files at `./data/2026-04/2026-04-14T14-30-00Z.gpx` and
+   `.../2026-04-14T14-30-00Z.json`. Delete both afterwards so the test
    trip doesn't end up in your mileage log.
 
    Leave out `X-Device-Id` for this synthetic upload. Adding it registers a
@@ -372,6 +375,44 @@ Step 1).
    The `^INGEST_AUTH_TOKEN=` match above reads only the setting, not
    comments that mention its name. It assumes the unquoted hexadecimal
    token generated in step 3.
+
+   A timed GPX always gets its ID from its earliest point time (or metadata
+   time when no point is timed), in UTC. `X-Trip-Id` is ignored for timed GPX;
+   it can name an untimed upload, except that timestamp-shaped IDs are reserved
+   for timed GPX. Firmware never sends that header: local
+   filenames (`t000001.gpx`, for example) use an NVS counter, while each
+   uploaded size-split piece starts at its own boundary fix. Retries search
+   all month directories under the upload lock and keep the original folder,
+   including after a `DISPLAY_TZ` change. Existing duplicate folders require
+   operator review; ingest returns 409 rather than choosing one.
+   Older third-party timed uploads named with a custom header keep their old
+   names on disk. Review those pairs before re-uploading: the new timestamp ID
+   can create another record. Firmware uploads already use timestamp IDs.
+
+   Ingest rejects GPX document types/entities, unknown XML encodings, timestamps
+   before 2000-01-01 or more than one day after server receipt, and non-finite
+   derived mileage/speeds with 400 before writing trip files. Old backlog since
+   2000 remains valid. GPX creator and the two identity headers are limited to
+   128 characters; diagnostics device labels use the stricter 32-character rule.
+
+   `INGEST_AUTH_TOKEN` must be nonempty, with no whitespace or control characters;
+   invalid settings stop ingest at startup. New data directories are private
+   (0700) and files, including `events.db`, use 0600. The viewer and monitor run
+   as the same UID 1000 and can read these through their read-only data mounts.
+
+   Ingest keeps two Gunicorn sync workers and the 900-second upload timeout:
+   an authenticated 8 MiB piece can take about 839 seconds at 10 kB/s. Rejected
+   bodies are drained only within both the byte cap and a three-second absolute
+   deadline; a slower rejected sender may see a connection reset. The deadline
+   uses POSIX main-thread signals. A threaded or non-POSIX host skips draining
+   non-memory streams. Changing to `gthread` would require a different hard
+   deadline mechanism, even though POSIX upload `flock` locks use separate open
+   descriptions and diagnostics uses request-local SQLite transactions.
+   More sync workers increase capacity and memory use but do not prevent denial
+   of service. Incomplete headers never reach the drain deadline, and slow
+   authenticated bodies still occupy workers. For an untrusted network, configure
+   a reverse proxy with an absolute header deadline and connection limits; keep
+   its authenticated upload allowance long enough for the tracker.
 
 ## Daily Operation
 
@@ -1026,8 +1067,9 @@ a letter/digit. Bodies are capped at 32 KiB even for chunked requests. This
 synthetic empty-event heartbeat returns `{"accepted":[]}` after committing:
 
 ```sh
-curl -X POST 'http://<host>:8090/v1/device-events' \
-  -H 'Authorization: Bearer <token>' \
+TOKEN=$(grep '^INGEST_AUTH_TOKEN=' .env | cut -d= -f2-)
+printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -X POST 'http://<host>:8090/v1/device-events' \
+  -H @- \
   -H 'X-Device-Id: tracker-1' \
   -H 'Content-Type: application/json' \
   --data '{"schema_version":1,"checkin":{"boot_id":"00000000000000000000000000000001","status_sequence":1,"uptime_ms":1500,"active":[]},"events":[]}'
@@ -1038,6 +1080,11 @@ boots; reuse it only for identical retries. Event retries are acknowledged
 again; conflicting event IDs or equal revisions with changed snapshots return
 409 and commit nothing. Validation errors return 400, oversized bodies 413,
 authentication failures 401, and storage/commit failures 5xx without an ack.
+Snapshots more than 1,000,000 above the stored revision (or zero for a new
+device) are discarded without changing current health. Valid events still
+commit and receive a normal 200 acknowledgment so firmware can drain its queue.
+See the explicit [admin recovery command](../DIAGNOSTICS.md#admin-high-water-recovery)
+for a mistaken enrollment or poisoned high-water.
 See [DIAGNOSTICS.md](../DIAGNOSTICS.md) for the full protocol and ordering rules.
 
 `data/diagnostics/events.db` belongs to ingest, alongside trip data. Valid
