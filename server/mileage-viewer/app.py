@@ -2256,6 +2256,14 @@ HISTORY_HTML = """
 """
 
 
+def _annotation_words(values):
+    """A stored annotation in one line for the history page: purpose, destination, note."""
+    values = values if isinstance(values, dict) else {}
+    shown = [str(values[field]) for field in ("category", "destination", "purpose_note")
+             if values.get(field)]
+    return ", ".join(shown) if shown else "none"
+
+
 def _history_summary(row):
     details = row["parsed_details"]
     action = row["action"]
@@ -2270,7 +2278,14 @@ def _history_summary(row):
         source = details.get("annotation_from")
         return f"Merged {merged}; kept annotation from {source}."
     if action == "split":
-        return "Restored original recordings: " + ", ".join(details.get("parts", ())) + "."
+        text = "Restored original recordings: " + ", ".join(details.get("parts", ())) + "."
+        # Older rows carry only the parts.
+        if "dropped" in details:
+            text += f" Dropped the merged annotation: {_annotation_words(details['dropped'])}."
+        if "restored" in details:
+            text += " Restored: " + "; ".join(
+                f"{part}: {_annotation_words(values)}" for part, values in details["restored"].items()) + "."
+        return text
     if action == "remove":
         return "Removed from the log: " + str(details.get("reason", ""))
     if action == "restore":
@@ -2947,10 +2962,20 @@ def split_trip(ym, trip_id):
         if not keys:
             abort(409, description="This merge no longer exists. Reopen the trip list.")
         _abort_if_key_in_closed_year(conn, key)
+        # What the undo throws away and brings back, kept in the history row.
+        merged = conn.execute("SELECT * FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
+        dropped = {field: (merged[field] or "") if merged else ""
+                   for field in trip_merges.ANNOTATION_FIELDS}
+        restored = {part: {field: "" for field in trip_merges.ANNOTATION_FIELDS} for part in keys}
+        for row in conn.execute(
+            f"SELECT * FROM annotations WHERE trip_key IN ({','.join('?' * len(keys))})", keys
+        ):
+            restored[row["trip_key"]] = {field: row[field] or "" for field in trip_merges.ANNOTATION_FIELDS}
         conn.execute("DELETE FROM trip_merge_aliases WHERE merge_key=?", (key,))
         conn.execute("DELETE FROM trip_merge_parts WHERE merge_key=?", (key,))
         conn.execute("DELETE FROM trip_merges WHERE trip_key=?", (key,))
-        trip_log.record(conn, key, "split", {"parts": keys}, actor=g.user, actor_role=g.role)
+        trip_log.record(conn, key, "split", {"parts": keys, "dropped": dropped, "restored": restored},
+                        actor=g.user, actor_role=g.role)
     first_ym, first_id = keys[0].split("/")
     return redirect(url_for("trip_view", ym=first_ym, trip_id=first_id, year=year or ""))
 

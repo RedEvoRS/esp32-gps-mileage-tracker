@@ -219,12 +219,46 @@ class ViewerHistoryTests(unittest.TestCase):
                 "SELECT trip_key, details, actor, actor_role FROM trip_history WHERE action='split'"
             ).fetchone()
         self.assertEqual(row[0], merged_twice)
-        self.assertEqual(json.loads(row[1]), {"parts": [first, second, third]})
+        blank = {"category": "", "purpose_note": "", "destination": ""}
+        self.assertEqual(json.loads(row[1]), {
+            "parts": [first, second, third], "dropped": blank,
+            "restored": {first: blank, second: blank, third: blank}})
         self.assertEqual(row[2:], ("driver", "admin"))
         part_page = self.admin.get(f"/trip/{first}").get_data(as_text=True)
         self.assertIn("Last edited by driver on", part_page)
         split_history = self.admin.get(f"/admin/history?trip={first}").get_data(as_text=True)
         self.assertIn("Undo merge", split_history)
+
+    def test_split_history_records_the_dropped_and_restored_annotations(self):
+        first = self.add_trip("first", 0)
+        second = self.add_trip("second", 120)
+        self.annotate(self.admin, first, "business", "Client visit", "Example Road")
+        merged = self.merge(first, second)
+        self.annotate(self.admin, merged, "personal", "Edited on the merge", "Other Place")
+        self.admin.post(f"/trip/{merged}/split", data={"csrf_token": "test-csrf", "confirm": "yes"})
+        with closing(sqlite3.connect(self.db)) as conn:
+            details = json.loads(conn.execute(
+                "SELECT details FROM trip_history WHERE action='split'").fetchone()[0])
+        self.assertEqual(details["dropped"], {
+            "category": "personal", "purpose_note": "Edited on the merge", "destination": "Other Place"})
+        self.assertEqual(details["restored"][first], {
+            "category": "business", "purpose_note": "Client visit", "destination": "Example Road"})
+        self.assertEqual(details["restored"][second],
+                         {"category": "", "purpose_note": "", "destination": ""})
+        page = self.admin.get(f"/admin/history?trip={first}").get_data(as_text=True)
+        self.assertIn("Dropped the merged annotation: personal, Other Place, Edited on the merge.", page)
+        self.assertIn(f"{first}: business, Example Road, Client visit", page)
+        self.assertIn(f"{second}: none", page)
+
+    def test_split_history_rows_from_before_the_extra_fields_still_render(self):
+        first = self.add_trip("first", 0)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO trip_history (trip_key, actor, actor_role, at, action, details) "
+                         "VALUES (?, 'driver', 'admin', '2026-01-03T12:00:00+00:00', 'split', ?)",
+                         (first, json.dumps({"parts": [first]})))
+        page = self.admin.get(f"/admin/history?trip={first}").get_data(as_text=True)
+        self.assertIn(f"Restored original recordings: {first}.", page)
+        self.assertNotIn("Dropped the merged annotation", page)
 
     def count_history_queries(self, path):
         """Statements that read trip_history, merge tables or annotations during one request."""
