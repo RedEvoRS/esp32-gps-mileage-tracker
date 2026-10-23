@@ -3,6 +3,7 @@
 import math
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from xml.parsers import expat
 
 # Unit conversions, named so the math below reads in plain English.
 METERS_PER_MILE = 1609.344
@@ -20,6 +21,7 @@ MAX_PLAUSIBLE_MPS = 60.0
 # Fixes with a worse horizontal dilution of precision than this are left
 # out of the distance; their neighbours are joined directly instead.
 MAX_HDOP = 5.0
+MAX_UPLOAD_TEXT = 128
 
 
 def _local(tag):
@@ -68,7 +70,7 @@ def _haversine_m(lat1, lon1, lat2, lon2):
     return 2 * r * math.asin(math.sqrt(min(1.0, max(0.0, a))))
 
 
-def parse_gpx(raw_bytes):
+def parse_gpx(raw_bytes, *, time_bounds=None):
     """Parse a GPX document into the segments and summary fields we need.
 
     Returns a dict:
@@ -79,16 +81,39 @@ def parse_gpx(raw_bytes):
         }
 
     Raises ValueError if the bytes are not a parseable <gpx> document.
+    Optional UTC time_bounds validate all parseable times before skipping points.
     """
+    # Use Expat's declaration callbacks, as the viewer does, so UTF-16 and
+    # other supported encodings cannot bypass a byte-pattern DTD check.
+    def reject_declaration(*args):
+        raise ValueError("GPX document types and entities are not supported")
+
+    parser = expat.ParserCreate()
+    parser.StartDoctypeDeclHandler = reject_declaration
+    parser.EntityDeclHandler = reject_declaration
     try:
+        parser.Parse(raw_bytes, True)
         root = ET.fromstring(raw_bytes)
-    except ET.ParseError as e:
+    except (ET.ParseError, expat.ExpatError, LookupError) as e:
         raise ValueError(f"not valid XML: {e}")
 
     if _local(root.tag) != "gpx":
         raise ValueError(f"root element is <{_local(root.tag)}>, expected <gpx>")
 
+    if time_bounds is not None:
+        earliest, latest = time_bounds
+        # Validate before skipping malformed-coordinate points or selecting
+        # just the first metadata time. No rejected timestamp may hide in raw
+        # GPX that the viewer will subsequently parse independently.
+        for element in root.iter():
+            if _local(element.tag) == "time":
+                instant = _parse_iso(element.text)
+                if instant is not None and not earliest <= instant.astimezone(timezone.utc) <= latest:
+                    raise ValueError("trip timestamps must be from 2000-01-01 through one day after receipt")
+
     creator = root.get("creator")
+    if creator is not None and len(creator) > MAX_UPLOAD_TEXT:
+        raise ValueError("GPX creator exceeds 128 characters")
 
     metadata_time = None
     for child in root:
@@ -265,6 +290,11 @@ def summarize(parsed):
     else:
         avg_speed_mph = 0.0 if timing_status == "complete" else None
 
+    max_speed_mph = max_speed_mps * MPS_TO_MPH
+    for value in (distance_m, distance_miles, max_speed_mph, avg_speed_mph):
+        if value is not None and not math.isfinite(value):
+            raise ValueError("derived trip numbers must be finite")
+
     bbox = None
     if lats:
         bbox = {
@@ -287,7 +317,7 @@ def summarize(parsed):
         ),
         "summary_version": SUMMARY_VERSION,
         "distance_miles": round(distance_miles, 3),
-        "max_speed_mph": round(max_speed_mps * MPS_TO_MPH, 1),
+        "max_speed_mph": round(max_speed_mph, 1),
         "avg_speed_mph": round(avg_speed_mph, 1) if avg_speed_mph is not None else None,
         "num_points": num_points,
         "bbox": bbox,

@@ -19,12 +19,12 @@ and identifies the trip with two optional headers:
     X-Trip-Id:   2026-04-14T13-45-22
 
 The T-Beam sends only X-Device-Id. Without X-Device-Id we use the GPX
-`creator` attribute; without X-Trip-Id, the trip's start time in UTC
-(2026-04-14T13-45-22Z), which is also the stored file's name.
+`creator` attribute. Timed uploads always use the trip's start time in UTC
+(2026-04-14T13-45-22Z); X-Trip-Id is used only for untimed uploads.
 
 For each upload we write two files into /data/YYYY-MM/ (bucketed by the
-trip's end time, or its first upload for an undated trip). Undated retries
-reuse their original directory even if the month has changed:
+trip's end time, or its first upload for an undated trip). All retries
+reuse their original directory even if the month or DISPLAY_TZ has changed:
 
     <id>.gpx    the raw upload, byte-for-byte
     <id>.json   { trip_id, device_id, start_time, end_time, recorded_until,
@@ -43,14 +43,18 @@ summary be recomputed.
 
 import hashlib
 import hmac
+import io
 import json
 import logging
 import os
 import re
+import signal
 import sys
 import tempfile
+import threading
+import unicodedata
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -66,7 +70,7 @@ for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resol
 from common.version import server_version
 from common.trip_summary import (
     parse_gpx, summarize, SUMMARY_VERSION, METERS_PER_MILE, MPS_TO_MPH,
-    STATIONARY_MPS, MAX_PLAUSIBLE_MPS, MAX_HDOP, _haversine_m,
+    STATIONARY_MPS, MAX_PLAUSIBLE_MPS, MAX_HDOP, MAX_UPLOAD_TEXT, _haversine_m,
 )
 
 from common.diagnostics import CatalogError, ProtocolError, load_catalog, parse_request, validate_device_id
@@ -82,6 +86,10 @@ from diag_store import ConflictError, DiagnosticsStore
 # "twelve factor app" pattern for config.
 
 AUTH_TOKEN = os.environ.get("INGEST_AUTH_TOKEN")
+if (not AUTH_TOKEN or not AUTH_TOKEN.strip()
+        or any(c.isspace() or unicodedata.category(c) == "Cc" for c in AUTH_TOKEN)):
+    raise RuntimeError("INGEST_AUTH_TOKEN must be nonempty and contain no whitespace or control characters")
+os.umask(0o077)
 DATA_ROOT = Path(os.environ.get("INGEST_DATA_ROOT", "/data"))
 try:
     DIAGNOSTICS_CATALOG = load_catalog()
@@ -137,19 +145,10 @@ MAX_UPLOAD_BYTES = int(os.environ.get("INGEST_MAX_UPLOAD_BYTES", 16 * 1024 * 102
 # bigger body gets the reset. It must stay well above the cap: if it
 # didn't, an over-cap upload would get the reset, not the 413, and the
 # device would keep retrying it instead of setting it aside. Discarding
-# reads 64 KB at a time, so this costs time, not memory.
+# reads 8 KB at a time, for at most three seconds. A slower rejected upload
+# may see a connection reset instead of its HTTP status.
 MAX_DISCARD_BYTES = 4 * MAX_UPLOAD_BYTES
-
-# Fail loudly at startup if the auth token wasn't provided. We'd rather
-# crash immediately than run unauthenticated and silently accept uploads
-# from anyone who can reach the port.
-if not AUTH_TOKEN:
-    print(
-        "FATAL: INGEST_AUTH_TOKEN environment variable not set. "
-        "Refusing to start without authentication.",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+DISCARD_SECONDS = 3.0
 
 # Ensure the storage directory exists. This should normally be a
 # volume mount, but creating it here makes the app robust to being
@@ -278,8 +277,8 @@ def _stored_summary(json_file):
 def _stored_trip_directories(safe_id):
     """Find either half of a stored pair; caller must hold _upload_lock.
 
-    Undated trips have no stable timestamp to choose a month. Look for
-    their ID before using the receipt month, including GPX-only failed
+    Timezone changes and undated receipt times can change the month. Look
+    for the ID before choosing a new month, including GPX-only failed
     writes and summary-only records whose GPX can be restored by a retry.
     Check known filenames in each month instead of reading every trip.
     """
@@ -309,15 +308,40 @@ def _discard_body():
     remaining = request.content_length or 0
     if remaining > MAX_DISCARD_BYTES:
         return
+    _drain_input(remaining)
+
+
+def _drain_input(remaining):
+    """Hard wall-clock budget, including a stalled read or continuous trickle.
+
+    Production uses POSIX Gunicorn sync workers: SIGALRM interrupts blocking
+    Python socket reads. In a thread or on platforms without setitimer, only
+    in-memory input is drained; returning early is safer than an unbounded read.
+    """
     stream = request.environ["wsgi.input"]
+    timed = hasattr(signal, "setitimer") and threading.current_thread() is threading.main_thread()
+    if not timed and not isinstance(stream, io.BytesIO):
+        return
+
+    def expired(*args):
+        raise TimeoutError("rejected body drain deadline")
+
+    if timed:
+        previous_handler = signal.signal(signal.SIGALRM, expired)
+        previous_timer = signal.setitimer(signal.ITIMER_REAL, DISCARD_SECONDS)
     try:
         while remaining > 0:
-            chunk = stream.read(min(remaining, 64 * 1024))
+            chunk = stream.read(min(remaining, 8192))
             if not chunk:
                 break
             remaining -= len(chunk)
-    except OSError:
-        pass  # the client went away mid-body; nobody is left to answer
+    except (OSError, ClientDisconnected):
+        pass
+    finally:
+        if timed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
 
 
 def _authenticate(discard):
@@ -355,14 +379,7 @@ def _discard_diagnostics_body(consumed=0):
     remaining = MAX_DIAGNOSTICS_DISCARD_BYTES - consumed
     if length is not None:
         remaining = min(remaining, max(0, length - consumed))
-    try:
-        while remaining > 0:
-            chunk = request.environ["wsgi.input"].read(min(remaining, 8192))
-            if not chunk:
-                break
-            remaining -= len(chunk)
-    except (OSError, ClientDisconnected):
-        pass
+    _drain_input(remaining)
 
 
 # ---------------------------------------------------------------------
@@ -485,8 +502,16 @@ def upload_trip():
         abort(413)
 
     try:
-        parsed = parse_gpx(raw)
-    except ValueError as e:
+        # Receipt time supplies only an upper limit: years of old backlog are
+        # valid. Compare in UTC before local bucketing can overflow datetime.
+        earliest = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        latest = datetime.now(timezone.utc) + timedelta(days=1)
+        parsed = parse_gpx(raw, time_bounds=(earliest, latest))
+        for header in ("X-Device-Id", "X-Trip-Id"):
+            if len(request.headers.get(header, "")) > MAX_UPLOAD_TEXT:
+                raise ValueError(f"{header} exceeds 128 characters")
+        summary = summarize(parsed)
+    except (ValueError, OverflowError) as e:
         return jsonify({"error": f"invalid GPX: {e}"}), 400
 
     # A well-formed GPX with no track points is still not a trip. Accepting
@@ -495,7 +520,6 @@ def upload_trip():
     if not parsed["segments"]:
         return jsonify({"error": "invalid GPX: no track points"}), 400
 
-    summary = summarize(parsed)
     identity_dt = summary.pop("_identity_dt")
 
     # -----------------------------------------------------------------
@@ -503,14 +527,14 @@ def upload_trip():
     # -----------------------------------------------------------------
     device_id = request.headers.get("X-Device-Id") or (parsed["creator"] or "unknown")
 
-    trip_id = request.headers.get("X-Trip-Id")
+    anchor = identity_dt or parsed["metadata_time"]
+    trip_id = None if anchor else request.headers.get("X-Trip-Id")
     if not trip_id:
         # Fall back to the earliest recorded point time, then metadata time. This is
         # the T-Beam's path: it sends no X-Trip-Id. Build the id in UTC and
         # already filename-safe (2026-04-14T14-30-00Z), so the trip_id in
         # the summary and the export is the file's name, not a variant of
         # it that _safe_id() rewrote.
-        anchor = identity_dt or parsed["metadata_time"]
         if anchor:
             trip_id = anchor.astimezone(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
         else:
@@ -523,12 +547,13 @@ def upload_trip():
     safe_id = _safe_id(trip_id) or (
         "untimed-" + hashlib.sha256(raw).hexdigest()[:12]
     )
+    if anchor is None and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}Z", safe_id):
+        return jsonify(error="untimed X-Trip-Id cannot use the timestamp trip ID namespace"), 400
 
     # -----------------------------------------------------------------
     # Step 4: Determine target directory (bucket by end time)
     # -----------------------------------------------------------------
     end_dt = summary.pop("_end_dt") or parsed["metadata_time"]
-    untimed = end_dt is None
     end_dt = end_dt or datetime.now(timezone.utc)
     # Bucket by LOCAL month, matching how the viewer displays the trip.
     # Bucketing in UTC while displaying local would file a Dec 31 evening
@@ -552,15 +577,19 @@ def upload_trip():
     record.update(summary)
 
     try:
+        json.dumps(record, allow_nan=False)
+    except (ValueError, OverflowError):
+        return jsonify(error="invalid GPX: summary cannot be serialized"), 400
+
+    try:
         with _upload_lock():
-            if untimed:
-                # Lookup and creation share the lock so workers handling
-                # opposite sides of midnight cannot create two records.
-                existing_dirs = _stored_trip_directories(safe_id)
-                if len(existing_dirs) > 1:
-                    return jsonify({"error": "undated trip ID exists in multiple month directories"}), 409
-                if existing_dirs:
-                    target_dir = existing_dirs[0]
+            # Lookup and creation share the lock, including timed trips whose
+            # local month changes after DISPLAY_TZ is corrected.
+            existing_dirs = _stored_trip_directories(safe_id)
+            if len(existing_dirs) > 1:
+                return jsonify({"error": "trip ID exists in multiple month directories"}), 409
+            if existing_dirs:
+                target_dir = existing_dirs[0]
             gpx_file = target_dir / f"{safe_id}.gpx"
             json_file = target_dir / f"{safe_id}.json"
             target_dir.mkdir(parents=True, exist_ok=True)
