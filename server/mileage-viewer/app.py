@@ -1023,13 +1023,20 @@ def _to_local(dt):
     """Convert an instant to the display timezone.
 
     A naive datetime is treated as UTC. That's the storage convention, and
-    guessing "local" for a bare timestamp is how dates silently drift.
+    guessing "local" for a bare timestamp is how dates silently drift. An
+    instant with no representable local time returns None, like a missing one.
     """
     if dt is None:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(DISPLAY_TZ)
+    try:
+        return dt.astimezone(DISPLAY_TZ)
+    except (OverflowError, ValueError):
+        # Year 1 west of UTC, year 9999 east of it: no local time exists.
+        # Treat the stamp as unknown (the trip is undated) rather than 500
+        # every page that lists it.
+        return None
 
 
 def _history_trip_keys(conn, trip_key, parts=()):
@@ -2461,7 +2468,7 @@ def _late_edit_rows(conn, year, trips):
     rows = {}
     try:
         boundary = datetime(year + 1, 1, 1, tzinfo=DISPLAY_TZ).astimezone(timezone.utc)
-    except ValueError:  # year 9999: nothing can happen after it
+    except (ValueError, OverflowError):  # year 9999: nothing can happen after it
         boundary = None
     if boundary:
         # The string compare only narrows the scan (a day of margin); the

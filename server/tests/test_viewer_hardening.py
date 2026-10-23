@@ -1,12 +1,15 @@
 """Viewer response headers and login redirect safety (2026-10-23 audit)."""
 
 import io
+import json
 import sqlite3
 import unittest
 from contextlib import closing
+from unittest.mock import patch
 from urllib.parse import quote
 
 from openpyxl import load_workbook
+from zoneinfo import ZoneInfo
 
 import test_viewer_roles as roles
 
@@ -200,6 +203,59 @@ class ViewerHardeningTests(unittest.TestCase):
         self.assertIn("TRUNCATED: 40000 characters", cells[0])
         csv_text = self.client.get("/export.csv").data.decode()
         self.assertIn(long_text, csv_text)
+
+    # -- stored times with no local equivalent (year 1, year 9999) --------
+
+    def write_trip(self, trip_id, **summary):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        base = {"trip_id": trip_id, "device_id": "example", "distance_miles": 3,
+                "duration_seconds": 300, "start_time": "2026-01-03T12:00:00Z",
+                "end_time": "2026-01-03T12:05:00Z"}
+        base.update(summary)
+        (month / f"{trip_id}.json").write_text(json.dumps(base), encoding="utf-8")
+        (month / f"{trip_id}.gpx").write_text("<gpx><trk><trkseg/></trk></gpx>", encoding="utf-8")
+
+    def test_times_with_no_local_equivalent_are_unknown_not_a_500(self):
+        cases = [
+            ("America/Chicago", "year1", {"start_time": "0001-01-01T00:00:00Z"}),
+            ("Asia/Tokyo", "year9999", {"recorded_until": "9999-12-31T23:59:59Z",
+                                          "end_time": "9999-12-31T23:59:59Z"}),
+            ("Asia/Tokyo", "start9999", {"start_time": "9999-12-31T23:00:00Z"}),
+        ]
+        for zone, trip_id, summary in cases:
+            with self.subTest(zone=zone, trip=trip_id):
+                self.write_trip(trip_id, **summary)
+                with patch.object(self.viewer, "DISPLAY_TZ", ZoneInfo(zone)):
+                    self.assertIsNone(self.viewer._to_local(self.viewer._parse(
+                        summary.get("start_time") or summary["recorded_until"])))
+                    self.assertEqual(self.viewer.fmt_local_iso(
+                        summary.get("start_time") or summary["recorded_until"]), "")
+                    self.signed_in("admin")
+                    for path in ("/", "/?year=2026", "/export.csv", "/export.xlsx", "/admin",
+                                 "/admin/year/2026", f"/trip/2026-01/{trip_id}"):
+                        response = self.client.get(path)
+                        self.assertEqual(response.status_code, 200, path)
+                        response.close()
+                    # The admin can still take it out of the log.
+                    removed = self.client.post(f"/trip/2026-01/{trip_id}/remove", data={
+                        "csrf_token": "known-token", "reason": "bad timestamp"})
+                    self.assertEqual(removed.status_code, 302)
+
+    def test_year_1_trip_is_listed_as_undated_and_stays_out_of_every_year(self):
+        self.write_trip("year1", start_time="0001-01-01T00:00:00Z")
+        with patch.object(self.viewer, "DISPLAY_TZ", ZoneInfo("America/Chicago")):
+            trips, _ = self.viewer.load_trips()
+            trip = next(t for t in trips if t["id"] == "year1")
+            self.assertIsNone(self.viewer._trip_local_year(trip))
+            self.assertEqual(self.viewer.trip_years(trip), set())
+            # With a year closed, the closed-year check runs on every edit and
+            # must cope with the unconvertible date too.
+            self.signed_in("admin")
+            self.assertEqual(self.client.post("/admin/year/2026/close", data={
+                "csrf_token": "known-token", "confirm": "yes"}).status_code, 302)
+            self.assertEqual(self.client.get("/trip/2026-01/year1").status_code, 200)
+            self.assertEqual(self.client.post("/trip/2026-01/year1/annotate", data={
+                "csrf_token": "known-token", "category": "business"}).status_code, 302)
 
 
 if __name__ == "__main__":
