@@ -144,6 +144,41 @@ class ViewerLockoutTests(unittest.TestCase):
         self.assertEqual(self.attempt('driver', 'test-password'), 429)
         self.assertIsNotNone(self.row()[1])
 
+    def test_correct_password_in_flight_when_the_lock_starts_gets_no_session(self):
+        # The password hash is slow; guesses already past the lock check can
+        # finish after the fifth failure locked the address. Inject the lock at
+        # exactly that point: after the lock check, before the session.
+        real_check = self.viewer.check_password_hash
+
+        def check_then_lock(stored, password):
+            result = real_check(stored, password)
+            for _ in range(5):
+                self.viewer._record_failure('127.0.0.1', 'guesser')
+            return result
+
+        for username, password in (('driver', 'test-password'), ('helper', 'everyday-password')):
+            with self.subTest(username=username):
+                client = self.viewer.app.test_client()
+                with patch.object(self.viewer, 'check_password_hash', side_effect=check_then_lock):
+                    response = self.login(username, password, client)
+                self.assertEqual(response.status_code, 429)
+                self.assertIn(b'Too many failed attempts', response.data)
+                with client.session_transaction() as sess:
+                    self.assertNotIn('user', sess)
+                self.assertEqual(client.get('/').status_code, 302)  # still sent to log in
+                with closing(sqlite3.connect(self.db)) as conn, conn:
+                    conn.execute('DELETE FROM login_attempts')
+                    conn.execute('DELETE FROM login_attempt_names')
+
+    def test_clear_failures_reports_whether_the_address_is_locked(self):
+        self.assertTrue(self.viewer._clear_failures('127.0.0.1', 'driver'))
+        self.viewer._record_failure('127.0.0.1', 'driver')
+        self.assertTrue(self.viewer._clear_failures('127.0.0.1', 'driver'))
+        for _ in range(5):
+            self.viewer._record_failure('127.0.0.1', 'driver')
+        self.assertFalse(self.viewer._clear_failures('127.0.0.1', 'driver'))
+        self.assertGreater(self.viewer._lock_seconds_remaining('127.0.0.1'), 0)
+
     def test_failures_of_one_ip_do_not_touch_another(self):
         self.viewer._record_failure('192.0.2.1', 'driver')
         self.viewer._record_failure('192.0.2.2', 'helper')

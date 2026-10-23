@@ -458,6 +458,11 @@ def _clear_failures(ip, username):
     Anyone who holds one valid login could otherwise reset the count between
     guesses at another account's password. Failures against other names (or
     unknown ones) keep counting toward the IP's lock.
+
+    Returns False, clearing nothing, if the IP is locked: the lock can appear
+    while a login's slow password hash is running, and that login must not
+    still get a session. This check shares the clearing transaction, so no
+    lock can slip in between it and the session being issued.
     """
     name = _failure_name(username)
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
@@ -467,14 +472,14 @@ def _clear_failures(ip, username):
         ).fetchone()
         if not row:
             conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
-            return
+            return True
         if row[1] and datetime.fromisoformat(row[1]) > datetime.now(timezone.utc):
-            return  # a lock set by a concurrent request stands
+            return False  # a lock set by a concurrent request stands
         own = conn.execute(
             "SELECT fails FROM login_attempt_names WHERE ip = ? AND name = ?", (ip, name)
         ).fetchone()
         if not own:
-            return
+            return True
         conn.execute("DELETE FROM login_attempt_names WHERE ip = ? AND name = ?", (ip, name))
         fails = max(0, row[0] - own[0])
         if fails:
@@ -482,6 +487,7 @@ def _clear_failures(ip, username):
         else:
             conn.execute("DELETE FROM login_attempts WHERE ip = ?", (ip,))
             conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
+    return True
 
 
 def _safe_equal(a, b):
@@ -2074,6 +2080,12 @@ def device_health():
     ), 503 if data["state"] == "unavailable" else 200
 
 
+def _locked_login_response(seconds):
+    minutes = max(1, round(seconds / 60))
+    error = f"Too many failed attempts. Try again in {minutes} minute(s)."
+    return render_template_string(LOGIN_HTML, error=error), 429
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if _is_logged_in():
@@ -2084,9 +2096,7 @@ def login():
         ip = _client_ip()
         locked = _lock_seconds_remaining(ip)
         if locked:
-            minutes = max(1, round(locked / 60))
-            error = f"Too many failed attempts. Try again in {minutes} minute(s)."
-            return render_template_string(LOGIN_HTML, error=error), 429
+            return _locked_login_response(locked)
 
         # Validated here rather than in the global hook so an expired
         # session shows "please try again" instead of a bare 400.
@@ -2116,7 +2126,10 @@ def login():
                 editor_ok = False
 
         if pass_ok and (name_ok or editor_ok):
-            _clear_failures(ip, VIEWER_USERNAME if name_ok else user["username"])
+            if not _clear_failures(ip, VIEWER_USERNAME if name_ok else user["username"]):
+                # Other guesses from this address locked it while this
+                # password was being checked: even a correct one waits.
+                return _locked_login_response(_lock_seconds_remaining(ip) or 1)
             session.clear()  # new session id on privilege change
             session["user"] = VIEWER_USERNAME
             session["pw_tag"] = _password_tag()
