@@ -134,7 +134,7 @@ class ViewerHistoryTests(unittest.TestCase):
 
         response = self.admin.get("/export.csv")
         reader = csv.DictReader(io.StringIO(response.data.decode("utf-8")))
-        self.assertEqual(reader.fieldnames[-3:], ["last_edited_by", "last_edited_at", "row_type"])
+        self.assertEqual(reader.fieldnames[-4:], ["last_edited_by", "last_edited_at", "row_type", "received_after_close"])
         rows = list(reader)
         trip_row = next(row for row in rows if row["row_type"] == "trip")
         total_row = next(row for row in rows if row["row_type"] == "total")
@@ -145,7 +145,7 @@ class ViewerHistoryTests(unittest.TestCase):
         try:
             headers = [cell.value for cell in workbook["Mileage"][1]]
             cells = dict(zip(headers, workbook["Mileage"][2]))
-            self.assertEqual(headers[-2:], ["last_edited_by", "last_edited_at"])
+            self.assertEqual(headers[-3:], ["last_edited_by", "last_edited_at", "received_after_close"])
             self.assertEqual((cells["last_edited_by"].value, cells["last_edited_at"].value),
                              ("helper", "2026-01-04T04:00:00-08:00"))
         finally:

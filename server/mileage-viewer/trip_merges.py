@@ -7,6 +7,7 @@ from xml.parsers import expat
 from datetime import datetime, timedelta, timezone
 
 from common.trip_summary import parse_gpx, summarize, _parse_iso
+import trip_log
 
 MERGE_MAX_GAP = timedelta(minutes=15)
 ANNOTATION_FIELDS = ("category", "purpose_note", "destination")
@@ -166,6 +167,10 @@ def apply_merges(conn, data_root, trips, unreadable):
             else:
                 summary = json.loads(row["summary"])
             t = {**summary, **t, "start_time": summary.get("start_time")}
+            # The merged trip arrived when its last part did.
+            received = trip_log.latest_stamp(originals[k].get("received_at") for k in keys)
+            if received:
+                t["received_at"] = received
             merged.append(t)
         except (OSError, ValueError):
             broken.append({**t, "problem": "A merge part is missing or unreadable; restore it or undo the merge."})

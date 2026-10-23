@@ -527,6 +527,42 @@ refused. The trip page identifies the closed year and who closed it, and the
 trip list shows **Closed for edits**. Viewing trips, exporting, and place
 lookup continue to work.
 
+**Saved totals.** Closing a year saves its totals as they stand at that moment:
+the trip count and miles for each category (business, personal, other,
+no category) and overall, the same figures as the year's exports, plus the
+list of trips that were counted. They are stored in `annotations.db` (so the
+backups include them), and the close entry in change history shows them too.
+A year closed before this feature existed has no saved totals; its review
+page says so and keeps working. Reopening a year discards its saved totals (the
+reopen entry in change history records what was discarded), and closing it
+again saves new ones.
+
+**Trips that arrive after the close.** Closing a year stops *viewer* edits only.
+The tracker can still upload a trip that started in that year (for example a
+backlog it was holding while it was out of WiFi range), and the server stores
+it. That trip joins the year's list, totals and exports like any other, so
+nothing is hidden, but it is not silent either:
+
+- The year review has a **Received after this year was closed** section listing
+  each such trip (when the server received it, its distance, its category) with
+  a link. A trip counts as late when ingest stored it after the moment the year
+  was closed. A trip whose summary has no received time (stored by an older
+  ingest) is never listed as late.
+- The CSV and XLSX exports gain a last column, `received_after_close`, set to
+  `yes` for those trips and blank for the rest. In the CSV it comes after
+  `row_type`, so existing columns keep their positions and names.
+- **Saved totals** on the review page shows the totals saved at the close next
+  to today's, with a difference column. Rows that differ are in bold, and a
+  warning appears when anything differs. A difference is not always a late
+  upload: changing `DISPLAY_TZ` can move a trip near New Year into or out of the
+  year, and rebuilding a summary can change its miles. The review lists those
+  trips under "Other changes since the close".
+
+A late trip is in a closed year, so it can't be categorized (the viewer answers
+409) until the admin reopens the year. To fix that, reopen the year, categorize
+the trip, and close the year again. That takes a fresh snapshot, so the new
+totals become the saved ones and the late trip no longer shows as late.
+
 Endpoint coordinates come from the first and last recorded GPX track points,
 so they are also available for existing summaries. They describe the raw
 recording, including any final stationary samples; they are not geocoded
