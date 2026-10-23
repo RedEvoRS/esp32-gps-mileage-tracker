@@ -43,7 +43,9 @@ class ViewerWorkerIntegrationTests(unittest.TestCase):
         # Gunicorn 26.2.0 waits up to 5 s before deferring a new idle socket
         # to its selector. Accepts need not be balanced: all nine spare sockets
         # can land on one worker, requiring two waves before a request runs.
-        self.run_idle_connections(saturated=True, response_limit=12)
+        # Local runs measured 8-10 s; the bound leaves room for slower CI
+        # runners; what matters is recovery without any worker being killed.
+        self.run_idle_connections(saturated=True, response_limit=20)
 
     def run_idle_connections(self, *, saturated, response_limit):
         command = worker_command()
@@ -83,7 +85,8 @@ class ViewerWorkerIntegrationTests(unittest.TestCase):
             with (root / 'gunicorn.log').open('w+') as log:
                 process = subprocess.Popen(command, cwd=VIEWER, env=env, stdout=log, stderr=log)
                 try:
-                    startup_deadline = time.monotonic() + 6
+                    # Generous: a busy CI runner can be slow to import the app.
+                    startup_deadline = time.monotonic() + 20
                     while True:
                         self.assertIsNone(process.poll(), 'gunicorn exited during startup')
                         try:
@@ -91,7 +94,7 @@ class ViewerWorkerIntegrationTests(unittest.TestCase):
                             break
                         except OSError:
                             if time.monotonic() >= startup_deadline:
-                                self.fail('gunicorn did not become healthy within 6 seconds')
+                                self.fail('gunicorn did not become healthy within 20 seconds')
                             time.sleep(0.05)
                     idle_count = workers * threads + 1 if saturated else 2
                     for _ in range(idle_count):
