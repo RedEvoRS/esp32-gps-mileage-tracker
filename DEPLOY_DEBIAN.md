@@ -402,13 +402,15 @@ Create it yourself first:
 ```bash
 cd ~/mileage-tracker
 mkdir -p data
-ls -ld data          # should be owned by your user
+chmod 700 data       # trip file names are drive start times; keep them private
+ls -ld data          # should be owned by your user, drwx------
 ```
 
 If your `id -u` from Step 0 was **not** 1000:
 
 ```bash
 sudo chown -R 1000:1000 ~/mileage-tracker/data
+sudo chmod 700 ~/mileage-tracker/data
 ```
 
 This lets the containers write trips, but your non-1000 login still cannot
@@ -655,12 +657,22 @@ Expect `401`.
 ```bash
 cd ~/mileage-tracker
 TOKEN=$(grep '^INGEST_AUTH_TOKEN=' .env | cut -d= -f2-)
-curl -X POST "http://$H:8090/upload" \
-  -H "Authorization: Bearer $TOKEN" \
+printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -X POST "http://$H:8090/upload" \
+  -H @- \
   -H "Content-Type: application/gpx+xml" \
-  -H "X-Trip-Id: 2026-04-14T13-45-22" \
   --data-binary @sample.gpx
 ```
+
+The token goes to curl on its standard input (`-H @-`), not on the command
+line, because any other account on the server can read a running command's
+arguments (`ps`). The same rule applies to every command in this guide that
+sends a token. Don't paste a token into a command's arguments, and don't leave
+it in your shell history.
+
+Ingest names a trip with timestamps after those timestamps (here
+`2026-04-14T14-30-00Z`, from the first point's time, in UTC). It ignores any
+`X-Trip-Id` header on such a trip, so the test needs none. (The header only
+names a GPX with no timestamps at all.)
 
 Expect a JSON success body with `distance_miles` ≈ **0.30** over 45 seconds at
 ~24 mph (that's what `sample.gpx` encodes — if the number is wildly different,
@@ -674,7 +686,7 @@ that device, which would later be reported as silent.
 
 ```bash
 sudo ls -l data/2026-04/
-sudo cat data/2026-04/2026-04-14T13-45-22.json | jq .
+sudo cat data/2026-04/2026-04-14T14-30-00Z.json | jq .
 ```
 
 You want a `.gpx` (byte-for-byte raw) *and* a derived `.json` summary.
@@ -763,7 +775,7 @@ for the annotation and timing details.
 **Clean up the test trip** so it doesn't pollute your real mileage log:
 
 ```bash
-sudo rm ~/mileage-tracker/data/2026-04/2026-04-14T13-45-22.{gpx,json}
+sudo rm ~/mileage-tracker/data/2026-04/2026-04-14T14-30-00Z.{gpx,json}
 sudo rmdir ~/mileage-tracker/data/2026-04   # only goes if nothing else is in it
 ```
 
@@ -1069,11 +1081,23 @@ off-host destination. Each run:
   snapshot at all, so daily runs cost almost nothing.
 - keeps the newest 14 snapshots plus the first of each month for 7 years.
 - rsyncs to the off-host copy, then reads the newest snapshot back from
-  there and checks it matches byte for byte. The script does not prune remote
-  snapshots by default (`REMOTE_PRUNE=no`). The server still has write access:
-  protection from deletion by a compromised server needs retention or snapshots
-  enforced on the backup host, or a restricted backup account. See
+  there and checks it matches byte for byte. It copies only if the
+  destination holds a file named `.mileage-backup-target` (see 10a): a share
+  that isn't mounted is an empty folder on this machine's own disk, and
+  without the file the run fails instead of filling that disk and calling it
+  an off-host copy. The copy never deletes anything on its own, and by default
+  (`REMOTE_PRUNE=no`) the script never prunes remote snapshots. With
+  `REMOTE_PRUNE=yes` it applies the same keep rule to the snapshot names
+  already on the destination and deletes only the names that rule drops. It
+  refuses to prune, and warns in the log, while the destination holds
+  snapshots newer than this server's newest or ones this server doesn't have
+  (a rebuilt server). The server still has write access: protection from
+  deletion by a compromised server needs retention or snapshots enforced on
+  the backup host, or a restricted backup account. See
   [backup.conf.example](server/backup/backup.conf.example).
+- gives up instead of hanging when the destination vanishes mid-copy: rsync
+  stops after 10 minutes without data moving, an SSH connection after about
+  two minutes of silence, and the systemd unit after 6 hours in all.
 
 The timer runs the script as your login user, which has to be able to read
 the trip files. Ingest writes them as UID 1000 with mode 600, so that user
@@ -1114,6 +1138,24 @@ RSYNC_SSH="ssh -i /home/<user>/.ssh/mileage_backup"
 The rest of the file explains the retention settings and an optional
 `PING_URL`.
 
+**Mark the destination.** A backup copies there only if the folder holds a
+file named `.mileage-backup-target`. `install.sh` writes it when it sets up
+backups; if you set them up by hand, write it once now, after checking that
+`REMOTE` is the real destination (a mounted share is mounted right now):
+
+```bash
+bash ~/mileage-tracker/backup/backup.sh --mark-target
+```
+
+The file is the guard against an unmounted share. When the share is missing,
+its mount point is an empty folder on this server's disk, with no marker, so
+the backup stops with an error (the systemd unit fails, `last-success` isn't
+updated and `PING_URL` isn't called) instead of copying onto the disk it's
+meant to protect against. A local destination should be a mount that systemd
+knows about, for example a line in `/etc/fstab` (add `nofail` if the machine
+should boot without it): `install.sh` tells the backup unit to wait for that
+mount before each run (`RequiresMountsFor=`).
+
 ### 10c — Run it once by hand
 
 ```bash
@@ -1121,7 +1163,9 @@ bash ~/mileage-tracker/backup/backup.sh
 ```
 
 It should finish with `Backup complete: <snapshot> is on <REMOTE>`. Running
-it a second time straight away should say `Nothing changed`.
+it a second time straight away should say `Nothing changed`. If it stops with
+`has no .mileage-backup-target file`, the destination isn't marked or isn't
+there: see the end of 10b.
 
 ### 10d — Test a restore from the off-host copy
 
@@ -1175,6 +1219,26 @@ If the server files live somewhere else, edit `ExecStart` in the
 old path: edit it again, or rerun `install.sh` from the new place, which
 fixes it (`install.sh --check` reports the mismatch).
 
+When `REMOTE` (or `BACKUP_DIR`) is a folder on this machine, such as a mounted
+share, create a drop-in so systemd mounts it before each run:
+
+```bash
+sudo systemctl edit mileage-backup@$USER.service
+```
+
+and add (your folder paths):
+
+```
+[Unit]
+RequiresMountsFor=/mnt/backup-share/mileage-tracker
+```
+
+`install.sh` writes the same thing itself, and rewrites the unit and timer
+files in `/etc/systemd/system` whenever an update changes them (rerun it after
+updating the server files); `install.sh --check` warns when the installed
+files differ from the ones in `backup/`. If you copied the files by hand,
+copy them again after an update and run `sudo systemctl daemon-reload`.
+
 Run it once through systemd to prove the unattended path works (the SSH key,
 the paths, the user):
 
@@ -1198,17 +1262,81 @@ journal, but nobody looks there. Two options:
   so if the pings stop, the backups have stopped.
 - Or check by hand now and then: `cat ~/mileage-backups/last-success`.
 
+### Backups set up before the destination marker existed
+
+A server whose backups were set up by an older version has no
+`.mileage-backup-target` file at its destination yet, and the nightly backup
+refuses to copy until it's there. Until you do the steps below, every night's
+run fails (`systemctl --failed` lists `mileage-backup@<user>.service`,
+`last-success` stops moving and `PING_URL` stops being called). Nothing is lost;
+the local snapshots in `~/mileage-backups` keep being made. After updating the
+server files:
+
+1. Rerun `bash ~/mileage-tracker/install.sh`. For a destination over SSH it
+   writes the marker file itself. For a destination that is a folder on this
+   machine it first asks whether this is really the mounted share or disk (an
+   unmounted share's empty folder looks the same); if it can't tell, it
+   leaves the folder unmarked and prints the command from step 2.
+2. If the installer didn't mark it, make sure the destination is the right
+   place and is mounted now (`mount | grep <share>`), then run:
+
+   ```bash
+   bash ~/mileage-tracker/backup/backup.sh --mark-target
+   ```
+
+3. Run `bash ~/mileage-tracker/install.sh --check`. It reports a missing marker
+   as a problem and a backup systemd file that differs from `backup/` as a
+   warning (the rerun in step 1 installs the new ones).
+4. Run `sudo systemctl start mileage-backup@$USER.service` and confirm
+   `systemctl status` shows `status=0/SUCCESS`.
+
 ### Restoring for real
 
 After losing the disk, rebuild the server with Steps 1–9, put
-`backup.conf` back, then:
+`backup.conf` back, then restore. Two things to know first.
+
+**Keep these files somewhere other than the server.** None of them is in a
+snapshot (they hold credentials), so a lost disk loses them:
+
+- `~/mileage-tracker/.env`: the ingest upload token, `DISPLAY_TZ`, `BIND_ADDR`
+  and the other settings.
+- `~/mileage-tracker/viewer.env`: the admin login and the viewer's session key.
+- `~/mileage-tracker/monitor.env`, if you use notifications or metrics.
+- `~/mileage-tracker/backup/backup.conf` and the SSH key it names
+  (`~/.ssh/mileage_backup`), without which the rebuilt server can't reach the
+  off-host copy at all.
+- Your ntfy volume, if you use it (see below).
+
+Keep them off this machine and off the backup destination (a password manager
+or an encrypted USB stick). If you rebuild without the old `.env`, the server
+generates a new upload token. The tracker still carries the old one, so every
+upload gets `401` until you rebuild its firmware with the new token and flash
+it again (Step 8). Putting the old `.env` back before you start the services
+avoids that.
+
+**Don't let the rebuild's own backup hide the history.** If you turn on
+backups during the rebuild with the same destination, the installer's first
+backup adds a new, empty snapshot there (the old history stays; the marker
+file from the old server is already in place). `latest` skips a newest snapshot
+with no trips while an older one has some and says so, but the safest way is to
+name the snapshot you want. List what is there, then restore that one:
+
+```bash
+rsync --list-only backup@nas.lan:/volume1/backups/mileage-tracker/snapshots/   # your REMOTE
+bash ~/mileage-tracker/backup/restore.sh restore 2026-10-06T033012Z
+```
+
+Or skip backups in the installer's question during the rebuild, restore, and
+set backups up afterwards. Check the line `Snapshot holds N trip GPX files`
+before you type `RESTORE`; with `--yes` there is no prompt to stop you. Without
+a name, the command is:
 
 ```bash
 bash ~/mileage-tracker/backup/restore.sh restore latest
 ```
 
-`latest` means the newest snapshot on the off-host copy. You can also name
-one (`2026-10-06T103000Z`) or give a path. It runs the same checks as
+`latest` means the newest snapshot on the off-host copy that holds trips. You
+can also name one (`2026-10-06T103000Z`) or give a path. It runs the same checks as
 `restore.sh check`, asks you to type `RESTORE`, and stops ingest, viewer and
 any installed monitor. It saves all current databases before replacing any,
 and saves trip files it would overwrite under
@@ -1478,9 +1606,9 @@ Enter the topic token privately for an authenticated manual test:
 
 ```bash
 read -rs -p 'ntfy token: ' NTFY_TEST_TOKEN; echo
-curl -fsS -H "Authorization: Bearer $NTFY_TEST_TOKEN" \
+printf 'Authorization: Bearer %s\n' "$NTFY_TEST_TOKEN" | curl -fsS -H @- \
   --data-binary 'Mileage tracker test notification' 'http://<host>:8092/<topic>'
-curl -fsS -H "Authorization: Bearer $NTFY_TEST_TOKEN" \
+printf 'Authorization: Bearer %s\n' "$NTFY_TEST_TOKEN" | curl -fsS -H @- \
   'http://<host>:8092/<topic>/json?poll=1'
 unset NTFY_TEST_TOKEN
 ```
@@ -1642,7 +1770,7 @@ Test the path from the Prometheus host (or another host on the same LAN/VPN):
 
 ```bash
 read -rs -p 'metrics token: ' METRICS_TEST_TOKEN; echo
-curl -i -H "Authorization: Bearer $METRICS_TEST_TOKEN" \
+printf 'Authorization: Bearer %s\n' "$METRICS_TEST_TOKEN" | curl -i -H @- \
   'http://<host>:8093/metrics'
 unset METRICS_TEST_TOKEN
 ```
@@ -1878,18 +2006,21 @@ record: send it to ingest again, and ingest rebuilds the summary from it.
 cd ~/mileage-tracker
 TRIP=2026-10/2026-10-05T16-00-00Z      # the path from the warning, minus .json
 TOKEN=$(grep '^INGEST_AUTH_TOKEN=' .env | cut -d= -f2-)
-curl -X POST http://<host>:8090/upload \
-  -H "Authorization: Bearer $TOKEN" \
+printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -X POST http://<host>:8090/upload \
+  -H @- \
   -H "Content-Type: application/gpx+xml" \
   -H "X-Device-Id: tbeam-01" \
-  -H "X-Trip-Id: ${TRIP#*/}" \
   --data-binary @data/$TRIP.gpx
 ```
 
-`X-Device-Id` is the firmware's `DEVICE_ID`, and `X-Trip-Id` keeps the
-file's name. The reply's `stored_as` should be `$TRIP.gpx`; the trip is then
-back in the list with its annotations. Ingest rebuilds a damaged or missing
-summary only when the GPX it already holds matches the upload byte for byte,
+`X-Device-Id` is the firmware's `DEVICE_ID`. Ingest gives a timed trip the
+same name again from its timestamps (it ignores `X-Trip-Id` for a GPX that has
+them), so nothing else is needed. (For a GPX with no timestamps at all, add
+`-H "X-Trip-Id: ${TRIP#*/}"`.) The reply's `stored_as` should be `$TRIP.gpx`.
+If it differs, that trip was filed under a custom `X-Trip-Id` by an older
+version of ingest; see [server/README.md](server/README.md) before sending it
+again. When it matches, the trip is back in the list with its annotations.
+Ingest rebuilds a damaged or missing summary only when the GPX it already holds matches the upload byte for byte,
 since that's what proves it's the same trip.
 
 If the warning says there's no GPX either, put the GPX back from a backup

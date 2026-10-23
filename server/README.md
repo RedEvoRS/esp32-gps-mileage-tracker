@@ -354,10 +354,14 @@ Step 1).
    is in this folder:
 
        TOKEN=$(grep '^INGEST_AUTH_TOKEN=' .env | cut -d= -f2-)
-       curl -X POST "http://$H:8090/upload" \
-         -H "Authorization: Bearer $TOKEN" \
+       printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -X POST "http://$H:8090/upload" \
+         -H @- \
          -H "Content-Type: application/gpx+xml" \
          --data-binary @sample.gpx
+
+   (`-H @-` reads the header from standard input. A token written into curl's
+   arguments can be read by any other account on this server while the command
+   runs.)
 
    You should see a JSON success response with a `distance_miles` value,
    and find two files at `./data/2026-04/2026-04-14T14-30-00Z.gpx` and
@@ -989,8 +993,9 @@ a letter/digit. Bodies are capped at 32 KiB even for chunked requests. This
 synthetic empty-event heartbeat returns `{"accepted":[]}` after committing:
 
 ```sh
-curl -X POST 'http://<host>:8090/v1/device-events' \
-  -H 'Authorization: Bearer <token>' \
+TOKEN=$(grep '^INGEST_AUTH_TOKEN=' .env | cut -d= -f2-)
+printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -X POST 'http://<host>:8090/v1/device-events' \
+  -H @- \
   -H 'X-Device-Id: tracker-1' \
   -H 'Content-Type: application/json' \
   --data '{"schema_version":1,"checkin":{"boot_id":"00000000000000000000000000000001","status_sequence":1,"uptime_ms":1500,"active":[]},"events":[]}'
