@@ -134,7 +134,8 @@ scan. Strict up-to-date required checks mean main receives exactly the files
 tested on the PR. A new push to a PR cancels its older run; main runs are not
 cancelled. The PII/tools job is skipped for Dependabot PRs:
 - PII: `python tools/check_pii.py` (add `--commits origin/main..HEAD`
-  before pushing) and `python -m unittest discover -s tools`.
+  before pushing; it also checks every file version and path the range adds,
+  even ones later removed) and `python -m unittest discover -s tools`.
   The scanner checks positions and new commit dates; commit with TZ=UTC.
 - Server: `python -m unittest discover -s server/tests`,
   `python tools/generate_error_catalog.py --check`,
@@ -303,7 +304,13 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   `.json` summary out (atomic writes); distance = haversine over moving
   steps only (speed > 2 mph at either end), HDOP > 5 and > 60 m/s jumps
   skipped, GPS gaps bridged by straight line (`summarize()`, tests in
-  `server/tests/`)
+  `server/tests/`). GPX with a DTD/entities, times before 2000 or more than a
+  day ahead, or non-finite derived numbers gets 400 before anything is written.
+  Timed GPX ignores `X-Trip-Id` and uses its timestamp-derived UTC ID; untimed
+  uploads may use a custom ID outside that namespace (installer test uploads are
+  untimed copies of `sample.gpx`). Every upload looks for its ID in all month
+  folders under the upload lock, so a `DISPLAY_TZ` change can't duplicate a trip.
+  Ingest runs with umask 077; `install.sh` keeps `data/` at mode 700
 - Upload limits: 16 MiB body cap (`INGEST_MAX_UPLOAD_BYTES`, ~39 h of
   nonstop driving). It protects the server's memory: the ingest parses the
   whole body at once, peaking at ~9x its size. Firmware splits long trips
@@ -311,22 +318,35 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   points and closing tags. Each piece uploads separately, with no arming
   gap between pieces. gunicorn `--timeout 900` lets an 8 MiB piece upload
   at 10 kB/s (~839 s), with a margin for handling it. The timeout includes
-  reading the body. Early 401/413 replies read and
-  discard up to 4x the cap first, so the device sees the status, not a reset.
+  reading the body. Early 401/413 replies drain up to 4x the cap for at most
+  3 s (SIGALRM in the two sync workers), so the device normally sees the status;
+  a slower rejected client may get a reset. Incomplete headers and slow
+  authenticated bodies can still occupy a worker.
   `server/tests/test_upload_limits.py` ties the current upload limit to
   the firmware split limit and the flash fallback in `partitions.csv`
 - Diagnostics: `POST /v1/device-events` on ingest, same bearer auth plus validated
   `X-Device-Id`, 32 KiB streaming cap (also without Content-Length), protocol v1
   from `common.diagnostics`, catalog cached at startup. Ingest owns
   `/data/diagnostics/events.db` under `INGEST_DATA_ROOT`: SQLite DELETE journal,
-  synchronous=FULL, 5 s busy timeout, schema version 1. One transaction dedupes
-  events and applies the device-wide `status_sequence` high-water rule; ack only
-  after commit. GPX successes refresh contact only for a valid device header;
+  synchronous=FULL, 5 s busy timeout, schema version 1, file mode 0600. One
+  transaction dedupes events and applies the device-wide `status_sequence`
+  high-water rule; a snapshot more than 1,000,000 above the high-water is
+  ignored (its events still commit, 200). `reset_high_water.py` is the
+  compare-and-set admin recovery (DIAGNOSTICS.md); ack only after commit. GPX successes refresh contact only for a valid device header;
   diagnostics failure never changes their response. See `DIAGNOSTICS.md` for
   schema/unknown-condition semantics.
 - Viewer port: 8091, admin/everyday session logins (LAN-only), reads `./data`
   read-only, owns `annotations.db` (SQLite) in `viewer-db`. Removal only marks
-  a trip in that DB; it never touches `./data`. The DB includes `users`,
+  a trip in that DB; it never touches `./data`. Closing a year saves its totals
+  in `tax_years.snapshot`; the year review compares saved and current totals,
+  and lists trips received after the close (ingest `_received_at` later than
+  `closed_at`), undated trips and trips inside a merge. Exports mark late trips
+  in a last `received_after_close` column; late trips still count and stay
+  un-annotatable (409) until the year is reopened. Every response sends
+  `frame-ancestors 'none'`, `X-Frame-Options: DENY` and `nosniff`. Notes and
+  destinations are limited to 2,000 characters without XML-illegal control
+  characters. Merged summaries keep the rules they were built with until a
+  source file changes. The DB includes `users`,
   `trip_removals`, `trip_history` and `tax_years`. Optional `geocoding.py`
   sends a selected endpoint to an explicitly configured provider only on an
   authenticated, CSRF-protected click and caches suggestions in that database.
@@ -363,7 +383,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   of `GRAYLOG_GELF_URL` (GELF HTTP, preferred) or `GRAYLOG_GELF_TCP` (optional
   TLS) in `monitor.env`. Graylog runs on the owner's own server; never bundle it.
   Sends facts, not ntfy decisions: cursor-based, at-least-once forwarding of
-  events.db rows (rowid cursor, reset if events.db is restored lower), and
+  events.db rows (rowid cursor, reset if events.db is restored lower or the
+  event stored at the cursor changes), and
   per-(device, code) condition state changes (active/clear/unknown, E7001 silence),
   so deep-sleep wakes don't repeat. Duplicates are possible after an
   interrupted send or a lower events.db restore. Independent of NOTIFY_*;
@@ -383,7 +404,7 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   including E7001 silence and recovery) independent of ntfy, and successful
   ntfy alert/reminder/resolution decisions. Fixed labels are `job`, validated
   `device_id` and catalog severity. The independent event cursor resets on a
-  lower restored events.db rowid; real timestamps (Loki 2.4+), backlog first. Network
+  lower restored events.db rowid or a changed event at the cursor; real timestamps (Loki 2.4+), backlog first. Network
   failures, 408, 429 and 5xx retry; other HTTP 4xx rejections skip the batch and
   advance its cursors. The condition table and cursor are additive to monitor
   schema v1. Setup and LogQL examples: DEPLOY_DEBIAN Step 11f.
@@ -406,6 +427,13 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   still restore trips/annotations with a message for missing new DBs, leaving
   those live DBs unchanged and never replaying an old live diagnostics file.
   Optional ntfy state needs a separate backup. Runbook: DEPLOY_DEBIAN Step 10.
+  The off-host copy goes only to a destination holding `.mileage-backup-target`
+  (written by install.sh or `backup.sh --mark-target`; otherwise the unit fails).
+  `REMOTE_PRUNE=yes` never uses rsync `--delete`: it applies the retention rule
+  to the remote's own snapshot names and refuses, with a warning, when the
+  remote has snapshots newer than or missing from the local set. rsync has a
+  600 s I/O timeout, the unit 6 h. Restore saves a corrupt live DB's raw files
+  in the pre-restore folder and continues; its scratch is under `$BACKUP_DIR`.
 - Port binding: `BIND_ADDR` in `.env` sets the host IP published ports bind
   on (unset = all interfaces). UFW does not filter Docker-published ports,
   so the bind address is the LAN-only control (`DEPLOY_DEBIAN.md` Step 7)

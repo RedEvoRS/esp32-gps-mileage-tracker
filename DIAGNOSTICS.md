@@ -1913,8 +1913,8 @@ heartbeat integration is implemented by #125; consistent state backups shipped
 under #129 (see [backups and acceptance](#backups-and-acceptance-129130)).
 Installer test uploads omit `X-Device-Id` so a routine `--check` does not enroll
 an ever-watched synthetic device. A synthetic upload that will delete its files
-must use a unique timestamp in its body and verify the returned `stored_as`:
-`X-Trip-Id` cannot isolate a timed GPX for cleanup.
+must be untimed (no `<time>` elements) so its `X-Trip-Id` is honoured, and must
+verify the returned `stored_as`: ingest ignores `X-Trip-Id` for timed GPX.
 
 #### Prometheus metrics (#134)
 
