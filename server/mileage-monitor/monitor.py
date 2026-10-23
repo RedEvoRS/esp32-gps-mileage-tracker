@@ -548,14 +548,16 @@ class Monitor:
                     self.codes, key[0], key[1], value[0], value[1], now, value[2]))
                  for key, value in sorted(changes.items())][:gelf.MAX_PER_TICK]
         cursor = db.execute("SELECT event_rowid FROM gelf_cursor WHERE singleton=1").fetchone()[0]
-        highest, rows = gelf.read_events(self.events_path, cursor, max(0, gelf.MAX_PER_TICK - len(items)))
-        if highest < cursor:
+        highest, rows, anchor = gelf.read_events(self.events_path, cursor, max(0, gelf.MAX_PER_TICK - len(items)))
+        if highest < cursor or gelf.cursor_changed(db, "gelf", cursor, anchor):
             # events.db was replaced (e.g. restored from a backup): start over.
             # Graylog may see duplicates; it never silently misses events.
-            LOG.warning("Diagnostics events restarted below the Graylog cursor; resending from the start")
+            LOG.warning("Diagnostics event identity changed at the Graylog cursor; resending from the start")
             with db:
                 db.execute("UPDATE gelf_cursor SET event_rowid=0 WHERE singleton=1")
+                db.execute("DELETE FROM event_cursor_markers WHERE sink='gelf'")
             return
+        fingerprints = {row[0]: gelf.event_fingerprint(row) for row in rows}
         for row in rows:
             payload = gelf.event_message(self.codes, row)
             if payload is None:
@@ -583,6 +585,7 @@ class Monitor:
                                (device, code, state, episode))
                 else:
                     db.execute("UPDATE gelf_cursor SET event_rowid=? WHERE singleton=1", (key,))
+                    gelf.save_cursor_marker(db, "gelf", key, fingerprints[key])
             if error is None:
                 db.execute("UPDATE gelf_retry SET attempts=0,next_attempt=0 WHERE singleton=1")
             else:
@@ -606,13 +609,14 @@ class Monitor:
             return
         event_cursor, decision_cursor = db.execute(
             "SELECT event_rowid,decision_id FROM loki_cursor WHERE singleton=1").fetchone()
-        highest, rows = gelf.read_events(self.events_path, event_cursor, loki_module.MAX_PER_TICK)
-        if highest < event_cursor:
+        highest, rows, anchor = gelf.read_events(self.events_path, event_cursor, loki_module.MAX_PER_TICK)
+        if highest < event_cursor or gelf.cursor_changed(db, "loki", event_cursor, anchor):
             # A restored events.db can be shorter than this sink's cursor.
             # Start its history over without changing GELF progress.
             with db:
                 db.execute("UPDATE loki_cursor SET event_rowid=0 WHERE singleton=1")
-            LOG.warning("Diagnostics events restarted below the Loki cursor; resending from the start")
+                db.execute("DELETE FROM event_cursor_markers WHERE sink='loki'")
+            LOG.warning("Diagnostics event identity changed at the Loki cursor; resending from the start")
             return
 
         # While an event backlog drains, send only events so each stream stays
@@ -673,6 +677,8 @@ class Monitor:
         with db:
             db.execute("UPDATE loki_cursor SET event_rowid=?,decision_id=? WHERE singleton=1",
                        (next_event, next_decision))
+            if rows:
+                gelf.save_cursor_marker(db, "loki", next_event, gelf.event_fingerprint(rows[-1]))
             for (device, code), (state, episode, _), _ in condition_items:
                 db.execute("INSERT INTO loki_conditions VALUES (?,?,?,?) ON CONFLICT(device,code) "
                            "DO UPDATE SET state=excluded.state, episode=excluded.episode",

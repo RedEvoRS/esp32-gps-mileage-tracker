@@ -6,6 +6,8 @@ JSON validation work is performed while holding the write lock.
 """
 
 import json
+import logging
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -13,6 +15,9 @@ from pathlib import Path
 
 
 SCHEMA_VERSION = 1
+# The firmware saves +1 per drain opportunity (normally at most every 30 s).
+# This permits about 347 days of continuous awake allocations without contact.
+MAX_STATUS_STEP = 1_000_000
 SCHEMA = (
     "CREATE TABLE IF NOT EXISTS schema_version ("
     "singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL)",
@@ -55,6 +60,11 @@ class DiagnosticsStore:
 
     def _connect(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Explicit creation mode also protects callers that import this store
+        # independently of app.py's private umask. Existing files are tightened.
+        fd = os.open(self.path, os.O_CREAT | os.O_WRONLY, 0o600)
+        os.close(fd)
+        os.chmod(self.path, 0o600)
         db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
         try:
             db.execute("PRAGMA busy_timeout=5000")
@@ -101,6 +111,19 @@ class DiagnosticsStore:
         with self._transaction() as db:
             self._contact(db, device_id, datetime.now(timezone.utc).isoformat())
 
+    def reset_high_water(self, device_id, high_water, expected):
+        """Explicit operator recovery; never retain health from the old revision."""
+        if not 0 <= high_water < (1 << 63) - 1:
+            raise ValueError("high-water must be between 0 and 9223372036854775806")
+        with self._transaction() as db:
+            row = db.execute("SELECT status_sequence FROM devices WHERE device_id=?", (device_id,)).fetchone()
+            if row is None or row[0] != expected:
+                raise ConflictError("device high-water changed or device does not exist")
+            db.execute("UPDATE devices SET status_sequence=?,snapshot_json=NULL,snapshot_received_at=NULL "
+                       "WHERE device_id=?", (high_water, device_id))
+            db.execute("UPDATE device_conditions SET state='unknown',episode_id=NULL WHERE device_id=?",
+                       (device_id,))
+
     def accept(self, device_id, body):
         snapshot = body["checkin"]
         snapshot_json = canonical(snapshot)
@@ -115,6 +138,12 @@ class DiagnosticsStore:
                 (device_id,)).fetchone()
             if revision == snapshot["status_sequence"] and previous != snapshot_json:
                 raise ConflictError("status_sequence conflicts with stored snapshot")
+            snapshot_allowed = snapshot["status_sequence"] <= (revision or 0) + MAX_STATUS_STEP
+            if not snapshot_allowed:
+                # 400 keeps retrying the same bad check-in; 409 permanently
+                # suspends firmware revision authority. Ack durable events with
+                # 200 while refusing only this health snapshot, like stale ones.
+                logging.getLogger(__name__).warning("Ignored diagnostics snapshot: status_sequence step exceeds limit")
 
             boot_ids = {snapshot["boot_id"]} | {event["boot_id"] for event, _ in events}
             for boot_id in boot_ids:
@@ -136,7 +165,7 @@ class DiagnosticsStore:
                            (*identity, event["code"], definition["severity"] if definition else None,
                             event["utc_ms"], received_at, encoded))
 
-            if revision is None or snapshot["status_sequence"] > revision:
+            if snapshot_allowed and (revision is None or snapshot["status_sequence"] > revision):
                 db.execute(
                     "UPDATE devices SET status_sequence=?, snapshot_json=?, snapshot_received_at=? "
                     "WHERE device_id=?",

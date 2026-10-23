@@ -99,12 +99,12 @@ class UploadSafety(unittest.TestCase):
         self.assertEqual((gpx.read_bytes(), summary.read_bytes()), before)
 
     def test_device_and_sanitized_id_collisions_preserve_existing_trip(self):
-        response = self.upload(**{"X-Trip-Id": "trip:id"})
+        response = self.upload(body(timed=False), **{"X-Trip-Id": "trip:id"})
         gpx, summary = self.saved_pair(response)
         before = (gpx.read_bytes(), summary.read_bytes())
         for headers in ({"X-Trip-Id": "trip_id"},
                         {"X-Trip-Id": "trip:id", "X-Device-Id": "other"}):
-            self.assertEqual(self.upload(**headers).status_code, 409)
+            self.assertEqual(self.upload(body(timed=False), **headers).status_code, 409)
         self.assertEqual((gpx.read_bytes(), summary.read_bytes()), before)
 
     def test_retry_repairs_summary_after_write_failure(self):
@@ -132,7 +132,7 @@ class UploadSafety(unittest.TestCase):
                 self.assertIn("damaged summary", logs.output[0])
                 record = json.loads(summary.read_bytes())
                 self.assertEqual((record["trip_id"], record["device_id"], record["num_points"]),
-                                 ("audit-trip", "test-device", 2))
+                                 ("2026-04-14T14-30-00Z", "test-device", 2))
                 self.assertEqual(gpx.read_bytes(), body())
 
     def test_damaged_summary_without_its_gpx_is_409_and_kept(self):
@@ -179,7 +179,7 @@ class UploadSafety(unittest.TestCase):
         self.assertEqual(list(self.root.glob("*/*.json")), [])
 
     def test_unicode_trip_id_uses_viewer_compatible_filename(self):
-        response = self.upload(**{"X-Trip-Id": "caf\u00e9-trip"})
+        response = self.upload(body(timed=False), **{"X-Trip-Id": "caf\u00e9-trip"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(Path(response.get_json()["stored_as"]).stem, "caf_-trip")
 

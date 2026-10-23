@@ -80,11 +80,39 @@ bound or storage problem first; only then retry with a higher ID and reboot.
 
 For recovery after metadata loss/replacement or a confirmed snapshot conflict,
 preserve the existing metadata, re-read the server and inspect the card before
-choosing the recovery value. Never reset the server high-water or treat a
+choosing the recovery value. Never silently reset the server high-water or treat a
 replacement card as a new device identity. A conflict suspends revision
 allocation and blocks diagnostics in memory; explicit recovery with a new ID,
 verified lower bound and reboot is required. The normal cleanup above applies
 again after a successful current snapshot.
+
+#### Admin high-water recovery
+
+Use this only to repair a confirmed poisoned high-water or incorrect enrollment.
+Ordinary replacement-card recovery still follows the enrollment procedure above.
+Stop the tracker first and preserve a backup of `events.db` and the SD metadata.
+Read the current server high-water and inspect the SD stored revision using the
+commands above. Choose a replacement high-water at least as high as the SD
+revision, with room for another revision, then explicitly re-enroll with a new
+enrollment ID and that value if the allocator needs recovery. Do not guess or
+use the signed-integer maximum.
+
+From the server folder, run (replace each bracketed value):
+
+```sh
+docker compose exec mileage-ingest python /app/reset_high_water.py \
+  --device-id <device-id> --expect-high-water <current-server-revision> \
+  --high-water <replacement-revision>
+```
+
+The command compares the current value inside the write transaction and refuses
+if another request changed it. It preserves journal history and last contact,
+clears the old snapshot, and marks all current conditions unknown. No resolved
+fault is inferred. A later snapshot must exceed the replacement value by at most
+1,000,000. Reboot after re-enrollment, confirm a current snapshot in Device health,
+then remove the enrollment defines and reflash with erase disabled as above.
+The script accepts values from 0 through 9223372036854775806. This is an explicit
+local administration action, never an upload-triggered reset.
 
 Leaving enrollment firmware installed normally cannot reuse a consumed ID
 while NVS survives. **Erase-all clears `diag/enroll`**: firmware still carrying
@@ -700,6 +728,22 @@ current health. Equal revision with different snapshot content is a conflict;
 an identical retry does not refresh snapshot observation time. This prevents a
 delayed, previously unseen old boot from clearing a newer boot's faults. Random
 boot IDs, receipt order and the diagnostic boot counter cannot guarantee that.
+
+A new snapshot may advance at most **1,000,000** above the stored high-water
+(zero when no snapshot has been accepted). The SD allocator advances by one per
+drain opportunity, normally at most once per 30-second awake network tick, so
+this allows about 347 days of continuous allocations between contacts. Normal
+re-enrollment starts from the freshly read high-water and advances by one. If
+restored server state is further behind the card, use explicit admin recovery.
+An excessive jump is refused only as a snapshot: current health and high-water
+stay unchanged, a warning is logged, and validated journal events/contact still
+commit with a normal **200 and exact event acknowledgment list**. A snapshot-only
+request gets `accepted: []`. This follows stale-snapshot semantics: firmware
+does not wedge its queue. Returning 400 would keep retrying the bad check-in;
+409 on an empty check-in/probe suspends the firmware revision allocator until
+explicit recovery. This bound limits one-request poisoning; a holder of the
+shared token can still forge events or repeatedly advance revisions. Per-device
+credentials remain a separate hardening option.
 
 Persisting the revision once per new check-in has an NVS wear and recovery cost;
 do not write it for every scan or event. EventLog's allocator uses one durable
@@ -1868,7 +1912,9 @@ default silence is exactly seven days with an inclusive threshold. Firmware
 heartbeat integration is implemented by #125; consistent state backups shipped
 under #129 (see [backups and acceptance](#backups-and-acceptance-129130)).
 Installer test uploads omit `X-Device-Id` so a routine `--check` does not enroll
-an ever-watched synthetic device; their unique `X-Trip-Id` still owns cleanup.
+an ever-watched synthetic device. A synthetic upload that will delete its files
+must use a unique timestamp in its body and verify the returned `stored_as`:
+`X-Trip-Id` cannot isolate a timed GPX for cleanup.
 
 #### Prometheus metrics (#134)
 
@@ -1915,8 +1961,12 @@ independent of `NOTIFY_ENABLED` and `NOTIFY_*` settings (only
   order. An interrupted send before cursor commit can produce duplicates. The
   cursor is the last delivered rowid (`gelf_cursor`). The ingest never deletes
   events, so rowids only grow; if the table's highest rowid is ever below the
-  cursor (events.db replaced by a restore), the cursor resets to 0 and history
-  is resent, so Graylog may see duplicates but never silently misses events.
+  cursor, or the row at the cursor no longer has the stored fingerprint, the
+  cursor resets to 0 and history is resent. This also detects a restore whose
+  rowids were refilled before the next tick. Graylog may see duplicates.
+  Fingerprints live in the additive `event_cursor_markers` table; existing v1
+  cursor tables are unchanged. On upgrade, a nonzero cursor without a marker
+  replays once because its old identity cannot be verified.
   A damaged stored row is skipped with a type-only warning and the cursor
   moves past it.
 - `condition`: the state of each (device, code) as the monitor sees it:
@@ -1995,8 +2045,11 @@ from 60 seconds to one hour without advancing the batch. A permanent HTTP 4xx
 other than 408 or 429 logs only the status code, skips the rejected batch and
 advances its cursors; that history is not retried, and later rows continue.
 Successful pushes advance the batch; an ambiguous response can be retried and
-duplicated. If `events.db` is restored with a lower rowid than Loki's cursor,
-only the Loki event cursor resets and that history is sent again. Loki runs
+duplicated. If `events.db` has a lower maximum rowid or a different event
+fingerprint at Loki's cursor, only that sink's event cursor resets and history
+is sent again, even when new uploads refilled the old rowids between ticks.
+Its marker is independent of GELF in `event_cursor_markers`; upgrading an old
+nonzero cursor without a marker replays once. Loki runs
 after ntfy and GELF; its failures are caught separately and do not change
 either sink's progress or trip uploads.
 
