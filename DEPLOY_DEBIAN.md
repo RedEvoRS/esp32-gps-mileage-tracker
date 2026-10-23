@@ -755,8 +755,9 @@ CSRF-protected POSTs. See [Merge recordings from one drive](server/README.md#mer
 for the annotation and timing details.
 
 > Deliberately fail a login password five times and you'll be locked out of that
-> browser's IP for 15 minutes — including with the *correct* password. If you
-> trip this during setup, clear it with:
+> browser's IP for 15 minutes — including with the *correct* password. Failures
+> count until there has been a 15-minute pause without one; the next failure
+> then starts a fresh count. If you trip this during setup, clear it with:
 > `docker compose exec mileage-viewer python -c "import sqlite3;c=sqlite3.connect('/db/annotations.db');c.execute('DELETE FROM login_attempts');c.commit()"`
 
 **Clean up the test trip** so it doesn't pollute your real mileage log:
@@ -1798,8 +1799,10 @@ docker compose logs mileage-viewer --tail 20
 Usual causes: `viewer.env` not created, or the admin password hash lost its `$`
 characters to shell expansion (fix by single-quoting it).
 
-**Locked out of the viewer** — 5 bad passwords locks the IP for 15 minutes.
-Clear it:
+**Locked out of the viewer** — 5 bad passwords lock the IP for 15 minutes.
+Failures count until there has been a 15-minute pause without one; the next
+failure then starts a fresh count. A successful login clears only failures
+against its own username. To unlock immediately, clear it:
 
 ```bash
 docker compose exec mileage-viewer python -c \

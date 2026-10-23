@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,6 +32,74 @@ class ViewerLockoutTests(unittest.TestCase):
     def row(self, ip='127.0.0.1'):
         with closing(sqlite3.connect(self.db)) as conn:
             return conn.execute('SELECT fails, locked_until FROM login_attempts WHERE ip=?', (ip,)).fetchone()
+
+    def test_stale_failures_and_their_names_expire_at_the_quiet_window(self):
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with patch.object(self.viewer, 'datetime', wraps=datetime) as clock:
+            clock.now.return_value = start
+            for _ in range(4):
+                self.viewer._record_failure('127.0.0.1', 'typo')
+            # Just short of a quiet window, the existing count still applies.
+            clock.now.return_value = start + timedelta(minutes=15, microseconds=-1)
+            self.assertEqual(self.row()[0], 4)
+            clock.now.return_value = start + timedelta(minutes=15)
+            self.viewer._record_failure('127.0.0.1', 'driver')
+        self.assertEqual(self.row(), (1, None))
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute('SELECT name, fails FROM login_attempt_names').fetchall(), [('driver', 1)])
+        # A later success against an expired name cannot erase this new failure.
+        self.viewer._clear_failures('127.0.0.1', 'TYPO')
+        self.assertEqual(self.row()[0], 1)
+
+    def test_each_failure_restarts_the_quiet_window_and_five_still_lock(self):
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with patch.object(self.viewer, 'datetime', wraps=datetime) as clock:
+            for index in range(5):
+                # More than 15 min from the first guess, but never a 15 min pause.
+                clock.now.return_value = start + timedelta(minutes=14 * index)
+                self.viewer._record_failure('127.0.0.1', 'typo')
+                if index < 4:
+                    self.assertEqual(self.row(), (index + 1, None))
+            self.assertEqual(self.viewer._lock_seconds_remaining('127.0.0.1'), 15 * 60)
+
+    def test_active_lock_lasts_fifteen_minutes_and_is_not_extended(self):
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with patch.object(self.viewer, 'datetime', wraps=datetime) as clock:
+            clock.now.return_value = start
+            for _ in range(5):
+                self.viewer._record_failure('127.0.0.1', 'driver')
+            until = self.row()[1]
+            clock.now.return_value = start + timedelta(minutes=14, seconds=59)
+            self.assertEqual(self.viewer._lock_seconds_remaining('127.0.0.1'), 1)
+            self.viewer._record_failure('127.0.0.1', 'helper')
+            self.viewer._clear_failures('127.0.0.1', 'driver')
+            self.assertEqual(self.row()[1], until)
+            clock.now.return_value = start + timedelta(minutes=15)
+            self.assertEqual(self.viewer._lock_seconds_remaining('127.0.0.1'), 0)
+            self.viewer._record_failure('127.0.0.1', 'helper')
+            self.assertEqual(self.row(), (1, None))
+
+    def test_success_for_another_name_does_not_postpone_expiry(self):
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with patch.object(self.viewer, 'datetime', wraps=datetime) as clock:
+            clock.now.return_value = start
+            self.viewer._record_failure('127.0.0.1', 'typo')
+            clock.now.return_value = start + timedelta(minutes=14)
+            self.assertEqual(self.attempt('helper', 'everyday-password'), 302)
+            clock.now.return_value = start + timedelta(minutes=15)
+            self.viewer._record_failure('127.0.0.1', 'driver')
+            self.assertEqual(self.row(), (1, None))
+
+    def test_concurrent_failures_after_quiet_window_start_one_fresh_count(self):
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with patch.object(self.viewer, 'datetime', wraps=datetime) as clock:
+            clock.now.return_value = start
+            for _ in range(4):
+                self.viewer._record_failure('127.0.0.1', 'typo')
+            clock.now.return_value = start + timedelta(minutes=15)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                list(pool.map(lambda _: self.viewer._record_failure('127.0.0.1', 'driver'), range(4)))
+        self.assertEqual(self.row(), (4, None))
 
     def test_everyday_login_cannot_reset_failed_admin_guesses(self):
         codes = []
@@ -156,7 +225,7 @@ class ViewerLockoutTests(unittest.TestCase):
             counts = dict(conn.execute("SELECT name, fails FROM login_attempt_names WHERE ip='192.0.2.9'"))
         self.assertEqual(counts, {'driver': 8, 'helper': 8, 'someone': 8})
 
-    def test_upgrade_keeps_old_login_attempts_and_still_locks(self):
+    def test_upgrade_keeps_active_locks_but_untimed_failures_are_stale(self):
         # An annotations.db from before per-name counts: login_attempts only.
         root = Path(self.temp.name) / 'upgrade'
         root.mkdir()
@@ -177,12 +246,40 @@ class ViewerLockoutTests(unittest.TestCase):
             self.assertEqual(conn.execute('SELECT fails FROM login_attempts WHERE ip="127.0.0.1"').fetchone()[0], 3)
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM login_attempt_names').fetchone()[0], 0)
         self.assertGreater(viewer._lock_seconds_remaining('192.0.2.5'), 0)
-        # The old, unattributed failures keep counting: two more lock the IP,
-        # and a success by any user does not erase them.
+        # The old unattributed failures have no time; the next failure starts
+        # a fresh count, while an already active lock is preserved above.
         viewer._clear_failures('127.0.0.1', 'driver')
         viewer._record_failure('127.0.0.1', 'driver')
         viewer._record_failure('127.0.0.1', 'driver')
-        self.assertGreater(viewer._lock_seconds_remaining('127.0.0.1'), 0)
+        self.assertEqual(viewer._lock_seconds_remaining('127.0.0.1'), 0)
+        with closing(sqlite3.connect(old_db)) as conn:
+            self.assertEqual(conn.execute('SELECT fails FROM login_attempts WHERE ip="127.0.0.1"').fetchone()[0], 2)
+
+    def test_v005_migration_is_additive_and_serialized_across_startup(self):
+        old_db = Path(self.temp.name) / 'v005.db'
+        with closing(sqlite3.connect(old_db)) as conn, conn:
+            conn.execute('CREATE TABLE annotations (trip_key TEXT PRIMARY KEY, category TEXT, purpose_note TEXT, updated_at TEXT, destination TEXT NOT NULL DEFAULT "")')
+            conn.execute("INSERT INTO annotations VALUES ('2026-01/example', 'business', 'example', '', 'example')")
+            conn.execute('CREATE TABLE login_attempts (ip TEXT PRIMARY KEY, fails INTEGER NOT NULL DEFAULT 0, locked_until TEXT)')
+            conn.execute('CREATE TABLE login_attempt_names (ip TEXT NOT NULL, name TEXT NOT NULL, fails INTEGER NOT NULL, PRIMARY KEY (ip, name))')
+            conn.execute("INSERT INTO login_attempts VALUES ('192.0.2.1', 4, NULL)")
+            conn.execute("INSERT INTO login_attempt_names VALUES ('192.0.2.1', 'typo', 4)")
+            conn.execute("INSERT INTO login_attempts VALUES ('192.0.2.2', 0, '2999-01-01T00:00:00+00:00')")
+        with patch.object(self.viewer, 'DB_PATH', old_db):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(lambda _: self.viewer.init_db(), range(8)))
+            with closing(sqlite3.connect(old_db)) as conn:
+                self.assertEqual(conn.execute('SELECT COUNT(*) FROM annotations').fetchone()[0], 1)
+                self.assertEqual(conn.execute('SELECT last_failed_at FROM login_attempts').fetchall(), [(None,), (None,)])
+                self.assertEqual(conn.execute('SELECT fails FROM login_attempt_names').fetchone()[0], 4)
+            self.viewer._record_failure('192.0.2.2', 'driver')
+            self.assertGreater(self.viewer._lock_seconds_remaining('192.0.2.2'), 0)
+            self.viewer._record_failure('192.0.2.1', 'driver')
+            self.viewer._clear_failures('192.0.2.1', 'typo')
+            with closing(sqlite3.connect(old_db)) as conn:
+                self.assertEqual(conn.execute('SELECT fails FROM login_attempts WHERE ip="192.0.2.1"').fetchone()[0], 1)
+                self.assertEqual(conn.execute('SELECT name, fails FROM login_attempt_names').fetchall(), [('driver', 1)])
+                self.assertIsNotNone(conn.execute('SELECT last_failed_at FROM login_attempts WHERE ip="192.0.2.1"').fetchone()[0])
 
 
 if __name__ == '__main__':

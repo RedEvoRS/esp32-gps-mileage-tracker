@@ -148,6 +148,7 @@ VIEWER_SECRET_KEY = os.environ.get("VIEWER_SECRET_KEY", "").strip()
 
 # Lockout policy: after MAX_FAILS bad passwords from one IP, refuse that
 # IP for LOCKOUT_MINUTES regardless of whether the next guess is correct.
+# A quiet LOCKOUT_MINUTES without a failure resets the count on the next one.
 MAX_FAILS = 5
 LOCKOUT_MINUTES = 15
 
@@ -284,6 +285,11 @@ def init_db():
             )
             """
         )
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(login_attempts)")}
+        if "last_failed_at" not in columns:
+            # Existing failures have no known age. Treat them as stale at the
+            # next failure, but preserve any active lock until its expiry.
+            conn.execute("ALTER TABLE login_attempts ADD COLUMN last_failed_at TEXT")
         # Which usernames the failures in login_attempts.fails were against.
         # A success may only subtract its own username's share; login_attempts
         # stays the per-IP count and lock, so clearing it unlocks everyone.
@@ -365,26 +371,31 @@ def _record_failure(ip, username=""):
     """Count a bad password and lock the IP once it hits MAX_FAILS.
 
     The lock and total are per IP, whichever username was tried; the name
-    is kept only so a later success can subtract its own failures.
+    is kept only so a later success can subtract its own failures. A pause of
+    LOCKOUT_MINUTES since the last failure starts the count and names afresh.
     """
-    now = datetime.now(timezone.utc)
     name = _failure_name(username)
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         # Reserve the writer before reading: workers must not both read
         # the same count, then overwrite each other's increment.
         conn.execute("BEGIN IMMEDIATE")
+        now = datetime.now(timezone.utc)
         row = conn.execute(
-            "SELECT fails, locked_until FROM login_attempts WHERE ip = ?", (ip,)
+            "SELECT fails, locked_until, last_failed_at FROM login_attempts WHERE ip = ?", (ip,)
         ).fetchone()
-        if not row:
-            # Name counts only describe a login_attempts row. A manual
-            # DELETE FROM login_attempts leaves them behind; drop them so
-            # they can't be subtracted from failures counted after the unlock.
-            conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
         # Another request may have established the lock while this request
         # was checking its password. Its failure must not clear that lock.
         if row and row[1] and datetime.fromisoformat(row[1]) > now:
             return
+        if row and (row[2] is None or datetime.fromisoformat(row[2]) <=
+                    now - timedelta(minutes=LOCKOUT_MINUTES)):
+            row = None
+        if not row:
+            # Name counts only describe a login_attempts row. A manual
+            # DELETE FROM login_attempts leaves them behind; drop them so
+            # they can't be subtracted from failures counted after the unlock.
+            # The same applies when the whole count expires after a quiet gap.
+            conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
         fails = (row[0] if row else 0) + 1
         if fails >= MAX_FAILS:
             locked_until = (now + timedelta(minutes=LOCKOUT_MINUTES)).isoformat()
@@ -401,13 +412,14 @@ def _record_failure(ip, username=""):
             )
         conn.execute(
             """
-            INSERT INTO login_attempts (ip, fails, locked_until)
-            VALUES (?, ?, ?)
+            INSERT INTO login_attempts (ip, fails, locked_until, last_failed_at)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(ip) DO UPDATE SET
                 fails = excluded.fails,
-                locked_until = excluded.locked_until
+                locked_until = excluded.locked_until,
+                last_failed_at = excluded.last_failed_at
             """,
-            (ip, fails, locked_until),
+            (ip, fails, locked_until, now.isoformat()),
         )
 
 
