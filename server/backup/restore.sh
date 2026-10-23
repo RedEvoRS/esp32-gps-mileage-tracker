@@ -39,7 +39,7 @@ usage() {
 # when an older one has some. A rebuilt server's first backup is empty and
 # is newer than the history it is about to be restored from.
 newest_snapshot_with_trips() {
-    local names name trips newest= info
+    local names name trips newest="" info
     names=$(rsync_remote --list-only "$REMOTE/snapshots/" \
         | awk '{ print $NF }' | grep -E "$SNAPSHOT_RE" | LC_ALL=C sort -r || true)
     while read -r name; do
