@@ -94,15 +94,25 @@ class InstallerBackupTimer(unittest.TestCase):
         (path / "backup").mkdir(parents=True)
         for name in ("mileage-backup@.service", "mileage-backup@.timer"):
             shutil.copy(SERVER / "backup" / name, path / "backup" / name)
-        for name, what in (("backup.sh", "backup"), ("restore.sh", "restore")):
-            (path / "backup" / name).write_text(
-                f'echo "{what} {path}" >> "$STATE/log"\n')
-        (path / "backup" / "backup.conf").write_text(
-            "REMOTE='backup@nas.invalid:/backups/mileage'\n"
-            f"BACKUP_DIR='{self.backups}'\n")
+        (path / "backup" / "backup.sh").write_text(textwrap.dedent(f"""\
+            case ${{1:-}} in
+                --check-target) [[ ! -f "$STATE/unmarked" ]]; exit ;;
+                --mark-target) rm -f "$STATE/unmarked"; echo "mark {path}" >> "$STATE/log"; exit 0 ;;
+            esac
+            echo "backup {path}" >> "$STATE/log"
+            """))
+        (path / "backup" / "restore.sh").write_text(
+            f'echo "restore {path}" >> "$STATE/log"\n')
+        (path / "data").mkdir()
+        self.write_conf(path, "backup@nas.invalid:/backups/mileage")
         return path
 
-    def run_setup(self, where, mode="install"):
+    def write_conf(self, path, remote):
+        (path / "backup" / "backup.conf").write_text(
+            f"REMOTE='{remote}'\n"
+            f"BACKUP_DIR='{self.backups}'\n")
+
+    def run_setup(self, where, mode="install", extra_env=None):
         log = self.state / "log"
         if log.exists():
             log.unlink()
@@ -110,6 +120,7 @@ class InstallerBackupTimer(unittest.TestCase):
                    RUN_DIR=str(where), FAKE_UNITS=str(self.units),
                    FAKE_DEFAULT=str(self.default), STATE=str(self.state),
                    FAKE_USER=USER)
+        env.update({"INSTALL_SAME_DISK": "y", **(extra_env or {})})
         proc = subprocess.run(["bash", "-c", HARNESS], env=env, text=True,
                               capture_output=True, timeout=60)
         out = proc.stdout + proc.stderr
@@ -163,12 +174,122 @@ class InstallerBackupTimer(unittest.TestCase):
         self.assertIn(str(self.a), self.dropin.read_text())
         self.assertNotIn(f"backup {self.b}", log)
 
+    # --- unit files follow the update (#470) and the mount rule (#466) ---
+
+    def installed(self, name="mileage-backup@.service"):
+        return self.units / name
+
+    def test_update_reinstalls_unit_files_that_differ_from_the_shipped_ones(self):
+        self.run_setup(self.a)
+        shipped = (self.a / "backup/mileage-backup@.service").read_text()
+        self.installed().write_text("old unit\n")
+        self.installed("mileage-backup@.timer").write_text("old timer\n")
+        code, out, log = self.run_setup(self.a)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.installed().read_text(), shipped)
+        self.assertEqual(self.installed("mileage-backup@.timer").read_text(),
+                         (self.a / "backup/mileage-backup@.timer").read_text())
+        self.assertIn("Updated the backup's systemd files", out)
+        # No new backup run for a file refresh.
+        self.assertEqual(log, [])
+        code, out, log = self.run_setup(self.a)
+        self.assertNotIn("Updating them", out)
+
+    def test_check_warns_about_stale_unit_files_without_changing_them(self):
+        self.run_setup(self.a)
+        self.installed().write_text("old unit\n")
+        code, out, _ = self.run_setup(self.a, mode="check")
+        self.assertIn("differ from the ones", out)
+        self.assertIn("FAILURES=0", out)
+        self.assertEqual(self.installed().read_text(), "old unit\n")
+
+    def mounts_dropin(self):
+        return self.units / f"mileage-backup@{USER}.service.d" / "backup-mounts.conf"
+
+    def test_local_destination_requires_its_mount_through_a_drop_in(self):
+        mount = self.root / "mnt/backup-share/mileage"
+        self.write_conf(self.a, str(mount))
+        code, out, _ = self.run_setup(self.a)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.mounts_dropin().read_text(),
+                         f"[Unit]\nRequiresMountsFor={mount} {self.backups}\n")
+        # Back to an SSH destination: only BACKUP_DIR is left to require.
+        self.write_conf(self.a, "backup@nas.invalid:/backups/mileage")
+        code, out, _ = self.run_setup(self.a)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.mounts_dropin().read_text(),
+                         f"[Unit]\nRequiresMountsFor={self.backups}\n")
+
+    # --- the destination marker file (#466) ---
+
+    def test_a_rerun_marks_a_destination_that_has_no_marker_yet(self):
+        self.run_setup(self.a)
+        (self.state / "unmarked").touch()
+        code, out, log = self.run_setup(self.a)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(log, [f"mark {self.a}"])
+        self.assertIn("Marked", out)
+
+    def test_a_marked_destination_is_left_alone(self):
+        self.run_setup(self.a)
+        code, out, log = self.run_setup(self.a)
+        self.assertEqual(log, [])
+
+    def test_a_rerun_does_not_mark_an_unmounted_local_destination(self):
+        # A local folder on the same disk as the data is what an unmounted
+        # share looks like. The default answer to "use it anyway?" is no.
+        self.run_setup(self.a)
+        target = self.root / "mnt/backup-share"
+        self.write_conf(self.a, str(target))
+        (self.state / "unmarked").touch()
+        env_answer = {"INSTALL_SAME_DISK": "n"}
+        code, out, log = self.run_setup(self.a, extra_env=env_answer)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(log, [])
+        self.assertIn("nightly backup will refuse", out)
+
+    def test_check_fails_when_the_destination_has_no_marker(self):
+        self.run_setup(self.a)
+        (self.state / "unmarked").touch()
+        code, out, _ = self.run_setup(self.a, mode="check")
+        self.assertIn("FAILURES=1", out)
+        self.assertIn("--mark-target", out)
+
     def test_a_similar_path_is_not_mistaken_for_this_one(self):
         # /srv/a/mileage-tracker must not match /srv/a/mileage-tracker-old.
         old = self.make_install("srv/a/mileage-tracker-old")
         self.run_setup(old)
         code, out, _ = self.run_setup(self.a, mode="check")
         self.assertIn("doesn't back up", out)
+
+
+SSH_HARNESS = textwrap.dedent("""\
+    source <(sed '$d' "$INSTALL")
+    ME=tester
+    ssh() { return 0; }
+    ssh-keygen() { return 0; }
+    ssh-copy-id() { return 0; }
+    ssh_target_ok user@nas.invalid:/backups/mileage > /dev/null
+    echo "CMD=$RSYNC_SSH_CMD"
+    """)
+
+
+@unittest.skipIf(os.name == "nt" or shutil.which("bash") is None,
+                 "needs bash")
+class InstallerBackupSshCommand(unittest.TestCase):
+    def test_generated_ssh_command_has_keepalive_and_connect_limits(self):
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home)
+        (home / ".ssh").mkdir()
+        (home / ".ssh/mileage_backup").write_text("key")
+        env = dict(os.environ, INSTALL=str(INSTALL), HOME=str(home))
+        proc = subprocess.run(["bash", "-c", SSH_HARNESS], env=env, text=True,
+                              capture_output=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        cmd = [line for line in proc.stdout.splitlines() if line.startswith("CMD=")][0]
+        for option in ("IdentitiesOnly=yes", "BatchMode=yes", "ServerAliveInterval=30",
+                       "ServerAliveCountMax=4", "ConnectTimeout=30"):
+            self.assertIn(option, cmd)
 
 
 if __name__ == "__main__":
