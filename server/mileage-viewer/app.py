@@ -79,6 +79,7 @@ from flask import (
     url_for,
 )
 from openpyxl import Workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.exceptions import HTTPException
 
@@ -218,6 +219,32 @@ def _startup_check():
 
 # These are user classifications for recordkeeping, not tax determinations.
 CATEGORIES = ("business", "personal", "other")
+
+# A note or destination is a sentence, not a document. The cap also keeps every
+# saved value inside one XLSX cell (32,767 characters) with room to spare.
+ANNOTATION_MAX_CHARS = 2000
+XLSX_CELL_MAX_CHARS = 32767
+# What XML 1.0 can't hold: openpyxl's own list of control characters, plus
+# lone surrogates and U+FFFE/U+FFFF, which openpyxl lets through into a
+# workbook that then can't be opened.
+XML_ILLEGAL_RE = re.compile(ILLEGAL_CHARACTERS_RE.pattern + r"|[\ud800-\udfff\ufffe\uffff]")
+
+
+def _annotation_text_problem(label, text):
+    """Why a typed note or destination can't be saved, or None.
+
+    It never strips anything: the user is told, so nothing they typed changes
+    without them knowing.
+    """
+    if len(text) > ANNOTATION_MAX_CHARS:
+        return (f"The {label} is {len(text)} characters long; the limit is "
+                f"{ANNOTATION_MAX_CHARS}. Shorten it and save again.")
+    bad = XML_ILLEGAL_RE.search(text)
+    if bad:
+        return (f"The {label} contains a control character (U+{ord(bad.group()):04X}) that "
+                "spreadsheets can't hold. Remove it (often a stray paste from another "
+                "program) and save again.")
+    return None
 
 # Strict patterns for the URL components, so a trip path can never escape
 # DATA_ROOT via "..", absolute paths, or odd characters.
@@ -1318,7 +1345,7 @@ def _abort_if_key_in_closed_year(conn, *keys):
 
 app.jinja_env.globals.update(
     fmt_date=fmt_date, fmt_day=fmt_day, fmt_trip_date=fmt_trip_date, fmt_duration=fmt_duration,
-    fmt_speed=fmt_speed, csrf_token=_csrf_token
+    fmt_speed=fmt_speed, csrf_token=_csrf_token, annotation_max=ANNOTATION_MAX_CHARS
 )
 
 
@@ -1853,14 +1880,14 @@ TRIP_HTML = """
       {% endfor %}
     </select>
     <label for="destination">Destination / place</label>
-    <input type="text" name="destination" id="destination" value="{{ t.destination or '' }}">
+    <input type="text" name="destination" id="destination" maxlength="{{ annotation_max }}" value="{{ t.destination or '' }}">
     {% if geocoder_enabled and 'end' in places %}
     <button type="button" class="btn secondary" id="use-end-place"
       {% if not places.get('end') %}disabled{% endif %}>Use end suggestion as destination</button>
     <p class="muted">Using a suggestion replaces the destination field above. Click Save to keep it.</p>
     {% endif %}
     <label for="purpose_note">Note (e.g. "Client visit — Acme Corp")</label>
-    <textarea name="purpose_note" id="purpose_note" rows="3">{{ t.purpose_note or "" }}</textarea>
+    <textarea name="purpose_note" id="purpose_note" rows="3" maxlength="{{ annotation_max }}">{{ t.purpose_note or "" }}</textarea>
     <p><button class="btn" type="submit">Save</button></p>
   </form>
   {% endif %}
@@ -2741,6 +2768,10 @@ def annotate(ym, trip_id):
         category = ""
     note = request.form.get("purpose_note", "").strip()
     destination = request.form.get("destination", "").strip()
+    for label, text in (("note", note), ("destination", destination)):
+        problem = _annotation_text_problem(label, text)
+        if problem:
+            abort(400, description=problem)
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
@@ -2973,6 +3004,26 @@ def _csv_safe(value):
     return value
 
 
+def _xlsx_clean(values):
+    """Make a row of export values safe for a workbook.
+
+    Control characters XML can't hold are dropped (openpyxl raises on most
+    and writes an unreadable file for U+FFFE), and a value longer than one
+    cell holds is cut with a visible marker instead of silently. Both only
+    affect values that predate the save-time checks or came from an upload.
+    """
+    cleaned = []
+    for value in values:
+        if isinstance(value, str):
+            value = XML_ILLEGAL_RE.sub("", value)
+            if len(value) > XLSX_CELL_MAX_CHARS:
+                marker = (f" [TRUNCATED: {len(value)} characters; an Excel cell holds "
+                          f"{XLSX_CELL_MAX_CHARS}. The full text is in the viewer and the CSV.]")
+                value = value[:XLSX_CELL_MAX_CHARS - len(marker)] + marker
+        cleaned.append(value)
+    return cleaned
+
+
 def _xlsx_literal_text(row):
     """Force every string cell in an openpyxl row to be stored as text.
 
@@ -3046,12 +3097,12 @@ def export_xlsx():
     ws.append([name for name, _ in EXPORT_COLUMNS])
     for t in trips:
         t = {**t, **track_endpoints(t)}
-        ws.append([fn(t) for _, fn in EXPORT_COLUMNS])
+        ws.append(_xlsx_clean([fn(t) for _, fn in EXPORT_COLUMNS]))
         _xlsx_literal_text(ws[ws.max_row])
     totals = wb.create_sheet("Totals")
     totals.append(["year", "timezone", "category", "distance_miles"])
     for category, miles in mileage_totals(trips).items():
-        totals.append([year or "All years", DISPLAY_TZ_NAME, category, miles])
+        totals.append(_xlsx_clean([year or "All years", DISPLAY_TZ_NAME, category, miles]))
         _xlsx_literal_text(totals[totals.max_row])
     if unreadable:
         # A sheet of their own: Mileage has no row_type column, so a row
@@ -3060,7 +3111,7 @@ def export_xlsx():
         sheet.append(list(UNREADABLE_COLUMNS))
         for t in unreadable:
             values = _unreadable_values(t)
-            sheet.append([values[name] for name in UNREADABLE_COLUMNS])
+            sheet.append(_xlsx_clean([values[name] for name in UNREADABLE_COLUMNS]))
             _xlsx_literal_text(sheet[sheet.max_row])
     buf = io.BytesIO()
     wb.save(buf)

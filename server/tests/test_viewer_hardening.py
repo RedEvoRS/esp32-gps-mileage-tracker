@@ -1,7 +1,12 @@
 """Viewer response headers and login redirect safety (2026-10-23 audit)."""
 
+import io
+import sqlite3
 import unittest
+from contextlib import closing
 from urllib.parse import quote
+
+from openpyxl import load_workbook
 
 import test_viewer_roles as roles
 
@@ -109,6 +114,92 @@ class ViewerHardeningTests(unittest.TestCase):
             token = sess["csrf"]
         return self.client.post(location, data={
             "username": "driver", "password": "test-password", "csrf_token": token})
+
+    # -- control characters and length in notes (XLSX export) -------------
+
+    ILLEGAL = {"U+0001": chr(1), "U+000B": chr(0x0B), "U+FFFE": chr(0xFFFE), "U+FFFF": chr(0xFFFF)}
+
+    def annotate(self, **fields):
+        self.signed_in("admin")
+        data = {"csrf_token": "known-token", "category": "business",
+                "purpose_note": "", "destination": ""}
+        data.update(fields)
+        return self.client.post("/trip/2026-01/drive/annotate", data=data)
+
+    def stored(self):
+        with closing(sqlite3.connect(self.db)) as conn:
+            return conn.execute("SELECT purpose_note, destination FROM annotations "
+                                "WHERE trip_key='2026-01/drive'").fetchone()
+
+    def test_save_rejects_characters_xml_cannot_hold_and_says_why(self):
+        for name, char in self.ILLEGAL.items():
+            for field in ("purpose_note", "destination"):
+                with self.subTest(char=name, field=field):
+                    response = self.annotate(**{field: "Client" + char + "visit"})
+                    self.assertEqual(response.status_code, 400)
+                    self.assertIn(name.encode(), response.data)
+        # Nothing was saved: the seeded annotation is untouched.
+        self.assertEqual(self.stored()[0], "example")
+
+    def test_save_keeps_ordinary_text_including_tabs_and_line_breaks(self):
+        note = "Line one" + chr(13) + chr(10) + chr(9) + "line two " + chr(0xE9) + chr(0x2014)
+        response = self.annotate(purpose_note=note, destination="Caf" + chr(0xE9))
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.stored(), (note, "Caf" + chr(0xE9)))
+
+    def test_xlsx_export_survives_old_bad_values(self):
+        # A value saved before the check, or a device ID from an upload.
+        bad = {name: "Client" + char + "visit" for name, char in self.ILLEGAL.items()}
+        for index, (name, text) in enumerate(bad.items()):
+            with closing(sqlite3.connect(self.db)) as conn, conn:
+                conn.execute("UPDATE annotations SET purpose_note=?, destination=? WHERE trip_key='2026-01/drive'",
+                             (text, text))
+            with self.subTest(char=name):
+                self.signed_in("admin")
+                response = self.client.get("/export.xlsx")
+                self.assertEqual(response.status_code, 200)
+                sheet = load_workbook(io.BytesIO(response.data))["Mileage"]
+                values = [cell.value for row in sheet.iter_rows() for cell in row]
+                self.assertIn("Clientvisit", values)
+
+    def test_xlsx_cleans_uploaded_text_such_as_device_ids(self):
+        summary = self.viewer.Path(self.viewer.DATA_ROOT / "2026-01/drive.json")
+        import json
+        data = json.loads(summary.read_text(encoding="utf-8"))
+        data["device_id"] = "tr" + chr(0x0B) + "acker" + chr(0xFFFE)
+        summary.write_text(json.dumps(data), encoding="utf-8")
+        self.signed_in("admin")
+        response = self.client.get("/export.xlsx")
+        self.assertEqual(response.status_code, 200)
+        values = [c.value for row in load_workbook(io.BytesIO(response.data))["Mileage"].iter_rows() for c in row]
+        self.assertIn("tracker", values)
+
+    # -- length ------------------------------------------------------------
+
+    def test_notes_and_destinations_have_a_server_side_limit_and_field_maxlength(self):
+        limit = self.viewer.ANNOTATION_MAX_CHARS
+        self.assertLess(limit, self.viewer.XLSX_CELL_MAX_CHARS)
+        for field in ("purpose_note", "destination"):
+            with self.subTest(field=field):
+                over = self.annotate(**{field: "x" * (limit + 1)})
+                self.assertEqual(over.status_code, 400)
+                self.assertIn(str(limit).encode(), over.data)
+                self.assertEqual(self.annotate(**{field: "x" * limit}).status_code, 302)
+        page = self.client.get("/trip/2026-01/drive").data.decode()
+        self.assertEqual(page.count(f'maxlength="{limit}"'), 2)
+
+    def test_xlsx_flags_a_stored_value_too_long_for_a_cell(self):
+        long_text = "a" * 40000
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("UPDATE annotations SET purpose_note=? WHERE trip_key='2026-01/drive'", (long_text,))
+        self.signed_in("admin")
+        sheet = load_workbook(io.BytesIO(self.client.get("/export.xlsx").data))["Mileage"]
+        cells = [c.value for row in sheet.iter_rows() for c in row if isinstance(c.value, str) and c.value.startswith("aaa")]
+        self.assertEqual(len(cells), 1)
+        self.assertLessEqual(len(cells[0]), 32767)
+        self.assertIn("TRUNCATED: 40000 characters", cells[0])
+        csv_text = self.client.get("/export.csv").data.decode()
+        self.assertIn(long_text, csv_text)
 
 
 if __name__ == "__main__":
