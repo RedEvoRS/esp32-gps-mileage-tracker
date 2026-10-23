@@ -489,13 +489,17 @@ plan_sudo() {
             || [[ ! -d data && $(id -u) != "$CONTAINER_UID" ]]; }; then
         reasons+=("hand data/ to UID $CONTAINER_UID, which the containers run as")
     fi
+    if [[ $MODE == install && -d data && $(stat -c %u data) != "$(id -u)" && $(stat -c %a data) != 700 ]]; then
+        reasons+=("make data/ private to its owner (mode 700)")
+    fi
     if (( ${#DATA_SUDO[@]} )); then
         reasons+=("check and delete the test trip, whose files belong to UID $CONTAINER_UID")
     fi
-    # Backups already set up, but the timer is off or runs another copy:
-    # setup_backups puts it right without asking.
+    # Backups already set up, but the timer is off, runs another copy, or
+    # its systemd files are out of date: setup_backups puts it right
+    # without asking.
     if [[ $MODE == install && $(id -u) == "$CONTAINER_UID" ]] \
-        && backups_configured && ! { timer_ok && timer_current; }; then
+        && backups_configured && ! { timer_ok && timer_current && backup_units_current; }; then
         reasons+=("set up the daily backup timer")
     fi
 
@@ -710,6 +714,26 @@ setup_data_dir() {
         fi
     fi
     ok "data/ belongs to UID $CONTAINER_UID, which the containers run as"
+    # Trip file names are their start times, so other accounts on this
+    # machine shouldn't be able to list the folder. The containers and the
+    # login that runs the backups all use UID 1000, so nothing else changes.
+    # Existing installs get this on the next run too.
+    if [[ $(stat -c %a data) != 700 ]]; then
+        if [[ $MODE == install ]]; then
+            if [[ $(stat -c %u data) == "$(id -u)" ]]; then
+                chmod 700 data
+            else
+                need_sudo
+                sudo chmod 700 data
+            fi
+            ok "data/ is private (mode 700)"
+        else
+            warn "data/ can be listed by other accounts on this machine (mode $(stat -c %a data))" \
+                "Trip file names show when each drive started. Run install.sh to make it private (mode 700)."
+        fi
+    else
+        ok "data/ is private (mode 700)"
+    fi
 }
 
 setup_env() {
@@ -1779,6 +1803,42 @@ dropin_text() {
     printf '[Service]\nExecStart=\nExecStart=/bin/bash "%s/backup/backup.sh"\n' "${SCRIPT_DIR//%/%%}"
 }
 
+# The drop-in that makes systemd mount the backup destination (and
+# BACKUP_DIR) before a run, when they are local folders. If a share isn't
+# mounted, the run fails loudly instead of copying onto this disk.
+backup_mounts_dropin() { printf '%s/%s.service.d/backup-mounts.conf' "$UNIT_DIR" "$(backup_unit)"; }
+
+# Empty when there's nothing to require (an SSH destination).
+mounts_text() {
+    local paths=() path
+    for path in "$(conf_get REMOTE)" "$(conf_get BACKUP_DIR)"; do
+        # A path with spaces, quotes or % can't go in the unit file safely.
+        if [[ $path == /* && $path != *[[:space:]\'\"\\%]* ]]; then paths+=("$path"); fi
+    done
+    if (( ${#paths[@]} )); then
+        printf '[Unit]\nRequiresMountsFor=%s\n' "${paths[*]}"
+    fi
+}
+
+# Whether /etc/systemd/system has the unit, timer and drop-ins this install
+# would write. An update that changes them reaches existing servers here.
+backup_units_current() {
+    local expected
+    cmp -s backup/mileage-backup@.service "$UNIT_DIR/mileage-backup@.service" 2> /dev/null || return 1
+    cmp -s backup/mileage-backup@.timer "$UNIT_DIR/mileage-backup@.timer" 2> /dev/null || return 1
+    if [[ $SCRIPT_DIR != "$DEFAULT_DIR" ]]; then
+        [[ -f $(backup_dropin) && $(< "$(backup_dropin)") == "$(dropin_text)" ]] || return 1
+    else
+        [[ ! -e $(backup_dropin) ]] || return 1
+    fi
+    expected=$(mounts_text)
+    if [[ -n $expected ]]; then
+        [[ -f $(backup_mounts_dropin) && $(< "$(backup_mounts_dropin)") == "$expected" ]] || return 1
+    else
+        [[ ! -e $(backup_mounts_dropin) ]] || return 1
+    fi
+}
+
 backups_configured() {
     local remote
     remote=$(conf_get REMOTE)
@@ -1843,7 +1903,9 @@ ssh_target_ok() {
         return 1
     fi
     ok "$host takes the backup key without a password, has rsync, and has $path"
-    RSYNC_SSH_CMD="ssh -i $key -o IdentitiesOnly=yes -o BatchMode=yes"
+    # The keepalive and connect limits stop a NAS that vanished mid-backup
+    # from holding the backup (and every later one) for hours.
+    RSYNC_SSH_CMD="ssh -i $key -o IdentitiesOnly=yes -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o ConnectTimeout=30"
 }
 
 choose_backup_target() {
@@ -1889,6 +1951,38 @@ choose_backup_target() {
     ok "Wrote backup/backup.conf"
 }
 
+# backup.sh won't copy to a destination without the marker file
+# (.mileage-backup-target), so an unmounted share can't pass for it. Write
+# it once the destination is known to be the real one: right after setup
+# ("new"), or on a rerun for a backup set up before the marker existed
+# ("rerun", which warns instead of stopping the update).
+ensure_backup_target() {
+    local how=$1 remote backup=$SCRIPT_DIR/backup/backup.sh
+    remote=$(conf_get REMOTE)
+    if "${AS_ME[@]}" bash "$backup" --check-target < /dev/null 2> /dev/null; then
+        return 0
+    fi
+    if [[ $how == rerun && $remote == /* ]]; then
+        note "Backups go to $remote, which has no marker file yet. Writing one says this" \
+            "folder is the real backup destination, so it must be the mounted share or disk now."
+        if ! local_target_ok "$remote"; then
+            warn "Left $remote unmarked, so the nightly backup will refuse to copy there" \
+                "When it is the right, mounted destination: bash $backup --mark-target"
+            return 0
+        fi
+    fi
+    if "${AS_ME[@]}" bash "$backup" --mark-target < /dev/null 2>&1 | indent; then
+        ok "Marked $remote as the backup destination"
+    elif [[ $how == rerun ]]; then
+        warn "Couldn't write the backup marker file to $remote" \
+            "Until it's there, the nightly backup refuses to copy and fails (its log says why)." \
+            "When $remote is reachable: bash $backup --mark-target"
+    else
+        die "Couldn't write the backup marker file to $remote." \
+            "Fix backup/backup.conf or the destination, then run this again."
+    fi
+}
+
 first_backup() {
     note "Running the first backup"
     if ! "${AS_ME[@]}" bash "$SCRIPT_DIR/backup/backup.sh" < /dev/null 2>&1 | indent; then
@@ -1910,10 +2004,12 @@ restore_test() {
     fi
 }
 
-install_backup_timer() {
-    local unit dropin
+# Put the unit, the timer and their drop-ins in place and tell systemd.
+install_backup_units() {
+    local unit dropin mounts mounts_dropin
     unit=$(backup_unit)
     dropin=$(backup_dropin)
+    mounts_dropin=$(backup_mounts_dropin)
     need_sudo
     sudo install -m 644 backup/mileage-backup@.service backup/mileage-backup@.timer "$UNIT_DIR/"
     # The unit runs /home/<user>/mileage-tracker/backup/backup.sh. If the
@@ -1927,7 +2023,23 @@ install_backup_timer() {
         sudo rm -f "$dropin"
         note "Pointed $unit.service back at $DEFAULT_DIR"
     fi
+    # A local destination or BACKUP_DIR (a mounted share or disk) must be
+    # mounted before the backup runs.
+    mounts=$(mounts_text)
+    if [[ -n $mounts ]]; then
+        sudo install -d -m 755 "${mounts_dropin%/*}"
+        printf '%s\n' "$mounts" | sudo tee "$mounts_dropin" > /dev/null
+        sudo chmod 644 "$mounts_dropin"
+    elif [[ -e $mounts_dropin ]]; then
+        sudo rm -f "$mounts_dropin"
+    fi
     sudo systemctl daemon-reload
+}
+
+install_backup_timer() {
+    local unit
+    unit=$(backup_unit)
+    install_backup_units
     sudo systemctl enable --now --quiet "$unit.timer"
     note "Running the backup once through systemd, the way the timer will"
     if ! sudo systemctl start "$unit.service"; then
@@ -1949,6 +2061,17 @@ verify_backups() {
     else
         next=$(systemctl show -p NextElapseUSecRealtime --value "$unit.timer" 2> /dev/null) || next=
         ok "The daily backup timer is on${next:+ (next run: $next)}"
+        if ! backup_units_current; then
+            warn "The installed backup systemd files differ from the ones in $SCRIPT_DIR/backup" \
+                "An update changed them. Run install.sh to install the new ones."
+        fi
+    fi
+    # (Install mode already warned if it couldn't write the marker.)
+    if [[ $MODE == check && -f backup/backup.conf ]] \
+        && ! "${AS_ME[@]}" bash "$SCRIPT_DIR/backup/backup.sh" --check-target < /dev/null 2> /dev/null; then
+        problem "The backup destination $(conf_get REMOTE) has no .mileage-backup-target file" \
+            "Backups refuse to copy there until it's marked. If it is the right, mounted destination:" \
+            "bash $SCRIPT_DIR/backup/backup.sh --mark-target"
     fi
     if systemctl is-failed --quiet "$unit.service" 2> /dev/null; then
         problem "The last backup failed" "To see why: journalctl -u $unit.service -n 30"
@@ -1998,10 +2121,13 @@ setup_backups() {
             return 0
         fi
         choose_backup_target
+        ensure_backup_target new
         first_backup
         install_backup_timer
     else
         ok "backup.conf sends backups to $(conf_get REMOTE)"
+        # Backups set up before the marker file existed get it here.
+        if [[ $MODE == install ]]; then ensure_backup_target rerun; fi
         if [[ $MODE == install ]] && ! { timer_ok && timer_current; }; then
             if timer_ok; then
                 note "The backup timer is on, but it runs backup.sh from somewhere else." \
@@ -2009,6 +2135,11 @@ setup_backups() {
             fi
             first_backup
             install_backup_timer
+        elif [[ $MODE == install ]] && ! backup_units_current; then
+            note "The backup's systemd files are out of date (this update changed them). Updating them."
+            install_backup_units
+            sudo systemctl try-restart "$(backup_unit).timer"
+            ok "Updated the backup's systemd files"
         elif [[ $MODE == check ]]; then
             restore_test
         fi
