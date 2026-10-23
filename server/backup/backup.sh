@@ -12,13 +12,20 @@
 #   3. Writes SHA256SUMS. If nothing changed since the last snapshot, the
 #      new one is dropped. Old snapshots are pruned (KEEP_RECENT newest,
 #      plus the first of each month for KEEP_MONTHLY months).
-#   4. rsyncs every snapshot to REMOTE and re-reads the newest copy there
-#      to confirm it matches byte for byte.
+#   4. rsyncs every snapshot to REMOTE (only if REMOTE holds the marker
+#      file, so an unmounted share can't pass for the off-host copy),
+#      re-reads the newest copy there to confirm it matches byte for byte,
+#      and, with REMOTE_PRUNE=yes, applies the same retention to REMOTE.
 #
 # Layout under BACKUP_DIR (the same under REMOTE, minus `latest`):
 #   snapshots/2026-10-06T033012Z/{annotations.db,events.db?,monitor.db?,data/,SHA256SUMS,INFO}
 #   latest -> snapshots/<newest>
 #   last-success
+# REMOTE also holds .mileage-backup-target.
+#
+# `backup.sh --mark-target` writes the marker file (.mileage-backup-target)
+# the destination needs before a backup will copy to it, and
+# `backup.sh --check-target` says whether it is there (exit 0 or 1).
 #
 # Restore and restore tests: restore.sh.
 
@@ -33,6 +40,18 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 [[ $KEEP_RECENT =~ ^[1-9][0-9]*$ ]] || die "KEEP_RECENT must be a positive number"
 [[ $KEEP_MONTHLY =~ ^[0-9]+$ ]] || die "KEEP_MONTHLY must be a number"
 require_commands rsync flock sha256sum cmp
+
+case ${1:-} in
+    --mark-target)
+        mark_target || die "couldn't write $TARGET_MARKER to $REMOTE"
+        log "$REMOTE is now the backup destination ($TARGET_MARKER written)"
+        exit 0 ;;
+    --check-target)
+        if target_marked; then exit 0; else exit 1; fi ;;
+    '') ;;
+    *) die "unknown option $1 (backup.sh takes --mark-target or --check-target)" ;;
+esac
+
 [[ -d $COMPOSE_DIR/data ]] || die "no trip data directory at $COMPOSE_DIR/data"
 
 mkdir -p "$SNAPSHOTS"
@@ -42,6 +61,9 @@ flock -n 9 || die "another backup is already running"
 name=$(date -u +%Y-%m-%dT%H%M%SZ)
 work=$SNAPSHOTS/.partial-$name
 rm -rf "$SNAPSHOTS"/.partial-*        # left behind by a run that died
+# restore.sh's scratch folders, left behind if a restore test was killed
+find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -name '.restore-scratch-*' -mmin +1440 \
+    -exec rm -rf {} + 2> /dev/null || true
 prev=$(list_snapshots | tail -n 1)
 mkdir "$work"
 
@@ -123,32 +145,82 @@ ln -sfn "snapshots/$current" "$BACKUP_DIR/latest"
 # Keep the newest KEEP_RECENT, plus the first snapshot of each of the
 # newest KEEP_MONTHLY months. The current snapshot is always among the
 # newest, so it's never pruned.
-list_snapshots | awk -v recent="$KEEP_RECENT" -v monthly="$KEEP_MONTHLY" '
-    { name[NR] = $0; month = substr($0, 1, 7)
-      if (!(month in seen)) { seen[month] = 1; firsts[++months] = NR } }
-    END {
-        for (i = NR - recent + 1; i <= NR; i++) if (i >= 1) keep[i] = 1
-        for (j = months - monthly + 1; j <= months; j++) if (j >= 1) keep[firsts[j]] = 1
-        for (i = 1; i <= NR; i++) if (!(i in keep)) print name[i]
-    }' | while read -r old; do
+list_snapshots | retention_drops | while read -r old; do
     log "Pruning local snapshot $old"
     rm -rf "${SNAPSHOTS:?}/$old"
 done
 
 # --- 4. Off-host copy --------------------------------------------------
 
+if ! target_marked; then
+    die "$REMOTE has no $TARGET_MARKER file, so this backup was not copied off this machine.
+  That file marks the real backup destination. If the destination is a mounted share or
+  disk, it probably isn't mounted right now (otherwise the copy would land on this
+  machine's own disk). Mount it, or fix REMOTE in $CONF, and run this again.
+  (Or $REMOTE can't be reached at all: a NAS that is down, a wrong address.)
+  If $REMOTE is the right place and is reachable, mark it once with:
+      bash $SCRIPT_DIR/backup.sh --mark-target"
+fi
+
 log "Copying snapshots to $REMOTE"
-delete=()
-[[ $REMOTE_PRUNE == yes ]] && delete=(--delete)
+# No --delete: pruning the off-host copy is done by name, below.
 # -H keeps the hard links between snapshots, so the remote copy is as
 # small as the local one.
-rsync_remote -aH "${delete[@]}" "$SNAPSHOTS/" "$REMOTE/snapshots/"
+rsync_remote -aH "$SNAPSHOTS/" "$REMOTE/snapshots/"
 
 log "Checking the off-host copy of $current"
 diffs=$(rsync_remote -anc --delete --itemize-changes \
     "$SNAPSHOTS/$current/" "$REMOTE/snapshots/$current/")
 [[ -z $diffs ]] || die "off-host copy of $current doesn't match:
 $diffs"
+
+# REMOTE_PRUNE=yes: apply the same retention rule to the off-host snapshots,
+# on their own list of names. Only the names the rule drops are deleted.
+# The remote is never made to mirror the local folder: a rebuilt server
+# starts with few or no local snapshots, and the history on the remote
+# must survive that.
+prune_remote() {
+    local names drops history_only newer empty old
+    if ! names=$(list_remote_snapshots); then
+        log "WARNING: couldn't list the snapshots on $REMOTE; not pruning it"
+        return 0
+    fi
+    # Another writer, or a clock that went backwards, would make "newest"
+    # mean something else here.
+    newer=$(awk -v current="$current" '$0 > current' <<< "$names" | head -n 1)
+    if [[ -n $newer ]]; then
+        log "WARNING: not pruning $REMOTE: it has a snapshot ($newer) newer than this server's newest ($current)."
+        log "WARNING: Is another server backing up to the same place, or did this server's clock go back? Nothing was deleted there."
+        return 0
+    fi
+    drops=$(retention_drops <<< "$names")
+    # What the rule would keep that this server doesn't have: history that
+    # exists only off-host, as after a rebuild or a changed BACKUP_DIR.
+    history_only=$(comm -23 <(comm -23 <(sort <<< "$names") <(sort <<< "$drops")) <(list_snapshots | sort))
+    if [[ -n $history_only ]]; then
+        log "WARNING: not pruning $REMOTE: it holds $(wc -l <<< "$history_only") snapshot(s) that this server doesn't (first: $(head -n 1 <<< "$history_only"))."
+        log "WARNING: That looks like a rebuilt server or a changed BACKUP_DIR. Nothing was deleted there."
+        log "WARNING: Off-host pruning stays off until this server has them again (copy them back with:"
+        log "WARNING:   rsync -aH $REMOTE/snapshots/ $SNAPSHOTS/ ), or set REMOTE_PRUNE=no in $CONF."
+        return 0
+    fi
+    [[ -n $drops ]] || return 0
+    empty=$(mktemp -d "$BACKUP_DIR/.empty.XXXXXX")
+    while read -r old; do
+        [[ $old < $current ]] || continue            # never the snapshot just made
+        log "Pruning off-host snapshot $old"
+        # rsync deletes the one named folder because the empty source lacks
+        # it; every other name is excluded, so it stays. Works the same
+        # for a path and for user@host:/path.
+        rsync_remote -r --delete --include="/$old/***" --exclude='*' \
+            "$empty/" "$REMOTE/snapshots/" < /dev/null \
+            || { log "WARNING: couldn't delete $old from $REMOTE"; break; }
+    done <<< "$drops"
+    rmdir "$empty"
+}
+if [[ $REMOTE_PRUNE == yes ]]; then
+    prune_remote
+fi
 
 date -u +%Y-%m-%dT%H:%M:%SZ > "$BACKUP_DIR/last-success"
 log "Backup complete: $current is on $REMOTE"

@@ -16,7 +16,10 @@
 #       left alone; nothing is deleted.
 #
 # SNAPSHOT is one of:
-#   (nothing) or latest      the newest snapshot on REMOTE
+#   (nothing) or latest      the newest snapshot on REMOTE that holds trips
+#                            (an empty one, such as the installer's first
+#                            backup of a rebuilt server, is skipped while
+#                            older ones exist)
 #   2026-10-06T033012Z       that snapshot on REMOTE
 #   a path or host:path      any snapshot directory, local or remote
 
@@ -32,13 +35,34 @@ usage() {
     exit 2
 }
 
+# The newest snapshot on REMOTE, except that one with no trips is skipped
+# when an older one has some. A rebuilt server's first backup is empty and
+# is newer than the history it is about to be restored from.
+newest_snapshot_with_trips() {
+    local names name trips newest= info
+    names=$(rsync_remote --list-only "$REMOTE/snapshots/" \
+        | awk '{ print $NF }' | grep -E "$SNAPSHOT_RE" | LC_ALL=C sort -r || true)
+    while read -r name; do
+        [[ -n $name ]] || continue
+        [[ -n $newest ]] || newest=$name
+        info=$(rsync_remote -q "$REMOTE/snapshots/$name/INFO" "$scratch/INFO" > /dev/null 2>&1 \
+            && cat "$scratch/INFO" || true)
+        trips=$(sed -n 's/^trips=//p' <<< "$info")
+        if [[ $trips != 0 ]]; then
+            [[ $name == "$newest" ]] || log "Skipping $newest and newer: no trips in them; restoring $name instead (give a snapshot name to choose another)"
+            printf '%s\n' "$name"
+            return 0
+        fi
+    done <<< "$names"
+    printf '%s\n' "$newest"
+}
+
 resolve_snapshot() {
     local arg=${1:-latest}
     if [[ $arg == latest || $arg =~ $SNAPSHOT_RE ]]; then
         [[ -n $REMOTE ]] || die "REMOTE is not set in $CONF; give a snapshot path instead"
         if [[ $arg == latest ]]; then
-            arg=$(rsync_remote --list-only "$REMOTE/snapshots/" \
-                | awk '{ print $NF }' | grep -E "$SNAPSHOT_RE" | LC_ALL=C sort | tail -n 1 || true)
+            arg=$(newest_snapshot_with_trips)
             [[ -n $arg ]] || die "no snapshots found on $REMOTE"
         fi
         printf '%s\n' "$REMOTE/snapshots/$arg"
@@ -125,7 +149,16 @@ done
 [[ $command == check || -n $snapshot_arg ]] || die "say which snapshot to restore (latest, a name, or a path)"
 require_commands rsync sha256sum
 
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/mileage-restore.XXXXXX")
+# The snapshot, trip files included, is copied here. Debian 13 keeps /tmp
+# in RAM, so by default this is next to the snapshots (same disk, mode 700).
+# TMPDIR overrides it. backup.sh clears these after a day if one is left
+# behind by a restore that was killed.
+if [[ -n ${TMPDIR:-} ]]; then
+    scratch=$(mktemp -d "$TMPDIR/mileage-restore.XXXXXX")
+else
+    mkdir -p "$BACKUP_DIR"
+    scratch=$(mktemp -d "$BACKUP_DIR/.restore-scratch-XXXXXX")
+fi
 trap cleanup EXIT
 
 fetch_and_check "$snapshot_arg"
@@ -166,24 +199,41 @@ fi
 
 # Save every current database before replacing any of them. The stopped
 # ingest helper has /data writable; the viewer's /data is read-only.
+# A current database that SQLite can't read (damaged: a main reason to
+# restore) can't be snapshotted; its raw files are saved instead, and it
+# is cleared out of the way just before its replacement goes in.
 log "Saving the current databases to $pre"
-snapshot_db viewer_python /db/annotations.db "$pre/annotations.db" yes
-snapshot_db ingest_python /data/diagnostics/events.db "$pre/events.db" yes
+unreadable=()
+save_current_db() {
+    local runner=$1 path=$2 dest=$3
+    snapshot_db "$runner" "$path" "$dest" yes yes
+    [[ $SNAPSHOT_REPORT != unreadable ]] || unreadable+=("$path")
+}
+# Restore one database over the live one, clearing a damaged one first.
+restore_db() {
+    local runner=$1 kind=$2 path=$3 file=$4 damaged
+    for damaged in ${unreadable[@]+"${unreadable[@]}"}; do
+        if [[ $damaged == "$path" ]]; then remove_raw_db "$runner" "$path"; fi
+    done
+    "$runner" "$PY_CHECK_RESTORE" "$kind" "$path" < "$file" >&2
+}
+save_current_db viewer_python /db/annotations.db "$pre/annotations.db"
+save_current_db ingest_python /data/diagnostics/events.db "$pre/events.db"
 if [[ $MONITOR_PRESENT == yes ]]; then
-    snapshot_db monitor_python /state/monitor.db "$pre/monitor.db" yes
+    save_current_db monitor_python /state/monitor.db "$pre/monitor.db"
 fi
 
 log "Restoring the annotations database"
-viewer_python "$PY_CHECK_RESTORE" annotations /db/annotations.db < "$scratch/snapshot/annotations.db" >&2
+restore_db viewer_python annotations /db/annotations.db "$scratch/snapshot/annotations.db"
 if [[ -f $scratch/snapshot/events.db ]]; then
     log "Restoring the diagnostics database"
-    ingest_python "$PY_CHECK_RESTORE" events /data/diagnostics/events.db < "$scratch/snapshot/events.db" >&2
+    restore_db ingest_python events /data/diagnostics/events.db "$scratch/snapshot/events.db"
 fi
 if [[ $MONITOR_PRESENT != unknown && -f $scratch/snapshot/monitor.db ]]; then
     # This may create the volume on a replacement server, without starting
     # the monitor or enabling notifications. Its image supplies UID ownership.
     log "Restoring the monitor database"
-    monitor_python "$PY_CHECK_RESTORE" monitor /state/monitor.db < "$scratch/snapshot/monitor.db" >&2
+    restore_db monitor_python monitor /state/monitor.db "$scratch/snapshot/monitor.db"
 fi
 
 log "Restoring trip files (anything replaced goes to $pre/data)"
@@ -197,4 +247,8 @@ log "Starting the services again"
 start_services
 services_stopped=no
 
+if (( ${#unreadable[@]} )); then
+    log "WARNING: ${#unreadable[@]} damaged database(s) were replaced: ${unreadable[*]}"
+    log "WARNING: their raw files are kept in $pre (the *-unreadable folders)."
+fi
 log "Restore complete. Check the viewer, then delete $pre once you're happy."

@@ -75,6 +75,22 @@ FAKE_COMPOSE = textwrap.dedent("""\
         sys.exit(subprocess.call([sys.executable] + args[1:]))
     """)
 
+MARKER = ".mileage-backup-target"
+
+# Stands in for ssh: skips ssh's options and the host, then runs the command
+# rsync asked it to run on the "far end" right here.
+FAKE_SSH = """\
+echo "$@" >> "${SSH_LOG:-/dev/null}"
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -l|-i|-o|-p|-F) shift 2 ;;
+        -*) shift ;;
+        *) shift; break ;;
+    esac
+done
+exec "$@"
+"""
+
 SCHEMA = """
 CREATE TABLE annotations (
     trip_key TEXT PRIMARY KEY, category TEXT, purpose_note TEXT,
@@ -135,9 +151,39 @@ class BackupScripts(unittest.TestCase):
                         FAKE_DATA_DIR=str(self.data),
                         FAKE_MONITOR_DIR=str(self.monitor_dir),
                         FAKE_STATE_DIR=str(self.state_dir),
-                        FAKE_COMPOSE_LOG=str(self.compose_log),
-                        TMPDIR=str(self.tmp))
+                        FAKE_COMPOSE_LOG=str(self.compose_log))
         self.env.pop("JOURNAL_STREAM", None)
+        self.env.pop("TMPDIR", None)
+        self.mark_target()
+
+    def mark_target(self, root=None):
+        (root or self.remote).joinpath(MARKER).write_text("mileage-tracker backup destination\n")
+
+    def shim(self, name, body):
+        """A script named `name` ahead of the real one on PATH."""
+        directory = self.tmp / "shims"
+        directory.mkdir(exist_ok=True)
+        path = directory / name
+        path.write_text("#!/bin/bash\n" + body)
+        path.chmod(0o755)
+        if str(directory) not in self.env["PATH"].split(":"):
+            self.env["PATH"] = f"{directory}:{self.env['PATH']}"
+        return path
+
+    def conf_append(self, text):
+        conf = Path(self.env["MILEAGE_BACKUP_CONF"])
+        conf.write_text(conf.read_text() + text)
+
+    def use_ssh_remote(self):
+        """REMOTE becomes user@host:/path, reached through a fake ssh."""
+        fake = self.tmp / "fakessh"
+        fake.write_text("#!/bin/bash\n" + FAKE_SSH)
+        fake.chmod(0o755)
+        conf = Path(self.env["MILEAGE_BACKUP_CONF"])
+        conf.write_text(conf.read_text().replace(
+            f"REMOTE={self.remote}", f"REMOTE=nasuser@nas.invalid:{self.remote}"))
+        self.conf_append(f"RSYNC_SSH={fake}\n")
+        return fake
 
     def add_events(self):
         path = self.data / "diagnostics/events.db"
@@ -593,17 +639,344 @@ class BackupScripts(unittest.TestCase):
             path.write_bytes(good)
             self.refresh_manifest(snap)
 
-    def test_safety_snapshot_failure_prevents_restore_and_restarts_services(self):
-        self.add_events()
-        monitor = self.add_monitor()
+    # --- the backup destination must be marked (#466) ---
+
+    def test_refuses_to_copy_to_an_unmarked_destination(self):
+        (self.remote / MARKER).unlink()
+        self.shim("curl", 'echo "$@" >> "$CURL_LOG"\n')
+        self.env["CURL_LOG"] = str(self.tmp / "curl.log")
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        result = self.run_script("backup.sh", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(MARKER, result.stderr)
+        self.assertIn("--mark-target", result.stderr)
+        self.assertFalse((self.remote / "snapshots").exists())
+        self.assertFalse((self.backups / "last-success").exists())
+        self.assertFalse((self.tmp / "curl.log").exists(), "no ping after a refused backup")
+        # The local snapshot is still made, and the next good run copies it.
+        self.assertEqual(len(self.snapshots()), 1)
+
+    def test_unmounted_mount_point_is_not_an_off_host_copy(self):
+        mount_point = self.tmp / "mnt-backup"
+        mount_point.mkdir()   # what is left on the root disk when the share isn't mounted
+        conf = Path(self.env["MILEAGE_BACKUP_CONF"])
+        conf.write_text(conf.read_text().replace(f"REMOTE={self.remote}", f"REMOTE={mount_point}"))
+        result = self.run_script("backup.sh", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(list(mount_point.iterdir()), [])
+        self.assertFalse((self.backups / "last-success").exists())
+
+    def test_mark_target_writes_the_marker_and_backups_then_work(self):
+        (self.remote / MARKER).unlink()
+        self.assertEqual(self.run_script("backup.sh", "--check-target", check=False).returncode, 1)
+        self.run_script("backup.sh", "--mark-target")
+        self.assertTrue((self.remote / MARKER).exists())
+        self.run_script("backup.sh", "--check-target")
         self.run_script("backup.sh")
-        before = (self.db_dir / "annotations.db").read_bytes()
-        monitor.write_bytes(b"broken live monitor database")
+        self.assertTrue((self.backups / "last-success").exists())
+        # Marking again changes nothing.
+        self.run_script("backup.sh", "--mark-target")
+
+    def test_ssh_destination_needs_the_marker_too(self):
+        self.use_ssh_remote()
+        (self.remote / MARKER).unlink()
+        result = self.run_script("backup.sh", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.remote / "snapshots").exists())
+        self.run_script("backup.sh", "--mark-target")
+        self.run_script("backup.sh")
+        self.assertEqual(len(self.snapshots(self.remote)), 1)
+
+    def test_unit_file_limits_the_run_and_waits_for_mounts(self):
+        unit = (BACKUP / "mileage-backup@.service").read_text()
+        self.assertIn("TimeoutStartSec=6h", unit)
+        self.assertRegex(unit, r"(?m)^After=.*\bremote-fs\.target\b")
+
+    # --- off-host pruning must never mirror the local folder (#467) ---
+
+    def make_remote_snapshots(self, *names):
+        for name in names:
+            snap = self.remote / "snapshots" / name
+            (snap / "data").mkdir(parents=True)
+            (snap / "annotations.db").write_bytes(b"x")
+            (snap / "SHA256SUMS").write_text("")
+
+    def assert_rebuilt_server_keeps_remote_history(self):
+        old = ["2024-01-01T030000Z", "2024-02-01T030000Z", "2025-06-01T030000Z",
+               "2026-09-01T030000Z"]
+        self.conf_append("REMOTE_PRUNE=yes\n")
+        self.make_remote_snapshots(*old)
+        # A fresh server: no local backups, backup.conf put back.
+        self.assertFalse((self.backups / "snapshots").exists())
+        result = self.run_script("backup.sh")
+        [new] = self.snapshots()
+        self.assertEqual(self.snapshots(self.remote), old + [new])
+        self.assertIn("not pruning", result.stderr)
+        self.assertIn("rebuilt server", result.stderr)
+        self.assertTrue((self.backups / "last-success").exists(), "the backup itself is fine")
+        # Later runs keep leaving it alone.
+        self.add_trip("2026-10/2026-10-02T08-00-00", "second")
+        self.run_script("backup.sh")
+        self.assertEqual(self.snapshots(self.remote), old + self.snapshots())
+
+    def test_remote_prune_keeps_history_a_rebuilt_server_never_had(self):
+        self.assert_rebuilt_server_keeps_remote_history()
+
+    def test_remote_prune_keeps_history_a_rebuilt_server_never_had_over_ssh(self):
+        self.use_ssh_remote()
+        self.assert_rebuilt_server_keeps_remote_history()
+
+    def assert_remote_prune_applies_the_retention_rule(self):
+        names = ["2026-05-01T030000Z", "2026-06-01T030000Z", "2026-06-02T030000Z",
+                 "2026-07-01T030000Z", "2026-07-02T030000Z", "2026-07-03T030000Z"]
+        self.conf_append("REMOTE_PRUNE=yes\n")
+        for n in names:   # both sides hold these, as after earlier runs
+            (self.backups / "snapshots" / n).mkdir(parents=True)
+            (self.backups / "snapshots" / n / "SHA256SUMS").write_text("")
+        self.make_remote_snapshots(*names, "2026-01-01T030000Z")
+        (self.remote / "snapshots" / "notes.txt").write_text("not a snapshot")
+        result = self.run_script("backup.sh")
+        current = self.snapshots()[-1]
+        # KEEP_RECENT=3, KEEP_MONTHLY=2: the same four survive on both sides.
+        kept = {"2026-07-01T030000Z", "2026-07-02T030000Z", "2026-07-03T030000Z", current}
+        self.assertEqual(set(self.snapshots()), kept)
+        self.assertEqual(set(self.snapshots(self.remote)), kept | {"notes.txt"})
+        self.assertIn("Pruning off-host snapshot 2026-01-01T030000Z", result.stderr)
+        self.assertTrue((self.remote / MARKER).exists())
+        self.assertTrue((self.remote / "snapshots" / current / "annotations.db").exists())
+
+    def test_remote_prune_applies_the_retention_rule_to_the_remote_list(self):
+        self.assert_remote_prune_applies_the_retention_rule()
+
+    def test_remote_prune_applies_the_retention_rule_over_ssh(self):
+        self.use_ssh_remote()
+        self.assert_remote_prune_applies_the_retention_rule()
+
+    def test_remote_prune_refuses_when_the_remote_has_newer_snapshots(self):
+        self.conf_append("REMOTE_PRUNE=yes\n")
+        self.make_remote_snapshots("2026-01-01T030000Z", "2099-01-01T030000Z")
+        result = self.run_script("backup.sh")
+        self.assertIn("newer than", result.stderr)
+        self.assertIn("2099-01-01T030000Z", self.snapshots(self.remote))
+        self.assertIn("2026-01-01T030000Z", self.snapshots(self.remote))
+        self.assertTrue((self.backups / "last-success").exists())
+
+    # --- timeouts (#469) ---
+
+    def test_remote_commands_carry_rsync_and_ssh_timeouts(self):
+        real = shutil.which("rsync")
+        self.shim("rsync", f'echo "$@" >> "$RSYNC_LOG"\nexec {real} "$@"\n')
+        self.shim("ssh", FAKE_SSH)
+        self.env.update(RSYNC_LOG=str(self.tmp / "rsync.log"), SSH_LOG=str(self.tmp / "ssh.log"))
+        conf = Path(self.env["MILEAGE_BACKUP_CONF"])
+        conf.write_text(conf.read_text().replace(
+            f"REMOTE={self.remote}", f"REMOTE=nasuser@nas.invalid:{self.remote}"))
+        self.run_script("backup.sh")
+        keepalive = "ServerAliveInterval=30 -o ServerAliveCountMax=4 -o ConnectTimeout=30"
+        remote_calls = [line for line in (self.tmp / "rsync.log").read_text().splitlines()
+                        if "nas.invalid" in line]
+        self.assertTrue(remote_calls)
+        for line in remote_calls:
+            self.assertIn("--timeout=600", line)
+            self.assertIn(keepalive, line)
+        self.assertIn(keepalive, (self.tmp / "ssh.log").read_text())
+
+    def test_an_rsync_ssh_that_sets_its_own_keepalive_is_left_alone(self):
+        fake = self.use_ssh_remote()
+        self.conf_append(f'RSYNC_SSH="{fake} -o ServerAliveInterval=5"\n')
+        self.env["SSH_LOG"] = str(self.tmp / "ssh.log")
+        self.run_script("backup.sh")
+        log = (self.tmp / "ssh.log").read_text()
+        self.assertIn("ServerAliveInterval=5", log)
+        self.assertNotIn("ServerAliveInterval=30", log)
+
+    # --- restore over a damaged live database (#465) ---
+
+    def damage_malformed(self, path):
+        with sqlite3.connect(path) as conn:
+            conn.executemany("INSERT INTO annotations VALUES (?, ?, ?, ?, ?)",
+                             [(f"2026-10/k{i}", "business", "x" * 300, "2026-10-01T00:00:00Z", "")
+                              for i in range(100)])
+        conn.close()
+        data = bytearray(path.read_bytes())
+        self.assertGreater(len(data), 8192)
+        for i in range(4096, len(data)):   # everything after page 1
+            data[i] = 0xAB
+        path.write_bytes(bytes(data))
+
+    def damage_random(self, path):
+        path.write_bytes(os.urandom(5000))
+
+    def assert_restore_replaces_a_damaged_database(self, live, damage, verify):
+        self.run_script("backup.sh")
+        name = live.name
+        damage(live)
+        sidecars = {}
+        for suffix in ("-wal", "-journal"):
+            sidecars[suffix] = os.urandom(64)
+            Path(str(live) + suffix).write_bytes(sidecars[suffix])
+        damaged = live.read_bytes()
+        result = self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertIn("can't be read as a database", result.stderr)
+        self.assertIn("WARNING", result.stderr)
+        verify()
+        for suffix in ("-wal", "-journal", "-shm"):
+            self.assertFalse(Path(str(live) + suffix).exists(), suffix)
+        [pre] = self.backups.glob("pre-restore-*")
+        raw = pre / f"{name}-unreadable"
+        self.assertEqual((raw / name).read_bytes(), damaged)
+        for suffix, content in sidecars.items():
+            self.assertEqual((raw / (name + suffix)).read_bytes(), content)
+        self.assertFalse((pre / name).exists(), "no snapshot of a database SQLite can't read")
+        self.assertNotIn("did not finish", result.stderr)
+        self.assertIn("Restore complete", result.stderr)
+
+    def verify_annotations(self):
+        with sqlite3.connect(self.db_dir / "annotations.db") as conn:
+            self.assertEqual(conn.execute("SELECT purpose_note FROM annotations").fetchall(),
+                             [("client visit",)])
+        conn.close()
+
+    def test_restore_replaces_a_malformed_annotations_database(self):
+        self.assert_restore_replaces_a_damaged_database(
+            self.db_dir / "annotations.db", self.damage_malformed, self.verify_annotations)
+
+    def test_restore_replaces_an_annotations_database_of_random_bytes(self):
+        self.assert_restore_replaces_a_damaged_database(
+            self.db_dir / "annotations.db", self.damage_random, self.verify_annotations)
+
+    def test_restore_replaces_a_damaged_diagnostics_database(self):
+        events = self.add_events()
+        def verify():
+            with sqlite3.connect(events) as conn:
+                self.assertEqual(conn.execute("SELECT * FROM events").fetchall(), [(1,)])
+            conn.close()
+        self.assert_restore_replaces_a_damaged_database(events, self.damage_random, verify)
+
+    def test_restore_replaces_a_damaged_monitor_database(self):
+        monitor = self.add_monitor()
+        def verify():
+            with sqlite3.connect(monitor) as conn:
+                self.assertEqual(conn.execute("SELECT * FROM gelf_cursor").fetchall(), [(9,)])
+            conn.close()
+        self.assert_restore_replaces_a_damaged_database(monitor, self.damage_random, verify)
+
+    def test_restore_still_stops_when_a_database_just_can_not_be_opened(self):
+        # Not being able to open the file (permissions, a mount problem) says
+        # nothing about its contents, so it isn't treated as damage: the
+        # restore stops and the services restart.
+        self.run_script("backup.sh")
+        (self.db_dir / "annotations.db").unlink()
+        (self.db_dir / "annotations.db").mkdir()
         result = self.run_script("restore.sh", "restore", "latest", "--yes", check=False)
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(before, (self.db_dir / "annotations.db").read_bytes())
-        self.assertEqual(self.compose_log.read_text().splitlines()[-1],
-                         "--profile monitor start mileage-monitor")
+        self.assertIn("could not snapshot", result.stderr)
+        self.assertEqual(self.compose_log.read_text().splitlines()[-1], "up -d")
+        self.assertFalse(list(self.backups.glob("pre-restore-*/*-unreadable")))
+
+    # --- a table-less events.db (#468) ---
+
+    def test_snapshot_of_a_table_less_events_database_restores(self):
+        path = self.data / "diagnostics/events.db"
+        path.parent.mkdir()
+        variants = (lambda: path.write_bytes(b""),
+                    lambda: sqlite3.connect(path).executescript("CREATE TABLE other (x);"))
+        for make in variants:
+            if path.exists():
+                path.unlink()
+            make()
+            self.run_script("backup.sh")
+            checked = self.run_script("restore.sh", "check")
+            self.assertIn("no diagnostics yet", checked.stderr)
+            self.assertIn("Restore test passed", checked.stderr)
+            self.run_script("restore.sh", "restore", "latest", "--yes")
+
+    # --- the restore scratch folder (#472) ---
+
+    def watch_rsync(self):
+        real = shutil.which("rsync")
+        self.shim("rsync", 'echo "$@" >> "$RSYNC_LOG"\n'
+                  'dest=${@: -1}\n'
+                  'case $dest in *.restore-scratch-*|*mileage-restore.*)\n'
+                  '    echo "mode $(stat -c %a "$(dirname "${dest%/}")")" >> "$RSYNC_LOG";;\n'
+                  'esac\n'
+                  f'exec {real} "$@"\n')
+        self.env["RSYNC_LOG"] = str(self.tmp / "rsync.log")
+        return self.tmp / "rsync.log"
+
+    def test_restore_stages_the_snapshot_next_to_the_backups_not_in_tmp(self):
+        self.run_script("backup.sh")
+        log = self.watch_rsync()
+        self.run_script("restore.sh", "check")
+        lines = log.read_text().splitlines()
+        scratch = [line for line in lines if f"{self.backups}/.restore-scratch-" in line]
+        self.assertTrue(scratch, lines)
+        self.assertIn("mode 700", lines)
+        self.assertEqual(list(self.backups.glob(".restore-scratch-*")), [])
+
+    def test_tmpdir_still_overrides_the_restore_scratch_folder(self):
+        self.run_script("backup.sh")
+        log = self.watch_rsync()
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        self.env["TMPDIR"] = str(elsewhere)
+        self.run_script("restore.sh", "check")
+        lines = log.read_text().splitlines()
+        self.assertTrue([line for line in lines if f"{elsewhere}/mileage-restore." in line])
+        self.assertFalse([line for line in lines if ".restore-scratch-" in line])
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_backup_clears_scratch_folders_a_killed_restore_left_behind(self):
+        old = self.backups / ".restore-scratch-OLD"
+        fresh = self.backups / ".restore-scratch-NEW"
+        for d in (old, fresh):
+            (d / "snapshot").mkdir(parents=True)
+        three_days_ago = os.stat(old).st_mtime - 3 * 86400
+        os.utime(old, (three_days_ago, three_days_ago))
+        self.run_script("backup.sh")
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+
+    # --- restore latest skips the installer's empty snapshot (#471) ---
+
+    def wipe_trips_and_annotations(self):
+        for path in self.data.rglob("*"):
+            if path.is_file():
+                path.unlink()
+        with sqlite3.connect(self.db_dir / "annotations.db") as conn:
+            conn.execute("DELETE FROM annotations")
+        conn.close()
+
+    def test_restore_latest_skips_a_newer_snapshot_with_no_trips(self):
+        self.run_script("backup.sh")
+        [full] = self.snapshots()
+        self.wipe_trips_and_annotations()   # a rebuilt server's first backup
+        self.run_script("backup.sh")
+        empty = self.snapshots()[-1]
+        self.assertNotEqual(full, empty)
+        self.assertIn("trips=0", (self.remote / "snapshots" / empty / "INFO").read_text())
+        result = self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertIn(f"restoring {full} instead", result.stderr)
+        self.assertEqual(
+            (self.data / "2026-10/2026-10-01T15-00-00.gpx").read_text(), "first.gpx")
+        self.verify_annotations()
+
+    def test_restore_latest_still_takes_the_newest_when_all_are_empty(self):
+        self.wipe_trips_and_annotations()
+        self.run_script("backup.sh")
+        [only] = self.snapshots()
+        result = self.run_script("restore.sh", "check", "latest")
+        self.assertIn(f"{self.remote}/snapshots/{only}", result.stderr)
+        self.assertNotIn("instead", result.stderr)
+
+    def test_restore_of_a_named_empty_snapshot_is_not_redirected(self):
+        self.run_script("backup.sh")
+        self.wipe_trips_and_annotations()
+        self.run_script("backup.sh")
+        empty = self.snapshots()[-1]
+        result = self.run_script("restore.sh", "check", empty)
+        self.assertIn("0 trip GPX files", result.stderr)
+        self.assertNotIn("instead", result.stderr)
 
 
 if __name__ == "__main__":
