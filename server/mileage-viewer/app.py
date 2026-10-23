@@ -36,13 +36,13 @@ Authentication:
     request. All registered private endpoints declare their allowed roles.
     Passwords are stored only as hashes, never as plaintext.
   - Sessions are signed with VIEWER_SECRET_KEY. That key MUST be supplied
-    from the environment and be stable: gunicorn runs multiple workers,
-    and a per-process random key would mean a session minted by worker A
-    is rejected by worker B.
+    from the environment and be stable: gunicorn runs 2 workers with 4
+    threads each. A per-process random key would mean a session minted by
+    worker A is rejected by worker B.
   - A session is tied to the password hash it logged in under, so setting
     a new VIEWER_PASSWORD_HASH logs out everyone already logged in.
   - Repeated failed logins lock out the source IP. The counter lives in
-    SQLite rather than process memory so all workers share one view of it.
+    SQLite rather than process memory so all workers and threads share it.
   - This remains a LAN-only tool. The login is defence in depth against
     other devices on your network, not a licence to expose port 8091 to
     the internet -- the session cookie still travels over plain HTTP.
@@ -148,6 +148,7 @@ VIEWER_SECRET_KEY = os.environ.get("VIEWER_SECRET_KEY", "").strip()
 
 # Lockout policy: after MAX_FAILS bad passwords from one IP, refuse that
 # IP for LOCKOUT_MINUTES regardless of whether the next guess is correct.
+# A quiet LOCKOUT_MINUTES without a failure resets the count on the next one.
 MAX_FAILS = 5
 LOCKOUT_MINUTES = 15
 
@@ -248,6 +249,8 @@ def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     # closing() actually closes the connection on exit; sqlite3's own
     # context manager only commits/rolls back the transaction.
+    # Match the other viewer writers: concurrent requests may queue behind a
+    # merge refresh, so use 30 s consistently rather than SQLite's 5 s default.
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         # Multiple Gunicorn workers can start together. Serialize the schema
         # check and migration so neither tries to add the same column twice.
@@ -270,8 +273,8 @@ def init_db():
         trip_merges.init_schema(conn)
         trip_log.init_schema(conn)
         # Failed-login tracking. This lives in SQLite, not in a module
-        # global, because gunicorn runs 2 workers -- an in-memory counter
-        # would give an attacker MAX_FAILS attempts per worker and would
+        # global, because gunicorn runs 2 workers with 4 threads each. A counter
+        # per worker would give an attacker MAX_FAILS attempts per worker and
         # reset every restart.
         conn.execute(
             """
@@ -282,6 +285,11 @@ def init_db():
             )
             """
         )
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(login_attempts)")}
+        if "last_failed_at" not in columns:
+            # Existing failures have no known age. Treat them as stale at the
+            # next failure, but preserve any active lock until its expiry.
+            conn.execute("ALTER TABLE login_attempts ADD COLUMN last_failed_at TEXT")
         # Which usernames the failures in login_attempts.fails were against.
         # A success may only subtract its own username's share; login_attempts
         # stays the per-IP count and lock, so clearing it unlocks everyone.
@@ -299,7 +307,7 @@ def init_db():
 
 def get_annotations():
     """Return categories, notes and destinations keyed by trip path."""
-    with closing(sqlite3.connect(DB_PATH)) as conn:
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT trip_key, category, purpose_note, destination FROM annotations"
@@ -308,7 +316,7 @@ def get_annotations():
 
 
 def upsert_annotation(trip_key, category, purpose_note, destination=""):
-    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         conn.execute(
             """
             INSERT INTO annotations (trip_key, category, purpose_note, destination, updated_at)
@@ -340,7 +348,7 @@ def _client_ip():
 
 def _lock_seconds_remaining(ip):
     """Seconds this IP is still locked out for; 0 if it may try again."""
-    with closing(sqlite3.connect(DB_PATH)) as conn:
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         row = conn.execute(
             "SELECT locked_until FROM login_attempts WHERE ip = ?", (ip,)
         ).fetchone()
@@ -363,26 +371,31 @@ def _record_failure(ip, username=""):
     """Count a bad password and lock the IP once it hits MAX_FAILS.
 
     The lock and total are per IP, whichever username was tried; the name
-    is kept only so a later success can subtract its own failures.
+    is kept only so a later success can subtract its own failures. A pause of
+    LOCKOUT_MINUTES since the last failure starts the count and names afresh.
     """
-    now = datetime.now(timezone.utc)
     name = _failure_name(username)
-    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         # Reserve the writer before reading: workers must not both read
         # the same count, then overwrite each other's increment.
         conn.execute("BEGIN IMMEDIATE")
+        now = datetime.now(timezone.utc)
         row = conn.execute(
-            "SELECT fails, locked_until FROM login_attempts WHERE ip = ?", (ip,)
+            "SELECT fails, locked_until, last_failed_at FROM login_attempts WHERE ip = ?", (ip,)
         ).fetchone()
-        if not row:
-            # Name counts only describe a login_attempts row. A manual
-            # DELETE FROM login_attempts leaves them behind; drop them so
-            # they can't be subtracted from failures counted after the unlock.
-            conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
         # Another request may have established the lock while this request
         # was checking its password. Its failure must not clear that lock.
         if row and row[1] and datetime.fromisoformat(row[1]) > now:
             return
+        if row and (row[2] is None or datetime.fromisoformat(row[2]) <=
+                    now - timedelta(minutes=LOCKOUT_MINUTES)):
+            row = None
+        if not row:
+            # Name counts only describe a login_attempts row. A manual
+            # DELETE FROM login_attempts leaves them behind; drop them so
+            # they can't be subtracted from failures counted after the unlock.
+            # The same applies when the whole count expires after a quiet gap.
+            conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
         fails = (row[0] if row else 0) + 1
         if fails >= MAX_FAILS:
             locked_until = (now + timedelta(minutes=LOCKOUT_MINUTES)).isoformat()
@@ -399,13 +412,14 @@ def _record_failure(ip, username=""):
             )
         conn.execute(
             """
-            INSERT INTO login_attempts (ip, fails, locked_until)
-            VALUES (?, ?, ?)
+            INSERT INTO login_attempts (ip, fails, locked_until, last_failed_at)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(ip) DO UPDATE SET
                 fails = excluded.fails,
-                locked_until = excluded.locked_until
+                locked_until = excluded.locked_until,
+                last_failed_at = excluded.last_failed_at
             """,
-            (ip, fails, locked_until),
+            (ip, fails, locked_until, now.isoformat()),
         )
 
 
@@ -417,7 +431,7 @@ def _clear_failures(ip, username):
     unknown ones) keep counting toward the IP's lock.
     """
     name = _failure_name(username)
-    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT fails, locked_until FROM login_attempts WHERE ip = ?", (ip,)
@@ -2259,7 +2273,7 @@ def admin_history():
 def _year_list():
     """The years the admin can review, newest first, each with its closed record."""
     trips, unreadable = load_trips(include_removed=True)
-    with closing(sqlite3.connect(DB_PATH)) as conn:
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         closed = trip_log.closed_years(conn)
     years = {y for y in map(_trip_local_year, trips) if y} | closed.keys()
     for trip in unreadable:
@@ -2587,7 +2601,7 @@ def logout():
 @app.route("/")
 def index():
     trips, unreadable, year, years = selected_trips()
-    with closing(sqlite3.connect(DB_PATH)) as conn:
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         year_closed = year in trip_log.closed_years(conn)
     return render_template_string(
         LIST_HTML, trips=trips, unreadable=unreadable, year=year, years=years,
@@ -2600,7 +2614,7 @@ def trip_view(ym, trip_id):
     year = selected_year()
     _safe_trip_paths(ym, trip_id)
     key = f"{ym}/{trip_id}"
-    with closing(sqlite3.connect(DB_PATH)) as conn:
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         key = trip_merges.canonical_key(conn, key)
         removed = trip_log.removal(conn, key)
     # Merge suggestions get the standard lists plus the removed readable
@@ -2649,7 +2663,7 @@ def lookup_place(ym, trip_id):
     # Coordinates and provider are always server-selected. This is not an
     # arbitrary geocoding proxy, even for an authenticated browser.
     _safe_trip_paths(ym, trip_id)
-    with closing(sqlite3.connect(DB_PATH)) as conn:
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         _abort_if_removed(conn, f"{ym}/{trip_id}")
     t = resolved_trip(ym, trip_id)
     endpoint = request.form.get("endpoint", "")
@@ -2668,7 +2682,7 @@ def lookup_place(ym, trip_id):
 @app.route("/gpx/<ym>/<trip_id>")
 def trip_gpx(ym, trip_id):
     gpx_path, _ = _safe_trip_paths(ym, trip_id)
-    with closing(sqlite3.connect(DB_PATH)) as conn:
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         removed = trip_log.removal(conn, trip_merges.canonical_key(conn, f"{ym}/{trip_id}"))
     # The track of a removed trip is the admin's to look at, nobody else's;
     # without this check the plain-file path below would still serve it.
@@ -2739,7 +2753,7 @@ def _abort_if_removed(conn, key):
 
 def resolved_trip(ym, trip_id, allow_original=False, include_removed=False):
     key = f"{ym}/{trip_id}"
-    with closing(sqlite3.connect(DB_PATH)) as conn:
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         key = trip_merges.canonical_key(conn, key)
     trips, _ = load_trips(include_removed=include_removed)
     t = next((t for t in trips if t["trip_key"] == key or key in t.get("parts", [])), None)

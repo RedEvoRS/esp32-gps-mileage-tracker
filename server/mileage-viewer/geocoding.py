@@ -74,8 +74,6 @@ class Geocoder:
                     "without URL credentials, query or fragment. The public "
                     "OpenStreetMap service does not permit vehicle tracking."
                 ) from None
-        # Avoid ambient proxies and never forward an endpoint via a redirect.
-        self.opener = build_opener(ProxyHandler({}), NoRedirect())
 
     @property
     def enabled(self):
@@ -104,7 +102,7 @@ class Geocoder:
 
     def cached(self, latitude, longitude):
         key = self.key(latitude, longitude)
-        with closing(sqlite3.connect(self.db_path)) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=30)) as conn:
             row = conn.execute(
                 "SELECT label FROM geocode_cache WHERE cache_key = ?", (key,)
             ).fetchone()
@@ -117,7 +115,7 @@ class Geocoder:
         token = os.urandom(16).hex()
         # A short transaction reserves the provider across all workers. Never
         # hold a SQLite write lock during HTTP or block manual annotation saves.
-        with closing(sqlite3.connect(self.db_path)) as conn, conn:
+        with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT label FROM geocode_cache WHERE cache_key = ?", (key,)
@@ -137,7 +135,7 @@ class Geocoder:
         try:
             label = self._fetch(latitude, longitude)
             cooldown = self.interval
-            with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
                 conn.execute(
                     "INSERT OR REPLACE INTO geocode_cache VALUES (?, ?, ?)",
                     (key, label, time.time()),
@@ -149,7 +147,7 @@ class Geocoder:
             cooldown = exc.cooldown
             raise
         finally:
-            with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
                 conn.execute(
                     "UPDATE geocode_gate SET next_allowed = ? WHERE singleton = 1 AND token = ?",
                     (time.time() + cooldown, token),
@@ -164,9 +162,12 @@ class Geocoder:
             "User-Agent": self.user_agent, "Accept": "application/json",
         })
         deadline = time.monotonic() + self.RESPONSE_BUDGET
+        # Keep the opener and its handlers local to this call, so threads share
+        # only configuration. Avoid ambient proxies and never follow redirects.
+        opener = build_opener(ProxyHandler({}), NoRedirect())
         try:
             try:
-                response = self.opener.open(req, timeout=5)
+                response = opener.open(req, timeout=5)
             except HTTPError as exc:
                 # Some compatible providers return no coverage as HTTP 404.
                 # Only the exact, bounded no-match body is cacheable.

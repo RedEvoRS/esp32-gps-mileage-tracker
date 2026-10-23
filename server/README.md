@@ -791,10 +791,11 @@ How authentication behaves:
   anyone who can reach the port on the LAN; it contains no trip or device data.
 - Session cookie is HttpOnly, SameSite=Lax, 30-day lifetime.
 - All state-changing forms carry CSRF tokens.
-- Five bad passwords from one IP locks that IP out for 15 minutes. The
-  counter is in SQLite, not process memory, so both gunicorn workers
-  share one view of it and it survives restarts. The count is per IP across
-  all usernames. A successful login, or your own password change, clears
+- Five bad passwords from one IP lock that IP out for 15 minutes. Failures
+  count until there has been a 15-minute pause without one; the next failure
+  then starts a fresh count. The counter is in SQLite, not process memory,
+  so both gunicorn workers and their threads share it across restarts. The count
+  is per IP across all usernames. A successful login, or your own password change, clears
   only the failures typed against that same username, so an everyday login
   can't reset guesses at the admin password.
 - The service **refuses to start** if the username, hash, or secret key

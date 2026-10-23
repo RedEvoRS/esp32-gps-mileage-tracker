@@ -47,7 +47,10 @@ roles; undeclared endpoints are denied. Passwords are stored as hashes. These co
 help keep casual LAN users without credentials from uploading data or viewing
 trips. The viewer checks cross-site request forgery (CSRF) tokens as before,
 and slows password guessing by locking a source IP for 15 minutes after five
-failed logins.
+failed logins. Failures count until there has been a 15-minute pause without
+one; the next failure then starts a fresh count. A successful login or own
+password change clears only failures against that same username, so an
+everyday login cannot reset guesses at the admin password.
 
 Both services' `/health` endpoints are unauthenticated and report status,
 service name and server version, without trip or device data. The viewer's

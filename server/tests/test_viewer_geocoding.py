@@ -279,7 +279,9 @@ class EndpointPlaceTests(unittest.TestCase):
         self.assertFalse(any("should-not-be-followed" in p for p, _ in self.received))
 
     def test_timeout_is_generic_and_not_cached(self):
-        with patch.object(self.viewer.GEOCODER.opener, "open", side_effect=TimeoutError("private endpoint")) as call:
+        with patch("geocoding.build_opener") as factory:
+            call = factory.return_value.open
+            call.side_effect = TimeoutError("private endpoint")
             response = self.post()
         self.assertEqual(response.status_code, 503)
         self.assertNotIn("private endpoint", response.get_data(as_text=True))

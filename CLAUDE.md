@@ -420,9 +420,11 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   login's tag covers its username, hash and `session_version`, so reset,
   disable, enable or remove logs it out at once. `ENDPOINT_ROLES` is checked
   server-side on every request; undeclared endpoints are denied.
-  `manage_users.py` manages everyday accounts. CSRF on POSTs; 5 failures locks
-  an IP for 15 min via shared SQLite `login_attempts`. App fail-fasts if auth
-  config is missing or the admin hash lost its `$` chars.
+  `manage_users.py` manages everyday accounts. CSRF on POSTs; 5 failures lock
+  an IP for 15 min via shared SQLite `login_attempts`. Failures count until a
+  15-minute pause without one; the next failure starts a fresh count. A success
+  clears only its own username's failures. App fail-fasts if auth config is
+  missing or the admin hash lost its `$` chars.
 - Timezone: stored UTC, displayed/exported in `DISPLAY_TZ` via `ZoneInfo`,
   DST-aware — never a fixed offset. No default: `install.sh` asks for it and
   writes it to `.env`, Compose passes it to **both** services (viewer
