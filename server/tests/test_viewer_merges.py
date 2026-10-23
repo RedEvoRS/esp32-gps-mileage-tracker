@@ -204,6 +204,30 @@ class ViewerMerges(unittest.TestCase):
             self.assertEqual(self.client.get("/").status_code, 200)
             self.assertEqual(len(self.viewer.load_trips()[0]), 1)
 
+    def test_a_rules_version_bump_does_not_rebuild_merged_summaries_alone(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        # Pretend this merged summary was built under earlier distance rules,
+        # like the plain trips' stored summaries.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            summary, fingerprint = conn.execute(
+                "SELECT summary, fingerprint FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
+            conn.execute("UPDATE trip_merges SET summary=? WHERE trip_key=?",
+                         (json.dumps({**json.loads(summary), "distance_miles": 123.0}), key))
+        with patch.object(self.viewer.trip_merges, "SUMMARY_VERSION", 4, create=True), patch.object(
+                self.viewer.trip_merges, "combined_summary", side_effect=AssertionError("rebuilt")):
+            self.assertEqual(self.viewer.load_trips()[0][0]["distance_miles"], 123.0)
+            # A row saved before the version left the fingerprint is not rebuilt either.
+            with closing(sqlite3.connect(self.db)) as conn, conn:
+                conn.execute("UPDATE trip_merges SET fingerprint=? WHERE trip_key=?",
+                             (json.dumps([3, *json.loads(fingerprint)]), key))
+            self.assertEqual(self.viewer.load_trips()[0][0]["distance_miles"], 123.0)
+        # A changed source file still rebuilds it, under the current rules.
+        path = self.month / "a.gpx"
+        path.write_bytes(path.read_bytes() + b" ")
+        rebuilt = self.viewer.load_trips()[0][0]["distance_miles"]
+        self.assertNotEqual(rebuilt, 123.0)
+
     def test_chain_and_old_merged_link_then_split_to_all_originals(self):
         a, b, c = self.trip("a", 0), self.trip("b", 120, .001), self.trip("c", 240, .002)
         self.annotate(a, "business", "Original A")

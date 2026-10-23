@@ -6,7 +6,7 @@ import xml.etree.ElementTree as ET
 from xml.parsers import expat
 from datetime import datetime, timedelta, timezone
 
-from common.trip_summary import parse_gpx, summarize, SUMMARY_VERSION, _parse_iso
+from common.trip_summary import parse_gpx, summarize, _parse_iso
 
 MERGE_MAX_GAP = timedelta(minutes=15)
 ANNOTATION_FIELDS = ("category", "purpose_note", "destination")
@@ -53,12 +53,36 @@ def source_paths(data_root, keys):
 
 
 def fingerprint(data_root, keys):
-    stamps = [SUMMARY_VERSION]
+    """The stamps of the source files a merged summary was built from.
+
+    It deliberately leaves out SUMMARY_VERSION. Plain trips keep the summary
+    ingest stored under the rules of the day, so a merged trip must too: a
+    later change to the distance rules reaches merges only when a source
+    file changes (or the merge is undone and redone), not on first view.
+    """
+    stamps = []
     for path in source_paths(data_root, keys):
         for source in (path, path.with_suffix(".json")):
             st = source.stat()
             stamps.append((source.name, st.st_mtime_ns, st.st_size))
     return json.dumps(stamps)
+
+
+def same_sources(fresh, stored):
+    """Whether two fingerprints name the same source files and stamps.
+
+    Rows saved before the rule version was dropped start with that number;
+    it is ignored, so upgrading does not rebuild every merge under new rules.
+    """
+    def stamps(text):
+        try:
+            value = json.loads(text)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(value, list):
+            return None
+        return value[1:] if value and isinstance(value[0], int) else value
+    return stamps(fresh) is not None and stamps(fresh) == stamps(stored)
 
 
 def parsed_parts(data_root, keys):
@@ -133,7 +157,7 @@ def apply_merges(conn, data_root, trips, unreadable):
             if not keys or any(k not in originals for k in keys):
                 raise ValueError("A merge part's summary is unavailable")
             stamp = fingerprint(data_root, keys)
-            if stamp != row["fingerprint"]:
+            if not same_sources(stamp, row["fingerprint"]):
                 summary = combined_summary(data_root, keys)
                 if fingerprint(data_root, keys) != stamp:
                     raise ValueError("Merge part changed during refresh")
