@@ -409,7 +409,7 @@ preflight() {
     local f missing=()
     for f in VERSION stamp_version.py common/version.py docker-compose.yml .dockerignore .env.example viewer.env.example monitor.env.example sample.gpx \
         common/__init__.py common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json} \
-        mileage-ingest/{Dockerfile,app.py,diag_store.py,requirements.txt} \
+        mileage-ingest/{Dockerfile,app.py,diag_store.py,reset_high_water.py,requirements.txt} \
         mileage-viewer/{Dockerfile,app.py,geocoding.py,requirements.txt} \
         mileage-viewer/static/{leaflet.js,leaflet.css,gpx.js,endpoint-places.js} \
         mileage-monitor/{Dockerfile,monitor.py,gelf.py,prometheus.py,loki.py} ntfy/server.yml \
@@ -1374,30 +1374,54 @@ http_fetch() {
 
 # The real thing: upload sample.gpx with the token from .env. The header
 # comes from a pipe so the token stays out of the process list.
-# sample.gpx ends on 2026-04-14, so it's filed under data/2026-04/.
+#
+# What goes up is an untimed copy of sample.gpx (its <time> elements
+# removed). Ingest names a trip with timestamps after those timestamps and
+# ignores X-Trip-Id for it, so a timed upload couldn't be told apart from a
+# real trip. An untimed one takes the ID we give it, is filed under the
+# current month of DISPLAY_TZ, and has no date, so it can't land in a tax
+# year (a closed one included).
 #
 # Cleanup deletes the test trip, so it may only ever be this run's: the
 # ID is new each run, and its path has to be free beforehand. Then
 # whatever turns up there came from this upload.
+TEST_UPLOAD=          # the untimed copy of sample.gpx that was uploaded
+
+# The month folder ingest files an untimed upload under right now.
+test_month() {
+    local zone
+    zone=$(env_raw .env DISPLAY_TZ)
+    TZ=$zone date +%Y-%m
+}
+
 upload_test_trip() {
-    local trip token response code body status miles stored
+    local trip token response code body status miles stored after
     TEST_ID=$TEST_PREFIX-$(openssl rand -hex 6)
-    trip=data/2026-04/$TEST_ID
+    trip=data/$(test_month)/$TEST_ID
     if data_exists "$trip.gpx" "$trip.json"; then
         problem "$trip already exists, so the test upload can't use it" \
             "Nothing was uploaded or deleted. Run the check again for a new test ID."
+        return 1
+    fi
+    TEST_UPLOAD=$(mktemp)
+    TMP_FILES+=("$TEST_UPLOAD")
+    sed 's#<time>[^<]*</time>##g' sample.gpx > "$TEST_UPLOAD"
+    if [[ ! -s $TEST_UPLOAD ]] || grep -q '<time' "$TEST_UPLOAD"; then
+        problem "Couldn't make the untimed test copy of sample.gpx" \
+            "Copy server/sample.gpx here again (DEPLOY_DEBIAN.md Step 2)."
         return 1
     fi
     if ! data_exists "${trip%/*}"; then TEST_NEW_DIR=${trip%/*}; fi
     token=$(env_raw .env INGEST_AUTH_TOKEN)
     TEST_TRIP=$trip
     # No X-Device-Id: this synthetic trip must not enroll a device that the
-    # all-device monitor would later report silent. X-Trip-Id owns cleanup.
+    # all-device monitor would later report silent. X-Trip-Id owns cleanup
+    # (it applies because the copy is untimed).
     response=$(curl -s -m 30 -w '\n%{http_code}' -X POST \
         -H @<(printf 'Authorization: Bearer %s\n' "$token") \
         -H 'Content-Type: application/gpx+xml' \
         -H "X-Trip-Id: $TEST_ID" \
-        --data-binary @sample.gpx "$INGEST_URL/upload") || response=$'\n000'
+        --data-binary @"$TEST_UPLOAD" "$INGEST_URL/upload") || response=$'\n000'
     code=${response##*$'\n'}
     body=${response%$'\n'*}
     status=$(jq -r '.status // empty' <<< "$body" 2> /dev/null) || status=
@@ -1405,12 +1429,18 @@ upload_test_trip() {
     stored=$(jq -r '.stored_as // empty' <<< "$body" 2> /dev/null) || stored=
     if [[ $code == 200 && $status == accepted && $stored == */"$TEST_ID.gpx" ]]; then
         TEST_TRIP=data/${stored%.gpx}
-        ok "Uploaded sample.gpx with the token; it was filed as $stored"
+        ok "Uploaded sample.gpx (untimed copy) with the token; it was filed as $stored"
     else
         # A refusal (4xx) stored nothing, so there's nothing of ours to
         # delete. After a timeout or a 5xx some of it may have been
         # written; the path was free before, so cleanup can remove that.
-        if [[ $code == 4?? ]]; then TEST_TRIP=; fi
+        if [[ $code == 4?? ]]; then
+            TEST_TRIP=
+        else
+            # The month may have turned over during the request.
+            after=data/$(test_month)/$TEST_ID
+            if [[ $after != "$trip" ]] && data_exists "$after.gpx" "$after.json"; then TEST_TRIP=$after; fi
+        fi
         problem "The test upload failed: HTTP $code ${body}" \
             "401: the running service has a different token from .env; recreate it: docker compose up -d" \
             "500: data/ probably isn't writable by UID $CONTAINER_UID (DEPLOY_DEBIAN.md Step 3)."
@@ -1477,10 +1507,10 @@ verify_end_to_end() {
     fi
 
     upload_test_trip || return 1
-    if "${DATA_SUDO[@]}" cmp -s sample.gpx "$TEST_TRIP.gpx"; then
+    if "${DATA_SUDO[@]}" cmp -s "$TEST_UPLOAD" "$TEST_TRIP.gpx"; then
         ok "The GPX on disk matches the upload byte for byte"
     else
-        problem "$TEST_TRIP.gpx is missing or differs from sample.gpx"
+        problem "$TEST_TRIP.gpx is missing or differs from what was uploaded"
     fi
     if "${DATA_SUDO[@]}" cat "$TEST_TRIP.json" 2> /dev/null \
         | jq -e --arg id "$TEST_ID" '.trip_id == $id and .distance_miles > 0' > /dev/null 2>&1; then
@@ -1569,7 +1599,7 @@ verify_viewer() {
         problem "The test trip's map page didn't load"
     fi
     if [[ $(http_fetch "$file" -b "$jar" "$VIEWER_URL/gpx/$ym/$TEST_ID") == 200 ]] \
-        && cmp -s "$file" sample.gpx; then
+        && cmp -s "$file" "$TEST_UPLOAD"; then
         ok "The viewer serves its track for the map"
     else
         problem "The viewer didn't serve the test trip's GPX track"
