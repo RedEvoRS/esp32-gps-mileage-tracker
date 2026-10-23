@@ -18,15 +18,18 @@ Findings print as location + rule, never the matched text, so a CI log
 can't become the leak.
 
     python tools/check_pii.py                  # tracked files
-    python tools/check_pii.py --commits A..B   # plus commit emails, messages and UTC dates
+    python tools/check_pii.py --commits A..B   # plus commit emails, messages, UTC dates
+                                               # and every file version the range adds
     python tools/check_pii.py --history        # plus every file version ever committed
 """
 
 import argparse
+import codecs
 import os
 import re
 import subprocess
 import sys
+import unicodedata
 from decimal import Decimal
 from pathlib import Path
 
@@ -63,7 +66,7 @@ SYNTHETIC_GPX_CONTENT = SYNTHETIC_GPX | {
 }
 
 FORBIDDEN_PATHS = [
-    (re.compile(r"(^|/)(secrets\.h|\.env|viewer\.env|backup\.conf|\.pii-denylist)$"),
+    (re.compile(r"(^|/)(secrets\.h|\.env|viewer\.env|monitor\.env|backup\.conf|\.pii-denylist)$"),
      "secrets file"),
     (re.compile(r"(^|/)settings\.local\.json$"), "per-machine Claude Code settings"),
     (re.compile(r"\.(db|sqlite3?|pem|key|p12|pfx)$|(^|/)id_(rsa|ecdsa|ed25519)"),
@@ -72,6 +75,12 @@ FORBIDDEN_PATHS = [
 ]
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".heic", ".webp", ".tif", ".tiff")
+
+# Files that should always be readable text. A NUL byte that no Unicode
+# encoding explains is a finding for these, not a reason to skip them.
+TEXT_EXTS = (".txt", ".log", ".md", ".csv", ".tsv", ".json", ".gpx", ".xml",
+             ".html", ".css", ".js", ".py", ".sh", ".ps1", ".yml", ".yaml",
+             ".toml", ".ini", ".cfg", ".conf", ".h", ".cpp", ".ino")
 
 # A home directory with a real account name after it: C:\Users\<name> (also
 # with forward slashes or JSON-escaped), /c/Users/<name>, /mnt/c/Users/<name>,
@@ -158,8 +167,18 @@ LINE_RULES = [
 ]
 
 
+def normalize(text):
+    """One canonical spelling for denylist matching. NFKC rather than NFC: NFC
+    only joins canonically equivalent forms (e + combining accent = e-acute,
+    which macOS file names and some paste paths produce), while NFKC also
+    folds look-alikes such as full-width letters and ligatures. A personal
+    name has no legitimate reason to differ in those, so the wider fold
+    catches more without adding false positives."""
+    return text if text.isascii() else unicodedata.normalize("NFKC", text)
+
+
 def term_pattern(term):
-    return re.compile(r"(?i)(?<![A-Za-z0-9])" + re.escape(term) + r"(?![A-Za-z0-9])")
+    return re.compile(r"(?i)(?<![A-Za-z0-9])" + re.escape(normalize(term)) + r"(?![A-Za-z0-9])")
 
 
 def load_denylist():
@@ -177,7 +196,8 @@ def scan_text(label, text, deny, *, synthetic_gpx=False):
         rules = {name for name, hit in LINE_RULES + COORDINATE_RULES
                  if not (synthetic_gpx and name == "GPX latitude/longitude attributes")
                  and hit(line)}
-        if any(p.search(line) for p in deny):
+        spelling = normalize(line)
+        if any(p.search(spelling) for p in deny):
             rules.add("personal term from the denylist")
         for rule in sorted(rules):
             yield f"{label}:{n}: {rule}"
@@ -200,14 +220,64 @@ def has_image_metadata(data):
     return b"Exif\0\0" in data[:65536] or b"eXIf" in data[:65536]
 
 
+_BOMS = ((codecs.BOM_UTF32_LE, "utf-32-le"), (codecs.BOM_UTF32_BE, "utf-32-be"),
+         (codecs.BOM_UTF8, "utf-8"),
+         (codecs.BOM_UTF16_LE, "utf-16-le"), (codecs.BOM_UTF16_BE, "utf-16-be"))
+# Readable runs inside binary data, like strings(1): ASCII/UTF-8 bytes, or
+# ASCII as 16-bit little- or big-endian characters.
+_STRINGS = re.compile(rb"[\t\x20-\x7e\x80-\xff]{4,}")
+_STRINGS_16LE = re.compile(rb"(?:[\x20-\x7e]\x00){4,}")
+_STRINGS_16BE = re.compile(rb"(?:\x00[\x20-\x7e]){4,}")
+
+
+def decode_text(data):
+    """data as text, or None if it is binary.
+
+    Windows tools write UTF-16 (PowerShell 5.1's > does by default), whose NUL
+    bytes would otherwise make readable text look binary. A byte-order mark
+    names the encoding; without one, UTF-16 of mostly ASCII text has a NUL in
+    every other byte."""
+    for bom, codec in _BOMS:
+        if data.startswith(bom):
+            return data[len(bom):].decode(codec, "replace")
+    head = data[:8192]
+    if b"\0" not in head:
+        return data.decode("utf-8", "replace")
+    pairs = len(head) // 2
+    even_nuls, odd_nuls = head[0:pairs * 2:2].count(0), head[1:pairs * 2:2].count(0)
+    if pairs >= 2 and odd_nuls >= pairs * 0.3 and even_nuls <= pairs * 0.02:
+        return data.decode("utf-16-le", "replace")
+    if pairs >= 2 and even_nuls >= pairs * 0.3 and odd_nuls <= pairs * 0.02:
+        return data.decode("utf-16-be", "replace")
+    return None
+
+
+def binary_strings(data):
+    """The readable text runs in binary data, one per line."""
+    runs = [m[0].decode("utf-8", "replace") for m in _STRINGS.finditer(data)]
+    runs += [m[0].decode("utf-16-le") for m in _STRINGS_16LE.finditer(data)]
+    runs += [m[0].decode("utf-16-be") for m in _STRINGS_16BE.finditer(data)]
+    return "\n".join(dict.fromkeys(runs))  # the two 16-bit patterns can find the same text
+
+
 def check_blob(path, data, deny):
     yield from check_path(path, deny)
-    if path.lower().endswith(IMAGE_EXTS) and has_image_metadata(data):
+    is_image = path.lower().endswith(IMAGE_EXTS)
+    if is_image and has_image_metadata(data):
         yield f"{path}: image has EXIF metadata (can include GPS); strip it"
-    if path in VENDORED or b"\0" in data[:8192]:
+    if path in VENDORED or (is_image and b"\0" in data[:8192]):
         return
-    yield from scan_text(path, data.decode("utf-8", "replace"), deny,
-                         synthetic_gpx=path in SYNTHETIC_GPX_CONTENT)
+    synthetic = path in SYNTHETIC_GPX_CONTENT
+    text = decode_text(data)
+    if text is not None:
+        yield from scan_text(path, text, deny, synthetic_gpx=synthetic)
+        return
+    # No Unicode encoding explains the NUL bytes. In a file that should be text
+    # that could be hiding its content, so say so; scan what is readable anyway.
+    if path.lower().endswith(TEXT_EXTS):
+        yield f"{path}: text file has NUL bytes in an unrecognised encoding (save it as UTF-8)"
+    yield from scan_text(f"{path} [binary strings]", binary_strings(data), deny,
+                         synthetic_gpx=synthetic)
 
 
 def git(*args, data=None):
@@ -221,16 +291,26 @@ def scan_tree(deny):
             yield from check_blob(path, (ROOT / path).read_bytes(), deny)
 
 
-def scan_history(deny):
-    """Every file version reachable from a branch, tag or remote."""
+def list_objects(*rev_list_args):
+    """{object id: path} for what `git rev-list --objects` names. Git names
+    each object once, under the first path it meets."""
     paths = {}
-    for line in git("rev-list", "--objects", "--exclude=refs/stash", "--all").decode().splitlines():
+    for line in git("rev-list", "--objects", *rev_list_args).decode("utf-8", "replace").splitlines():
         sha, _, path = line.partition(" ")
         if path:
             paths.setdefault(sha, path)
+    return paths
+
+
+def scan_file_versions(paths, deny, tag):
+    """Check every blob in {object id: path}, contents and name."""
+    if not paths:
+        return
     types = git("cat-file", "--batch-check=%(objectname) %(objecttype)",
                 data="\n".join(paths).encode()).decode().split()
     blobs = [sha for sha, kind in zip(types[::2], types[1::2]) if kind == "blob"]
+    if not blobs:
+        return
     out = git("cat-file", "--batch", data=("\n".join(blobs) + "\n").encode())
     i = 0
     while i < len(out):
@@ -239,7 +319,31 @@ def scan_history(deny):
         body = out[nl + 1:nl + 1 + int(size)]
         i = nl + 2 + int(size)
         for problem in check_blob(paths[sha], body, deny):
-            yield f"(history {sha[:8]}) {problem}"
+            yield f"({tag} {sha[:8]}) {problem}"
+
+
+def scan_history(deny):
+    """Every file version reachable from a branch, tag or remote."""
+    yield from scan_file_versions(
+        list_objects("--exclude=refs/stash", "--all"), deny, "history")
+
+
+def scan_range_files(rev_range, deny):
+    """Every file version and path a commit range adds, even one a later commit
+    in the range removed or rewrote. GitHub keeps a PR's commits for good and
+    they go public with the repo, so a clean final tree isn't enough. Versions
+    already reachable from the range's base are left out, which keeps a typical
+    PR's scan small."""
+    paths = list_objects(rev_range)
+    yield from scan_file_versions(paths, deny, "range")
+    # Git names a file version only once, and not at all if the base already
+    # has it, so a rename or move to a new name can slip through the walk
+    # above. The commits' own change lists name every path they touch.
+    log = git("log", "--format=", "--name-only", "--no-renames", "-m", "-z", rev_range)
+    touched = {p.strip("\n") for p in log.decode("utf-8", "replace").split("\0")}
+    for path in sorted(touched - set(paths.values()) - {""}):
+        for problem in check_path(path, deny):
+            yield f"(range) {problem}"
 
 
 def scan_commits(rev_range, deny):
@@ -258,12 +362,14 @@ def scan_commits(rev_range, deny):
                 yield f"{where}: {role} date isn't UTC (commit with TZ=UTC)"
         yield from scan_text(f"{where} names", f"{an}\n{cn}", deny)
         yield from scan_text(f"{where} message", body, deny)
+    yield from scan_range_files(rev_range, deny)
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--commits", metavar="RANGE",
-                    help="also check commit emails, messages and UTC dates, e.g. origin/main..HEAD")
+                    help="also check commit emails, messages, UTC dates and every file "
+                         "version the range adds, e.g. origin/main..HEAD")
     ap.add_argument("--history", action="store_true",
                     help="also check every file version ever committed")
     args = ap.parse_args(argv)

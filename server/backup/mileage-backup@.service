@@ -6,10 +6,15 @@
 [Unit]
 Description=Mileage tracker backup (trip files + annotations, copied off-host)
 Wants=network-online.target
-After=network-online.target docker.service
+# remote-fs.target: network shares in /etc/fstab are mounted first. A local
+# destination also gets RequiresMountsFor= from install.sh's drop-in.
+After=network-online.target remote-fs.target docker.service
 
 [Service]
 Type=oneshot
+# A oneshot has no start timeout unless one is set. Without this, a backup
+# stuck on a vanished destination would block every later timer run.
+TimeoutStartSec=6h
 User=%i
 ExecStart=/bin/bash /home/%i/mileage-tracker/backup/backup.sh
 Nice=10

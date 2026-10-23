@@ -58,6 +58,8 @@ import sqlite3
 import sys
 import json
 import math
+import unicodedata
+from urllib.parse import unquote, urlsplit
 from xml.parsers import expat
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -77,6 +79,7 @@ from flask import (
     url_for,
 )
 from openpyxl import Workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.exceptions import HTTPException
 
@@ -216,6 +219,32 @@ def _startup_check():
 
 # These are user classifications for recordkeeping, not tax determinations.
 CATEGORIES = ("business", "personal", "other")
+
+# A note or destination is a sentence, not a document. The cap also keeps every
+# saved value inside one XLSX cell (32,767 characters) with room to spare.
+ANNOTATION_MAX_CHARS = 2000
+XLSX_CELL_MAX_CHARS = 32767
+# What XML 1.0 can't hold: openpyxl's own list of control characters, plus
+# lone surrogates and U+FFFE/U+FFFF, which openpyxl lets through into a
+# workbook that then can't be opened.
+XML_ILLEGAL_RE = re.compile(ILLEGAL_CHARACTERS_RE.pattern + r"|[\ud800-\udfff\ufffe\uffff]")
+
+
+def _annotation_text_problem(label, text):
+    """Why a typed note or destination can't be saved, or None.
+
+    It never strips anything: the user is told, so nothing they typed changes
+    without them knowing.
+    """
+    if len(text) > ANNOTATION_MAX_CHARS:
+        return (f"The {label} is {len(text)} characters long; the limit is "
+                f"{ANNOTATION_MAX_CHARS}. Shorten it and save again.")
+    bad = XML_ILLEGAL_RE.search(text)
+    if bad:
+        return (f"The {label} contains a control character (U+{ord(bad.group()):04X}) that "
+                "spreadsheets can't hold. Remove it (often a stray paste from another "
+                "program) and save again.")
+    return None
 
 # Strict patterns for the URL components, so a trip path can never escape
 # DATA_ROOT via "..", absolute paths, or odd characters.
@@ -429,6 +458,11 @@ def _clear_failures(ip, username):
     Anyone who holds one valid login could otherwise reset the count between
     guesses at another account's password. Failures against other names (or
     unknown ones) keep counting toward the IP's lock.
+
+    Returns False, clearing nothing, if the IP is locked: the lock can appear
+    while a login's slow password hash is running, and that login must not
+    still get a session. This check shares the clearing transaction, so no
+    lock can slip in between it and the session being issued.
     """
     name = _failure_name(username)
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
@@ -438,14 +472,14 @@ def _clear_failures(ip, username):
         ).fetchone()
         if not row:
             conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
-            return
+            return True
         if row[1] and datetime.fromisoformat(row[1]) > datetime.now(timezone.utc):
-            return  # a lock set by a concurrent request stands
+            return False  # a lock set by a concurrent request stands
         own = conn.execute(
             "SELECT fails FROM login_attempt_names WHERE ip = ? AND name = ?", (ip, name)
         ).fetchone()
         if not own:
-            return
+            return True
         conn.execute("DELETE FROM login_attempt_names WHERE ip = ? AND name = ?", (ip, name))
         fails = max(0, row[0] - own[0])
         if fails:
@@ -453,6 +487,7 @@ def _clear_failures(ip, username):
         else:
             conn.execute("DELETE FROM login_attempts WHERE ip = ?", (ip,))
             conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
+    return True
 
 
 def _safe_equal(a, b):
@@ -524,12 +559,42 @@ def _valid_csrf():
 def _safe_next(target):
     """Only allow same-site relative redirects after login.
 
-    Rejects absolute URLs and protocol-relative '//evil.com' so the login
-    form can't be used as an open redirect.
+    Rejects absolute URLs, protocol-relative '//evil.com', backslashes and
+    control characters (raw or percent-encoded). Werkzeug builds the Location
+    header with urlsplit(), which silently drops tabs and newlines, so
+    a tab after the first slash would otherwise become '//evil.com'. The result is
+    parsed the same way and must be a plain path with no scheme or host.
     """
-    if not target or not target.startswith("/") or target.startswith("//"):
+    if not target:
+        return None
+    for text in (target, unquote(target)):
+        if "\\" in text or any(unicodedata.category(c) == "Cc" or (c.isspace() and c != " ") for c in text):
+            return None
+    if not target.startswith("/") or target.startswith("//"):
+        return None
+    parts = urlsplit(target)
+    if parts.scheme or parts.netloc or not parts.path.startswith("/") or parts.path.startswith("//"):
         return None
     return target
+
+
+@app.after_request
+def _security_headers(response):
+    """Refuse framing (clickjacking) and content sniffing on every response.
+
+    A page from the same site (another app on this host, or the same home
+    domain) would otherwise be able to frame a viewer page under the admin's
+    session cookie and steer their clicks onto its real forms. An existing
+    Content-Security-Policy is kept: frame-ancestors is merged into it.
+    """
+    policy = response.headers.get("Content-Security-Policy", "")
+    directives = [d.strip() for d in policy.split(";")
+                  if d.strip() and d.strip().split()[0].lower() != "frame-ancestors"]
+    directives.append("frame-ancestors 'none'")
+    response.headers["Content-Security-Policy"] = "; ".join(directives)
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 @app.before_request
@@ -626,6 +691,15 @@ def _summary_problem(summary):
             return f"{field} is not a finite number"
     if summary.get("timing_status") not in (None, "complete", "partial", "untimed"):
         return "timing_status is not recognized"
+    # Valid JSON that lacks the fields every ingest-written summary has (a hand
+    # edit, a partial restore, "{}") must not pass for a 0-mile trip that
+    # silently drops out of every year. Ingest's _stored_summary() is stricter
+    # about the IDs; the viewer takes them from the file name, so it asks only
+    # for what it files and totals the trip by.
+    if not _is_number(summary.get("distance_miles")):
+        return "distance_miles is missing"
+    if "start_time" not in summary and "timing_status" not in summary:
+        return "neither start_time nor timing_status is present"
     return None
 
 
@@ -653,11 +727,17 @@ def read_summary(json_path):
         identity = {field: summary[field] for field in ("device_id", "start_time")
                     if isinstance(summary, dict) and isinstance(summary.get(field), str)}
         return identity or None, problem
-    return {
+    kept = {
         field: summary[field]
         for field in SUMMARY_TEXT_FIELDS + SUMMARY_NUMBER_FIELDS
         if field in summary
-    }, None
+    }
+    # When ingest first stored the trip. Only read to tell a trip that arrived
+    # after its year was closed; a summary without it (or with junk in it) is
+    # simply never "late", and is never rejected for it.
+    if isinstance(summary.get("_received_at"), str):
+        kept["received_at"] = summary["_received_at"]
+    return kept, None
 
 
 def load_trips(conn=None, include_removed=False):
@@ -964,13 +1044,20 @@ def _to_local(dt):
     """Convert an instant to the display timezone.
 
     A naive datetime is treated as UTC. That's the storage convention, and
-    guessing "local" for a bare timestamp is how dates silently drift.
+    guessing "local" for a bare timestamp is how dates silently drift. An
+    instant with no representable local time returns None, like a missing one.
     """
     if dt is None:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(DISPLAY_TZ)
+    try:
+        return dt.astimezone(DISPLAY_TZ)
+    except (OverflowError, ValueError):
+        # Year 1 west of UTC, year 9999 east of it: no local time exists.
+        # Treat the stamp as unknown (the trip is undated) rather than 500
+        # every page that lists it.
+        return None
 
 
 def _history_trip_keys(conn, trip_key, parts=()):
@@ -1180,6 +1267,18 @@ def year_members(trips, unreadable, year):
             [t for t in unreadable if _may_start_in(t["ym"], year)])
 
 
+def _flag_trips_inside_merges(trips):
+    """Give each trip a live merged trip already covers an "inside_merge" entry.
+
+    The list and the year review show it so the double count can be undone.
+    The totals and exports are not changed: which trips count is the
+    admin's call (undo the merge, or remove the later recording).
+    """
+    by_key = {t["trip_key"]: t for t in trips}
+    for key, cover in trip_merges.trips_inside_merges(trips).items():
+        by_key[key]["inside_merge"] = {"ym": cover["ym"], "id": cover["id"], "trip_key": cover["trip_key"]}
+
+
 def selected_trips(include_history=False):
     """Use local start year, or first recorded time for partly timed trips.
 
@@ -1188,6 +1287,7 @@ def selected_trips(include_history=False):
     """
     year = selected_year()
     trips, unreadable = load_trips()
+    _flag_trips_inside_merges(trips)
     years = {y for y in map(_trip_local_year, trips) if y}
     selected = trips
     if year:
@@ -1197,8 +1297,11 @@ def selected_trips(include_history=False):
         with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
             conn.row_factory = sqlite3.Row
             lookup = _last_edited_lookup(conn)
+            closed = trip_log.closed_years(conn)
             for trip in selected + unreadable:
                 _set_export_last_edited(lookup, trip)
+            for trip in selected:
+                trip["received_after_close"] = "yes" if closed and late_in_closed_year(trip, closed) else ""
     return selected, unreadable, year, sorted(years, reverse=True)
 
 
@@ -1217,6 +1320,45 @@ def mileage_totals(trips):
 # ---------------------------------------------------------------------
 # Closed years
 # ---------------------------------------------------------------------
+
+
+def received_after(trip, closed_at):
+    """True if ingest stored the trip after closed_at (both are UTC stamps).
+
+    A summary with no usable _received_at (written before ingest recorded it,
+    or damaged) is never late: there is no evidence it arrived after the close.
+    """
+    received, closed = trip_log.parse_utc(trip.get("received_at")), trip_log.parse_utc(closed_at)
+    return bool(received and closed and received > closed)
+
+
+def late_in_closed_year(trip, closed):
+    """True if trip belongs to a closed year and arrived after that year's close."""
+    return any(received_after(trip, closed[year]["closed_at"])
+               for year in trip_years(trip) & closed.keys())
+
+
+def year_figures(members, unreadable):
+    """What a year's totals are made of: the figures the review and exports show.
+
+    members are the readable trips of the year, unreadable the ones whose miles
+    can't be counted. trip_keys lets a later review name the trips that joined
+    or left the year since a snapshot was taken.
+    """
+    totals = mileage_totals(members)
+    counts = {category: 0 for category in totals}
+    counts["all"] = len(members)
+    for trip in members:
+        counts[trip.get("category") if trip.get("category") in CATEGORIES else "unclassified"] += 1
+    return {"trips": len(members), "unreadable": len(unreadable), "totals": totals, "counts": counts,
+            "trip_keys": sorted(t["trip_key"] for t in members)}
+
+
+def _live_year_members(conn, year):
+    """(readable, unreadable) trips of one year, without removed ones. Caller holds the transaction."""
+    trips, unreadable = _load_trips(conn, include_removed=True)
+    return year_members([t for t in trips if "removal" not in t],
+                        [t for t in unreadable if "removal" not in t], year)
 
 
 def _recording_years(key):
@@ -1286,7 +1428,7 @@ def _abort_if_key_in_closed_year(conn, *keys):
 
 app.jinja_env.globals.update(
     fmt_date=fmt_date, fmt_day=fmt_day, fmt_trip_date=fmt_trip_date, fmt_duration=fmt_duration,
-    fmt_speed=fmt_speed, csrf_token=_csrf_token
+    fmt_speed=fmt_speed, csrf_token=_csrf_token, annotation_max=ANNOTATION_MAX_CHARS
 )
 
 
@@ -1657,7 +1799,7 @@ LIST_HTML = """
         <th>Purpose</th><th>Destination</th><th>Note</th><th></th></tr>
     {% for t in trips %}
     <tr>
-      <td>{{ fmt_trip_date(t) }}{% if t.get('timing_status') == 'partial' %}<br><span class="muted">Partial timing</span>{% endif %}{% if t.get('parts') %}<br><code>{{ t.gpx_file }}</code>{% endif %}</td>
+      <td>{{ fmt_trip_date(t) }}{% if t.get('timing_status') == 'partial' %}<br><span class="muted">Partial timing</span>{% endif %}{% if t.get('inside_merge') %}<br><span class="tag other">Inside a merged trip</span> <a href="{{ url_for('trip_view', ym=t.inside_merge.ym, trip_id=t.inside_merge.id, year=year or '') }}">counted twice: undo that merge</a>{% endif %}{% if t.get('parts') %}<br><code>{{ t.gpx_file }}</code>{% endif %}</td>
       <td>{{ "%.2f"|format(t.distance_miles or 0) }} mi</td>
       <td>{{ fmt_duration(t.duration_seconds) }}</td>
       <td>{{ fmt_speed(t.get('avg_speed_mph')) }}</td>
@@ -1821,14 +1963,14 @@ TRIP_HTML = """
       {% endfor %}
     </select>
     <label for="destination">Destination / place</label>
-    <input type="text" name="destination" id="destination" value="{{ t.destination or '' }}">
+    <input type="text" name="destination" id="destination" maxlength="{{ annotation_max }}" value="{{ t.destination or '' }}">
     {% if geocoder_enabled and 'end' in places %}
     <button type="button" class="btn secondary" id="use-end-place"
       {% if not places.get('end') %}disabled{% endif %}>Use end suggestion as destination</button>
     <p class="muted">Using a suggestion replaces the destination field above. Click Save to keep it.</p>
     {% endif %}
     <label for="purpose_note">Note (e.g. "Client visit — Acme Corp")</label>
-    <textarea name="purpose_note" id="purpose_note" rows="3">{{ t.purpose_note or "" }}</textarea>
+    <textarea name="purpose_note" id="purpose_note" rows="3" maxlength="{{ annotation_max }}">{{ t.purpose_note or "" }}</textarea>
     <p><button class="btn" type="submit">Save</button></p>
   </form>
   {% endif %}
@@ -2008,6 +2150,12 @@ def device_health():
     ), 503 if data["state"] == "unavailable" else 200
 
 
+def _locked_login_response(seconds):
+    minutes = max(1, round(seconds / 60))
+    error = f"Too many failed attempts. Try again in {minutes} minute(s)."
+    return render_template_string(LOGIN_HTML, error=error), 429
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if _is_logged_in():
@@ -2018,9 +2166,7 @@ def login():
         ip = _client_ip()
         locked = _lock_seconds_remaining(ip)
         if locked:
-            minutes = max(1, round(locked / 60))
-            error = f"Too many failed attempts. Try again in {minutes} minute(s)."
-            return render_template_string(LOGIN_HTML, error=error), 429
+            return _locked_login_response(locked)
 
         # Validated here rather than in the global hook so an expired
         # session shows "please try again" instead of a bare 400.
@@ -2050,7 +2196,10 @@ def login():
                 editor_ok = False
 
         if pass_ok and (name_ok or editor_ok):
-            _clear_failures(ip, VIEWER_USERNAME if name_ok else user["username"])
+            if not _clear_failures(ip, VIEWER_USERNAME if name_ok else user["username"]):
+                # Other guesses from this address locked it while this
+                # password was being checked: even a correct one waits.
+                return _locked_login_response(_lock_seconds_remaining(ip) or 1)
             session.clear()  # new session id on privilege change
             session["user"] = VIEWER_USERNAME
             session["pw_tag"] = _password_tag()
@@ -2168,6 +2317,14 @@ HISTORY_HTML = """
 """
 
 
+def _annotation_words(values):
+    """A stored annotation in one line for the history page: purpose, destination, note."""
+    values = values if isinstance(values, dict) else {}
+    shown = [str(values[field]) for field in ("category", "destination", "purpose_note")
+             if values.get(field)]
+    return ", ".join(shown) if shown else "none"
+
+
 def _history_summary(row):
     details = row["parsed_details"]
     action = row["action"]
@@ -2182,17 +2339,35 @@ def _history_summary(row):
         source = details.get("annotation_from")
         return f"Merged {merged}; kept annotation from {source}."
     if action == "split":
-        return "Restored original recordings: " + ", ".join(details.get("parts", ())) + "."
+        text = "Restored original recordings: " + ", ".join(details.get("parts", ())) + "."
+        # Older rows carry only the parts.
+        if "dropped" in details:
+            text += f" Dropped the merged annotation: {_annotation_words(details['dropped'])}."
+        if "restored" in details:
+            text += " Restored: " + "; ".join(
+                f"{part}: {_annotation_words(values)}" for part, values in details["restored"].items()) + "."
+        return text
     if action == "remove":
         return "Removed from the log: " + str(details.get("reason", ""))
     if action == "restore":
         return "Restored to the log. Removal reason: " + str(details.get("reason", ""))
     if action == "year_close":
-        return "Closed for edits."
+        return "Closed for edits." + _snapshot_words(details.get("snapshot"), "Saved totals")
     if action == "year_reopen":
-        return "Reopened for edits."
+        return "Reopened for edits." + _snapshot_words(details.get("discarded_snapshot"), "Discarded totals")
     label = action.replace("_", " ").capitalize()
     return f"{label}: {json.dumps(details, ensure_ascii=False, sort_keys=True)}"
+
+
+def _snapshot_words(snapshot, label):
+    """One sentence for the totals a close saved (or a reopen discarded), or ""."""
+    try:
+        totals, counts = snapshot["totals"], snapshot["counts"]
+        words = ", ".join(f"{name} {totals[name]:.3f} mi" for name in (*CATEGORIES, "unclassified")
+                          if counts.get(name))
+        return f" {label}: {snapshot['trips']} trips, {totals['all']:.3f} mi" + (f" ({words})." if words else ".")
+    except (TypeError, KeyError, ValueError, AttributeError):
+        return ""
 
 
 def _history_action_label(action):
@@ -2286,6 +2461,7 @@ YEAR_HTML = """
 <title>{{ year }} year review</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """
 .review-table { overflow-x: auto; }
 .review-table td { vertical-align: top; overflow-wrap: anywhere; }
+.changed { font-weight: 700; }
 </style></head><body>
 """ + ACCOUNT_HEADER + """<main class="wrap">
 {% macro trip_link(t) %}<a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{% if t.problem %}{{ t.trip_key }}{% else %}{{ fmt_trip_date(t) }}{% endif %}</a>{% endmacro %}
@@ -2304,6 +2480,9 @@ first recorded time), the same as the trip list and exports.</p>
 <p><span class="tag other">Closed for edits</span> by {{ closed.closed_by }} on {{ fmt_date(closed.closed_at) }}.
 Nobody can annotate, merge, undo a merge, remove or restore a trip in {{ year }} until you reopen it.
 Viewing and exporting still work.</p>
+<p class="muted">Closing saved this year's totals (see "Saved totals" below). A trip the tracker uploads after the close
+still joins the year's list, totals and exports, so it is listed under "Received after this year was closed" and
+marked in the exports. To categorize it, reopen the year and close it again: that saves fresh totals.</p>
 <form method="post" action="{{ url_for('reopen_year', year=year) }}">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 <label><input type="checkbox" name="confirm" value="yes" required> Confirm reopening {{ year }}</label>
@@ -2312,6 +2491,7 @@ Viewing and exporting still work.</p>
 <p>{{ year }} is open. Close it once its return is filed, so its trips can't change by accident.</p>
 <form method="post" action="{{ url_for('close_year', year=year) }}">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<p class="muted">Closing also saves this year's trip count and miles, so any later change to them shows on this page.</p>
 <label><input type="checkbox" name="confirm" value="yes" required> Confirm closing {{ year }} for edits</label>
 <button class="btn" type="submit">Close {{ year }}</button></form>
 {% endif %}
@@ -2324,6 +2504,87 @@ Viewing and exporting still work.</p>
 <thead><tr><th>Category</th><th>Trips</th><th>Miles</th></tr></thead>
 <tbody>{% for category, miles in totals.items() %}<tr>
 <td>{{ category }}</td><td>{{ counts[category] }}</td><td>{{ "%.3f"|format(miles) }}</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+
+{% if closed %}
+<section aria-labelledby="snapshot-heading">
+<h2 id="snapshot-heading">Saved totals (taken when {{ year }} was closed)</h2>
+{% if not comparison %}
+<p>No totals were saved for {{ year }}: it was closed before the viewer saved totals at the close (or the saved
+text couldn't be read). Nothing here can say whether its numbers have changed since. Reopening and closing it again
+saves its totals as they are then.</p>
+{% else %}
+<p class="muted">Saved at the close on {{ fmt_date(closed.closed_at) }} next to the figures now. A row in bold
+differs. Late uploads are not hidden: the current totals include them.</p>
+{% if comparison.differs %}<p class="warn" role="status">The totals now differ from the ones saved at the close.
+The sections below name the trips behind the difference.</p>
+{% elif joined or left %}<p class="warn" role="status">The totals match the ones saved at the close, but they are made of
+different trips. See "Other changes since the close" below.</p>
+{% else %}<p>The totals match the ones saved at the close.</p>{% endif %}
+<div class="review-table"><table>
+<thead><tr><th>Category</th><th>Saved trips</th><th>Saved miles</th><th>Trips now</th><th>Miles now</th><th>Difference</th></tr></thead>
+<tbody>{% for r in comparison.rows %}<tr{% if r.differs %} class="changed"{% endif %}>
+<td>{{ r.category }}</td>
+<td>{{ r.saved_trips if r.saved_trips is not none else "unknown" }}</td>
+<td>{{ "%.3f"|format(r.saved_miles) if r.saved_miles is not none else "unknown" }}</td>
+<td>{{ r.trips }}</td><td>{{ "%.3f"|format(r.miles) }}</td>
+<td>{% if r.miles_diff is none %}unknown{% elif r.differs %}{{ "%+d"|format(r.trip_diff) }} trips, {{ "%+.3f"|format(r.miles_diff) }} mi{% else %}none{% endif %}</td></tr>{% endfor %}</tbody>
+</table></div>
+{% if comparison.unreadable_saved is not none and comparison.unreadable_saved != comparison.unreadable %}
+<p class="warn">Trips with an unreadable summary: {{ comparison.unreadable_saved }} at the close, {{ comparison.unreadable }} now.</p>
+{% endif %}
+{% if joined or left %}
+<h3>Other changes since the close</h3>
+<p class="muted">Trips that count in {{ year }} now but did not at the close (and weren't received after it), or the
+other way round. This happens when the display time zone was changed (which can move a trip across New Year) or when a summary was rebuilt.</p>
+<ul>
+{% for t in joined %}<li>Now counted: {{ trip_link(t) }} ({{ "%.2f"|format(t.distance_miles or 0) }} mi)</li>{% endfor %}
+{% for key in left %}<li>No longer counted: {{ key }}</li>{% endfor %}
+</ul>
+{% endif %}
+{% endif %}
+</section>
+
+<section aria-labelledby="after-close-heading">
+<h2 id="after-close-heading">Received after this year was closed ({{ late|length }}, {{ "%.3f"|format(late_miles) }} mi)</h2>
+<p class="muted">Trips that start in {{ year }} but reached the server after {{ fmt_date(closed.closed_at) }}, the close.
+They are in the totals above and marked <code>received_after_close</code> in the CSV and XLSX exports. They can't be
+categorized until you reopen {{ year }}; close it again afterwards to save fresh totals.</p>
+<div class="review-table"><table>
+<thead><tr><th>Trip</th><th>Received ({{ timezone }})</th><th>Distance</th><th>Category</th></tr></thead>
+<tbody>{% for t in late %}<tr><td>{{ trip_link(t) }}</td><td>{{ fmt_date(t.received_at) }}</td>
+<td>{{ "%.2f"|format(t.distance_miles or 0) }} mi</td><td>{{ t.category or "—" }}</td></tr>
+{% else %}<tr><td colspan="4" class="muted">No trip arrived after the close.</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+{% endif %}
+
+<section aria-labelledby="undated-heading">
+<h2 id="undated-heading">Undated trips ({{ undated|length }}, {{ "%.3f"|format(undated_miles) }} mi)</h2>
+<p class="muted">Trips with no usable start time (the GPS clock wasn't set, or the stored time can't be shown in
+{{ timezone }}). They count in no year: not in the totals above, not in this year's exports and not in the
+close, so a closed year doesn't lock them. They appear under "All years". Open each to categorize it or, as admin, remove it
+before you file.</p>
+<div class="review-table"><table>
+<thead><tr><th>Trip</th><th>Distance</th><th>Category</th></tr></thead>
+<tbody>{% for t in undated %}<tr><td><a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{{ t.trip_key }}</a></td>
+<td>{{ "%.2f"|format(t.distance_miles or 0) }} mi</td><td>{{ t.category or "—" }}</td></tr>
+{% else %}<tr><td colspan="3" class="muted">Every trip has a date.</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+
+<section aria-labelledby="inside-merge-heading">
+<h2 id="inside-merge-heading">Trips inside a merged trip ({{ inside_merge|length }})</h2>
+<p class="muted">A merge joins its recordings with a straight line across the gap, so a recording from inside that
+gap that was uploaded after the merge is counted a second time. Open the merged trip and undo the merge
+(or, as admin, remove the later recording) so the drive is counted once.</p>
+<div class="review-table"><table>
+<thead><tr><th>Trip</th><th>Distance</th><th>Merged trip that covers it</th></tr></thead>
+<tbody>{% for item in inside_merge %}<tr><td>{{ trip_link(item.trip) }}</td>
+<td>{{ "%.2f"|format(item.trip.distance_miles or 0) }} mi</td>
+<td><a href="{{ url_for('trip_view', ym=item.merge.ym, trip_id=item.merge.id, year=year) }}">{{ item.merge.trip_key }}</a></td></tr>
+{% else %}<tr><td colspan="3" class="muted">No trip is covered by a merge.</td></tr>{% endfor %}</tbody>
 </table></div>
 </section>
 
@@ -2402,7 +2663,7 @@ def _late_edit_rows(conn, year, trips):
     rows = {}
     try:
         boundary = datetime(year + 1, 1, 1, tzinfo=DISPLAY_TZ).astimezone(timezone.utc)
-    except ValueError:  # year 9999: nothing can happen after it
+    except (ValueError, OverflowError):  # year 9999: nothing can happen after it
         boundary = None
     if boundary:
         # The string compare only narrows the scan (a day of margin); the
@@ -2458,11 +2719,19 @@ def admin_year(year):
         gone, gone_unreadable = year_members(
             [t for t in trips if "removal" in t], [t for t in unreadable if "removal" in t], year)
         edits = _late_edit_rows(conn, year, members + broken + gone + gone_unreadable)
-    totals = mileage_totals(members)
-    counts = {category: 0 for category in totals}
-    counts["all"] = len(members)
-    for t in members:
-        counts[t.get("category") if t.get("category") in CATEGORIES else "unclassified"] += 1
+    current = year_figures(members, broken)
+    totals, counts = current["totals"], current["counts"]
+    late, comparison, joined, left = [], None, [], []
+    if closed:
+        late = [t for t in members if received_after(t, closed["closed_at"])]
+        snapshot = closed["snapshot"]
+        if snapshot:
+            comparison = _compare_snapshot(snapshot, current)
+            if isinstance(snapshot.get("trip_keys"), list):
+                saved_keys = set(snapshot["trip_keys"])
+                late_keys = {t["trip_key"] for t in late}
+                joined = [t for t in members if t["trip_key"] not in saved_keys | late_keys]
+                left = sorted(saved_keys - {t["trip_key"] for t in members})
     incomplete = []
     for t in members:
         if t.get("category") == "business":
@@ -2471,12 +2740,42 @@ def admin_year(year):
             if missing:
                 incomplete.append({"trip": t, "missing": missing})
     removed = sorted(gone + gone_unreadable, key=lambda t: t["removal"]["removed_at"], reverse=True)
+    # No year owns these, so every year's review lists the same ones. They
+    # still count only under "All years"; this just stops them going unseen.
+    undated = [t for t in trips if "removal" not in t and _trip_local_year(t) is None]
+    covered = trip_merges.trips_inside_merges(live)
+    inside_merge = [{"trip": t, "merge": covered[t["trip_key"]]} for t in members if t["trip_key"] in covered]
     return render_template_string(
         YEAR_HTML, year=year, closed=closed, totals=totals, counts=counts, edits=edits,
+        inside_merge=inside_merge, late=late, late_miles=sum(t.get("distance_miles") or 0 for t in late),
+        comparison=comparison, joined=joined, left=left, undated=undated, undated_miles=sum(t.get("distance_miles") or 0 for t in undated),
         uncategorized=[t for t in members if t.get("category") not in CATEGORIES],
         incomplete=incomplete, unreadable=broken, removed=removed, timezone=DISPLAY_TZ_NAME,
         year_end=f"{year + 1}-01-01 00:00",
     )
+
+
+def _compare_snapshot(snapshot, current):
+    """Rows of saved vs current trips and miles per category, with the difference.
+
+    A snapshot that lacks a figure (damaged, or from an older shape) shows it
+    as unknown rather than as zero, and counts as different.
+    """
+    rows = []
+    for category in (*CATEGORIES, "unclassified", "all"):
+        saved_trips = (snapshot.get("counts") or {}).get(category)
+        saved_miles = (snapshot.get("totals") or {}).get(category)
+        known = _is_number(saved_trips) and _is_number(saved_miles)
+        now_trips, now_miles = current["counts"][category], current["totals"][category]
+        rows.append({
+            "category": category, "saved_trips": saved_trips if known else None,
+            "saved_miles": saved_miles if known else None, "trips": now_trips, "miles": now_miles,
+            "trip_diff": now_trips - saved_trips if known else None,
+            "miles_diff": round(now_miles - saved_miles, 3) if known else None,
+            "differs": not known or now_trips != saved_trips or round(now_miles - saved_miles, 3) != 0,
+        })
+    return {"rows": rows, "differs": any(r["differs"] for r in rows),
+            "unreadable_saved": snapshot.get("unreadable"), "unreadable": current["unreadable"]}
 
 
 def _change_year(raw_year, closing_it):
@@ -2485,15 +2784,25 @@ def _change_year(raw_year, closing_it):
     if request.form.get("confirm") != "yes":
         abort(400, description=f"Confirm {'closing' if closing_it else 'reopening'} {year}.")
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
-        is_closed = year in trip_log.closed_years(conn)
+        closed = trip_log.closed_years(conn)
+        is_closed = year in closed
         if is_closed == closing_it:
             abort(409, description=f"{year} is already {'closed' if closing_it else 'open'}.")
+        details = {}
         if closing_it:
-            trip_log.close_year(conn, year, g.user)
+            # Save the totals as they stand, so a later change can't go unseen.
+            # The history row carries the figures; the key list stays in tax_years.
+            snapshot = year_figures(*_live_year_members(conn, year))
+            trip_log.close_year(conn, year, g.user, snapshot)
+            details = {"snapshot": {k: v for k, v in snapshot.items() if k != "trip_keys"}}
         else:
+            discarded = closed[year]["snapshot"]
             trip_log.reopen_year(conn, year)
-        trip_log.record(conn, f"year/{year}", "year_close" if closing_it else "year_reopen", {},
+            if discarded:
+                details = {"discarded_snapshot": {k: v for k, v in discarded.items() if k != "trip_keys"}}
+        trip_log.record(conn, f"year/{year}", "year_close" if closing_it else "year_reopen", details,
                         actor=g.user, actor_role=g.role)
     return redirect(url_for("admin_year", year=year))
 
@@ -2709,6 +3018,10 @@ def annotate(ym, trip_id):
         category = ""
     note = request.form.get("purpose_note", "").strip()
     destination = request.form.get("destination", "").strip()
+    for label, text in (("note", note), ("destination", destination)):
+        problem = _annotation_text_problem(label, text)
+        if problem:
+            abort(400, description=problem)
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
@@ -2837,10 +3150,20 @@ def split_trip(ym, trip_id):
         if not keys:
             abort(409, description="This merge no longer exists. Reopen the trip list.")
         _abort_if_key_in_closed_year(conn, key)
+        # What the undo throws away and brings back, kept in the history row.
+        merged = conn.execute("SELECT * FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
+        dropped = {field: (merged[field] or "") if merged else ""
+                   for field in trip_merges.ANNOTATION_FIELDS}
+        restored = {part: {field: "" for field in trip_merges.ANNOTATION_FIELDS} for part in keys}
+        for row in conn.execute(
+            f"SELECT * FROM annotations WHERE trip_key IN ({','.join('?' * len(keys))})", keys
+        ):
+            restored[row["trip_key"]] = {field: row[field] or "" for field in trip_merges.ANNOTATION_FIELDS}
         conn.execute("DELETE FROM trip_merge_aliases WHERE merge_key=?", (key,))
         conn.execute("DELETE FROM trip_merge_parts WHERE merge_key=?", (key,))
         conn.execute("DELETE FROM trip_merges WHERE trip_key=?", (key,))
-        trip_log.record(conn, key, "split", {"parts": keys}, actor=g.user, actor_role=g.role)
+        trip_log.record(conn, key, "split", {"parts": keys, "dropped": dropped, "restored": restored},
+                        actor=g.user, actor_role=g.role)
     first_ym, first_id = keys[0].split("/")
     return redirect(url_for("trip_view", ym=first_ym, trip_id=first_id, year=year or ""))
 
@@ -2875,6 +3198,11 @@ EXPORT_COLUMNS = [
     ("last_edited_by", lambda t: t.get("last_edited_by", "")),
     ("last_edited_at", lambda t: t.get("last_edited_at", "")),
 ]
+
+
+# Appended after every other column (after row_type in the CSV) so existing
+# spreadsheets that read columns by position keep working.
+LATE_COLUMN = "received_after_close"
 
 
 def track_endpoints(trip):
@@ -2941,6 +3269,26 @@ def _csv_safe(value):
     return value
 
 
+def _xlsx_clean(values):
+    """Make a row of export values safe for a workbook.
+
+    Control characters XML can't hold are dropped (openpyxl raises on most
+    and writes an unreadable file for U+FFFE), and a value longer than one
+    cell holds is cut with a visible marker instead of silently. Both only
+    affect values that predate the save-time checks or came from an upload.
+    """
+    cleaned = []
+    for value in values:
+        if isinstance(value, str):
+            value = XML_ILLEGAL_RE.sub("", value)
+            if len(value) > XLSX_CELL_MAX_CHARS:
+                marker = (f" [TRUNCATED: {len(value)} characters; an Excel cell holds "
+                          f"{XLSX_CELL_MAX_CHARS}. The full text is in the viewer and the CSV.]")
+                value = value[:XLSX_CELL_MAX_CHARS - len(marker)] + marker
+        cleaned.append(value)
+    return cleaned
+
+
 def _xlsx_literal_text(row):
     """Force every string cell in an openpyxl row to be stored as text.
 
@@ -2982,20 +3330,20 @@ def export_csv():
     trips, unreadable, year, _ = selected_trips(include_history=True)
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow([name for name, _ in EXPORT_COLUMNS] + ["row_type"])
+    writer.writerow([name for name, _ in EXPORT_COLUMNS] + ["row_type", LATE_COLUMN])
     for t in trips:
         t = {**t, **track_endpoints(t)}
-        writer.writerow([_csv_safe(fn(t)) for _, fn in EXPORT_COLUMNS] + ["trip"])
+        writer.writerow([_csv_safe(fn(t)) for _, fn in EXPORT_COLUMNS] + ["trip", t["received_after_close"]])
     for t in unreadable:
         values = _unreadable_values(t)
         writer.writerow(
-            [_csv_safe(values.get(name, "")) for name, _ in EXPORT_COLUMNS] + ["unreadable"]
+            [_csv_safe(values.get(name, "")) for name, _ in EXPORT_COLUMNS] + ["unreadable", ""]
         )
     for category, miles in mileage_totals(trips).items():
         # Keep the CSV rectangular and mark totals explicitly, so consumers
         # can select row_type=trip without double-counting summary rows.
         values = {"category": category, "distance_miles": miles}
-        writer.writerow([values.get(name, "") for name, _ in EXPORT_COLUMNS] + ["total"])
+        writer.writerow([values.get(name, "") for name, _ in EXPORT_COLUMNS] + ["total", ""])
     data = buf.getvalue().encode("utf-8")
     return send_file(
         io.BytesIO(data),
@@ -3011,15 +3359,15 @@ def export_xlsx():
     wb = Workbook()
     ws = wb.active
     ws.title = "Mileage"
-    ws.append([name for name, _ in EXPORT_COLUMNS])
+    ws.append([name for name, _ in EXPORT_COLUMNS] + [LATE_COLUMN])
     for t in trips:
         t = {**t, **track_endpoints(t)}
-        ws.append([fn(t) for _, fn in EXPORT_COLUMNS])
+        ws.append(_xlsx_clean([fn(t) for _, fn in EXPORT_COLUMNS] + [t["received_after_close"]]))
         _xlsx_literal_text(ws[ws.max_row])
     totals = wb.create_sheet("Totals")
     totals.append(["year", "timezone", "category", "distance_miles"])
     for category, miles in mileage_totals(trips).items():
-        totals.append([year or "All years", DISPLAY_TZ_NAME, category, miles])
+        totals.append(_xlsx_clean([year or "All years", DISPLAY_TZ_NAME, category, miles]))
         _xlsx_literal_text(totals[totals.max_row])
     if unreadable:
         # A sheet of their own: Mileage has no row_type column, so a row
@@ -3028,7 +3376,7 @@ def export_xlsx():
         sheet.append(list(UNREADABLE_COLUMNS))
         for t in unreadable:
             values = _unreadable_values(t)
-            sheet.append([values[name] for name in UNREADABLE_COLUMNS])
+            sheet.append(_xlsx_clean([values[name] for name in UNREADABLE_COLUMNS]))
             _xlsx_literal_text(sheet[sheet.max_row])
     buf = io.BytesIO()
     wb.save(buf)

@@ -354,15 +354,18 @@ Step 1).
    is in this folder:
 
        TOKEN=$(grep '^INGEST_AUTH_TOKEN=' .env | cut -d= -f2-)
-       curl -X POST "http://$H:8090/upload" \
-         -H "Authorization: Bearer $TOKEN" \
+       printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -X POST "http://$H:8090/upload" \
+         -H @- \
          -H "Content-Type: application/gpx+xml" \
-         -H "X-Trip-Id: 2026-04-14T13-45-22" \
          --data-binary @sample.gpx
 
+   (`-H @-` reads the header from standard input. A token written into curl's
+   arguments can be read by any other account on this server while the command
+   runs.)
+
    You should see a JSON success response with a `distance_miles` value,
-   and find two files at `./data/2026-04/2026-04-14T13-45-22.gpx` and
-   `.../2026-04-14T13-45-22.json`. Delete both afterwards so the test
+   and find two files at `./data/2026-04/2026-04-14T14-30-00Z.gpx` and
+   `.../2026-04-14T14-30-00Z.json`. Delete both afterwards so the test
    trip doesn't end up in your mileage log.
 
    Leave out `X-Device-Id` for this synthetic upload. Adding it registers a
@@ -372,6 +375,44 @@ Step 1).
    The `^INGEST_AUTH_TOKEN=` match above reads only the setting, not
    comments that mention its name. It assumes the unquoted hexadecimal
    token generated in step 3.
+
+   A timed GPX always gets its ID from its earliest point time (or metadata
+   time when no point is timed), in UTC. `X-Trip-Id` is ignored for timed GPX;
+   it can name an untimed upload, except that timestamp-shaped IDs are reserved
+   for timed GPX. Firmware never sends that header: local
+   filenames (`t000001.gpx`, for example) use an NVS counter, while each
+   uploaded size-split piece starts at its own boundary fix. Retries search
+   all month directories under the upload lock and keep the original folder,
+   including after a `DISPLAY_TZ` change. Existing duplicate folders require
+   operator review; ingest returns 409 rather than choosing one.
+   Older third-party timed uploads named with a custom header keep their old
+   names on disk. Review those pairs before re-uploading: the new timestamp ID
+   can create another record. Firmware uploads already use timestamp IDs.
+
+   Ingest rejects GPX document types/entities, unknown XML encodings, timestamps
+   before 2000-01-01 or more than one day after server receipt, and non-finite
+   derived mileage/speeds with 400 before writing trip files. Old backlog since
+   2000 remains valid. GPX creator and the two identity headers are limited to
+   128 characters; diagnostics device labels use the stricter 32-character rule.
+
+   `INGEST_AUTH_TOKEN` must be nonempty, with no whitespace or control characters;
+   invalid settings stop ingest at startup. New data directories are private
+   (0700) and files, including `events.db`, use 0600. The viewer and monitor run
+   as the same UID 1000 and can read these through their read-only data mounts.
+
+   Ingest keeps two Gunicorn sync workers and the 900-second upload timeout:
+   an authenticated 8 MiB piece can take about 839 seconds at 10 kB/s. Rejected
+   bodies are drained only within both the byte cap and a three-second absolute
+   deadline; a slower rejected sender may see a connection reset. The deadline
+   uses POSIX main-thread signals. A threaded or non-POSIX host skips draining
+   non-memory streams. Changing to `gthread` would require a different hard
+   deadline mechanism, even though POSIX upload `flock` locks use separate open
+   descriptions and diagnostics uses request-local SQLite transactions.
+   More sync workers increase capacity and memory use but do not prevent denial
+   of service. Incomplete headers never reach the drain deadline, and slow
+   authenticated bodies still occupy workers. For an untrusted network, configure
+   a reverse proxy with an absolute header deadline and connection limits; keep
+   its authenticated upload allowance long enough for the tracker.
 
 ## Daily Operation
 
@@ -448,7 +489,12 @@ What it does:
 - **Annotate** — tag each trip business / personal / other and add a
   note (e.g. "Client visit — Acme Corp") and destination / place. Annotations are stored in a
   SQLite database in a separate `viewer-db` volume, kept apart from the
-  immutable trip files.
+  immutable trip files. A note or destination can hold up to 2,000
+  characters, and the viewer refuses (and says why) one that contains a
+  control character a spreadsheet can't store, which a paste from another
+  program sometimes brings along. The XLSX export drops such a character from
+  an older value and marks any value too long for one spreadsheet cell with
+  `[TRUNCATED: ...]`; the CSV keeps the full text.
 - **Export** — "Export CSV" / "Export XLSX" use the selected year and
   include annotations, recorded start/end latitude and longitude, and totals.
 - **Device health** — open `/device-health` from the navigation after login.
@@ -473,7 +519,8 @@ use `timed_from`, the first recorded timestamp in `DISPLAY_TZ`, so their miles
 remain in year totals and exports. The date is labeled **Timed from** and
 `year_basis` exports `first_recorded_time`. Their actual start may be in an
 earlier year, which the viewer states explicitly. Wholly undated trips appear
-only under All years. Direct exports
+only under All years; the admin year review lists them (count, miles and links) so
+they can be dealt with before closing a year. Direct exports
 accept `?year=2026`; omit `year` for all years. Empty years export headers
 and zero totals. Totals cover the recorded trips in the selection, not an
 odometer measurement of all vehicle use or a determination of deductibility.
@@ -502,9 +549,10 @@ summary from its GPX.
 The admin-only `/admin/year/<YYYY>` page is linked from the trip list after
 selecting a year, or from the year list on `/admin`, which shows whether each
 year is open or closed. The review page brings together that year's category
-totals (calculated the same way as exports), trips without a category, business
-trips missing a purpose note or destination, unreadable trips, removed trips
-and their reasons, and edits made after the year ended. It also shows that
+totals (calculated the same way as exports), undated trips (which count in no
+year), trips inside a merged trip (see below), trips without a category,
+business trips missing a purpose note or destination, unreadable trips, removed
+trips and their reasons, and edits made after the year ended. It also shows that
 year's own close and reopen history. The review includes edits made at or
 after local January 1 of the following year.
 
@@ -519,6 +567,42 @@ a trip in that year. A merge that would include a trip from a closed year is
 refused. The trip page identifies the closed year and who closed it, and the
 trip list shows **Closed for edits**. Viewing trips, exporting, and place
 lookup continue to work.
+
+**Saved totals.** Closing a year saves its totals as they stand at that moment:
+the trip count and miles for each category (business, personal, other,
+no category) and overall, the same figures as the year's exports, plus the
+list of trips that were counted. They are stored in `annotations.db` (so the
+backups include them), and the close entry in change history shows them too.
+A year closed before this feature existed has no saved totals; its review
+page says so and keeps working. Reopening a year discards its saved totals (the
+reopen entry in change history records what was discarded), and closing it
+again saves new ones.
+
+**Trips that arrive after the close.** Closing a year stops *viewer* edits only.
+The tracker can still upload a trip that started in that year (for example a
+backlog it was holding while it was out of WiFi range), and the server stores
+it. That trip joins the year's list, totals and exports like any other, so
+nothing is hidden, but it is not silent either:
+
+- The year review has a **Received after this year was closed** section listing
+  each such trip (when the server received it, its distance, its category) with
+  a link. A trip counts as late when ingest stored it after the moment the year
+  was closed. A trip whose summary has no received time (stored by an older
+  ingest) is never listed as late.
+- The CSV and XLSX exports gain a last column, `received_after_close`, set to
+  `yes` for those trips and blank for the rest. In the CSV it comes after
+  `row_type`, so existing columns keep their positions and names.
+- **Saved totals** on the review page shows the totals saved at the close next
+  to today's, with a difference column. Rows that differ are in bold, and a
+  warning appears when anything differs. A difference is not always a late
+  upload: changing `DISPLAY_TZ` can move a trip near New Year into or out of the
+  year, and rebuilding a summary can change its miles. The review lists those
+  trips under "Other changes since the close".
+
+A late trip is in a closed year, so it can't be categorized (the viewer answers
+409) until the admin reopens the year. To fix that, reopen the year, categorize
+the trip, and close the year again. That takes a fresh snapshot, so the new
+totals become the saved ones and the late trip no longer shows as late.
 
 Endpoint coordinates come from the first and last recorded GPX track points,
 so they are also available for existing summaries. They describe the raw
@@ -596,8 +680,19 @@ choose which to retain by clearing **all three fields** on the other trip
 and saving it first. Copy any text you want to retain before clearing it.
 **Undo merge (split back)** restores every original trip and the annotations
 saved on those trips when they were merged. Confirm the checkbox first:
-annotation edits made to the merged trip are removed by Undo. Undo of a chain
-restores all original recordings, rather than just its most recent pair.
+annotation edits made to the merged trip are removed by Undo. The change
+history records what was dropped (the merged trip's purpose, destination and
+note) and what each original trip got back. Undo of a chain restores all
+original recordings, rather than just its most recent pair.
+
+A merge draws a straight line across the gap between its recordings, so that
+stretch is already counted. If another recording from the same device, from
+inside that gap, is uploaded after the merge (the tracker was away from home
+when it was driven), the viewer would count the drive twice. The trip list
+marks such a trip **Inside a merged trip**, and the admin year review lists
+them in "Trips inside a merged trip". Totals and exports are not changed for
+you: open the merged trip and undo the merge (then merge the three recordings
+in order), or, as admin, remove the later recording.
 
 An admin removes a merged trip as a whole; an original part cannot be removed
 on its own. Undo merge is refused while the merged trip is removed from the
@@ -613,7 +708,10 @@ annotations. The original annotation rows remain intact. Back up this database
 alongside the trip files: losing it also loses merges.
 
 The cached summary is refreshed only when a part's GPX/JSON size or modification
-time changes, or the shared summary-rule version changes. Ordinary list views
+time changes. A change to the shared summary rules (`SUMMARY_VERSION`) does not
+rebuild it by itself, the same as the plain trips' stored summaries, which keep the
+rules of the day they were written; otherwise one release would total merged
+trips under new rules and everything else under old ones. Ordinary list views
 read the cache without parsing every merged track. Both images ship the shared
 rules in `common/trip_summary.py` through the default-deny Docker build context.
 If a source disappears or becomes unreadable, the merged trip is flagged as
@@ -831,9 +929,11 @@ There is no default zone. `install.sh` asks for one and writes it to
 
 `docker-compose.yml` passes that one value to **both** services. The viewer
 uses it to render times; the ingest service uses it to decide which
-`data/YYYY-MM/` folder a trip is filed under. Because both read the same
-line, a trip near a month boundary can't sit in one folder while
-displaying a date in another. `install.sh --check` confirms both running
+`data/YYYY-MM/` folder a trip is filed under. A trip is filed under the
+local month in which the drive **ends**, but dated and counted by its local
+**start** (see "Years are based on trip start" in the viewer section), so a
+drive that starts on December 31 and ends after midnight sits in the January
+folder and shows as December 31. `install.sh --check` confirms both running
 containers have the value `.env` holds.
 
 Use a named IANA zone (`America/Denver`, `Europe/London`), never a fixed
@@ -844,7 +944,16 @@ rather than guessing a zone or quietly falling back to UTC.
 
 After changing it, run `docker compose up -d` (a plain restart keeps the
 old value). Trips already filed stay in the month folder they were filed
-under; only the displayed and exported times change.
+under, but the zone decides more than how times read:
+
+- Displayed and exported times change.
+- **Which year a trip belongs to follows `DISPLAY_TZ` too.** A trip's year is
+  its local start date, worked out on every page load, so after a zone change
+  the trips near New Year can move to the neighbouring year. That includes a
+  year you already closed: its totals and exports change, and nothing records
+  that they did. Pick the right zone before you close a year, and if you must
+  change it afterwards, compare the closed year's exported totals before and
+  after.
 
 The containers' `TZ`, which only affects log timestamps, follows
 `DISPLAY_TZ` too (UTC if it's unset).
@@ -857,6 +966,12 @@ to the internet: the session cookie and the ingest token both travel over
 plain HTTP, so anyone able to observe the traffic can replay them. The
 login is defence in depth against other devices and people on your
 network, not a substitute for TLS.
+
+Every viewer response (login and error pages, static files and exports too)
+carries `Content-Security-Policy: frame-ancestors 'none'`, `X-Frame-Options: DENY`
+and `X-Content-Type-Options: nosniff`, so another web page on the same host
+or home domain can't show a viewer page in a frame and steer the admin's clicks
+onto its buttons. A reverse proxy must not remove these headers.
 
 If you ever do put a TLS reverse proxy in front, set
 `SESSION_COOKIE_SECURE=True` in `mileage-viewer/app.py`.
@@ -952,8 +1067,9 @@ a letter/digit. Bodies are capped at 32 KiB even for chunked requests. This
 synthetic empty-event heartbeat returns `{"accepted":[]}` after committing:
 
 ```sh
-curl -X POST 'http://<host>:8090/v1/device-events' \
-  -H 'Authorization: Bearer <token>' \
+TOKEN=$(grep '^INGEST_AUTH_TOKEN=' .env | cut -d= -f2-)
+printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -X POST 'http://<host>:8090/v1/device-events' \
+  -H @- \
   -H 'X-Device-Id: tracker-1' \
   -H 'Content-Type: application/json' \
   --data '{"schema_version":1,"checkin":{"boot_id":"00000000000000000000000000000001","status_sequence":1,"uptime_ms":1500,"active":[]},"events":[]}'
@@ -964,6 +1080,11 @@ boots; reuse it only for identical retries. Event retries are acknowledged
 again; conflicting event IDs or equal revisions with changed snapshots return
 409 and commit nothing. Validation errors return 400, oversized bodies 413,
 authentication failures 401, and storage/commit failures 5xx without an ack.
+Snapshots more than 1,000,000 above the stored revision (or zero for a new
+device) are discarded without changing current health. Valid events still
+commit and receive a normal 200 acknowledgment so firmware can drain its queue.
+See the explicit [admin recovery command](../DIAGNOSTICS.md#admin-high-water-recovery)
+for a mistaken enrollment or poisoned high-water.
 See [DIAGNOSTICS.md](../DIAGNOSTICS.md) for the full protocol and ordering rules.
 
 `data/diagnostics/events.db` belongs to ingest, alongside trip data. Valid

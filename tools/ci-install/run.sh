@@ -63,11 +63,16 @@ for port in 8090 8091; do
 done
 
 # Back up an accepted synthetic trip, damage it, then restore both files.
+# Ingest names a timed trip after its timestamps and ignores X-Trip-Id, so
+# upload an untimed copy to get the ID this test looks for.
+untimed=$(mktemp)
+sed 's#<time>[^<]*</time>##g' "$install_dir/sample.gpx" > "$untimed"
 token=$(sed -n 's/^INGEST_AUTH_TOKEN=//p' "$install_dir/.env" | tail -n 1)
 curl -fsS -o /dev/null -H @<(printf 'Authorization: Bearer %s\n' "$token") \
     -H 'Content-Type: application/gpx+xml' -H 'X-Device-Id: ci-device' \
-    -H 'X-Trip-Id: ci-backup' --data-binary @"$install_dir/sample.gpx" "http://$lan_addr:8090/upload"
+    -H 'X-Trip-Id: ci-backup' --data-binary @"$untimed" "http://$lan_addr:8090/upload"
 unset token
+rm -f "$untimed"
 trip=$(find "$install_dir/data" -name ci-backup.gpx -print -quit)
 test -n "$trip"
 trip=${trip%.gpx}

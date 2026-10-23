@@ -11,6 +11,7 @@ mileage-ingest/**
 !mileage-ingest/requirements.txt
 !mileage-ingest/app.py
 !mileage-ingest/diag_store.py
+!mileage-ingest/reset_high_water.py
 !mileage-viewer/
 mileage-viewer/**
 !mileage-viewer/Dockerfile

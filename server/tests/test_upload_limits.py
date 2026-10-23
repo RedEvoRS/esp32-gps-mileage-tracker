@@ -116,7 +116,9 @@ class EarlyReplies(unittest.TestCase):
     def test_chunked_at_or_just_under_cap_is_accepted(self):
         for size in (CAP - 1, CAP):
             with self.subTest(size=size):
-                payload = gpx(2).ljust(size, b" ")
+                # Timed identity comes from GPX, so give each padded upload
+                # its own start minute rather than relying on X-Trip-Id.
+                payload = gpx(2).replace(b"14:30:", f"14:{size % 60:02d}:".encode()).ljust(size, b" ")
                 response, read = self.post_chunked(payload)
                 self.assertEqual(response.status_code, 200, response.get_json())
                 self.assertEqual(read, size)

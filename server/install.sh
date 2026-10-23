@@ -409,7 +409,7 @@ preflight() {
     local f missing=()
     for f in VERSION stamp_version.py common/version.py docker-compose.yml .dockerignore .env.example viewer.env.example monitor.env.example sample.gpx \
         common/__init__.py common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json} \
-        mileage-ingest/{Dockerfile,app.py,diag_store.py,requirements.txt} \
+        mileage-ingest/{Dockerfile,app.py,diag_store.py,reset_high_water.py,requirements.txt} \
         mileage-viewer/{Dockerfile,app.py,geocoding.py,requirements.txt} \
         mileage-viewer/static/{leaflet.js,leaflet.css,gpx.js,endpoint-places.js} \
         mileage-monitor/{Dockerfile,monitor.py,gelf.py,prometheus.py,loki.py} ntfy/server.yml \
@@ -489,13 +489,17 @@ plan_sudo() {
             || [[ ! -d data && $(id -u) != "$CONTAINER_UID" ]]; }; then
         reasons+=("hand data/ to UID $CONTAINER_UID, which the containers run as")
     fi
+    if [[ $MODE == install && -d data && $(stat -c %u data) != "$(id -u)" && $(stat -c %a data) != 700 ]]; then
+        reasons+=("make data/ private to its owner (mode 700)")
+    fi
     if (( ${#DATA_SUDO[@]} )); then
         reasons+=("check and delete the test trip, whose files belong to UID $CONTAINER_UID")
     fi
-    # Backups already set up, but the timer is off or runs another copy:
-    # setup_backups puts it right without asking.
+    # Backups already set up, but the timer is off, runs another copy, or
+    # its systemd files are out of date: setup_backups puts it right
+    # without asking.
     if [[ $MODE == install && $(id -u) == "$CONTAINER_UID" ]] \
-        && backups_configured && ! { timer_ok && timer_current; }; then
+        && backups_configured && ! { timer_ok && timer_current && backup_units_current; }; then
         reasons+=("set up the daily backup timer")
     fi
 
@@ -710,6 +714,26 @@ setup_data_dir() {
         fi
     fi
     ok "data/ belongs to UID $CONTAINER_UID, which the containers run as"
+    # Trip file names are their start times, so other accounts on this
+    # machine shouldn't be able to list the folder. The containers and the
+    # login that runs the backups all use UID 1000, so nothing else changes.
+    # Existing installs get this on the next run too.
+    if [[ $(stat -c %a data) != 700 ]]; then
+        if [[ $MODE == install ]]; then
+            if [[ $(stat -c %u data) == "$(id -u)" ]]; then
+                chmod 700 data
+            else
+                need_sudo
+                sudo chmod 700 data
+            fi
+            ok "data/ is private (mode 700)"
+        else
+            warn "data/ can be listed by other accounts on this machine (mode $(stat -c %a data))" \
+                "Trip file names show when each drive started. Run install.sh to make it private (mode 700)."
+        fi
+    else
+        ok "data/ is private (mode 700)"
+    fi
 }
 
 setup_env() {
@@ -1350,30 +1374,54 @@ http_fetch() {
 
 # The real thing: upload sample.gpx with the token from .env. The header
 # comes from a pipe so the token stays out of the process list.
-# sample.gpx ends on 2026-04-14, so it's filed under data/2026-04/.
+#
+# What goes up is an untimed copy of sample.gpx (its <time> elements
+# removed). Ingest names a trip with timestamps after those timestamps and
+# ignores X-Trip-Id for it, so a timed upload couldn't be told apart from a
+# real trip. An untimed one takes the ID we give it, is filed under the
+# current month of DISPLAY_TZ, and has no date, so it can't land in a tax
+# year (a closed one included).
 #
 # Cleanup deletes the test trip, so it may only ever be this run's: the
 # ID is new each run, and its path has to be free beforehand. Then
 # whatever turns up there came from this upload.
+TEST_UPLOAD=          # the untimed copy of sample.gpx that was uploaded
+
+# The month folder ingest files an untimed upload under right now.
+test_month() {
+    local zone
+    zone=$(env_raw .env DISPLAY_TZ)
+    TZ=$zone date +%Y-%m
+}
+
 upload_test_trip() {
-    local trip token response code body status miles stored
+    local trip token response code body status miles stored after
     TEST_ID=$TEST_PREFIX-$(openssl rand -hex 6)
-    trip=data/2026-04/$TEST_ID
+    trip=data/$(test_month)/$TEST_ID
     if data_exists "$trip.gpx" "$trip.json"; then
         problem "$trip already exists, so the test upload can't use it" \
             "Nothing was uploaded or deleted. Run the check again for a new test ID."
+        return 1
+    fi
+    TEST_UPLOAD=$(mktemp)
+    TMP_FILES+=("$TEST_UPLOAD")
+    sed 's#<time>[^<]*</time>##g' sample.gpx > "$TEST_UPLOAD"
+    if [[ ! -s $TEST_UPLOAD ]] || grep -q '<time' "$TEST_UPLOAD"; then
+        problem "Couldn't make the untimed test copy of sample.gpx" \
+            "Copy server/sample.gpx here again (DEPLOY_DEBIAN.md Step 2)."
         return 1
     fi
     if ! data_exists "${trip%/*}"; then TEST_NEW_DIR=${trip%/*}; fi
     token=$(env_raw .env INGEST_AUTH_TOKEN)
     TEST_TRIP=$trip
     # No X-Device-Id: this synthetic trip must not enroll a device that the
-    # all-device monitor would later report silent. X-Trip-Id owns cleanup.
+    # all-device monitor would later report silent. X-Trip-Id owns cleanup
+    # (it applies because the copy is untimed).
     response=$(curl -s -m 30 -w '\n%{http_code}' -X POST \
         -H @<(printf 'Authorization: Bearer %s\n' "$token") \
         -H 'Content-Type: application/gpx+xml' \
         -H "X-Trip-Id: $TEST_ID" \
-        --data-binary @sample.gpx "$INGEST_URL/upload") || response=$'\n000'
+        --data-binary @"$TEST_UPLOAD" "$INGEST_URL/upload") || response=$'\n000'
     code=${response##*$'\n'}
     body=${response%$'\n'*}
     status=$(jq -r '.status // empty' <<< "$body" 2> /dev/null) || status=
@@ -1381,12 +1429,18 @@ upload_test_trip() {
     stored=$(jq -r '.stored_as // empty' <<< "$body" 2> /dev/null) || stored=
     if [[ $code == 200 && $status == accepted && $stored == */"$TEST_ID.gpx" ]]; then
         TEST_TRIP=data/${stored%.gpx}
-        ok "Uploaded sample.gpx with the token; it was filed as $stored"
+        ok "Uploaded sample.gpx (untimed copy) with the token; it was filed as $stored"
     else
         # A refusal (4xx) stored nothing, so there's nothing of ours to
         # delete. After a timeout or a 5xx some of it may have been
         # written; the path was free before, so cleanup can remove that.
-        if [[ $code == 4?? ]]; then TEST_TRIP=; fi
+        if [[ $code == 4?? ]]; then
+            TEST_TRIP=
+        else
+            # The month may have turned over during the request.
+            after=data/$(test_month)/$TEST_ID
+            if [[ $after != "$trip" ]] && data_exists "$after.gpx" "$after.json"; then TEST_TRIP=$after; fi
+        fi
         problem "The test upload failed: HTTP $code ${body}" \
             "401: the running service has a different token from .env; recreate it: docker compose up -d" \
             "500: data/ probably isn't writable by UID $CONTAINER_UID (DEPLOY_DEBIAN.md Step 3)."
@@ -1453,10 +1507,10 @@ verify_end_to_end() {
     fi
 
     upload_test_trip || return 1
-    if "${DATA_SUDO[@]}" cmp -s sample.gpx "$TEST_TRIP.gpx"; then
+    if "${DATA_SUDO[@]}" cmp -s "$TEST_UPLOAD" "$TEST_TRIP.gpx"; then
         ok "The GPX on disk matches the upload byte for byte"
     else
-        problem "$TEST_TRIP.gpx is missing or differs from sample.gpx"
+        problem "$TEST_TRIP.gpx is missing or differs from what was uploaded"
     fi
     if "${DATA_SUDO[@]}" cat "$TEST_TRIP.json" 2> /dev/null \
         | jq -e --arg id "$TEST_ID" '.trip_id == $id and .distance_miles > 0' > /dev/null 2>&1; then
@@ -1545,7 +1599,7 @@ verify_viewer() {
         problem "The test trip's map page didn't load"
     fi
     if [[ $(http_fetch "$file" -b "$jar" "$VIEWER_URL/gpx/$ym/$TEST_ID") == 200 ]] \
-        && cmp -s "$file" sample.gpx; then
+        && cmp -s "$file" "$TEST_UPLOAD"; then
         ok "The viewer serves its track for the map"
     else
         problem "The viewer didn't serve the test trip's GPX track"
@@ -1779,6 +1833,42 @@ dropin_text() {
     printf '[Service]\nExecStart=\nExecStart=/bin/bash "%s/backup/backup.sh"\n' "${SCRIPT_DIR//%/%%}"
 }
 
+# The drop-in that makes systemd mount the backup destination (and
+# BACKUP_DIR) before a run, when they are local folders. If a share isn't
+# mounted, the run fails loudly instead of copying onto this disk.
+backup_mounts_dropin() { printf '%s/%s.service.d/backup-mounts.conf' "$UNIT_DIR" "$(backup_unit)"; }
+
+# Empty when there's nothing to require (an SSH destination).
+mounts_text() {
+    local paths=() path
+    for path in "$(conf_get REMOTE)" "$(conf_get BACKUP_DIR)"; do
+        # A path with spaces, quotes or % can't go in the unit file safely.
+        if [[ $path == /* && $path != *[[:space:]\'\"\\%]* ]]; then paths+=("$path"); fi
+    done
+    if (( ${#paths[@]} )); then
+        printf '[Unit]\nRequiresMountsFor=%s\n' "${paths[*]}"
+    fi
+}
+
+# Whether /etc/systemd/system has the unit, timer and drop-ins this install
+# would write. An update that changes them reaches existing servers here.
+backup_units_current() {
+    local expected
+    cmp -s backup/mileage-backup@.service "$UNIT_DIR/mileage-backup@.service" 2> /dev/null || return 1
+    cmp -s backup/mileage-backup@.timer "$UNIT_DIR/mileage-backup@.timer" 2> /dev/null || return 1
+    if [[ $SCRIPT_DIR != "$DEFAULT_DIR" ]]; then
+        [[ -f $(backup_dropin) && $(< "$(backup_dropin)") == "$(dropin_text)" ]] || return 1
+    else
+        [[ ! -e $(backup_dropin) ]] || return 1
+    fi
+    expected=$(mounts_text)
+    if [[ -n $expected ]]; then
+        [[ -f $(backup_mounts_dropin) && $(< "$(backup_mounts_dropin)") == "$expected" ]] || return 1
+    else
+        [[ ! -e $(backup_mounts_dropin) ]] || return 1
+    fi
+}
+
 backups_configured() {
     local remote
     remote=$(conf_get REMOTE)
@@ -1843,7 +1933,9 @@ ssh_target_ok() {
         return 1
     fi
     ok "$host takes the backup key without a password, has rsync, and has $path"
-    RSYNC_SSH_CMD="ssh -i $key -o IdentitiesOnly=yes -o BatchMode=yes"
+    # The keepalive and connect limits stop a NAS that vanished mid-backup
+    # from holding the backup (and every later one) for hours.
+    RSYNC_SSH_CMD="ssh -i $key -o IdentitiesOnly=yes -o BatchMode=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o ConnectTimeout=30"
 }
 
 choose_backup_target() {
@@ -1889,6 +1981,38 @@ choose_backup_target() {
     ok "Wrote backup/backup.conf"
 }
 
+# backup.sh won't copy to a destination without the marker file
+# (.mileage-backup-target), so an unmounted share can't pass for it. Write
+# it once the destination is known to be the real one: right after setup
+# ("new"), or on a rerun for a backup set up before the marker existed
+# ("rerun", which warns instead of stopping the update).
+ensure_backup_target() {
+    local how=$1 remote backup=$SCRIPT_DIR/backup/backup.sh
+    remote=$(conf_get REMOTE)
+    if "${AS_ME[@]}" bash "$backup" --check-target < /dev/null 2> /dev/null; then
+        return 0
+    fi
+    if [[ $how == rerun && $remote == /* ]]; then
+        note "Backups go to $remote, which has no marker file yet. Writing one says this" \
+            "folder is the real backup destination, so it must be the mounted share or disk now."
+        if ! local_target_ok "$remote"; then
+            warn "Left $remote unmarked, so the nightly backup will refuse to copy there" \
+                "When it is the right, mounted destination: bash $backup --mark-target"
+            return 0
+        fi
+    fi
+    if "${AS_ME[@]}" bash "$backup" --mark-target < /dev/null 2>&1 | indent; then
+        ok "Marked $remote as the backup destination"
+    elif [[ $how == rerun ]]; then
+        warn "Couldn't write the backup marker file to $remote" \
+            "Until it's there, the nightly backup refuses to copy and fails (its log says why)." \
+            "When $remote is reachable: bash $backup --mark-target"
+    else
+        die "Couldn't write the backup marker file to $remote." \
+            "Fix backup/backup.conf or the destination, then run this again."
+    fi
+}
+
 first_backup() {
     note "Running the first backup"
     if ! "${AS_ME[@]}" bash "$SCRIPT_DIR/backup/backup.sh" < /dev/null 2>&1 | indent; then
@@ -1910,10 +2034,12 @@ restore_test() {
     fi
 }
 
-install_backup_timer() {
-    local unit dropin
+# Put the unit, the timer and their drop-ins in place and tell systemd.
+install_backup_units() {
+    local unit dropin mounts mounts_dropin
     unit=$(backup_unit)
     dropin=$(backup_dropin)
+    mounts_dropin=$(backup_mounts_dropin)
     need_sudo
     sudo install -m 644 backup/mileage-backup@.service backup/mileage-backup@.timer "$UNIT_DIR/"
     # The unit runs /home/<user>/mileage-tracker/backup/backup.sh. If the
@@ -1927,7 +2053,23 @@ install_backup_timer() {
         sudo rm -f "$dropin"
         note "Pointed $unit.service back at $DEFAULT_DIR"
     fi
+    # A local destination or BACKUP_DIR (a mounted share or disk) must be
+    # mounted before the backup runs.
+    mounts=$(mounts_text)
+    if [[ -n $mounts ]]; then
+        sudo install -d -m 755 "${mounts_dropin%/*}"
+        printf '%s\n' "$mounts" | sudo tee "$mounts_dropin" > /dev/null
+        sudo chmod 644 "$mounts_dropin"
+    elif [[ -e $mounts_dropin ]]; then
+        sudo rm -f "$mounts_dropin"
+    fi
     sudo systemctl daemon-reload
+}
+
+install_backup_timer() {
+    local unit
+    unit=$(backup_unit)
+    install_backup_units
     sudo systemctl enable --now --quiet "$unit.timer"
     note "Running the backup once through systemd, the way the timer will"
     if ! sudo systemctl start "$unit.service"; then
@@ -1949,6 +2091,17 @@ verify_backups() {
     else
         next=$(systemctl show -p NextElapseUSecRealtime --value "$unit.timer" 2> /dev/null) || next=
         ok "The daily backup timer is on${next:+ (next run: $next)}"
+        if ! backup_units_current; then
+            warn "The installed backup systemd files differ from the ones in $SCRIPT_DIR/backup" \
+                "An update changed them. Run install.sh to install the new ones."
+        fi
+    fi
+    # (Install mode already warned if it couldn't write the marker.)
+    if [[ $MODE == check && -f backup/backup.conf ]] \
+        && ! "${AS_ME[@]}" bash "$SCRIPT_DIR/backup/backup.sh" --check-target < /dev/null 2> /dev/null; then
+        problem "The backup destination $(conf_get REMOTE) has no .mileage-backup-target file" \
+            "Backups refuse to copy there until it's marked. If it is the right, mounted destination:" \
+            "bash $SCRIPT_DIR/backup/backup.sh --mark-target"
     fi
     if systemctl is-failed --quiet "$unit.service" 2> /dev/null; then
         problem "The last backup failed" "To see why: journalctl -u $unit.service -n 30"
@@ -1998,10 +2151,13 @@ setup_backups() {
             return 0
         fi
         choose_backup_target
+        ensure_backup_target new
         first_backup
         install_backup_timer
     else
         ok "backup.conf sends backups to $(conf_get REMOTE)"
+        # Backups set up before the marker file existed get it here.
+        if [[ $MODE == install ]]; then ensure_backup_target rerun; fi
         if [[ $MODE == install ]] && ! { timer_ok && timer_current; }; then
             if timer_ok; then
                 note "The backup timer is on, but it runs backup.sh from somewhere else." \
@@ -2009,6 +2165,11 @@ setup_backups() {
             fi
             first_backup
             install_backup_timer
+        elif [[ $MODE == install ]] && ! backup_units_current; then
+            note "The backup's systemd files are out of date (this update changed them). Updating them."
+            install_backup_units
+            sudo systemctl try-restart "$(backup_unit).timer"
+            ok "Updated the backup's systemd files"
         elif [[ $MODE == check ]]; then
             restore_test
         fi

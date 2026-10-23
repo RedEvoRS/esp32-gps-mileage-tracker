@@ -355,11 +355,14 @@ lost, it can be rebuilt from the GPX.
 Times are stored in UTC, which is what the GPS reports, and shown in your
 local timezone everywhere a person reads them. That way a 6pm drive shows
 up as 6pm on the right day instead of 1am the next one. Trips are also
-filed by local month, so a New Year's Eve drive lands in `2026-12/` and not
-`2027-01/`. There's no built-in timezone: the server installer asks for
+filed by local month, so a New Year's Eve evening drive lands in `2026-12/` and
+not `2027-01/`. There's no built-in timezone: the server installer asks for
 yours and saves it as `DISPLAY_TZ` in `server/.env`, and both services
-refuse to start until it's set. Both read that one setting, so the folder
-a trip lands in and the date the viewer shows always agree.
+refuse to start until it's set. Both read that one setting. A trip is filed
+under the local month the drive ends, but dated and counted by its local
+start, so a drive that starts just before midnight on December 31 sits in the
+`2027-01/` folder and shows as December 31 (see "Years are based on trip
+start" in [server/README.md](server/README.md#viewer--export-ui)).
 
 ## Security
 

@@ -18,7 +18,7 @@ class InstallerLayout(unittest.TestCase):
         preflight = INSTALL.split("preflight() {", 1)[1].split("\n}\n", 1)[0]
         for required in (".dockerignore", "common/__init__.py",
                          "common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json}",
-                         "mileage-ingest/{Dockerfile,app.py,diag_store.py,requirements.txt}",
+                         "mileage-ingest/{Dockerfile,app.py,diag_store.py,reset_high_water.py,requirements.txt}",
                          "mileage-viewer/{Dockerfile,app.py,geocoding.py,requirements.txt}",
                          "mileage-monitor/{Dockerfile,monitor.py,gelf.py,prometheus.py,loki.py}",
                          "monitor.env.example", "ntfy/server.yml"):

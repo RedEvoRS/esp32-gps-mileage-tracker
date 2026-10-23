@@ -12,6 +12,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from openpyxl import load_workbook
 from werkzeug.security import generate_password_hash
@@ -250,10 +251,15 @@ class ClosedYearTests(YearTestBase):
     def test_close_and_reopen_write_history_in_the_same_transaction(self):
         self.close_year(2026)
         self.reopen_year(2026)
-        self.assertEqual(self.history("year/2026"), [
-            ("year/2026", "driver", "admin", "year_close", "{}"),
-            ("year/2026", "driver", "admin", "year_reopen", "{}"),
+        rows = self.history("year/2026")
+        self.assertEqual([r[:4] for r in rows], [
+            ("year/2026", "driver", "admin", "year_close"),
+            ("year/2026", "driver", "admin", "year_reopen"),
         ])
+        # The close records the totals it saved; the reopen records the ones it discarded.
+        saved = json.loads(rows[0][4])["snapshot"]
+        self.assertEqual((saved["trips"], saved["totals"]["all"]), (0, 0))
+        self.assertEqual(json.loads(rows[1][4]), {"discarded_snapshot": saved})
         with closing(sqlite3.connect(self.db)) as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM tax_years").fetchone()[0], 0)
         page = self.admin.get("/admin/history").get_data(as_text=True)
@@ -464,6 +470,35 @@ class YearReviewTests(YearTestBase):
             self.assertEqual(shown, exported[year])
         self.assertIn('href="/trip/2027-01/broken-jan?year=2026"', pages[2026])
 
+    def test_undated_trips_are_listed_with_count_and_miles_but_stay_out_of_every_year(self):
+        self.annotated_trip("dated", "2026-03-01T12:00:00Z", "business", 0.923)
+        undated = self.add_trip("clockless", "2026-03-02T12:00:00Z", miles=2.787,
+                                start_time=None, end_time=None, timing_status="untimed")
+        removed = self.add_trip("clockless-gone", "2026-03-03T12:00:00Z", miles=5,
+                                start_time=None, end_time=None, timing_status="untimed")
+        self.assertEqual(self.post(f"/trip/{removed}/remove", reason="test").status_code, 302)
+        for year in (2025, 2026):
+            with self.subTest(year=year):
+                page = self.review(year)
+                section = self.section(page, "undated")
+                self.assertIn("Undated trips (1, 2.787 mi)", section)
+                self.assertIn(f'href="/trip/{undated}?year={year}"', section)
+                self.assertNotIn("clockless-gone", section)
+        # The year rule itself is unchanged: totals and exports leave them out.
+        self.assertEqual(self.csv_rows("?year=2026")[-1]["distance_miles"], "0.923")
+        self.assertEqual([r["trip_id"] for r in self.csv_rows("?year=2026") if r["row_type"] == "trip"], ["dated"])
+        all_years = [r for r in self.csv_rows() if r["row_type"] == "trip"]
+        self.assertEqual({r["trip_id"] for r in all_years}, {"dated", "clockless"})
+        self.close_year(2026)
+        self.assertEqual(self.annotate(undated, category="business").status_code, 302)
+        self.assertIn("Undated trips (1, 2.787 mi)", self.section(self.review(2026), "undated"))
+
+    def test_review_without_undated_trips_says_so(self):
+        self.annotated_trip("dated", "2026-03-01T12:00:00Z", "business", 1)
+        section = self.section(self.review(2026), "undated")
+        self.assertIn("Undated trips (0, 0.000 mi)", section)
+        self.assertIn("Every trip has a date.", section)
+
     def test_removed_trips_with_reason_actor_and_time(self):
         key = self.add_trip("gone", "2026-03-01T12:00:00Z")
         other_year = self.add_trip("old", "2025-03-01T12:00:00Z")
@@ -596,6 +631,216 @@ class YearReviewTests(YearTestBase):
         self.close_year(2026)
         self.review(2026)
         self.assertEqual(self.admin.get("/export.csv?year=2026").data, before)
+
+
+    # --- Snapshot at close, and trips received after the close (#449) ---
+
+    CLOSE = "2026-10-01T00:00:00+00:00"
+    BEFORE = "2026-09-01T00:00:00+00:00"
+    AFTER = "2026-10-05T08:30:00.123456+00:00"
+
+    def closed_year_with_two_trips(self):
+        """Two business trips (2.5 + 1.25 mi) received before a close at CLOSE."""
+        first = self.add_trip("b1", "2026-03-01T12:00:00Z", miles=2.5, _received_at=self.BEFORE)
+        second = self.add_trip("b2", "2026-03-02T12:00:00Z", miles=1.25, _received_at=self.BEFORE)
+        for key in (first, second):
+            self.annotate(key, category="business", destination="Example Road", purpose_note="Visit")
+        with self.at(self.CLOSE):
+            self.close_year(2026)
+        return first, second
+
+    def sheet_values(self, path):
+        workbook = load_workbook(io.BytesIO(self.admin.get(path).data))
+        try:
+            return {sheet.title: [[cell.value for cell in row] for row in sheet.iter_rows()]
+                    for sheet in workbook}
+        finally:
+            workbook.close()
+
+    def saved(self, year=2026):
+        with closing(sqlite3.connect(self.db)) as conn:
+            return json.loads(conn.execute("SELECT snapshot FROM tax_years WHERE year=?", (year,)).fetchone()[0])
+
+    def test_close_saves_the_totals_the_review_and_exports_show(self):
+        self.closed_year_with_two_trips()
+        self.add_trip("p1", "2026-04-01T12:00:00Z", miles=4.0, _received_at=self.BEFORE)   # no category
+        self.add_broken("broken", "2026-03")
+        self.reopen_year(2026)
+        with self.assertLogs(self.viewer.app.logger, "WARNING"):
+            self.close_year(2026)
+            totals = {r["category"]: float(r["distance_miles"])
+                      for r in self.csv_rows("?year=2026") if r["row_type"] == "total"}
+        snapshot = self.saved()
+        self.assertEqual(snapshot["totals"], totals)
+        self.assertEqual(snapshot["counts"], {"business": 2, "personal": 0, "other": 0, "unclassified": 1, "all": 3})
+        self.assertEqual((snapshot["trips"], snapshot["unreadable"]), (3, 1))
+        self.assertEqual(snapshot["trip_keys"], ["2026-03/b1", "2026-03/b2", "2026-04/p1"])
+        # The history row carries the figures (not the key list) for the audit trail.
+        details = json.loads(self.history("year/2026")[-1][4])["snapshot"]
+        self.assertEqual(details, {k: v for k, v in snapshot.items() if k != "trip_keys"})
+        page = self.admin.get("/admin/history").get_data(as_text=True)
+        self.assertIn("Saved totals: 3 trips, 7.750 mi", page)
+
+    def test_a_trip_received_after_the_close_is_visible_everywhere(self):
+        self.closed_year_with_two_trips()
+        page = self.review(2026)
+        self.assertIn("The totals match the ones saved at the close.", page)
+        self.assertIn("No trip arrived after the close.", self.section(page, "after-close"))
+        late = self.add_trip("late", "2026-09-20T12:00:00Z", miles=2.0, _received_at=self.AFTER)
+        page = self.review(2026)
+        section = self.section(page, "after-close")
+        self.assertIn("(1, 2.000 mi)", section)
+        self.assertIn(f'href="/trip/{late}?year=2026"', section)
+        self.assertIn("2026-10-05", section)
+        self.assertIn("reopen 2026", section)
+        # Saved next to current, with the difference spelled out and highlighted.
+        snapshot = self.section(page, "snapshot")
+        self.assertIn("The totals now differ", snapshot)
+        self.assertRegex(snapshot, r'<tr class="changed">\s*<td>all</td>\s*<td>2</td>\s*<td>3.750</td>\s*<td>3</td><td>5.750</td>')
+        self.assertIn("+1 trips, +2.000 mi", snapshot)
+        self.assertRegex(snapshot, r"<tr>\s*<td>personal</td>")           # unchanged rows stay plain
+        # The late trip still counts: nothing is hidden, and the saved figures don't move.
+        self.assertEqual(self.saved()["totals"]["all"], 3.75)
+        csv_rows = self.csv_rows("?year=2026")
+        trips = [r for r in csv_rows if r["row_type"] == "trip"]
+        self.assertEqual({r["trip_id"]: r["received_after_close"] for r in trips}, {"b1": "", "b2": "", "late": "yes"})
+        self.assertEqual(float(next(r for r in csv_rows if r["row_type"] == "total"
+                                    and r["category"] == "all")["distance_miles"]), 5.75)
+        values = self.sheet_values("/export.xlsx?year=2026")["Mileage"]
+        self.assertEqual(values[0][-1], "received_after_close")
+        self.assertEqual({row[1]: row[-1] for row in values[1:]}, {"b1": None, "b2": None, "late": "yes"})
+        # All years marks it too, judged against its own year's close.
+        self.add_trip("open-year", "2025-03-01T12:00:00Z", _received_at=self.AFTER)
+        marks = {r["trip_id"]: r["received_after_close"] for r in self.csv_rows() if r["row_type"] == "trip"}
+        self.assertEqual(marks, {"b1": "", "b2": "", "late": "yes", "open-year": ""})
+        # It still can't be categorized until the year is reopened.
+        self.assertEqual(self.annotate(late, category="business").status_code, 409)
+
+    def test_existing_export_columns_keep_their_order_and_the_new_one_comes_last(self):
+        self.closed_year_with_two_trips()
+        text = self.admin.get("/export.csv?year=2026").data.decode("utf-8")
+        header = next(csv.reader(io.StringIO(text)))
+        self.assertEqual(header[-4:], ["last_edited_by", "last_edited_at", "row_type", "received_after_close"])
+        self.assertEqual(header[:3], ["date", "trip_id", "device_id"])
+        self.assertTrue(all(len(row) == len(header) for row in csv.reader(io.StringIO(text))))
+
+    def test_reopen_and_close_again_takes_a_fresh_snapshot(self):
+        self.closed_year_with_two_trips()
+        self.add_trip("late", "2026-09-20T12:00:00Z", miles=2.0, _received_at=self.AFTER)
+        self.reopen_year(2026)
+        reopened = json.loads(self.history("year/2026")[-1][4])
+        self.assertEqual(reopened["discarded_snapshot"]["totals"]["all"], 3.75)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM tax_years").fetchone()[0], 0)
+        self.assertNotIn("Saved totals (taken when", self.review(2026))
+        with self.at("2026-10-10T00:00:00+00:00"):
+            self.close_year(2026)
+        self.assertEqual(self.saved()["totals"]["all"], 5.75)
+        page = self.review(2026)
+        self.assertIn("The totals match the ones saved at the close.", page)
+        self.assertIn("No trip arrived after the close.", self.section(page, "after-close"))
+        self.assertEqual({r["received_after_close"] for r in self.csv_rows("?year=2026") if r["row_type"] == "trip"}, {""})
+        history = self.admin.get("/admin/history").get_data(as_text=True)
+        self.assertIn("Discarded totals: 2 trips, 3.750 mi", history)
+
+    def test_a_year_closed_before_snapshots_existed_still_renders(self):
+        self.closed_year_with_two_trips()
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("UPDATE tax_years SET snapshot=NULL")
+        late = self.add_trip("late", "2026-09-20T12:00:00Z", miles=2.0, _received_at=self.AFTER)
+        page = self.review(2026)
+        self.assertIn("No totals were saved for 2026", self.section(page, "snapshot"))
+        self.assertIn(f"/trip/{late}", self.section(page, "after-close"))     # late detection needs no snapshot
+        self.assertEqual([r["received_after_close"] for r in self.csv_rows("?year=2026")
+                          if r["row_type"] == "trip" and r["trip_id"] == "late"], ["yes"])
+        self.assertEqual(self.admin.get("/admin").status_code, 200)
+        self.reopen_year(2026)                      # nothing to discard: the row has no figures
+        self.assertEqual(json.loads(self.history("year/2026")[-1][4]), {})
+        self.close_year(2026)
+        self.assertEqual(self.saved()["totals"]["all"], 5.75)
+
+    def test_unreadable_saved_text_is_treated_as_no_snapshot(self):
+        self.closed_year_with_two_trips()
+        for text in ("not json", "[1, 2]", ""):
+            with closing(sqlite3.connect(self.db)) as conn, conn:
+                conn.execute("UPDATE tax_years SET snapshot=?", (text,))
+            self.assertIn("No totals were saved", self.section(self.review(2026), "snapshot"))
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("UPDATE tax_years SET snapshot=?", (json.dumps({"trips": 2}),))
+        page = self.section(self.review(2026), "snapshot")
+        self.assertIn("unknown", page)
+        self.assertIn("The totals now differ", page)
+
+    def test_old_annotations_db_gains_the_snapshot_column(self):
+        path = self.root / "old.db"
+        with closing(sqlite3.connect(path)) as conn, conn:
+            conn.execute("CREATE TABLE tax_years (year INTEGER PRIMARY KEY, closed_by TEXT NOT NULL, closed_at TEXT NOT NULL)")
+            conn.execute("INSERT INTO tax_years VALUES (2025, 'driver', '2026-01-20T00:00:00+00:00')")
+        for _ in range(2):                           # a second startup finds the column already there
+            with closing(sqlite3.connect(path)) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self.viewer.trip_log.init_schema(conn)
+        with closing(sqlite3.connect(path)) as conn:
+            self.assertEqual(self.viewer.trip_log.closed_years(conn),
+                             {2025: {"closed_by": "driver", "closed_at": "2026-01-20T00:00:00+00:00", "snapshot": None}})
+            self.viewer.trip_log.close_year(conn, 2026, "driver", {"trips": 0})
+            self.assertEqual(self.viewer.trip_log.closed_years(conn)[2026]["snapshot"], {"trips": 0})
+
+    def test_a_summary_with_no_usable_received_at_is_never_late(self):
+        self.closed_year_with_two_trips()
+        self.add_trip("old", "2026-06-01T12:00:00Z")                         # an older ingest wrote no stamp
+        self.add_trip("junk", "2026-06-02T12:00:00Z", _received_at=12345)    # damaged
+        self.add_trip("text", "2026-06-03T12:00:00Z", _received_at="yesterday")
+        page = self.review(2026)
+        self.assertIn("(0, 0.000 mi)", self.section(page, "after-close"))
+        self.assertEqual({r["received_after_close"] for r in self.csv_rows("?year=2026") if r["row_type"] == "trip"}, {""})
+        # A bad stamp doesn't make the trip unreadable: all five still count.
+        self.assertEqual(len(self.viewer.load_trips()[0]), 5)
+
+    def test_received_at_compares_as_an_instant_and_the_close_itself_is_not_late(self):
+        self.closed_year_with_two_trips()
+        self.add_trip("same", "2026-06-01T12:00:00Z", _received_at=self.CLOSE)
+        self.add_trip("zoned", "2026-06-02T12:00:00Z", _received_at="2026-09-30T23:59:59-08:00")   # 07:59:59Z on Oct 1: after
+        self.add_trip("early", "2026-06-03T12:00:00Z", _received_at="2026-09-30T15:00:00-08:00")   # 23:00:00Z on Sep 30: before
+        late = {t["trip_id"] for t in self.viewer.load_trips()[0] if self.viewer.received_after(t, self.CLOSE)}
+        self.assertEqual(late, {"zoned"})
+
+    def test_a_merged_trip_arrived_when_its_last_part_did(self):
+        first = self.add_trip("first", "2026-03-01T12:00:00Z", _received_at=self.BEFORE)
+        second = self.add_trip("second", "2026-03-01T12:10:00Z", _received_at="2026-09-15T00:00:00+00:00")
+        response = self.post(f"/trip/{first}/merge", next_trip=second)
+        self.assertEqual(response.status_code, 302, response.get_data(as_text=True))
+        merged = [t for t in self.viewer.load_trips()[0] if t.get("parts")]
+        self.assertEqual([t["received_at"] for t in merged], ["2026-09-15T00:00:00+00:00"])
+        with self.at(self.CLOSE):
+            self.close_year(2026)
+        self.assertEqual([r["received_after_close"] for r in self.csv_rows("?year=2026") if r["row_type"] == "trip"], [""])
+        with self.at("2026-09-01T00:00:00+00:00"):
+            self.reopen_year(2026)
+            self.close_year(2026)
+        self.assertEqual([r["received_after_close"] for r in self.csv_rows("?year=2026") if r["row_type"] == "trip"], ["yes"])
+
+    def test_a_display_tz_change_shows_as_a_difference_without_a_late_upload(self):
+        stays = self.add_trip("stays", "2026-06-01T12:00:00Z", _received_at=self.BEFORE)
+        leaves = self.add_trip("leaves", "2026-12-31T16:00:00Z", _received_at=self.BEFORE)   # LA: Dec 31, Tokyo: Jan 1
+        with self.at(self.CLOSE):
+            self.close_year(2026)
+        joins = self.add_trip("joins", "2025-12-31T16:00:00Z", _received_at=self.BEFORE)     # LA: 2025, Tokyo: 2026
+        with patch.object(self.viewer, "DISPLAY_TZ", ZoneInfo("Asia/Tokyo")):
+            page = self.review(2026)
+            marks = {r["received_after_close"] for r in self.csv_rows("?year=2026") if r["row_type"] == "trip"}
+        snapshot = self.section(page, "snapshot")
+        # Same trip count and miles by coincidence, but not the same trips.
+        self.assertIn("The totals match the ones saved at the close, but they are made of", snapshot)
+        self.assertIn(f"No longer counted: {leaves}", snapshot)
+        self.assertIn(f'href="/trip/{joins}?year=2026"', snapshot)
+        self.assertNotIn(stays, snapshot)
+        self.assertIn("No trip arrived after the close.", self.section(page, "after-close"))
+        self.assertEqual(marks, {""})
+
+    def test_everyday_login_cannot_see_the_review_snapshot(self):
+        self.closed_year_with_two_trips()
+        self.assertEqual(self.editor.get("/admin/year/2026").status_code, 403)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ the server; never free text, coordinates, SSIDs or credentials. Delivery is at
 least once with its own persistent retry state, independent of ntfy.
 """
 
+import hashlib
 import ipaddress
 import json
 import re
@@ -41,6 +42,9 @@ FIELD = re.compile(r"[A-Za-z0-9_.\-]{1,64}")  # GELF additional field names
 SILENCE = 7001
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS event_cursor_markers (
+    sink TEXT PRIMARY KEY, event_rowid INTEGER NOT NULL, fingerprint TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS gelf_cursor (singleton INTEGER PRIMARY KEY, event_rowid INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS gelf_conditions (
     device TEXT NOT NULL, code INTEGER NOT NULL, state TEXT NOT NULL, episode TEXT,
@@ -320,10 +324,32 @@ def desired_conditions(devices, known, now, stale_seconds, snapshot_max_age):
 
 
 def read_events(path, after_rowid, limit):
-    """Events after a rowid, oldest first, plus the table's highest rowid."""
+    """Read rows and cursor identity from the same SQLite snapshot."""
     with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
         db.execute("BEGIN")
         highest = db.execute("SELECT COALESCE(MAX(rowid),0) FROM events").fetchone()[0]
         rows = db.execute("SELECT rowid,device_id,boot_id,sequence,code,received_at,canonical_json "
                           "FROM events WHERE rowid>? ORDER BY rowid LIMIT ?", (after_rowid, limit)).fetchall()
-        return highest, rows
+        anchor = db.execute("SELECT rowid,device_id,boot_id,sequence,code,received_at,canonical_json "
+                            "FROM events WHERE rowid=?", (after_rowid,)).fetchone()
+        return highest, rows, event_fingerprint(anchor) if anchor else None
+
+
+def event_fingerprint(row):
+    return hashlib.sha256(json.dumps(row, ensure_ascii=True).encode("ascii")).hexdigest()
+
+
+def cursor_changed(db, sink, cursor, fingerprint):
+    if not cursor:
+        return False
+    stored = db.execute("SELECT event_rowid,fingerprint FROM event_cursor_markers WHERE sink=?",
+                        (sink,)).fetchone()
+    # A pre-marker monitor.db replays once on upgrade rather than trusting an
+    # unverifiable cursor that may already refer to a restored database.
+    return stored is None or tuple(stored) != (cursor, fingerprint)
+
+
+def save_cursor_marker(db, sink, cursor, fingerprint):
+    db.execute("INSERT INTO event_cursor_markers VALUES (?,?,?) ON CONFLICT(sink) DO UPDATE SET "
+               "event_rowid=excluded.event_rowid,fingerprint=excluded.fingerprint",
+               (sink, cursor, fingerprint))

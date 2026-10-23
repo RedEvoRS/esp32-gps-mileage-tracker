@@ -242,11 +242,34 @@ class ViewerRecords(unittest.TestCase):
                 self.assertIn(f"{name}.json", logs.output[0])
         # Fields the viewer doesn't use are dropped, not type-checked.
         (self.month / "extra.json").write_text(json.dumps({
-            "trip_id": "extra", "distance_miles": 1.5, "bbox": None, "start_latitude": {},
+            "trip_id": "extra", "distance_miles": 1.5, "start_time": None, "bbox": None,
+            "start_latitude": {},
         }), encoding="utf-8")
         self.assertEqual(self.viewer.read_summary(self.month / "extra.json"),
-                         ({"trip_id": "extra", "distance_miles": 1.5}, None))
+                         ({"trip_id": "extra", "distance_miles": 1.5, "start_time": None}, None))
         self.assertEqual(self.client.get("/export.xlsx").status_code, 200)
+
+    def test_valid_json_missing_its_fields_is_unreadable_not_a_zero_mile_trip(self):
+        self.trip("good", "2026-08-01T12:00:00Z", 2, "business")
+        incomplete = {
+            "empty": {},
+            "no_distance": {"trip_id": "no_distance", "start_time": "2026-08-01T12:00:00Z"},
+            "null_distance": {"distance_miles": None, "start_time": "2026-08-01T12:00:00Z"},
+            "no_timing": {"trip_id": "no_timing", "distance_miles": 3},
+        }
+        for name, record in incomplete.items():
+            (self.month / f"{name}.json").write_text(json.dumps(record), encoding="utf-8")
+            (self.month / f"{name}.gpx").write_bytes(b"<gpx/>")
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual([t["id"] for t in trips], ["good"])
+        self.assertEqual({t["id"] for t in unreadable}, set(incomplete))
+        # Like any damaged summary they are reported, with their folder year.
+        rows = self.csv_rows()
+        self.assertEqual({r["trip_id"] for r in rows if r["row_type"] == "unreadable"} - {""}, set(incomplete))
+        self.assertEqual([r["trip_id"] for r in rows if r["row_type"] == "trip"], ["good"])
+        self.assertEqual({r["trip_id"] for r in self.csv_rows("?year=2027") if r["row_type"] == "unreadable"},
+                         set(incomplete))
+        self.assertIn("can't be read", self.client.get("/").get_data(as_text=True))
 
     def test_unreadable_summary_is_reported_on_the_list_and_in_exports(self):
         self.trip("good", "2026-08-01T12:00:00Z", 2, "business")

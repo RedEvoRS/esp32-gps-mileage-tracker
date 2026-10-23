@@ -49,6 +49,7 @@ HARNESS = textwrap.dedent("""\
     wait_online_unit() { printf 'fake-wait-online.service'; }
     wait_online_enabled() { [[ $FAKE_WAIT_ONLINE == enabled ]]; }
     backups_configured() { [[ $FAKE_BACKUPS != none ]]; }
+    backup_units_current() { true; }
     timer_ok() { [[ $FAKE_BACKUPS == timer ]]; }
     timer_current() { true; }
     cd "$RUN_DIR"

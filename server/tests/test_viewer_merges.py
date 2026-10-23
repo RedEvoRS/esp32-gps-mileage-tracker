@@ -80,6 +80,35 @@ class ViewerMerges(unittest.TestCase):
     def split(self, key):
         return self.client.post(f"/trip/{key}/split", data={"csrf_token": "test-csrf", "confirm": "yes"})
 
+    def test_trip_uploaded_after_its_neighbours_were_merged_is_flagged_not_silent(self):
+        first, last = self.trip("a", 0), self.trip("c", 200)
+        merged = self.merged_key(self.merge(first, last))
+        self.assertEqual(self.client.get("/?year=2026").get_data(as_text=True).count("Inside a merged trip"), 0)
+        late = self.trip("b", 90)  # recorded between the two, uploaded after the merge
+        other_device = self.trip("other", 90, offset=.01, device="another-device")
+        after = self.trip("after", 5000)  # a separate drive later
+        page = self.client.get("/?year=2026").get_data(as_text=True)
+        self.assertEqual(page.count("Inside a merged trip"), 1)
+        self.assertIn(f'href="/trip/{merged}?year=2026"', page)
+        self.assertIn("counted twice: undo that merge", page)
+        # Only the overlapping same-device recording is flagged.
+        trips, _ = self.viewer.load_trips()
+        flagged = {t["trip_key"]: t for t in trips}
+        self.viewer._flag_trips_inside_merges(trips)
+        self.assertEqual({t["trip_key"] for t in trips if t.get("inside_merge")}, {late})
+        self.assertNotIn("inside_merge", flagged[other_device])
+        self.assertNotIn("inside_merge", flagged[after])
+        # The year review lists it too, with a pointer to the merged trip.
+        review = self.client.get("/admin/year/2026").get_data(as_text=True)
+        section = review[review.index('id="inside-merge-heading"'):]
+        section = section[:section.index("</section>")]
+        self.assertIn("Trips inside a merged trip (1)", section)
+        self.assertIn(f'href="/trip/{merged}?year=2026"', section)
+        # Undoing the merge clears the flag.
+        self.assertEqual(self.split(merged).status_code, 302)
+        self.assertNotIn("Inside a merged trip", self.client.get("/?year=2026").get_data(as_text=True))
+        self.assertIn("Trips inside a merged trip (0)", self.client.get("/admin/year/2026").get_data(as_text=True))
+
     def damage_summary(self, key, **fields):
         path = self.data / (key + ".json")
         summary = json.loads(path.read_text(encoding="utf-8"))
@@ -174,6 +203,30 @@ class ViewerMerges(unittest.TestCase):
         with patch.object(self.viewer.trip_merges, "combined_summary", side_effect=AssertionError("rebuilt")):
             self.assertEqual(self.client.get("/").status_code, 200)
             self.assertEqual(len(self.viewer.load_trips()[0]), 1)
+
+    def test_a_rules_version_bump_does_not_rebuild_merged_summaries_alone(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        # Pretend this merged summary was built under earlier distance rules,
+        # like the plain trips' stored summaries.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            summary, fingerprint = conn.execute(
+                "SELECT summary, fingerprint FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
+            conn.execute("UPDATE trip_merges SET summary=? WHERE trip_key=?",
+                         (json.dumps({**json.loads(summary), "distance_miles": 123.0}), key))
+        with patch.object(self.viewer.trip_merges, "SUMMARY_VERSION", 4, create=True), patch.object(
+                self.viewer.trip_merges, "combined_summary", side_effect=AssertionError("rebuilt")):
+            self.assertEqual(self.viewer.load_trips()[0][0]["distance_miles"], 123.0)
+            # A row saved before the version left the fingerprint is not rebuilt either.
+            with closing(sqlite3.connect(self.db)) as conn, conn:
+                conn.execute("UPDATE trip_merges SET fingerprint=? WHERE trip_key=?",
+                             (json.dumps([3, *json.loads(fingerprint)]), key))
+            self.assertEqual(self.viewer.load_trips()[0][0]["distance_miles"], 123.0)
+        # A changed source file still rebuilds it, under the current rules.
+        path = self.month / "a.gpx"
+        path.write_bytes(path.read_bytes() + b" ")
+        rebuilt = self.viewer.load_trips()[0][0]["distance_miles"]
+        self.assertNotEqual(rebuilt, 123.0)
 
     def test_chain_and_old_merged_link_then_split_to_all_originals(self):
         a, b, c = self.trip("a", 0), self.trip("b", 120, .001), self.trip("c", 240, .002)
