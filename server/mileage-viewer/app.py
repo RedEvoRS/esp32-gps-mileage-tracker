@@ -691,6 +691,15 @@ def _summary_problem(summary):
             return f"{field} is not a finite number"
     if summary.get("timing_status") not in (None, "complete", "partial", "untimed"):
         return "timing_status is not recognized"
+    # Valid JSON that lacks the fields every ingest-written summary has (a hand
+    # edit, a partial restore, "{}") must not pass for a 0-mile trip that
+    # silently drops out of every year. Ingest's _stored_summary() is stricter
+    # about the IDs; the viewer takes them from the file name, so it asks only
+    # for what it files and totals the trip by.
+    if not _is_number(summary.get("distance_miles")):
+        return "distance_miles is missing"
+    if "start_time" not in summary and "timing_status" not in summary:
+        return "neither start_time nor timing_status is present"
     return None
 
 
