@@ -219,7 +219,8 @@ class InstallerUnraid(unittest.TestCase):
             setup_viewer_proxy
             printf '2: test inet 192.0.2.1/24\n' | host_python address -c 'import ipaddress,sys; print(ipaddress.ip_address(sys.stdin.read().split()[3].split("/")[0]))'
             ''')
-        self.assertIn("BUILD_STAMP=v0.08+aaaaaaaaaa", out)
+        version = (SERVER / "VERSION").read_text(encoding="utf-8").strip()
+        self.assertIn(f"BUILD_STAMP={version}+aaaaaaaaaa", out)
         self.assertEqual(out.count("Installer Python: container"), 1)
         calls = (self.work / "docker-calls").read_text()
         self.assertIn("--network none --user 1000:1000", calls)

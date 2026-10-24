@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import select
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -59,8 +60,12 @@ class FirmwareBuilderShellTests(unittest.TestCase):
         self.env_file.chmod(0o600)
         self.bin = self.root / "bin"
         self.bin.mkdir()
-        for command in ("bash", "dirname", "flock", "mktemp", "mkdir", "chmod", "find", "chown",
-                        "grep", "awk", "cat", "mkfifo", "rm", "basename", "tr", "mv", "cp"):
+        # The tests fake root with FAKE_UID=0. Only real root can chown to
+        # 1000:1000 (a non-root CI runner can't), so record chown calls instead.
+        real_root = os.geteuid() == 0
+        for command in ("bash", "dirname", "flock", "mktemp", "mkdir", "chmod", "find",
+                        "grep", "awk", "cat", "mkfifo", "rm", "basename", "tr", "mv", "cp") \
+                + (("chown",) if real_root else ()):
             target = shutil.which(command)
             self.assertIsNotNone(target, command)
             (self.bin / command).symlink_to(target)
@@ -71,6 +76,10 @@ class FirmwareBuilderShellTests(unittest.TestCase):
                         TRACKER_WIFI_PASSWORD="example-password", TRACKER_DEVICE_ID="test-01",
                         TRACKER_SERVER_HOST="tracker.example", TRACKER_FRESH_SD="no")
         self.executable("id", "#!/bin/bash\nprintf '%s\\n' \"${FAKE_UID}\"\n")
+        self.chown_log = self.root / "chown.log"
+        if not real_root:
+            self.executable("chown", "#!/bin/bash\nprintf '%s\\n' \"$*\" >> "
+                            + shlex.quote(str(self.chown_log)) + "\n")
         for command in ("sudo", "apt-get", "dpkg", "systemctl", "journalctl"):
             self.executable(command, "#!/bin/bash\nprintf 'forbidden:%s\\n' \"$0\" >> \"$FAKE_LOG\"\nexit 98\n")
         self.executable("docker", "#!" + sys.executable + "\n" + r'''
