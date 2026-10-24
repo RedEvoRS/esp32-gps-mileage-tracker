@@ -1023,7 +1023,7 @@ to keep those names out of public certificate transparency logs; the wildcard
 domain itself remains public. DNS answers for service names must point only
 at private addresses: use local DNS for the proxy's LAN IP, and a public
 record pointing to its Tailscale 100.x address or [Tailscale split
-DNS](https://tailscale.com/docs/reference/dns-in-tailscale#split-dns) for remote
+DNS](https://tailscale.com/docs/reference/dns-in-tailscale#restricted-nameservers) for remote
 clients. Tailscale must be installed on the proxy host and phone, with access
 allowed by your tailnet policy; make sure the proxy listens on its Tailscale
 interface too. A LAN IP instead needs an explicitly configured Tailscale
