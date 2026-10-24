@@ -232,6 +232,190 @@ class BackupScripts(unittest.TestCase):
         root = (root or self.backups) / "snapshots"
         return sorted(p.name for p in root.iterdir() if not p.name.startswith("."))
 
+    # --- Unraid mount, config and root ownership safeguards ---
+
+    def fake_mounts(self, mounted=True, target="/backup-disk"):
+        self.shim("findmnt", f'''
+if [[ $* == '-n --mountpoint /backup-disk' ]]; then
+    exit {0 if mounted else 1}
+elif [[ $1 == -n && $2 == -o && $3 == TARGET && $4 == --target ]]; then
+    printf '%s\\n' '{target}'
+else
+    exit 99
+fi
+''')
+
+    def test_mount_guard_refuses_missing_or_wrong_mount_before_mkdir(self):
+        self.conf_append("BACKUP_MOUNT=/backup-disk\n")
+        for mounted, target in ((False, "/backup-disk"), (True, "/")):
+            self.fake_mounts(mounted, target)
+            for script, args in (("backup.sh", ()), ("restore.sh", ("check",))):
+                with self.subTest(mounted=mounted, target=target, script=script):
+                    result = self.run_script(script, *args, check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("mount", result.stderr)
+                    self.assertFalse(self.backups.exists())
+                    self.assertFalse(self.compose_log.exists())
+
+    def test_remote_mount_guard_applies_to_mark_target_too(self):
+        self.conf_append("REMOTE_MOUNT=/backup-disk\n")
+        self.fake_mounts(False)
+        (self.remote / MARKER).unlink()
+        result = self.run_script("backup.sh", "--mark-target", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.remote / MARKER).exists())
+        self.assertFalse(self.backups.exists())
+
+    def test_matching_mount_allows_new_backup_folder_and_restore(self):
+        self.conf_append("BACKUP_MOUNT=/backup-disk\nREMOTE_MOUNT=/backup-disk\n")
+        self.fake_mounts()
+        self.run_script("backup.sh")
+        self.run_script("restore.sh", "check")
+
+    def test_mount_guard_resolves_dangling_symlinks_before_existing_parent(self):
+        outside = self.tmp / "wrong-disk"
+        outside.mkdir()
+        self.backups.symlink_to(outside / "not-created")
+        self.conf_append("BACKUP_MOUNT=/backup-disk\n")
+        self.shim("findmnt", f'''
+if [[ $* == '-n --mountpoint /backup-disk' ]]; then
+    exit 0
+elif [[ ${{@: -1}} == '{outside}' ]]; then
+    echo /
+else
+    echo /backup-disk
+fi
+''')
+        result = self.run_script("backup.sh", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not on its recorded mount", result.stderr)
+        self.assertFalse((outside / "not-created").exists())
+
+    def test_remote_mount_guard_does_not_apply_to_ssh_remote(self):
+        self.use_ssh_remote()
+        self.conf_append("REMOTE_MOUNT=/backup-disk\n")
+        self.fake_mounts(False)
+        self.run_script("backup.sh")
+
+    def test_catchup_with_direct_backup_lock_preserves_attempt_record(self):
+        self.backups.mkdir()
+        scripts = self.tmp / "scheduled-install/backup"
+        scripts.mkdir(parents=True)
+        for name in ("backup.sh", "scheduled.sh", "lib.sh"):
+            shutil.copyfile(BACKUP / name, scripts / name)
+        state = scripts / "state/last-attempt"
+        state.parent.mkdir()
+        previous = "start=2026-01-01T00:00:00Z\nend=2026-01-01T00:01:00Z\nstatus=0\n"
+        state.write_text(previous)
+        holder = subprocess.Popen(["flock", str(self.backups / ".lock"), "bash", "-c",
+                                   "echo ready; read -r release"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline(), "ready\n")
+            result = subprocess.run(["bash", str(scripts / "scheduled.sh"), "--if-overdue", "26"],
+                                    env=self.env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(state.read_text(), previous)
+            self.assertIn("another backup is already running",
+                          (scripts / "logs/backup.log").read_text())
+            self.assertFalse(self.compose_log.exists())
+        finally:
+            holder.communicate(input="release\n", timeout=5)
+
+    def test_unraid_requires_explicit_backup_dir_and_override_wins(self):
+        for command in ("sudo", "apt-get", "dpkg", "systemctl", "journalctl"):
+            self.shim(command, 'echo "forbidden command" >&2; exit 99\n')
+        conf = Path(self.env["MILEAGE_BACKUP_CONF"])
+        conf.write_text(conf.read_text().replace(f"BACKUP_DIR={self.backups}\n", ""))
+        version = self.tmp / "unraid-version"
+        version.write_text('version="7.3.4"\n')
+        self.env.update(MILEAGE_UNRAID_VERSION_FILE=str(version), HOME=str(self.tmp))
+        for platform in (None, "unraid"):
+            if platform:
+                self.env["MILEAGE_PLATFORM"] = platform
+            result = self.run_script("backup.sh", check=False)
+            self.assertIn("BACKUP_DIR must be set", result.stderr)
+            self.assertFalse((self.tmp / "mileage-backups").exists())
+        self.env["MILEAGE_PLATFORM"] = "debian"
+        self.run_script("backup.sh")
+        self.assertTrue((self.tmp / "mileage-backups/last-success").exists())
+
+    def test_all_trip_rsyncs_request_numeric_ids(self):
+        log = self.watch_rsync()
+        self.use_ssh_remote()
+        self.run_script("backup.sh")
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+        copies = [line for line in log.read_text().splitlines()
+                  if line.startswith(("-a ", "--timeout=600")) and
+                  (" -a " in f" {line} " or " -aH " in f" {line} " or
+                   " -anc " in f" {line} ")]
+        self.assertGreaterEqual(len(copies), 5)
+        for line in copies:
+            self.assertIn("--numeric-ids", line)
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "needs root")
+    def test_root_refuses_untrusted_config_before_sourcing_it(self):
+        conf = Path(self.env["MILEAGE_BACKUP_CONF"])
+        sentinel = self.tmp / "sourced"
+        self.conf_append(f"touch {sentinel}\n")
+        for uid, mode in ((1000, 0o600), (0, 0o620), (0, 0o602)):
+            os.chown(conf, uid, uid)
+            conf.chmod(mode)
+            for script, args in (("backup.sh", ()), ("restore.sh", ("check",))):
+                result = self.run_script(script, *args, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("root-owned and not group/world-writable", result.stderr)
+                self.assertFalse(sentinel.exists())
+                self.assertFalse(self.backups.exists())
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "needs root")
+    def test_root_backup_publishes_app_owned_private_lock_and_trip_copies(self):
+        for path in [self.data, *self.data.rglob("*")]:
+            os.chown(path, 1000, 1000)
+            path.chmod(0o700 if path.is_dir() else 0o600)
+        self.run_script("backup.sh")
+        lock = self.data / ".upload.lock"
+        self.assertEqual((lock.stat().st_uid, lock.stat().st_gid), (1000, 1000))
+        self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(list(self.data.glob(".upload-lock.*")))
+        for root in (self.backups, self.remote):
+            [name] = self.snapshots(root)
+            copied = root / "snapshots" / name / "data"
+            for path in [copied, *copied.rglob("*")]:
+                self.assertEqual((path.stat().st_uid, path.stat().st_gid), (1000, 1000))
+                self.assertEqual(path.stat().st_mode & 0o777,
+                                 0o700 if path.is_dir() else 0o600)
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "needs root")
+    def test_root_restore_normalizes_debian_snapshot_to_current_data_owner(self):
+        self.run_script("backup.sh")
+        # Model a Debian snapshot with a different login UID and permissive modes.
+        [name] = self.snapshots(self.remote)
+        copied = self.remote / "snapshots" / name / "data"
+        for uid in (1000, 1234):
+            for path in [copied, *copied.rglob("*")]:
+                os.chown(path, uid, uid)
+                path.chmod(0o755 if path.is_dir() else 0o644)
+            shutil.rmtree(self.data / "2026-10", ignore_errors=True)
+            os.chown(self.data, 1000, 1000)
+            self.run_script("restore.sh", "restore", "latest", "--yes")
+            for path in [self.data, *self.data.rglob("*")]:
+                if path.name == ".upload.lock":  # Created before switching the fixture's owner.
+                    continue
+                self.assertEqual((path.stat().st_uid, path.stat().st_gid), (1000, 1000))
+                self.assertEqual(path.stat().st_mode & 0o777,
+                                 0o700 if path.is_dir() else 0o600)
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "needs root")
+    def test_root_restore_on_replacement_server_creates_app_owned_data(self):
+        self.run_script("backup.sh")
+        shutil.rmtree(self.data)
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+        for path in [self.data, *self.data.rglob("*")]:
+            self.assertEqual((path.stat().st_uid, path.stat().st_gid), (1000, 1000))
+            self.assertEqual(path.stat().st_mode & 0o777,
+                             0o700 if path.is_dir() else 0o600)
+
     def test_backup_copies_everything_off_host_and_verifies(self):
         self.run_script("backup.sh")
         [name] = self.snapshots()

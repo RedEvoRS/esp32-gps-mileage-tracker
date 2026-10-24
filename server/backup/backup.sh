@@ -40,6 +40,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 [[ $KEEP_RECENT =~ ^[1-9][0-9]*$ ]] || die "KEEP_RECENT must be a positive number"
 [[ $KEEP_MONTHLY =~ ^[0-9]+$ ]] || die "KEEP_MONTHLY must be a number"
 require_commands rsync flock sha256sum cmp
+guard_backup_mounts
 
 case ${1:-} in
     --mark-target)
@@ -56,7 +57,8 @@ esac
 
 mkdir -p "$SNAPSHOTS"
 exec 9> "$BACKUP_DIR/.lock"
-flock -n 9 || die "another backup is already running"
+# 75 lets the scheduled catch-up distinguish contention from a failed backup.
+flock -n 9 || { log "another backup is already running"; exit 75; }
 
 name=$(date -u +%Y-%m-%dT%H%M%SZ)
 work=$SNAPSHOTS/.partial-$name
@@ -102,10 +104,12 @@ log "Copying trip files"
 link=()
 [[ -n $prev && -d $SNAPSHOTS/$prev/data ]] && link=(--link-dest="$SNAPSHOTS/$prev/data")
 # Ingest holds this lock for the whole write of a trip's GPX + JSON.
-flock -w 300 "$COMPOSE_DIR/data/.upload.lock" \
-    rsync -a --exclude=/.upload.lock --exclude='*.tmp' \
+open_upload_lock
+flock -w 300 7
+rsync -a --numeric-ids --exclude=/.upload.lock --exclude='/.upload-lock.*' --exclude='*.tmp' \
         --exclude=/diagnostics/events.db --exclude='/diagnostics/events.db-*' "${link[@]}" \
         "$COMPOSE_DIR/data/" "$work/data/"
+exec 7<&-
 trips=$(find "$work/data" -type f -name '*.gpx' | wc -l)
 
 # --- 3. Manifest, dedupe, prune ----------------------------------------
@@ -166,10 +170,10 @@ log "Copying snapshots to $REMOTE"
 # No --delete: pruning the off-host copy is done by name, below.
 # -H keeps the hard links between snapshots, so the remote copy is as
 # small as the local one.
-rsync_remote -aH "$SNAPSHOTS/" "$REMOTE/snapshots/"
+rsync_remote -aH --numeric-ids "$SNAPSHOTS/" "$REMOTE/snapshots/"
 
 log "Checking the off-host copy of $current"
-diffs=$(rsync_remote -anc --delete --itemize-changes \
+diffs=$(rsync_remote -anc --numeric-ids --delete --itemize-changes \
     "$SNAPSHOTS/$current/" "$REMOTE/snapshots/$current/")
 [[ -z $diffs ]] || die "off-host copy of $current doesn't match:
 $diffs"

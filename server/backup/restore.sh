@@ -29,6 +29,7 @@ umask 077
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib.sh
 . "$SCRIPT_DIR/lib.sh"
+guard_backup_mounts
 
 usage() {
     sed -n '2,/^$/s/^# \{0,1\}//p' "${BASH_SOURCE[0]}" >&2
@@ -80,7 +81,7 @@ fetch_and_check() {
     local source
     source=$(resolve_snapshot "${1:-}")
     log "Fetching $source"
-    rsync_remote -a "$source/" "$scratch/snapshot/"
+    rsync_remote -a --numeric-ids "$source/" "$scratch/snapshot/"
     local snap=$scratch/snapshot
     [[ -f $snap/SHA256SUMS && -f $snap/annotations.db && -d $snap/data ]] \
         || die "$source doesn't look like a backup snapshot"
@@ -180,7 +181,16 @@ if [[ $yes != yes ]]; then
 fi
 
 pre=$BACKUP_DIR/pre-restore-$(date -u +%Y-%m-%dT%H%M%SZ)
+[[ ! -L $COMPOSE_DIR/data ]] || die "trip data directory must not be a symlink"
+data_owner=1000:1000
+[[ ! -d $COMPOSE_DIR/data ]] || data_owner=$(stat -c %u:%g "$COMPOSE_DIR/data")
 mkdir -p "$pre" "$COMPOSE_DIR/data"
+trip_owner=()
+if (( EUID == 0 )); then
+    chown "$data_owner" "$COMPOSE_DIR/data"
+    chmod 700 "$COMPOSE_DIR/data"
+    trip_owner=(--chown="$data_owner" '--chmod=D700,F600')
+fi
 
 find_monitor_volume
 monitor_running=no
@@ -243,7 +253,8 @@ fi
 log "Restoring trip files (anything replaced goes to $pre/data)"
 # Old backups may contain the unsafe live diagnostics copy. Never replay it
 # (or its journal) through rsync; only restore the checked SQLite snapshot.
-rsync -a --backup --backup-dir="$pre/data" --itemize-changes \
+rsync -a --numeric-ids "${trip_owner[@]}" --backup --backup-dir="$pre/data" --itemize-changes \
+    --exclude=/.upload.lock --exclude='/.upload-lock.*' \
     --exclude=/diagnostics/events.db --exclude='/diagnostics/events.db-*' \
     "$scratch/snapshot/data/" "$COMPOSE_DIR/data/" >&2
 
