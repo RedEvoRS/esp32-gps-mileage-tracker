@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 
-from server.tests.test_backup import BACKUP, tools_missing
+from test_backup import BACKUP, tools_missing
 
 
 @unittest.skipIf(tools_missing(), tools_missing())
