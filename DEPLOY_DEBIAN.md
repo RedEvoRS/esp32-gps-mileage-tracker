@@ -223,8 +223,10 @@ Setup verifies the bundle against that release's `SHA256SUMS`, shows the
 old/new versions and asks before copying. Server files go directly into
 `~/mileage-tracker/`; firmware sources and the version-stamping tool go in
 `firmware-src/`. Use `bash setup.sh --dir "$HOME/mileage-tracker"` to choose
-a different destination. For the flash helpers, use a simple absolute path
-or `~/` path without spaces, and an SSH hostname or IPv4 address.
+a different destination. The flash helpers accept only simple paths, so setup
+refuses a destination that contains anything but letters, digits, `_`, `.`, `-`
+and `/` (a space, for example) and installs nothing. They also need an SSH
+hostname or IPv4 address.
 It then runs `install.sh` to configure, rebuild,
 start and verify the services. Choose the **LAN IP for `BIND_ADDR`**: UFW
 does not filter Docker-published ports; see [Step 7](#step-7--firewall-and-network).

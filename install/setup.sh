@@ -7,7 +7,7 @@ main() {
     local releases=https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases
     local install_dir=$HOME/mileage-tracker tag='' bundle='' yes=no
     local tty_available=no filename base root source old_version new_version
-    local arg parent available compose_version os_id os_like
+    local arg parent resolved_parent resolved_dir available compose_version os_id os_like
 
     fail() { printf 'setup: %s\n' "$@" >&2; exit 1; }
     usage() {
@@ -15,7 +15,9 @@ main() {
 Usage: bash setup.sh [--dir DIR] [--tag TAG] [--bundle FILE] [--yes]
 
 Install or update the server (Debian 13 recommended). Run as your login user.
-  --dir DIR       Install directory (default: ~/mileage-tracker)
+  --dir DIR       Install directory (default: ~/mileage-tracker). The flash
+                  scripts accept only letters, digits, _, ., - and /, so
+                  other characters (such as spaces) are refused.
   --tag TAG       Select a release instead of this script's stamped release
   --bundle FILE   Use mileage-tracker-<tag>.tar.gz and its adjacent SHA256SUMS
                   without downloading (the filename supplies the tag)
@@ -197,6 +199,16 @@ HELP
     # target until the bundle has passed checksum and layout validation.
     parent=$install_dir
     while [[ ! -d $parent ]]; do parent=$(dirname -- "$parent"); done
+    # The printed flash commands pass the resolved path (symlinks followed) to
+    # flash.ps1 / flash.sh, which refuse anything but a simple path. Check that
+    # form now so a folder they would reject is never installed.
+    resolved_parent=$(cd -- "$parent" && pwd -P)
+    resolved_dir=${resolved_parent%/}${install_dir#"$parent"}
+    if [[ ! $resolved_dir =~ ^/[a-zA-Z0-9_./-]+$ || $resolved_dir == *'/../'* ]]; then
+        fail "Install directory $resolved_dir can't be used: the flash scripts accept only simple paths" \
+            '(letters, digits, _, ., - and / only; no spaces or other characters).' \
+            'Choose another folder with --dir, for example --dir ~/mileage-tracker. Nothing was installed.'
+    fi
     available=$(df -Pk -- "$parent" | awk 'NR==2 {print $4}')
     [[ $available =~ ^[0-9]+$ ]] || fail 'Could not measure free disk space. Check: df -h'
     (( available >= 1048576 )) || fail 'Less than 1 GiB free at the install directory. Free space or select --dir on a larger disk; check df -h.'
