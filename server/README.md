@@ -38,6 +38,11 @@ login with sudo and working Docker Engine / Compose v2:
 curl -fsSL https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases/latest/download/setup.sh | bash
 ```
 
+On Unraid 7.3+ (7.x), use root, a persistent pool path and Unraid-managed
+Docker with Compose Manager Plus. Follow [the Unraid runbook](../DEPLOY_UNRAID.md)
+instead of the Debian prerequisites. Unraid support has only fake-test
+coverage so far; Unraid 8.x is not supported yet.
+
 This verifies/copies the release, runs `install.sh` to configure, build and
 check the services, then offers a personal firmware build. Read the
 [trust note and download/read/run alternative](../README.md#setting-it-up)
@@ -58,10 +63,11 @@ own output. See the [update procedure](../DEPLOY_DEBIAN.md#updating).
 
 `install.sh --check` leaves configuration unchanged but uploads and removes
 a temporary test trip, can test the admin login, and lists existing everyday
-logins for information. Automatic backups
+logins for information. On Debian, automatic backups
 currently require the server login's numeric user ID to be **1000**
 (`id -u`); the installer skips backups for other IDs. See
 [the deployment prerequisites](../DEPLOY_DEBIAN.md).
+Unraid runs backups as root and keeps the containers and `data/` at UID 1000.
 
 ## What the Ingest Service Does
 
@@ -135,7 +141,7 @@ by the `mileage-viewer` service, which reads these files independently.
     │   └── 2026-04/
     │       ├── 2026-04-14T13-45-22.gpx
     │       └── 2026-04-14T13-45-22.json
-    ├── backup/                # Scheduled backup + restore scripts, systemd timer
+    ├── backup/                # Backup + restore; Debian timer / Unraid scheduled.sh cron
     ├── firmware-builder/      # Server-side tracker firmware build (build.sh, README.md)
     ├── firmware-src/          # Firmware source the builder compiles (created by setup.sh)
     ├── firmware-out/          # Your private firmware build output (created by the builder, never committed)
@@ -305,6 +311,11 @@ checks each step, and tests an upload end to end
 set up both services by hand, in the order Compose needs them, all run
 from this folder. Docker has to be installed first (`DEPLOY_DEBIAN.md`
 Step 1).
+
+The manual steps below use Debian's login and sudo conventions. On Unraid,
+run host commands as root without `sudo`; `data/` must still belong to
+1000:1000, mode 700. Use [the Unraid install steps](../DEPLOY_UNRAID.md#step-1--install-with-setupsh)
+for storage, Python fallback and service setup.
 
 1. Create the `data/` folder yourself, owned by UID 1000, the user both
    containers run as. If Docker creates it on first start, root owns it
@@ -1051,7 +1062,12 @@ restore. Backups also preserve
 `monitor-state` volume exists, `/state/monitor.db` (alert delivery state and
 export cursors).
 
-`backup/backup.sh` runs daily through the systemd timer in `backup/`. It uses
+On Debian, `backup/backup.sh` runs daily through the systemd timer in `backup/`.
+On Unraid, a persistent cron file calls `backup/scheduled.sh` as root, with
+nightly and hourly catch-up entries. Status and logs stay under `backup/state/`
+and `backup/logs/` in the install folder. See [Unraid backups](../DEPLOY_UNRAID.md#step-4--set-up-and-check-backups)
+for the schedule, mount guards, root-owned config and persistent SSH key.
+The backup script uses
 SQLite's backup API and checks each database's integrity. A throwaway viewer
 container reads annotations and diagnostics (its `/data` mount is read-only);
 a throwaway monitor container reads monitor state, even if the monitor service
@@ -1098,7 +1114,7 @@ annotations and diagnostics, leaving the monitor service and its database alone.
 To recover monitor state separately, fix discovery and rerun the restore, or
 follow the manual monitor recovery procedure in `DEPLOY_DEBIAN.md` Step 10.
 
-The timer runs as the server login, while ingest writes private trip files
+The Debian timer runs as the server login, while ingest writes private trip files
 as UID 1000. Use a UID 1000 login with this setup; giving `data/` to UID
 1000 lets ingest write but does not make the files readable by another
 account's backup timer.

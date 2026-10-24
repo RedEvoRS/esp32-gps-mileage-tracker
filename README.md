@@ -148,6 +148,11 @@ first; the bundle checksum does not authenticate the script you already ran.
 
 ### Step 1 — Set up the server
 
+Debian 13 is the main path below. **Unraid 7.3+ (7.x)** is also supported;
+follow [the Unraid runbook](DEPLOY_UNRAID.md) for root login, pool storage,
+Docker prerequisites and cron backups. Unraid paths have only fake-test
+coverage so far; real-host checks remain. Unraid 8.x is not supported yet.
+
 Connect with `ssh <user>@<host>`. **In that SSH session on the Debian server**,
 run as your normal login, not root:
 
