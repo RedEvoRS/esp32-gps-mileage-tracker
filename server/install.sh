@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the mileage tracker server on Debian (or Ubuntu), checking each
+# Install the mileage tracker server on Debian, Ubuntu or Unraid, checking each
 # step as it goes.
 #
 #   bash install.sh           set everything up, or finish a setup that
@@ -7,7 +7,7 @@
 #   bash install.sh --check   leave configuration unchanged; upload and
 #                             remove a test trip, optionally test login
 #
-# Run it as your normal login user, not root. If any step will need root,
+# Run as root on Unraid, or your normal login user on Debian. On Debian,
 # it asks for sudo once, before the long steps: at the start, or for
 # optional steps (backups, waiting for the network) as soon as you say
 # yes to them. If none will, it doesn't ask at all. It works on the
@@ -36,6 +36,13 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+is_unraid() { local f=${MILEAGE_UNRAID_VERSION_FILE:-/etc/unraid-version}; [[ -r $f ]] && grep -Eq '^version="?[0-9]' "$f"; }
+case ${MILEAGE_PLATFORM:-} in
+    '') if is_unraid; then MILEAGE_PLATFORM=unraid; else MILEAGE_PLATFORM=debian; fi ;;
+    debian|unraid) ;;
+    *) printf 'MILEAGE_PLATFORM must be debian or unraid.\n' >&2; exit 1 ;;
+esac
+export MILEAGE_PLATFORM
 # Both images run as a user called app, which gets UID 1000.
 CONTAINER_UID=1000
 # Trip and device IDs of the test upload start with this. Each run adds
@@ -82,6 +89,8 @@ TMP_FILES=()
 WARNINGS=()
 FAILURES=0
 BUILD_SERVER_VERSION=unversioned
+BOOT_UNVERIFIED=no
+PYTHON_ROUTE=
 
 # --- Output ------------------------------------------------------------
 
@@ -219,6 +228,7 @@ confirm() {
 # has to. Every step that runs sudo calls this first, though plan_sudo
 # has usually asked already.
 need_sudo() {
+    [[ $MILEAGE_PLATFORM != unraid ]] || return 0
     [[ $SUDO_READY == no ]] || return 0
     command -v sudo > /dev/null \
         || die "sudo isn't installed." \
@@ -249,6 +259,45 @@ need_sudo() {
         sudo -n true 2> /dev/null || exit 0
     done) > /dev/null 2>&1 &
     SUDO_KEEPALIVE=$!
+}
+
+# Unraid runs as root; Debian retains the existing sudo authentication flow.
+as_root() {
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then "$@"; else sudo "$@"; fi
+}
+
+select_python() {
+    [[ -z $PYTHON_ROUTE ]] || return 0
+    if command -v python3 > /dev/null; then PYTHON_ROUTE=host; else PYTHON_ROUTE=container; fi
+    note "Installer Python: $PYTHON_ROUTE" >&2
+}
+
+# Only public inputs needed by this step are visible to the Python container.
+# Config values and address lists arrive through arguments/stdin, never mounts.
+host_python() {  # stamp|proxy|address PYTHON_ARGUMENTS...
+    local step=$1 image file mounts=()
+    shift
+    select_python
+    if [[ $PYTHON_ROUTE == host ]]; then
+        PYTHONPATH="$SCRIPT_DIR" python3 "$@"
+        return
+    fi
+    image=$(awk 'toupper($1) == "FROM" { print $2; exit }' "$SCRIPT_DIR/mileage-ingest/Dockerfile")
+    [[ -n $image ]] || die "No Python base image in mileage-ingest/Dockerfile."
+    if [[ $step == stamp || $step == proxy ]]; then
+        mounts+=(-v "$SCRIPT_DIR/common/__init__.py:/work/common/__init__.py:ro")
+        if [[ $step == stamp ]]; then file=version.py; else file=settings.py; fi
+        mounts+=(-v "$SCRIPT_DIR/common/$file:/work/common/$file:ro")
+    fi
+    if [[ $step == stamp ]]; then
+        for file in stamp_version.py VERSION COMMIT; do
+            if [[ -f $SCRIPT_DIR/$file ]]; then mounts+=(-v "$SCRIPT_DIR/$file:/work/$file:ro"); fi
+        done
+        shift
+        set -- /work/stamp_version.py "$@"
+    fi
+    "${DOCKER[@]}" run --rm -i --network none --user "$CONTAINER_UID:$CONTAINER_UID" \
+        "${mounts[@]}" -w /work -e PYTHONPATH=/work -e PYTHONDONTWRITEBYTECODE=1 "$image" python3 "$@"
 }
 
 # Default provenance changes image IDs on Docker's containerd store even for
@@ -347,7 +396,10 @@ default_addr() {
 # wrong one shows up when the services refuse to start.
 tz_names() {
     if [[ -z ${TZ_NAMES+set} ]]; then
-        TZ_NAMES=$(timedatectl list-timezones 2> /dev/null) || TZ_NAMES=
+        TZ_NAMES=
+        if [[ $MILEAGE_PLATFORM != unraid ]]; then
+            TZ_NAMES=$(timedatectl list-timezones 2> /dev/null) || TZ_NAMES=
+        fi
         if [[ -z $TZ_NAMES && -f /usr/share/zoneinfo/tzdata.zi ]]; then
             TZ_NAMES=$(awk '$1 == "Z" { print $2 } $1 == "L" { print $3 }' \
                 /usr/share/zoneinfo/tzdata.zi | sort -u)
@@ -364,8 +416,10 @@ tz_ok() {
 
 # This machine's own timezone as an IANA name, or nothing.
 host_tz() {
-    local zone
-    zone=$(timedatectl show -p Timezone --value 2> /dev/null) || zone=
+    local zone=
+    if [[ $MILEAGE_PLATFORM != unraid ]]; then
+        zone=$(timedatectl show -p Timezone --value 2> /dev/null) || zone=
+    fi
     if [[ -z $zone ]]; then zone=$(cat /etc/timezone 2> /dev/null) || zone=; fi
     if [[ -z $zone ]]; then
         zone=$(readlink /etc/localtime 2> /dev/null | sed -n 's|.*/zoneinfo/||p') || zone=
@@ -390,22 +444,37 @@ os_release() {
 preflight() {
     section "Preflight"
     [[ $(uname -s) == Linux ]] || die "This sets up the server on Linux, and this is $(uname -s)."
-    if (( EUID == 0 )); then
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then
+        (( EUID == 0 )) || die "Run install.sh as root on Unraid."
+        [[ $SCRIPT_DIR == /mnt/* && $SCRIPT_DIR =~ ^/[-a-zA-Z0-9_./]+$ ]] \
+            || die "Unraid install directory must be a simple path under /mnt/ on persistent storage."
+        check_unraid_commands
+        local install_mount install_fs
+        install_mount=$(findmnt -n -o TARGET --target "$SCRIPT_DIR")
+        install_fs=$(findmnt -n -o FSTYPE --target "$SCRIPT_DIR")
+        [[ -n $install_mount && $install_mount != / && $install_fs != tmpfs && $install_fs != rootfs ]] \
+            || die "The install pool is not mounted on persistent storage. Mount it before installing."
+    elif (( EUID == 0 )); then
         die "Run this as your normal login user, not as root or with sudo." \
             "It asks for sudo itself when it needs it. The trip files, the" \
             "backups and the backup timer all belong to the user who runs it."
     fi
     ok "Running as $ME (UID $(id -u)) in $SCRIPT_DIR"
 
-    OS_ID=$(os_release ID)
-    OS_CODENAME=$(os_release VERSION_CODENAME)
-    local os_name
-    os_name=$(os_release PRETTY_NAME)
-    case $OS_ID in
-        debian | ubuntu) ok "${os_name:-$OS_ID}" ;;
-        *) warn "${os_name:-This system} isn't Debian or Ubuntu" \
-            "This script can't install Docker here, so it expects it installed already." ;;
-    esac
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then
+        OS_ID=unraid OS_CODENAME=
+        ok "Unraid (Docker is managed by Unraid)"
+    else
+        OS_ID=$(os_release ID)
+        OS_CODENAME=$(os_release VERSION_CODENAME)
+        local os_name
+        os_name=$(os_release PRETTY_NAME)
+        case $OS_ID in
+            debian | ubuntu) ok "${os_name:-$OS_ID}" ;;
+            *) warn "${os_name:-This system} isn't Debian or Ubuntu" \
+                "This script can't install Docker here, so it expects it installed already." ;;
+        esac
+    fi
 
     # COMMIT is optional: archives supply it, but hand copies can use VERSION alone.
     local f missing=()
@@ -425,6 +494,9 @@ preflight() {
             "scp -r can skip dotfiles like .env.example; copy any that are missing one by one."
     fi
     ok "All the server files are here"
+    if [[ $MILEAGE_PLATFORM == unraid && ! -f backup/scheduled.sh ]]; then
+        die "Files missing: backup/scheduled.sh. Copy the complete server release."
+    fi
 
     # Files copied from a Windows checkout can arrive with CRLF line
     # endings. Those break the shell scripts and systemd units, and leave
@@ -444,7 +516,9 @@ preflight() {
             "Run install.sh to convert them, or: sed -i 's/\\r\$//' <file>"
     fi
 
-    if [[ $(id -u) == "$CONTAINER_UID" ]]; then
+    if [[ $MILEAGE_PLATFORM == unraid && $(id -u) == 0 ]]; then
+        ok "Root can back up data/; containers stay UID $CONTAINER_UID"
+    elif [[ $(id -u) == "$CONTAINER_UID" ]]; then
         ok "Your UID matches the containers' (1000)"
     else
         DATA_SUDO=(sudo)
@@ -455,6 +529,7 @@ preflight() {
     fi
 
     local free_kb
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then plan_sudo; return 0; fi
     free_kb=$(df -Pk /var/lib 2> /dev/null | awk 'NR == 2 { print $4 }') || free_kb=
     if [[ -n $free_kb ]] && (( free_kb < 3 * 1024 * 1024 )); then
         warn "Only $((free_kb / 1024)) MB free under /var/lib" \
@@ -471,6 +546,7 @@ preflight() {
 # answers they depend on are in. Each step still calls need_sudo itself,
 # in case this misses something.
 plan_sudo() {
+    [[ $MILEAGE_PLATFORM != unraid ]] || return 0
     local reasons=() missing
     if [[ $MODE == install ]]; then
         missing=$(missing_packages)
@@ -514,6 +590,7 @@ plan_sudo() {
 
 # sudo_for REASON...: list why, then make sure sudo works.
 sudo_for() {
+    [[ $MILEAGE_PLATFORM != unraid ]] || return 0
     local reason
     note "Root is needed to:"
     for reason; do note "  - $reason"; done
@@ -525,6 +602,10 @@ sudo_for() {
 # (which chooses BIND_ADDR) and before the image build. A yes gets its
 # sudo prompt here rather than after the build; a no means no prompt.
 ask_root_options() {
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then
+        note "No wait-online setup: Unraid starts Docker after networking and the array."
+        return 0
+    fi
     local reasons=() unit
     if [[ -n $BIND_ADDR ]] && have_systemd; then
         unit=$(wait_online_unit)
@@ -544,15 +625,62 @@ ask_root_options() {
 
 # --- Packages and Docker -----------------------------------------------
 
-apt_get() {
-    need_sudo
-    sudo DEBIAN_FRONTEND=noninteractive apt-get -q -y "$@" < /dev/null
+check_unraid_commands() {
+    local cmd
+    for cmd in curl jq openssl rsync ssh ssh-keygen ip flock findmnt stat date \
+        awk sed grep sort cut tail head cat cmp readlink realpath df dirname \
+        mktemp install chmod chown mkdir mv rm cp touch id uname sleep nice timeout crontab; do
+        command -v "$cmd" > /dev/null || die "Missing required Unraid command: $cmd" \
+            "Restore the stock Unraid tools (OpenSSH for SSH commands); then rerun install.sh."
+    done
+    stat -c %u "$SCRIPT_DIR" > /dev/null 2>&1 || die "GNU stat -c is required. Restore Unraid's coreutils."
+    date -d '2000-01-01T00:00:00Z' +%s > /dev/null 2>&1 || die "GNU date -d is required. Restore Unraid's coreutils."
+    command -v "${MILEAGE_UPDATE_CRON:-/usr/local/sbin/update_cron}" > /dev/null \
+        || die "Unraid update_cron is missing. Restore the Dynamix scheduler."
 }
 
-WANTED_PACKAGES=(ca-certificates curl gnupg jq openssl openssh-client rsync iproute2 python3)
+unraid_docker_enabled() {
+    if grep -Eq '^DOCKER_ENABLED=("yes"|yes)[[:space:]]*$' "${MILEAGE_UNRAID_DOCKER_CFG:-/boot/config/docker.cfg}" 2> /dev/null; then
+        ok "Docker is enabled in Unraid Settings > Docker"
+    else
+        warn "DOCKER_ENABLED isn't yes in Unraid's docker.cfg" "Enable Docker in Settings > Docker, then start the array."
+    fi
+}
 
-have_apt() { command -v apt-get > /dev/null && command -v dpkg-query > /dev/null; }
-have_systemd() { [[ -d /run/systemd/system ]]; }
+setup_unraid_docker() {
+    local version root path free
+    command -v docker > /dev/null || die "Docker is missing. Enable Docker in Settings > Docker and start the array."
+    version=$(docker compose version --short 2> /dev/null) \
+        || die "docker compose is missing. Install the Compose Manager Plus plugin."
+    version=${version#v}
+    if [[ ! $version =~ ^([0-9]+)\. ]] || (( BASH_REMATCH[1] < 2 )); then
+        die "Compose $version is too old; install Compose Manager Plus (Compose v2 or newer)."
+    fi
+    docker info > /dev/null 2>&1 || die "Docker isn't answering. Start the array and enable Docker in Settings > Docker."
+    DOCKER=(docker) AS_ME=() DATA_SUDO=()
+    ok "Unraid Docker is answering, Compose $version"
+    root=$(docker info --format '{{.DockerRootDir}}')
+    [[ $root == /* && -d $root ]] || die "Cannot find Docker storage. Check Settings > Docker."
+    for path in "$root" "$SCRIPT_DIR"; do
+        free=$(df -Pk -- "$path" | awk 'NR == 2 {print $4}')
+        [[ $free =~ ^[0-9]+$ ]] || die "Cannot measure free space at $path. Check df -h."
+        if (( free < 3 * 1024 * 1024 )); then
+            warn "Only $((free / 1024)) MB free at $path" "Free space here; Docker storage and the install disk are checked separately."
+        else
+            ok "$((free / 1024)) MB free at $path"
+        fi
+    done
+}
+
+apt_get() {
+    need_sudo
+    as_root env DEBIAN_FRONTEND=noninteractive apt-get -q -y "$@" < /dev/null
+}
+
+WANTED_PACKAGES=(ca-certificates curl jq openssl openssh-client rsync iproute2 python3)
+
+have_apt() { [[ $MILEAGE_PLATFORM != unraid ]] && command -v apt-get > /dev/null && command -v dpkg-query > /dev/null; }
+have_systemd() { [[ $MILEAGE_PLATFORM != unraid && -d /run/systemd/system ]]; }
 
 # The WANTED_PACKAGES that aren't installed, space-separated. Empty
 # without apt, where install_packages only checks for the commands.
@@ -568,6 +696,7 @@ missing_packages() {
 }
 
 install_packages() {
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then check_unraid_commands; return 0; fi
     local wanted=("${WANTED_PACKAGES[@]}")
     local p missing=()
     if have_apt; then
@@ -597,6 +726,7 @@ install_packages() {
 # Docker's own packages, from Docker's apt repository, exactly as in
 # DEPLOY_DEBIAN.md Step 1. Debian's docker.io doesn't ship Compose v2.
 install_docker() {
+    [[ $MILEAGE_PLATFORM != unraid ]] || die "Enable Docker in Settings > Docker and start the array."
     case $OS_ID in
         debian | ubuntu) ;;
         *) die "Docker isn't installed, and this script only installs it on Debian or Ubuntu." \
@@ -605,6 +735,7 @@ install_docker() {
     esac
     [[ -n $OS_CODENAME ]] || die "Couldn't tell which $OS_ID release this is (no VERSION_CODENAME in /etc/os-release)."
     need_sudo
+    if ! command -v gpg > /dev/null; then apt_get update; apt_get install gnupg; fi
     note "Installing Docker from Docker's apt repository"
     # A second entry for the same repository with a different key path
     # makes apt refuse to update, so reuse one set up some other way
@@ -612,23 +743,28 @@ install_docker() {
     if grep -rqs --exclude=docker.list download.docker.com /etc/apt/sources.list /etc/apt/sources.list.d/; then
         note "Docker's repository is already in your apt sources; using that"
     else
-        sudo install -m 0755 -d /etc/apt/keyrings
+        as_root install -m 0755 -d /etc/apt/keyrings
         curl -fsSL "https://download.docker.com/linux/$OS_ID/gpg" \
-            | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg
-        sudo chmod a+r /etc/apt/keyrings/docker.gpg
+            | as_root gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg
+        as_root chmod a+r /etc/apt/keyrings/docker.gpg
         printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/%s %s stable\n' \
             "$(dpkg --print-architecture)" "$OS_ID" "$OS_CODENAME" \
-            | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-        sudo chmod 644 /etc/apt/sources.list.d/docker.list
+            | as_root tee /etc/apt/sources.list.d/docker.list > /dev/null
+        as_root chmod 644 /etc/apt/sources.list.d/docker.list
     fi
     apt_get update
     apt_get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-    sudo systemctl enable --now docker
+    as_root systemctl enable --now docker
 }
 
 setup_docker() {
     section "Docker"
     install_packages
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then
+        setup_unraid_docker
+        select_python
+        return 0
+    fi
 
     local fresh=no
     if ! command -v docker > /dev/null; then
@@ -642,16 +778,17 @@ setup_docker() {
             "That's usually Debian's own docker.io package. Remove it with" \
             "sudo apt remove docker.io docker-compose, then run this again to get Docker's packages."
     fi
-    if [[ ${compose_version#v} != [2-9]* ]]; then
+    compose_version=${compose_version#v}
+    if [[ ! $compose_version =~ ^([0-9]+)\. ]] || (( BASH_REMATCH[1] < 2 )); then
         die "Docker Compose $compose_version is too old; this needs v2 or newer."
     fi
     ok "$(docker --version | cut -d, -f1), Compose $compose_version"
 
     # Docker's daemon has to be running and start at boot.
-    if [[ -d /run/systemd/system && $(systemctl is-active docker 2> /dev/null) != active ]]; then
+    if have_systemd && [[ $(systemctl is-active docker 2> /dev/null) != active ]]; then
         [[ $MODE == install ]] || die "The Docker service isn't running." "sudo systemctl enable --now docker"
         need_sudo
-        sudo systemctl enable --now docker
+        as_root systemctl enable --now docker
     fi
 
     # Can this session talk to Docker? Being in the docker group only
@@ -664,7 +801,7 @@ setup_docker() {
         need_sudo
         if [[ " $(id -nG "$ME") " != *" docker "* ]]; then
             if [[ $MODE == install ]]; then
-                sudo usermod -aG docker "$ME"
+                as_root usermod -aG docker "$ME"
                 ok "Added $ME to the docker group"
             else
                 problem "$ME isn't in the docker group" \
@@ -684,6 +821,7 @@ setup_docker() {
         ok "Docker works (through sudo until you log in again)"
     fi
 
+    select_python
     if [[ $fresh == yes ]]; then
         if ! "${DOCKER[@]}" pull hello-world > /dev/null; then
             die "Docker couldn't download hello-world (output above)." \
@@ -701,6 +839,7 @@ setup_docker() {
 # --- Configuration -----------------------------------------------------
 
 setup_data_dir() {
+    [[ ! -L data && ( ! -e data || -d data ) ]] || die "data/ must be a real directory, never a symlink."
     if [[ ! -d data ]]; then
         [[ $MODE == install ]] || { problem "There's no data/ directory" "Run install.sh."; return 0; }
         mkdir data
@@ -708,10 +847,10 @@ setup_data_dir() {
     if [[ $(stat -c %u data) != "$CONTAINER_UID" ]]; then
         if [[ $MODE == install ]]; then
             need_sudo
-            sudo chown -R "$CONTAINER_UID:$CONTAINER_UID" data
+            as_root chown -hR -P "$CONTAINER_UID:$CONTAINER_UID" -- data
         else
             problem "data/ doesn't belong to UID $CONTAINER_UID, so uploads will fail" \
-                "sudo chown -R $CONTAINER_UID:$CONTAINER_UID $SCRIPT_DIR/data"
+                "Run install.sh to repair data/ ownership safely."
             return 0
         fi
     fi
@@ -726,7 +865,7 @@ setup_data_dir() {
                 chmod 700 data
             else
                 need_sudo
-                sudo chmod 700 data
+                as_root chmod 700 data
             fi
             ok "data/ is private (mode 700)"
         else
@@ -743,6 +882,9 @@ setup_env() {
         [[ $MODE == install ]] || { problem ".env is missing" "Run install.sh, or see DEPLOY_DEBIAN.md Step 4a."; return 0; }
         install -m 600 .env.example .env
         note "Created .env from .env.example"
+    fi
+    if [[ $MILEAGE_PLATFORM == unraid && $MODE == install ]]; then
+        env_set .env RESTART_POLICY always
     fi
 
     local token
@@ -833,7 +975,7 @@ setup_viewer_proxy() {
     VIEWER_BIND_ADDR=$(env_raw .env VIEWER_BIND_ADDR)
     trusted=$(env_raw .env VIEWER_TRUSTED_PROXIES)
     secure=$(env_raw .env VIEWER_COOKIE_SECURE)
-    if ! error=$(PYTHONPATH="$SCRIPT_DIR" python3 - "$trusted" "$secure" <<'PY'
+    if ! error=$(host_python proxy - "$trusted" "$secure" <<'PY'
 import sys
 from common.settings import trusted_proxies, viewer_cookie_secure
 try:
@@ -869,7 +1011,7 @@ PY
 viewer_host_addr() {
     [[ $1 == 127.0.0.1 || $1 == ::1 ]] && return 0
     # Compare canonical addresses so IPv6 spelling differences are harmless.
-    ip -o addr show 2> /dev/null | python3 -c '
+    ip -o addr show 2> /dev/null | host_python address -c '
 import ipaddress, sys
 try:
     wanted = ipaddress.ip_address(sys.argv[1])
@@ -897,7 +1039,8 @@ set_service_urls() {
 # folder. Both services read DISPLAY_TZ from .env and won't start without
 # it, so nobody gets a zone picked for them.
 setup_display_tz() {
-    local zone
+    local zone list_hint='timedatectl list-timezones'
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then list_hint='the names in /usr/share/zoneinfo/tzdata.zi'; fi
     zone=$(env_raw .env DISPLAY_TZ)
     if [[ -n $zone ]] && tz_ok "$zone"; then
         ok "Trips are filed and shown in $zone (DISPLAY_TZ in .env)"
@@ -906,7 +1049,7 @@ setup_display_tz() {
     if [[ $MODE == check ]]; then
         if [[ -n $zone ]]; then
             problem "DISPLAY_TZ=$zone in .env isn't a timezone name, so neither service will start" \
-                "Use an IANA name like America/Chicago (timedatectl list-timezones lists them)," \
+                "Use an IANA name like America/Chicago (see $list_hint)," \
                 "then: docker compose up -d"
         else
             problem "DISPLAY_TZ isn't set in .env, so neither service will start" \
@@ -936,7 +1079,7 @@ setup_display_tz() {
         if [[ -n $answer ]] && tz_ok "$answer"; then break; fi
         if [[ -n ${INSTALL_DISPLAY_TZ+set} ]]; then
             die "INSTALL_DISPLAY_TZ=$answer isn't a timezone name." \
-                "Use an IANA name like America/Chicago; timedatectl list-timezones lists them."
+                "Use an IANA name like America/Chicago; see $list_hint."
         fi
         if [[ -z $answer ]]; then
             note "There's no default timezone; type yours, or part of its name."
@@ -1034,7 +1177,7 @@ configure() {
 
 build_images() {
     section "Build and start"
-    BUILD_SERVER_VERSION=$(python3 "$SCRIPT_DIR/stamp_version.py")
+    BUILD_SERVER_VERSION=$(host_python stamp "$SCRIPT_DIR/stamp_version.py")
     note "Server build version: $BUILD_SERVER_VERSION"
     note "Building the images. The first build downloads Python and takes a few minutes."
     if ! compose build < /dev/null 2>&1 | indent; then
@@ -1277,6 +1420,11 @@ check_port_free() {
     elif [[ $(container_state "$svc") == running ]]; then
         return 0
     fi
+    if ! command -v ss > /dev/null; then
+        warn "ss is unavailable; Docker will check port $port when starting $svc" \
+            "If startup reports a port conflict, stop or reconfigure the program using that port."
+        return 0
+    fi
     taken=$(ss -Hltn "sport = :$port" 2> /dev/null | awk -v want="$addr" '{
         addr = $4
         sub(/:[0-9]+$/, "", addr)
@@ -1285,7 +1433,7 @@ check_port_free() {
     }') || taken=
     if [[ -n $taken ]]; then
         die "Port $port is already in use (${taken//$'\n'/, }), so $svc can't start." \
-            "See what has it: sudo ss -tlnp 'sport = :$port'" \
+            "See what has it: ss -tlnp 'sport = :$port' (run as root for process names)" \
             "Stop or reconfigure that program to free the port, then rerun install.sh."
     fi
 }
@@ -1803,7 +1951,33 @@ verify_binding() {
 
 verify_reboots() {
     section "Reboots"
-    if [[ ! -d /run/systemd/system ]]; then
+    local svc policy restart=yes id required='unless-stopped or always'
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then required=always; fi
+    for svc in mileage-ingest mileage-viewer ntfy mileage-monitor; do
+        id=$svc
+        case $svc in
+            ntfy|mileage-monitor)
+                id=$({ compose --profile ntfy --profile monitor ps -a -q "$svc" < /dev/null 2> /dev/null || true; } | head -n 1)
+                [[ -n $id ]] || continue ;;
+        esac
+        policy=$("${DOCKER[@]}" inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$id" 2> /dev/null) || policy=
+        if [[ $policy != always && ( $MILEAGE_PLATFORM == unraid || $policy != unless-stopped ) ]]; then
+            restart=no
+            problem "$svc won't come back on its own (restart policy: ${policy:-none}; expected $required)" \
+                "Run install.sh to apply the platform's restart policy, then docker compose up -d with any enabled profiles."
+        fi
+    done
+    if [[ $restart == yes ]]; then ok "Containers start again with Docker (restart: $required)"; fi
+
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then
+        unraid_docker_enabled
+        note "Unraid starts Docker after networking and the array; no wait-online service is needed."
+        BOOT_UNVERIFIED=yes
+        note "Actual array stop/start and reboot recovery are unverified; test them on the Unraid host."
+        return 0
+    fi
+    if ! have_systemd; then
+        BOOT_UNVERIFIED=yes
         warn "systemd isn't running here, so this can't check what starts at boot"
         return 0
     fi
@@ -1811,23 +1985,11 @@ verify_reboots() {
         ok "Docker starts at boot"
     elif [[ $MODE == install ]]; then
         need_sudo
-        sudo systemctl enable --quiet docker
+        as_root systemctl enable --quiet docker
         ok "Docker now starts at boot"
     else
         problem "Docker doesn't start at boot" "sudo systemctl enable docker"
     fi
-
-    local svc policy restart=yes
-    for svc in mileage-ingest mileage-viewer; do
-        policy=$("${DOCKER[@]}" inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$svc" 2> /dev/null) || policy=
-        if [[ $policy != unless-stopped && $policy != always ]]; then
-            restart=no
-            problem "$svc won't come back on its own (restart policy: ${policy:-none})" \
-                "docker-compose.yml should say restart: unless-stopped; then docker compose up -d"
-        fi
-    done
-    if [[ $restart == yes ]]; then ok "Both containers start again with Docker (restart: unless-stopped)"; fi
-
     if [[ -n $BIND_ADDR ]]; then check_wait_online; fi
 }
 
@@ -1891,7 +2053,7 @@ check_wait_online() {
     if [[ -z $WANT_WAIT_ONLINE ]]; then ask_wait_online "$unit"; fi
     if [[ $WANT_WAIT_ONLINE == yes ]]; then
         need_sudo
-        sudo systemctl enable --quiet "$unit"
+        as_root systemctl enable --quiet "$unit"
         ok "Docker waits for the network at boot ($unit)"
     else
         warn "At boot, Docker may start before $BIND_ADDR is up and leave the containers down" \
@@ -1900,6 +2062,199 @@ check_wait_online() {
 }
 
 # --- Backups -----------------------------------------------------------
+
+# Resolve before creating anything: a missing Unassigned Devices mount can
+# leave an ordinary folder on the RAM root. backup.sh checks these recorded
+# mounts again at run time, including when cron runs without the disk.
+unraid_mount() {  # PATH; sets UNRAID_MOUNT and UNRAID_PATH
+    local path=$1 probe fs target
+    [[ $path == /* && $path != *[\'\"\\$'\n'$'\r']* ]] || {
+        note "Use an absolute backup path without quotes, backslashes or newlines."; return 1;
+    }
+    UNRAID_PATH=$(realpath -m -- "$path") || return 1
+    case $UNRAID_PATH in
+        /boot|/boot/*|/root|/root/*|/tmp|/tmp/*)
+            note "Backup paths must be on persistent storage, never /boot, /root or /tmp."; return 1 ;;
+    esac
+    probe=$UNRAID_PATH
+    while [[ ! -e $probe ]]; do probe=${probe%/*}; probe=${probe:-/}; done
+    target=$(findmnt -n -o TARGET --target "$probe") || return 1
+    fs=$(findmnt -n -o FSTYPE --target "$probe") || return 1
+    if [[ -z $target || $target == / || $target == /boot || $target == /boot/* || $fs == rootfs || $fs == tmpfs ]] \
+        || ! findmnt -n --mountpoint "$target" > /dev/null; then
+            note "Backup destination is not on a mounted persistent filesystem. Mount it first."; return 1;
+    fi
+    [[ $target != *[\'\"\\$'\n'$'\r']* ]] || return 1
+    UNRAID_MOUNT=$target
+}
+
+prepare_unraid_backup_paths() {
+    local dir remote mount data_mount
+    dir=$(conf_get BACKUP_DIR)
+    if [[ -n ${INSTALL_BACKUP_DIR+set} ]]; then dir=$INSTALL_BACKUP_DIR; fi
+    if [[ -z $dir ]]; then
+        ask dir BACKUP_DIR "Local snapshot folder on a mounted persistent disk (absolute path)"
+    fi
+    unraid_mount "$dir" || die "BACKUP_DIR isn't on persistent mounted storage. Set INSTALL_BACKUP_DIR to a mounted destination."
+    dir=$UNRAID_PATH mount=$UNRAID_MOUNT
+    data_mount=$(findmnt -n -o TARGET --target "$SCRIPT_DIR/data") || data_mount=
+    if [[ $mount == "$data_mount" ]]; then
+        warn "BACKUP_DIR is on the same filesystem as data/; it won't survive that disk failing"
+    fi
+    env_set backup/backup.conf BACKUP_DIR "'$dir'"
+    env_set backup/backup.conf BACKUP_MOUNT "'$mount'"
+    remote=$(conf_get REMOTE)
+    if [[ $remote == /* ]]; then
+        unraid_mount "$remote" || die "The local REMOTE isn't on persistent mounted storage. Mount it first."
+        env_set backup/backup.conf REMOTE "'$UNRAID_PATH'"
+        env_set backup/backup.conf REMOTE_MOUNT "'$UNRAID_MOUNT'"
+        warn "The local REMOTE is on this Unraid host; it isn't an off-host copy"
+        if [[ $UNRAID_MOUNT == "$data_mount" ]]; then
+            warn "REMOTE is on the same filesystem as data/; it won't survive that disk failing"
+        fi
+    else
+        env_set backup/backup.conf REMOTE_MOUNT "''"
+        # Existing configurations must migrate away from volatile /root keys.
+        if ! unraid_ssh_target_ok "$remote"; then die "The persistent backup SSH key couldn't reach the destination."; fi
+        env_set backup/backup.conf RSYNC_SSH "\"$RSYNC_SSH_CMD\""
+    fi
+}
+
+unraid_ssh_target_ok() {
+    local host=${1%%:*} path=${1#*:} key=$SCRIPT_DIR/backup/ssh/id_ed25519 known=$SCRIPT_DIR/backup/ssh/known_hosts
+    [[ ! -L backup/ssh && ( ! -e backup/ssh || -d backup/ssh ) ]] || die "backup/ssh must be a real private directory."
+    mkdir -p -- "$SCRIPT_DIR/backup/ssh"
+    chmod 700 "$SCRIPT_DIR/backup/ssh"
+    [[ ! -L $key && ! -L $known && ! -L $key.pub ]] || die "Backup SSH files must not be symlinks."
+    if [[ ! -f $key ]]; then
+        ssh-keygen -q -t ed25519 -N '' -C mileage-backup -f "$key" < /dev/null
+        ok "Made a persistent SSH key just for backups"
+    fi
+    touch "$known"
+    chmod 600 "$key" "$known"
+    local ssh=(ssh -i "$key" -o IdentitiesOnly=yes -o "UserKnownHostsFile=$known" -o BatchMode=yes -o ConnectTimeout=10)
+    if ! "${ssh[@]}" "$host" true < /dev/null 2> /dev/null; then
+        if ! command -v ssh-copy-id > /dev/null; then
+            note "ssh-copy-id isn't installed. Add backup/ssh/id_ed25519.pub to the destination's authorized_keys, then rerun."
+            return 1
+        fi
+        note "Installing only the dedicated persistent backup key on $host; confirm its host key and password privately."
+        ssh-copy-id -i "$key.pub" -o IdentitiesOnly=yes -o "UserKnownHostsFile=$known" "$host" || return 1
+    fi
+    "${ssh[@]}" "$host" "mkdir -p -- $(printf %q "$path") && command -v rsync > /dev/null" < /dev/null || return 1
+    RSYNC_SSH_CMD="ssh -i $key -o IdentitiesOnly=yes -o UserKnownHostsFile=$known"
+}
+
+unraid_cron_file() { printf '%s/mileage-tracker-backup.cron' "${MILEAGE_UNRAID_CRON_DIR:-/boot/config/plugins/dynamix}"; }
+
+unraid_cron_text() {
+    printf '# Mileage tracker backup. Written by install.sh; rerun it to change.\n'
+    printf '30 3 * * * /bin/bash %s/backup/scheduled.sh --delay 900\n' "$SCRIPT_DIR"
+    printf '15 * * * * /bin/bash %s/backup/scheduled.sh --if-overdue 26\n' "$SCRIPT_DIR"
+}
+
+unraid_cron_current() {
+    cmp -s "$(unraid_cron_file)" <(unraid_cron_text) || return 1
+    local loaded line
+    loaded=$(crontab -l 2> /dev/null) || return 1
+    while IFS= read -r line; do
+        [[ $line == '#'* ]] && continue
+        grep -qxF -- "$line" <<< "$loaded" || return 1
+    done < <(unraid_cron_text)
+}
+
+install_unraid_cron() {
+    local file tmp
+    file=$(unraid_cron_file)
+    mkdir -p -- "${file%/*}"
+    tmp=$(mktemp "${file}.XXXXXX")
+    unraid_cron_text > "$tmp"
+    # /boot may be FAT: do not depend on Unix mode or execution bits here.
+    mv -- "$tmp" "$file"
+    "${MILEAGE_UPDATE_CRON:-/usr/local/sbin/update_cron}"
+    unraid_cron_current || die "The backup cron file wasn't loaded. Check update_cron and crontab -l."
+    ok "Persistent nightly backup and hourly catch-up cron entries are loaded"
+}
+
+unraid_backup_log() {
+    local log=$SCRIPT_DIR/backup/logs/backup.log
+    note "Backup log: $log"
+    if [[ -f $log ]]; then tail -n 10 -- "$log" | indent; fi
+}
+
+verify_unraid_backups() {
+    local status key value last='' attempt='' dir recorded
+    if unraid_cron_current; then
+        ok "Persistent backup cron file matches this install and both entries are loaded"
+    else
+        problem "Persistent backup cron file or loaded crontab doesn't match this install" "Run install.sh to reload it."
+    fi
+    for key in BACKUP REMOTE; do
+        if [[ $key == BACKUP ]]; then dir=$(conf_get BACKUP_DIR); else dir=$(conf_get REMOTE); fi
+        if [[ $dir != /* && $key == REMOTE ]]; then continue; fi
+        recorded=$(conf_get "${key}_MOUNT")
+        if ! unraid_mount "$dir" || [[ -z $recorded || $recorded != "$UNRAID_MOUNT" ]]; then
+            problem "$key destination mount is missing or differs from backup.conf" "Mount the recorded disk, or rerun install.sh to configure the destination."
+        fi
+    done
+    if ! status=$(bash "$SCRIPT_DIR/backup/scheduled.sh" --status); then
+        unraid_backup_log
+        problem "Couldn't read scheduled backup status" "See the backup log above."
+        return 0
+    fi
+    while IFS='=' read -r key value; do
+        case $key in last_attempt_status) attempt=$value ;; last_success) last=$value ;; esac
+    done <<< "$status"
+    if [[ $attempt == running ]]; then
+        warn "A scheduled backup is running; its final status is not verified yet"
+    elif [[ $attempt != 0 ]]; then
+        unraid_backup_log
+        problem "The last scheduled backup failed or has never run (status: ${attempt:-missing})" "Run: bash $SCRIPT_DIR/backup/scheduled.sh"
+    else
+        ok "The last scheduled backup attempt succeeded"
+    fi
+    local timestamp now
+    timestamp=$(date -d "$last" +%s 2> /dev/null) || timestamp=0
+    now=$(date +%s)
+    if [[ -z $last || $timestamp == 0 ]] || (( now - timestamp > 2 * 86400 )); then
+        unraid_backup_log
+        problem "No good backup within the last two days" "Run: bash $SCRIPT_DIR/backup/scheduled.sh"
+    else
+        ok "Last good backup: $last"
+    fi
+}
+
+setup_unraid_backups() {
+    local first=no refresh=no
+    [[ $SCRIPT_DIR =~ ^/[-a-zA-Z0-9_./]+$ && $SCRIPT_DIR != *'/../'* ]] \
+        || die "The install path must be a simple absolute path for the persistent cron entries."
+    if [[ $MODE == check ]]; then
+        if ! backups_configured; then warn "Backups aren't set up. Run install.sh."; return 0; fi
+        verify_unraid_backups
+        restore_test
+        return 0
+    fi
+    if ! backups_configured; then
+        if [[ -z $WANT_BACKUPS ]]; then ask_backups; fi
+        if [[ $WANT_BACKUPS != yes ]]; then warn "Backups aren't set up. Run install.sh to set them up."; return 0; fi
+        choose_backup_target
+        first=yes
+    fi
+    prepare_unraid_backup_paths
+    ensure_backup_target "$([[ $first == yes ]] && echo new || echo rerun)"
+    if ! unraid_cron_current; then refresh=yes; fi
+    if [[ $first == yes || $refresh == yes ]]; then
+        note "Running one backup through scheduled.sh, the same wrapper cron uses"
+        if ! bash "$SCRIPT_DIR/backup/scheduled.sh" < /dev/null; then
+            unraid_backup_log
+            die "The scheduled backup failed. Fix the destination or backup.conf and rerun."
+        fi
+        FIRST_BACKUP=yes
+        restore_test
+        install_unraid_cron
+    fi
+    verify_unraid_backups
+}
 
 # Where the backup units go, and where their template expects the files.
 UNIT_DIR=/etc/systemd/system
@@ -1975,6 +2330,10 @@ timer_current() {
 
 local_target_ok() {
     local dir=$1
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then
+        unraid_mount "$dir" || return 1
+        warn "A local backup destination on this Unraid host isn't an off-host copy"
+    fi
     if ! mkdir -p -- "$dir" 2> /dev/null; then
         note "Couldn't create $dir. Create it, make it writable by $ME, and try again."
         return 1
@@ -1986,13 +2345,17 @@ local_target_ok() {
     if [[ $(stat -c %d -- "$dir") == "$(stat -c %d data)" ]]; then
         warn "$dir is on the same disk as the trip data" \
             "A backup there won't survive that disk failing. A NAS share or another machine is better."
-        confirm SAME_DISK "Use it anyway?" n || return 1
+        if [[ $MILEAGE_PLATFORM != unraid ]]; then confirm SAME_DISK "Use it anyway?" n || return 1; fi
     fi
     ok "Backups will go to $dir"
 }
 
 ssh_target_ok() {
     local host=${1%%:*} path=${1#*:} key=$HOME/.ssh/mileage_backup
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then
+        unraid_ssh_target_ok "$1"
+        return
+    fi
     if [[ ! -f $key ]]; then
         if [[ ! -d $HOME/.ssh ]]; then mkdir -m 700 "$HOME/.ssh"; fi
         ssh-keygen -q -t ed25519 -N '' -C mileage-backup -f "$key" < /dev/null
@@ -2122,39 +2485,39 @@ install_backup_units() {
     dropin=$(backup_dropin)
     mounts_dropin=$(backup_mounts_dropin)
     need_sudo
-    sudo install -m 644 backup/mileage-backup@.service backup/mileage-backup@.timer "$UNIT_DIR/"
+    as_root install -m 644 backup/mileage-backup@.service backup/mileage-backup@.timer "$UNIT_DIR/"
     # The unit runs /home/<user>/mileage-tracker/backup/backup.sh. If the
     # files are somewhere else, a drop-in points it at them.
     if [[ $SCRIPT_DIR != "$DEFAULT_DIR" ]]; then
-        sudo install -d -m 755 "${dropin%/*}"
-        dropin_text | sudo tee "$dropin" > /dev/null
-        sudo chmod 644 "$dropin"
+        as_root install -d -m 755 "${dropin%/*}"
+        dropin_text | as_root tee "$dropin" > /dev/null
+        as_root chmod 644 "$dropin"
         note "Pointed $unit.service at $SCRIPT_DIR"
     elif [[ -e $dropin ]]; then
-        sudo rm -f "$dropin"
+        as_root rm -f "$dropin"
         note "Pointed $unit.service back at $DEFAULT_DIR"
     fi
     # A local destination or BACKUP_DIR (a mounted share or disk) must be
     # mounted before the backup runs.
     mounts=$(mounts_text)
     if [[ -n $mounts ]]; then
-        sudo install -d -m 755 "${mounts_dropin%/*}"
-        printf '%s\n' "$mounts" | sudo tee "$mounts_dropin" > /dev/null
-        sudo chmod 644 "$mounts_dropin"
+        as_root install -d -m 755 "${mounts_dropin%/*}"
+        printf '%s\n' "$mounts" | as_root tee "$mounts_dropin" > /dev/null
+        as_root chmod 644 "$mounts_dropin"
     elif [[ -e $mounts_dropin ]]; then
-        sudo rm -f "$mounts_dropin"
+        as_root rm -f "$mounts_dropin"
     fi
-    sudo systemctl daemon-reload
+    as_root systemctl daemon-reload
 }
 
 install_backup_timer() {
     local unit
     unit=$(backup_unit)
     install_backup_units
-    sudo systemctl enable --now --quiet "$unit.timer"
+    as_root systemctl enable --now --quiet "$unit.timer"
     note "Running the backup once through systemd, the way the timer will"
-    if ! sudo systemctl start "$unit.service"; then
-        sudo journalctl -u "$unit.service" -n 20 --no-pager 2>&1 | indent || true
+    if ! as_root systemctl start "$unit.service"; then
+        as_root journalctl -u "$unit.service" -n 20 --no-pager 2>&1 | indent || true
         die "The backup failed when systemd ran it (log above)." \
             "journalctl -u $unit.service has the whole log."
     fi
@@ -2216,6 +2579,7 @@ ask_backups() {
 
 setup_backups() {
     section "Backups"
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then setup_unraid_backups; return; fi
     if [[ $(id -u) != "$CONTAINER_UID" ]]; then
         warn "Skipped backups: they run as you (UID $(id -u)), and the trip files belong to UID $CONTAINER_UID" \
             "DEPLOY_DEBIAN.md Step 10 explains."
@@ -2249,7 +2613,7 @@ setup_backups() {
         elif [[ $MODE == install ]] && ! backup_units_current; then
             note "The backup's systemd files are out of date (this update changed them). Updating them."
             install_backup_units
-            sudo systemctl try-restart "$(backup_unit).timer"
+            as_root systemctl try-restart "$(backup_unit).timer"
             ok "Updated the backup's systemd files"
         elif [[ $MODE == check ]]; then
             restore_test
@@ -3340,6 +3704,9 @@ setup_outputs() {
 summary() {
     section "Summary"
     local item
+    if [[ $BOOT_UNVERIFIED == yes ]]; then
+        note "Boot recovery remains unverified. The running-service and restart-policy checks above are separate."
+    fi
     if (( ${#WARNINGS[@]} )); then
         printf 'Worth a look:\n'
         for item in "${WARNINGS[@]}"; do printf '  - %s\n' "$item"; done
@@ -3350,7 +3717,11 @@ summary() {
             printf '%s%d check(s) failed.%s Each FAIL above says what to do.\n' "$RED" "$FAILURES" "$PLAIN"
             exit 1
         fi
-        printf '%sEverything checks out.%s\n' "$GREEN" "$PLAIN"
+        if [[ $BOOT_UNVERIFIED == yes ]]; then
+            printf '%sThe checks above passed; boot recovery remains unverified.%s\n' "$GREEN" "$PLAIN"
+        else
+            printf '%sEverything checks out.%s\n' "$GREEN" "$PLAIN"
+        fi
         return 0
     fi
 
@@ -3402,13 +3773,20 @@ summary() {
     if [[ $RELOGIN == yes ]]; then
         printf '  - Log out and back in, so docker works without sudo.\n'
     fi
-    printf '  - Reboot (sudo reboot), then check it all came back:\n'
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then
+        printf '  - At a suitable time, test array stop/start and a reboot from the Unraid UI.\n'
+        printf '    After the array and Docker start, check it all came back:\n'
+    else
+        printf '  - Reboot (sudo reboot), then check it all came back:\n'
+    fi
     printf '      bash %s/install.sh --check\n' "$SCRIPT_DIR"
     if [[ $FIRST_BACKUP == yes ]]; then
         # --check tests an existing snapshot; make one after real data
         # arrives instead of checking the empty install-time copy (#23).
         printf '  - After the first real drives, annotate one in the viewer, then run:\n'
-        printf '      bash %q\n' "$SCRIPT_DIR/backup/backup.sh"
+        local backup_runner=$SCRIPT_DIR/backup/backup.sh
+        if [[ $MILEAGE_PLATFORM == unraid ]]; then backup_runner=$SCRIPT_DIR/backup/scheduled.sh; fi
+        printf '      bash %q\n' "$backup_runner"
         printf '      bash %q --check\n' "$SCRIPT_DIR/install.sh"
         printf '    Or wait for a successful nightly backup before running --check.\n'
         printf '    --check tests the newest existing backup; it does not make one.\n'

@@ -36,7 +36,7 @@ services:
       args:
         SERVER_VERSION: ${SERVER_VERSION:-unversioned}
     container_name: mileage-ingest
-    restart: unless-stopped
+    restart: ${RESTART_POLICY:-unless-stopped}
 
     # Host port 8090 maps to container port 8090, on BIND_ADDR only.
     ports:
@@ -82,7 +82,7 @@ services:
       args:
         SERVER_VERSION: ${SERVER_VERSION:-unversioned}
     container_name: mileage-viewer
-    restart: unless-stopped
+    restart: ${RESTART_POLICY:-unless-stopped}
 
     # Override only the viewer's host address for a reverse proxy.
     ports:
@@ -136,7 +136,7 @@ services:
       dockerfile: mileage-monitor/Dockerfile
       args:
         SERVER_VERSION: ${SERVER_VERSION:-unversioned}
-    restart: unless-stopped
+    restart: ${RESTART_POLICY:-unless-stopped}
     volumes:
       - ./data:/data:ro
       - monitor-state:/state
@@ -154,7 +154,7 @@ services:
     profiles: ["ntfy"]
     image: binwiederhier/ntfy:v2.31.0
     command: ["serve"]
-    restart: unless-stopped
+    restart: ${RESTART_POLICY:-unless-stopped}
     ports:
       - "${BIND_ADDR:-0.0.0.0}:8092:80"
     volumes:

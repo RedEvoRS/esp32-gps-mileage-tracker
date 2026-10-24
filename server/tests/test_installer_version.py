@@ -89,6 +89,6 @@ class InstallerVersion(unittest.TestCase):
 class InstallerVersionLayout(unittest.TestCase):
     def test_check_calls_version_health_check_and_preflight_requires_helper(self):
         install = (SERVER / "install.sh").read_text(encoding="utf-8")
-        self.assertIn('BUILD_SERVER_VERSION=$(python3 "$SCRIPT_DIR/stamp_version.py")', install)
+        self.assertIn('BUILD_SERVER_VERSION=$(host_python stamp "$SCRIPT_DIR/stamp_version.py")', install)
         self.assertIn("verify_health_versions || return 1", install)
         self.assertIn("for f in VERSION stamp_version.py common/version.py", install)

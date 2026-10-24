@@ -4,6 +4,9 @@ server/.env
 server/viewer.env
 server/monitor.env
 server/backup/backup.conf
+server/backup/ssh/
+server/backup/state/
+server/backup/logs/
 
 # Trip data and databases
 server/data/

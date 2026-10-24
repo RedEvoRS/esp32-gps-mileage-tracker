@@ -197,6 +197,34 @@ class BashFlashTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(list(self.folder.glob("tracker-firmware.*")), [])
 
+    def test_unraid_root_absolute_pool_path_with_fake_scp(self):
+        fake = self.folder / "esptool"
+        fake.write_text('#!/bin/sh\n[ "$1" = version ] || exit 90\necho "esptool v5.6.0"\n')
+        fake.chmod(0o700)
+        scp = self.folder / "scp"
+        scp.write_text('''#!/bin/bash
+set -eu
+[[ $1 == -rq ]]
+[[ $2 == root@host.invalid:/mnt/pool/appdata/mileage-tracker/firmware-out/current/ ]]
+printf '%s\\n' "$2" > "$FLASH_TEST_SCP_LOG"
+mkdir -p "$3"
+cp "$FLASH_TEST_FIXTURE"/manifest.json "$FLASH_TEST_FIXTURE"/*.bin "$3/"
+''')
+        scp.chmod(0o700)
+        log = self.folder / "scp-calls"
+        result = subprocess.run(["bash", str(ROOT / "install/flash.sh"),
+                                 "--server", "root@host.invalid", "--install-dir",
+                                 "/mnt/pool/appdata/mileage-tracker", "--port", "/dev/test",
+                                 "--dry-run", "--esptool", str(fake)],
+                                text=True, capture_output=True, timeout=20,
+                                env=dict(os.environ, PATH=str(self.folder) + os.pathsep + os.environ["PATH"],
+                                         FLASH_TEST_FIXTURE=str(self.folder), FLASH_TEST_SCP_LOG=str(log),
+                                         TMPDIR=str(self.folder)))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(log.read_text().strip(),
+                         "root@host.invalid:/mnt/pool/appdata/mileage-tracker/firmware-out/current/")
+        self.assertEqual(list(self.folder.glob("tracker-firmware.*")), [])
+
     def interactive(self, options, replies, failure="", major=5):
         # A private pseudo-terminal exercises the real /dev/tty prompts. The
         # only executable given to the script is a fake tool; no device opens.
