@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from common.settings import boolean as _boolean
+
 
 SOURCE = "mileage-tracker"  # GELF "host": one fixed value to filter streams on.
 LEVELS = {"critical": 2, "error": 3, "warning": 4, "info": 6}  # syslog levels
@@ -75,13 +77,6 @@ def _valid_host(host):
         return bool(host and len(host) <= 253 and all(
             re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", label)
             for label in host.rstrip(".").split(".")))
-
-
-def _boolean(env, name, default):
-    value = env.get(name, default).lower()
-    if value not in ("true", "false"):
-        raise ValueError(name + " must be true or false")
-    return value == "true"
 
 
 @dataclass(frozen=True)

@@ -339,8 +339,11 @@ jobs:
             bash "$INSTALLER" < /dev/null
           sudo grep -q "^VIEWER_PASSWORD_HASH='" "$dir/viewer.env"
           ! sudo grep -q $'\r' "$dir/.env"
-      - name: Restart Docker, then check
+      - name: Restart Docker, then check with viewer on loopback
         run: |
+          dir=$(dirname "$INSTALLER")
+          sudo -u "$TEST_USER" bash -c 'printf "\nVIEWER_BIND_ADDR=127.0.0.1\n" >> "$1/.env"' _ "$dir"
+          sudo -u "$TEST_USER" -H bash -c 'cd "$1" && SERVER_VERSION=$(python3 stamp_version.py) docker compose up -d --no-build mileage-viewer' _ "$dir"
           sudo systemctl restart docker
           sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
             bash "$INSTALLER" --check < /dev/null

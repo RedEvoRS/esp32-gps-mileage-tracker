@@ -384,11 +384,13 @@ internet.
 The upload endpoint checks a bearer token and the viewer has a login, but
 it's all plain HTTP, so anyone who can see the traffic can see the
 credentials. The login keeps other people and devices on your network out of
-your trips; it isn't a replacement for TLS. If you do put a TLS reverse proxy
-in front, set `SESSION_COOKIE_SECURE=True` in `mileage-viewer/app.py` and
-rebuild the viewer so the change takes effect. Redo the edit after every
-update: updating overwrites `app.py` and silently puts the cookie back to
-non-Secure.
+your trips; it isn't a replacement for TLS. For HTTPS names through Caddy or
+Nginx Proxy Manager, set `VIEWER_COOKIE_SECURE=true` in `server/.env` and run
+`docker compose up -d` from `server/`. `VIEWER_TRUSTED_PROXIES` preserves
+per-client login lockout; `VIEWER_BIND_ADDR` can limit only the viewer's
+8091 port to loopback while ingest stays on `BIND_ADDR` port 8090.
+The [private reverse-proxy guide](DEPLOY_DEBIAN.md#behind-a-reverse-proxy-caddy-or-nginx-proxy-manager)
+covers Docker networking, certificates and Tailscale access without internet exposure.
 If it also fronts ingest, allow bodies of at least `INGEST_MAX_UPLOAD_BYTES`
 (16 MiB by default; firmware pieces stay under 8 MiB) and slow uploads
 (gunicorn allows 900 s). A proxy's HTTP 413 sets the trip aside as `.bad`
