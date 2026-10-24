@@ -176,7 +176,9 @@ $global:LASTEXITCODE = 0
             # No executable scp/ssh is allowed to run in these tests.
             function scp {
                 Assert-Equal $args[0] '-rq'
-                Assert-Equal $args[1] 'alias:~/mileage-tracker/firmware-out/current/'
+                $expectedRemote = 'alias:~/mileage-tracker/firmware-out/current/'
+                if ($env:FLASH_TEST_UNRAID -eq '1') { $expectedRemote = 'root@host.invalid:/mnt/pool/appdata/mileage-tracker/firmware-out/current/' }
+                Assert-Equal $args[1] $expectedRemote
                 $destination = $args[2]
                 if ($env:FLASH_TEST_COPY_FAILURE -eq '1') { Write-Error 'Synthetic Connection closed'; $global:LASTEXITCODE = 1; return }
                 [IO.Directory]::CreateDirectory($destination) | Out-Null
@@ -190,6 +192,9 @@ $global:LASTEXITCODE = 0
             [IO.File]::WriteAllText($copyScript, $source.Replace($scpResolver.Extent.Text, "function Get-FlashScp { return 'scp' }"))
             try {
                 $null = & $copyScript -Server alias -Port COMx -Esptool $Esptool -DryRun 6>&1
+                $env:FLASH_TEST_UNRAID = '1'
+                $null = & $copyScript -Server root@host.invalid -InstallDir /mnt/pool/appdata/mileage-tracker -Port COMx -Esptool $Esptool -DryRun 6>&1
+                Remove-Item Env:\FLASH_TEST_UNRAID
                 $env:FLASH_TEST_COPY_FAILURE = '1'
                 $copyError = ''
                 try { $null = & $copyScript -Server alias -Port COMx -Esptool $Esptool -DryRun 6>&1 2>&1 } catch { $copyError = $_.Exception.Message }
@@ -199,6 +204,7 @@ $global:LASTEXITCODE = 0
             } finally {
                 Remove-Item Function:\scp
                 Remove-Item Env:\FLASH_TEST_COPY_FAILURE -ErrorAction SilentlyContinue
+                Remove-Item Env:\FLASH_TEST_UNRAID -ErrorAction SilentlyContinue
             }
             # Run the entire real flow with fake esptool and queued Read-Host
             # answers. Actual erase/write commands can only reach this fake.

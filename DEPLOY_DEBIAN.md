@@ -1,5 +1,7 @@
 # Debian Deployment Runbook — Mileage Tracker Server
 
+Using Unraid? Follow [DEPLOY_UNRAID.md](DEPLOY_UNRAID.md) instead.
+
 Deploys both services from `server/`:
 
 | Service | Port | Auth | Purpose |

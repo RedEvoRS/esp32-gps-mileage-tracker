@@ -5,19 +5,29 @@ main() {
     set -euo pipefail
     RELEASE_TAG="@RELEASE_TAG@"
     local releases=https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases
-    local install_dir=$HOME/mileage-tracker tag='' bundle='' yes=no
+    local install_dir=$HOME/mileage-tracker dir_set=no tag='' bundle='' yes=no
     local tty_available=no filename base root source old_version new_version
     local arg parent resolved_parent resolved_dir available compose_version os_id os_like
 
     fail() { printf 'setup: %s\n' "$@" >&2; exit 1; }
+    is_unraid() { local f=${MILEAGE_UNRAID_VERSION_FILE:-/etc/unraid-version}; [[ -r $f ]] && grep -Eq '^version="?[0-9]' "$f"; }
+    case ${MILEAGE_PLATFORM:-} in
+        '') if is_unraid; then MILEAGE_PLATFORM=unraid; else MILEAGE_PLATFORM=debian; fi ;;
+        debian|unraid) ;;
+        *) fail 'MILEAGE_PLATFORM must be debian or unraid.' ;;
+    esac
+    export MILEAGE_PLATFORM
     usage() {
         cat <<'HELP'
 Usage: bash setup.sh [--dir DIR] [--tag TAG] [--bundle FILE] [--yes]
 
-Install or update the server (Debian 13 recommended). Run as your login user.
+Install or update the server (Debian 13 or Unraid 7.3+).
+Run as your login user on Debian, or root on Unraid.
   --dir DIR       Install directory (default: ~/mileage-tracker). The flash
                   scripts accept only letters, digits, _, ., - and /, so
                   other characters (such as spaces) are refused.
+                  Unraid default: /mnt/cache/appdata/mileage-tracker if cache
+                  is mounted; otherwise --dir /mnt/<pool>/appdata/... is required.
   --tag TAG       Select a release instead of this script's stamped release
   --bundle FILE   Use mileage-tracker-<tag>.tar.gz and its adjacent SHA256SUMS
                   without downloading (the filename supplies the tag)
@@ -73,7 +83,7 @@ HELP
             relative=$prefix$name
             if [[ $scope == server ]]; then
                 case $relative in
-                    .env|viewer.env|monitor.env|backup/backup.conf|data|data/*|firmware-out|firmware-out/*)
+                    .env|viewer.env|monitor.env|backup/backup.conf|backup/ssh|backup/ssh/*|backup/state|backup/state/*|backup/logs|backup/logs/*|data|data/*|firmware-out|firmware-out/*)
                         continue ;;
                     firmware-src|firmware-src/*)
                         fail 'Bundle server/ contains reserved firmware-src/.' ;;
@@ -93,6 +103,7 @@ HELP
     flash_commands() {
         local host='' user server answer line value url ps_dir sh_dir
         user=$(id -un)
+        if [[ $MILEAGE_PLATFORM == unraid ]]; then user=root; fi
         # Read only BIND_ADDR; never source .env or print its other settings.
         if [[ -f $install_dir/.env ]]; then
             while IFS= read -r line || [[ -n $line ]]; do
@@ -137,7 +148,7 @@ HELP
             --dir|--tag|--bundle)
                 (( $# >= 2 )) && [[ -n $2 && $2 != --* ]] || fail "$arg needs a value (see --help)."
                 case $arg in
-                    --dir) install_dir=$2 ;;
+                    --dir) install_dir=$2; dir_set=yes ;;
                     --tag) tag=$2 ;;
                     --bundle) bundle=$2 ;;
                 esac
@@ -168,35 +179,60 @@ HELP
             'For automation, use --yes and supply the existing install.sh INSTALL_* presets.'
     fi
 
-    [[ $(uname -s) == Linux ]] || fail 'Use a Debian 13 Linux server for piece 1; run setup.sh there over SSH.'
-    [[ -r /etc/os-release ]] || fail 'Cannot identify this Linux system. Use Debian 13 or a Debian-like distribution.'
-    # shellcheck source=/dev/null
-    os_id=$(. /etc/os-release; printf '%s' "${ID:-}")
-    # shellcheck source=/dev/null
-    os_like=$(. /etc/os-release; printf '%s' "${ID_LIKE:-}")
-    if [[ $os_id != debian ]]; then
-        case " $os_id $os_like " in
-            *' debian '*|*' ubuntu '*) printf 'Warning: %s is Debian-like; Debian 13 is the recommended server.\n' "$os_id" ;;
-            *) fail 'This wrapper requires Debian or a Debian-like distribution. Use Debian 13.' ;;
-        esac
+    [[ $(uname -s) == Linux ]] || fail 'Use a Debian 13 or Unraid Linux server for piece 1; run setup.sh there over SSH.'
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then
+        [[ $(id -u) == 0 ]] || fail 'Run setup.sh as root on Unraid.'
+        if [[ $dir_set == no ]]; then
+            command -v mountpoint >/dev/null || fail 'Missing mountpoint. Restore the stock Unraid util-linux tools.'
+            mountpoint -q /mnt/cache || fail 'No mounted cache pool. Supply --dir /mnt/<pool>/appdata/mileage-tracker.'
+            install_dir=/mnt/cache/appdata/mileage-tracker
+        fi
+    else
+        [[ -r ${MILEAGE_OS_RELEASE_FILE:-/etc/os-release} ]] || fail 'Cannot identify this Linux system. Use Debian 13 or a Debian-like distribution.'
+        # shellcheck source=/dev/null
+        os_id=$(. "${MILEAGE_OS_RELEASE_FILE:-/etc/os-release}"; printf '%s' "${ID:-}")
+        # shellcheck source=/dev/null
+        os_like=$(. "${MILEAGE_OS_RELEASE_FILE:-/etc/os-release}"; printf '%s' "${ID_LIKE:-}")
+        if [[ $os_id != debian ]]; then
+            case " $os_id $os_like " in
+                *' debian '*|*' ubuntu '*) printf 'Warning: %s is Debian-like; Debian 13 is the recommended server.\n' "$os_id" ;;
+                *) fail 'This wrapper requires Debian or a Debian-like distribution. Use Debian 13.' ;;
+            esac
+        fi
     fi
-    for arg in curl tar sha256sum; do
-        command -v "$arg" >/dev/null || fail "Missing $arg. Fix: sudo apt update && sudo apt install curl tar coreutils"
-    done
-    command -v docker >/dev/null || fail 'Docker Engine is missing. Install Engine and the Compose plugin using DEPLOY_DEBIAN.md Step 1 or https://docs.docker.com/engine/install/debian/.'
-    compose_version=$(docker compose version --short 2>/dev/null) \
-        || fail 'Compose v2 plugin is missing. Fix: sudo apt install docker-compose-plugin (Docker apt repository; DEPLOY_DEBIAN.md Step 1).'
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then
+        for arg in curl tar sha256sum docker mountpoint findmnt awk grep id mktemp mkdir cp mv chmod rm dirname df; do
+            command -v "$arg" >/dev/null || fail "Missing $arg. Restore Unraid's stock tools; enable Docker in Settings > Docker and start the array."
+        done
+        docker info >/dev/null 2>&1 || fail 'Start the array and enable Docker in Settings > Docker.'
+    else
+        for arg in curl tar sha256sum; do
+            command -v "$arg" >/dev/null || fail "Missing $arg. Fix: sudo apt update && sudo apt install curl tar coreutils"
+        done
+        command -v docker >/dev/null || fail 'Docker Engine is missing. Install Engine and the Compose plugin using DEPLOY_DEBIAN.md Step 1 or https://docs.docker.com/engine/install/debian/.'
+    fi
+    if ! compose_version=$(docker compose version --short 2>/dev/null); then
+        if [[ $MILEAGE_PLATFORM == unraid ]]; then fail 'Install the Compose Manager Plus plugin for docker compose.'; fi
+        fail 'Compose v2 plugin is missing. Fix: sudo apt install docker-compose-plugin (Docker apt repository; DEPLOY_DEBIAN.md Step 1).'
+    fi
     compose_version=${compose_version#v}
     if [[ ! $compose_version =~ ^([0-9]+)\. ]] || (( BASH_REMATCH[1] < 2 )); then
+        if [[ $MILEAGE_PLATFORM == unraid ]]; then fail 'Compose v2 or newer is required. Install Compose Manager Plus.'; fi
         fail 'Docker Compose v2 or newer is required. Install docker-compose-plugin; docker-compose v1 is unsupported.'
     fi
-    docker info >/dev/null 2>&1 || fail 'Docker Engine is not usable by this login user.' \
-        'Check: sudo systemctl enable --now docker; sudo docker info' \
-        "If sudo works: sudo usermod -aG docker \"\$USER\", then log out and back in." \
-        'Docker group access grants root-level privileges. Run setup as your normal user; install.sh asks for sudo when needed.'
+    if [[ $MILEAGE_PLATFORM != unraid ]]; then
+        docker info >/dev/null 2>&1 || fail 'Docker Engine is not usable by this login user.' \
+            'Check: sudo systemctl enable --now docker; sudo docker info' \
+            "If sudo works: sudo usermod -aG docker \"\$USER\", then log out and back in." \
+            'Docker group access grants root-level privileges. Run setup as your normal user; install.sh asks for sudo when needed.'
+    fi
     [[ $install_dir == /* ]] || install_dir=$PWD/$install_dir
-    # Resolve the existing parent before measuring free space; do not create the
-    # target until the bundle has passed checksum and layout validation.
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then
+        [[ $install_dir == /mnt/* && $install_dir != */../* && $install_dir != */.. ]] \
+            || fail 'Unraid install directory must be under /mnt/ on persistent storage.'
+    fi
+    # Resolve the existing parent before measuring free space. Unraid stages
+    # extraction on this filesystem; source copying still waits for validation.
     parent=$install_dir
     while [[ ! -d $parent ]]; do parent=$(dirname -- "$parent"); done
     # The printed flash commands pass the resolved path (symlinks followed) to
@@ -204,6 +240,18 @@ HELP
     # form now so a folder they would reject is never installed.
     resolved_parent=$(cd -- "$parent" && pwd -P)
     resolved_dir=${resolved_parent%/}${install_dir#"$parent"}
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then
+        [[ $resolved_dir == /mnt/* && $resolved_dir != */../* && $resolved_dir != */.. && $resolved_dir != */./* ]] \
+            || fail 'Unraid install directory must be under /mnt/ on persistent storage.'
+        case $resolved_dir in
+            /mnt/user/*) printf 'Warning: a direct pool path is preferred for SQLite instead of /mnt/user/.\n' ;;
+        esac
+        local install_mount install_fs
+        install_mount=$(findmnt -n -o TARGET --target "$parent")
+        install_fs=$(findmnt -n -o FSTYPE --target "$parent")
+        [[ -n $install_mount && $install_mount != / && $install_fs != tmpfs && $install_fs != rootfs ]] \
+            || fail 'The install pool is not mounted on persistent storage. Mount it before setup.'
+    fi
     if [[ ! $resolved_dir =~ ^/[a-zA-Z0-9_./-]+$ || $resolved_dir == *'/../'* ]]; then
         fail "Install directory $resolved_dir can't be used: the flash scripts accept only simple paths" \
             '(letters, digits, _, ., - and / only; no spaces or other characters).' \
@@ -216,7 +264,21 @@ HELP
     if (( available < 10485760 )); then printf 'Warning: free at least 10 GiB before the first firmware build (download, extraction and image export).\n'; fi
 
     # Global within main for the EXIT trap, which also runs after main returns.
-    temp_dir=$(mktemp -d)
+    if [[ $MILEAGE_PLATFORM == unraid ]]; then
+        install_dir=$resolved_dir
+        mkdir -p -- "$install_dir"
+        temp_dir=$(mktemp -d "$install_dir/.mileage-setup.XXXXXX")
+        trap 'rm -rf -- "$temp_dir"' EXIT
+        local docker_root docker_free
+        docker_root=$(docker info --format '{{.DockerRootDir}}')
+        [[ $docker_root == /* ]] || fail 'Cannot determine Docker storage. Check Settings > Docker.'
+        docker_free=$(df -Pk -- "$docker_root" | awk 'NR==2 {print $4}')
+        if [[ ! $docker_free =~ ^[0-9]+$ ]] || (( docker_free < 1048576 )); then
+            fail 'Less than 1 GiB free in Docker storage. Increase or free Docker storage in Settings > Docker.'
+        fi
+    else
+        temp_dir=$(mktemp -d)
+    fi
     trap 'rm -rf -- "$temp_dir"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -278,7 +340,7 @@ HELP
         printf 'First server install: %s\n' "$new_version"
     fi
     printf 'Source destination: %s\n' "$install_dir"
-    printf 'Private .env, viewer.env, monitor.env, backup/backup.conf, data/ and firmware-out/ are excluded.\n'
+    printf 'Private .env, viewer.env, monitor.env, backup/backup.conf, backup/{ssh,state,logs}/, data/ and firmware-out/ are excluded.\n'
     printf 'Files deleted upstream are not removed; review obsolete source files after updates.\n'
     if [[ $yes == no ]]; then
         confirm 'Copy this release and run the server installer?' || { printf 'Cancelled.\n'; return 0; }

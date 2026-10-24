@@ -44,12 +44,12 @@ is closed and it's verified on the bench.
 Two-component system:
 - **Firmware** (Arduino/C++) — runs on the T-Beam, logs trips, uploads
   over home WiFi
-- **Server** (Flask + Gunicorn, Docker, Debian Linux) — two default services. Ingest
+- **Server** (Flask + Gunicorn, Docker, Debian or Unraid) — two default services. Ingest
   accepts authenticated GPX uploads and writes `/data/YYYY-MM/<trip>.gpx`
   plus a derived `<trip>.json` summary; the viewer lists, maps, annotates
   and exports them. Optional stdlib monitor and self-hosted ntfy services
   deliver device fault/silence notifications. Deploy with
-  `server/install.sh` (runbook: `DEPLOY_DEBIAN.md`); `install.sh --check`
+  `server/install.sh` (runbooks: `DEPLOY_DEBIAN.md` / `DEPLOY_UNRAID.md`); `install.sh --check`
   re-verifies an install
 
 ## Project Layout
@@ -86,13 +86,15 @@ server/
   mileage-monitor/       Stdlib monitor.py, gelf.py, prometheus.py, loki.py; own state volume
   grafana/               Importable Prometheus scrape config, dashboard, alert examples
   ntfy/server.yml        Optional self-hosted ntfy; deny-all access, ntfy-state volume
-  backup/                backup.sh + restore.sh, systemd timer, backup.conf.example
+  backup/                backup.sh + restore.sh, systemd timer, scheduled.sh cron wrapper,
+                         backup.conf.example
   tests/                 Server tests (unittest) + map-parser check (node)
   sample.gpx             Test upload for the end-to-end check
   README.md              Deployment + curl test guide
 
 tools/check_pii.py                  Personal-info scan (CI runs it; see Do Not)
 tools/generate_error_catalog.py     Generates sketch-local diag_catalog.h
+DEPLOY_UNRAID.md                   Unraid install, cron backups and Debian migration
 DIAGNOSTICS.md                     Framework reference and issue delivery map
 .github/workflows/release.yml       Published-release bundle, scripts and checksums
 .github/workflows/audit-tests.yml   CI: PII scan + server tests + firmware host tests
@@ -158,6 +160,10 @@ cancelled. The PII/tools job is skipped for Dependabot PRs:
   sudo user, reruns, config repair (unquoted hash, CRLF `.env`), a Docker
   restart, concurrent `--check` runs, turning on metrics, and `--check`
   reporting a stopped viewer.
+  `server/tests/test_installer_unraid.py` and `test_backup_scheduled.py`
+  cover Unraid installer paths and the cron wrapper. Unraid paths are tested
+  only with fakes; real-host install, array/reboot recovery and migration
+  remain unverified. Run Bash-based tests under WSL; Windows skips them.
 
 ## Key Technical Details
 
@@ -291,6 +297,16 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 
 ### Server
 
+- Unraid: detect `/etc/unraid-version` (`version=` starts with a digit);
+  `MILEAGE_PLATFORM=debian|unraid` overrides detection. Root-only, no sudo,
+  apt or systemd. Installer writes `RESTART_POLICY=always`; unset Compose
+  default remains `unless-stopped`. Persistent Dynamix cron calls
+  `backup/scheduled.sh` (nightly + overdue catch-up); `--status` reads its
+  state, log is `backup/logs/backup.log`. `BACKUP_MOUNT` / `REMOTE_MOUNT`
+  guard missing destinations; root requires root-owned backup.conf without
+  group/world write. Missing host Python uses disposable containers from
+  ingest's base image. Builder high-water/compile helpers stay UID 1000.
+  Runbook: `DEPLOY_UNRAID.md`; actual boot recovery remains unverified.
 - Version: `server/VERSION`; `python3 server/stamp_version.py` prints release +
   ten-character Git commit (+ `-dirty` for tracked changes; VERSION alone if
   Git and archive COMMIT are unavailable). Pass as Compose build arg `SERVER_VERSION`; installer

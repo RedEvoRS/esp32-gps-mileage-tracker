@@ -8,10 +8,12 @@ import os
 from pathlib import Path
 import re
 import select
+import shlex
 import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -36,6 +38,273 @@ def load(name):
 
 builder = load("builder")
 checker = load("check_pins")
+
+
+@unittest.skipUnless(os.name == "posix" and shutil.which("bash"), "needs POSIX bash")
+class FirmwareBuilderShellTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.install = self.root / "install with spaces"
+        self.scripts = self.install / "firmware-builder"
+        shutil.copytree(HERE, self.scripts)
+        (self.install / "mileage-ingest").mkdir()
+        shutil.copyfile(HERE.parent / "mileage-ingest/Dockerfile", self.install / "mileage-ingest/Dockerfile")
+        sketch = self.install / "firmware-src/firmware/04_trip_logger"
+        sketch.mkdir(parents=True)
+        (sketch / "04_trip_logger.ino").write_text("// fake source\n")
+        (self.install / "data").mkdir()
+        self.env_file = self.install / ".env"
+        self.env_file.write_text("INGEST_AUTH_TOKEN='" + "a" * 64 + "'\nBIND_ADDR=tracker.example\n")
+        self.env_file.chmod(0o600)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        # The tests fake root with FAKE_UID=0. Only real root can chown to
+        # 1000:1000 (a non-root CI runner can't), so record chown calls instead.
+        real_root = os.geteuid() == 0
+        for command in ("bash", "dirname", "flock", "mktemp", "mkdir", "chmod", "find",
+                        "grep", "awk", "cat", "mkfifo", "rm", "basename", "tr", "mv", "cp") \
+                + (("chown",) if real_root else ()):
+            target = shutil.which(command)
+            self.assertIsNotNone(target, command)
+            (self.bin / command).symlink_to(target)
+        self.log = self.root / "docker.jsonl"
+        self.env = dict(os.environ, PATH=str(self.bin), FAKE_LOG=str(self.log),
+                        FAKE_INSTALL=str(self.install), FAKE_UID="0", MILEAGE_PLATFORM="unraid",
+                        TRACKER_ACCEPT_DOWNLOAD="yes", TRACKER_WIFI_SSID="example-ssid",
+                        TRACKER_WIFI_PASSWORD="example-password", TRACKER_DEVICE_ID="test-01",
+                        TRACKER_SERVER_HOST="tracker.example", TRACKER_FRESH_SD="no")
+        self.executable("id", "#!/bin/bash\nprintf '%s\\n' \"${FAKE_UID}\"\n")
+        self.chown_log = self.root / "chown.log"
+        if not real_root:
+            self.executable("chown", "#!/bin/bash\nprintf '%s\\n' \"$*\" >> "
+                            + shlex.quote(str(self.chown_log)) + "\n")
+        for command in ("sudo", "apt-get", "dpkg", "systemctl", "journalctl"):
+            self.executable(command, "#!/bin/bash\nprintf 'forbidden:%s\\n' \"$0\" >> \"$FAKE_LOG\"\nexit 98\n")
+        self.executable("docker", "#!" + sys.executable + "\n" + r'''
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+args = sys.argv[1:]
+with open(os.environ["FAKE_LOG"], "a") as stream:
+    stream.write(json.dumps(args) + "\n")
+if args[:2] == ["buildx", "version"]:
+    sys.exit(int(os.environ.get("FAKE_NO_BUILDX", "0")))
+if args[:2] == ["buildx", "inspect"]:
+    print("Platforms: " + os.environ.get("FAKE_PLATFORMS", "linux/amd64, linux/arm64"))
+    sys.exit(0)
+if args[:2] == ["image", "inspect"]:
+    sys.exit(1)
+if args[0] == "build":
+    sys.exit(0)
+if args[:2] == ["rm", "-f"]:
+    sys.exit(0)
+assert args[0] == "run", args
+mounts = {}
+for i, value in enumerate(args):
+    if value == "--mount":
+        fields = dict(item.split("=", 1) for item in args[i + 1].split(",") if "=" in item)
+        mounts[fields["dst"]] = Path(fields["src"])
+install = Path(os.environ["FAKE_INSTALL"])
+spec = importlib.util.spec_from_file_location("fake_builder", mounts.get("/builder/builder.py", install / "firmware-builder/builder.py"))
+builder = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(builder)
+os.umask(0o077)
+if "python3" in args and "-" in args:
+    result = subprocess.run([sys.executable, "-", str(mounts["/builder"])], stdin=sys.stdin)
+    sys.exit(result.returncode)
+if "configure" in args:
+    if os.environ.get("FAKE_CONFIGURE_FAIL"):
+        sys.exit(7)
+    # Drain the real private FIFO and execute configure with the same input.
+    with tempfile.TemporaryDirectory() as directory:
+        view = Path(directory)
+        (view / "firmware-src").symlink_to(install / "firmware-src", target_is_directory=True)
+        (view / ".env").write_text(mounts["/install/.env"].read_text())
+        builder.configure(view, mounts["/private"], True)
+elif "high-water" in args:
+    if os.environ.get("FAKE_HIGH_WATER_FAIL"):
+        sys.exit(8)
+    private = mounts["/private"]
+    plan = builder.read_json(private / "plan.json")
+    builder.write_json(private / "high-water.json", builder.read_high_water(mounts["/data"], plan["device_id"]))
+elif "enrollment" in args:
+    builder.enrollment(mounts["/private"], True)
+elif "compile" in args:
+    current = mounts["/result"] / "current"
+    current.mkdir(mode=0o700)
+    builder.write_json(current / "manifest.json", {"version": "v0.00+0123456789", "kind": "normal"})
+    builder.private_write(current / "app.bin", "fake firmware")
+elif "publish" in args:
+    private = mounts["/private/result"].parent
+    builder.publish(install, private, prepare=True)
+else:
+    raise AssertionError(args)
+''')
+
+    def executable(self, name, content):
+        path = self.bin / name
+        path.write_text(content)
+        path.chmod(0o755)
+
+    def calls(self):
+        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def run_builder(self, *, host_python=False, interactive=False):
+        if host_python:
+            (self.bin / "python3").symlink_to(sys.executable)
+        command = [str(self.bin / "bash"), str(self.scripts / "build.sh")]
+        if not interactive:
+            command.append("--non-interactive")
+        if interactive:
+            master, slave = pty.openpty()
+            try:
+                result = subprocess.run(command, env=self.env, stdin=slave, stdout=slave, stderr=slave, timeout=10)
+                return result
+            finally:
+                os.close(master)
+                os.close(slave)
+        return subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=10)
+
+    def test_unraid_root_helpers_nonroot_with_host_python(self):
+        result = self.run_builder(host_python=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runs = [call for call in self.calls() if call[0] == "run"]
+        self.assertEqual(len(runs), 2)
+        for call in runs:
+            self.assertEqual(call[call.index("--user") + 1], "1000:1000")
+        self.assertIn("dst=/data,readonly", " ".join(runs[0]))
+        self.assertEqual(self.env_file.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn("a" * 64, result.stdout + result.stderr)
+        for path in (self.install / "firmware-src", self.install / "firmware-out"):
+            for item in [path, *path.rglob("*")]:
+                self.assertEqual(item.stat().st_mode & 0o777, 0o700 if item.is_dir() else 0o600)
+        self.assertEqual(list(self.install.glob(".firmware-build.*")), [])
+
+    def test_debian_root_still_refused(self):
+        self.env["MILEAGE_PLATFORM"] = "debian"
+        result = self.run_builder()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("normal user", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_missing_python_uses_minimal_container_mounts_and_preserves_env(self):
+        before = (self.env_file.stat().st_uid, self.env_file.stat().st_gid, self.env_file.stat().st_mode)
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr.count("Firmware builder Python:"), 1)
+        calls = self.calls()
+        runs = [call for call in calls if call[0] == "run"]
+        self.assertEqual(len(runs), 6)
+        image = (self.install / "mileage-ingest/Dockerfile").read_text().splitlines()[0].split()[1]
+        fallback = [call for call in runs if image in call]
+        self.assertEqual(len(fallback), 4)
+        for call in runs:
+            self.assertEqual(call[call.index("--user") + 1], "1000:1000")
+            self.assertEqual(call[call.index("--network") + 1], "none")
+        for call in fallback:
+            self.assertIn("-i", call)
+            self.assertIn("-w", call)
+            self.assertNotIn("-t", call)
+            self.assertNotIn("a" * 64, " ".join(call))
+            self.assertNotIn("src=" + str(self.scripts), " ".join(call))
+        configure = next(call for call in fallback if "configure" in call)
+        self.assertIn("env.pipe,dst=/install/.env,readonly", " ".join(configure))
+        self.assertNotIn("src=" + str(self.env_file) + ",", " ".join(configure))
+        publish = next(call for call in fallback if "publish" in call)
+        self.assertIn("--prepare", publish)
+        self.assertIn("dst=/private/result,readonly", " ".join(publish))
+        self.assertNotIn("dst=/install,", " ".join(publish))
+        self.assertEqual(before, (self.env_file.stat().st_uid, self.env_file.stat().st_gid, self.env_file.stat().st_mode))
+        self.assertTrue((self.install / "firmware-out/current/app.bin").is_file())
+        self.assertEqual(list(self.install.glob(".firmware-build.*")), [])
+
+    def test_debian_fallback_helpers_keep_callers_uid(self):
+        self.env.update(MILEAGE_PLATFORM="debian", FAKE_UID="1234")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for call in self.calls():
+            if call[0] == "run":
+                self.assertEqual(call[call.index("--user") + 1], "1234:1234")
+
+    @unittest.skipUnless(pty is not None, "needs POSIX pty")
+    def test_interactive_fallback_allocates_tty(self):
+        result = self.run_builder(interactive=True)
+        self.assertEqual(result.returncode, 0)
+        for step in ("configure", "enrollment"):
+            call = next(call for call in self.calls() if step in call)
+            self.assertIn("-i", call)
+            self.assertIn("-t", call)
+
+    def test_failed_configure_cleans_blocked_env_writer(self):
+        self.env["FAKE_CONFIGURE_FAIL"] = "1"
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(list(self.install.glob(".firmware-build.*")), [])
+
+    def test_fallback_publication_rolls_back_after_failed_rename(self):
+        current = self.install / "firmware-out/current"
+        current.mkdir(parents=True)
+        (current / "old.bin").write_bytes(b"previous good firmware")
+        self.bin.joinpath("mv").unlink()
+        self.executable("mv", '#!/bin/bash\nif [[ $3 == */result ]]; then exit 33; fi\nexec /bin/mv "$@"\n')
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 33, result.stderr)
+        self.assertEqual((current / "old.bin").read_bytes(), b"previous good firmware")
+        self.assertNotIn("is ready", result.stdout)
+        self.assertEqual(list(self.install.glob(".firmware-build.*")), [])
+
+    def test_fallback_publication_preserves_unexpected_existing_output(self):
+        output = self.install / "firmware-out"
+        output.mkdir()
+        (output / "unrelated").write_text("keep")
+        result = self.run_builder()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((output / "unrelated").read_text(), "keep")
+        self.assertNotIn("is ready", result.stdout)
+
+    def test_high_water_failure_never_proceeds_to_enrollment(self):
+        self.env["FAKE_HIGH_WATER_FAIL"] = "1"
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 8)
+        self.assertFalse(any("enrollment" in call or "compile" in call for call in self.calls()))
+
+    def test_unraid_private_source_rejects_symlinks_without_touching_target(self):
+        outside = self.root / "outside"
+        outside.write_text("unrelated")
+        outside.chmod(0o644)
+        (self.install / "firmware-src/link").symlink_to(outside)
+        result = self.run_builder()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("without symlinks", result.stderr)
+        self.assertEqual(outside.stat().st_mode & 0o777, 0o644)
+
+    def test_buildx_and_amd64_checked_before_configuration(self):
+        for variable, value, expected in (("FAKE_NO_BUILDX", "1", "Buildx/BuildKit"),
+                                          ("FAKE_PLATFORMS", "linux/arm64", "linux/amd64")):
+            with self.subTest(variable=variable):
+                self.env[variable] = value
+                result = self.run_builder()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stderr)
+                self.assertIn("Unraid", result.stderr)
+                self.assertFalse(any(call[0] == "run" for call in self.calls()))
+                del self.env[variable]
+                self.log.unlink()
+
+    def test_unraid_detection_file_and_debian_override(self):
+        version = self.root / "unraid-version"
+        version.write_text('version="7.3.4"\n')
+        self.env.pop("MILEAGE_PLATFORM")
+        self.env["MILEAGE_UNRAID_VERSION_FILE"] = str(version)
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 @unittest.skipUnless(pty is not None and termios is not None, "needs POSIX pty and termios")

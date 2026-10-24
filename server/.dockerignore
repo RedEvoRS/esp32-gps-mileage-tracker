@@ -5,6 +5,10 @@
 # Re-deny contents after opening each directory: Docker otherwise includes
 # unlisted descendants through the directory exception.
 **
+# Private backup keys, scheduler state and logs also stay excluded.
+backup/ssh/
+backup/state/
+backup/logs/
 !mileage-ingest/
 mileage-ingest/**
 !mileage-ingest/Dockerfile

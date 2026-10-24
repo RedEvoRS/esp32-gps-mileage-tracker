@@ -45,8 +45,12 @@ def read_json(path):
 
 def env_value(path, key):
     """Read installer values without sourcing shell code or expanding dollars."""
+    return parse_env(Path(path).read_text(encoding="utf-8"), key)
+
+
+def parse_env(content, key):
     value = None
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
+    for line in content.splitlines():
         match = re.fullmatch(r"\s*" + re.escape(key) + r"=(.*)", line)
         if match:
             value = match[1].strip()
@@ -148,7 +152,9 @@ def configure(install, private, noninteractive):
     print("The first run downloads about 1.8 GB of toolchain data (image about 2.7 GB; allow 10 GiB free for the first build); later builds reuse the image.", flush=True)
     if not yes("Continue with the toolchain download/build?", noninteractive, "TRACKER_ACCEPT_DOWNLOAD"):
         raise ValueError("Download not accepted (non-interactive: TRACKER_ACCEPT_DOWNLOAD=yes)")
-    host = env_value(install / ".env", "BIND_ADDR")
+    # Read once: the no-host-Python route supplies .env through a private FIFO.
+    env = (install / ".env").read_text(encoding="utf-8")
+    host = parse_env(env, "BIND_ADDR")
     if host in ("", "0.0.0.0", "::"):
         try:
             # Route lookup sends no packets. Documentation-only destination.
@@ -156,7 +162,7 @@ def configure(install, private, noninteractive):
             host = route[0]["prefsrc"]
         except (OSError, subprocess.CalledProcessError, IndexError, KeyError, ValueError):
             host = ""
-    settings = {"token": env_value(install / ".env", "INGEST_AUTH_TOKEN")}
+    settings = {"token": parse_env(env, "INGEST_AUTH_TOKEN")}
     for key, env, prompt, default, secret in (
             ("ssid", "TRACKER_WIFI_SSID", "2.4 GHz WiFi SSID", "", False),
             ("password", "TRACKER_WIFI_PASSWORD", "WiFi password (empty for open network)", "", True),
@@ -333,21 +339,24 @@ def compile_images():
             print(f"Built {version}: {folder} ({kind})", flush=True)
 
 
-def publish(install, private):
+def publish(install, private, prepare=False):
     install, private = Path(install), Path(private)
     result, output, previous = private / "result", install / "firmware-out", private / "previous"
     manifest = read_json(result / "current/manifest.json")
     summary = f'Firmware {manifest["version"]} ({manifest["kind"]}) is ready in firmware-out/current/.'
     if output.is_symlink() or (output.exists() and (not output.is_dir() or any(p.name not in ("current", "cleanup") for p in output.iterdir()))):
         raise ValueError("firmware-out must be a builder-owned directory containing only current/cleanup")
-    if output.exists():
-        output.rename(previous)
-    try:
-        result.rename(output)
-    except OSError:
-        if previous.exists():
-            previous.rename(output)
-        raise
+    # A fallback container validates read-only mounts; the host does the same
+    # rename/rollback below without granting it write access to the install.
+    if not prepare:
+        if output.exists():
+            output.rename(previous)
+        try:
+            result.rename(output)
+        except OSError:
+            if previous.exists():
+                previous.rename(output)
+            raise
     print(summary)
     print("Run piece 2 on the PC connected to the tracker (install/flash.ps1 or install/flash.sh).")
     if manifest["kind"] == "enroll":
@@ -368,7 +377,9 @@ def main():
         elif command == "compile":
             compile_images()
         elif command == "publish":
-            publish(*args)
+            if len(args) != 2 and not (len(args) == 3 and args[2] == "--prepare"):
+                raise ValueError("Expected publish INSTALL PRIVATE [--prepare]")
+            publish(*args[:2], prepare=args[2:] == ["--prepare"])
         else:
             raise ValueError("Unknown builder operation")
     except ValueError as error:

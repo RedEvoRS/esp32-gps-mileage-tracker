@@ -39,6 +39,10 @@ class ReleaseSetup(unittest.TestCase):
         # A route lookup only; do not contact a network or expose host addresses.
         self.command("ip", 'echo "default src <host>"\n')
         self.command("df", 'printf "Filesystem 1024-blocks Used Available Capacity Mounted\\nfixture 9999999 0 9000000 0%% /\\n"\n')
+        os_release = self.root / "os-release"
+        os_release.write_text('ID=debian\nVERSION_CODENAME=trixie\n')
+        self.env["MILEAGE_OS_RELEASE_FILE"] = str(os_release)
+        self.env["MILEAGE_UNRAID_VERSION_FILE"] = str(self.root / "no-unraid")
 
     def command(self, name, body):
         path = self.bin / name
@@ -125,6 +129,68 @@ class ReleaseSetup(unittest.TestCase):
         self.assert_ok(result)
         self.assertTrue((self.root / "mileage-tracker" / "installer-ran").is_file())
 
+    def unraid(self):
+        version = self.root / "unraid-version"
+        version.write_text('version="7.3.4"\n')
+        self.env["MILEAGE_UNRAID_VERSION_FILE"] = str(version)
+        self.command("id", 'case "$*" in "-u") echo 0 ;; *) echo root ;; esac\n')
+        # Only OS facts and commands are faked; extraction still uses real tar.
+        self.command("docker", 'case "$*" in\n'
+                     '"compose version --short") echo "${FAKE_COMPOSE_VERSION:-5.6.0}" ;;\n'
+                     'info) exit "${FAKE_DOCKER_EXIT:-0}" ;;\n'
+                     '*DockerRootDir*) echo "$HOME/docker-storage" ;;\n'
+                     '*) exit 99 ;; esac\n')
+        self.command("findmnt", 'echo /mnt/pool\n')
+
+    def test_unraid_refuses_outside_mnt_and_requires_explicit_dir_without_cache(self):
+        self.unraid()
+        self.command("mountpoint", 'exit 1\n')
+        archive = self.bundle()
+        command = ["bash", str(SETUP), "--yes", "--bundle", str(archive)]
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Supply --dir", result.stderr)
+        for name in ("/root/fixture", "/boot/fixture", str(self.destination)):
+            self.destination = Path(name)
+            result = self.run_setup("--bundle", str(archive))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("under /mnt/", result.stderr)
+
+    def test_unraid_exact_root_absolute_flash_commands_target_temp_and_platform_handoff(self):
+        self.unraid()
+        # No privileged /mnt writes: translate only the filesystem boundary to
+        # our temporary folder in this test copy, keeping actual tar/cp/mktemp.
+        script = self.root / "unraid-setup.sh"
+        source = SETUP.read_text()
+        source = source.replace('[[ $resolved_dir == /mnt/*', '[[ $resolved_dir == "$HOME"/*')
+        source = source.replace('[[ $install_dir == /mnt/*', '[[ $install_dir == "$HOME"/*')
+        script.write_text(source)
+        self.command("mktemp", 'printf "%s\\n" "$*" >> "$HOME/temp-calls"\nexec /usr/bin/mktemp "$@"\n')
+        archive = self.bundle(extra={"server/install.sh": '#!/bin/bash\nprintf "%s" "$MILEAGE_PLATFORM" > platform\n'})
+        result = self.run_setup("--bundle", str(archive), script=script)
+        self.assert_ok(result)
+        self.assertEqual((self.destination / "platform").read_text(), "unraid")
+        self.assertIn(f"-Server 'root@<host>' -InstallDir '{self.destination}'", result.stdout)
+        self.assertIn(f"--server 'root@<host>' --install-dir {self.destination}", result.stdout)
+        self.assertIn(str(self.destination / ".mileage-setup.XXXXXX"), (self.root / "temp-calls").read_text())
+        self.assertEqual(list(self.destination.glob(".mileage-setup.*")), [])
+
+    def test_unraid_docker_failure_and_old_compose_give_unraid_fixes(self):
+        self.unraid()
+        archive = self.bundle()
+        self.env["FAKE_DOCKER_EXIT"] = "1"
+        result = self.run_setup("--bundle", str(archive))
+        self.assertIn("Settings > Docker", result.stderr)
+        self.assertNotIn("sudo", result.stderr)
+        self.env["FAKE_DOCKER_EXIT"] = "0"
+        self.env["FAKE_COMPOSE_VERSION"] = "1.29.2"
+        result = self.run_setup("--bundle", str(archive))
+        self.assertIn("Compose Manager Plus", result.stderr)
+
+    def test_future_compose_major_is_accepted(self):
+        self.env["FAKE_COMPOSE_VERSION"] = "10.0.0"
+        self.assert_ok(self.run_setup("--bundle", str(self.bundle())))
+
     def test_directory_the_flash_scripts_reject_fails_before_installing(self):
         archive = self.bundle()
         link_target = self.root / "real folder"
@@ -159,6 +225,8 @@ class ReleaseSetup(unittest.TestCase):
         first = self.bundle(extra={"server/obsolete.py": "old source\n"})
         self.assert_ok(self.run_setup("--bundle", str(first)))
         private = (".env", "viewer.env", "monitor.env", "backup/backup.conf",
+                   "backup/ssh/id_ed25519", "backup/ssh/known_hosts",
+                   "backup/state/last-attempt", "backup/logs/backup.log",
                    "data/trip.gpx", "firmware-out/current/app.bin")
         proxy_settings = ("VIEWER_BIND_ADDR=127.0.0.1\nVIEWER_COOKIE_SECURE=true\n"
                           "VIEWER_TRUSTED_PROXIES=192.0.2.1,2001:db8::/64\n")
@@ -178,6 +246,14 @@ class ReleaseSetup(unittest.TestCase):
         self.assertEqual((self.destination / "obsolete.py").read_text(), "old source\n")
         self.assertIn("v0.10+aaaaaaaaaa -> v0.11+bbbbbbbbbb", result.stdout)
         self.assertIn("Files deleted upstream are not removed", result.stdout)
+
+    def test_private_backup_paths_are_excluded_on_first_install_too(self):
+        private = ("backup/ssh/id_ed25519", "backup/ssh/known_hosts",
+                   "backup/state/last-attempt", "backup/logs/backup.log")
+        archive = self.bundle(extra={f"server/{name}": "synthetic private fixture\n" for name in private})
+        self.assert_ok(self.run_setup("--bundle", str(archive)))
+        for name in private:
+            self.assertFalse((self.destination / name).exists(), name)
 
     def test_checkout_placeholder_requires_tag_or_bundle(self):
         result = self.run_setup()

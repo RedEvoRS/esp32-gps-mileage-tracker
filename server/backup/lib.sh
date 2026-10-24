@@ -18,13 +18,34 @@ die() {
     exit 1
 }
 
+is_unraid() {
+    case ${MILEAGE_PLATFORM:-} in
+        unraid) return 0 ;;
+        debian) return 1 ;;
+    esac
+    local f=${MILEAGE_UNRAID_VERSION_FILE:-/etc/unraid-version}
+    [[ -r $f ]] && grep -Eq '^version="?[0-9]' "$f"
+}
+
 CONF=${MILEAGE_BACKUP_CONF:-$SCRIPT_DIR/backup.conf}
 [[ -f $CONF ]] || die "no config at $CONF (copy backup.conf.example to backup.conf)"
+if (( EUID == 0 )); then
+    conf_owner=$(stat -Lc %u "$CONF")
+    conf_mode=$(stat -Lc %a "$CONF")
+    if [[ $conf_owner != 0 ]] || (( (8#$conf_mode & 0022) != 0 )); then
+        die "refusing to source $CONF as root: backup.conf must be root-owned and not group/world-writable (use mode 600 or 644)"
+    fi
+fi
 # shellcheck source=backup.conf.example
 . "$CONF"
 
 COMPOSE_DIR=${COMPOSE_DIR:-$(dirname "$SCRIPT_DIR")}
+if is_unraid && [[ -z ${BACKUP_DIR:-} ]]; then
+    die "BACKUP_DIR must be set in backup.conf on Unraid; choose persistent storage under /mnt"
+fi
 BACKUP_DIR=${BACKUP_DIR:-$HOME/mileage-backups}
+BACKUP_MOUNT=${BACKUP_MOUNT:-}
+REMOTE_MOUNT=${REMOTE_MOUNT:-}
 REMOTE=${REMOTE:-}
 RSYNC_SSH=${RSYNC_SSH:-}
 KEEP_RECENT=${KEEP_RECENT:-14}
@@ -42,6 +63,53 @@ read -r -a COMPOSE <<< "${MILEAGE_COMPOSE:-docker compose}"
 
 compose() {
     (cd "$COMPOSE_DIR" && "${COMPOSE[@]}" "$@")
+}
+
+# Check before mkdir or rsync: a missing share can leave its empty folder
+# on the host's root filesystem. Resolve a new folder via its existing parent.
+guard_mount() {
+    local path=$1 mount=$2 label=$3 target probe
+    [[ -n $mount ]] || return 0
+    findmnt -n --mountpoint "$mount" > /dev/null 2>&1 \
+        || die "$label mount is not mounted; refusing backup/restore"
+    probe=$(realpath -m -- "$path") || die "cannot resolve $label path"
+    while [[ ! -e $probe ]]; do
+        [[ $probe != / && $probe != . ]] || break
+        probe=$(dirname -- "$probe")
+    done
+    target=$(findmnt -n -o TARGET --target "$probe" 2>/dev/null) \
+        || die "cannot resolve $label onto its recorded mount"
+    [[ $(readlink -f -- "$target") == "$(readlink -f -- "$mount")" ]] \
+        || die "$label is not on its recorded mount; refusing backup/restore"
+}
+
+guard_backup_mounts() {
+    guard_mount "$BACKUP_DIR" "$BACKUP_MOUNT" BACKUP_DIR
+    if [[ -n $REMOTE && $REMOTE != *:* ]]; then
+        guard_mount "$REMOTE" "$REMOTE_MOUNT" REMOTE
+    fi
+}
+
+# Publish a new lock only after it belongs to the data owner. A concurrent
+# ingest may create it first; link never replaces that inode. Open read-only
+# afterwards, so root cannot accidentally create a root-owned upload lock.
+open_upload_lock() {
+    local data=$COMPOSE_DIR/data tmp owner
+    [[ ! -L $data && ! -L $data/.upload.lock ]] || die "trip data and its upload lock must not be symlinks"
+    if [[ ! -e $data/.upload.lock ]]; then
+        owner=$(stat -c %u:%g "$data")
+        tmp=$(mktemp "$data/.upload-lock.XXXXXX")
+        if (( EUID == 0 )); then
+            chown "$owner" "$tmp" || { rm -f "$tmp"; die "could not set upload lock ownership"; }
+        fi
+        chmod 600 "$tmp"
+        ln -T "$tmp" "$data/.upload.lock" 2>/dev/null || {
+            rm -f "$tmp"
+            [[ -f $data/.upload.lock && ! -L $data/.upload.lock ]] || die "could not create upload lock"
+        }
+        rm -f "$tmp"
+    fi
+    exec 7< "$data/.upload.lock"
 }
 
 # Run a Python snippet in a throwaway viewer container. It mounts the

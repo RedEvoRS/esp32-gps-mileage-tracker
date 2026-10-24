@@ -138,3 +138,28 @@ For isolated tests only, `--test-data-dir DIR` substitutes a fake
 `DIR/diagnostics/events.db` for the install data directory. It still performs a
 real read-only query and never bypasses failures. Use only fake settings and a
 fake `.env`; the option does not disable any enrollment safety checks.
+
+## On Unraid
+
+Run the builder as root from a persistent install under `/mnt/<pool>/`.
+Unraid is detected from `/etc/unraid-version`; `MILEAGE_PLATFORM=unraid|debian`
+overrides detection (`MILEAGE_UNRAID_VERSION_FILE` overrides the test fixture).
+Debian still requires a normal user. On Unraid, high-water and compile helpers
+run as the image's `app` user, **1000:1000**. Only builder-owned source, settings
+and output folders are assigned to that UID, with directories 0700 and files
+0600; symlinks are refused. `.env` keeps its root-only ownership and permissions.
+
+Host Python is optional: when `python3` is absent, the builder reads the first
+`FROM` image in `mileage-ingest/Dockerfile` and runs disposable Python containers
+with no network and only the mounts each step needs. Configure receives `.env`
+through a private FIFO, without copying its token into arguments or Docker
+environment variables. Interactive configure/enrollment allocate a Docker TTY;
+`--non-interactive` keeps the settings interface above. Publication validates
+read-only mounts before the host replaces the output with rollback on failure.
+
+Start the Unraid array and Docker first. Docker Buildx/BuildKit must be enabled
+and report `linux/amd64` support; the builder checks both before configuration.
+The Python image must already be cached or Docker must be able to pull it.
+Copy the private finished files from `root@<host>` with the PC flash helper.
+They remain 0700/0600 and readable by root. A diagnostics read failure stops
+the build and never authorizes enrollment.

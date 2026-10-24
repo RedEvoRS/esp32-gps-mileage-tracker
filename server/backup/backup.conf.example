@@ -1,6 +1,8 @@
 # Backup settings for backup.sh and restore.sh. Copy to backup.conf next
 # to this file and edit. backup.conf is gitignored. It's read by bash, so
 # no spaces around '=' and quote anything with spaces in it.
+# When run as root, this file must be root-owned and not group/world-writable
+# (mode 600 recommended; 644 is also accepted).
 
 # Where the copy that leaves this box goes. Required. Either an
 # rsync-over-SSH target or a mounted share. The directory has to exist,
@@ -21,8 +23,15 @@ REMOTE=backup@nas.lan:/volume1/backups/mileage-tracker
 # after 10 minutes without any data moving.)
 #RSYNC_SSH="ssh -i /home/<user>/.ssh/mileage_backup"
 
-# Local snapshots. Default: ~/mileage-backups of the user the timer runs as.
+# Local snapshots. Debian default: ~/mileage-backups of the timer user.
+# Required on Unraid: choose persistent storage under /mnt, never /root or /boot.
 #BACKUP_DIR=/home/<user>/mileage-backups
+
+# Optional mount guards, recorded by the Unraid installer. Each folder must
+# resolve onto this mounted filesystem before backup or restore can proceed.
+# REMOTE_MOUNT applies only to a local REMOTE (mounted share/disk), not SSH.
+#BACKUP_MOUNT=/mnt/disks/<name>
+#REMOTE_MOUNT=/mnt/remotes/<name>
 
 # Retention for local snapshots: the newest KEEP_RECENT, plus the first
 # snapshot of each of the newest KEEP_MONTHLY months. Unchanged trip files
