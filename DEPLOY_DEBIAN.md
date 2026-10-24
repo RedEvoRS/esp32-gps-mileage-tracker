@@ -1407,9 +1407,9 @@ starts fresh when the owning service next creates it. The optional ntfy volume
 (users, tokens and cached messages) is not included; back it up separately.
 
 `restore.sh` must run as the UID 1000 login. With another UID it cannot write
-into `data/` (owned by UID 1000, mode 700) and stops after it has already
-stopped the services. Restored files keep UID 1000 ownership, so no `chown` is
-needed afterwards.
+into `data/` (owned by UID 1000, mode 700): it fails after stopping the
+services, restarts them on exit, and nothing is restored. Restored files keep
+UID 1000 ownership, so no `chown` is needed afterwards.
 
 **A restore also brings back everyday logins as they were in that snapshot.**
 A password reset, account disable or removal made since then is undone. Open

@@ -38,10 +38,12 @@ Uploads with debug mode off and server-down retry were also verified on
 2026-10-21 (UTC). Uploads from internal flash and server errors
 (401/413/5xx) remain untested on the Supreme.
 
-Still to check on the road: the everyday (production) screen, the board's
-current draw while switched off, and a few car-power cases. Distance accuracy
-still needs a pass mark based on comparisons with the car's odometer, followed
-by a week of normal driving on the exact firmware intended for release.
+Still to check on the road: the everyday (production) screen and a trip that
+ends in a parking garage. Engine crank, start-stop, the GPS hot start and the
+parked battery drain have been checked on the road; the drain was estimated
+from battery readings across parked hours, without a meter. Distance accuracy
+still needs a pass mark based on comparisons with the car's odometer, and
+firmware `v0.11`, the release candidate, is in its week of normal driving.
 Project progress is tracked in GitHub issues.
 
 **Have the older T-Beam V1.2?** This project started on the LilyGO TTGO
