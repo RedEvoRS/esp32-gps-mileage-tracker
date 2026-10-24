@@ -23,7 +23,7 @@ class ReleaseSetup(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.destination = self.root / "installed server"
+        self.destination = self.root / "installed-server"
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ["PATH"],
@@ -115,6 +115,32 @@ class ReleaseSetup(unittest.TestCase):
         self.assertIn(f"irm {RELEASES}/download/v1.00/flash.ps1 | iex", result.stdout)
         self.assertIn("-Server 'user@<host>' -InstallDir '", result.stdout)
         self.assertIn("bash -s -- --server 'user@<host>' --install-dir ", result.stdout)
+
+    def test_default_directory_is_accepted(self):
+        archive = self.bundle()
+        command = ["bash", str(SETUP), "--yes", "--bundle", str(archive)]
+        result = subprocess.run(command, env=self.env, stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=30,
+                                start_new_session=True)
+        self.assert_ok(result)
+        self.assertTrue((self.root / "mileage-tracker" / "installer-ran").is_file())
+
+    def test_directory_the_flash_scripts_reject_fails_before_installing(self):
+        archive = self.bundle()
+        link_target = self.root / "real folder"
+        link_target.mkdir()
+        (self.root / "link").symlink_to(link_target)
+        for name in ("installed server", "it's", "a$b", "link/inside", "ok/../x y"):
+            with self.subTest(name=name):
+                self.destination = self.root / name
+                result = self.run_setup("--bundle", str(archive))
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("flash scripts accept only simple paths", result.stderr)
+                self.assertIn("--dir", result.stderr)
+                self.assertFalse((self.destination / "installer-ran").exists())
+                self.assertEqual(list(link_target.iterdir()), [])
+                self.assertFalse((self.root / "installed server").exists())
+                self.assertFalse((self.root / "it's").exists())
 
     def test_checksum_failure_leaves_existing_install_untouched(self):
         archive = self.bundle()

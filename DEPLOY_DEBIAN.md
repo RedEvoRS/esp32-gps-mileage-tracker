@@ -17,7 +17,9 @@ T-Beam V1.2's last firmware and instructions are on the frozen
 [`tbeam-v1.2` branch](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/tree/tbeam-v1.2).
 
 Assumes: Debian 13, a non-root user with sudo, SSH reachable.
-Placeholders: `<user>` = your Debian login, `<host>` = server IP or hostname.
+Placeholders: `<user>` = your Debian login, `<host>` = server IP or hostname,
+`<admin>` = the viewer's admin username you choose and `<everyday-user>` = the
+username of an everyday viewer login. Neither viewer username is your Debian login.
 Replace the angle-bracket placeholders before running commands. The server
 SSH login is separate from the viewer's admin and everyday logins and from the
 upload token the board uses.
@@ -93,7 +95,11 @@ missing answers fail. The base presets are:
   optional backup-success ping). The destination must already be usable
   without interactive SSH prompts. `INSTALL_SAME_DISK=y` accepts a destination
   on the server's own disk if asked; it does not protect against that disk
-  failing. Use `n` to reject such a destination.
+  failing. Use `n` to reject such a destination. The same question is asked
+  on an update when an existing backup folder on this machine has no
+  destination marker yet (see Step 10), so without `INSTALL_SAME_DISK` an
+  unattended update stops at the Backups step. An unmounted share's empty
+  folder looks like the server's own disk, so `n` is the safe answer there.
 - `INSTALL_OUTPUTS=none`: skips optional notification/dashboard outputs on a
   fresh install. Step 11 lists the presets for enabling them.
 - On a rerun, `INSTALL_KEEP_LOGIN=y` and `INSTALL_KEEP_OUTPUTS=y` answer the
@@ -156,7 +162,8 @@ get the `docker compose` plugin (v2 or newer), not the deprecated `docker-compos
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-sudo apt install -y ca-certificates curl gnupg git rsync jq
+sudo apt install -y ca-certificates curl gnupg git rsync jq \
+                    openssl openssh-client iproute2 python3
 
 # Docker's GPG key
 sudo install -m 0755 -d /etc/apt/keyrings
@@ -223,8 +230,10 @@ Setup verifies the bundle against that release's `SHA256SUMS`, shows the
 old/new versions and asks before copying. Server files go directly into
 `~/mileage-tracker/`; firmware sources and the version-stamping tool go in
 `firmware-src/`. Use `bash setup.sh --dir "$HOME/mileage-tracker"` to choose
-a different destination. For the flash helpers, use a simple absolute path
-or `~/` path without spaces, and an SSH hostname or IPv4 address.
+a different destination. The flash helpers accept only simple paths, so setup
+refuses a destination that contains anything but letters, digits, `_`, `.`, `-`
+and `/` (a space, for example) and installs nothing. They also need an SSH
+hostname or IPv4 address.
 It then runs `install.sh` to configure, rebuild,
 start and verify the services. Choose the **LAN IP for `BIND_ADDR`**: UFW
 does not filter Docker-published ports; see [Step 7](#step-7--firewall-and-network).
@@ -367,7 +376,18 @@ and runs `install.sh` to rebuild, start and verify the server. The wrapper
 excludes `.env`, `viewer.env`, `monitor.env`, `backup/backup.conf`, `data/`
 and `firmware-out/` from the source copy. It does **not remove obsolete
 source files**; review local source changes/obsolete files before updating.
+It also replaces every other supplied file with the release copy, so an edit
+you made to `ntfy/server.yml` (the iOS setting in [Step 11a](#11a--start-and-secure-ntfy))
+is lost: redo it after the update and restart ntfy.
 The installer may still change configuration when you answer its prompts.
+
+When the update finishes, run `bash ~/mileage-tracker/install.sh --check`.
+From server v0.07 the nightly backup refuses to copy to a destination that has
+no `.mileage-backup-target` file, and nothing else flags a backup that then
+fails every night. If the check reports that the backup destination has no
+marker file, or that the installed backup systemd files differ from the
+update's, follow [Backups set up before the destination marker
+existed](#backups-set-up-before-the-destination-marker-existed) in Step 10.
 
 Accept the firmware-build prompt and enter/confirm the WiFi/device settings
 again; settings are not saved for reuse by the builder. A successful build
@@ -539,7 +559,7 @@ The password is read from standard input by `manage_users.py`:
 
 ```bash
 read -rs -p 'Everyday password: ' new_password; printf '\n'
-printf '%s\n' "$new_password" | docker compose run --rm --no-deps -T mileage-viewer python manage_users.py add '<user>'
+printf '%s\n' "$new_password" | docker compose run --rm --no-deps -T mileage-viewer python manage_users.py add '<everyday-user>'
 unset new_password
 ```
 
@@ -622,6 +642,14 @@ period and 30s interval, so give it ~45 seconds). If one says `unhealthy` or
 ---
 
 ## Step 6 — Verify end to end
+
+This manual check is for a fresh install, before any real trips exist. The
+sample is a dated 2026 trip, so until you delete it, it counts in the 2026
+totals. If 2026 is already closed in the viewer, the sample is flagged as
+received after the close and cannot be annotated (the viewer answers 409), so
+the annotate part of this step fails. To recheck a server that already holds
+real trips, run `bash ~/mileage-tracker/install.sh --check` instead: it
+uploads an untimed copy of the sample that cannot land in any tax year.
 
 Run these commands from `~/mileage-tracker` on the server. Set `H` once to
 the server's LAN IP address (the `BIND_ADDR` value chosen in Step 4a). Using
@@ -721,7 +749,9 @@ http://<host>:8091/
 You should land on a login page. Sign in with the admin username and password
 from Step 4b. The trip should then be listed. Click **Map / Edit** → the track
 draws on an OSM map. Tag it business/personal and add a note → reload → the
-annotation persists. Then hit **Export CSV** and **Export XLSX** and confirm
+annotation persists. (Saving an annotation adds a permanent line to the
+admin change history, which stays after the trip files are deleted. Skip the
+annotation if you would rather not leave that line.) Then hit **Export CSV** and **Export XLSX** and confirm
 both download with the annotation joined in. Finally click **Log out** and
 confirm you're bounced back to the login page.
 
@@ -779,8 +809,9 @@ sudo rm ~/mileage-tracker/data/2026-04/2026-04-14T14-30-00Z.{gpx,json}
 sudo rmdir ~/mileage-tracker/data/2026-04   # only goes if nothing else is in it
 ```
 
-(The annotation row stays in the viewer DB but is harmless — it has no
-matching trip and won't appear in exports.)
+If you annotated the sample, an annotation row stays in the viewer database
+and a line stays in the admin change history. Neither appears in exports,
+because the trip itself is gone, but the history line is permanent.
 
 ---
 
@@ -900,7 +931,8 @@ networks won't work.
 
 `secrets.h` is gitignored. Keep it that way.
 
-Build and flash `firmware/04_trip_logger` for the **T-Beam Supreme**,
+Build and flash `firmware/04_trip_logger` (the trip logger sketch, the one
+that records and uploads trips) for the **T-Beam Supreme**,
 using **ESP32S3 Dev Module**, ESP32 core **3.3.11**, and the libraries and
 board settings in the [source-build walkthrough](firmware/README.md#advanced-build-from-source).
 The equivalent arduino-cli board identifier (FQBN) is:
@@ -909,18 +941,19 @@ The equivalent arduino-cli board identifier (FQBN) is:
 esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled
 ```
 
-Before each Stage 4 build, run `python tools/stamp_firmware_version.py` from
+Before each trip logger build, run `python tools/stamp_firmware_version.py` from
 the repository root so Device health shows `firmware/VERSION` plus the ten-character
 Git commit (for example `v0.05+3f9a1c07be`), with `-dirty` for tracked edits.
 Runtime debug mode does not change the version. Without the generated header
 it shows `unversioned`; an old header keeps its old version. Road-use version bumps and tags are described
 in [Firmware versions and releases](firmware/README.md#firmware-versions-and-releases).
 
-Fit a **FAT32 microSD card** with the board switched off. Stage 4 records
-there when it mounts, otherwise it uses internal LittleFS. Its bundled
+Fit a **FAT32 microSD card** with the board switched off. The trip logger
+records there when it mounts, otherwise it uses internal LittleFS. Its bundled
 `partitions.csv` overrides the Arduino IDE's Partition Scheme menu.
-The **first Stage 4 upload** needs **Erase All Flash Before Sketch Upload →
-Enabled** once to clear factory data, then **Disabled** for later uploads;
+The first time you upload the sketch to a new board it needs **Erase All Flash
+Before Sketch Upload → Enabled** once to clear factory data, then
+**Disabled** for later uploads;
 see [First flash on a new board](firmware/README.md#first-flash-on-a-new-board).
 Later uploads with erase disabled keep trips on the card and in internal
 flash and preserve NVS (the board's settings memory, including trip
@@ -974,29 +1007,11 @@ leaving the defines in the
 firmware then re-enrolls from the compiled-in, possibly stale high-water.
 See [snapshot revision enrollment and recovery](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery).
 
-The first real upload succeeded on 2026-10-21 (UTC), after deployment with
-`server/install.sh` on Debian 13 on 2026-10-20 and a passing
-`install.sh --check`. The Supreme's Stage 4 debug build uploaded four
-finished trips from microSD. Each logged `HTTP 200 (deleted)`, and the
-ingest log confirmed acceptance. Each produced a GPX file and JSON summary
-under `data/YYYY-MM/`; all four appeared in the viewer.
-
-Diagnostics succeeded separately: two `POST /v1/device-events` requests
-returned HTTP 200 at 04:36:43Z and 04:36:44Z, after the last GPX. The new
-`data/diagnostics/events.db` held all 115 pending events. Device health
-showed recent contact and snapshot receipt, storage backend `sd`, zero
-dropped events and no active conditions. Successful diagnostics uploads
-print nothing on serial; check the ingest log or Device health.
-That build showed `Firmware: Not reported` because it predates version
-reporting; builds stamped with `tools/stamp_firmware_version.py` show their
-version number plus Git commit. Enrollment ID 1 was consumed; the Step 8 command
-above had returned high-water 0 because the database did not yet exist.
-
-The internal LittleFS store was mounted but had no trips to upload.
-Uploads with debug mode off and server-down retry were also verified on
-2026-10-21 (UTC): two `HTTP -1` failures kept the trip queued, then HTTP 200
-after ingest restarted deleted the local file. LittleFS uploads and server
-errors (401/413/5xx) remain untested on the Supreme.
+Successful diagnostics uploads print nothing on the board's serial output;
+check the ingest log or the viewer's **Device health** page instead. The
+enrollment command above prints `0` on a brand-new server, because
+`data/diagnostics/events.db` is only created by the first diagnostics upload.
+That is expected, and `0` is the right value to use then.
 
 Then follow the firmware guide's [recording and upload checks](firmware/README.md#check-recording-and-uploads)
 and [car installation](firmware/README.md#put-it-in-the-car). If storage
@@ -1038,9 +1053,10 @@ Back up these files and databases:
 - **Trip files** in `~/mileage-tracker/data`, the raw GPX and its summary.
   The GPX cannot be regenerated; a summary can be rebuilt from its GPX.
 - **The annotations database** (business/personal, purpose, destination,
-  merges and cached merged summaries)
-  in the `viewer-db` Docker volume. It's easy to forget, and it's the
-  record the IRS cares about. It can't be rebuilt from the trips.
+  merges and cached merged summaries, plus everyday logins and their
+  password hashes, trip removals, the change history and the saved totals of
+  closed tax years) in the `viewer-db` Docker volume. It's easy to forget,
+  and it's the record the IRS cares about. It can't be rebuilt from the trips.
 - **The diagnostics database** at `data/diagnostics/events.db`, containing
   device events, contact times and current health. It may not exist before the
   first device check-in.
@@ -1086,7 +1102,9 @@ off-host destination. Each run:
   that isn't mounted is an empty folder on this machine's own disk, and
   without the file the run fails instead of filling that disk and calling it
   an off-host copy. The copy never deletes anything on its own, and by default
-  (`REMOTE_PRUNE=no`) the script never prunes remote snapshots. With
+  (`REMOTE_PRUNE=no`) the script never prunes remote snapshots, so the
+  off-host copy keeps every snapshot ever taken and grows for as long as
+  backups run: delete old ones there yourself, or set `REMOTE_PRUNE=yes`. With
   `REMOTE_PRUNE=yes` it applies the same keep rule to the snapshot names
   already on the destination and deletes only the names that rule drops. It
   refuses to prune, and warns in the log, while the destination holds
@@ -1176,8 +1194,13 @@ bash ~/mileage-tracker/backup/restore.sh check
 ```
 
 This pulls the newest snapshot back **from the off-host copy** into a
-scratch directory, checks every file against `SHA256SUMS`, opens the
-database and checks its integrity, and prints what it holds:
+scratch directory, `~/mileage-backups/.restore-scratch-<random>` (it is on the
+backup disk, because `/tmp` is in RAM on Debian 13). The scratch copy holds the
+whole snapshot, every trip file included, so you need about a full copy of
+your trips in free space there. Set `TMPDIR=<folder>` to put it elsewhere. The
+script removes it when it finishes, and a backup clears one left behind
+by a killed run after a day. It checks every file against `SHA256SUMS`, opens
+the database and checks its integrity, and prints what it holds:
 
 ```
 snapshot: integrity ok, 1 annotations (1 tagged), last edited 2026-...
@@ -1274,9 +1297,15 @@ server files:
 
 1. Rerun `bash ~/mileage-tracker/install.sh`. For a destination over SSH it
    writes the marker file itself. For a destination that is a folder on this
-   machine it first asks whether this is really the mounted share or disk (an
-   unmounted share's empty folder looks the same); if it can't tell, it
-   leaves the folder unmarked and prints the command from step 2.
+   machine it prints a reminder that the folder must be the mounted share right
+   now. If the folder is on the same disk as the trip data, which is what an
+   unmounted share's empty mount point looks like, it asks "Use it anyway?".
+   Answer **n** unless you really mean to back up to the server's own disk:
+   **y** marks the local folder, which is the failure the marker exists to
+   prevent. The installer marks the folder only if it is writable and you
+   accepted; otherwise it leaves it unmarked and prints the command from step 2.
+   (An unattended update has no one to answer: set `INSTALL_SAME_DISK`, see the
+   presets near the top.)
 2. If the installer didn't mark it, make sure the destination is the right
    place and is mounted now (`mount | grep <share>`), then run:
 
@@ -1321,8 +1350,13 @@ file from the old server is already in place). `latest` skips a newest snapshot
 with no trips while an older one has some and says so, but the safest way is to
 name the snapshot you want. List what is there, then restore that one:
 
+Use the same `-e` value as `RSYNC_SSH` in `backup.conf`: the backup logs in
+with the dedicated key, and a plain `rsync` would try your default SSH
+identities, which a rebuilt server doesn't have. If `REMOTE` is a mounted
+folder instead, run `ls <REMOTE>/snapshots/`.
+
 ```bash
-rsync --list-only backup@nas.lan:/volume1/backups/mileage-tracker/snapshots/   # your REMOTE
+rsync -e "ssh -i ~/.ssh/mileage_backup" --list-only backup@nas.lan:/volume1/backups/mileage-tracker/snapshots/   # your REMOTE
 bash ~/mileage-tracker/backup/restore.sh restore 2026-10-06T033012Z
 ```
 
@@ -1372,8 +1406,15 @@ SQLite snapshots. Missing diagnostics or monitor state on a replacement server
 starts fresh when the owning service next creates it. The optional ntfy volume
 (users, tokens and cached messages) is not included; back it up separately.
 
-If your UID isn't 1000, re-run the `chown` from Step 3 afterwards so ingest
-can write to `data/` again.
+`restore.sh` must run as the UID 1000 login. With another UID it cannot write
+into `data/` (owned by UID 1000, mode 700): it fails after stopping the
+services, restarts them on exit, and nothing is restored. Restored files keep
+UID 1000 ownership, so no `chown` is needed afterwards.
+
+**A restore also brings back everyday logins as they were in that snapshot.**
+A password reset, account disable or removal made since then is undone. Open
+the admin pages afterwards and redo any of those, and check that trip removals
+and closed tax years match what you expect.
 
 ---
 
@@ -1443,11 +1484,12 @@ access. Turning an output off keeps its URL and secrets in `monitor.env`, so tur
 needs no re-entry, except Loki's URL and login: those are commented out when
 it's off, and you type them again when it's turned back on.
 
-`install.sh --check` only checks, and changes nothing or sends nothing. It
-verifies what is on: the monitor must be running with the settings in
-`monitor.env`, each destination must be reachable from the monitor, metrics
-must refuse a request without the token, and the bundled ntfy must refuse
-anonymous reads. Outputs that are off are reported as "off", never as
+`install.sh --check` leaves your settings and the notification outputs alone:
+it only checks them. (It does upload and remove a temporary test trip, as
+described near the top of this runbook.) It verifies what is on: the monitor
+must be running with the settings in `monitor.env`, each destination must be
+reachable from the monitor, metrics must refuse a request without the token,
+and the bundled ntfy must refuse anonymous reads. Outputs that are off are reported as "off", never as
 problems, so a check with nothing turned on passes.
 
 For an unattended install, every question has an environment variable. Set
@@ -1525,6 +1567,11 @@ then `docker compose restart ntfy`. The free upstream relays a wake-up poke,
 not message text; the phone fetches text from your server and must still be
 able to reach it. Android needs no relay. Without the setting, iOS delivery
 can be delayed by hours. See [ntfy's iOS explanation](https://docs.ntfy.sh/config/#ios-instant-notifications).
+
+An update replaces `ntfy/server.yml` with the release copy (`.env` is kept), so
+the `upstream-base-url` edit is lost and iOS delivery quietly goes back to
+being delayed. After each update, redo the edit and run
+`docker compose --profile ntfy up -d ntfy` again.
 
 ### 11b — Enable the monitor
 
@@ -1697,6 +1744,12 @@ GRAYLOG_ENABLED=true
 GRAYLOG_GELF_URL=http://<graylog-host>:12201/gelf
 # or: GRAYLOG_GELF_TCP=<graylog-host>:12201
 ```
+
+Set exactly one of `GRAYLOG_GELF_URL` and `GRAYLOG_GELF_TCP`. The shipped
+`monitor.env.example` has `GRAYLOG_GELF_URL` uncommented with a placeholder, so
+for TCP delete or comment out that line. With both set, the monitor refuses to
+start, which also stops ntfy and Loki delivery, and the only trace is a
+one-line "Set exactly one of GRAYLOG_GELF_URL or GRAYLOG_GELF_TCP" in its log.
 
 `GRAYLOG_GELF_HEADER=<Header-Name>: <value>` adds one HTTP header, for a proxy
 in front of the input. Apply with `docker compose --profile monitor up -d
@@ -1950,7 +2003,7 @@ password from standard input:
 
 ```bash
 read -rs -p 'New everyday password: ' new_password; printf '\n'
-printf '%s\n' "$new_password" | docker compose run --rm --no-deps -T mileage-viewer python manage_users.py reset-password '<user>'
+printf '%s\n' "$new_password" | docker compose run --rm --no-deps -T mileage-viewer python manage_users.py reset-password '<everyday-user>'
 unset new_password
 ```
 
@@ -1964,7 +2017,7 @@ docker compose run --rm --no-deps -T mileage-viewer python manage_users.py list
 For a disabled everyday login, enable it:
 
 ```bash
-docker compose run --rm --no-deps -T mileage-viewer python manage_users.py enable '<user>'
+docker compose run --rm --no-deps -T mileage-viewer python manage_users.py enable '<everyday-user>'
 ```
 
 If no everyday login can be used, `add '<user>'` creates one. `add` and
@@ -2006,12 +2059,16 @@ record: send it to ingest again, and ingest rebuilds the summary from it.
 cd ~/mileage-tracker
 TRIP=2026-10/2026-10-05T16-00-00Z      # the path from the warning, minus .json
 TOKEN=$(grep '^INGEST_AUTH_TOKEN=' .env | cut -d= -f2-)
-printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -X POST http://<host>:8090/upload \
+printf 'Authorization: Bearer %s\n' "$TOKEN" | sudo curl -X POST http://<host>:8090/upload \
   -H @- \
   -H "Content-Type: application/gpx+xml" \
   -H "X-Device-Id: tbeam-01" \
   --data-binary @data/$TRIP.gpx
 ```
+
+The trip files are private to UID 1000, so `curl` runs under `sudo` to read the
+GPX even when your server login has another numeric user ID (as in Step 6).
+`sudo` passes the header on standard input through to `curl` unchanged.
 
 `X-Device-Id` is the firmware's `DEVICE_ID`. Ingest gives a timed trip the
 same name again from its timestamps (it ignores `X-Trip-Id` for a GPX that has
@@ -2029,8 +2086,10 @@ snapshot first (Step 10), then send it as above. Without it, ingest answers
 
 ```bash
 ls ~/mileage-backups/snapshots/*/data/$TRIP.gpx      # the snapshots that have it
-cp -p ~/mileage-backups/snapshots/<time>/data/$TRIP.gpx data/$TRIP.gpx
+sudo cp -p ~/mileage-backups/snapshots/<time>/data/$TRIP.gpx data/$TRIP.gpx
 ```
+
+This copy also uses `sudo`, because `data/` belongs to UID 1000 (mode 700).
 
 **Port already in use** — `sudo ss -tlnp | grep -E '8090|8091|8092|8093'` shows
 which program has it. Stop or reconfigure that program to free the required
@@ -2038,7 +2097,15 @@ port, then rerun the installer. Its checks use the supplied ports; changing
 the Compose port mapping does not fix this check, and release updates replace
 the supplied Compose file.
 
-**Rebuild after code changes:**
+**Rebuild without changing configuration (code-only fix):**
+
+This is a shortcut for rebuilding the containers from source you have just
+changed. **It is not the way to update the server.** An update means copying
+the source and running `bash ~/mileage-tracker/install.sh` (see
+[Updating](#updating)), because only the installer tightens `data/` to mode
+700, writes the backup destination marker and refreshes the backup systemd
+unit, timer and drop-ins. After this shortcut on an existing install, backups
+can fail from the first night.
 
 First copy the new committed source from your computer using Step 2's
 `git -c core.autocrlf=false archive HEAD server | ssh ...` command (or copy a fresh source download
