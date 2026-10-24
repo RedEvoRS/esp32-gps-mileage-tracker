@@ -43,14 +43,14 @@ Authentication:
     a new VIEWER_PASSWORD_HASH logs out everyone already logged in.
   - Repeated failed logins lock out the source IP. The counter lives in
     SQLite rather than process memory so all workers and threads share it.
-  - This remains a LAN-only tool. The login is defence in depth against
-    other devices on your network, not a licence to expose port 8091 to
-    the internet -- the session cookie still travels over plain HTTP.
+  - This remains a private-network tool. Direct HTTP is the default;
+    HTTPS through a trusted reverse proxy can opt into Secure cookies.
 """
 
 import csv
 import hmac
 import io
+import ipaddress
 import os
 import re
 import secrets
@@ -59,6 +59,7 @@ import sys
 import json
 import math
 import unicodedata
+from threading import Lock
 from urllib.parse import unquote, urlsplit
 from xml.parsers import expat
 from contextlib import closing
@@ -89,6 +90,7 @@ for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resol
         sys.path.insert(0, str(import_root))
 
 from common.version import server_version
+from common.settings import trusted_proxies, viewer_cookie_secure
 
 from common.diagnostics import CatalogError, load_catalog
 from geocoding import Geocoder, GeocodeError
@@ -148,6 +150,17 @@ except ZoneInfoNotFoundError as exc:  # pragma: no cover - environment fault
 VIEWER_USERNAME = os.environ.get("VIEWER_USERNAME", "").strip()
 VIEWER_PASSWORD_HASH = os.environ.get("VIEWER_PASSWORD_HASH", "").strip()
 VIEWER_SECRET_KEY = os.environ.get("VIEWER_SECRET_KEY", "").strip()
+try:
+    VIEWER_TRUSTED_PROXIES = trusted_proxies(os.environ.get("VIEWER_TRUSTED_PROXIES", ""))
+    VIEWER_COOKIE_SECURE = viewer_cookie_secure(os.environ.get("VIEWER_COOKIE_SECURE", ""))
+except ValueError as exc:
+    raise RuntimeError("mileage-viewer refusing to start: " + str(exc)) from exc
+
+# Per worker process: warn once for each of the first 256 untrusted peers.
+# Stop adding/logging at the cap, so a flood cannot grow memory or logs forever.
+_PROXY_WARNING_CAP = 256
+_proxy_warning_peers = set()
+_proxy_warning_lock = Lock()
 
 # Lockout policy: after MAX_FAILS bad passwords from one IP, refuse that
 # IP for LOCKOUT_MINUTES regardless of whether the next guess is correct.
@@ -259,9 +272,9 @@ app.config.update(
     SESSION_COOKIE_NAME="mileage_session",
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    # Deliberately NOT Secure: this is plain HTTP on the LAN. If you ever
-    # put a TLS reverse proxy in front, set SESSION_COOKIE_SECURE=True.
-    SESSION_COOKIE_SECURE=False,
+    # Direct HTTP on the LAN remains the default.
+    # For HTTPS through a reverse proxy, opt in with VIEWER_COOKIE_SECURE=true.
+    SESSION_COOKIE_SECURE=VIEWER_COOKIE_SECURE,
     PERMANENT_SESSION_LIFETIME=timedelta(days=30),
     # POST bodies hold login fields or short trip annotations. Anything larger
     # is either a mistake or an attack.
@@ -366,13 +379,49 @@ def upsert_annotation(trip_key, category, purpose_note, destination=""):
 
 
 def _client_ip():
-    """Source IP for lockout accounting.
+    """Use XFF only from a trusted peer, stopping at the rightmost outsider.
 
-    No proxy header is trusted here. The service is meant to be reached
-    directly on the LAN, and honouring X-Forwarded-For would let anyone
-    dodge the lockout by inventing a new address on every request.
+    Ignore invalid entries. Missing/invalid/all-trusted chains fall back to
+    the direct peer, preserving a stable lockout key instead of trusting a
+    caller-supplied leftmost value. Cache per request to warn at most once.
     """
-    return request.remote_addr or "unknown"
+    if "client_ip" in g:
+        return g.client_ip
+    peer = request.remote_addr or "unknown"
+    forwarded = request.headers.getlist("X-Forwarded-For")
+    try:
+        peer_addr = ipaddress.ip_address(peer)
+    except ValueError:
+        peer_addr = None
+    trusted = peer_addr is not None and _trusted_proxy(peer_addr)
+    if forwarded and not trusted and peer_addr is not None:
+        with _proxy_warning_lock:
+            warn = (peer not in _proxy_warning_peers
+                    and len(_proxy_warning_peers) < _PROXY_WARNING_CAP)
+            if warn:
+                _proxy_warning_peers.add(peer)
+        if warn:
+            app.logger.warning(
+                "Ignoring X-Forwarded-For from untrusted peer %s; add it to "
+                "VIEWER_TRUSTED_PROXIES if it is your proxy", peer)
+    resolved = peer
+    if trusted:
+        for item in reversed(",".join(forwarded).split(",")):
+            try:
+                if "%" in item:
+                    continue
+                addr = ipaddress.ip_address(item.strip())
+            except ValueError:
+                continue
+            if not _trusted_proxy(addr):
+                resolved = str(addr)
+                break
+    g.client_ip = resolved
+    return resolved
+
+
+def _trusted_proxy(addr):
+    return any(addr in network for network in VIEWER_TRUSTED_PROXIES)
 
 
 def _lock_seconds_remaining(ip):
@@ -599,6 +648,7 @@ def _security_headers(response):
 
 @app.before_request
 def _require_login():
+    _client_ip()  # Resolve once, including discovery warnings on public GETs.
     if request.endpoint in PUBLIC_ENDPOINTS:
         return None
     # Unknown endpoint (404) -- let Flask produce the 404 itself, but only

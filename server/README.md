@@ -1009,10 +1009,15 @@ and `X-Content-Type-Options: nosniff`, so another web page on the same host
 or home domain can't show a viewer page in a frame and steer the admin's clicks
 onto its buttons. A reverse proxy must not remove these headers.
 
-If you ever do put a TLS reverse proxy in front, set
-`SESSION_COOKIE_SECURE=True` in `mileage-viewer/app.py` and rebuild the viewer
-so the change takes effect. Redo the edit after every update: updating
-overwrites `app.py` and silently puts the cookie back to non-Secure.
+For HTTPS through Caddy or Nginx Proxy Manager, set `VIEWER_COOKIE_SECURE=true`
+in `.env`, then run `docker compose up -d`. Set `VIEWER_TRUSTED_PROXIES` to
+the proxy's peer address so login lockout still counts each client separately.
+`VIEWER_BIND_ADDR` overrides `BIND_ADDR` for port 8091 only; empty keeps the
+existing binding. A host-networked proxy can use `127.0.0.1`, closing the
+viewer HTTP port on the LAN; a bridge-networked proxy needs the host's LAN IP.
+Keep ingest unproxied on `BIND_ADDR` port 8090. Follow
+[Behind a reverse proxy](../DEPLOY_DEBIAN.md#behind-a-reverse-proxy-caddy-or-nginx-proxy-manager)
+for private HTTPS names, trusted proxy discovery and Tailscale access.
 If it also fronts ingest, it must accept request bodies of at least
 `INGEST_MAX_UPLOAD_BYTES` (16 MiB by default; firmware keeps each piece under
 8 MiB). Its request-body read and proxy timeouts must allow a slow upload;

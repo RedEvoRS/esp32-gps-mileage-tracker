@@ -19,6 +19,7 @@ HARNESS = textwrap.dedent("""\
     source <(sed '$d' "$INSTALL")
     MODE=$TEST_MODE
     BIND_ADDR=$TEST_BIND_ADDR
+    VIEWER_BIND_ADDR=$TEST_VIEWER_BIND_ADDR
     compose() {
         case "$*" in
             'port mileage-ingest 8090') printf '%s\\n' "$INGEST_MAPPING" ;;
@@ -37,10 +38,11 @@ HARNESS = textwrap.dedent("""\
 @unittest.skipIf(os.name == "nt" or shutil.which("bash") is None, "needs a POSIX shell")
 class InstallerBinding(unittest.TestCase):
     def run_check(self, *, bind_addr=LAN_ADDR, ingest=None, viewer=None,
-                  loopback_status=0, mode="check", failed_service=""):
+                  loopback_status=0, mode="check", failed_service="", viewer_bind_addr=""):
         env = {
             **os.environ, "INSTALL": str(INSTALL), "TEST_MODE": mode,
             "TEST_BIND_ADDR": bind_addr,
+            "TEST_VIEWER_BIND_ADDR": viewer_bind_addr,
             "INGEST_MAPPING": f"{bind_addr}:8090" if ingest is None else ingest,
             "VIEWER_MAPPING": f"{bind_addr}:8091" if viewer is None else viewer,
             "LOOPBACK_STATUS": str(loopback_status), "FAILED_SERVICE": failed_service,
@@ -98,6 +100,17 @@ class InstallerBinding(unittest.TestCase):
 
     def test_unset_bind_address_skips_the_restriction_check(self):
         self.assert_passes(self.run_check(bind_addr="", ingest="", viewer=""))
+
+    def test_viewer_override_mapping_checked_independently_of_ingest(self):
+        for bind_addr in (LAN_ADDR, ""):
+            self.assert_passes(self.run_check(bind_addr=bind_addr, viewer_bind_addr="127.0.0.1",
+                                             viewer="127.0.0.1:8091"))
+            proc = self.run_check(bind_addr=bind_addr, viewer_bind_addr="127.0.0.1",
+                                  viewer=f"{LAN_ADDR}:8091")
+            self.assertIn("FAILURES=1", proc.stdout)
+
+    def test_ipv6_viewer_mapping_uses_brackets(self):
+        self.assert_passes(self.run_check(viewer_bind_addr="::1", viewer="[::1]:8091"))
 
 
 if __name__ == "__main__":

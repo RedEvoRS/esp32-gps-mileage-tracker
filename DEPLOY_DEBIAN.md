@@ -880,6 +880,162 @@ Another application may listen on `localhost:8090` while the tracker is
 bound only to the LAN address, so a response there doesn't tell you where
 the tracker is published. Use the LAN IP for any curl tests from here on.
 
+### Behind a reverse proxy (Caddy or Nginx Proxy Manager)
+
+A reverse proxy accepts a browser's HTTPS connection and forwards the request
+to a service such as the viewer over your private network. It lets you open
+`https://viewer.home.<domain>` instead of remembering an IP address and port.
+Use a domain you control and one name per service, for example
+`viewer.home.<domain>` and `ntfy.home.<domain>`; the viewer needs the root of
+its own name and cannot run under a sub-path such as `/viewer`.
+
+This is an optional private-network setup. Keep the existing `BIND_ADDR`
+for ingest: the tracker still posts plain HTTP to its compiled-in
+`<server-ip>:8090`. All three new `.env` settings are empty by default, so
+an existing install keeps its current HTTP behavior:
+
+- `VIEWER_BIND_ADDR` changes only the viewer's published port 8091. Empty
+  uses `BIND_ADDR`, or all interfaces if both are empty. Set `127.0.0.1`
+  when the proxy is installed on the host or runs with host networking:
+  it can reach `127.0.0.1:8091`, and plain HTTP is closed on the LAN.
+  An IPv6 loopback bind (`::1`) is also supported if your Docker host has IPv6.
+- `VIEWER_TRUSTED_PROXIES` is a comma-separated list of proxy peer IPs or
+  CIDRs, IPv4 or IPv6, with optional spaces. Empty trusts no forwarded
+  addresses. Trust only addresses under your control that really are proxies;
+  trusting all clients or a whole LAN lets clients forge their lockout IP.
+  Invalid entries stop the viewer at startup.
+- `VIEWER_COOKIE_SECURE=true` marks the viewer's session cookie Secure,
+  so browsers send it only over HTTPS. Empty or `false` preserves direct
+  HTTP logins. Only `true`/`false` (case insensitive) is accepted; any other
+  value stops the viewer. Once enabled, log in at the HTTPS name. A plain
+  HTTP login on LAN port 8091 cannot keep a browser session.
+
+For a proxy on the host, use `VIEWER_BIND_ADDR=127.0.0.1`,
+`VIEWER_COOKIE_SECURE=true`, and trust only the observed proxy peer described
+below. **A bridge-networked proxy container cannot reach the host's
+127.0.0.1**: that address means the proxy container itself. In that case set
+`VIEWER_BIND_ADDR=<server-ip>` to the host's LAN IP (or leave it empty if
+`BIND_ADDR` already has that IP), forward to that IP on port 8091, and use
+the trusted-proxy setting plus Secure cookies. Plain HTTP stays reachable
+on the LAN in that combination; Secure cookies protect the browser session,
+and trusted-proxy handling prevents forged forwarded addresses from direct
+clients. To close that HTTP port on the LAN, move the proxy to host networking.
+The proxy-to-viewer hop still uses HTTP, so keep that network private too.
+
+Find the address to trust by opening the viewer through the proxy once,
+then, in the server folder, running:
+
+```bash
+docker compose logs mileage-viewer
+```
+
+Look for `Ignoring X-Forwarded-For from untrusted peer ...; add it to
+VIEWER_TRUSTED_PROXIES if it is your proxy`. Verify that peer belongs to your
+proxy path before adding it. Docker often presents the bridge gateway's IP
+instead of the proxy's own IP. The warning is logged once per peer for the
+first 256 peers in each worker process; recreating the viewer resets it.
+Trusting a bridge gateway also trusts other traffic that Docker presents
+under that address, so keep other containers on that path under your control.
+For example, set `VIEWER_TRUSTED_PROXIES=<proxy-peer-ip>` (replace the
+placeholder; an individual IP is preferable to a broad CIDR). Then recreate
+the viewer, since a restart alone retains the old environment:
+
+```bash
+docker compose up -d mileage-viewer
+bash install.sh --check
+```
+
+The viewer ignores X-Forwarded-For from untrusted peers. From trusted peers,
+it combines all header instances, walks right to left, skips invalid entries
+and trusted hops, and uses the first valid untrusted address for login
+lockout and failed-login logging. A missing, wholly invalid or entirely
+trusted chain falls back to the direct peer IP. Both Caddy and NPM supply
+X-Forwarded-For; no X-Real-IP setting or hop count is needed. `--check`
+reports the selected viewer address and checks health there; with Secure
+cookies enabled it skips authenticated HTTP tests and asks you to test
+logging in through the HTTPS name yourself.
+
+**Caddy.** This minimal site block forwards to a viewer bound to loopback:
+
+```caddyfile
+viewer.home.<domain> {
+    reverse_proxy 127.0.0.1:8091
+}
+```
+
+Replace `<domain>` with your domain. This shows routing only: before using
+it on a private network, configure a DNS-challenge certificate or load an
+existing certificate. Caddy's normal HTTP/TLS challenges need public inbound
+reachability; do not open router ports for them. DNS challenge needs a Caddy
+build containing your DNS provider's module and that provider's credentials;
+follow [Caddy's DNS challenge documentation](https://caddyserver.com/docs/automatic-https#dns-challenge).
+For a wildcard certificate, configure issuance for `*.home.<domain>` and route
+the individual names within that wildcard site (or load an existing wildcard
+certificate into the site above). Requesting a separate certificate for the
+viewer name publishes that name in certificate logs.
+
+**Nginx Proxy Manager (NPM).** Add a Proxy Host. In **Details**, set
+**Domain Names** to `viewer.home.<domain>`, **Scheme** to `http`,
+**Forward Hostname / IP** to the host's LAN IP for a bridge-networked NPM
+(or `127.0.0.1` for host networking), and **Forward Port** to `8091`.
+Websockets Support is not needed for the viewer. In **SSL**, request/select
+a wildcard certificate for `*.home.<domain>` using **Use a DNS Challenge**
+and your DNS provider, then enable **Force SSL**. You can create the wildcard
+under **SSL Certificates** first and select it for each Proxy Host.
+NPM's admin UI is on port **81**: keep it off the internet and set a strong
+login. See [NPM's setup guide](https://nginxproxymanager.com/guide/) for its
+container and certificate storage.
+
+**Leave ingest unproxied for now.** If you ever proxy it, allow 16 MiB request
+bodies and 900 s timeouts. nginx/NPM's default `client_max_body_size` is `1m`;
+NPM's **Advanced** field would need `client_max_body_size 16m;` plus the
+timeout settings. Follow the existing [upload/proxy limits and HTTP 413
+consequences](server/README.md#security-notes) before changing that path.
+
+**ntfy through a proxy.** Give it its own name, forwarding to the bundled
+ntfy's host port 8092 (use the LAN IP from a bridge-networked proxy).
+In `server/ntfy/server.yml` in a source checkout, or `ntfy/server.yml` in
+the installed server folder, set:
+
+```yaml
+base-url: "https://ntfy.home.<domain>"
+behind-proxy: true
+```
+
+Set `.env` `NTFY_BASE_URL=https://ntfy.home.<domain>` to the same URL, since
+the Compose environment can override the YAML value. `base-url` is ntfy's
+external URL; `behind-proxy` makes its visitor rate limiting use forwarded
+client addresses instead of counting everyone as the proxy. Restrict access
+to the backend to your private network/proxy and see [ntfy's proxy
+settings](https://docs.ntfy.sh/config/#behind-a-proxy-tls-etc) for trusted-hop
+controls; these are independent of `VIEWER_TRUSTED_PROXIES`. Recreate ntfy
+with `docker compose --profile ntfy up -d --force-recreate ntfy`. Resubscribe
+the phone to the topic using that exact HTTPS server URL and its ntfy login.
+Keep the monitor's `NTFY_URL` topic destination reachable from its container;
+it can still use the existing internal ntfy URL. For iOS instant push, retain
+the [Step 11a requirements](#11a--start-and-secure-ntfy).
+
+**Keep every service off the internet.** Add no router port forwards for
+80, 443, 8090–8093 or NPM's 81; check that none already exist. DNS challenge
+validates a public DNS TXT record and needs no inbound ports. Use a wildcard
+certificate containing `*.home.<domain>` rather than individual service names
+to keep those names out of public certificate transparency logs; the wildcard
+domain itself remains public. DNS answers for service names must point only
+at private addresses: use local DNS for the proxy's LAN IP, and a public
+record pointing to its Tailscale 100.x address or [Tailscale split
+DNS](https://tailscale.com/docs/reference/dns-in-tailscale#split-dns) for remote
+clients. Tailscale must be installed on the proxy host and phone, with access
+allowed by your tailnet policy; make sure the proxy listens on its Tailscale
+interface too. A LAN IP instead needs an explicitly configured Tailscale
+subnet route. Do not enable Tailscale Funnel.
+
+Test from a phone on mobile data with WiFi and Tailscale **off**: every
+service name must fail to connect. Turn Tailscale **on** and check that the
+HTTPS names connect and the viewer login works. Finally, on **Unraid**, its
+web UI uses ports 80/443 by default: move the UI to other ports in its
+[Settings > Management Access](https://docs.unraid.net/unraid-os/system-administration/secure-your-server/securing-your-connection/)
+before giving 80/443 to a proxy.
+
 ---
 
 ## Step 8 — Point the firmware at it

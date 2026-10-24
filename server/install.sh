@@ -63,6 +63,8 @@ DOCKER=(docker)     # becomes sudo-prefixed if this session can't use Docker
 AS_ME=()            # runs a command as $ME with fresh group membership
 DATA_SUDO=()        # sudo, if trip files (UID 1000) aren't ours to touch
 BIND_ADDR=
+VIEWER_BIND_ADDR=
+VIEWER_COOKIE_SECURE=false
 VIEWER_PASSWORD=    # the admin's password, when entered during this run
 EVERYDAY_USER=      # an everyday login made by this run, and its password
 EVERYDAY_PASSWORD=  # (only kept for the login test; never written anywhere)
@@ -407,7 +409,7 @@ preflight() {
 
     # COMMIT is optional: archives supply it, but hand copies can use VERSION alone.
     local f missing=()
-    for f in VERSION stamp_version.py common/version.py docker-compose.yml .dockerignore .env.example viewer.env.example monitor.env.example sample.gpx \
+    for f in VERSION stamp_version.py common/version.py common/settings.py docker-compose.yml .dockerignore .env.example viewer.env.example monitor.env.example sample.gpx \
         common/__init__.py common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json} \
         mileage-ingest/{Dockerfile,app.py,diag_store.py,reset_high_water.py,requirements.txt} \
         mileage-viewer/{Dockerfile,app.py,geocoding.py,requirements.txt} \
@@ -758,6 +760,7 @@ setup_env() {
     fi
 
     setup_bind_addr
+    setup_viewer_proxy
     setup_display_tz
 
     if [[ $(stat -c %a .env) != 600 ]]; then
@@ -772,7 +775,7 @@ setup_env() {
 setup_bind_addr() {
     BIND_ADDR=$(env_raw .env BIND_ADDR)
     if [[ -n $BIND_ADDR ]] && is_host_addr "$BIND_ADDR"; then
-        ok "The ports are published on $BIND_ADDR only (BIND_ADDR in .env)"
+        ok "Default port binding is $BIND_ADDR only (BIND_ADDR in .env; viewer may override)"
         dhcp_reminder
         return 0
     fi
@@ -782,7 +785,7 @@ setup_bind_addr() {
                 "Docker can't publish the ports there, so the containers won't start." \
                 "Compare with ip -4 addr show, fix .env or the DHCP reservation, then: docker compose up -d"
         else
-            warn "BIND_ADDR isn't set, so ports 8090 and 8091 are open on every interface" \
+            warn "BIND_ADDR isn't set, so ports without a viewer override are open on every interface" \
                 "UFW doesn't filter Docker's ports. Set BIND_ADDR in .env (DEPLOY_DEBIAN.md Step 7)."
         fi
         return 0
@@ -795,8 +798,8 @@ setup_bind_addr() {
     addrs=$(host_addrs | awk '{ printf "%s%s (%s)", sep, $1, $2; sep = ", " }')
     suggested=$(default_addr)
     if ! is_host_addr "$suggested"; then suggested=; fi
-    note "The T-Beam uploads to this server's LAN address, and both ports are" \
-        "published on that address only. UFW can't do this for Docker's ports." \
+    note "The T-Beam uploads to this server's LAN address. BIND_ADDR limits service ports" \
+        "to that address (the viewer may override it). UFW can't do this for Docker's ports." \
         "This server has: ${addrs:-no LAN address found}"
     while :; do
         ask answer BIND_ADDR "LAN address for the ports (or \"all\")" "$suggested"
@@ -813,14 +816,81 @@ setup_bind_addr() {
     if [[ $answer == all ]]; then
         BIND_ADDR=
         env_set .env BIND_ADDR ""
-        warn "Ports 8090 and 8091 will be open on every interface" \
+        warn "Ports without a viewer override will be open on every interface" \
             "Set BIND_ADDR in .env later to limit them (DEPLOY_DEBIAN.md Step 7)."
     else
         BIND_ADDR=$answer
         env_set .env BIND_ADDR "$BIND_ADDR"
-        ok "The ports will be published on $BIND_ADDR only"
+        ok "Default port binding will be $BIND_ADDR only (viewer may override)"
         dhcp_reminder
     fi
+}
+
+# Read opt-in proxy settings without adding installer questions or rewriting
+# them. env_set preserves every other key; setup.sh preserves the whole .env.
+setup_viewer_proxy() {
+    local trusted secure error addr
+    VIEWER_BIND_ADDR=$(env_raw .env VIEWER_BIND_ADDR)
+    trusted=$(env_raw .env VIEWER_TRUSTED_PROXIES)
+    secure=$(env_raw .env VIEWER_COOKIE_SECURE)
+    if ! error=$(PYTHONPATH="$SCRIPT_DIR" python3 - "$trusted" "$secure" <<'PY'
+import sys
+from common.settings import trusted_proxies, viewer_cookie_secure
+try:
+    trusted_proxies(sys.argv[1])
+    viewer_cookie_secure(sys.argv[2])
+except ValueError as exc:
+    print(exc)
+    sys.exit(1)
+PY
+    ); then
+        problem "Invalid viewer proxy configuration: $error" \
+            "Fix .env, then run docker compose up -d. See DEPLOY_DEBIAN.md Step 7."
+    fi
+    VIEWER_COOKIE_SECURE=${secure,,}
+    VIEWER_COOKIE_SECURE=${VIEWER_COOKIE_SECURE:-false}
+    if [[ -n $VIEWER_BIND_ADDR ]]; then
+        if viewer_host_addr "$VIEWER_BIND_ADDR"; then
+            ok "Viewer port 8091 is published on $VIEWER_BIND_ADDR only (VIEWER_BIND_ADDR in .env)"
+        else
+            problem "VIEWER_BIND_ADDR isn't an address this server has or loopback (127.0.0.1/::1)" \
+                "Compare with ip addr show, fix .env, then: docker compose up -d"
+        fi
+    else
+        note "Viewer port 8091 uses ${BIND_ADDR:-all interfaces} (VIEWER_BIND_ADDR is unset)"
+    fi
+    addr=${VIEWER_BIND_ADDR:-$BIND_ADDR}
+    if [[ $VIEWER_COOKIE_SECURE == true && $addr != 127.0.0.1 && $addr != ::1 ]]; then
+        warn "VIEWER_COOKIE_SECURE=true with viewer port 8091 on a non-loopback address" \
+            "Plain-HTTP logins on 8091 cannot keep a browser session. Use the proxy's HTTPS name."
+    fi
+}
+
+viewer_host_addr() {
+    [[ $1 == 127.0.0.1 || $1 == ::1 ]] && return 0
+    # Compare canonical addresses so IPv6 spelling differences are harmless.
+    ip -o addr show 2> /dev/null | python3 -c '
+import ipaddress, sys
+try:
+    wanted = ipaddress.ip_address(sys.argv[1])
+    addresses = [line.split()[3].split("/")[0] for line in sys.stdin if len(line.split()) > 3]
+    valid = any(wanted == ipaddress.ip_address(addr) for addr in addresses)
+except ValueError:
+    valid = False
+sys.exit(0 if valid else 1)' "$1"
+}
+
+# Brackets are required around IPv6 literals in URLs and Docker port output.
+http_url() {
+    local addr=$1 port=$2
+    [[ $addr != 0.0.0.0 ]] || addr=127.0.0.1
+    if [[ $addr == *:* ]]; then addr=[$addr]; fi
+    printf 'http://%s:%s' "$addr" "$port"
+}
+
+set_service_urls() {
+    INGEST_URL=$(http_url "${BIND_ADDR:-127.0.0.1}" 8090)
+    VIEWER_URL=$(http_url "${VIEWER_BIND_ADDR:-${BIND_ADDR:-127.0.0.1}}" 8091)
 }
 
 # The zone trip times are shown in, which also decides a trip's month
@@ -1200,16 +1270,18 @@ add_everyday_login() {
 # Fail early if something else already listens where a port has to go.
 # With a profile, $svc is a Compose service (see service_state).
 check_port_free() {
-    local svc=$1 port=$2 profile=${3-} taken
+    local svc=$1 port=$2 profile=${3-} taken addr=$BIND_ADDR
+    if [[ $svc == mileage-viewer ]]; then addr=${VIEWER_BIND_ADDR:-$BIND_ADDR}; fi
     if [[ -n $profile ]]; then
         if [[ $(service_state "$svc" "$profile") == running ]]; then return 0; fi
     elif [[ $(container_state "$svc") == running ]]; then
         return 0
     fi
-    taken=$(ss -Hltn "sport = :$port" 2> /dev/null | awk -v want="$BIND_ADDR" '{
+    taken=$(ss -Hltn "sport = :$port" 2> /dev/null | awk -v want="$addr" '{
         addr = $4
         sub(/:[0-9]+$/, "", addr)
-        if (want == "" || addr == want || addr == "0.0.0.0" || addr == "*" || addr == "[::]") print $4
+        gsub(/[][]/, "", addr)
+        if (want == "" || addr == want || addr == "0.0.0.0" || addr == "*" || addr == "::") print $4
     }') || taken=
     if [[ -n $taken ]]; then
         die "Port $port is already in use (${taken//$'\n'/, }), so $svc can't start." \
@@ -1462,7 +1534,7 @@ verify_health_versions() {
             ok "$url answers"
         else
             problem "$url doesn't answer from this server" "${body:-no response}" \
-                "If BIND_ADDR is set, the containers may need recreating: docker compose up -d"
+                "If BIND_ADDR or VIEWER_BIND_ADDR changed, recreate the containers: docker compose up -d"
             return 1
         fi
         # Match common/version.py's ASCII token budget before printing data
@@ -1529,16 +1601,21 @@ verify_end_to_end() {
 
     local user
     user=$(env_raw viewer.env VIEWER_USERNAME)
-    if [[ -z $VIEWER_PASSWORD ]]; then
+    if [[ $VIEWER_COOKIE_SECURE == true ]]; then
+        warn "Skipped authenticated viewer tests because VIEWER_COOKIE_SECURE=true" \
+            "The health and redirect checks use HTTP. Test logging in through the proxy's HTTPS name."
+    elif [[ -z $VIEWER_PASSWORD ]]; then
         ask_secret VIEWER_PASSWORD VIEWER_PASSWORD \
             "Admin password for $user, to test logging in (Enter to skip)" optional
     fi
-    if [[ -n $VIEWER_PASSWORD ]]; then
+    if [[ $VIEWER_COOKIE_SECURE == true ]]; then
+        : # A Secure cookie must not be sent over this plain-HTTP test connection.
+    elif [[ -n $VIEWER_PASSWORD ]]; then
         verify_viewer "$user" || true
     else
         warn "Skipped the login test" "Log in at $VIEWER_URL/ from a browser to check it."
     fi
-    if [[ -n $EVERYDAY_PASSWORD ]]; then
+    if [[ -n $EVERYDAY_PASSWORD && $VIEWER_COOKIE_SECURE != true ]]; then
         verify_everyday_login "$EVERYDAY_USER" || true
     fi
     if [[ $MODE == check ]]; then report_everyday_logins; fi
@@ -1701,19 +1778,23 @@ report_everyday_logins() {
 }
 
 verify_binding() {
-    local pair svc port mapped
-    if [[ -z $BIND_ADDR ]]; then return 0; fi
+    local pair svc port mapped addr expected
     # Check these containers' mappings. A response from localhost could
     # belong to another service bound there, so it can't prove exposure.
     for pair in mileage-ingest:8090 mileage-viewer:8091; do
         svc=${pair%:*}
         port=${pair#*:}
+        addr=$BIND_ADDR
+        if [[ $svc == mileage-viewer ]]; then addr=${VIEWER_BIND_ADDR:-$BIND_ADDR}; fi
+        [[ -n $addr ]] || continue
+        expected=$addr:$port
+        if [[ $addr == *:* ]]; then expected=[$addr]:$port; fi
         mapped=$(compose port "$svc" "$port" < /dev/null 2> /dev/null) || mapped=
-        if [[ $mapped == "$BIND_ADDR:$port" ]]; then
-            ok "Port $port is published on $BIND_ADDR only"
+        if [[ $mapped == "$expected" ]]; then
+            ok "Port $port is published on $addr only"
         else
-            problem "Port $port is published on ${mapped:-nothing}, not $BIND_ADDR" \
-                "Recreate the containers so they pick up BIND_ADDR: docker compose up -d"
+            problem "Port $port is published on ${mapped:-nothing}, not $addr" \
+                "Recreate the containers so they pick up BIND_ADDR / VIEWER_BIND_ADDR: docker compose up -d"
         fi
     done
 }
@@ -3273,18 +3354,22 @@ summary() {
         return 0
     fi
 
-    local host=${BIND_ADDR:-$(default_addr)}
+    local host=${BIND_ADDR:-$(default_addr)} viewer_url
+    viewer_url=$(http_url "${VIEWER_BIND_ADDR:-${host:-<this server>}}" 8091)
     printf '%sThe server is installed and working.%s\n' "$GREEN" "$PLAIN"
     local admin
     admin=$(env_raw viewer.env VIEWER_USERNAME)
-    printf 'The viewer is at http://%s:8091/\n' "${host:-<this server>}"
+    printf 'The viewer is at %s/\n' "$viewer_url"
+    if [[ $VIEWER_COOKIE_SECURE == true ]]; then
+        printf 'Log in through the proxy HTTPS name; Secure cookies require HTTPS.\n'
+    fi
     printf 'The admin login is %s (kept in %s/viewer.env).\n' "${admin:-the one in viewer.env}" "$SCRIPT_DIR"
     if (( ${#EVERYDAY_LOGINS[@]} )); then
         printf 'Everyday logins: %s\n' "$(everyday_text)"
     else
         printf 'There are no everyday logins yet.\n'
     fi
-    printf 'The admin adds, turns off and resets everyday logins at http://%s:8091/admin\n\n' "${host:-<this server>}"
+    printf 'The admin adds, turns off and resets everyday logins at %s/admin\n\n' "$viewer_url"
     printf 'The upload token is INGEST_AUTH_TOKEN in %s/.env; keep it private.\n\n' "$SCRIPT_DIR"
     # setup.sh installs this bundle before invoking us. It also identifies
     # release installs when install.sh is rerun directly, without the wrapper.
@@ -3355,9 +3440,7 @@ main() {
     else
         section "Services"
     fi
-    local host=${BIND_ADDR:-127.0.0.1}
-    INGEST_URL=http://$host:8090
-    VIEWER_URL=http://$host:8091
+    set_service_urls
     if verify_services; then
         verify_end_to_end || true
     fi

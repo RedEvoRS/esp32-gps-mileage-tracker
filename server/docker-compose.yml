@@ -84,9 +84,11 @@ services:
     container_name: mileage-viewer
     restart: unless-stopped
 
-    # Host port 8091 maps to container port 8091, on BIND_ADDR only.
+    # Override only the viewer's host address for a reverse proxy.
     ports:
-      - "${BIND_ADDR:-0.0.0.0}:8091:8091"
+      - target: 8091
+        published: "8091"
+        host_ip: "${VIEWER_BIND_ADDR:-${BIND_ADDR:-0.0.0.0}}"
 
     volumes:
       # Same trip data as ingest, but read-only — the viewer never
@@ -106,6 +108,8 @@ services:
 
     environment:
       - VIEWER_DB_PATH=/db/annotations.db
+      - VIEWER_TRUSTED_PROXIES=${VIEWER_TRUSTED_PROXIES:-}
+      - VIEWER_COOKIE_SECURE=${VIEWER_COOKIE_SECURE:-false}
       # Timezone all trip times are displayed and exported in, from .env
       # (see the note on the ingest service).
       - DISPLAY_TZ=${DISPLAY_TZ:-}

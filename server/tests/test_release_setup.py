@@ -160,10 +160,12 @@ class ReleaseSetup(unittest.TestCase):
         self.assert_ok(self.run_setup("--bundle", str(first)))
         private = (".env", "viewer.env", "monitor.env", "backup/backup.conf",
                    "data/trip.gpx", "firmware-out/current/app.bin")
+        proxy_settings = ("VIEWER_BIND_ADDR=127.0.0.1\nVIEWER_COOKIE_SECURE=true\n"
+                          "VIEWER_TRUSTED_PROXIES=192.0.2.1,2001:db8::/64\n")
         for name in private:
             path = self.destination / name
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("keep private\n")
+            path.write_text(proxy_settings if name == ".env" else "keep private\n")
             path.chmod(0o600)
         second = self.bundle("v1.01", "v0.11", "b" * 40,
                              extra={f"server/{name}": "must not replace\n" for name in private})
@@ -171,7 +173,7 @@ class ReleaseSetup(unittest.TestCase):
         self.assert_ok(result)
         for name in private:
             path = self.destination / name
-            self.assertEqual(path.read_text(), "keep private\n", name)
+            self.assertEqual(path.read_text(), proxy_settings if name == ".env" else "keep private\n", name)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600, name)
         self.assertEqual((self.destination / "obsolete.py").read_text(), "old source\n")
         self.assertIn("v0.10+aaaaaaaaaa -> v0.11+bbbbbbbbbb", result.stdout)

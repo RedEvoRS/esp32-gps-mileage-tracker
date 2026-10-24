@@ -435,7 +435,10 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   600 s I/O timeout, the unit 6 h. Restore saves a corrupt live DB's raw files
   in the pre-restore folder and continues; its scratch is under `$BACKUP_DIR`.
 - Port binding: `BIND_ADDR` in `.env` sets the host IP published ports bind
-  on (unset = all interfaces). UFW does not filter Docker-published ports,
+  on (unset = all interfaces). Optional `VIEWER_BIND_ADDR` overrides only
+  viewer port 8091 (empty falls back to BIND_ADDR, then all interfaces);
+  host-networked proxies can use loopback, bridge-networked proxies need
+  the host's LAN address. UFW does not filter Docker-published ports,
   so the bind address is the LAN-only control (`DEPLOY_DEBIAN.md` Step 7)
 - Viewer auth: `viewer.env` holds the admin `VIEWER_USERNAME`, scrypt
   `VIEWER_PASSWORD_HASH` and `VIEWER_SECRET_KEY`; rerun `install.sh` to change
@@ -453,6 +456,13 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   15-minute pause without one; the next failure starts a fresh count. A success
   clears only its own username's failures. App fail-fasts if auth config is
   missing or the admin hash lost its `$` chars.
+  Optional `.env` `VIEWER_TRUSTED_PROXIES` accepts comma-separated IPv4/IPv6
+  IPs/CIDRs: only trusted peers may supply X-Forwarded-For; use the rightmost
+  valid untrusted address, falling back to the peer if none. Untrusted XFF
+  warns once per peer, capped at 256 peers per worker with a thread lock.
+  `VIEWER_COOKIE_SECURE=true` enables Secure session cookies for private
+  HTTPS proxies (empty/false preserves HTTP). Both settings fail fast on
+  invalid syntax; Compose passes them only to the viewer. Ingest stays HTTP.
 - Timezone: stored UTC, displayed/exported in `DISPLAY_TZ` via `ZoneInfo`,
   DST-aware — never a fixed offset. No default: `install.sh` asks for it and
   writes it to `.env`, Compose passes it to **both** services (viewer
