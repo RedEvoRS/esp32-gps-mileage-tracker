@@ -18,7 +18,7 @@ four real trips from microSD to the deployed server, then delivered all 115
 pending diagnostic events and a current snapshot. Uploads with debug mode
 off and server-down retry were also verified on 2026-10-21 (UTC). Uploads
 from the internal LittleFS fallback and server errors (401/413/5xx) remain
-untested on the Supreme. The [top-level README](../README.md#wheres-it-at)
+untested on the Supreme. The [top-level README](../README.md#where-its-at)
 has the current status.
 
 **Have a T-Beam V1.2?** That board is retired. Its last firmware and full
@@ -654,7 +654,7 @@ For why it works this way, see [the firmware design](DESIGN.md).
 The `04_trip_logger/` sketch detects trips, accumulates mileage and writes
 GPX files to the microSD card, with internal LittleFS as fallback. The
 current release candidate is `v0.11`; it uploads trips from the card, and the
-[top-level README](../README.md#wheres-it-at) lists what has and hasn't been
+[top-level README](../README.md#where-its-at) lists what has and hasn't been
 checked on a real board. Since `v0.06` there is one firmware build: debug
 mode starts off at every power-on and can be toggled by holding BOOT and
 tapping POWER.
