@@ -11,12 +11,15 @@ USB, power and GPS before installing the trip logger for use in the car.
 The power-management unit (PMU) controls the board's rails, battery and
 shutdown; Stage 2 checks it before the GPS and trip-logging stages.
 
-All four stages run on the Supreme. On 2026-10-21 (UTC), Stage 4's debug
-build uploaded four real trips from microSD to the deployed server, then
-delivered all 115 pending diagnostic events and a current snapshot.
-Uploads with debug mode off and server-down retry were also verified on
-2026-10-21 (UTC). LittleFS uploads and server errors (401/413/5xx) remain
-untested on the Supreme.
+All four stages run on the Supreme. Firmware `v0.11` is the release
+candidate: the build the install flow delivers, and the one being driven for a
+week of normal use. On 2026-10-21 (UTC), an earlier Stage 4 build uploaded
+four real trips from microSD to the deployed server, then delivered all 115
+pending diagnostic events and a current snapshot. Uploads with debug mode
+off and server-down retry were also verified on 2026-10-21 (UTC). Uploads
+from the internal LittleFS fallback and server errors (401/413/5xx) remain
+untested on the Supreme. The [top-level README](../README.md#wheres-it-at)
+has the current status.
 
 **Have a T-Beam V1.2?** That board is retired. Its last firmware and full
 instructions are on the frozen [`tbeam-v1.2` branch](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/tree/tbeam-v1.2),
@@ -149,7 +152,11 @@ with BOOT released only if the board stays in download mode.
   saved server snapshot revision, the builder prepares both `current/`
   (enrollment) and `cleanup/` (normal). After Device health shows a newly
   received current snapshot, run the saved script with `-Cleanup` / `--cleanup`
-  as below. Contact from a trip alone is insufficient. Cleanup writes only
+  as below. If you used the one-liner, you don't have the script yet (and the
+  Windows `irm | iex` form can't pass `-Cleanup`): save it first with the
+  `Invoke-WebRequest` / `curl -o` commands shown earlier in this guide. On
+  macOS/Linux you can instead pipe it with `bash -s -- --server '<user>@<host>'
+  --cleanup`. Contact from a trip alone is insufficient. Cleanup writes only
   the app, removing enrollment defines and preserving settings/trips. Do it
   before the next server build: a normal build removes stale cleanup output.
   Used boards/cards or an existing server revision need the
@@ -347,8 +354,15 @@ a card. Stage 4 has since recorded two real drives on the card.
 - **Very long trips:** firmware splits a trip into pieces below 8 MiB,
   half the server's 16 MiB upload limit. Recording continues immediately
   with the boundary fix shared by both pieces, and each is queued for a separate upload.
-  A very long drive can therefore show up as more than one trip. This also
-  keeps a parked, powered device's GPS drift from creating one oversized file.
+  A very long drive can therefore show up as more than one trip. In the
+  viewer, open the earlier piece and choose **Merge with next trip** to join
+  them again, so the drive isn't annotated and exported as two trips (the
+  viewer accepts a following trip that starts within 15 minutes of the
+  earlier one's last recorded point; the pieces share their boundary fix, so
+  the gap is zero). See
+  [Merge recordings from one drive](../server/README.md#merge-recordings-from-one-drive).
+  This also keeps a parked, powered device's GPS drift from creating one
+  oversized file.
 
 ### Supreme pin and power reference
 
@@ -358,7 +372,7 @@ Measured with Stages 1–3 unless marked.
 |---|---|---|
 | PMU (AXP2101) | `Wire1`, SDA 42 / SCL 41, address 0x34 | Interrupt on GPIO 40, which can't wake the ESP32-S3 from deep sleep |
 | RTC (PCF8563) | `Wire1`, address 0x51 | Shares the PMU's bus |
-| OLED (SH1106), BME280 | `Wire`, SDA 17 / SCL 18, 0x3C / 0x77 | Powered by ALDO1, which also feeds the magnetometer and, per LilyGO's schematic, this bus's pull-ups. ALDO1 starts at 1.8 V; Stage 4 sets it to 3.3 V once the PMU checks out, as LilyGO's and Meshtastic's code do. At 1.8 V the bus's high level sits below the ESP32-S3's input spec (#274) |
+| OLED (SH1106), BME280 | `Wire`, SDA 17 / SCL 18, 0x3C / 0x77 | Powered by ALDO1, which also feeds the magnetometer and, per LilyGO's schematic, this bus's pull-ups. ALDO1 starts at 1.8 V; Stage 4 sets it to 3.3 V once the PMU checks out, as LilyGO's and Meshtastic's code do. At 1.8 V the bus's high level sits below the ESP32-S3's input spec |
 | GPS UART | ESP32 RX 9 / TX 8, 9600 baud | u-blox MAX-M10S, firmware SPG 5.10 |
 | GPS_EN | GPIO 7 | Drive HIGH. Low or high made no difference on this GPS |
 | GPS PPS | GPIO 6 | One pulse per second once the GPS has a fix |
@@ -604,10 +618,10 @@ Stage 4 prints these after its early LoRa rail safety check. If all attempts
 fail, Stages 2 and 3 halt; Stage 4 enters [degraded service](#startup-failures).
 Recovery is host-tested; repeatedly resetting during PMU reads still needs
 a bench check. Stage 4 retains the boot result
-and has a host-tested helper for E2007 PMU_STARTUP_RECOVERY (#151). Stage 4
+and has a host-tested helper for E2007 PMU_STARTUP_RECOVERY. Stage 4
 now queues that notice in its diagnostic journal after storage startup;
-failed startup is now reported by the degraded loop (#126). OLED reporting
-is implemented for normal operation (#127); the panel stays off in degraded mode.
+failed startup is now reported by the degraded loop. OLED reporting
+is implemented for normal operation; the panel stays off in degraded mode.
 
 ### Stage 3: GPS (`03_gps_test/`)
 
@@ -638,16 +652,21 @@ socket.
 For why it works this way, see [the firmware design](DESIGN.md).
 
 The `04_trip_logger/` sketch detects trips, accumulates mileage and writes
-GPX files to the microSD card, with internal LittleFS as fallback. Its
-first real uploads from microSD succeeded on 2026-10-21 (UTC): four trips
-received HTTP 200, were deleted from the card and appeared in the viewer.
-This used main commit `a358eaf`'s earlier Stage 4 debug firmware, flashed at
-20:39Z on 2026-10-20 with real settings and one-time diagnostics enrollment.
-A trip upload with debug off also succeeded, on the former production build
-`v0.05+615a13ffae` (the server-down test below). `v0.06` has so far uploaded
-diagnostics, but no trips yet. Since v0.06 there is one firmware build: debug
+GPX files to the microSD card, with internal LittleFS as fallback. The
+current release candidate is `v0.11`; it uploads trips from the card, and the
+[top-level README](../README.md#wheres-it-at) lists what has and hasn't been
+checked on a real board. Since `v0.06` there is one firmware build: debug
 mode starts off at every power-on and can be toggled by holding BOOT and
-tapping POWER. On 2026-10-21 (UTC), with `v0.05+615a13ffae`, ingest was
+tapping POWER.
+
+What follows is the dated record of the first uploads, kept as history. They
+ran on earlier builds. The first real uploads from microSD succeeded on
+2026-10-21 (UTC): four trips received HTTP 200, were deleted from the card and
+appeared in the viewer. This used main commit `a358eaf`'s earlier Stage 4
+debug firmware, flashed at 20:39Z on 2026-10-20 with real settings and
+one-time diagnostics enrollment. A trip upload with debug off also succeeded,
+on the former production build `v0.05+615a13ffae` (the server-down test
+below). On 2026-10-21 (UTC), with `v0.05+615a13ffae`, ingest was
 stopped with a test trip queued. Both upload attempts returned `HTTP -1` (connection failure),
 and the trip stayed queued. The next retry after ingest restarted received
 HTTP 200 and deleted the local file. LittleFS uploads remain untested on
@@ -718,7 +737,7 @@ Before flashing:
    arduino-cli. Don't pick a larger Partition Scheme to silence it: the
    menu's bigger limit would let an image bigger than the real 1.5 MB
    partition pass the check.
-3. **Prepare diagnostics enrollment.** Follow [deployment Step 8](../DEPLOY_DEBIAN.md#step-8--point-the-firmware-at-it)
+3. **Prepare diagnostics enrollment.** Follow [deployment Step 8](../DEPLOY_DEBIAN.md#one-time-diagnostics-enrollment)
    to read the server's snapshot revision and set the two one-use enrollment
    defines. A snapshot is the board's current diagnostic state; its revision
    must be newer than the server's saved value. GPX delivery does not depend
@@ -740,7 +759,7 @@ Before flashing:
 | `SERVER_HOST` | Only the server's IP address or hostname, from `install.sh` on the server. Do not include `http://`, a port, or `/upload`. |
 | `SERVER_PORT` | `8090`. |
 | `AUTH_TOKEN` | The token from `install.sh` on the server. It has to match `INGEST_AUTH_TOKEN` in the server's `.env` exactly, or every upload is refused. |
-| `DEVICE_ID` | A name for this board. The default, `tbeam-01`, is fine. |
+| `DEVICE_ID` | A name for this board. The default, `tbeam-01`, is fine. A different one must be 1–32 characters: lowercase letters, digits, `_` or `-`, starting with a letter or digit (so `Car 1` is invalid). An invalid ID still uploads trips, but the server rejects its diagnostics, so the tracker never appears in Device health. |
 
 Leave `USE_BSSID_FILTER` at 0 unless you want to restrict uploads to one
 router; the example explains it. Keep `secrets.h` private and gitignored.
@@ -764,7 +783,7 @@ counter (`tripno`), diagnostic journal boot counter and consumed enrollment
 ID (`diag/enroll`), among other settings. If `DIAGNOSTICS_ENROLLMENT_ID`
 and `DIAGNOSTICS_STATUS_HIGH_WATER` are still defined in `secrets.h`, the
 next boot can consume that ID again and re-enroll from its possibly stale
-high-water value. Follow [deployment Step 8](../DEPLOY_DEBIAN.md#step-8--point-the-firmware-at-it),
+high-water value. Follow [deployment Step 8](../DEPLOY_DEBIAN.md#one-time-diagnostics-enrollment),
 then remove both defines after the first successful diagnostics upload and
 reflash with erase disabled. If you must erase an enrolled board later,
 read a fresh server high-water and choose a higher enrollment ID first.
@@ -999,9 +1018,17 @@ untested on the Supreme.
 If a trip does not appear, first confirm `Trip started` and `Trip finalized`:
 an active or discarded trip cannot upload. `HTTP 401` means the upload
 token does not match. A negative result means a connection or transfer
-failure, including timeouts after reaching the server. `HTTP 400/413`
+failure, including timeouts after reaching the server. It can also hide a
+rejection: the server only drains a rejected upload for about 3 seconds, so
+on a slow link the 401 (or 413) can be lost to a connection reset and print
+as a negative code. If WiFi is fine and the server is reachable but every
+upload fails, compare the token in the build with the server's
+`INGEST_AUTH_TOKEN` and look for 401s in the ingest log. `HTTP 400/413`
 normally sets the file aside as `.bad` without further retries, while
-`409` and `5xx` leave it queued. No upload result can mean WiFi trouble,
+`409` and `5xx` leave it queued. A `409` means the server already holds a
+trip with the same start time but different contents or from another device
+(the ingest log says which); the board keeps retrying it on every visit
+home until you resolve it on the server. No upload result can mean WiFi trouble,
 but also an incomplete file or one set aside during repair. A failed WiFi
 scan or join prints `Network: home WiFi not found "<ssid>"` or
 `Network: couldn't join home WiFi "<ssid>" (status N)`, with the time until
@@ -1139,7 +1166,7 @@ Things to know:
   an unknown motion state does not turn them off. Codes are severity ordered and
   deduplicated. Four fit in a two-by-two grid; with more faults, three codes
   and `+N` show how many were omitted. Error cards show only a centred code.
-  Production does not render catalog OLED text; catalog v5's text
+  Production does not render catalog OLED text; the catalog's OLED-text
   validation rules still apply. New
   ERROR/CRITICAL episodes show once even while moving; unresolved faults
   remind at the next parked opportunity. Cards last 30 seconds at maximum
@@ -1319,7 +1346,7 @@ the board.
 
 **Enable snapshot delivery deliberately:** read this device's current
 `devices.status_sequence` in the ingest diagnostics database (zero only for a
-verified new identity), using [deployment Step 8](../DEPLOY_DEBIAN.md#step-8--point-the-firmware-at-it).
+verified new identity), using [deployment Step 8](../DEPLOY_DEBIAN.md#one-time-diagnostics-enrollment).
 Then uncomment/set `DIAGNOSTICS_STATUS_HIGH_WATER` and
 `DIAGNOSTICS_ENROLLMENT_ID` in private `secrets.h`. The enrollment ID must be
 positive and greater than any previously used on this board. NVS consumes it
@@ -1351,8 +1378,8 @@ use internal frame/metadata scratch, and ESP-IDF suspends tasks during its
 cache-disabled flash operations. The network stack remains 12 KiB.
 Debug mode prints `Heap: internal ... free (largest ...), PSRAM ... free`
 on entry and once after the first diagnostics HTTP attempt made with debug on,
-whether it succeeds or fails. Record those lines during #6's real-upload
-checks; host tests and compile sizes are not measurements of live heap pressure.
+whether it succeeds or fails. Record those lines when you next test uploads;
+host tests and compile sizes are not measurements of live heap pressure.
 Earlier core 3.3.11 builds with PSRAM enabled used 108,356 bytes of static
 RAM in debug and 84,388 in release, down from 193,804/169,836 with internal upload
 buffers. Each build recovers 85,448 bytes and is 2,736 above its pre-upload
@@ -1361,7 +1388,7 @@ account for the remaining internal-memory overhead.
 Compiler frames are 432 bytes for the HTTP wrapper, 672 for `nextBatch`, 240
 for acknowledgment and 1,088 for singleton isolation, before callees. These
 figures supplement, but do not replace, the real-upload watermark measurements
-below. Degraded startup (#126) and production OLED code cards (#127)
+below. Degraded startup and production OLED code cards
 are implemented. Failed PMU startup attempts a non-formatting LittleFS
 mount for diagnostics; failure of both trip stores uses the bounded RAM
 journal. Neither degraded mode starts networking, and the production panel
@@ -1472,14 +1499,26 @@ discarded as noise has nothing to upload. Then look for the upload result:
 - A negative number, like `HTTP -1`: a connection or transfer failed.
   This can include a dropped connection or timeout after reaching the
   server. Check WiFi signal, `SERVER_HOST`, `SERVER_PORT` and server logs.
+  A rejected upload (401, or 413) can also show as a negative number on a
+  slow link, because the server stops reading a rejected upload after about
+  3 seconds and the connection is reset before the board sees the status. If
+  WiFi is fine and the server is reachable but every upload fails, compare
+  the token in the build with the server's `INGEST_AUTH_TOKEN` and look for
+  401s in the ingest log. The small diagnostics uploads do get the real 401,
+  so Device health shows the token-rejected fault.
 - `HTTP 400` or `HTTP 413`: the server rejected the file as invalid or
   too large. Look for `kept as .bad, not retried`. That file remains on
   the board for inspection and uses storage, but no longer uploads
   automatically. Preserve it and investigate the server logs; changing
   WiFi settings will not make it retry. If the rename fails, the log says
   `rename failed, will retry` instead.
-- `HTTP 409` or a `5xx` status: the trip stays queued for retry. Check
-  server logs for a conflicting trip identity (409) or a server error.
+- `HTTP 409` or a `5xx` status: the trip stays queued and the board retries
+  it indefinitely. A `5xx` is a server error: check the server logs. A `409`
+  means the server already holds a trip with the same start time but
+  different contents or from another device, or its stored summary is
+  damaged; the ingest log gives the exact reason. Look at the matching
+  `data/YYYY-MM/<trip>.gpx` and `.json` on the server, or move the file aside
+  on the card if you don't want it uploaded.
 - `Network: home WiFi not found` or `Network: couldn't join home WiFi`:
   the message names the configured SSID; a join failure also reports
   `status N` (`4` can indicate a wrong password). Check the name and
@@ -1541,7 +1580,10 @@ trip reaches the viewer during the battery-powered upload window. On the
 next start, take another short drive and confirm a second trip appears
 after parking. This checks the installed recording and upload path across
 power-off and restart. It doesn't measure how much current the board draws
-while switched off, which still needs a meter.
+while switched off. The parked-drain check
+([guide](../DIAGNOSTICS.md#reading-parked-battery-drain-without-a-meter))
+estimates it from battery readings across parked hours instead; on the
+author's board it found no measurable drain over about 33 parked hours.
 
 ## Legacy T-Beam V1.2
 

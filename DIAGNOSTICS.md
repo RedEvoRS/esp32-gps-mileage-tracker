@@ -1069,14 +1069,21 @@ E2009 for an attempted power-off that did not happen; it is not proof of rail-of
 On the Supreme, parked means PMU power-off: the 18650 still supplies the PMU,
 RTC and GPS backup RAM. After updating the server and firmware, ordinary drives
 and parked nights collect the two readings; no special driving procedure is
-needed. Once the board next uploads its retained journal, run this from a copy
-of the repository on the server, where the diagnostics database is accessible:
+needed. Once the board next uploads its retained journal, run the helper on the
+server. On a release install (`setup.sh`), the helper sits in the install
+folder, and the database is under that folder's `data/` (the `/data/...` path
+you see inside the containers is not a host path). `data/` is mode 700 and
+belongs to UID 1000 (the user the containers run as), so run it as that login:
 
 ```sh
-python server/parked_drain.py /data/diagnostics/events.db
+python3 ~/mileage-tracker/parked_drain.py ~/mileage-tracker/data/diagnostics/events.db
 ```
 
-Use the database's actual mounted path. The stdlib-only helper opens SQLite
+Use your own install folder if it isn't `~/mileage-tracker`. On a source install
+(a copy of the repository), run `python3 server/parked_drain.py` from the
+repository's top folder with the database's path on the host. If your login's
+UID isn't 1000 (`id -u`), put `sudo` in front of the command, or you get
+"Permission denied". The stdlib-only helper opens SQLite
 with `mode=ro`, a two-second timeout, `query_only` and one read transaction. It
 never initializes, migrates or changes the database. CSV output identifies the
 device and off/boot UTC times, hours parked, raw mV drop, raw mV/hour and charge
@@ -1650,7 +1657,7 @@ counts, and two-digit overflow strings. They check panel margins, glyph
 coverage, row/column separation and adapter font/coordinate selection.
 When U8g2 is installed, the host runner also compares the committed metrics
 with the actual library (set `U8G2_DIR` for a nonstandard installation).
-Catalog v5's OLED-text validation rules still apply.
+The catalog's OLED-text validation rules still apply.
 
 The following are **Supreme port targets to verify against the board revision
 and on the bench**, not pin changes for the existing T-Beam V1.2 sketch:
