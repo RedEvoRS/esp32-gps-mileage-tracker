@@ -8,8 +8,8 @@ the complete setup.
 The board is the LilyGO T-Beam Supreme with MAX-M10S GPS and microSD trip
 storage, though the server accepts GPX uploads from any board. The server
 was deployed with `install.sh` on Debian 13 on 2026-10-20;
-`install.sh --check` passed. On 2026-10-21 (UTC), the Supreme's Stage 4
-debug build uploaded four real trips from microSD. Ingest logged acceptance
+`install.sh --check` passed. On 2026-10-21 (UTC), the Supreme's trip logger
+firmware, running in debug mode, uploaded four real trips from microSD. Ingest logged acceptance
 and HTTP 200 for each, wrote `data/YYYY-MM/<trip>.gpx` and `.json`, and
 the viewer listed all four with distances. The board deleted each local
 file after HTTP 200. For the new drive, the board reported 11.40 mi and
@@ -82,7 +82,8 @@ three rules, all in `summarize()`:
 - **Stopped steps don't count.** If the device's speed at both ends of a
   step is under 2 mph, the vehicle was parked or at a light, and the step
   is GPS scatter. Without device speed, distance/time is used instead.
-- **Bad fixes are skipped.** That means fixes with HDOP above 5, and any
+- **Bad fixes are skipped.** That means fixes with HDOP (a GPS accuracy figure; higher is worse)
+  above 5, and any
   step implying more than 60 m/s.
 - **GPS gaps are bridged.** A new `<trkseg>` marks a gap (tunnel, parking
   structure). The straight line across it is the shortest possible path,
@@ -110,13 +111,14 @@ by the `mileage-viewer` service, which reads these files independently.
 
 ## Directory Layout
 
-    mileage-tracker/           # this folder, copied to the server
+    mileage-tracker/           # this folder, copied to the server (main files only)
     ├── docker-compose.yml     # All Python builds use this server directory as context
     ├── .dockerignore          # Runtime allowlist; excludes secrets, tests and data
     ├── VERSION                # Server release number
     ├── COMMIT                 # Archive commit; literal placeholder in a Git checkout
     ├── stamp_version.py       # Build stamp from Git, then COMMIT, then VERSION alone
-    ├── common/diagnostics/    # Shared validators and catalog.json (required)
+    ├── common/                # Shared code (required): diagnostics/ validators and catalog.json,
+    │                          #   trip_summary.py (distance rules), version.py
     ├── .env.example           # Template for .env
     ├── .env                   # Upload token and BIND_ADDR (created by you or install.sh, never committed)
     ├── viewer.env.example     # Template for viewer.env
@@ -126,6 +128,7 @@ by the `mileage-viewer` service, which reads these files independently.
     ├── grafana/               # Importable Prometheus/Grafana/Loki starter files; no bundled services
     ├── ntfy/server.yml        # Optional ntfy deny-all config; no credentials
     ├── install.sh             # First-time install with checks; --check later
+    ├── parked_drain.py        # Read-only parked battery drain helper (see DIAGNOSTICS.md)
     ├── sample.gpx             # A short test trip for checking uploads
     ├── data/                  # Trip files (create it before the first start, see below)
     │   ├── diagnostics/events.db # Ingest-owned SQLite, created on first contact
@@ -133,16 +136,25 @@ by the `mileage-viewer` service, which reads these files independently.
     │       ├── 2026-04-14T13-45-22.gpx
     │       └── 2026-04-14T13-45-22.json
     ├── backup/                # Scheduled backup + restore scripts, systemd timer
+    ├── firmware-builder/      # Server-side tracker firmware build (build.sh, README.md)
+    ├── firmware-src/          # Firmware source the builder compiles (created by setup.sh)
+    ├── firmware-out/          # Your private firmware build output (created by the builder, never committed)
     ├── tests/                 # The server test suite (not needed to run it)
     ├── mileage-ingest/
     │   ├── Dockerfile         # Container definition
     │   ├── requirements.txt   # Python dependencies
     │   ├── app.py             # GPX uploads + device-event endpoint (Flask)
-    │   └── diag_store.py      # Diagnostics transactions and ordered health
+    │   ├── diag_store.py      # Diagnostics transactions and ordered health
+    │   └── reset_high_water.py # Admin recovery for a device's snapshot high-water (see DIAGNOSTICS.md)
     └── mileage-viewer/
         ├── Dockerfile
         ├── requirements.txt
         ├── app.py             # The web UI (Flask)
+        ├── manage_users.py    # Command-line management of everyday logins
+        ├── users.py           # Login accounts and password hashing
+        ├── trip_log.py        # Trip removal, change history and tax-year records
+        ├── trip_merges.py     # Merging recordings from one drive
+        ├── geocoding.py       # Optional place lookup
         └── static/            # Leaflet and its GPX plugin, bundled
 
 ## Optional diagnostics notifications
@@ -299,8 +311,13 @@ Step 1).
    and every upload fails with a 500:
 
        mkdir -p data
+       chmod 700 data              # keep trip file names private
        id -u                       # if this isn't 1000:
        sudo chown 1000:1000 data
+
+   Ingest runs as UID 1000 and creates private (mode 700) month folders
+   inside `data/`. If your login's UID isn't 1000, you can't open `data/`
+   afterwards without `sudo`; the commands below that look inside it say so.
 
 2. Copy the example environment file to `.env` so you can fill in
    the real auth token:
@@ -365,8 +382,13 @@ Step 1).
 
    You should see a JSON success response with a `distance_miles` value,
    and find two files at `./data/2026-04/2026-04-14T14-30-00Z.gpx` and
-   `.../2026-04-14T14-30-00Z.json`. Delete both afterwards so the test
-   trip doesn't end up in your mileage log.
+   `.../2026-04-14T14-30-00Z.json`. If `id -u` isn't 1000, look with
+   `sudo ls data/2026-04`; a plain `ls` says "Permission denied", which looks
+   like a failed upload. Delete both afterwards (with `sudo` in the same case)
+   so the test trip doesn't end up in your mileage log, its viewer totals or
+   its exports:
+
+       sudo rm data/2026-04/2026-04-14T14-30-00Z.gpx data/2026-04/2026-04-14T14-30-00Z.json
 
    Leave out `X-Device-Id` for this synthetic upload. Adding it registers a
    device for diagnostics monitoring; deleting the trip files does not remove
@@ -377,10 +399,12 @@ Step 1).
    token generated in step 3.
 
    A timed GPX always gets its ID from its earliest point time (or metadata
-   time when no point is timed), in UTC. `X-Trip-Id` is ignored for timed GPX;
-   it can name an untimed upload, except that timestamp-shaped IDs are reserved
-   for timed GPX. Firmware never sends that header: local
-   filenames (`t000001.gpx`, for example) use an NVS counter, while each
+   time when no point is timed), in UTC. `X-Trip-Id` is used only when the GPX
+   has no `<time>` anywhere, neither on points nor in `<metadata>`; otherwise it
+   is ignored. It can then name that upload, except that timestamp-shaped IDs
+   are reserved for timed GPX. Firmware never sends that header: local
+   filenames (`t000001.gpx`, for example) use a counter kept in the board's
+   flash settings (NVS, the ESP32's non-volatile storage), while each
    uploaded size-split piece starts at its own boundary fix. Retries search
    all month directories under the upload lock and keep the original folder,
    including after a `DISPLAY_TZ` change. Existing duplicate folders require
@@ -394,6 +418,10 @@ Step 1).
    derived mileage/speeds with 400 before writing trip files. Old backlog since
    2000 remains valid. GPX creator and the two identity headers are limited to
    128 characters; diagnostics device labels use the stricter 32-character rule.
+   The board treats 400 and 413 as final: it renames that trip to `.bad` on its
+   storage and doesn't retry it, so a trip rejected by one of these checks is
+   missing from the mileage log until someone reads the card. See the
+   [firmware guide's upload troubleshooting](../firmware/README.md#check-recording-and-uploads).
 
    `INGEST_AUTH_TOKEN` must be nonempty, with no whitespace or control characters;
    invalid settings stop ingest at startup. New data directories are private
@@ -436,8 +464,9 @@ Stop the service entirely:
     docker compose down
 
 To update code or dependency versions, first copy the new committed source
-and its `COMMIT` using the archive command above (or copy a fresh GitHub source
-download). Then rebuild **on the server**, from this folder:
+and its `COMMIT` using the
+[manual copy route](../DEPLOY_DEBIAN.md#manual-alternative-copy-server) (or copy
+a fresh GitHub source download). Then rebuild **on the server**, from this folder:
 
     SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build
 
@@ -445,7 +474,9 @@ download). Then rebuild **on the server**, from this folder:
 
 The normal way to browse, audit, and export trips is the `mileage-viewer`
 web UI (see its section in `docker-compose.yml`). But the summary files
-are plain JSON, so you can also use any tool you like.
+are plain JSON, so you can also use any tool you like. The month folders are
+private to UID 1000. If `id -u` isn't 1000, run each command through
+`sudo bash -c '...'`, because your own shell can't expand `data/*` for `sudo`.
 
 Count trips in the current month:
 
@@ -454,6 +485,11 @@ Count trips in the current month:
 Sum total miles for a month with jq:
 
     jq -s 'map(.distance_miles) | add' data/2026-04/*.json
+
+These commands read the raw files, so they include trips an admin removed from
+the log, count the separate parts of a merged drive, and file trips by the
+month the drive ended (the viewer uses the local start date). Use the viewer's
+totals or export for your mileage record.
 
 View the most recent trip summary:
 
@@ -974,7 +1010,9 @@ or home domain can't show a viewer page in a frame and steer the admin's clicks
 onto its buttons. A reverse proxy must not remove these headers.
 
 If you ever do put a TLS reverse proxy in front, set
-`SESSION_COOKIE_SECURE=True` in `mileage-viewer/app.py`.
+`SESSION_COOKIE_SECURE=True` in `mileage-viewer/app.py` and rebuild the viewer
+so the change takes effect. Redo the edit after every update: updating
+overwrites `app.py` and silently puts the cookie back to non-Secure.
 If it also fronts ingest, it must accept request bodies of at least
 `INGEST_MAX_UPLOAD_BYTES` (16 MiB by default; firmware keeps each piece under
 8 MiB). Its request-body read and proxy timeouts must allow a slow upload;
@@ -1030,6 +1068,11 @@ Database snapshots sit beside `annotations.db` as `events.db` and `monitor.db`,
 when present. All database files are covered by `SHA256SUMS`; `INFO` records
 annotation/event counts and monitor status. The script keeps dated local
 snapshots, rsyncs them to another machine, and verifies that copy byte for byte.
+The off-host destination must hold a marker file, `.mileage-backup-target`;
+without it the backup unit fails rather than copying. `install.sh` writes the
+marker for you, and `backup/backup.sh --mark-target` writes it if you set
+`REMOTE` by hand. `REMOTE_PRUNE` defaults to `no`; its rules, when you turn it
+on, are in `DEPLOY_DEBIAN.md` Step 10.
 Each SQLite snapshot is consistent individually; the databases and trip files
 are captured in sequence, rather than in one shared transaction.
 
@@ -1063,17 +1106,16 @@ Setup, the restore test and the restore procedure are in
 Ingest also accepts protocol-v1 diagnostics at `POST /v1/device-events`. The
 same bearer token authenticates it; `X-Device-Id` is required and must be a
 non-personal lowercase label of 1-32 letters/digits, `_` or `-`, starting with
-a letter/digit. Bodies are capped at 32 KiB even for chunked requests. This
-synthetic empty-event heartbeat returns `{"accepted":[]}` after committing:
+a letter/digit. Bodies are capped at 32 KiB even for chunked requests.
 
-```sh
-TOKEN=$(grep '^INGEST_AUTH_TOKEN=' .env | cut -d= -f2-)
-printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -X POST 'http://<host>:8090/v1/device-events' \
-  -H @- \
-  -H 'X-Device-Id: tracker-1' \
-  -H 'Content-Type: application/json' \
-  --data '{"schema_version":1,"checkin":{"boot_id":"00000000000000000000000000000001","status_sequence":1,"uptime_ms":1500,"active":[]},"events":[]}'
-```
+To check that diagnostics work, look at **Device health** in the viewer after
+the tracker's first real upload; it lists the device and its latest snapshot.
+Don't test with a hand-made request. Any new `X-Device-Id` creates a device
+that cannot be removed later, and with the optional monitor on it would
+eventually raise a "no contact for seven days" alert for a tracker that doesn't
+exist. Using your real device ID is no safer: a made-up `status_sequence` would
+set that device's snapshot high-water and interfere with the one-time
+diagnostics enrollment (see [DIAGNOSTICS.md](../DIAGNOSTICS.md)).
 
 Devices must durably increase `status_sequence` for each new snapshot across
 boots; reuse it only for identical retries. Event retries are acknowledged

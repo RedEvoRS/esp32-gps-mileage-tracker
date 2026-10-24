@@ -29,7 +29,8 @@ it has recorded real drives on the microSD card, which were read back on a
 PC. If no card mounts, trips go to the board's internal flash instead,
 which holds about 6 hours of driving. The server has been deployed with its
 installer on Debian 13 on 2026-10-20; `install.sh --check` passed.
-On 2026-10-21 (UTC), the Supreme's Stage 4 debug build uploaded four real
+On 2026-10-21 (UTC), the Supreme's trip logger firmware, running in debug
+mode, uploaded four real
 trips from the card. All four received HTTP 200, were deleted from the
 card and appeared in the viewer. Diagnostics arrived too: all 115 pending
 events and a current snapshot were visible in Device health.
@@ -268,7 +269,12 @@ Trips ended by the stop timer or lost GPS are discarded if shorter than
 trips that have started.
 
 Open `http://<host>:8091/` and sign in with the admin login. You can add an
-optional everyday login during setup for whoever annotates trips. Check the
+optional everyday login during setup for whoever annotates trips. The
+everyday login can annotate, merge and export trips and see Device health. Only
+the admin login can remove trips (reversibly), see the change history, manage
+everyday logins, and close or reopen a tax year; a closed year blocks edits
+for everyone. The full table is in
+[Viewer Login](server/README.md#viewer-login). Check the
 trip, then open **Device health** and check for a newly received
 **current status snapshot**. A listed device or recent trip contact alone does not prove
 that diagnostics enrollment succeeded. See
@@ -347,9 +353,11 @@ without a card) until the server accepts them; see
 [microSD card](firmware/README.md#microsd-card). You can also take the card
 out, with the board switched off, and read the files on a PC.
 
-Once a trip is on the server, nothing changes it. The viewer mounts the trip
-folder read-only and keeps your notes in its own SQLite database, so editing
-a trip's purpose can't touch the record underneath. If the summary ever gets
+Once a trip is on the server, its files are never edited. The viewer mounts
+the trip folder read-only and keeps your notes in its own SQLite database, so
+editing a trip's purpose can't touch the record underneath. Removing a trip
+and merging trips are recorded in that same viewer database; the original
+`.gpx` and `.json` files stay where they are. If the summary ever gets
 lost, it can be rebuilt from the GPX.
 
 Times are stored in UTC, which is what the GPS reports, and shown in your
@@ -375,7 +383,10 @@ The upload endpoint checks a bearer token and the viewer has a login, but
 it's all plain HTTP, so anyone who can see the traffic can see the
 credentials. The login keeps other people and devices on your network out of
 your trips; it isn't a replacement for TLS. If you do put a TLS reverse proxy
-in front, set `SESSION_COOKIE_SECURE=True` in `mileage-viewer/app.py`.
+in front, set `SESSION_COOKIE_SECURE=True` in `mileage-viewer/app.py` and
+rebuild the viewer so the change takes effect. Redo the edit after every
+update: updating overwrites `app.py` and silently puts the cookie back to
+non-Secure.
 If it also fronts ingest, allow bodies of at least `INGEST_MAX_UPLOAD_BYTES`
 (16 MiB by default; firmware pieces stay under 8 MiB) and slow uploads
 (gunicorn allows 900 s). A proxy's HTTP 413 sets the trip aside as `.bad`
