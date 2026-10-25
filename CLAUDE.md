@@ -392,7 +392,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   monitor settings/token, defaults to disabled `monitor.env.example` for normal
   install/--check. Disabled monitor idles without DB reads. Optional `ntfy`
   profile uses port 8092 with `BIND_ADDR`, deny-all auth and `ntfy-state` cache/auth
-  volume. Self-hosted only; iOS instant push requires ntfy.sh wake-up relay
+  volume. `.env` `NTFY_BASE_URL` and `NTFY_BEHIND_PROXY` (default false)
+  survive updates; hand edits to shipped `ntfy/server.yml` do not.
+  Self-hosted only; iOS instant push requires ntfy.sh wake-up relay
   (no message text), Android does not. install.sh's Notifications step turns them on
   (INSTALL_OUTPUTS); the by-hand route is DEPLOY_DEBIAN Step 11.
 - Optional Graylog export (`gelf.py`): `GRAYLOG_ENABLED` plus exactly one

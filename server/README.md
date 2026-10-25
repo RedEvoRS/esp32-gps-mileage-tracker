@@ -1022,7 +1022,10 @@ onto its buttons. A reverse proxy must not remove these headers.
 
 For HTTPS through Caddy or Nginx Proxy Manager, set `VIEWER_COOKIE_SECURE=true`
 in `.env`, then run `docker compose up -d`. Set `VIEWER_TRUSTED_PROXIES` to
-the proxy's peer address so login lockout still counts each client separately.
+the proxy's peer address so login lockout can count each client separately.
+NPM also needs the Advanced setting and forged-header check in the guide
+below: its defaults let LAN clients forge their address and evade lockout.
+Use a strong viewer password with either proxy.
 `VIEWER_BIND_ADDR` overrides `BIND_ADDR` for port 8091 only; empty keeps the
 existing binding. A host-networked proxy can use `127.0.0.1`, closing the
 viewer HTTP port on the LAN; a bridge-networked proxy needs the host's LAN IP.

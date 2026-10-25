@@ -391,8 +391,11 @@ it's all plain HTTP, so anyone who can see the traffic can see the
 credentials. The login keeps other people and devices on your network out of
 your trips; it isn't a replacement for TLS. For HTTPS names through Caddy or
 Nginx Proxy Manager, set `VIEWER_COOKIE_SECURE=true` in `server/.env` and run
-`docker compose up -d` from `server/`. `VIEWER_TRUSTED_PROXIES` preserves
-per-client login lockout; `VIEWER_BIND_ADDR` can limit only the viewer's
+`docker compose up -d` from `server/`. `VIEWER_TRUSTED_PROXIES` lets login
+lockout count each client when the proxy supplies its real address. NPM also
+needs the Advanced setting and forged-header check in the guide below;
+its defaults let LAN clients forge their address and evade that lockout.
+Use a strong viewer password. `VIEWER_BIND_ADDR` can limit only the viewer's
 8091 port to loopback while ingest stays on `BIND_ADDR` port 8090.
 The [private reverse-proxy guide](DEPLOY_DEBIAN.md#behind-a-reverse-proxy-caddy-or-nginx-proxy-manager)
 covers Docker networking, certificates and Tailscale access without internet exposure.

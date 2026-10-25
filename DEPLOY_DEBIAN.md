@@ -951,8 +951,10 @@ The viewer ignores X-Forwarded-For from untrusted peers. From trusted peers,
 it combines all header instances, walks right to left, skips invalid entries
 and trusted hops, and uses the first valid untrusted address for login
 lockout and failed-login logging. A missing, wholly invalid or entirely
-trusted chain falls back to the direct peer IP. Both Caddy and NPM supply
-X-Forwarded-For; no X-Real-IP setting or hop count is needed. `--check`
+trusted chain falls back to the direct peer IP. Caddy supplies X-Forwarded-For
+from the connection by default, [without trusting client-supplied addresses](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#headers);
+NPM needs the additional setting below before its headers can be trusted.
+Use a strong viewer password with either proxy. `--check`
 reports the selected viewer address and checks health there; with Secure
 cookies enabled it skips authenticated HTTP tests and asks you to test
 logging in through the HTTPS name yourself.
@@ -988,27 +990,63 @@ NPM's admin UI is on port **81**: keep it off the internet and set a strong
 login. See [NPM's setup guide](https://nginxproxymanager.com/guide/) for its
 container and certificate storage.
 
+In this viewer Proxy Host's **Advanced** field, add this line and save:
+
+```nginx
+set_real_ip_from unix:;
+```
+
+NPM 2.16.0 trusts incoming `X-Real-IP` from private IPv4 ranges by default.
+A LAN client can choose that header, making NPM forward a made-up client
+address; rotating it evades the viewer's five-failures/15-minute lockout
+and puts false addresses in the failed-login log. The line above replaces
+NPM's inherited trust list for this Proxy Host with Unix sockets only, so
+TCP clients cannot rewrite their address. Keep NPM directly reachable by
+the clients: if another proxy sits in front, this setup counts that proxy
+as the client and needs a separate, carefully limited trust configuration.
+Do not add server-level `proxy_set_header` overrides here: NPM's generated
+location supplies its own headers, which replace inherited ones. See the
+[NPM host template](https://github.com/NginxProxyManager/nginx-proxy-manager/blob/v2.16.0/backend/templates/proxy_host.conf)
+and [nginx real-IP directives](https://nginx.org/en/docs/http/ngx_http_realip_module.html).
+
+**Check the client address with either proxy.** From a separate LAN client,
+open the HTTPS login page, then use the browser's developer tools **Network**
+tab to copy one deliberately failed login request as curl. Use a made-up
+username and password, never your real credentials. Run that copied command
+promptly with `-H 'X-Real-IP: 198.51.100.77'` added; keep its session cookie
+and `csrf_token` so the viewer accepts it as a login attempt. In
+`docker compose logs --since 2m mileage-viewer`, find `Failed login ... from`:
+it must show the client's connection address (or its network's NAT address),
+not `198.51.100.77`. A 400 means the session/CSRF check failed; copy a fresh
+request and retry. A 429 means that address is locked; wait 15 minutes.
+If the forged address appears, fix the proxy configuration before relying
+on per-client lockout. Repeat this check after proxy upgrades.
+
 **Leave ingest unproxied for now.** If you ever proxy it, allow 16 MiB request
-bodies and 900 s timeouts. nginx/NPM's default `client_max_body_size` is `1m`;
-NPM's **Advanced** field would need `client_max_body_size 16m;` plus the
-timeout settings. Follow the existing [upload/proxy limits and HTTP 413
+bodies and 900 s timeouts. Plain nginx defaults to `client_max_body_size 1m`
+(1 MiB); NPM 2.16.0 instead sets `2000m` (2000 MiB) in its
+[nginx configuration](https://github.com/NginxProxyManager/nginx-proxy-manager/blob/v2.16.0/docker/rootfs/etc/nginx/nginx.conf).
+Check the effective proxy limit against ingest's 16 MiB cap; `16m` raises
+plain nginx's default but lowers NPM's. Check the timeout settings too.
+Follow the existing [upload/proxy limits and HTTP 413
 consequences](server/README.md#security-notes) before changing that path.
 
 **ntfy through a proxy.** Give it its own name, forwarding to the bundled
 ntfy's host port 8092 (use the LAN IP from a bridge-networked proxy).
-In `server/ntfy/server.yml` in a source checkout, or `ntfy/server.yml` in
-the installed server folder, set:
+In `server/.env` in a source checkout, or `.env` in the installed server
+folder, set:
 
-```yaml
-base-url: "https://ntfy.home.<domain>"
-behind-proxy: true
+```dotenv
+NTFY_BASE_URL=https://ntfy.home.<domain>
+NTFY_BEHIND_PROXY=true
 ```
 
-Set `.env` `NTFY_BASE_URL=https://ntfy.home.<domain>` to the same URL, since
-the Compose environment can override the YAML value. `base-url` is ntfy's
-external URL; `behind-proxy` makes its visitor rate limiting use forwarded
-client addresses instead of counting everyone as the proxy. Restrict access
-to the backend to your private network/proxy and see [ntfy's proxy
+These settings survive updates; hand edits to shipped `ntfy/server.yml` are
+replaced. Compose passes them to ntfy and overrides the corresponding YAML
+settings. `NTFY_BASE_URL` is ntfy's external URL; `NTFY_BEHIND_PROXY=true`
+makes its visitor rate limiting use forwarded client addresses instead of
+counting everyone as the proxy. Leave it unset or `false` without a proxy.
+Restrict access to the backend to your private network/proxy and see [ntfy's proxy
 settings](https://docs.ntfy.sh/config/#behind-a-proxy-tls-etc) for trusted-hop
 controls; these are independent of `VIEWER_TRUSTED_PROXIES`. Recreate ntfy
 with `docker compose --profile ntfy up -d --force-recreate ntfy`. Resubscribe

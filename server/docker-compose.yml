@@ -162,6 +162,7 @@ services:
       - ntfy-state:/var/lib/ntfy
     environment:
       - NTFY_BASE_URL=${NTFY_BASE_URL:-}
+      - NTFY_BEHIND_PROXY=${NTFY_BEHIND_PROXY:-false}
 
 # Separate named volumes; none of these lives in the ingest data directory.
 volumes:

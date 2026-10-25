@@ -323,6 +323,8 @@ class InstallerOutputs(unittest.TestCase):
         self.assertEqual(self.sent(), [])
 
     def test_keep_yes_starts_the_bundled_ntfy_too(self):
+        with self.env_file.open("a", encoding="utf-8") as config:
+            config.write("NTFY_BEHIND_PROXY=true\n")
         setup = self.run_step(INSTALL_OUTPUTS="ntfy", INSTALL_NTFY_MODE="bundled", INSTALL_NTFY_TOPIC="mileage-tracker",
                               INSTALL_NTFY_USER="mileage", INSTALL_NTFY_PASSWORD=PHONE_PASSWORD,
                               INSTALL_NTFY_READY="n", FAKE_USERS="")
@@ -335,6 +337,7 @@ class InstallerOutputs(unittest.TestCase):
         self.assertIn("up -d --build --no-deps mileage-monitor", log)
         self.assertNotIn("user add", log)
         self.assertEqual(self.sent(), [])
+        self.assertEqual(self.setting("NTFY_BEHIND_PROXY", ".env"), "true")
 
     def test_keep_yes_recreates_the_monitor_after_a_hand_edit(self):
         # The monitor is running with the settings from before the owner added

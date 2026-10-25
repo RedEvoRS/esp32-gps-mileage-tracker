@@ -54,8 +54,10 @@ docker compose version
 ```
 
 Both commands must work before setup. There is no `sudo`, apt or systemd
-setup on this route. Containers still run as the non-root application user,
-UID/GID **1000:1000**. Root on the host can maintain their private files.
+setup on this route. Ingest, viewer and monitor run as the non-root application
+user, UID/GID **1000:1000**. The optional bundled ntfy runs as root inside its
+container and keeps its state in the `ntfy-state` volume. Root on the host
+can maintain their private files.
 The installer creates and checks `data/` with that ownership and mode 700.
 
 Allow space on both the install pool and Docker's storage. Setup checks
@@ -79,7 +81,10 @@ Use a simple path with letters, digits, underscores, dots, hyphens and
 slashes; spaces are refused. Setup extracts on the target disk, verifies
 the release checksum, and copies the server files directly into that folder.
 It preserves private configuration, trip data, backup keys, backup logs and
-state on updates. Rerun the release helper with the same `--dir` to update.
+state on updates. Hand edits to shipped files such as `ntfy/server.yml` are
+replaced on update; use the `.env` settings for ntfy's proxy configuration
+described in [Debian Step 7](DEPLOY_DEBIAN.md#behind-a-reverse-proxy-caddy-or-nginx-proxy-manager).
+Rerun the release helper with the same `--dir` to update.
 
 Setup runs `install.sh`. Answer its questions about the LAN bind address,
 display timezone, viewer admin, optional everyday login, backups and optional
@@ -143,9 +148,11 @@ Unraid's own web UI normally uses **80/443**. This stack uses:
 
 These app ports do not conflict with 80/443. Unraid has no UFW-style host
 firewall for this setup. Choose the server's LAN IP for `BIND_ADDR` in
-`.env`; blank or `all` publishes on every interface. Binding is the LAN-only
-control here. It does not replace router rules between networks. Do not
-forward these ports from the internet.
+`.env`; an empty `BIND_ADDR=` publishes on every interface. `all` is only an
+answer to the installer's prompt, which writes that empty value. Do not put
+`BIND_ADDR=all` in `.env`: Compose rejects it as an invalid IP address.
+Binding is the LAN-only control here. It does not replace router rules between
+networks. Do not forward these ports from the internet.
 
 For HTTPS, follow [Debian Step 7's reverse-proxy section](DEPLOY_DEBIAN.md#behind-a-reverse-proxy-caddy-or-nginx-proxy-manager).
 The viewer proxy settings are the same. If the proxy takes host ports
@@ -155,9 +162,16 @@ the firmware's plain HTTP upload connection.
 
 For viewer use and account management, follow the
 [viewer guide](server/README.md#viewer--export-ui). For notifications and
-external dashboards, follow [Debian Step 11](DEPLOY_DEBIAN.md#step-11--optional-device-notifications).
-Run its Compose commands from this install directory as root. Its systemd,
-sudo and Debian firewall instructions do not apply on Unraid.
+external dashboards, rerun `bash install.sh` from this install directory as
+root. At **Notifications**, answer **no** to **Keep them as they are?** if
+outputs are already configured, then choose the outputs you want. Keep the
+other existing settings when asked. The installer stamps and builds the monitor
+using a disposable Python container when host `python3` is absent.
+[Debian Step 11](DEPLOY_DEBIAN.md#step-11--optional-device-notifications)
+explains the outputs and dashboard setup, but its manual build commands use
+host `python3`: that fallback works only inside `install.sh`, not in commands
+pasted into the shell. Its systemd, sudo and Debian firewall instructions do
+not apply on Unraid.
 
 ## Step 3 — Understand restarts
 
@@ -350,9 +364,15 @@ to confirm uploads and a fresh Device health snapshot.
 3. **Install on Unraid using Steps 0–2.** Before the first setup, create the
    chosen install directory and privately transfer the old `.env` and
    `viewer.env` into it. Keep them root-owned and mode 600. Edit the old
-   `BIND_ADDR` for the new LAN IP if needed. Setup preserves these files
-   and writes `RESTART_POLICY=always`. Keep the old ingest token and
-   `DISPLAY_TZ` so existing firmware and month grouping remain consistent.
+   `BIND_ADDR` and any `VIEWER_BIND_ADDR` for the new host if needed:
+   `VIEWER_BIND_ADDR` wins over `BIND_ADDR` for the viewer's port, so an old
+   LAN IP there prevents the viewer from starting. Keep loopback only if
+   the new proxy runs on the host or uses host networking. For a proxy,
+   change its forwarding destination to the new host, rediscover its peer
+   for `VIEWER_TRUSTED_PROXIES` using [Debian Step 7](DEPLOY_DEBIAN.md#behind-a-reverse-proxy-caddy-or-nginx-proxy-manager),
+   and test an HTTPS login before accepting the move. Setup preserves
+   these files and writes `RESTART_POLICY=always`. Keep the old ingest token
+   and `DISPLAY_TZ` so existing firmware and month grouping remain consistent.
    Restore optional output settings deliberately; avoid enabling the monitor
    until its old state is restored. Skip the firmware build if no firmware
    settings need to change.
