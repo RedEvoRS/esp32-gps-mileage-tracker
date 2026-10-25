@@ -120,10 +120,11 @@ class InstallerUnraid(unittest.TestCase):
 
     def test_configure_sets_restart_policy_only_on_unraid(self):
         for platform in ("unraid", "debian"):
-            (self.work / ".env").write_text("INGEST_AUTH_TOKEN=" + "a" * 32 + "\n")
+            (self.work / ".env").write_text("INGEST_AUTH_TOKEN=" + "a" * 32 + "\nNTFY_BEHIND_PROXY=true\n")
             self.run_step('setup_bind_addr() { :; }; setup_viewer_proxy() { :; }; setup_display_tz() { :; }; setup_env',
                           MILEAGE_PLATFORM=platform)
             self.assertEqual("RESTART_POLICY=always" in (self.work / ".env").read_text(), platform == "unraid")
+            self.assertIn("NTFY_BEHIND_PROXY=true\n", (self.work / ".env").read_text())
 
     def test_missing_required_command_and_coreutils_features_give_unraid_hints(self):
         out = self.run_step(r'''
