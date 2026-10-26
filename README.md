@@ -113,6 +113,12 @@ checked against the car's odometer before a release pass mark is set.
   before inserting the battery or connecting USB**: factory firmware may
   transmit even though this project does not use LoRa. Match the battery's
   polarity to the holder. Use a car USB port that switches off with the ignition.
+- **A case.** The tested one is a
+  [remix of Alley Cat's T-Beam Supreme case with an external GPS window](https://makerworld.com/en/models/3496457-alley-chat-ts2-tbeam-supreme-remixed-external-gps)
+  (CC BY-SA, like the [original](https://makerworld.com/models/574656-alley-chat-ts2-new-tbeam-supreme-case-by-alley-cat)),
+  printed in PETG, which copes with a hot car better than PLA. The original
+  case knocks the GPS antenna plug off; see
+  [Fitting it in the case](firmware/README.md#fitting-it-in-the-case).
 - **A Debian 13 server** on your home network, with a stable LAN address,
   SSH access, a normal login with sudo, and **Docker Engine with Compose v2**
   already usable by that login. [Deployment Steps 0–1](DEPLOY_DEBIAN.md#step-0--confirm-ssh-works)
