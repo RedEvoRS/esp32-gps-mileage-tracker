@@ -9,7 +9,9 @@ USB device for a car. Logs trips automatically; user annotates purpose later.
 version (not L76K)** (ESP32-S3 + SX1262 LoRa + AXP2101 PMU + microSD +
 SH1106 OLED + PCF8563 RTC) at 915 MHz. 18650 battery. The selected trip
 storage card is a **SanDisk 32 GB Max Endurance microSD**. Enclosure is a
-PETG print of a published Supreme case.
+PETG print of the owner's published remix of Alley Cat's Alley Chat TS2
+Supreme case (CC BY-SA, MakerWorld; adds a GPS connector window). Links
+and fitting steps: `firmware/README.md` "Fitting it in the case".
 
 **Old hardware, frozen branch:** the project started on the LilyGO TTGO
 T-Beam V1.2 (ESP32 + NEO-M8N). It's retired: its 2.375 MB trip partition

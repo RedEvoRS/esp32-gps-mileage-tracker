@@ -227,6 +227,27 @@ runs on the Supreme and has recorded real drives on the microSD card.
   Unplugging USB does not switch the board off while a cell is fitted. It
   powers the upload window and clean storage shutdown after the car turns off.
 
+### Fitting it in the case
+
+The tested case is the
+[Alley Chat TS2 T-Beam Supreme remix with an external GPS window](https://makerworld.com/en/models/3496457-alley-chat-ts2-tbeam-supreme-remixed-external-gps),
+printed in PETG. It is a remix of Alley Cat's
+[Alley Chat TS2 NEW TBeam SUPREME Case](https://makerworld.com/models/574656-alley-chat-ts2-new-tbeam-supreme-case-by-alley-cat);
+both are licensed CC BY-SA. The original case leaves too little room for
+the GPS antenna's push-on plug: closing it knocked the plug off, and the
+tracker then logs no positions while still looking alive. The remix adds a
+window at the GPS connector so nothing presses on the plug.
+
+- **Seat the GPS plug first** (it clicks), then fit the board. A small
+  piece of Kapton tape over the plug helps it stay put. These plugs are
+  rated for only about 30 connections and loosen a little each time.
+- **Push the board fully down into the top piece.** A board that isn't
+  fully seated leaves buttons stiff or dead, and the screen may not answer
+  at power-on (code E6001, dark screen for the whole drive).
+- **Check before the first drive:** every button clicks, the screen lights
+  at power-on, and a tap on POWER outdoors shows satellites. No satellites
+  at all, even outside, usually means the GPS plug has come off again.
+
 ### Buttons
 
 Hold the board (or its case) with the screen on the left and the USB-C
