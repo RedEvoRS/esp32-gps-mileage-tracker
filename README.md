@@ -24,42 +24,14 @@ when GPS time is unavailable.
 
 ## Where it's at
 
-As of 2026-11-01 (UTC, Coordinated Universal Time), the board runs firmware
-**v0.11** (`v0.11+f6b0b1c96a`, tag `fw-v0.11`), the release candidate, and
-server **v0.10** is deployed. The release-candidate driving week **passed**
-on that date: all 27 trips were accounted for, and the annotated log and
-exports were checked. The v1.00 version bumps will happen at release time;
-v1.00 is not out yet.
-
-The bring-up sketches and the trip logger were checked on a real board in
-October 2026: the logger switches the board off when the car is parked and
-back on when the car starts. It has recorded real drives on the microSD
-card, which were read back on a PC. If no card mounts, trips go to the
-board's internal flash instead,
-which holds about 6 hours of driving. The server has been deployed with its
-installer on Debian 13 on 2026-10-20; `install.sh --check` passed.
-On 2026-10-21 (UTC), the Supreme's trip logger firmware, running in debug
-mode, uploaded four real trips from the card. All four received HTTP 200, were deleted from the
-card and appeared in the viewer. Diagnostics arrived too: all 115 pending
-events and a current snapshot were visible in Device health.
-Uploads with debug mode off and server-down retry were also verified on
-2026-10-21 (UTC). On the bench on 2026-11-01 (UTC), server errors (HTTP 5xx)
-kept trips queued with E5008 ("Server unavailable"); they uploaded after
-recovery. A wrong token gave HTTP 401 and E5004 ("Upload unauthorized") on a
-small file, but a roughly 3 MB file saw a broken send (`HTTP -3`, E5003,
-"Upload link failed") instead. Both stayed queued and uploaded after recovery.
-Retried diagnostics batches created no duplicate events.
-Uploads from internal flash (LittleFS, the internal flash filesystem) and
-HTTP 413 handling remain untested on the Supreme.
-
-Still to check on the road: the everyday (production) screen. A trip ending
-in a parking garage remains untested and is deferred until after v1.00.
-Engine crank, start-stop, the GPS hot start and the parked battery drain
-have been checked on the road; the drain was estimated from battery readings
-across parked hours, without a meter. Distance accuracy
-has not been measured against the car's odometer; no numeric accuracy target
-was used for the release-candidate pass.
-Project progress is tracked in GitHub issues.
+The tracker and server are in daily use. **v1.00**, the first public
+release of both the firmware and the server, came out on 2026-11-01 (UTC),
+after a week of everyday driving on the release candidate in which every trip
+was recorded, uploaded and exported correctly. Still unproven on the Supreme:
+uploads from the internal-flash fallback (used when no microSD card mounts),
+trips that end in a parking garage, and distance accuracy against the car's
+odometer. Open work is tracked in
+[GitHub issues](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/issues).
 
 **Have the older T-Beam V1.2?** This project started on the LilyGO TTGO
 T-Beam V1.2 (ESP32 + NEO-M8N) and no longer supports it. Its last firmware

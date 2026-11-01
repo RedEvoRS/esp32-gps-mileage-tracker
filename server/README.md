@@ -20,10 +20,10 @@ debug mode off and server-down retry were also verified on 2026-10-21
 (UTC): two `HTTP -1` failures kept the trip queued, then HTTP 200 after
 ingest restarted deleted the local file.
 
-As of 2026-11-01 (UTC), the deployed server is **v0.10**. The board runs
-**v0.11+f6b0b1c96a** (tag `fw-v0.11`), the release candidate. Its week of
-normal driving passed on 2026-11-01 (UTC); the version bump to v1.00 waits
-for release time.
+As of 2026-11-01 (UTC), the deployed server and the board's firmware are
+both **v1.00** (tag `fw-v1.00`), the first public release. The release
+candidate, firmware `v0.11`, passed its week of normal driving on 2026-11-01
+(UTC).
 
 Bench checks on 2026-11-01 (UTC) also passed server-error recovery and
 diagnostics deduplication (retried batches stored each event once). HTTP 503 kept both a small trip and a roughly
