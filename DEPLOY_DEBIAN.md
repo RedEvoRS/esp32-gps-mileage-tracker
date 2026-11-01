@@ -11,12 +11,17 @@ Deploys both services from `server/`:
 | `ntfy` | 8092 | Topic token | Optional self-hosted phone notifications |
 | `mileage-monitor` | 8093 | Bearer token when enabled | Optional Prometheus `/metrics` endpoint in the `monitor` profile |
 
-This is the server half of the project. The [top-level README](README.md)
+GPX is GPS Exchange Format, the track file the board uploads. This is the
+server half of the project. The [top-level README](README.md)
 gives the complete setup. The board is the T-Beam Supreme with MAX-M10S
 GPS and a SanDisk 32 GB Max Endurance microSD card. Step 8 covers its
 server-built firmware, flashing and one-time diagnostics enrollment. The retired
 T-Beam V1.2's last firmware and instructions are on the frozen
 [`tbeam-v1.2` branch](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/tree/tbeam-v1.2).
+
+As of 2026-11-01 (UTC), firmware `v0.11` (tag `fw-v0.11`) is the release
+candidate and its driving week has passed. The server is v0.10; the v1.00
+version bump is still pending. Unraid has not yet been verified on a real box.
 
 Assumes: Debian 13, a non-root user with sudo, SSH reachable.
 Placeholders: `<user>` = your Debian login, `<host>` = server IP or hostname,
@@ -42,8 +47,8 @@ personal tracker firmware on the server. No source clone is needed.
 The PC connected to the board then runs the flash script from
 [README Step 2](README.md#step-2--flash-the-tracker).
 
-`install.sh` configures the LAN bind address, timezone, admin login, optional
-everyday login, backups and optional alert/dashboard outputs, and builds/starts
+`install.sh` configures the local network (LAN) bind address, timezone, admin
+login, optional everyday login, backups and optional alert/dashboard outputs, and builds/starts
 the services. It tests a sample upload, admin login, list, map and both
 exports, then removes the sample. It also tests the everyday login when that
 login is added during this run and its password is supplied. It asks for sudo when needed; run
@@ -73,7 +78,7 @@ missing answers fail. The base presets are:
 
 - `INSTALL_BIND_ADDR`: this server's LAN IP, needed if `.env` has no valid
   bind address. `all` deliberately publishes on every interface.
-- `INSTALL_DISPLAY_TZ`: an IANA timezone such as `Europe/London`, needed if
+- `INSTALL_DISPLAY_TZ`: a named timezone such as `Europe/London`, needed if
   `.env` has no valid zone.
 - `INSTALL_VIEWER_USER` and `INSTALL_VIEWER_PASSWORD`: the admin login,
   needed on first install or when replacing it. The password must have at
@@ -115,16 +120,17 @@ history. Sudo must already work without a prompt for the unattended run
 (for example, authenticate with `sudo -v` in this shell first):
 
 ```bash
-read -rs -p 'Admin password (at least 8 characters): ' VIEWER_PASSWORD; echo
+(  # Keep the password preset only for this run, out of command arguments.
+IFS= read -rs -p 'Admin password (at least 8 characters): ' INSTALL_VIEWER_PASSWORD; echo
+export INSTALL_VIEWER_PASSWORD
 env INSTALL_BIND_ADDR='<host>' \
   INSTALL_DISPLAY_TZ=Europe/London \
   INSTALL_VIEWER_USER='<admin>' \
-  INSTALL_VIEWER_PASSWORD="$VIEWER_PASSWORD" \
   INSTALL_WAIT_ONLINE=y \
   INSTALL_BACKUPS=n \
   INSTALL_OUTPUTS=none \
   bash setup.sh --yes
-unset VIEWER_PASSWORD
+)
 ```
 
 Here `<host>` must be the server's LAN IP, not its hostname, and
@@ -159,8 +165,11 @@ If `id -u` is **not** 1000, see the note in Step 3.
 
 Run this section **on the server**, in the SSH session from Step 0.
 
-Debian's repos ship an old/renamed Docker. Use Docker's official repo so you
-get the `docker compose` plugin (v2 or newer), not the deprecated `docker-compose`.
+Use Docker's official repository for Engine and the `docker compose` plugin
+(v2 or newer), matching `install.sh`. These commands assume Docker has not
+already been installed; for an existing installation, check Docker's
+[Debian prerequisites](https://docs.docker.com/engine/install/debian/#uninstall-old-versions)
+for conflicting packages before continuing.
 
 ```bash
 sudo apt update && sudo apt upgrade -y
@@ -238,7 +247,8 @@ and `/` (a space, for example) and installs nothing. They also need an SSH
 hostname or IPv4 address.
 It then runs `install.sh` to configure, rebuild,
 start and verify the services. Choose the **LAN IP for `BIND_ADDR`**: UFW
-does not filter Docker-published ports; see [Step 7](#step-7--firewall-and-network).
+(Uncomplicated Firewall) does not filter Docker-published ports; see
+[Step 7](#step-7--firewall-and-network).
 Backups and optional notification outputs are explained in Steps 10–11.
 
 Accept the firmware-build offer to continue to the board. The builder asks
@@ -303,7 +313,7 @@ on the server to display the exact source commit without a Git clone there.
 Use **`git archive HEAD server`**, not **`git archive HEAD:server`**: the latter
 selects a tree rather than a commit, so Git leaves the `$Format:%H$`
 placeholder unexpanded and the server can only report the release number.
-[Git's archive attributes](https://git-scm.com/docs/gitattributes#Documentation/gitattributes.txt-export-subst)
+[Git's archive attributes](https://git-scm.com/docs/gitattributes#_export_subst)
 require a commit or tag for this substitution.
 
 Do not run this binary archive pipeline in **Windows PowerShell 5.1**: it can
@@ -486,7 +496,7 @@ not the password used for SSH or for the viewer web page.
 
 **`DISPLAY_TZ` has no default.** It's the timezone every trip time is
 shown and exported in, and ingest uses it to pick the month folder a trip
-is filed in. Use your zone's IANA name, `America/Chicago` or
+is filed in. Use a timezone name, `America/Chicago` or
 `Europe/London`, say; `timedatectl list-timezones` lists them all. Never
 use a fixed offset like `-06:00`; it's an hour wrong for half the year
 wherever clocks change for daylight saving. Leave it blank and both
@@ -555,15 +565,8 @@ VIEWER_SECRET_KEY=<the openssl rand output>
 it logs you out everywhere, and it has to be identical across both gunicorn
 workers, which is why it's configured rather than generated at startup.
 
-These values configure the admin, not an everyday account. After the viewer
-image is built in Step 5, add an optional everyday login from this directory.
-The password is read from standard input by `manage_users.py`:
-
-```bash
-read -rs -p 'Everyday password: ' new_password; printf '\n'
-printf '%s\n' "$new_password" | docker compose run --rm --no-deps -T mileage-viewer python manage_users.py add '<everyday-user>'
-unset new_password
-```
+These values configure the admin, not an everyday account. Step 5 includes
+the optional everyday login after the viewer image is built.
 
 ---
 
@@ -640,6 +643,15 @@ docker compose ps
 Wait for both containers to show `healthy` (the healthchecks have a 10s start
 period and 30s interval, so give it ~45 seconds). If one says `unhealthy` or
 `restarting`, jump to Troubleshooting.
+
+To add an optional everyday login, run this from the same directory. The shell
+reads the password privately and passes it on standard input to `manage_users.py`:
+
+```bash
+read -rs -p 'Everyday password (8–1024 characters): ' new_password; printf '\n'
+printf '%s\n' "$new_password" | docker compose run --rm --no-deps -T mileage-viewer python manage_users.py add '<everyday-user>'
+unset new_password
+```
 
 ---
 
@@ -733,13 +745,13 @@ curl -s -o /dev/null -w "%{http_code} %{redirect_url}\n" "http://$H:8091/"
 Expect `302 .../login`. If you get `200`, auth is not engaged — stop and
 check `docker compose logs mileage-viewer`.
 
-**Verify the hash survived into the container intact:**
+**Verify the hash separators survived into the container without printing it:**
 
 ```bash
-docker compose exec mileage-viewer env | grep VIEWER_PASSWORD_HASH
+docker compose exec mileage-viewer python -c 'import os; print("Hash separators present" if os.environ["VIEWER_PASSWORD_HASH"].count("$") == 2 else "Hash separators missing")'
 ```
 
-The value must still contain its `$` separators. If they're gone, re-quote it
+Expect `Hash separators present`. If they're missing, re-quote the hash
 in `viewer.env` and `docker compose up -d mileage-viewer`.
 
 **Viewer, from a browser on your computer:**
@@ -792,8 +804,9 @@ aliases and cached summaries live in three additive tables in the existing
 workers and retains existing rows. The normal database backup/restore includes
 these tables. Back up both the database and trip files, since trip files alone
 cannot restore merges. Cached summaries keep list views fast and refresh when
-source GPX/JSON file stamps or the shared rule version change. Missing or
-unreadable sources flag a merge as unreadable and exclude it from totals; the
+source GPX/JSON file stamps change. A rule-version change alone does not
+recalculate saved mileage. Missing or unreadable sources flag a merge as
+unreadable and exclude it from totals; the
 list warning still offers Undo. All merge/Undo changes use authenticated,
 CSRF-protected POSTs. See [Merge recordings from one drive](server/README.md#merge-recordings-from-one-drive)
 for the annotation and timing details.
@@ -1093,6 +1106,11 @@ HTTPS names connect and the viewer login works.
 
 ## Step 8 — Point the firmware at it
 
+The Windows `flash.ps1` first-install and `-Cleanup` paths, and all of
+`flash.sh`, still need testing on a real board. The steps below describe the
+scripts' intended behavior; automated checks do not establish those hardware
+results.
+
 For the primary route, the builder in Step 2 has already read the upload
 token and built the server address and WiFi settings into the firmware.
 Exit SSH and use the printed flash command **on the PC connected by USB**;
@@ -1144,7 +1162,7 @@ Build and flash `firmware/04_trip_logger` (the trip logger sketch, the one
 that records and uploads trips) for the **T-Beam Supreme**,
 using **ESP32S3 Dev Module**, ESP32 core **3.3.11**, and the libraries and
 board settings in the [source-build walkthrough](firmware/README.md#advanced-build-from-source).
-The equivalent arduino-cli board identifier (FQBN) is:
+The equivalent arduino-cli fully qualified board name (FQBN) is:
 
 ```text
 esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled
@@ -1160,6 +1178,8 @@ in [Firmware versions and releases](firmware/README.md#firmware-versions-and-rel
 Fit a **FAT32 microSD card** with the board switched off. The trip logger
 records there when it mounts, otherwise it uses internal LittleFS. Its bundled
 `partitions.csv` overrides the Arduino IDE's Partition Scheme menu.
+Uploads from LittleFS without the SD card remain untested. A trip ending in a
+parking garage also remains unverified and is deferred until after v1.00.
 The first time you upload the sketch to a new board it needs **Erase All Flash
 Before Sketch Upload → Enabled** once to clear factory data, then
 **Disabled** for later uploads;
@@ -1180,7 +1200,26 @@ replacing `<DEVICE_ID>` with the value in your `secrets.h`:
 
 ```bash
 cd ~/mileage-tracker
-docker compose exec -T mileage-viewer python -c "import os,sqlite3,sys;p='/data/diagnostics/events.db';r=sqlite3.connect('file:'+p+'?mode=ro',uri=True).execute('SELECT status_sequence FROM devices WHERE device_id=?',(sys.argv[1],)).fetchone() if os.path.exists(p) else None;print((r and r[0]) or 0)" <DEVICE_ID>
+docker compose exec -T mileage-viewer python - '<DEVICE_ID>' <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+root = Path('/data')
+path = root / 'diagnostics/events.db'
+revision = 0
+# Directory listings must succeed: denied access is not an absent database.
+if ('diagnostics' in {p.name for p in root.iterdir()}
+        and 'events.db' in {p.name for p in path.parent.iterdir()}):
+    with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True) as db:
+        row = db.execute('SELECT status_sequence FROM devices WHERE device_id=?',
+                         (sys.argv[1],)).fetchone()
+    if row is not None and row[0] is not None:
+        revision = row[0]
+if type(revision) is not int or not 0 <= revision < (1 << 63):
+    raise ValueError('Invalid saved snapshot revision; investigate before enrollment')
+print(revision)
+PY
 ```
 
 This uses the viewer container because it mounts `data/` read-only, so the
@@ -1219,8 +1258,9 @@ See [snapshot revision enrollment and recovery](DIAGNOSTICS.md#snapshot-revision
 Successful diagnostics uploads print nothing on the board's serial output;
 check the ingest log or the viewer's **Device health** page instead. The
 enrollment command above prints `0` on a brand-new server, because
-`data/diagnostics/events.db` is only created by the first diagnostics upload.
-That is expected, and `0` is the right value to use then.
+no snapshot revision has been saved yet. An identified GPX upload can create
+`data/diagnostics/events.db` before any diagnostics upload; a device row without
+a snapshot revision also prints `0`. That is expected on a fresh board/card.
 
 Then follow the firmware guide's [recording and upload checks](firmware/README.md#check-recording-and-uploads)
 and [car installation](firmware/README.md#put-it-in-the-car). If storage
@@ -1332,18 +1372,21 @@ needs UID 1000 (Step 0).
 
 ### 10a — Pick the off-host destination
 
-Anything you can rsync to: a NAS, another always-on machine, or a mounted
-share. Over SSH, the far end needs `rsync` installed and a login the backup
-can use without a password. On this server:
+Anything you can rsync to: a network attached storage (NAS) device, another
+always-on machine, or a mounted share. Over SSH, the far end needs `rsync`
+installed and a login the backup
+can use without a password. In these examples, `<backup-user>` and
+`<backup-host>` are the login and host for that other machine, and
+`/<backup-path>` is the absolute destination directory there. On this server:
 
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/mileage_backup -N '' -C mileage-backup
-ssh-copy-id -i ~/.ssh/mileage_backup.pub backup@nas.lan
-ssh -i ~/.ssh/mileage_backup backup@nas.lan 'mkdir -p /volume1/backups/mileage-tracker && rsync --version | head -1'
+ssh-copy-id -i ~/.ssh/mileage_backup.pub <backup-user>@<backup-host>
+ssh -i ~/.ssh/mileage_backup <backup-user>@<backup-host> 'mkdir -p /<backup-path> && rsync --version | head -1'
 ```
 
 That last command must work without a password prompt, or the timer will
-fail at 3:30 am with nobody watching. It also creates the directory, which
+fail during its unattended run. It also creates the directory, which
 the script won't do for you.
 
 ### 10b — Configure it
@@ -1358,7 +1401,7 @@ nano backup.conf
 Set `REMOTE`, and `RSYNC_SSH` if you made a dedicated key:
 
 ```
-REMOTE=backup@nas.lan:/volume1/backups/mileage-tracker
+REMOTE=<backup-user>@<backup-host>:/<backup-path>
 RSYNC_SSH="ssh -i /home/<user>/.ssh/mileage_backup"
 ```
 
@@ -1478,11 +1521,12 @@ the paths, the user):
 sudo systemctl start mileage-backup@$USER.service
 systemctl status mileage-backup@$USER.service      # expect "status=0/SUCCESS"
 journalctl -u mileage-backup@$USER.service -n 20
-systemctl list-timers 'mileage-backup*'            # next run ~03:30
+systemctl list-timers --utc 'mileage-backup*'      # next run shown in UTC
 ```
 
 `Persistent=true` in the timer means a run missed while the box was off
-happens at the next boot.
+happens at the next boot. Its calendar schedule follows the server's timezone,
+with up to 15 minutes of random delay; the command above converts it to UTC.
 
 ### 10f — Know when it stops working
 
@@ -1565,7 +1609,7 @@ identities, which a rebuilt server doesn't have. If `REMOTE` is a mounted
 folder instead, run `ls <REMOTE>/snapshots/`.
 
 ```bash
-rsync -e "ssh -i ~/.ssh/mileage_backup" --list-only backup@nas.lan:/volume1/backups/mileage-tracker/snapshots/   # your REMOTE
+rsync -e "ssh -i ~/.ssh/mileage_backup" --list-only <backup-user>@<backup-host>:/<backup-path>/snapshots/   # your REMOTE
 bash ~/mileage-tracker/backup/restore.sh restore 2026-10-06T033012Z
 ```
 
@@ -1696,10 +1740,14 @@ it's off, and you type them again when it's turned back on.
 `install.sh --check` leaves your settings and the notification outputs alone:
 it only checks them. (It does upload and remove a temporary test trip, as
 described near the top of this runbook.) It verifies what is on: the monitor
-must be running with the settings in `monitor.env`, each destination must be
-reachable from the monitor, metrics must refuse a request without the token,
-and the bundled ntfy must refuse anonymous reads. Outputs that are off are reported as "off", never as
+must be running and its startup log must show the selected outputs, each
+destination must be reachable from the monitor, metrics must refuse a request
+without the token, and the bundled ntfy must refuse anonymous reads. Outputs that are off are reported as "off", never as
 problems, so a check with nothing turned on passes.
+
+This does not prove every edited URL, credential or tuning value was loaded.
+After editing `monitor.env`, recreate the monitor as in 11c and check delivery
+at each destination.
 
 For an unattended install, every question has an environment variable. Set
 `INSTALL_OUTPUTS` to `none` or a list such as `ntfy,metrics`. Set
@@ -1785,7 +1833,8 @@ being delayed. After each update, redo the edit and run
 ### 11b — Enable the monitor
 
 ```bash
-install -m 600 monitor.env.example monitor.env
+test -f monitor.env || install -m 600 monitor.env.example monitor.env
+chmod 600 monitor.env
 nano monitor.env
 ```
 
@@ -1813,7 +1862,8 @@ The monitor mounts `/data` read-only and persists policy and delivery state in
 `monitor-state`. Port 8093 is published on `BIND_ADDR` for the optional
 token-protected metrics endpoint; the listener stays off unless enabled. The
 `monitor` and `ntfy` profiles keep
-both optional services out of ordinary installs and `install.sh --check`.
+both optional services off unless selected. Once enabled in `monitor.env`,
+`install.sh --check` verifies them too.
 Once started, their restart policies also bring them back on reboot.
 
 | Setting | Default | Meaning |
@@ -1892,7 +1942,7 @@ Skip this unless you run [Graylog](https://graylog.org/) somewhere else on
 your network. Nothing here installs Graylog; the monitor only sends to it.
 It works with or without ntfy: Graylog gets the facts and does its own alerting.
 
-**What it sends**, as [GELF](https://go2docs.graylog.org/current/getting_in_log_data/gelf.html)
+**What it sends**, as [Graylog Extended Log Format (GELF)](https://go2docs.graylog.org/current/getting_in_log_data/gelf.html)
 messages with source `mileage-tracker`. Field names below are as Graylog shows
 and searches them; on the wire GELF prefixes each with `_` (`kind` is `_kind`),
 and Graylog removes it:
@@ -1929,10 +1979,17 @@ is the usual choice. Don't use GELF UDP: it drops messages without telling anyon
 **2. Open the path** from this server to the Graylog host on that port (its
 firewall, and Docker's if Graylog runs in a container). If the two hosts talk
 over anything you don't trust, use TLS: an `https://` URL for HTTP, or
-`GRAYLOG_GELF_TLS=true` for TCP. For a private CA, copy its certificate into
-the monitor's state volume, e.g.
-`docker compose cp graylog-ca.pem mileage-monitor:/state/graylog-ca.pem`, and
-set `GRAYLOG_GELF_CA_FILE=/state/graylog-ca.pem`.
+`GRAYLOG_GELF_TLS=true` for TCP. For a private certificate authority (CA), copy
+its certificate into the monitor's state volume before enabling Graylog. Put your CA certificate
+in `graylog-ca.pem` in the server directory first. The helper below works
+even before a monitor container exists and writes the file as its `app` user:
+
+```bash
+SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose build mileage-monitor
+docker compose run --rm --no-deps -T mileage-monitor sh -c 'cat > /state/graylog-ca.pem' < graylog-ca.pem
+```
+
+Then set `GRAYLOG_GELF_CA_FILE=/state/graylog-ca.pem` in `monitor.env`.
 
 **3. Configure the monitor.** If you skipped ntfy, create the private file
 without overwriting any existing monitor settings:
@@ -1961,8 +2018,14 @@ start, which also stops ntfy and Loki delivery, and the only trace is a
 one-line "Set exactly one of GRAYLOG_GELF_URL or GRAYLOG_GELF_TCP" in its log.
 
 `GRAYLOG_GELF_HEADER=<Header-Name>: <value>` adds one HTTP header, for a proxy
-in front of the input. Apply with `docker compose --profile monitor up -d
-mileage-monitor`, then check the log for `Graylog enabled` and, once there is
+in front of the input. Build and apply with the same version stamp as the
+other services:
+
+```bash
+SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --profile monitor up -d --build mileage-monitor
+```
+
+Then check the log for `Graylog enabled` and, once there is
 something to send, `Graylog accepted N message(s)`. If Graylog is down, the
 monitor logs the failure, keeps its place, and retries after 60 seconds,
 doubling to an hour. ntfy alerts and trip uploads are unaffected.
@@ -2157,19 +2220,34 @@ docker compose logs mileage-viewer --tail 50
 problem from Step 3. Fix: `sudo chown -R 1000:1000 ~/mileage-tracker/data`
 then `docker compose restart mileage-ingest`.
 
-**Upload returns 401** — token mismatch. Verify what the container actually
-sees: `docker compose exec mileage-ingest env | grep INGEST`. A trailing space
-or quotes in `.env` will break it. If the server's token looks right, the
-board has a different one: `AUTH_TOKEN` in `secrets.h` must match it byte
-for byte, and the board only picks up a change when you flash it again
-(Step 8). Regenerating the token after flashing causes exactly this.
+**Upload returns 401** — token mismatch. Check whether the running container
+has the unquoted hex token from Step 4a without printing either value:
+
+```bash
+TOKEN=$(grep '^INGEST_AUTH_TOKEN=' .env | cut -d= -f2-)
+printf '%s' "$TOKEN" | docker compose exec -T mileage-ingest python -c 'import hmac,os,sys; print("Token matches .env" if hmac.compare_digest(os.environ["INGEST_AUTH_TOKEN"], sys.stdin.read()) else "Token differs from .env")'
+unset TOKEN
+```
+
+If it differs, check `.env` and run `docker compose up -d mileage-ingest`.
+If it matches, compare the board's build settings privately: `AUTH_TOKEN` in
+`secrets.h` must match it byte for byte, and the board only picks up a change
+when you flash it again (Step 8). Regenerating the token after flashing causes
+exactly this. On the bench, a small file with a wrong token reported E5004
+(HTTP 401), while a roughly 3 MB file instead reported E5003 (`HTTP -3`):
+a broken send can hide the rejection. Check ingest's log for 401s too.
+
+**Upload returns 5xx** — the server answered with an error. The 2026-11-01
+(UTC) bench check on firmware `v0.11+f6b0b1c96a` and server v0.10 confirmed
+that a 503 keeps the trip queued, raises E5008, and uploads successfully after
+the server recovers. A duplicate-upload check passed on the same date.
 
 **Trips stop arriving from the board, but the server checks out** — the
 board can't reach it. The usual cause is something that changed since it
 was flashed: the server's IP (check the DHCP reservation), the token in
 `.env`, or the WiFi name or password. The board has all of these compiled
-in, so update `secrets.h` and reflash (Step 8). The top-level README's
-"Check it works" section says how to read the board's Serial Monitor
+in, so update `secrets.h` and reflash (Step 8). The firmware guide's
+[recording and upload checks](firmware/README.md#check-recording-and-uploads) explain the board's Serial Monitor
 output. Trips recorded meanwhile wait on the board, but once its storage
 fills it stops recording. On the microSD card it can hold far more
 than any realistic gap between uploads; without a usable card, internal
@@ -2229,8 +2307,9 @@ For a disabled everyday login, enable it:
 docker compose run --rm --no-deps -T mileage-viewer python manage_users.py enable '<everyday-user>'
 ```
 
-If no everyday login can be used, `add '<user>'` creates one. `add` and
-`reset-password` use the same hidden prompt and stdin pattern above. This
+If no everyday login can be used, `add '<everyday-user>'` creates one. `add` and
+`reset-password` read standard input; use the shell's hidden prompt and pipe
+above, because the CLI itself does not prompt. This
 restores everyday access to the trip list and its allowed actions; it does not
 restore the admin login. For a lost admin password, use the admin recovery
 steps above.
