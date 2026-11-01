@@ -902,7 +902,8 @@ an existing install keeps its current HTTP behavior:
   it can reach `127.0.0.1:8091`, and plain HTTP is closed on the LAN.
   An IPv6 loopback bind (`::1`) is also supported if your Docker host has IPv6.
 - `VIEWER_TRUSTED_PROXIES` is a comma-separated list of proxy peer IPs or
-  CIDRs, IPv4 or IPv6, with optional spaces. Empty trusts no forwarded
+  CIDR network ranges (an address followed by a prefix length), IPv4 or
+  IPv6, with optional spaces. Empty trusts no forwarded
   addresses. Trust only addresses under your control that really are proxies;
   trusting all clients or a whole LAN lets clients forge their lockout IP.
   Invalid entries stop the viewer at startup.
@@ -924,40 +925,34 @@ and trusted-proxy handling prevents forged forwarded addresses from direct
 clients. To close that HTTP port on the LAN, move the proxy to host networking.
 The proxy-to-viewer hop still uses HTTP, so keep that network private too.
 
-Find the address to trust by opening the viewer through the proxy once,
-then, in the server folder, running:
-
-```bash
-docker compose logs mileage-viewer
-```
-
-Look for `Ignoring X-Forwarded-For from untrusted peer ...; add it to
-VIEWER_TRUSTED_PROXIES if it is your proxy`. Verify that peer belongs to your
-proxy path before adding it. Docker often presents the bridge gateway's IP
-instead of the proxy's own IP. The warning is logged once per peer for the
-first 256 peers in each worker process; recreating the viewer resets it.
-Trusting a bridge gateway also trusts other traffic that Docker presents
-under that address, so keep other containers on that path under your control.
-For example, set `VIEWER_TRUSTED_PROXIES=<proxy-peer-ip>` (replace the
-placeholder; an individual IP is preferable to a broad CIDR). Then recreate
-the viewer, since a restart alone retains the old environment:
+Edit `.env` in the installed server folder (`server/.env` in a source
+checkout), setting `VIEWER_BIND_ADDR` for your chosen networking mode and
+`VIEWER_COOKIE_SECURE=true`. Leave `VIEWER_TRUSTED_PROXIES` empty until you
+verify the peer below. Apply the bind and cookie settings first:
 
 ```bash
 docker compose up -d mileage-viewer
-bash install.sh --check
 ```
 
-The viewer ignores X-Forwarded-For from untrusted peers. From trusted peers,
-it combines all header instances, walks right to left, skips invalid entries
-and trusted hops, and uses the first valid untrusted address for login
-lockout and failed-login logging. A missing, wholly invalid or entirely
-trusted chain falls back to the direct peer IP. Caddy supplies X-Forwarded-For
-from the connection by default, [without trusting client-supplied addresses](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#headers);
-NPM needs the additional setting below before its headers can be trusted.
-Use a strong viewer password with either proxy. `--check`
-reports the selected viewer address and checks health there; with Secure
-cookies enabled it skips authenticated HTTP tests and asks you to test
-logging in through the HTTPS name yourself.
+On **Unraid**, move its web UI off ports 80/443 in
+[Settings > Management Access](https://docs.unraid.net/unraid-os/system-administration/secure-your-server/securing-your-connection/)
+before starting a proxy on those host ports. Then configure either Caddy or
+Nginx Proxy Manager (NPM) below, including its certificate and Domain Name
+System (DNS) records, before opening the viewer through it.
+
+**Keep every service off the internet.** Add no router port forwards for
+80, 443, 8090–8093 or NPM's 81; check that none already exist. DNS challenge
+validates a public DNS TXT record and needs no inbound ports. Use a wildcard
+certificate containing `*.home.<domain>` rather than individual service names
+to keep those names out of public certificate transparency logs; the wildcard
+domain itself remains public. DNS answers for service names must point only
+at private addresses: use local DNS for the proxy's LAN IP, and a public
+record pointing to its Tailscale 100.x address or [Tailscale split
+DNS](https://tailscale.com/docs/reference/dns-in-tailscale#restricted-nameservers) for remote
+clients. Tailscale must be installed on the proxy host and phone, with access
+allowed by your tailnet policy; make sure the proxy listens on its Tailscale
+interface too. A LAN IP instead needs an explicitly configured Tailscale
+subnet route. Do not enable Tailscale Funnel.
 
 **Caddy.** This minimal site block forwards to a viewer bound to loopback:
 
@@ -1009,6 +1004,41 @@ location supplies its own headers, which replace inherited ones. See the
 [NPM host template](https://github.com/NginxProxyManager/nginx-proxy-manager/blob/v2.16.0/backend/templates/proxy_host.conf)
 and [nginx real-IP directives](https://nginx.org/en/docs/http/ngx_http_realip_module.html).
 
+Find the address to trust by opening the viewer through the proxy once,
+then, in the server folder, running:
+
+```bash
+docker compose logs mileage-viewer
+```
+
+Look for `Ignoring X-Forwarded-For from untrusted peer ...; add it to
+VIEWER_TRUSTED_PROXIES if it is your proxy`. Verify that peer belongs to your
+proxy path before adding it. Docker often presents the bridge gateway's IP
+instead of the proxy's own IP. The warning is logged once per peer for the
+first 256 peers in each worker process; recreating the viewer resets it.
+Trusting a bridge gateway also trusts other traffic that Docker presents
+under that address, so keep other containers on that path under your control.
+For example, set `VIEWER_TRUSTED_PROXIES=<proxy-peer-ip>` (replace the
+placeholder; an individual IP is preferable to a broad CIDR). Then recreate
+the viewer, since a restart alone retains the old environment:
+
+```bash
+docker compose up -d mileage-viewer
+bash install.sh --check
+```
+
+The viewer ignores X-Forwarded-For from untrusted peers. From trusted peers,
+it combines all header instances, walks right to left, skips invalid entries
+and trusted hops, and uses the first valid untrusted address for login
+lockout and failed-login logging. A missing, wholly invalid or entirely
+trusted chain falls back to the direct peer IP. Caddy supplies X-Forwarded-For
+from the connection by default, [without trusting client-supplied addresses](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#headers);
+NPM needs the additional setting above before its headers can be trusted.
+Use a strong viewer password with either proxy. `--check`
+reports the selected viewer address and checks health there; with Secure
+cookies enabled it skips authenticated HTTP tests and asks you to test
+logging in through the HTTPS name yourself.
+
 **Check the client address with either proxy.** From a separate LAN client,
 open the HTTPS login page, then use the browser's developer tools **Network**
 tab to copy one deliberately failed login request as curl. Use a made-up
@@ -1055,26 +1085,9 @@ Keep the monitor's `NTFY_URL` topic destination reachable from its container;
 it can still use the existing internal ntfy URL. For iOS instant push, retain
 the [Step 11a requirements](#11a--start-and-secure-ntfy).
 
-**Keep every service off the internet.** Add no router port forwards for
-80, 443, 8090–8093 or NPM's 81; check that none already exist. DNS challenge
-validates a public DNS TXT record and needs no inbound ports. Use a wildcard
-certificate containing `*.home.<domain>` rather than individual service names
-to keep those names out of public certificate transparency logs; the wildcard
-domain itself remains public. DNS answers for service names must point only
-at private addresses: use local DNS for the proxy's LAN IP, and a public
-record pointing to its Tailscale 100.x address or [Tailscale split
-DNS](https://tailscale.com/docs/reference/dns-in-tailscale#restricted-nameservers) for remote
-clients. Tailscale must be installed on the proxy host and phone, with access
-allowed by your tailnet policy; make sure the proxy listens on its Tailscale
-interface too. A LAN IP instead needs an explicitly configured Tailscale
-subnet route. Do not enable Tailscale Funnel.
-
 Test from a phone on mobile data with WiFi and Tailscale **off**: every
 service name must fail to connect. Turn Tailscale **on** and check that the
-HTTPS names connect and the viewer login works. Finally, on **Unraid**, its
-web UI uses ports 80/443 by default: move the UI to other ports in its
-[Settings > Management Access](https://docs.unraid.net/unraid-os/system-administration/secure-your-server/securing-your-connection/)
-before giving 80/443 to a proxy.
+HTTPS names connect and the viewer login works.
 
 ---
 

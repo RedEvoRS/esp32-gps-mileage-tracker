@@ -55,10 +55,11 @@ docker compose version
 
 Both commands must work before setup. There is no `sudo`, apt or systemd
 setup on this route. Ingest, viewer and monitor run as the non-root application
-user, UID/GID **1000:1000**. The optional bundled ntfy runs as root inside its
-container and keeps its state in the `ntfy-state` volume. Root on the host
-can maintain their private files.
-The installer creates and checks `data/` with that ownership and mode 700.
+user, with user/group IDs (UID/GID) **1000:1000**. The optional bundled ntfy
+runs as root inside its container and keeps its state in the `ntfy-state`
+volume. Root on the host can maintain their private files.
+The installer creates `data/` with that ownership and mode 700. On an existing
+folder, it checks the owner UID and permissions.
 
 Allow space on both the install pool and Docker's storage. Setup checks
 them separately: a Docker image disk can fill while the pool still has
@@ -304,6 +305,11 @@ the wrapper's last-attempt record or persistent log.
 
 ## Step 5 — Build on Unraid, flash from the PC
 
+The Windows helper's first-install and `-Cleanup` flows, and the macOS/Linux
+`flash.sh` helper, still need checks on a real board. Uploads from internal
+LittleFS flash without the SD card also remain untested on the Supreme;
+use the FAT32 microSD card for this route.
+
 Accept the build offered by setup, or run it later:
 
 ```bash
@@ -334,7 +340,7 @@ bash flash.sh --server 'root@<host>' --install-dir /mnt/<pool>/appdata/mileage-t
 
 Do not use the helpers' default `~/mileage-tracker`; root's home is not the
 Unraid install. For a previously used tracker, follow the update flow and
-preserve its NVS and trips. Follow [README Step 3](README.md#step-3--first-drive-and-device-health)
+preserve its saved settings and trips. Follow [README Step 3](README.md#step-3--first-drive-and-device-health)
 to confirm uploads and a fresh Device health snapshot.
 
 ## Moving an existing Debian install to Unraid
@@ -351,7 +357,11 @@ to confirm uploads and a fresh Device health snapshot.
 2. **Freeze Debian writes and take the final backup.** Pick a quiet time and
    stop ingest, viewer and any running monitor with `docker compose stop`
    from the old install directory. This prevents new uploads or annotations
-   while you move. As the Debian UID 1000 login, run:
+   on Debian while you move. Keep the tracker switched off or disconnected
+   from WiFi, and do not annotate on Unraid, until the restore in step 5
+   finishes. Setup starts the new services before the restore; any diagnostics
+   or annotations received there would be replaced by the saved databases.
+   As the Debian UID 1000 login, run:
 
    ```bash
    bash ~/mileage-tracker/backup/backup.sh
@@ -415,9 +425,11 @@ to confirm uploads and a fresh Device health snapshot.
 6. **Verify before retiring Debian.** Compare trip counts, mileage totals,
    annotations, trip removals and closed-year state with the old server.
    Everyday accounts return to their snapshot state; redo later account
-   changes if needed. Check Device health history and then a fresh tracker
-   contact. If the address or token changed, rebuild firmware and flash it
-   from the PC using the update flow, with no first-install erase. Run
+   changes if needed. After the restore, re-enable any optional outputs using
+   Step 2 above. Check Device health history, then turn the tracker back on
+   or reconnect its WiFi and check for a fresh contact. If the address or
+   token changed, rebuild firmware and flash it from the PC using the update
+   flow, with no first-install erase. Run
    `bash install.sh --check`, a scheduled backup and a restore test. Arrange
    the real array restart/reboot checks separately. Once satisfied, disable
    the old timer **on Debian**, replacing `<user>` with its login:
