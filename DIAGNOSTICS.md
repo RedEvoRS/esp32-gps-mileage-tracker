@@ -400,8 +400,12 @@ plus Git commit.
 This confirms SD diagnostics delivery in the earlier debug build. Trip
 uploads with debug mode off and server-down retry were verified separately
 on 2026-10-21 (UTC): two `HTTP -1` failures kept the trip queued, then HTTP
-200 after ingest restarted deleted the local file. LittleFS uploads and
-server errors (401/413/5xx) remain untested on the Supreme. Setup steps are in
+200 after ingest restarted deleted the local file. On the bench on
+2026-11-01 (UTC), a server error (5xx) kept trips queued with E5008 and they
+uploaded after recovery; a wrong token gave E5004 on a small file and a broken
+send (E5003, `HTTP -3`) on a roughly 3 MB file; retried diagnostics batches
+created no duplicate events. LittleFS uploads and HTTP 413 remain untested on
+the Supreme. Setup steps are in
 [README.md](README.md) and [DEPLOY_DEBIAN.md](DEPLOY_DEBIAN.md) Step 8.
 
 The tracker normally runs unattended in a car. A serial console cannot explain
@@ -1486,8 +1490,9 @@ failure). These are measurement hooks for #6. During and after the real SD uploa
 **7,436 of 12,288 bytes**, with GPS logging active. The earlier no-upload
 measurement after #182 was **7,356 free bytes** (2026-10-20), as recorded in
 #6. The server-down/recovery run on 2026-10-21 recorded 7,556 free bytes;
-#6 is closed with the 12,288-byte allocation retained. HTTP 401/413/5xx
-and visible-AP join failures remain untested on hardware. Real-upload heap measurements and the
+#6 is closed with the 12,288-byte allocation retained. HTTP 401 and 5xx
+were bench-checked on 2026-11-01 (UTC); HTTP 413 and visible-AP join failures
+remain untested on hardware. Real-upload heap measurements and the
 untested upload paths still need checks. No host test establishes ESP32
 heap/stack headroom, SD latency or power-cut safety.
 

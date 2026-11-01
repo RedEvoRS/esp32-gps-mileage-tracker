@@ -2,8 +2,11 @@
 
 Run `firmware-builder/build.sh --install-dir ~/mileage-tracker` after piece 1
 has installed the server and its `firmware-src/` release bundle. Requires
-Docker, Python 3, Bash and `flock` (util-linux); no host ESP32 toolchain.
-Run as a normal user with Docker access; root invocation is refused.
+Docker, Bash and `flock` (util-linux); no host ESP32 toolchain. Host
+`python3` is used when present; without it, the builder runs its Python steps
+in a throwaway container from the ingest image (no network).
+Run as a normal user with Docker access; root invocation is refused, except
+on Unraid, which runs everything as root (see [On Unraid](#on-unraid)).
 The Linux x86-64 CLI is checksum pinned to CI, so the image explicitly uses
 `linux/amd64`. Other hosts require Docker's amd64 emulation.
 

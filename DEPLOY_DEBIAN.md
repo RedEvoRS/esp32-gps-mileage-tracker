@@ -1521,12 +1521,13 @@ the paths, the user):
 sudo systemctl start mileage-backup@$USER.service
 systemctl status mileage-backup@$USER.service      # expect "status=0/SUCCESS"
 journalctl -u mileage-backup@$USER.service -n 20
-systemctl list-timers --utc 'mileage-backup*'      # next run shown in UTC
+systemctl list-timers 'mileage-backup*'            # next run ~03:30 server time
 ```
 
 `Persistent=true` in the timer means a run missed while the box was off
-happens at the next boot. Its calendar schedule follows the server's timezone,
-with up to 15 minutes of random delay; the command above converts it to UTC.
+happens at the next boot. The 03:30 schedule follows the server's own
+timezone (`timedatectl` shows it), and each run starts up to 15 minutes late
+on purpose (`RandomizedDelaySec`).
 
 ### 10f — Know when it stops working
 
@@ -1985,8 +1986,8 @@ in `graylog-ca.pem` in the server directory first. The helper below works
 even before a monitor container exists and writes the file as its `app` user:
 
 ```bash
-SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose build mileage-monitor
-docker compose run --rm --no-deps -T mileage-monitor sh -c 'cat > /state/graylog-ca.pem' < graylog-ca.pem
+SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose --profile monitor build mileage-monitor
+docker compose --profile monitor run --rm --no-deps -T mileage-monitor sh -c 'cat > /state/graylog-ca.pem' < graylog-ca.pem
 ```
 
 Then set `GRAYLOG_GELF_CA_FILE=/state/graylog-ca.pem` in `monitor.env`.
@@ -2240,7 +2241,9 @@ a broken send can hide the rejection. Check ingest's log for 401s too.
 **Upload returns 5xx** — the server answered with an error. The 2026-11-01
 (UTC) bench check on firmware `v0.11+f6b0b1c96a` and server v0.10 confirmed
 that a 503 keeps the trip queued, raises E5008, and uploads successfully after
-the server recovers. A duplicate-upload check passed on the same date.
+the server recovers; retried diagnostics batches created no duplicate events.
+Nothing needs doing on the board: it retries on its own. Look in
+`docker compose logs mileage-ingest` for the cause on the server.
 
 **Trips stop arriving from the board, but the server checks out** — the
 board can't reach it. The usual cause is something that changed since it

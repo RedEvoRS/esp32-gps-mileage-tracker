@@ -357,9 +357,9 @@ to confirm uploads and a fresh Device health snapshot.
 2. **Freeze Debian writes and take the final backup.** Pick a quiet time and
    stop ingest, viewer and any running monitor with `docker compose stop`
    from the old install directory. This prevents new uploads or annotations
-   on Debian while you move. Keep the tracker switched off or disconnected
-   from WiFi, and do not annotate on Unraid, until the restore in step 5
-   finishes. Setup starts the new services before the restore; any diagnostics
+   on Debian while you move. Keep the tracker from uploading (unplug it from
+   the car's USB port, or don't drive), and do not annotate on Unraid, until
+   the restore in step 5 finishes. Setup starts the new services before the restore; any diagnostics
    or annotations received there would be replaced by the saved databases.
    As the Debian UID 1000 login, run:
 
@@ -426,8 +426,8 @@ to confirm uploads and a fresh Device health snapshot.
    annotations, trip removals and closed-year state with the old server.
    Everyday accounts return to their snapshot state; redo later account
    changes if needed. After the restore, re-enable any optional outputs using
-   Step 2 above. Check Device health history, then turn the tracker back on
-   or reconnect its WiFi and check for a fresh contact. If the address or
+   Step 2 above. Check Device health history, then plug the tracker back in
+   and check for a fresh contact after its next drive. If the address or
    token changed, rebuild firmware and flash it from the PC using the update
    flow, with no first-install erase. Run
    `bash install.sh --check`, a scheduled backup and a restore test. Arrange

@@ -26,7 +26,7 @@ normal driving passed on 2026-11-01 (UTC); the version bump to v1.00 waits
 for release time.
 
 Bench checks on 2026-11-01 (UTC) also passed server-error recovery and
-duplicate-upload deduplication. HTTP 503 kept both a small trip and a roughly
+diagnostics deduplication (retried batches stored each event once). HTTP 503 kept both a small trip and a roughly
 3 MB trip queued, showed E5008 ("Server unavailable"), then both uploaded
 after recovery. A wrong token gave HTTP 401 and E5004 ("Upload unauthorized")
 for the small file; the roughly 3 MB file instead saw a broken send,
