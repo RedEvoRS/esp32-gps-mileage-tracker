@@ -2,19 +2,21 @@
 
 Deducting business mileage requires a log: the date, distance, destination,
 and business purpose of each trip. Phone apps will keep one, but they depend
-on the phone being in the car with location access, most are subscriptions,
-and the location history ends up on the vendor's servers.
+on the phone being in the car with location access, and may require a
+subscription or send your location history to the vendor's servers.
 
 This project moves mileage logging onto a small GPS board that lives in the
 car: a LilyGO **T-Beam Supreme with the u-blox MAX-M10S GPS** (choose the
 MAX-M10S version, not the L76K version). It detects trips from GPS speed,
-saves each track as a GPX file on a **SanDisk 32 GB Max Endurance** microSD
-card, and uploads the stored trips over your home WiFi when you park.
+saves each track as a GPX (GPS Exchange Format) file on a **SanDisk 32 GB
+Max Endurance** microSD card, and uploads the stored trips over your home
+WiFi when you park.
 
-The server side is two small Flask services on the LAN. One accepts the
-uploads and computes trip distance. The other shows each trip on a map,
-records its business purpose, and exports the log as CSV or XLSX. Tracks and
-annotations stay on the local network by default. The viewer requests
+The server side is two small Flask services on your local network (LAN).
+One accepts the uploads and computes trip distance. The other shows each
+trip on a map, records its business purpose, and exports the log as CSV
+(comma-separated values) or XLSX (Excel) files. Tracks and annotations stay
+on the local network by default. The viewer requests
 OpenStreetMap tiles when it draws a map. If you enable place lookup, it also
 sends the clicked trip endpoint to the provider you configure, which may be
 outside your network. The tracker asks an internet time server for the time
@@ -22,28 +24,41 @@ when GPS time is unavailable.
 
 ## Where it's at
 
-The firmware runs on the T-Beam Supreme. The bring-up sketches and the trip
-logger were checked on a real board in October 2026: the logger switches
-the board off when the car is parked and back on when the car starts, and
-it has recorded real drives on the microSD card, which were read back on a
-PC. If no card mounts, trips go to the board's internal flash instead,
+As of 2026-11-01 (UTC, Coordinated Universal Time), the board runs firmware
+**v0.11** (`v0.11+f6b0b1c96a`, tag `fw-v0.11`), the release candidate, and
+server **v0.10** is deployed. The release-candidate driving week **passed**
+on that date: all 27 trips were accounted for, and the annotated log and
+exports were checked. The v1.00 version bumps will happen at release time;
+v1.00 is not out yet.
+
+The bring-up sketches and the trip logger were checked on a real board in
+October 2026: the logger switches the board off when the car is parked and
+back on when the car starts. It has recorded real drives on the microSD
+card, which were read back on a PC. If no card mounts, trips go to the
+board's internal flash instead,
 which holds about 6 hours of driving. The server has been deployed with its
 installer on Debian 13 on 2026-10-20; `install.sh --check` passed.
 On 2026-10-21 (UTC), the Supreme's trip logger firmware, running in debug
-mode, uploaded four real
-trips from the card. All four received HTTP 200, were deleted from the
+mode, uploaded four real trips from the card. All four received HTTP 200, were deleted from the
 card and appeared in the viewer. Diagnostics arrived too: all 115 pending
 events and a current snapshot were visible in Device health.
 Uploads with debug mode off and server-down retry were also verified on
-2026-10-21 (UTC). Uploads from internal flash and server errors
-(401/413/5xx) remain untested on the Supreme.
+2026-10-21 (UTC). On the bench on 2026-11-01 (UTC), server errors (HTTP 5xx)
+kept trips queued with E5008 ("Server unavailable"); they uploaded after
+recovery. A wrong token gave HTTP 401 and E5004 ("Upload unauthorized") on a
+small file, but a roughly 3 MB file saw a broken send (`HTTP -3`, E5003,
+"Upload link failed") instead. Both stayed queued and uploaded after recovery.
+Retried diagnostics batches created no duplicate events.
+Uploads from internal flash (LittleFS, the internal flash filesystem) and
+HTTP 413 handling remain untested on the Supreme.
 
-Still to check on the road: the everyday (production) screen and a trip that
-ends in a parking garage. Engine crank, start-stop, the GPS hot start and the
-parked battery drain have been checked on the road; the drain was estimated
-from battery readings across parked hours, without a meter. Distance accuracy
-still needs a pass mark based on comparisons with the car's odometer, and
-firmware `v0.11`, the release candidate, is in its week of normal driving.
+Still to check on the road: the everyday (production) screen. A trip ending
+in a parking garage remains untested and is deferred until after v1.00.
+Engine crank, start-stop, the GPS hot start and the parked battery drain
+have been checked on the road; the drain was estimated from battery readings
+across parked hours, without a meter. Distance accuracy
+has not been measured against the car's odometer; no numeric accuracy target
+was used for the release-candidate pass.
 Project progress is tracked in GitHub issues.
 
 **Have the older T-Beam V1.2?** This project started on the LilyGO TTGO
@@ -68,14 +83,16 @@ POST /upload (GPX) --> mileage-ingest --> GPX + JSON summary
 ```
 
 If no card mounts at boot, the logger stores trips in the board's internal
-flash instead, and uploads them from there.
+flash instead, and is designed to upload them from there; that upload path
+remains untested on the Supreme. Diagnostics uploads need a working SD card:
+without one, the health journal stays local, even if trip uploads work.
 
 Alongside the trips, the board keeps a small journal of its own health:
 numbered error codes such as a lost GPS antenna, a full card or a refused
 upload. It uploads the journal after the trips, and the viewer's **Device
 health** page shows it. The server can optionally send those faults to your
-phone through a self-hosted ntfy service. [DIAGNOSTICS.md](DIAGNOSTICS.md)
-describes the whole framework and lists every code.
+phone through a self-hosted ntfy notification service.
+[DIAGNOSTICS.md](DIAGNOSTICS.md) describes the whole framework and lists every code.
 
 The logger decides on its own when a trip starts and stops. Going faster than 5 mph for 10 seconds starts one; staying under
 2 mph for 5 minutes ends it, allowing longer red lights without splitting
@@ -85,8 +102,8 @@ mile. Switching the car off keeps even a short trip that has started.
 
 The firmware writes each GPS point to the microSD card (or the internal
 flash fallback) and closes the file right after to limit data loss if
-power is cut. The card's behavior when power is cut still needs testing on
-the bench.
+power is cut. Recovery from a power cut during a write has not been tested
+on the board.
 
 The firmware runs from the car's USB port, with an 18650 battery as backup.
 When the car's port goes dead, it closes out the trip and keeps running on
@@ -100,8 +117,9 @@ while you're parked doesn't count (at least one end of a step must be over
 coverage like a tunnel or a parking garage gets filled with a straight line.
 That gap estimate is the shortest path between the measured endpoints, so it
 can miss road distance through the gap. The total is still an estimate: GPS
-position noise can add distance even on accepted points. Accuracy is being
-checked against the car's odometer before a release pass mark is set.
+position noise can add distance even on accepted points. Accuracy has not
+been measured against the car's odometer; the driving-week pass is not a
+numeric accuracy guarantee.
 
 ## What you need
 
@@ -120,8 +138,9 @@ checked against the car's odometer before a release pass mark is set.
   case knocks the GPS antenna plug off; see
   [Fitting it in the case](firmware/README.md#fitting-it-in-the-case).
 - **A Debian 13 server** on your home network, with a stable LAN address,
-  SSH access, a normal login with sudo, and **Docker Engine with Compose v2**
-  already usable by that login. [Deployment Steps 0–1](DEPLOY_DEBIAN.md#step-0--confirm-ssh-works)
+  SSH (Secure Shell) access, a normal login with sudo, and
+  **Docker Engine with Compose v2** already usable by that login.
+  [Deployment Steps 0–1](DEPLOY_DEBIAN.md#step-0--confirm-ssh-works)
   cover preparation. Allow space for Docker images and trips; the firmware
   builder image uses about 2.7 GB extra; allow 10 GiB free for its first build.
   Automatic backups currently require the
@@ -203,6 +222,10 @@ to return to your PC.
 <a id="3-flash-the-firmware"></a>
 
 ### Step 2 — Flash the tracker
+
+The Windows app-only update path has been checked on the Supreme. The
+`flash.ps1` first-install and `-Cleanup` paths, and all of `flash.sh`, remain
+untested on the board; script tests do not establish that they work on hardware.
 
 **On the PC connected to the board**, close any serial monitor and run the
 command for your OS. These latest-release forms also work; use the commands
@@ -296,7 +319,12 @@ that diagnostics enrollment succeeded. See
 
 **After the first diagnostics snapshot, do the one-time cleanup flash**
 using the saved Step 2 script, before rebuilding firmware on the server.
-If you used the one-liner, download the script using Step 2 first:
+If you used the one-liner, download the script using Step 2 first.
+
+The commands below use the default server directory, `~/mileage-tracker`.
+For a custom directory or Unraid, also pass `-InstallDir '<install-dir>'`
+on Windows or `--install-dir '<install-dir>'` on macOS/Linux, using the
+same server path as Step 2.
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\flash.ps1 -Server '<user>@<host>' -Cleanup
@@ -378,12 +406,13 @@ local timezone everywhere a person reads them. That way a 6pm drive shows
 up as 6pm on the right day instead of 1am the next one. Trips are also
 filed by local month, so a New Year's Eve evening drive lands in `2026-12/` and
 not `2027-01/`. There's no built-in timezone: the server installer asks for
-yours and saves it as `DISPLAY_TZ` in `server/.env`, and both services
-refuse to start until it's set. Both read that one setting. A trip is filed
-under the local month the drive ends, but dated and counted by its local
-start, so a drive that starts just before midnight on December 31 sits in the
-`2027-01/` folder and shows as December 31 (see "Years are based on trip
-start" in [server/README.md](server/README.md#viewer--export-ui)).
+yours and saves it as `DISPLAY_TZ` in the installed server's `.env`, and
+both services refuse to start until it's set. Both read that one setting.
+A trip is filed under the local month the drive ends, but dated and counted by its local
+start, so a drive that starts just before midnight on December 31, 2026 and
+ends after midnight sits in the `2027-01/` folder and shows as December 31
+(see "Years are based on trip start" in
+[server/README.md](server/README.md#viewer--export-ui)).
 
 ## Security
 
@@ -395,10 +424,12 @@ internet.
 The upload endpoint checks a bearer token and the viewer has a login, but
 it's all plain HTTP, so anyone who can see the traffic can see the
 credentials. The login keeps other people and devices on your network out of
-your trips; it isn't a replacement for TLS. For HTTPS names through Caddy or
-Nginx Proxy Manager, set `VIEWER_COOKIE_SECURE=true` in `server/.env` and run
-`docker compose up -d` from `server/`. `VIEWER_TRUSTED_PROXIES` lets login
-lockout count each client when the proxy supplies its real address. NPM also
+your trips; it isn't a replacement for TLS (Transport Layer Security, the
+encryption behind HTTPS). For HTTPS names through Caddy or Nginx Proxy
+Manager (NPM), set `VIEWER_COOKIE_SECURE=true` in the installed server's
+`.env` (`server/.env` in a source checkout) and run `docker compose up -d`
+from the directory containing `docker-compose.yml`. `VIEWER_TRUSTED_PROXIES`
+lets login lockout count each client when the proxy supplies its real address. NPM also
 needs the Advanced setting and forged-header check in the guide below;
 its defaults let LAN clients forge their address and evade that lockout.
 Use a strong viewer password. `VIEWER_BIND_ADDR` can limit only the viewer's
@@ -411,11 +442,12 @@ If it also fronts ingest, allow bodies of at least `INGEST_MAX_UPLOAD_BYTES`
 on the card, never retried and missing from the mileage log. See
 [proxy settings and nginx's 1 MiB default trap](server/README.md#security-notes).
 
-Beyond that, the viewer has CSRF protection on its forms and locks out an IP
-for 15 minutes after five wrong passwords. It also refuses to start at all
-if its login settings are missing or mangled, since a viewer that quietly
-runs with no auth is worse than one that won't run. Both containers run as
-a non-root user.
+Beyond that, the viewer protects its forms against CSRF (cross-site request
+forgery, where another site tries to submit a form using your login) and
+locks out an IP for 15 minutes after five wrong passwords. It also refuses
+to start at all if its login settings are missing or mangled, since a viewer
+that quietly runs with no auth is worse than one that won't run. Both
+containers run as a non-root user.
 
 `secrets.h`, `.env`, `viewer.env` and `monitor.env` are in `.gitignore`. Please keep them
 there.

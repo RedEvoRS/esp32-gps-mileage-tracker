@@ -1,8 +1,8 @@
 # Mileage Tracker Server
 
 This folder is the server half of the GPS mileage tracker. It accepts
-finished trips as GPX files over home WiFi, and lets you review, tag and
-export them in a web page. The [top-level README](../README.md) explains
+finished trips as GPX (GPS Exchange Format) files over home WiFi, and lets
+you review, tag and export them in a web page. The [top-level README](../README.md) explains
 the complete setup.
 
 The board is the LilyGO T-Beam Supreme with MAX-M10S GPS and microSD trip
@@ -18,16 +18,33 @@ Diagnostics followed in two HTTP 200 requests, storing all 115 pending
 events and a current snapshot visible in Device health. Trip uploads with
 debug mode off and server-down retry were also verified on 2026-10-21
 (UTC): two `HTTP -1` failures kept the trip queued, then HTTP 200 after
-ingest restarted deleted the local file. LittleFS uploads and server errors
-(401/413/5xx) remain untested on the Supreme.
+ingest restarted deleted the local file.
+
+As of 2026-11-01 (UTC), the deployed server is **v0.10**. The board runs
+**v0.11+f6b0b1c96a** (tag `fw-v0.11`), the release candidate. Its week of
+normal driving passed on 2026-11-01 (UTC); the version bump to v1.00 waits
+for release time.
+
+Bench checks on 2026-11-01 (UTC) also passed server-error recovery and
+diagnostics deduplication (retried batches stored each event once). HTTP 503 kept both a small trip and a roughly
+3 MB trip queued, showed E5008 ("Server unavailable"), then both uploaded
+after recovery. A wrong token gave HTTP 401 and E5004 ("Upload unauthorized")
+for the small file; the roughly 3 MB file instead saw a broken send,
+`HTTP -3`, and E5003 ("Upload link failed"). Both stayed queued and uploaded
+after the original token was restored.
+
+Still untested on hardware: uploads from LittleFS (the internal flash
+filesystem) without the SD card, HTTP 413 handling, a trip ending in a parking
+garage (deferred past v1.00), the `flash.ps1` first-install and `-Cleanup`
+paths, and `flash.sh`. Unraid has no real-box verification yet either.
 
 It runs as two default Docker containers, with two optional services, all
 defined in `docker-compose.yml`:
 
 | Service | Port | What it does |
 |---|---|---|
-| `mileage-ingest` | 8090 | Accepts trip uploads from the board (bearer token) and stores each one as GPX plus a JSON summary |
-| `mileage-viewer` | 8091 | A web page, behind a login, to list trips, check them on a map, tag their purpose, and export CSV/XLSX |
+| `mileage-ingest` | 8090 | Accepts trip uploads from the board (bearer token) and stores each one as GPX plus a JSON (structured text) summary |
+| `mileage-viewer` | 8091 | A web page, behind a login, to list trips, check them on a map, tag their purpose, and export CSV (comma-separated values) or XLSX (Excel workbook) files |
 | `mileage-monitor` | 8093 | Optional `monitor` profile: authenticated Prometheus metrics; current-fault and seven-day no-contact alerts |
 | `ntfy` | 8092 | Optional `ntfy` profile: self-hosted phone notifications, authenticated topic access |
 
@@ -47,7 +64,8 @@ This verifies/copies the release, runs `install.sh` to configure, build and
 check the services, then offers a personal firmware build. Read the
 [trust note and download/read/run alternative](../README.md#setting-it-up)
 before executing downloaded code. Follow [deployment Step 2](../DEPLOY_DEBIAN.md#step-2--run-setupsh)
-for prerequisites, LAN-only `BIND_ADDR`, backups and optional notifications.
+for prerequisites, binding to your local network (LAN) with `BIND_ADDR`,
+backups and optional notifications.
 The builder downloads about 1.8 GB once (about 2.7 GB installed image; allow
 10 GiB free for the first build) and asks for WiFi/device settings; its
 owner-only `firmware-out/` contains your WiFi password and upload token in
@@ -79,7 +97,7 @@ so they can never be left partially written:
 - `/data/YYYY-MM/<id>.gpx`  — the raw upload, byte-for-byte (the source
   of truth that any map tool can open directly)
 - `/data/YYYY-MM/<id>.json` — a derived summary (distance, duration,
-  speeds, bbox) so other tools can list and total trips without
+  speeds, bounding box) so other tools can list and total trips without
   re-parsing every track
 
 Distance is the great-circle (haversine) sum over consecutive fixes, with
@@ -112,8 +130,8 @@ Existing summaries are not rewritten at startup; new uploads and retries
 write the current version.
 
 The service is intentionally minimal. It does not generate reports,
-provide a web UI, or classify trips. Those are separate concerns handled
-by the `mileage-viewer` service, which reads these files independently.
+provide a web user interface (UI), or classify trips. Those are separate
+concerns handled by `mileage-viewer`, which reads these files independently.
 
 ## Directory Layout
 
@@ -209,8 +227,9 @@ only a free wake-up poke, not message text. Android needs no relay.
 [ntfy documents the settings](https://docs.ntfy.sh/config/).
 An existing self-hosted ntfy can be selected with `NTFY_URL` instead.
 
-Optionally, the monitor also sends diagnostics as GELF to a Graylog you run
-elsewhere (`GRAYLOG_*` in `monitor.env`, off by default; nothing here installs
+Optionally, the monitor also sends diagnostics as GELF (Graylog Extended Log
+Format) to a Graylog you run elsewhere (`GRAYLOG_*` in `monitor.env`, off by
+default; nothing here installs
 Graylog). It forwards diagnostic events at least once, with duplicates possible
 after an interrupted send or restoring an older diagnostics database. It also
 forwards each change in a device/code condition's state (active/clear/unknown,
@@ -277,7 +296,10 @@ arguments. Docker stores the stamp in each image's `SERVER_VERSION`
 environment value; restarting an old image does not give it a new version.
 The monitor reports its version in its startup log.
 
-Python 3 is required on the build host (`install.sh` installs it on Debian).
+The manual build commands below require Python 3 on the build host
+(`install.sh` installs it on Debian). On Unraid, the installer and firmware
+builder use disposable Python containers if host Python is absent; follow
+[the Unraid runbook](../DEPLOY_UNRAID.md).
 A Git clone with Git installed provides the commit and dirty state. Without
 usable Git metadata, the helper reads `COMMIT` if it contains a full 40- or
 64-hex hash and uses its first ten characters. Commit/tag archives and GitHub
@@ -344,8 +366,9 @@ for storage, Python fallback and service setup.
    You'll use the same token in the tracker firmware later. This token is
    separate from your SSH login and the viewer's admin or everyday login.
 
-4. In `.env`, set `DISPLAY_TZ` to the IANA timezone where you drive, for
-   example `DISPLAY_TZ=Europe/London`. Both services refuse to start without
+4. In `.env`, set `DISPLAY_TZ` to the IANA (Internet Assigned Numbers Authority)
+   timezone name for where you drive, for example `DISPLAY_TZ=Europe/London`.
+   Both services refuse to start without
    it; ingest uses it to choose month folders and the viewer uses it for
    displayed/exported times. See [Timezone](#timezone).
 
@@ -353,7 +376,7 @@ for storage, Python fallback and service setup.
    stable LAN IP address (`BIND_ADDR=<host>`; replace `<host>` with the IP,
    not a hostname). Find it with `ip -4 addr show` and arrange a static IP or
    DHCP reservation. Leaving this blank publishes ports on every interface;
-   UFW does not restrict Docker-published ports. See
+   UFW (Uncomplicated Firewall) does not restrict Docker-published ports. See
    [network setup](../DEPLOY_DEBIAN.md#step-7--firewall-and-network).
 
 6. Create `viewer.env` and set the admin login, as described under
@@ -411,8 +434,8 @@ for storage, Python fallback and service setup.
 
    A timed GPX always gets its ID from its earliest point time (or metadata
    time when no point is timed), in UTC. `X-Trip-Id` is used only when the GPX
-   has no `<time>` anywhere, neither on points nor in `<metadata>`; otherwise it
-   is ignored. It can then name that upload, except that timestamp-shaped IDs
+   has no usable point or metadata timestamp; otherwise it is ignored.
+   It can then name that upload, except that timestamp-shaped IDs
    are reserved for timed GPX. Firmware never sends that header: local
    filenames (`t000001.gpx`, for example) use a counter kept in the board's
    flash settings (NVS, the ESP32's non-volatile storage), while each
@@ -764,7 +787,8 @@ rules in `common/trip_summary.py` through the default-deny Docker build context.
 If a source disappears or becomes unreadable, the merged trip is flagged as
 unreadable and excluded from totals, rather than showing stale mileage. The
 list's warning includes Undo so the originals can still be restored. Merge,
-Undo and annotation changes require a logged-in session and CSRF-protected POSTs.
+Undo and annotation changes require a logged-in session and POSTs protected
+against cross-site request forgery (CSRF).
 
 ### Endpoint place suggestions
 
@@ -781,8 +805,9 @@ setting is shown in the viewer. Restart the viewer after changing configuration:
 
     SERVER_VERSION="$(python3 stamp_version.py)" BUILDX_NO_DEFAULT_ATTESTATIONS=1 docker compose up -d --build mileage-viewer
 
-HTTPS providers must have a certificate trusted by the container. A private CA
-can be supplied via `SSL_CERT_FILE` pointing to a CA bundle mounted inside the
+HTTPS providers must have a certificate trusted by the container. A private
+certificate authority (CA) can be supplied via `SSL_CERT_FILE` pointing to a
+CA bundle mounted inside the
 container; certificate verification is never disabled. Lookup requests prefer
 English names (`accept-language=en`).
 
@@ -827,8 +852,10 @@ without deleting the cache or changing saved destinations. To refresh all result
 stop the viewer, back up the database, delete rows from `geocode_cache` using
 SQLite, then restart. A future lookup will query the configured provider again.
 
-Requests are serialized across workers, with at least 1.1 seconds between calls
-by default. Set `VIEWER_GEOCODER_INTERVAL` in `viewer.env` to change this gap
+A shared gate normally serializes requests across workers, with at least 1.1
+seconds after each successful call by default. Its reservation expires after
+60 seconds, so a longer stalled call can overlap a later lookup.
+Set `VIEWER_GEOCODER_INTERVAL` in `viewer.env` to change the normal gap
 (0.1 to 60 seconds); leaving it unset or empty keeps the default, which suits
 providers with a one-request-per-second policy. Use values below 1 second only
 with self-hosted Nominatim or a provider that explicitly permits them.
@@ -838,9 +865,15 @@ redirects, or ambient HTTP proxies. Responses have a 64 KiB size limit and a
 ten-second monotonic deadline checked between reads, with five-second socket
 timeouts. A single read can overrun the deadline, particularly while parsing
 chunked response framing. DNS resolution and initial response headers are not
-covered by the read checks. Gunicorn's worker timeout is the final bound for a
-stalled request, including framing, resolver or header stalls.
-Busy/unavailable/no-match states leave the map,
+covered by the read checks. The viewer uses Gunicorn's `gthread` workers
+(two processes, four request threads each), whose
+[worker timeout](https://gunicorn.org/reference/settings/#timeout) does not
+limit an individual request. There is no hard whole-request deadline for
+lookup: a stalled provider can keep a thread occupied, and repeated stalls
+can exhaust the viewer's threads. If this happens, clear `VIEWER_GEOCODER_URL`
+in `viewer.env` and run `docker compose up -d mileage-viewer` to disable lookup
+and release the stalled threads.
+Ordinary busy/unavailable/no-match responses leave the map,
 manual annotations and exports usable. Lookup is authenticated and CSRF-protected;
 upstream errors, response bodies, coordinates and URLs are not logged by lookup.
 
@@ -924,7 +957,8 @@ unset new_password
 ```
 
 Usernames are 1–64 ASCII letters or digits, periods, underscores, at signs
-or hyphens. An everyday username cannot match the admin username, ignoring
+or hyphens, and must not start with `replace-me` (ignoring case).
+An everyday username cannot match the admin username, ignoring
 case. Passwords must be 8–1024 characters. The commands return 0 for success,
 1 for an operational error, 2 for usage or an unknown command, 3 for invalid input,
 4 when the login does not exist, and 5 when `add` finds that it already exists.
@@ -984,9 +1018,9 @@ folder and shows as December 31. `install.sh --check` confirms both running
 containers have the value `.env` holds.
 
 Use a named IANA zone (`America/Denver`, `Europe/London`), never a fixed
-offset like `-08:00`: most zones observe DST, so a fixed offset is an hour
-wrong for half the year. Both services refuse to start if `DISPLAY_TZ` is
-unset, the zone name is unknown, or the `tzdata` package is missing,
+offset like `-08:00`: in zones with daylight saving time (DST), a fixed offset
+is an hour wrong for part of the year. Both services refuse to start if
+`DISPLAY_TZ` is unset, the zone name is unknown, or the `tzdata` package is missing,
 rather than guessing a zone or quietly falling back to UTC.
 
 After changing it, run `docker compose up -d` (a plain restart keeps the
@@ -997,10 +1031,11 @@ under, but the zone decides more than how times read:
 - **Which year a trip belongs to follows `DISPLAY_TZ` too.** A trip's year is
   its local start date, worked out on every page load, so after a zone change
   the trips near New Year can move to the neighbouring year. That includes a
-  year you already closed: its totals and exports change, and nothing records
-  that they did. Pick the right zone before you close a year, and if you must
-  change it afterwards, compare the closed year's exported totals before and
-  after.
+  year you already closed: its live totals and exports change. Saved totals
+  from the close stay unchanged; the admin year review compares them with the
+  current figures and lists trips that joined or left the year. The timezone
+  change itself is not logged. Pick the right zone before closing a year; if
+  you must change it afterwards, check that comparison and the exports.
 
 The containers' `TZ`, which only affects log timestamps, follows
 `DISPLAY_TZ` too (UTC if it's unset).
@@ -1012,7 +1047,7 @@ bearer token; the viewer with a session login. Neither should be exposed
 to the internet: the session cookie and the ingest token both travel over
 plain HTTP, so anyone able to observe the traffic can replay them. The
 login is defence in depth against other devices and people on your
-network, not a substitute for TLS.
+network, not a substitute for TLS (Transport Layer Security).
 
 Every viewer response (login and error pages, static files and exports too)
 carries `Content-Security-Policy: frame-ancestors 'none'`, `X-Frame-Options: DENY`
@@ -1020,7 +1055,7 @@ and `X-Content-Type-Options: nosniff`, so another web page on the same host
 or home domain can't show a viewer page in a frame and steer the admin's clicks
 onto its buttons. A reverse proxy must not remove these headers.
 
-For HTTPS through Caddy or Nginx Proxy Manager, set `VIEWER_COOKIE_SECURE=true`
+For HTTPS through Caddy or Nginx Proxy Manager (NPM), set `VIEWER_COOKIE_SECURE=true`
 in `.env`, then run `docker compose up -d`. Set `VIEWER_TRUSTED_PROXIES` to
 the proxy's peer address so login lockout can count each client separately.
 NPM also needs the Advanced setting and forged-header check in the guide

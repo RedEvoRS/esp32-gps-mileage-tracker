@@ -36,8 +36,12 @@ and no active conditions. Minimum free network stack was 7,436 of 12,288
 bytes with GPS logging active. Trip uploads with debug mode off and
 server-down retry were also verified on 2026-10-21 (UTC): two `HTTP -1`
 failures kept the trip queued, then HTTP 200 after ingest restarted deleted
-the local file. LittleFS uploads and server errors (401/413/5xx) remain
-untested on the Supreme. Other hardware acceptance is tracked under `supreme-port`.
+the local file. On the bench on 2026-11-01 (UTC), a server error (5xx) kept
+trips queued (E5008) and they uploaded after recovery; a wrong token (401)
+gave E5004 on a small file and a broken send (E5003, `HTTP -3`) on a ~3 MB
+file; diagnostics dedupe held. The release-candidate driving week on firmware
+v0.11 passed on 2026-11-01. LittleFS uploads and HTTP 413 remain untested on
+the Supreme. Other hardware acceptance is tracked under `supreme-port`.
 Don't assume a Supreme pin, rail or peripheral works until its port issue
 is closed and it's verified on the bench.
 

@@ -11,14 +11,18 @@ USB, power and GPS before installing the trip logger for use in the car.
 The power-management unit (PMU) controls the board's rails, battery and
 shutdown; Stage 2 checks it before the GPS and trip-logging stages.
 
-All four stages run on the Supreme. Firmware `v0.11` is the release
-candidate: the build the install flow delivers, and the one being driven for a
-week of normal use. On 2026-10-21 (UTC), an earlier Stage 4 build uploaded
+All four stages run on the Supreme. Firmware `v0.11` remains the release
+candidate: the board ran `v0.11+f6b0b1c96a` (tag `fw-v0.11`) for its week of
+normal driving, which passed on 2026-11-01 (UTC). The version bump to `v1.00` waits for
+release time; it has not happened yet. Server `v0.10` is deployed. On
+2026-10-21 (UTC), an earlier Stage 4 build uploaded
 four real trips from microSD to the deployed server, then delivered all 115
 pending diagnostic events and a current snapshot. Uploads with debug mode
-off and server-down retry were also verified on 2026-10-21 (UTC). Uploads
-from the internal LittleFS fallback and server errors (401/413/5xx) remain
-untested on the Supreme. The [top-level README](../README.md#where-its-at)
+off and server-down retry were also verified on 2026-10-21 (UTC). Wrong-token
+and server-error retries passed bench checks on 2026-11-01 (UTC); see
+[upload checks](#check-recording-and-uploads). Uploads from the internal
+LittleFS fallback and HTTP 413 handling remain untested on the Supreme.
+The [top-level README](../README.md#where-its-at)
 has the current status.
 
 **Have a T-Beam V1.2?** That board is retired. Its last firmware and full
@@ -35,6 +39,10 @@ on the PC connected to the board. The server's container downloads
 about 1.8 GB of tools on the first build, keeps an image of about 2.7 GB,
 and reuses it later (allow 10 GiB free for the first build); see the
 [builder guide](../server/firmware-builder/README.md).
+
+Trip and diagnostics uploads use plain HTTP, so the upload token and trip
+data are not encrypted in transit. Keep ingest on your trusted home network;
+do not expose its port to the internet.
 
 ### PC prerequisites and commands
 
@@ -93,6 +101,12 @@ checkout`; downloaded release scripts show their release tag.
 
 ### First install, update and cleanup
 
+**Hardware validation:** the Windows app-only update was checked on the
+Supreme on 2026-10-22 (UTC). The `flash.ps1` first-install and `-Cleanup`
+paths, and all `flash.sh` paths, remain untested on the board. Automated
+checks and dry runs do not establish those results. A real-box
+[Unraid install](../DEPLOY_UNRAID.md) also remains unverified.
+
 When updating, install the new server **before** building and flashing the
 firmware. The trip logger (Stage 4) records a battery reading in its `BOOT`
 startup event and an `INFO` (informational severity) battery event before a
@@ -138,10 +152,10 @@ with BOOT released only if the board stays in download mode.
   script asks for the location and prints the saved path. Keep it outside
   the repo: it can contain factory device keys. Type **`ERASE`** to confirm
   the full internal-flash erase, then it writes the bootloader, partition
-  table, boot support image and app. All internal trips and settings memory
-  (NVS), including counters and enrollment records, are erased. The SD card
-  is untouched. The erase lets Stage 4 provision its internal trip filesystem;
-  see [first-flash behavior](#first-flash-on-a-new-board).
+  table, boot support image and app. All internal trips and settings in
+  nonvolatile storage (NVS), including counters and enrollment records, are
+  erased. The SD card is untouched. The erase lets Stage 4 provision its
+  internal trip filesystem; see [first-flash behavior](#first-flash-on-a-new-board).
 - **Update an installed tracker:** update/build on the server first, then
   rerun the script without the first-install flag and answer **no** at that
   prompt. This writes only the app, preserving NVS, internal trips and SD
@@ -183,7 +197,7 @@ requires `ERASE`. Do not use it to work around a failed first backup.
 ## Advanced: build from source
 
 The remaining hardware-test and build instructions are for a local source
-build. The scripts above build that same logger on the server. To build it
+build. The server-build route above builds that same logger. To build it
 yourself, work through these steps in order:
 
 1. Clone the repository or download its source ZIP.
@@ -289,10 +303,10 @@ check **Tools → Port** after each restart.
 
 ### Back up the factory flash first
 
-The flash scripts above automate the verified backup. For source builds,
-uploading anything replaces the factory firmware. Read the whole 8 MB
-first, so the board can go back to stock. esptool comes with the ESP32
-core, at
+The flash scripts above automate the double-read backup procedure. For
+source builds, uploading anything replaces the factory firmware. Read the
+whole 8 MB first, so the board can go back to stock. esptool comes with the
+ESP32 core, at
 `%LOCALAPPDATA%\Arduino15\packages\esp32\tools\esptool_py\<version>\esptool.exe`.
 Put the board in [download mode](#download-mode), then:
 
@@ -493,7 +507,8 @@ Open **Sketch → Include Library → Manage Libraries** and install these,
 picking the version from each library's version list:
 
 1. **XPowersLib**, version **0.3.3** — controls the AXP2101 power manager.
-2. **TinyGPSPlus**, version **1.0.3** — parses the GPS receiver's NMEA messages.
+2. **TinyGPSPlus**, version **1.0.3** — parses the GPS receiver's NMEA (National
+   Marine Electronics Association) text messages.
 3. **U8g2**, version **2.36.18** — draws Stage 4's debug and production OLED screens.
 
 These are the versions pinned by CI. Library Manager installs the newest
@@ -547,20 +562,21 @@ trips and settings. Reflashing does not erase trips on the card.
 
 #### Firmware versions and releases
 
-Versions `v0.xx` are beta; `v1.00` marks release once most firmware development
-is finished. Only bump the number when preparing a build to flash for road use.
-Builds between bumps show the last number plus their own commit.
+Versions `v0.xx` are beta; `v1.00` will mark the public release. The driven
+release candidate stays at `v0.11` until release time. Builds between bumps
+show the last number plus their own commit.
 
-For the next road build:
+For maintainers preparing the `v1.00` release, once its remaining checks are
+complete (these steps are not needed to install or update a tracker):
 
-1. Change `firmware/VERSION` to the next number (for example `v0.06`) in its
-   own commit, titled `Firmware v0.06`, and merge it.
+1. Change `firmware/VERSION` to `v1.00` in its own commit, titled
+   `Firmware v1.00`, and merge it.
 2. On that merged commit, create and push an annotated tag:
-   `git tag -a fw-v0.06 -m "Firmware v0.06"`, then `git push origin fw-v0.06`.
+   `git tag -a fw-v1.00 -m "Firmware v1.00"`, then `git push origin fw-v1.00`.
 3. Run `python tools/stamp_firmware_version.py`, build from that commit, then flash.
-4. Publish a GitHub release from the tag, titled `Supreme firmware v0.06 (beta)`,
+4. Publish a GitHub release from the tag, titled `Supreme firmware v1.00`,
    as a full release marked **Latest**:
-   `gh release create fw-v0.06 --verify-tag --latest --title "..." --notes-file notes.md`.
+   `gh release create fw-v1.00 --verify-tag --latest --title "..." --notes-file notes.md`.
    Publishing triggers the source bundle and checksum asset upload; `srv-v*` releases get the same bundle.
    Don't mark it pre-release: a pre-release can't be Latest, and the frozen
    "T-Beam V1.2 final" release would then look like the current firmware.
@@ -651,31 +667,33 @@ starts
 
 Needs the GPS antenna under open sky: outdoors, or at a window without
 metal-coated glass. Every 2 s it prints whether NMEA is arriving, whether
-there's a fix, satellites used, HDOP, PPS pulses and the time to first fix
-since the GPS rail came on. Coordinates stay hidden unless you press `l`.
+there's a fix, satellites used, horizontal dilution of precision (HDOP), PPS
+pulses and the time to first fix since the GPS rail came on. Coordinates
+stay hidden unless you press `l`.
 Don't paste logs with coordinates or raw NMEA anywhere public: they show
 where you are.
 
-Keys: `g` signal strength of every satellite heard plus the antenna/RF
-status, `4` GPS power off/on (time a hot start), `v` GPS firmware version,
+Keys: `g` signal strength of every satellite heard plus the antenna and
+radio-frequency (RF) status, `4` GPS power off/on (time a hot start),
+`v` GPS firmware version,
 `u` a legacy UBX config test (Stage 4 uses VALSET instead), `e` GPS_EN,
 `b` VBACKUP, `3` LoRa rail (needs the antenna attached and a confirmation),
 `r` raw NMEA, `h` help.
 
 What good looks like outdoors: a cold start in about 33 s, a hot start in
 about 2 s, and `g` showing 19 or more satellites heard at 40+ dBHz with
-the AGC around 30%. `heard=0` with the AGC stuck near 80% means no signal
-reaches the receiver: check that the GPS cable is clicked onto the **GPS**
-socket.
+the automatic gain control (AGC) around 30%. `heard=0` with the AGC stuck
+near 80% means no signal reaches the receiver: check that the GPS cable is
+clicked onto the **GPS** socket.
 
 ### Stage 4: The trip logger
 
 For why it works this way, see [the firmware design](DESIGN.md).
 
 The `04_trip_logger/` sketch detects trips, accumulates mileage and writes
-GPX files to the microSD card, with internal LittleFS as fallback. The
-current release candidate is `v0.11`; it uploads trips from the card, and the
-[top-level README](../README.md#where-its-at) lists what has and hasn't been
+GPS Exchange Format (GPX) files to the microSD card, with internal LittleFS
+as fallback. The current release candidate is `v0.11`; it uploads trips from
+the card, and the [top-level README](../README.md#where-its-at) lists what has and hasn't been
 checked on a real board. Since `v0.06` there is one firmware build: debug
 mode starts off at every power-on and can be toggled by holding BOOT and
 tapping POWER.
@@ -856,7 +874,7 @@ esptool --chip esp32s3 --port <port> read-flash 0x190000 0x260000 trips-backup.b
 ```
 
 Close Serial Monitor before running esptool. Replace `<port>` with the
-board's port, such as `COM5` or `/dev/ttyACM0`. The offset and size above
+board's port, such as `COMx` or `/dev/ttyACM0`. The offset and size above
 come from this project's `spiffs` line in `partitions.csv`; if a different
 layout was previously installed, use that layout's offset and size instead.
 Keep the backup outside the repo. Older esptool versions spell the command
@@ -901,10 +919,12 @@ How it behaves once flashed:
   or 0.1 mi as noise. Confirmed USB loss when the car switches off, or a
   clean board power-off, keeps even a short trip that has started.
   Speed must also pass the GPS receiver's accuracy check: a checksum-valid
-  NAV-PVT received within 1.5 s, with `gnssFixOK`, a 3D or combined fix,
-  and `sAcc` at most 0.5 m/s plus `hAcc` at most 5 m when starting,
+  NAV-PVT (navigation position, velocity and time) message received within
+  1.5 s, with `gnssFixOK`, a 3D or combined fix, and `sAcc` (speed accuracy)
+  at most 0.5 m/s plus `hAcc` (horizontal accuracy) at most 5 m when starting,
   or 1.0 m/s plus 10 m during a trip.
-  These are first guesses to calibrate from indoor and drive logs. The
+  These limits were retained after road-test calibration. A trip ending in a
+  parking garage remains untested and is deferred until after `v1.00`. The
   arrival window tolerates either message order at 1 Hz, so the latest
   sample may belong to the previous epoch; it does not change GPX times.
   Rejected speeds count as stopped: arming resets, or an active trip enters
@@ -921,9 +941,10 @@ How it behaves once flashed:
   succeeds or gives up after five attempts. Until then, speeds without
   fresh, accurate NAV-PVT stay untrusted. If NAV-PVT is absent for more
   than ten seconds after configuration ends (or since the last NAV-PVT), one
-  `WARNING:` announces fallback to the previous RMC-only behavior. A single
-  return message announces restored accuracy gating. Fallback can still
-  record false movement: check the warning during the hardware shakedown.
+  `WARNING:` announces fallback to RMC-only speed (the Recommended Minimum
+  Navigation Information message). A single return message announces restored
+  accuracy gating. Fallback can still record false movement: check the warning
+  during the hardware shakedown.
 - **Power-cut recovery:** each GPS point with valid RMC UTC is written
   to a `.gpx` file and the file is closed immediately to limit data loss.
   The buffered untimed tail is still in memory and can be lost on a
@@ -960,16 +981,19 @@ How it behaves once flashed:
   `Network: home WiFi not found "<ssid>" -- next try in 60 s.` When connected, it
   POSTs each trip to the ingest server as GPX and deletes it locally once
   the server accepts it. GPS
-  parsing runs on core 1; networking runs on core 0 and never blocks
-  it. On 2026-10-21 (UTC), absent home WiFi produced retry waits of
-  60, 120, 240, 300 and 300 s. Once home, four SD trips received HTTP 200
-  and were deleted locally. A scan at 04:35:35Z missed the access point;
+  parsing runs on core 1; networking runs on core 0, keeping WiFi and HTTP
+  waits out of the GPS loop. GPS writes and uploads still share a filesystem
+  lock for individual storage operations. On 2026-10-21 (UTC), absent home
+  WiFi produced retry waits of 60, 120, 240, 300 and 300 s. Once home, four SD
+  trips received HTTP 200 and were deleted locally. A scan at 04:35:35Z missed the access point;
   its 60 s retry led to the current trip's upload at 04:36:41Z. A scan
   miss at the edge of range can delay an upload; it need not mean the
   settings are wrong. Server-down retry was also verified on 2026-10-21
   (UTC): two `HTTP -1` failures kept the trip queued, then HTTP 200 after
-  ingest restarted deleted the local file. Server errors (401/413/5xx)
-  described here are code behaviour, still untested on the Supreme.
+  ingest restarted deleted the local file. Wrong-token and server-error
+  retries were bench-checked on 2026-11-01 (UTC); see
+  [upload checks](#check-recording-and-uploads). HTTP 413 handling remains
+  untested.
 - **Power loss:** after USB power has been absent for 10 s, the firmware
   finalizes the current trip. Once idle on battery for 10 minutes, it
   closes files, stops networking, seals the diagnostic journal, unmounts
@@ -977,7 +1001,8 @@ How it behaves once flashed:
   It does not deep-sleep. The next USB power insert switches it on again.
   An upload still running at 10 minutes gets up to **16 more minutes** to
   finish; a file cut off then remains queued. This is the opportunity to
-  upload at home, subject to the pending end-to-end test. Without an 18650,
+  upload at home; check your installed power setup as described under
+  [Put it in the car](#put-it-in-the-car). Without an 18650,
   the board loses power with the car and has no battery upload window or
   clean shutdown. A car USB port that stays powered never triggers this
   power-off. Unreadable USB-power state keeps the board awake for retries;
@@ -1004,9 +1029,9 @@ How it behaves once flashed:
 - **Charging:** the firmware pauses charging at high or low temperatures
   reported by the AXP2101 power-management chip. Its temperature is an
   indirect estimate using a 9 °C die-temperature offset measured on the
-  retired V1.2; recalibration for the Supreme is still pending. Debug builds
-  log the readings it needs (the `Temp:` line under [The screen](#the-screen)). It is not
-  a measurement of the battery cell or a guarantee of safe charging in a
+  retired V1.2; recalibration for the Supreme is still pending. Debug mode
+  logs the readings it needs (the `Temp:` line under [The screen](#the-screen)).
+  This is not a measurement of the battery cell or a guarantee of safe charging in a
   hot car. Logging continues while charging is paused.
   The guard verifies every charger on/off command with a checked register read
   and retries unconfirmed commands every 30 s; E2008 means three attempts failed
@@ -1034,8 +1059,9 @@ duplicate.
 
 Server-down retry was verified on 2026-10-21 (UTC): the trip stayed queued
 after two `HTTP -1` failures and uploaded with HTTP 200 after ingest
-restarted. Server errors (401/413/5xx) below describe the code and remain
-untested on the Supreme.
+restarted. Wrong-token and server-error retries were bench-checked on
+2026-11-01 (UTC); see [upload checks](#check-recording-and-uploads).
+HTTP 413 handling remains untested on the Supreme.
 If a trip does not appear, first confirm `Trip started` and `Trip finalized`:
 an active or discarded trip cannot upload. `HTTP 401` means the upload
 token does not match. A negative result means a connection or transfer
@@ -1090,7 +1116,8 @@ before relying on the tracker; see [degraded startup details](../DIAGNOSTICS.md#
 #### RTC
 
 The PCF8563 real-time clock (RTC) supplies diagnostic event timestamps
-before GPS/SNTP sync, never GPX times. The `RTC:` boot line reports whether its clock is
+before GPS or Simple Network Time Protocol (SNTP) sync, never GPX times.
+The `RTC:` boot line reports whether its clock is
 usable and, when known, how long ago it was set. `invalid (stopped/VL)` is
 normal after the battery was removed; trusted GPS or network time (SNTP)
 repairs it with one verified setting per boot. It keeps counting while the board is
@@ -1101,10 +1128,10 @@ slow, so a reset corrects it only when it's off by 2 s or more.
 
 Stage 4 sends one UBX-CFG-VALSET (`06 8A`) at every
 boot to the receiver's RAM layer, without saving to battery-backed RAM
-or flash. It explicitly enables UART1 RMC, GGA and NAV-PVT at rate 1;
-disables GLL, GSA and VTG; enables GSV every 5 epochs in all builds;
-and selects the automotive dynamic model. The
-navigation rate stays at the default 1 Hz. GGA supplies altitude, HDOP
+or flash. It explicitly enables UART1 RMC, GGA (fix data) and NAV-PVT at
+rate 1; disables GLL, GSA and VTG; enables GSV (satellites-in-view messages)
+every 5 epochs in all builds; and selects the automotive dynamic model.
+The navigation rate stays at the default 1 Hz. GGA supplies altitude, HDOP
 and satellite count; NAV-PVT supplies speed/horizontal accuracy used
 before recording movement.
 E3009 means high receiver gain and no usable-strength satellite persisted
@@ -1119,10 +1146,12 @@ legacy CFG-MSG and CFG-NAV5, but VALSET is the future-proof interface.
 After a cold power-up the MAX-M10S can emit NMEA before accepting UBX.
 The logger waits for checksum-valid NMEA (up to 3 s per attempt), then
 configures in the background while continuing to parse fixes. Each send
-waits 2 s for an ACK: at 9600 baud (8N1, about 960 bytes/s), a ~1 KB GSV
+waits 2 s for an acknowledgment (ACK): at 9600 baud (8 data bits, no parity,
+one stop bit, or 8N1; about 960 bytes/s), a ~1 KB GSV
 burst takes ~1.1 s, with more time needed for other queued NMEA,
 NAV-PVT (~100 bytes/s), and the ACK. Nothing is resent within that window.
-Silence permits up to three sends per attempt; a NAK ends that attempt.
+Silence permits up to three sends per attempt; a negative acknowledgment
+(NAK) ends that attempt.
 Failed attempts wait 8 s before retrying, up to five attempts. Success
 logs `GPS configured on attempt N (... ms after config start)`; final
 failure warns and continues with current settings, without a legacy
@@ -1148,8 +1177,9 @@ redraws about once a second and enables `GPS RF:`, `Temp:`, heap and other
 debug serial output. POWER alone shows the normal status card in either
 mode; the live page resumes when that card expires. Turning debug off
 returns to production power save after the brief feedback, unless a fresh
-card is due; old cards and errors are not replayed. The toggle and shared
-panel handoff still need bench verification. Illustrative debug values:
+card is due; old cards and errors are not replayed. The toggle, shared panel
+handoff and debug-off restart were bench-checked on 2026-10-21 (UTC).
+Production-card road checks remain open. Illustrative debug values:
 
 ```text
 ACTIVE 0h12m    v0.09  trip state, time since boot, release version
@@ -1240,7 +1270,7 @@ Things to know:
   `rf --`, and unknown or stale NMEA values show `--`. Antenna status
   and power may read `DONTKNOW` without an antenna supervisor; that
   alone does not mean the antenna failed.
-- Debug builds also print a `Temp:` line every 30 s: the guard's PMU die
+- Debug mode also prints a `Temp:` line every 30 s: the guard's PMU die
   temperature with sample age and its die-minus-9 C estimate (the retired
   V1.2 calibration; samples older than 35 s show `--`),
   TS voltage/raw ADC count, BME280 temperature, actual charging/phase,
@@ -1294,8 +1324,8 @@ GPS configured on attempt 1 (1500 ms after config start): RMC+GGA+NAV-PVT, GSV e
 ```
 
 > CI compiles this sketch for the Supreme on **ESP32 core 3.3.11**, with
-> **XPowersLib 0.3.3**, **TinyGPSPlus 1.0.3** and **U8g2 2.36.18**, in both
-> display modes. Its FQBN is
+> **XPowersLib 0.3.3**, **TinyGPSPlus 1.0.3** and **U8g2 2.36.18**, as one
+> build containing both runtime display modes. Its FQBN is
 > `esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled`.
 > Host tests run with `bash firmware/host_test/run.sh`. Compile and host
 > checks do not establish hardware durability or live upload headroom. The
@@ -1315,10 +1345,12 @@ and cleared; E5001's boot-local access-point-absence counter was 6.
 Successful diagnostics uploads print nothing on serial. Confirm them in
 the ingest log or Device health. That build showed `Firmware: Not reported`
 because it predates version reporting; stamped builds report their version
-number plus Git commit (see step 6). The behaviour below describes
-the implementation; LittleFS uploads and server errors (401/413/5xx)
-remain untested on the Supreme. Trip uploads with debug mode off and
-server-down retry were verified separately (see [Stage 4](#stage-4-the-trip-logger)).
+number plus Git commit (see [version stamping](#upload-a-sketch-and-read-its-messages)).
+LittleFS uploads and HTTP 413 handling remain untested on the Supreme.
+The 2026-11-01 (UTC) bench checks verified wrong-token/server-error recovery
+and diagnostics deduplication; see [upload checks](#check-recording-and-uploads).
+Trip uploads with debug mode off and server-down retry were verified
+separately (see [Stage 4](#stage-4-the-trip-logger)).
 
 Stage 4 carries a board-independent `event_log.h` / `event_log.cpp` module with
 a fixed producer queue, CRC-protected rolling segments, durable acknowledgment
@@ -1339,7 +1371,7 @@ RAM records are lost on reset or power-off.
 
 The existing core-0 network task drains one record per service slice, yielding
 the filesystem lock to trip writes and uploads. It also handles shutdown
-drain/sealing before the existing storage unmounts. Debug builds print one
+drain/sealing before the existing storage unmounts. Debug mode prints one
 boot line naming the active backend and unacknowledged record/segment counts;
 an incomplete inventory is labeled. There is no extra task. Runtime hooks now
 cover GPS data/fix loss and VALSET failures, unavailable UTC, the PMU's existing
@@ -1431,8 +1463,12 @@ The network task reserves 12,288 bytes. During and after the real SD uploads
 on 2026-10-21 (UTC), the debug build's minimum free stack was **7,436 bytes**,
 with GPS logging active. The server-down/recovery run that day recorded
 **7,556 bytes** free. Those measurements justified keeping the 12,288-byte
-allocation. LittleFS uploads and HTTP 401/413/5xx server responses remain
-unmeasured on the Supreme; successful paths do not prove their headroom.
+allocation. On 2026-11-01 (UTC), the wrong-token and HTTP 503 bench session
+recorded **7,536 bytes** minimum free on `v0.11+f6b0b1c96a`, with debug off
+and no drive in progress. It covered a small file's HTTP 401, a roughly 3 MB
+file's `HTTP -3` broken send, HTTP 503 and recovery. LittleFS uploads and
+HTTP 413 responses remain unmeasured on the Supreme; these results do not
+establish their headroom or GPS responsiveness during a large upload.
 Serial diagnostics report the task's lifetime minimum free stack at startup,
 after each GPX HTTP upload (including failures), and after each network cycle.
 Diagnostic requests sample the watermark silently between batches.
@@ -1509,8 +1545,25 @@ Do this before a test drive, not during a trip.
 
 Server-down retry was verified on 2026-10-21 (UTC): two attempts returned
 `HTTP -1`, the trip stayed queued, and the next retry after ingest restarted
-received HTTP 200 and deleted the local file. Server errors (401/413/5xx)
-below describe the code's behaviour and remain untested on the Supreme.
+received HTTP 200 and deleted the local file.
+
+**Bench checks, 2026-11-01 (UTC):** firmware `v0.11+f6b0b1c96a`, server
+`v0.10`, two test trips on microSD, with the board on USB at the desk:
+
+- With the wrong token, the 14 KB trip returned HTTP 401 and raised E5004.
+  The 3.1 MB trip returned `HTTP -3` (broken send) and raised E5003: the
+  server's three-second rejected-body drain ended before it finished sending.
+  Both files stayed queued.
+- A stand-in server that read the full body and returned HTTP 503 kept both
+  files queued and raised E5008. After normal ingest and the matching token
+  were restored, both uploaded with HTTP 200 and were deleted locally.
+- The seven diagnostic events from that boot arrived once each, without
+  gaps or duplicates after retries. Device health showed no active conditions
+  and zero dropped events.
+
+This checks the microSD retry paths and diagnostics deduplication. LittleFS
+uploads and HTTP 413 handling remain untested on the Supreme. Debug was off
+during the large upload, so this session did not check GPS-loop responsiveness.
 
 If the trip does not appear, first confirm both `Trip started` and
 `Trip finalized`. A trip still in progress cannot upload; a short trip
@@ -1525,8 +1578,10 @@ discarded as noise has nothing to upload. Then look for the upload result:
   3 seconds and the connection is reset before the board sees the status. If
   WiFi is fine and the server is reachable but every upload fails, compare
   the token in the build with the server's `INGEST_AUTH_TOKEN` and look for
-  401s in the ingest log. The small diagnostics uploads do get the real 401,
-  so Device health shows the token-rejected fault.
+  401s in the ingest log. Check the board's status card for E5004 (token
+  rejected) or E5003 (transfer failed). Diagnostics use the same token and
+  cannot reach Device health while it is wrong; their queued events arrive
+  after the matching token is restored and diagnostics upload succeeds.
 - `HTTP 400` or `HTTP 413`: the server rejected the file as invalid or
   too large. Look for `kept as .bad, not retried`. That file remains on
   the board for inspection and uses storage, but no longer uploads
