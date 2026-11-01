@@ -19,9 +19,8 @@ server-built firmware, flashing and one-time diagnostics enrollment. The retired
 T-Beam V1.2's last firmware and instructions are on the frozen
 [`tbeam-v1.2` branch](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/tree/tbeam-v1.2).
 
-As of 2026-11-01 (UTC), firmware `v0.11` (tag `fw-v0.11`) is the release
-candidate and its driving week has passed. The server is v0.10; the v1.00
-version bump is still pending. Unraid has not yet been verified on a real box.
+As of 2026-11-01 (UTC), firmware `v1.00` (tag `fw-v1.00`) and server v1.00
+are the first public release. Unraid has not yet been verified on a real box.
 
 Assumes: Debian 13, a non-root user with sudo, SSH reachable.
 Placeholders: `<user>` = your Debian login, `<host>` = server IP or hostname,

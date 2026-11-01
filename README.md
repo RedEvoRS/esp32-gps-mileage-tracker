@@ -24,10 +24,10 @@ when GPS time is unavailable.
 
 ## Where it's at
 
-The tracker and server are in daily use. As of 2026-11-01 (UTC), the board
-runs firmware **v0.11**, the release candidate, against server **v0.10**, and
-it has passed a week of everyday driving: every trip was recorded, uploaded
-and exported correctly. v1.00 is not out yet. Still unproven on the Supreme:
+The tracker and server are in daily use. **v1.00**, the first public
+release of both the firmware and the server, came out on 2026-11-01 (UTC),
+after a week of everyday driving on the release candidate in which every trip
+was recorded, uploaded and exported correctly. Still unproven on the Supreme:
 uploads from the internal-flash fallback (used when no microSD card mounts),
 trips that end in a parking garage, and distance accuracy against the car's
 odometer. Open work is tracked in

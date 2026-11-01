@@ -40,7 +40,8 @@ the local file. On the bench on 2026-11-01 (UTC), a server error (5xx) kept
 trips queued (E5008) and they uploaded after recovery; a wrong token (401)
 gave E5004 on a small file and a broken send (E5003, `HTTP -3`) on a ~3 MB
 file; diagnostics dedupe held. The release-candidate driving week on firmware
-v0.11 passed on 2026-11-01. LittleFS uploads and HTTP 413 remain untested on
+v0.11 passed on 2026-11-01, and firmware and server v1.00, the first public
+release, followed the same day. LittleFS uploads and HTTP 413 remain untested on
 the Supreme. Other hardware acceptance is tracked under `supreme-port`.
 Don't assume a Supreme pin, rail or peripheral works until its port issue
 is closed and it's verified on the bench.

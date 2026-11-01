@@ -11,10 +11,9 @@ USB, power and GPS before installing the trip logger for use in the car.
 The power-management unit (PMU) controls the board's rails, battery and
 shutdown; Stage 2 checks it before the GPS and trip-logging stages.
 
-All four stages run on the Supreme. Firmware `v0.11` remains the release
-candidate: the board ran `v0.11+f6b0b1c96a` (tag `fw-v0.11`) for its week of
-normal driving, which passed on 2026-11-01 (UTC). The version bump to `v1.00` waits for
-release time; it has not happened yet. Server `v0.10` is deployed. On
+All four stages run on the Supreme. Firmware `v1.00` (tag `fw-v1.00`), the
+first public release, came out on 2026-11-01 (UTC) with server `v1.00`, after
+the release candidate `v0.11` passed a week of normal driving. On
 2026-10-21 (UTC), an earlier Stage 4 build uploaded
 four real trips from microSD to the deployed server, then delivered all 115
 pending diagnostic events and a current snapshot. Uploads with debug mode
@@ -562,21 +561,20 @@ trips and settings. Reflashing does not erase trips on the card.
 
 #### Firmware versions and releases
 
-Versions `v0.xx` are beta; `v1.00` will mark the public release. The driven
-release candidate stays at `v0.11` until release time. Builds between bumps
-show the last number plus their own commit.
+Versions `v0.xx` were beta; `v1.00` is the first public release. Builds
+between bumps show the last number plus their own commit.
 
-For maintainers preparing the `v1.00` release, once its remaining checks are
-complete (these steps are not needed to install or update a tracker):
+For maintainers preparing a new release, such as `v1.01` (these steps are
+not needed to install or update a tracker):
 
-1. Change `firmware/VERSION` to `v1.00` in its own commit, titled
-   `Firmware v1.00`, and merge it.
+1. Change `firmware/VERSION` to the new version in its own commit, titled
+   `Firmware v1.01`, and merge it.
 2. On that merged commit, create and push an annotated tag:
-   `git tag -a fw-v1.00 -m "Firmware v1.00"`, then `git push origin fw-v1.00`.
+   `git tag -a fw-v1.01 -m "Firmware v1.01"`, then `git push origin fw-v1.01`.
 3. Run `python tools/stamp_firmware_version.py`, build from that commit, then flash.
-4. Publish a GitHub release from the tag, titled `Supreme firmware v1.00`,
+4. Publish a GitHub release from the tag, titled `Supreme firmware v1.01`,
    as a full release marked **Latest**:
-   `gh release create fw-v1.00 --verify-tag --latest --title "..." --notes-file notes.md`.
+   `gh release create fw-v1.01 --verify-tag --latest --title "..." --notes-file notes.md`.
    Publishing triggers the source bundle and checksum asset upload; `srv-v*` releases get the same bundle.
    Don't mark it pre-release: a pre-release can't be Latest, and the frozen
    "T-Beam V1.2 final" release would then look like the current firmware.
@@ -692,7 +690,7 @@ For why it works this way, see [the firmware design](DESIGN.md).
 
 The `04_trip_logger/` sketch detects trips, accumulates mileage and writes
 GPS Exchange Format (GPX) files to the microSD card, with internal LittleFS
-as fallback. The current release candidate is `v0.11`; it uploads trips from
+as fallback. The current release is `v1.00`; it uploads trips from
 the card, and the [top-level README](../README.md#where-its-at) has the current status and
 what's still unproven on a real board. Since `v0.06` there is one firmware build: debug
 mode starts off at every power-on and can be toggled by holding BOOT and
