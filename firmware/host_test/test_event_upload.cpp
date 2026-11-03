@@ -8,6 +8,7 @@
 #include <vector>
 static std::vector<std::string> requests;
 static std::vector<std::string> cardLifecycle;
+static std::vector<std::string> failedCardLifecycle;
 static void collect() {
     for (size_t i = 0; i < g_httpBodies.size(); ++i)
         if (g_httpUrls[i].find("/v1/device-events") != std::string::npos &&
@@ -102,6 +103,46 @@ static void cardRemovalAndReturn() {
     assert(g_httpBodies.size() == 2 && eventCount(g_httpBodies[0]) == 1 && eventCount(g_httpBodies[1]) == 2);
     for (const auto& body : g_httpBodies) cardLifecycle.push_back(body);
     std::puts("Event upload: SD -> no SD/LittleFS with active E4001 -> SD, flash history drained across boots passed");
+}
+static void mountedStoreFailures() {
+    uploadWorld(); records(1); drainEvents();
+    failedCardLifecycle.push_back(g_httpBodies.front()); collect();
+    records(1); // retained on SD; it must not starve newer LittleFS events
+    g_sdDisk.writesFail = true; // still mounted, reads initially work
+    g_sdDisk.failNextOpens = 1;
+    assert(!beginTrip(Fix{})); // production trip-create hook raises E4006
+    serviceJournal(); records(2);
+    assert(eventSnapshot()); // LittleFS authority already works before reads fail
+    assert(Preferences::durable64["revstate"] & 2);
+    g_sdDisk.readsFail = true;
+    drainEvents();
+    assert(gSdMounted && g_httpBodies.size() == 1);
+    const auto& failed = g_httpBodies.front();
+    assert(eventCount(failed) == 3 && failed.find("\"code\":4006,") != std::string::npos);
+    assert(failed.find("\"storage_backend\":\"littlefs\"") != std::string::npos);
+    assert(failed.find("\"active\":[{\"code\":4006,") != std::string::npos);
+    assert(gJournal.stats().storageFailures > 0 && gJournal.stats().queued == 0);
+    failedCardLifecycle.push_back(failed); collect();
+    // A persistently unreadable SD cannot hide another flash batch next tick.
+    records(1); drainEvents();
+    assert(g_httpBodies.size() == 1 && eventCount(g_httpBodies.front()) == 1);
+    failedCardLifecycle.push_back(g_httpBodies.front()); collect();
+    g_sdDisk.writesFail = g_sdDisk.readsFail = false;
+    tripWriteResult(SD, true, "write"); // measured-recovery hook, no pending trip
+    serviceJournal(); drainEvents();
+    assert(g_httpBodies.size() == 1 && eventCount(g_httpBodies.front()) == 2);
+    assert(!(Preferences::durable64["revstate"] & 6) && backlog().records == 0);
+    failedCardLifecycle.push_back(g_httpBodies.front()); collect();
+
+    // The symmetric failure must retain v1.00's healthy-SD behavior.
+    uploadWorld(); g_disk.writesFail = true; records(2);
+    g_disk.readsFail = true; drainEvents();
+    assert(g_httpBodies.size() == 1 && eventCount(g_httpBodies.front()) == 2);
+    assert(g_httpBodies.front().find("\"storage_backend\":\"sd\"") != std::string::npos);
+    assert(Preferences::durable64["revstate"] & 4);
+    g_disk.writesFail = g_disk.readsFail = false;
+    assert(eventSnapshot() && !(Preferences::durable64["revstate"] & 6));
+    std::puts("Event upload: mounted SD write then read failure, real E4006 delivery, persistent-read progress, recovery/resync and healthy-SD/failed-LittleFS passed");
 }
 static void allocationFailure(bool missing) {
     uploadWorld();
@@ -377,6 +418,7 @@ int main(int argc, char** argv) {
     trip(); gNetRetryMs = 0; netCycle(); assert(!hasPending());
     std::puts("Event upload: one-use enrollment, card adoption, total authority loss and GPX independence passed");
     collect(); cardRemovalAndReturn(); collect();
+    mountedStoreFailures(); collect();
     // Refusal is actionable even when the flash copy cannot be read on a PC.
     uploadWorld(); Preferences::durable64["enroll"] = 0;
     assert(enrollAt(321)); drainEvents();
@@ -390,6 +432,7 @@ int main(int argc, char** argv) {
     assert(g_psramAllocations == 1); // all drains/retries reused the boot allocation
     if (argc > 1) for (const auto& body : requests) std::printf("REQUEST %s\n", body.c_str());
     if (argc > 1) for (const auto& body : cardLifecycle) std::printf("CARD_CYCLE %s\n", body.c_str());
+    if (argc > 1) for (const auto& body : failedCardLifecycle) std::printf("FAILED_CARD %s\n", body.c_str());
     std::printf("Event upload: %zu complete firmware requests; PSRAM Batch=%zu request=%zu snapshot=%zu ack=%zu bytes\n",
         requests.size(), sizeof(gEventBuffers->batch), sizeof(gEventBuffers->request), sizeof(gEventBuffers->snapshot), sizeof(gEventBuffers->ack));
     std::printf("PSRAM observations=%zu copy=%zu workspace=%zu bytes (host ABI)\n",

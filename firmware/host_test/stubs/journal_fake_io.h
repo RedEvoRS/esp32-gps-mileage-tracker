@@ -34,11 +34,13 @@ public:
     }
     bool read(const char* path, uint32_t offset, void* data, size_t bytes) {
         assertLocked();
+        if (fs_.g_disk.readsFail) return false;
         auto file = fs_.open(path);
         return file && file.seek(offset) && file.read(static_cast<uint8_t*>(data), bytes) == bytes;
     }
     bool write(const char* path, const void* data, size_t bytes, bool append) {
         assertLocked();
+        if (fs_.g_disk.writesFail) return false;
         size_t old = append && fs_.g_disk.files.count(path) ? fs_.g_disk.files[path].size() : 0;
         auto file = fs_.open(path, append ? FILE_APPEND : FILE_WRITE);
         if (!file) return false;

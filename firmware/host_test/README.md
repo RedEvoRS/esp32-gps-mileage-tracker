@@ -113,6 +113,13 @@ suspension, stale-only boots and journal/NVS failure paths. The worker/protocol
 bridge also posts a three-boot card lifecycle into one disposable ingest
 database: E4001 becomes active with `littlefs`, then clears with newer SD health,
 while retained flash events are accepted and deduplicated.
+Mounted-store regressions inject write failures followed by read failures on SD,
+deliver the production E4006 trip-create fault through the worker and real local
+ingest, then verify resynchronization. Symmetric LittleFS failure keeps SD
+diagnostics working. Journal tests prove unreadable partial batches cannot leak
+cursors or corruption counts into flash/RAM acknowledgments, refusals preserve
+the last authority, missing-witness epoch adoption survives erase-all, and new
+enrollment never reuses a loaded epoch after NVS reset.
 
 **Display**
 

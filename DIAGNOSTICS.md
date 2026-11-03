@@ -24,7 +24,10 @@ server internals and backups. Hardware acceptance limits remain explicit there.
   for trip capacity (FAT32 is the required card filesystem format). Diagnostics
   revisions are mirrored to SD and LittleFS, the internal flash filesystem.
   After enrollment or migration, internal flash can send current health and
-  events without a card, including active **E4001 (SD_UNAVAILABLE)**.
+  events without a card, including active **E4001 (SD_UNAVAILABLE)**. If a
+  mounted card starts failing, a healthy enrolled flash copy can still report
+  **E4006 (TRIP_WRITE_FAILED)** and upload its retained events. A failed flash
+  journal likewise does not block a healthy enrolled card.
 - A reachable ingest server and the same private bearer token and `DEVICE_ID`
   configured in the firmware. The device label is not authentication. See
   [DEPLOY_DEBIAN.md](DEPLOY_DEBIAN.md) for setup and exact server commands, and
@@ -58,8 +61,10 @@ that minimum was already met, check journal/NVS errors rather than raising it.
 
 Enrollment is one-use: core 0 saves and verifies the ID in `diag/enroll` in
 **NVS (non-volatile storage, the ESP32's settings memory)** before calling
-`restoreStatusSequence(highWater)` under the journal lock. Enrollment writes
-every mounted journal and the separate NVS recovery marker. A restore below either stored revision
+`restoreStatusSequence(highWater)` under the journal lock. Enrollment attempts
+every loaded journal and needs at least one verified save plus the separate
+NVS recovery marker. Failed/absent stores are marked stale before it succeeds.
+A restore below either loaded stored revision
 is refused **after the ID has been consumed**. Raising only the ID while keeping
 that too-low value repeats the failure and consumes another ID. Fix the lower
 bound or storage problem first; only then retry with a higher ID and reboot.
@@ -136,23 +141,43 @@ the card is missing leaves no internal-flash authority yet: insert the enrolled
 card for one successful allocation, or explicitly re-enroll internal flash
 against a fresh server read and the local bounds above.
 
-Every request requires a check-in. If no current enrolled journal is available,
-the allocator is suspended, NVS cannot be read, or any mounted journal cannot
-load/write its metadata, **all diagnostics requests stop and back off**. A
-failed write withholds the snapshot; any persisted revision becomes a harmless
-gap. Restore the failed store alongside a current copy, or re-enroll if the
-only remaining copy is marked stale. Local LittleFS/RAM journaling and GPX
-uploads retain their existing storage/durability limits.
+Every request requires a check-in. A mounted journal that cannot load, save or
+verify its revision is skipped for that attempt, just like an absent store.
+Diagnostics continue if at least one current, enrolled, nonsuspended authority
+successfully saves the revision and NVS records which stores missed it before
+transmission. Unreadable event journals are skipped too, so SD read errors
+cannot hide LittleFS or RAM events; unreadable history remains for recovery.
+If no current authority saves, the allocator is suspended, or NVS fails,
+**all diagnostics requests stop and back off**. Refusal does not mark another
+copy stale; any persisted but unsent revision is a harmless gap. Restore the
+failed store alongside a current copy, or re-enroll if the only remaining copy
+is stale. Local journaling and GPX uploads keep their existing storage limits.
 
 NVS records suspension and which store missed allocations. A stale store alone
 cannot resume; mount a current copy with it to synchronize, or explicitly
 re-enroll. A conflict on a card-out boot also blocks a card that missed the
-conflict. This assumes NVS and checked journal writes survive: erasing/rolling
-back NVS, downgrading to old firmware, restoring old media images, or corruption
-of both metadata copies can defeat that protection. Keep erase disabled and
-recover explicitly after such changes. Lower-but-valid revisions still upload
-history/contact without advancing current health; equal revisions with changed
-content conflict. Do not clear server state to hide this.
+conflict. A recovered store clears its stale bit only after it saves alongside
+current authority. This assumes NVS and checked journal writes survive;
+rolling back NVS, downgrading firmware, restoring old media images or corruption
+of both metadata copies can defeat that protection.
+
+**Erase-all on an enrolled board:** this erases LittleFS and NVS, including the
+recovery witness `diag/revstate`, but leaves the SD card intact. When that key
+is genuinely missing, firmware adopts the recovery epoch from ready,
+nonsuspended mounted journals and saves it to NVS before allocating. If several
+ready journals are present, their epochs must agree. A suspended copy alone
+stays blocked, an older epoch cannot authorize allocation after adoption, and
+an NVS read error never counts as a missing key. An intact enrolled card can
+therefore continue without re-enrollment and seed the erased internal flash.
+With no ready copy, disagreeing epochs or suspension in the adopted epoch,
+recover explicitly using the procedure above.
+
+Erasing NVS loses evidence that an absent card was stale or missed a conflict.
+A stale enrolled card may then issue low revisions: the server accepts history
+and contact, but current health stays old until revisions exceed its high-water.
+An exact high-water collision with different snapshot content suspends the
+allocator and needs explicit recovery. Keep erase disabled for updates, and
+check Device health after any erase. Do not clear server state to hide this.
 
 <details>
 <summary>Read the SD revision without changing it</summary>
@@ -341,7 +366,7 @@ second metric reference.
 |---|---|
 | No Device health entry | A successful GPX upload with a valid `X-Device-Id`, or an accepted diagnostics request, creates contact. Verify the configured identity, server reachability and upload result. Legacy GPX uploads without identity are not assigned to a guessed device. |
 | Contact exists, but no current snapshot | GPX contact does not establish diagnostics health. Check for a current enrolled SD or LittleFS copy, NVS suspension/stale state, and the one-time upload-workspace allocation warning. An upgrade while the card was absent needs it once or explicit enrollment. |
-| Diagnostics stay local while trips upload | Eligible completed GPX files always take priority, even after a failed trip attempt. Diagnostics use the next eligible awake network opportunity and independent retry backoff. Check both mounted journals can persist revisions and the serial warning `diagnostics upload disabled: PSRAM allocation failed`; PSRAM is the board's external working memory. |
+| Diagnostics stay local while trips upload | Eligible completed GPX files always take priority, even after a failed trip attempt. Diagnostics use the next eligible awake network opportunity and independent retry backoff. Check at least one current enrolled journal can persist revisions, NVS is working, and the serial warning `diagnostics upload disabled: PSRAM allocation failed`; PSRAM is the board's external working memory. |
 | Enrollment/recovery is refused or never produces a current snapshot | Check the server high-water, SD stored revision and serial `local minimum high-water` (includes internal flash) before consuming another ID. Failed attempts consume IDs. A snapshot conflict needs explicit recovery and reboot; do not clear server state to hide it. |
 | History arrives but current health stays old | Lower-but-valid revisions can deliver history/contact without replacing current health. Compare revision bounds and use the recovery procedure above. An identical retry also does not refresh snapshot age. |
 | An old fault is in history, or a condition says unknown | History is not current health. A reboot or omitted/unobserved condition is unknown, not measured recovery. Use the current snapshot and receipt age. |
@@ -900,11 +925,15 @@ remounting media; do not reuse cached state for a different card.
   is not event-time order. The default 30 KiB events-array budget leaves room
   for the current check-in; the worker also enforces the full 32 KiB request.
   Re-reads preserve exact JSON, including original timestamps and identity.
-  On the Windows host ABI, `sizeof(EventLog)` is **25,120 bytes** and
+  On the Windows host ABI, `sizeof(EventLog)` is **25,176 bytes** and
   `sizeof(EventLog::Batch)` is **35,288 bytes**; the host test prints both.
   ABI/alignment can differ on the ESP32-S3. #124 must place both objects in
   **static DRAM or PSRAM**, never on a task stack. Only one batch ticket is
-  outstanding; a new read replaces it.
+  outstanding; a new read replaces it. A load/read failure increments storage
+  failure accounting and skips that store for the call. Any partial batch and
+  its uncommitted corruption count/cursor are discarded before trying the next
+  store or RAM. Its records are retried after recovery; another store's ack
+  cannot advance its cursor or charge its corrupt frames as losses.
 - `acknowledge(batch, accepted_ids)` requires the exact complete ID set, with
   no missing, unexpected or duplicate IDs. Persistent data advances only after
   the new metadata slot is durably written and read back. A failed ack retains
@@ -1019,23 +1048,33 @@ is healthy, so flash fallback has space available. Trip files, splitting,
 recovery and upload policy otherwise retain their existing behavior.
 
 `restoreStatusSequence(highWater)` checks every loaded revision (and this boot's
-reserved floor), refuses a lower value, and writes every mounted journal.
+reserved floor), refuses a lower value, and attempts every loaded journal.
 The caller supplies a fresh server bound too. NVS `diag/revstate` encodes bit 0
 as suspended, bits 1/2 as SD/LittleFS stale, and bits 3-62 as the recovery epoch.
-Missing NVS key means legacy epoch zero; unreadable state blocks allocation.
-Enrollment increments the epoch by 8, persists a suspended marker first, writes
-the new authority to all mounted journals, then commits an unsuspended marker.
-Partial enrollment stays suspended. Absent copies cannot authorize themselves
-in the new epoch; they can adopt only alongside a current authorized copy.
+The NVS adapter uses typed ESP-IDF lookups to distinguish NOT_FOUND from I/O or
+type errors. Only a genuinely missing key permits adoption: ready nonsuspended
+loaded stores must agree on an epoch, which is durably written to the witness.
+Suspension at that epoch or above stays blocked; a suspended-only survivor is
+latched suspended. Lower epochs cannot authorize allocation. Legacy ELG1 ready
+metadata adopts epoch zero by the same rule.
+Enrollment chooses an epoch 8 above the highest witness or loaded-store epoch
+seen this boot, persists a suspended marker first, then writes new authority.
+At least one verified save is required before committing an unsuspended witness
+with all absent/failed stores stale. Total save failure leaves suspension and
+does not add stale bits. Absent copies cannot authorize themselves in the new
+epoch; they can adopt only alongside a current authorized copy.
 
 `allocateStatusSequence` needs at least one ready, nonsuspended, nonstale copy
 in the current epoch. It takes the highest loaded revision plus one and writes
-that value, ready flag and epoch to every mounted journal before returning it.
+that value, ready flag and epoch to every loaded journal it can save.
 Fresh/empty or older copies adopt only in the presence of that authority.
-Before writing, NVS marks absent stores stale. If a journal write fails, it is
-marked stale and no snapshot is exposed; successful writes are not rolled back.
-After all writes succeed, mounted stale bits are cleared. An uncertain NVS
-read/write latches allocation off for the boot; exhaustion also refuses.
+At least one copy that was current authority before the attempt must save and
+pass read-back. Only then does NVS mark absent/load-failed/save-failed stores
+stale and clear successfully synchronized stores' bits, before returning the
+revision for transmission. Refusal never adds stale bits, even if a stale copy
+saved but the last current authority failed. Successful writes are not rolled
+back; the boot's reserved floor prevents reuse after uncertain read-back. An
+uncertain NVS read/write latches allocation off for the boot; exhaustion refuses.
 `suspendStatusSequence` latches the boot off, persists NVS suspension first,
 then attempts every mounted journal even if one fails. The explicit metadata
 flag distinguishes suspension from never enrolled. Only explicit enrollment

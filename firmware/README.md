@@ -155,6 +155,10 @@ with BOOT released only if the board stays in download mode.
   nonvolatile storage (NVS), including counters and enrollment records, are
   erased. The SD card is untouched. The erase lets Stage 4 provision its
   internal trip filesystem; see [first-flash behavior](#first-flash-on-a-new-board).
+  On an enrolled board, an intact enrolled card can restore diagnostics without
+  re-enrollment. Erasing also loses stale-card/conflict protection; check
+  [revision recovery](../DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
+  before erasing a used board.
 - **Update an installed tracker:** update/build on the server first, then
   rerun the script without the first-install flag and answer **no** at that
   prompt. This writes only the app, preserving NVS, internal trips and SD
@@ -817,13 +821,21 @@ app-only update (or cleanup) for a tracker already running this project.
 
 **Erase-all also wipes the board's settings memory (NVS):** the trip
 counter (`tripno`), diagnostic journal boot counter and consumed enrollment
-ID (`diag/enroll`), among other settings. If `DIAGNOSTICS_ENROLLMENT_ID`
+ID (`diag/enroll`) and revision recovery witness (`diag/revstate`), among other
+settings. An intact enrolled SD card can restore the missing witness and seed
+the erased LittleFS journal automatically; ready mounted copies must agree on
+their recovery epoch. A suspended card alone stays blocked. Erasing loses any
+record that a card was stale: it may send history with low revisions while
+Device health stays old, or hit a revision conflict that requires re-enrollment.
+Keep erase disabled for updates and check Device health after any erase.
+If `DIAGNOSTICS_ENROLLMENT_ID`
 and `DIAGNOSTICS_STATUS_HIGH_WATER` are still defined in `secrets.h`, the
 next boot can consume that ID again and re-enroll from its possibly stale
 high-water value. Follow [deployment Step 8](../DEPLOY_DEBIAN.md#one-time-diagnostics-enrollment),
 then remove both defines after the first successful diagnostics upload and
-reflash with erase disabled. If you must erase an enrolled board later,
-read a fresh server high-water and choose a higher enrollment ID first.
+reflash with erase disabled. If automatic recovery is blocked after an erase,
+read a fresh server high-water and local revision bounds, then choose a higher
+enrollment ID; see [revision recovery](../DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery).
 
 Watch the Serial Monitor. If LittleFS mounts, startup uses it normally.
 Otherwise the firmware reads **every byte** of the `spiffs` data partition.
@@ -1416,7 +1428,14 @@ upgrading. An upgrade with the card missing needs that card once or explicit
 re-enrollment. After that, a card-out boot sends `littlefs` snapshots with E4001
 active and uploads flash events; a replacement card adopts the flash revision.
 NVS records suspension and stores that miss allocations. A stale store alone
-cannot allocate: reconnect a current copy or re-enroll. Each allocation adds
+cannot allocate: reconnect a current copy or re-enroll. Each allocation attempts
+to save both mounted journals; a load/write/read-back failure on one
+does not block a healthy current authority on the other. NVS marks the failed
+copy stale before transmission, then clears the bit after synchronization.
+Unreadable SD event batches do not block flash or RAM history, so an enrolled
+flash copy can report a card that mounted but then failed, including E4006.
+Erase-all can adopt an intact enrolled card's epoch as described in the flashing
+section; missing NVS keys permit adoption, NVS errors do not. Each allocation adds
 one 80-byte metadata-slot write on wear-levelled LittleFS, at most about once
 per 30-second awake network tick while home, never per scan/event.
 Without current writable revision authority, events remain local and

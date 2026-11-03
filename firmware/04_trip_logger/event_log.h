@@ -38,7 +38,8 @@ enum class EventTimeSource : uint8_t { Unknown, Rtc, Gps, Sntp };
 class StatusRevisionState {
 public:
     virtual ~StatusRevisionState() = default;
-    virtual bool read(uint64_t& state) = 0;
+    enum class Read { Ready, Missing, Error };
+    virtual Read read(uint64_t& state) = 0;
     virtual bool write(uint64_t state) = 0;
 };
 struct EventContext {
@@ -145,12 +146,14 @@ public:
     void invalidateStorage(); // after remount: keep boot/queue, reload all caches
 
     // Single consumer, FS_LOCK, unchanged core ownership. Mirror max(revision)+1
-    // to EVERY mounted journal before exposing it; any write/load failure
-    // withholds the snapshot (gaps are harmless). No volatile/RAM authority.
+    // to every usable journal before exposing it. At least one existing current
+    // authority must save; omitted/failed stores become stale in NVS before
+    // transmission. Refusal never adds stale bits. No volatile/RAM authority.
     // The independent recovery witness blocks suspended or absent/stale stores
-    // across boots. Only explicit enrollment advances its recovery epoch.
-    // Adoption requires a current, nonsuspended authority on another store.
-    // Each allocation writes one 80-byte slot per mounted store, including
+    // across boots. A missing witness adopts an agreed ready journal epoch;
+    // explicit enrollment advances beyond every observed recovery epoch.
+    // Store synchronization requires a current, nonsuspended authority.
+    // Each allocation attempts one 80-byte slot per usable mounted store, including
     // wear-levelled LittleFS; no revision writes per producer scan/event.
     // Enrollment must supply >= server high-water AND minimumStatusSequence().
     uint64_t minimumStatusSequence(); // read-only, includes every loaded store
@@ -189,6 +192,7 @@ private:
     uint64_t bootCounter_ = 0, sequence_ = 0;
     bool begun_ = false;
     uint64_t revisionFloor_ = 0;
+    uint64_t revisionEpochFloor_ = 0;
     bool revisionBlocked_ = false; // also latch uncertain recovery-witness I/O
     std::atomic_flag queueLock_ = ATOMIC_FLAG_INIT;
     std::atomic<uint32_t> queueDrops_{0};
@@ -214,7 +218,7 @@ private:
     uint64_t allocated(const Store& store, uint32_t bytes) const;
     bool save(Store& store, Meta next);
     bool revisionStores(uint8_t& mounted, uint64_t& highest);
-    bool readRevisionState(uint64_t& state);
+    bool readRevisionState(uint64_t& state, uint8_t loaded, bool adopt = true);
     bool writeRevisionState(uint64_t state);
     bool append(Store& store, const Frame& frame);
     bool makeRoom(Store& store, size_t bytes);

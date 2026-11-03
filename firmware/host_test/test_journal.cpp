@@ -67,22 +67,25 @@ int main() {
 
     NvsRevisionState witness;
     uint64_t state = 123;
-    assert(witness.read(state) && state == 0); // v1.00 has no witness key
+    assert(witness.read(state) == StatusRevisionState::Read::Missing);
+    Preferences::failRead64 = true;
+    assert(witness.read(state) == StatusRevisionState::Read::Error); // missing is not a read failure
+    Preferences::failRead64 = false;
     assert(witness.write(10));
     NvsRevisionState reopenedWitness;
-    assert(reopenedWitness.read(state) && state == 10);
-    Preferences::failRead64 = true; assert(!witness.read(state));
+    assert(reopenedWitness.read(state) == StatusRevisionState::Read::Ready && state == 10);
+    Preferences::failRead64 = true; assert(witness.read(state) == StatusRevisionState::Read::Error);
     Preferences::failRead64 = false;
     Preferences::failWrite64 = true; assert(!witness.write(11));
     Preferences::failWrite64 = false;
-    assert(witness.read(state) && state == 10);
+    assert(witness.read(state) == StatusRevisionState::Read::Ready && state == 10);
     Preferences::failBegin = true;
-    assert(!witness.read(state) && !witness.write(11));
+    assert(witness.read(state) == StatusRevisionState::Read::Error && !witness.write(11));
     Preferences::failBegin = false;
     Preferences::durable64["revstate"] = UINT64_MAX;
-    assert(!witness.read(state));
+    assert(witness.read(state) == StatusRevisionState::Read::Error);
     Preferences::durable64.clear();
-    std::puts("Journal NVS revision witness: legacy default, persistence, invalid state and checked I/O failures passed");
+    std::puts("Journal NVS revision witness: missing vs read failure, persistence, invalid state and checked I/O failures passed");
 
     world(false, false);
     gJournalReady = false;

@@ -1239,7 +1239,7 @@ before flashing, replacing `<printed>` with the number from the command:
 must be positive and **greater than every ID previously used on this
 board**; use a higher value if needed. `ULL` marks an unsigned long long
 integer in C++. The firmware consumes the ID in NVS before restoring the
-snapshot revision on every mounted journal, so even a failed attempt needs a higher ID.
+snapshot revision on the usable mounted journals, so even a failed attempt needs a higher ID.
 For recovery, also inspect the SD stored revision and the serial
 `local minimum high-water` (includes internal flash), then follow
 [the recovery procedure](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery);
@@ -1257,6 +1257,20 @@ card-out boots send LittleFS health with E4001 active. Erase-all also clears
 the recovery/suspension/stale-store marker (`diag/revstate`) and consumed ID (`diag/enroll`);
 leaving the defines in the
 firmware then re-enrolls from the compiled-in, possibly stale high-water.
+If a mounted card starts failing reads or writes, a current healthy flash copy
+can still send snapshots and its events, including E4006 trip-write faults.
+Likewise, failed LittleFS does not block a healthy enrolled card. NVS must
+record the skipped store as stale before sending; that store resynchronizes
+alongside current authority when it recovers. Unreadable event stores do not
+block another store's batches.
+After erase-all, a genuinely missing witness adopts the epoch from an intact
+enrolled card (or agreeing ready mounted journals), so re-enrollment is normally
+unnecessary. Suspension and disagreeing epochs still block automatic recovery;
+NVS read errors never permit adoption. Erasing loses stale-card protection:
+an old card can send history without updating current health, and an exact
+high-water collision suspends diagnostics until explicit recovery. Keep erase
+disabled for updates, remove the enrollment defines and check Device health
+after any erase.
 See [snapshot revision enrollment and recovery](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery).
 
 Successful diagnostics uploads print nothing on the board's serial output;
