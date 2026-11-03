@@ -1239,17 +1239,22 @@ before flashing, replacing `<printed>` with the number from the command:
 must be positive and **greater than every ID previously used on this
 board**; use a higher value if needed. `ULL` marks an unsigned long long
 integer in C++. The firmware consumes the ID in NVS before restoring the
-snapshot revision on the SD card, so even a failed attempt needs a higher ID.
-For any reused card or recovery, also read the SD stored revision and follow
+snapshot revision on every mounted journal, so even a failed attempt needs a higher ID.
+For recovery, also inspect the SD stored revision and the serial
+`local minimum high-water` (includes internal flash), then follow
 [the recovery procedure](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery);
 the server value alone is not a safe recovery bound.
 
 After the **first successful diagnostics upload**, check the viewer's
 **Device health** page for the board's contact and a current snapshot.
-Then remove both defines and reflash with erase **Disabled**. Existing SD
-revision metadata is used on later boots. Re-enrollment after lost or
-replaced metadata needs a higher ID (at least 2 after using ID 1) and a
-fresh server read. Erase-all also clears the consumed ID (`diag/enroll`);
+Then remove both defines and reflash with erase **Disabled**. Existing SD/LittleFS
+revision metadata is used on later boots. Re-enrollment after losing
+all current copies needs a higher ID (at least 2 after using ID 1) and a
+fresh server read. A replacement card adopts a current internal-flash copy.
+An enrolled v1.00 card seeds flash at the first allocation after upgrading;
+upgrading without the card needs it once or explicit re-enrollment. Later
+card-out boots send LittleFS health with E4001 active. Erase-all also clears
+the recovery/suspension/stale-store marker (`diag/revstate`) and consumed ID (`diag/enroll`);
 leaving the defines in the
 firmware then re-enrolls from the compiled-in, possibly stale high-water.
 See [snapshot revision enrollment and recovery](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery).

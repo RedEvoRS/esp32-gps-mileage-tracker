@@ -279,14 +279,19 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   after 24 hours without contact (first boot contact age is unknown).
   Successful diagnostics uploads print nothing on serial; confirm them
   in ingest logs or Device health.
-- Snapshot enrollment: the SD-only snapshot revision allocator needs explicit
+- Snapshot enrollment: the SD/LittleFS mirrored snapshot revision allocator needs explicit
   one-use enrollment in `secrets.h` against the server high-water: the server's
   highest accepted `status_sequence` for the device (see `DIAGNOSTICS.md`).
   Remove `DIAGNOSTICS_ENROLLMENT_ID` and `DIAGNOSTICS_STATUS_HIGH_WATER`
   after the first good diagnostics upload and reflash with erase disabled;
-  normal boots use existing SD metadata. Re-enrollment needs a new ID
+  normal boots use existing journal metadata. An enrolled v1.00 card seeds
+  internal flash on the first allocation; an upgrade without that card needs
+  it once or explicit re-enrollment. Missing-card boots then report LittleFS
+  and E4001. NVS preserves suspension and marks stores that miss allocations;
+  a stale copy alone cannot allocate. Re-enrollment needs a new ID
   greater than any used (at least 2 after ID 1) and a fresh server high-water
-  read. Missing revision authority retains diagnostics locally without
+  read and a value at least as high as either local copy (serial prints the
+  minimum on refusal). Missing revision authority retains diagnostics locally without
   blocking GPX.
 - Firmware identity: builds report a stamped version number plus Git commit.
   No generated `firmware_version.h` means `unversioned`; an existing header

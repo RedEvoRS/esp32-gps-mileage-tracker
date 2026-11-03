@@ -12,6 +12,16 @@
 using namespace diagnostics;
 static const char* boot1 = "00000000000000000000000000000001";
 static const char* boot2 = "00000000000000000000000000000002";
+struct MemoryRevisionState : StatusRevisionState {
+    uint64_t state = 0;
+    size_t writes = 0;
+    bool failRead = false, failWrite = false;
+    bool read(uint64_t& value) override { value = state; return !failRead; }
+    bool write(uint64_t value) override {
+        ++writes; if (failWrite) return false; state = value; return true;
+    }
+};
+static MemoryRevisionState revisionState;
 
 struct MemoryFs : EventLogFs {
     std::map<std::string, std::string> files;
@@ -81,6 +91,7 @@ static std::unique_ptr<EventLog> logger(MemoryFs* sd, MemoryFs* flash = nullptr,
                                       uint32_t segment = kJournalSegmentBytes) {
     EventLog::Config config; config.sdQuota = quota; config.segmentBytes = segment;
     config.sdCluster = 1; // byte-granular synthetic quotas; physical-media tests use defaults
+    config.revisionState = &revisionState;
     auto result = std::unique_ptr<EventLog>(new EventLog(sd, flash, config));
     assert(result->begin(boot, 1, "test-1")); return result;
 }
@@ -366,7 +377,10 @@ static void countersAndRevisions() {
     assert(reboot->allocateStatusSequence(revision) && revision == 102);
     sd.tear = 20; sd.tearPath = "ack-";
     assert(!reboot->allocateStatusSequence(revision) && revision == 102);
-    auto retry = logger(&sd, nullptr, boot2); assert(retry->allocateStatusSequence(revision) && revision == 103);
+    auto retry = logger(&sd, nullptr, boot2);
+    assert(!retry->allocateStatusSequence(revision)); // the only copy had uncertain I/O
+    assert(retry->restoreStatusSequence(102));
+    assert(retry->allocateStatusSequence(revision) && revision == 103);
     assert(!retry->restoreStatusSequence(1));
     assert(retry->restoreStatusSequence(INT64_MAX)); assert(!retry->allocateStatusSequence(revision));
     // Last numeric filename is usable once; the following reservation fails.
@@ -380,6 +394,148 @@ static void countersAndRevisions() {
     assert(last.files.count("/diag/seg-99999999.ready"));
     assert(!last.files.count("/diag/seg-00000000.open"));
     char path[40]; EventLog::segmentPath(path, 1, true); assert(!std::strcmp(path, "/diag/seg-00000001.ready"));
+}
+static void mirroredRevisions() {
+    revisionState = {};
+    MemoryFs sd, flash;
+    auto log = logger(&sd, &flash);
+    uint64_t revision = 999;
+    assert(!log->allocateStatusSequence(revision)); // fresh stores have no authority
+    assert(log->restoreStatusSequence(100));
+    auto sdWrites = sd.writes, flashWrites = flash.writes, stateWrites = revisionState.writes;
+    assert(log->allocateStatusSequence(revision) && revision == 101);
+    assert(sd.writes == sdWrites + 1 && flash.writes == flashWrites + 1);
+    assert(revisionState.writes == stateWrites); // no normal per-snapshot NVS wear
+    add(*log, 3); read(*log); log->backlog();
+    assert(log->minimumStatusSequence() == 101 && revisionState.writes == stateWrites);
+
+    auto noCard = logger(nullptr, &flash, boot2);
+    assert(noCard->allocateStatusSequence(revision) && revision == 102);
+    stateWrites = revisionState.writes;
+    assert(noCard->allocateStatusSequence(revision) && revision == 103);
+    assert(revisionState.writes == stateWrites); // absent bit was already durable
+    auto staleCard = logger(&sd, nullptr, boot2);
+    assert(!staleCard->allocateStatusSequence(revision)); // stale SD cannot restart alone
+    auto returned = logger(&sd, &flash, boot2);
+    assert(!returned->restoreStatusSequence(102)); // below flash, above SD
+    assert(returned->minimumStatusSequence() == 103);
+    assert(returned->allocateStatusSequence(revision) && revision == 104);
+    MemoryFs fresh;
+    auto replacement = logger(&fresh, &flash, boot2);
+    assert(replacement->allocateStatusSequence(revision) && revision == 105);
+    auto replacementAlone = logger(&fresh, nullptr, boot2);
+    assert(replacementAlone->allocateStatusSequence(revision) && revision == 106);
+    auto staleFlash = logger(nullptr, &flash, boot2);
+    assert(!staleFlash->allocateStatusSequence(revision));
+    auto together = logger(&fresh, &flash, boot2);
+    assert(!together->restoreStatusSequence(105)); // below SD, equal to flash
+    assert(together->allocateStatusSequence(revision) && revision == 107);
+    std::cout << "Revisions: no card, return, fresh-card adoption, both stale-only directions and enrollment bounds passed\n";
+
+    // Suspension is sticky across every store and survives either store's
+    // absence. Recovery changes epoch, so an absent old copy is not authority.
+    auto flashOnly = logger(nullptr, &flash, boot2);
+    assert(flashOnly->suspendStatusSequence());
+    assert(!flashOnly->allocateStatusSequence(revision));
+    auto missedSuspension = logger(&fresh, nullptr, boot2);
+    assert(!missedSuspension->allocateStatusSequence(revision));
+    auto recovery = logger(nullptr, &flash, boot2);
+    assert(recovery->restoreStatusSequence(200));
+    auto oldEpoch = logger(&fresh, nullptr, boot2);
+    assert(!oldEpoch->allocateStatusSequence(revision));
+    auto recovered = logger(&fresh, &flash, boot2);
+    assert(recovered->allocateStatusSequence(revision) && revision == 201);
+    assert(recovered->suspendStatusSequence());
+    for (MemoryFs* store : {&fresh, &flash}) {
+        auto alone = logger(store == &fresh ? store : nullptr, store == &flash ? store : nullptr, boot2);
+        assert(!alone->allocateStatusSequence(revision));
+        bool suspended = false;
+        for (auto& file : store->files) if (file.first.find("ack-") != std::string::npos)
+            suspended |= file.second[61] == 1;
+        assert(suspended);
+    }
+    std::cout << "Revisions: suspension mirrored, absent store blocked, explicit recovery and epoch adoption passed\n";
+
+    revisionState = {};
+    MemoryFs legacy, internal;
+    std::string meta(80, 0); meta.replace(0, 4, "ELG1");
+    metadataNumber(meta, 8, 1); metadataNumber(meta, 24, 1, 4);
+    metadataNumber(meta, 32, 300); metadataNumber(meta, 60, 1, 1);
+    legacy.files["/diag/ack-1"] = meta;
+    auto missingDuringUpdate = logger(nullptr, &internal);
+    assert(!missingDuringUpdate->allocateStatusSequence(revision));
+    auto migrated = logger(&legacy, &internal);
+    assert(migrated->allocateStatusSequence(revision) && revision == 301);
+    assert(legacy.files["/diag/ack-0"].substr(0, 4) == "ELG2");
+    auto migratedNoCard = logger(nullptr, &internal, boot2);
+    assert(migratedNoCard->allocateStatusSequence(revision) && revision == 302);
+    // A v1.00 suspension must not be mistaken for never-enrolled metadata.
+    revisionState = {}; metadataNumber(meta, 60, 0, 1);
+    legacy.files.clear(); legacy.files["/diag/ack-1"] = meta;
+    auto legacySuspended = logger(&legacy);
+    assert(!legacySuspended->allocateStatusSequence(revision));
+    assert(revisionState.state & 1);
+    assert(legacySuspended->restoreStatusSequence(300));
+    assert(legacySuspended->allocateStatusSequence(revision) && revision == 301);
+    std::cout << "Revisions: literal ELG1 migration, flash seeding, missing-card upgrade and legacy suspension passed\n";
+}
+static void revisionFailures() {
+    for (bool failSd : {false, true}) {
+        revisionState = {};
+        MemoryFs sd, flash; auto log = logger(&sd, &flash);
+        uint64_t revision = 0;
+        assert(log->restoreStatusSequence(50));
+        assert(log->allocateStatusSequence(revision) && revision == 51);
+        auto& failed = failSd ? sd : flash;
+        failed.tear = 20; failed.tearPath = "ack-";
+        assert(!log->allocateStatusSequence(revision) && revision == 51);
+        auto stale = logger(failSd ? &sd : nullptr, failSd ? nullptr : &flash, boot2);
+        assert(!stale->allocateStatusSequence(revision));
+        auto retry = logger(&sd, &flash, boot2);
+        assert(retry->allocateStatusSequence(revision) && revision == 53); // partial save consumed 52
+        failed.failRead = true; // full metadata write, uncertain read-back
+        assert(!retry->allocateStatusSequence(revision) && revision == 53);
+        failed.failRead = false;
+        auto uncertain = logger(&sd, &flash, boot2);
+        assert(uncertain->allocateStatusSequence(revision) && revision == 55);
+        failed.readOnly = true;
+        assert(!uncertain->allocateStatusSequence(revision));
+        auto witnessWrites = revisionState.writes;
+        assert(!uncertain->allocateStatusSequence(revision));
+        assert(revisionState.writes == witnessWrites); // no repeated stale-marker write
+        assert(!uncertain->suspendStatusSequence()); // witness still blocks healthy copy
+        failed.readOnly = false;
+        auto blocked = logger(&sd, &flash, boot2);
+        assert(!blocked->allocateStatusSequence(revision));
+        failed.readOnly = true;
+        assert(!blocked->restoreStatusSequence(100)); // incomplete enrollment stays suspended
+        failed.readOnly = false;
+        auto partial = logger(&sd, &flash, boot2);
+        assert(!partial->allocateStatusSequence(revision));
+        assert(!partial->restoreStatusSequence(99) && partial->minimumStatusSequence() == 100);
+        assert(partial->restoreStatusSequence(100));
+        assert(partial->allocateStatusSequence(revision) && revision == 101);
+    }
+    revisionState = {};
+    MemoryFs sd, flash; auto log = logger(&sd, &flash);
+    assert(log->restoreStatusSequence(0));
+    uint64_t revision = 0;
+    revisionState.failRead = true;
+    assert(!log->allocateStatusSequence(revision));
+    revisionState.failRead = false;
+    assert(!log->allocateStatusSequence(revision)); // uncertain state latched for this boot
+    auto reboot = logger(&sd, nullptr, boot2);
+    revisionState.failWrite = true; auto writes = sd.writes;
+    assert(!reboot->allocateStatusSequence(revision) && sd.writes == writes); // mark absent before journal
+    revisionState.failWrite = false;
+    auto recovered = logger(&sd, &flash, boot2);
+    assert(recovered->allocateStatusSequence(revision) && revision == 1);
+    // A mounted journal that cannot load is not silently omitted.
+    flash.failList = true; recovered->invalidateStorage();
+    assert(!recovered->allocateStatusSequence(revision) && revision == 1);
+    flash.failList = false;
+    assert(recovered->allocateStatusSequence(revision) && revision == 2);
+    std::cout << "Revisions: either journal torn/write/load failure, partial enrollment/suspension and witness I/O fail-closed passed\n";
 }
 static void validationAndConcurrency() {
     MemoryFs sd; auto log = logger(&sd);
@@ -436,6 +592,7 @@ int main(int argc, char** argv) {
     std::cerr << "fallback\n"; fallbackAndFsFailures();
     std::cerr << "quota\n"; quotaAndRetention(); rejectedIsolation();
     std::cerr << "counters\n"; countersAndRevisions();
+    mirroredRevisions(); revisionFailures();
     std::cerr << "validation\n"; validationAndConcurrency();
     std::cout << "EventLog: identity, recovery, faults, quota, fallback, protocol and concurrency passed\n";
 }

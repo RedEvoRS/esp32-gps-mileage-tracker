@@ -1401,15 +1401,25 @@ verified new identity), using [deployment Step 8](../DEPLOY_DEBIAN.md#one-time-d
 Then uncomment/set `DIAGNOSTICS_STATUS_HIGH_WATER` and
 `DIAGNOSTICS_ENROLLMENT_ID` in private `secrets.h`. The enrollment ID must be
 positive and greater than any previously used on this board. NVS consumes it
-before restoring the SD allocator; a failed enrollment requires a higher ID.
+before restoring every mounted journal; a failed enrollment requires a higher ID.
+Choose a value at least as high as either local revision too; refused enrollment
+prints `local minimum high-water` on serial, including the internal-flash copy.
 After the first successful diagnostics upload, remove both defines and
-reflash with erase disabled. Existing SD metadata works on later boots
+reflash with erase disabled. Existing SD/LittleFS metadata works on later boots
 without them. The first real test consumed enrollment ID 1 after the
 deployment Step 8 command returned high-water 0 (no `events.db` yet).
 Re-enrollment needs a fresh server read and an ID of at least 2, higher
 than every ID already used. Never reuse a fresh-identity zero after
 changing/corrupting cards: inspect the server again.
-Without an enrolled writable SD revision authority, events remain local and
+An enrolled v1.00 card seeds internal flash at the first allocation after
+upgrading. An upgrade with the card missing needs that card once or explicit
+re-enrollment. After that, a card-out boot sends `littlefs` snapshots with E4001
+active and uploads flash events; a replacement card adopts the flash revision.
+NVS records suspension and stores that miss allocations. A stale store alone
+cannot allocate: reconnect a current copy or re-enroll. Each allocation adds
+one 80-byte metadata-slot write on wear-levelled LittleFS, at most about once
+per 30-second awake network tick while home, never per scan/event.
+Without current writable revision authority, events remain local and
 GPX upload logic remains available independently of diagnostics enrollment.
 See [revision enrollment and recovery](../DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
 for the complete procedure and snapshot-conflict recovery.

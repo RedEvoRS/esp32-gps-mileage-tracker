@@ -96,7 +96,7 @@ static bool appendObservations(const diagnostics::RuntimeFaults& faults, unsigne
 }
 
 // Enrollment is an explicit operator action, consumed in NVS BEFORE resetting
-// the SD allocator. Reusing a firmware configuration after metadata loss must
+// the mirrored allocator. Reusing a firmware configuration after metadata loss must
 // never silently enroll at zero again. A failed attempt consumes the token too.
 static void enrollEventRevision() {
     if (gEnrollmentChecked) return;
@@ -108,8 +108,13 @@ static void enrollEventRevision() {
     uint64_t token = DIAGNOSTICS_ENROLLMENT_ID;
     if (token > used && token <= diagnostics::kMaxEventInteger &&
         settings.putULong64("enroll", token) == sizeof(uint64_t) &&
-        settings.getULong64("enroll", 0) == token)
-        gJournal.restoreStatusSequence(DIAGNOSTICS_STATUS_HIGH_WATER);
+        settings.getULong64("enroll", 0) == token) {
+        if (!gJournal.restoreStatusSequence(DIAGNOSTICS_STATUS_HIGH_WATER))
+            Serial.printf("Diagnostics enrollment refused: local minimum high-water %llu; "
+                          "also read server high-water, then use a higher enrollment ID. "
+                          "Check mounted journals and NVS if this minimum was met.\n",
+                          (unsigned long long)gJournal.minimumStatusSequence());
+    }
     settings.end();
 #endif
 }

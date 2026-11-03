@@ -296,12 +296,22 @@ bool EventLog::load(Store& store) {
     for (unsigned slot = 0; slot < 2; ++slot) {
         uint8_t data[kMetaBytes];
         if (!store.fs->read(metaPath(slot), 0, data, sizeof(data)) ||
-            std::memcmp(data, "ELG1", 4) || crc32(data, 76) != get32(data + 76)) continue;
+            (std::memcmp(data, "ELG1", 4) && std::memcmp(data, "ELG2", 4)) ||
+            crc32(data, 76) != get32(data + 76)) continue;
         Meta m;
         m.generation = get64(data + 8); m.ack = {get32(data + 16), get32(data + 20)};
         m.next = get32(data + 24); m.revision = get64(data + 32);
         m.dropped = get64(data + 40); m.pending = get64(data + 48);
         m.discarded = get32(data + 56); m.revisionReady = data[60] == 1;
+        if (data[3] == '2') {
+            m.revisionSuspended = data[61] == 1; m.revisionEpoch = get64(data + 64);
+            if (data[61] > 1 || (m.revisionReady && m.revisionSuspended) ||
+                m.revisionEpoch > kMaxEventInteger || (m.revisionEpoch & 7)) continue;
+        } else {
+            // v1.00 did not distinguish never enrolled from suspended. A
+            // nonzero revision with authority removed is a legacy suspension.
+            m.revisionSuspended = !m.revisionReady && m.revision != 0;
+        }
         if (!m.generation || m.generation % 2 != slot || m.generation > kMaxEventInteger ||
             m.ack.segment > 99999999 || m.ack.offset > kJournalSegmentBytes ||
             !m.next || m.next > 100000000 || m.revision > kMaxEventInteger ||
@@ -317,10 +327,11 @@ bool EventLog::save(Store& store, Meta next) {
     if (store.meta.generation == kMaxEventInteger || store.quota < 2 * allocated(store, kMetaBytes)) return false;
     next.generation = store.meta.generation + 1;
     uint8_t data[kMetaBytes] = {}, check[kMetaBytes];
-    std::memcpy(data, "ELG1", 4); put64(data + 8, next.generation);
+    std::memcpy(data, "ELG2", 4); put64(data + 8, next.generation);
     put32(data + 16, next.ack.segment); put32(data + 20, next.ack.offset); put32(data + 24, next.next);
     put64(data + 32, next.revision); put64(data + 40, next.dropped); put64(data + 48, next.pending);
     put32(data + 56, next.discarded); data[60] = next.revisionReady ? 1 : 0;
+    data[61] = next.revisionSuspended ? 1 : 0; put64(data + 64, next.revisionEpoch);
     put32(data + 76, crc32(data, 76));
     if (!store.fs->write(metaPath(next.generation), data, sizeof(data), false) ||
         !store.fs->read(metaPath(next.generation), 0, check, sizeof(check)) || std::memcmp(data, check, sizeof(data))) {
@@ -704,22 +715,108 @@ void EventLog::invalidateStorage() {
     for (auto& store : stores_) store.loaded = false;
     issued_ = 0;
 }
+// Witness layout: bit 0 = suspended, bits 1/2 = SD/LittleFS stale, remaining
+// bits = recovery epoch (multiple of 8). Missing key means legacy epoch zero.
+// Mark absent stores BEFORE an allocation. Clear their bits only AFTER writing
+// all mounted copies. Thus an old copy alone cannot reuse a sent revision.
+bool EventLog::readRevisionState(uint64_t& state) {
+    if (!config_.revisionState || !config_.revisionState->read(state) || state > kMaxEventInteger) {
+        revisionBlocked_ = true; return false;
+    }
+    return true;
+}
+bool EventLog::writeRevisionState(uint64_t state) {
+    if (!config_.revisionState || !config_.revisionState->write(state)) {
+        revisionBlocked_ = true; return false;
+    }
+    return true;
+}
+bool EventLog::revisionStores(uint8_t& mounted, uint64_t& highest) {
+    mounted = 0; highest = revisionFloor_;
+    bool ok = true;
+    for (unsigned i = 0; i < 2; ++i) {
+        auto& store = stores_[i];
+        if (!store.fs) continue; // mounted stores are fixed before consumers start
+        if (!load(store)) { ok = false; continue; }
+        mounted |= 2u << i;
+        highest = std::max(highest, store.meta.revision);
+    }
+    return ok && mounted;
+}
+uint64_t EventLog::minimumStatusSequence() {
+    uint8_t mounted; uint64_t highest;
+    revisionStores(mounted, highest); return highest;
+}
 bool EventLog::restoreStatusSequence(uint64_t highWater) {
-    auto& store = stores_[0];
-    if (!begun_ || highWater > kMaxEventInteger || !load(store) || highWater < store.meta.revision) return false;
-    Meta next = store.meta; next.revision = highWater; next.revisionReady = true; return save(store, next);
+    uint8_t mounted; uint64_t highest, state;
+    if (!begun_ || highWater > kMaxEventInteger || !revisionStores(mounted, highest) ||
+        highWater < highest || !readRevisionState(state)) return false;
+    uint64_t epoch = state & ~uint64_t(7);
+    if (epoch > kMaxEventInteger - 8) return false;
+    epoch += 8;
+    // Crash/partial enrollment must leave the DEVICE suspended, even when a
+    // store is absent. Commit the new epoch only after all copies are ready.
+    revisionBlocked_ = true;
+    if (!writeRevisionState(epoch | 1 | (6 & ~mounted))) return false;
+    bool ok = true;
+    for (auto& store : stores_) {
+        if (!store.fs) continue;
+        Meta next = store.meta; next.revision = highWater; next.revisionReady = true;
+        next.revisionSuspended = false; next.revisionEpoch = epoch;
+        if (!save(store, next)) ok = false;
+    }
+    if (!ok || !writeRevisionState(epoch | (6 & ~mounted))) return false;
+    revisionFloor_ = highWater; revisionBlocked_ = false; return true;
 }
 bool EventLog::allocateStatusSequence(uint64_t& sequence) {
-    auto& store = stores_[0];
-    if (!begun_ || !load(store) || !store.meta.revisionReady || store.meta.revision == kMaxEventInteger) return false;
-    Meta next = store.meta; ++next.revision;
-    if (!save(store, next)) return false;
-    sequence = next.revision; return true;
+    uint8_t mounted; uint64_t highest, state;
+    if (!begun_ || revisionBlocked_ || !readRevisionState(state) || (state & 1) ||
+        !revisionStores(mounted, highest) || highest == kMaxEventInteger) return false;
+    uint64_t epoch = state & ~uint64_t(7);
+    bool authority = false;
+    for (unsigned i = 0; i < 2; ++i) {
+        const auto& store = stores_[i];
+        if (!store.fs || store.meta.revisionEpoch != epoch) continue;
+        if (store.meta.revisionSuspended) { suspendStatusSequence(); return false; }
+        if (store.meta.revisionReady && !(state & (2u << i))) authority = true;
+    }
+    if (!authority) return false;
+    uint64_t marked = state | (6 & ~mounted);
+    if (marked != state && !writeRevisionState(marked)) return false;
+    // Reserve in RAM too: uncertain journal read-back/invalidation must not
+    // roll this boot backwards. Failed attempts may leave harmless gaps.
+    revisionFloor_ = highest + 1;
+    bool ok = true;
+    uint8_t failed = 0;
+    for (unsigned i = 0; i < 2; ++i) {
+        auto& store = stores_[i];
+        if (!store.fs) continue;
+        Meta next = store.meta; next.revision = revisionFloor_; next.revisionReady = true;
+        next.revisionSuspended = false; next.revisionEpoch = epoch;
+        if (!save(store, next)) { ok = false; failed |= 2u << i; }
+    }
+    if (!ok) {
+        if ((marked | failed) != marked) writeRevisionState(marked | failed);
+        return false;
+    }
+    uint64_t synced = marked & ~uint64_t(mounted);
+    if (synced != marked && !writeRevisionState(synced)) return false;
+    sequence = revisionFloor_; return true;
 }
 bool EventLog::suspendStatusSequence() {
-    auto& store = stores_[0];
-    if (!begun_ || !load(store)) return false;
-    Meta next = store.meta; next.revisionReady = false;
-    return save(store, next);
+    if (!begun_) return false;
+    revisionBlocked_ = true;
+    uint64_t state;
+    bool ok = readRevisionState(state);
+    if (ok) ok = writeRevisionState(state | 1);
+    // Best effort on EVERY mounted journal even if the witness or one copy
+    // fails. Explicit suspended differs from a fresh, adoptable empty store.
+    for (auto& store : stores_) {
+        if (!store.fs) continue;
+        if (!load(store)) { ok = false; continue; }
+        Meta next = store.meta; next.revisionReady = false; next.revisionSuspended = true;
+        if (!save(store, next)) ok = false;
+    }
+    return ok;
 }
 } // namespace diagnostics

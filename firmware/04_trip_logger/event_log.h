@@ -33,6 +33,14 @@ public:
 
 enum class EventTransition : uint8_t { Notice, Raise, Repeat, Clear };
 enum class EventTimeSource : uint8_t { Unknown, Rtc, Gps, Sntp };
+// Device-local recovery witness, independent of either removable/mountable
+// journal. Checked durable writes; reads fail closed. Single consumer, FS_LOCK.
+class StatusRevisionState {
+public:
+    virtual ~StatusRevisionState() = default;
+    virtual bool read(uint64_t& state) = 0;
+    virtual bool write(uint64_t state) = 0;
+};
 struct EventContext {
     enum class Type : uint8_t { Integer, Boolean, Enum };
     char key[24] = {};
@@ -66,6 +74,7 @@ public:
         uint32_t segmentBytes = kJournalSegmentBytes;
         uint32_t sdCluster = 32768, littleFsBlock = 4096; // actual allocation units
         bool reserveRejected = false; // transport's one-frame inspection slot
+        StatusRevisionState* revisionState = nullptr; // required for snapshot authority
     };
     struct Batch {
         // Caller owns storage: static DRAM or PSRAM on ESP32-S3, never a task
@@ -135,10 +144,16 @@ public:
     bool seal();
     void invalidateStorage(); // after remount: keep boot/queue, reload all caches
 
-    // Fixed SD authority, never switch to flash/RAM for snapshot revisions.
-    // Enrollment/recovery must explicitly supply >= server high-water. Missing
-    // or corrupt metadata disables allocation until restored. Each allocation
-    // durably writes one 80-byte slot; no writes per producer scan/event.
+    // Single consumer, FS_LOCK, unchanged core ownership. Mirror max(revision)+1
+    // to EVERY mounted journal before exposing it; any write/load failure
+    // withholds the snapshot (gaps are harmless). No volatile/RAM authority.
+    // The independent recovery witness blocks suspended or absent/stale stores
+    // across boots. Only explicit enrollment advances its recovery epoch.
+    // Adoption requires a current, nonsuspended authority on another store.
+    // Each allocation writes one 80-byte slot per mounted store, including
+    // wear-levelled LittleFS; no revision writes per producer scan/event.
+    // Enrollment must supply >= server high-water AND minimumStatusSequence().
+    uint64_t minimumStatusSequence(); // read-only, includes every loaded store
     bool restoreStatusSequence(uint64_t highWater);
     bool allocateStatusSequence(uint64_t& sequence);
     bool suspendStatusSequence(); // explicit recovery required after snapshot conflict
@@ -156,7 +171,8 @@ private:
         uint64_t generation = 0, revision = 0, dropped = 0, pending = 0;
         Cursor ack;
         uint32_t next = 1, discarded = 0;
-        bool revisionReady = false;
+        bool revisionReady = false, revisionSuspended = false;
+        uint64_t revisionEpoch = 0;
     };
     struct Store {
         EventLogFs* fs = nullptr;
@@ -172,6 +188,8 @@ private:
     char bootId_[33] = {}, version_[33] = {};
     uint64_t bootCounter_ = 0, sequence_ = 0;
     bool begun_ = false;
+    uint64_t revisionFloor_ = 0;
+    bool revisionBlocked_ = false; // also latch uncertain recovery-witness I/O
     std::atomic_flag queueLock_ = ATOMIC_FLAG_INIT;
     std::atomic<uint32_t> queueDrops_{0};
     Frame queue_[kEventQueueSize];
@@ -195,6 +213,9 @@ private:
     bool inventory(Store& store);
     uint64_t allocated(const Store& store, uint32_t bytes) const;
     bool save(Store& store, Meta next);
+    bool revisionStores(uint8_t& mounted, uint64_t& highest);
+    bool readRevisionState(uint64_t& state);
+    bool writeRevisionState(uint64_t state);
     bool append(Store& store, const Frame& frame);
     bool makeRoom(Store& store, size_t bytes);
     bool readFrame(Store& store, const Segment& segment, uint32_t& offset, Frame& frame);

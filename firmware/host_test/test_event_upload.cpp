@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 static std::vector<std::string> requests;
+static std::vector<std::string> cardLifecycle;
 static void collect() {
     for (size_t i = 0; i < g_httpBodies.size(); ++i)
         if (g_httpUrls[i].find("/v1/device-events") != std::string::npos &&
@@ -31,6 +32,7 @@ static bool readBatch() {
     assert(eventLock()); bool ok = gJournal.nextBatch(batch); eventUnlock(); return ok;
 }
 static void uploadWorld(bool enroll = true) {
+    Preferences::durable64.clear();
     collect(); world(true, true, uploadJournalConfig()); g_millis = 1000;
     LittleFS.mkdir(TRIP_DIR); SD.mkdir(TRIP_DIR);
     resetFaults(); gEventRetry = {}; gEnrollmentChecked = false;
@@ -66,6 +68,40 @@ static size_t logLines(const char* text) {
     return std::count_if(Serial.log.begin(), Serial.log.end(), [text](const std::string& line) {
         return line.find(text) != std::string::npos;
     });
+}
+static void rebootStores(bool sd) {
+    gSdMounted = g_sdDisk.mounted = SD.cardPresent = sd;
+    gTripFS = sd ? static_cast<fs::FS*>(&SD) : static_cast<fs::FS*>(&LittleFS);
+    gJournal.~EventLog();
+    new (&gJournal) EventLog(sd ? &gSdJournalFs : nullptr, &gFlashJournalFs, uploadJournalConfig(&gRevisionState));
+    gJournalBoot = newJournalBoot();
+    assert(gJournal.begin(gJournalBoot.id, gJournalBoot.counter, "test-card-cycle"));
+    gJournalStarted = false; resetFaults(); gEventRetry = {};
+    gEnrollmentChecked = false; gHaveEventSnapshot = false; gEventRevisionBlocked = false;
+    submitJournalBoot(gJournal, ESP_RST_POWERON, PmuStartupResult(), millis());
+    serviceJournal();
+}
+static void cardRemovalAndReturn() {
+    uploadWorld(); records(1); drainEvents();
+    cardLifecycle.push_back(g_httpBodies.front()); collect();
+    rebootStores(false);
+    gLoopFaults.event(4001, millis()).condition(true); // real missing-SD hook
+    serviceJournal(); records(2); drainEvents();
+    assert(!g_httpBodies.empty() && backlog().records == 0);
+    const auto missing = g_httpBodies.front();
+    assert(missing.find("\"storage_backend\":\"littlefs\"") != std::string::npos);
+    assert(missing.find("\"active\":[{\"code\":4001,") != std::string::npos);
+    assert(eventCount(missing) == 4); // BOOT, E4001 and both flash notices
+    cardLifecycle.push_back(missing); collect();
+    records(2); // left on flash until the card returns; no SD writes exist
+    rebootStores(true);
+    gLoopFaults.event(4001, millis()).condition(false);
+    drainEvents();
+    assert(!g_httpBodies.empty() && backlog().records == 0);
+    assert(g_httpBodies.front().find("\"storage_backend\":\"sd\"") != std::string::npos);
+    assert(g_httpBodies.size() == 2 && eventCount(g_httpBodies[0]) == 1 && eventCount(g_httpBodies[1]) == 2);
+    for (const auto& body : g_httpBodies) cardLifecycle.push_back(body);
+    std::puts("Event upload: SD -> no SD/LittleFS with active E4001 -> SD, flash history drained across boots passed");
 }
 static void allocationFailure(bool missing) {
     uploadWorld();
@@ -181,7 +217,7 @@ int main(int argc, char** argv) {
 
     // Old persisted boot plus today's snapshot; retries preserve old IDs/JSON.
     uploadWorld(); records(3); std::string oldBoot = gJournalBoot.id;
-    gJournal.~EventLog(); new (&gJournal) EventLog(&gSdJournalFs, &gFlashJournalFs, uploadJournalConfig());
+    gJournal.~EventLog(); new (&gJournal) EventLog(&gSdJournalFs, &gFlashJournalFs, uploadJournalConfig(&gRevisionState));
     gJournalBoot = newJournalBoot();
     assert(gJournal.begin(gJournalBoot.id, gJournalBoot.counter, "test-new"));
     resetFaults(); drainEvents();
@@ -287,7 +323,7 @@ int main(int argc, char** argv) {
         g_httpResponseHook = [rejected] { g_httpCode = eventCount(g_httpLastBody) ? rejected : 200; };
         drainEvents(); assert(g_httpRequests == 2);
         assert(g_sdDisk.files.count("/diag/rejected"));
-        gJournal.~EventLog(); new (&gJournal) EventLog(&gSdJournalFs, &gFlashJournalFs, uploadJournalConfig());
+        gJournal.~EventLog(); new (&gJournal) EventLog(&gSdJournalFs, &gFlashJournalFs, uploadJournalConfig(&gRevisionState));
         assert(gJournal.begin(gJournalBoot.id, 1, "test-reopen"));
         assert(readBatch() && batch.ids[0].sequence == 2);
         assert(gJournal.stats().dropped == 1 && gJournal.stats().pendingLoss == 1);
@@ -324,16 +360,28 @@ int main(int argc, char** argv) {
     assert(readBatch() && batch.ids[0].sequence == 1);
     std::puts("Event upload: 24 h heartbeat, success contact refresh and absent-server radio backoff passed");
 
-    // Explicit one-use enrollment; never silently reset after losing the card.
+    // Explicit one-use enrollment; flash remains authority after losing the card.
     uploadWorld(false); records(1); drainEvents(); assert(g_httpRequests == 1);
     assert(Preferences::durable64["enroll"] == 1);
     g_sdDisk.files.erase("/diag/ack-0"); g_sdDisk.files.erase("/diag/ack-1");
-    gJournal.~EventLog(); new (&gJournal) EventLog(&gSdJournalFs, &gFlashJournalFs, uploadJournalConfig());
+    gJournal.~EventLog(); new (&gJournal) EventLog(&gSdJournalFs, &gFlashJournalFs, uploadJournalConfig(&gRevisionState));
     assert(gJournal.begin(gJournalBoot.id, 1, "test-recovery"));
     gEnrollmentChecked = false; gEventRetry = {}; unsigned before = g_httpRequests;
+    drainEvents(); assert(g_httpRequests > before); // blank card adopts the flash revision
+    g_sdDisk.files.erase("/diag/ack-0"); g_sdDisk.files.erase("/diag/ack-1");
+    g_disk.files.erase("/diag/ack-0"); g_disk.files.erase("/diag/ack-1");
+    gJournal.~EventLog(); new (&gJournal) EventLog(&gSdJournalFs, &gFlashJournalFs, uploadJournalConfig(&gRevisionState));
+    assert(gJournal.begin(gJournalBoot.id, 1, "test-no-authority"));
+    gEnrollmentChecked = false; gEventRetry = {}; before = g_httpRequests;
     drainEvents(); assert(g_httpRequests == before && gEventRetry.delay);
     trip(); gNetRetryMs = 0; netCycle(); assert(!hasPending());
-    std::puts("Event upload: explicit revision enrollment, rollback fail-closed and GPX independence passed");
+    std::puts("Event upload: one-use enrollment, card adoption, total authority loss and GPX independence passed");
+    collect(); cardRemovalAndReturn(); collect();
+    // Refusal is actionable even when the flash copy cannot be read on a PC.
+    uploadWorld(); Preferences::durable64["enroll"] = 0;
+    assert(enrollAt(321)); drainEvents();
+    assert(logLines("local minimum high-water 321") == 1);
+    assert(Preferences::durable64["enroll"] == 1);
     collect();
     if (debugMode()) {
         assert(gEventHeapReported && logLines("Heap:") == 0); // no repeated post-attempt reports
@@ -341,6 +389,7 @@ int main(int argc, char** argv) {
 
     assert(g_psramAllocations == 1); // all drains/retries reused the boot allocation
     if (argc > 1) for (const auto& body : requests) std::printf("REQUEST %s\n", body.c_str());
+    if (argc > 1) for (const auto& body : cardLifecycle) std::printf("CARD_CYCLE %s\n", body.c_str());
     std::printf("Event upload: %zu complete firmware requests; PSRAM Batch=%zu request=%zu snapshot=%zu ack=%zu bytes\n",
         requests.size(), sizeof(gEventBuffers->batch), sizeof(gEventBuffers->request), sizeof(gEventBuffers->snapshot), sizeof(gEventBuffers->ack));
     std::printf("PSRAM observations=%zu copy=%zu workspace=%zu bytes (host ABI)\n",

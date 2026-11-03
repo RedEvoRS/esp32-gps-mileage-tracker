@@ -15,6 +15,7 @@ using namespace diagnostics;
 static EventLog::Batch batch; // also static, as required on target
 
 static void world(bool sd, bool flash, EventLog::Config config = EventLog::Config()) {
+    config.revisionState = &gRevisionState;
     gDebugMode.store(hostDebugMode());
     g_disk = FakeDisk(); g_sdDisk = FakeDisk();
     g_disk.mounted = flash; g_sdDisk.mounted = sd;
@@ -63,6 +64,25 @@ int main() {
     assert(!newJournalBoot().counterPersisted);
     Preferences::durable64.clear();
     std::puts("Journal NVS increment, reopen, failure, saturation and fresh identities passed");
+
+    NvsRevisionState witness;
+    uint64_t state = 123;
+    assert(witness.read(state) && state == 0); // v1.00 has no witness key
+    assert(witness.write(10));
+    NvsRevisionState reopenedWitness;
+    assert(reopenedWitness.read(state) && state == 10);
+    Preferences::failRead64 = true; assert(!witness.read(state));
+    Preferences::failRead64 = false;
+    Preferences::failWrite64 = true; assert(!witness.write(11));
+    Preferences::failWrite64 = false;
+    assert(witness.read(state) && state == 10);
+    Preferences::failBegin = true;
+    assert(!witness.read(state) && !witness.write(11));
+    Preferences::failBegin = false;
+    Preferences::durable64["revstate"] = UINT64_MAX;
+    assert(!witness.read(state));
+    Preferences::durable64.clear();
+    std::puts("Journal NVS revision witness: legacy default, persistence, invalid state and checked I/O failures passed");
 
     world(false, false);
     gJournalReady = false;
