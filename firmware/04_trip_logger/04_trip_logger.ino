@@ -66,6 +66,7 @@
 #include "pmu_read_state.h"
 #include "journal_fs.h"
 #include "journal_boot.h"
+#include "revision_nvs.h"
 #include "degraded_policy.h"
 #include "journal_sd_geometry.h"
 #include "diag_upload.h"
@@ -330,7 +331,8 @@ static JournalPlatformIo gSdJournalIo("/sd"), gFlashJournalIo("/littlefs");
 static diagnostics::MountedJournalFs<JournalPlatformIo> gSdJournalFs(gSdJournalIo, gSdMounted, journalMayRun);
 static diagnostics::MountedJournalFs<JournalPlatformIo> gFlashJournalFs(gFlashJournalIo, gFlashMounted, journalMayRun);
 // Static storage, never the 12 KiB network task stack.
-static diagnostics::EventLog gJournal(nullptr, nullptr, diagnostics::uploadJournalConfig());
+static diagnostics::NvsRevisionState gRevisionState;
+static diagnostics::EventLog gJournal(nullptr, nullptr, diagnostics::uploadJournalConfig(&gRevisionState));
 static diagnostics::JournalBoot gJournalBoot;
 static bool gJournalReady = false; // set once on core 1 before task creation
 static bool gJournalStarted = false; // under FS_LOCK; core-0 consumer only
@@ -2890,7 +2892,7 @@ static void serviceDisplay() {
 static void beginJournal() {
     gJournal.~EventLog();
     new (&gJournal) diagnostics::EventLog(gSdMounted ? &gSdJournalFs : nullptr,
-                                         gFlashMounted ? &gFlashJournalFs : nullptr, diagnostics::uploadJournalConfig());
+                                         gFlashMounted ? &gFlashJournalFs : nullptr, diagnostics::uploadJournalConfig(&gRevisionState));
     gJournalBoot = diagnostics::newJournalBoot();
     gJournalReady = gJournal.begin(gJournalBoot.id, gJournalBoot.counter, firmware::kVersion);
     gJournal.setTimeProvider(stampDiagnosticTime);

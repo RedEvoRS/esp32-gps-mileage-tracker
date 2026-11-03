@@ -187,6 +187,7 @@ struct FakeDisk {
     bool failRemount = false;
     std::string partitionLabel;
     bool mounted = true;
+    bool writesFail = false, readsFail = false; // mounted but failing media
     size_t used() const { size_t u = 0; for (auto& kv : files) u += kv.second.size(); return u; }
 };
 extern FakeDisk g_disk;

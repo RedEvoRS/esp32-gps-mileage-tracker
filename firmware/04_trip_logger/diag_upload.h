@@ -6,8 +6,8 @@
 #include <cstring>
 
 namespace diagnostics {
-inline EventLog::Config uploadJournalConfig() {
-    EventLog::Config config; config.reserveRejected = true; return config;
+inline EventLog::Config uploadJournalConfig(StatusRevisionState* state = nullptr) {
+    EventLog::Config config; config.reserveRejected = true; config.revisionState = state; return config;
 }
 constexpr size_t kRequestBytes = 32 * 1024, kAckBytes = 8192;
 constexpr uint32_t kDrainMs = 10000, kHeartbeatMs = 24 * 60 * 60 * 1000;

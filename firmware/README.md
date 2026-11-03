@@ -13,7 +13,9 @@ shutdown; Stage 2 checks it before the GPS and trip-logging stages.
 
 All four stages run on the Supreme. Firmware `v1.00` (tag `fw-v1.00`), the
 first public release, came out on 2026-11-01 (UTC) with server `v1.00`, after
-the release candidate `v0.11` passed a week of normal driving. On
+the release candidate `v0.11` passed a week of normal driving. Firmware
+`v1.01` (tag `fw-v1.01`) followed on 2026-11-03 (UTC): it keeps sending
+diagnostics when the microSD card is missing or failing. On
 2026-10-21 (UTC), an earlier Stage 4 build uploaded
 four real trips from microSD to the deployed server, then delivered all 115
 pending diagnostic events and a current snapshot. Uploads with debug mode
@@ -155,6 +157,10 @@ with BOOT released only if the board stays in download mode.
   nonvolatile storage (NVS), including counters and enrollment records, are
   erased. The SD card is untouched. The erase lets Stage 4 provision its
   internal trip filesystem; see [first-flash behavior](#first-flash-on-a-new-board).
+  On an enrolled board, an intact enrolled card can restore diagnostics without
+  re-enrollment. Erasing also loses stale-card/conflict protection; check
+  [revision recovery](../DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
+  before erasing a used board.
 - **Update an installed tracker:** update/build on the server first, then
   rerun the script without the first-install flag and answer **no** at that
   prompt. This writes only the app, preserving NVS, internal trips and SD
@@ -690,7 +696,7 @@ For why it works this way, see [the firmware design](DESIGN.md).
 
 The `04_trip_logger/` sketch detects trips, accumulates mileage and writes
 GPS Exchange Format (GPX) files to the microSD card, with internal LittleFS
-as fallback. The current release is `v1.00`; it uploads trips from
+as fallback. The current release is `v1.01`; it uploads trips from
 the card, and the [top-level README](../README.md#where-its-at) has the current status and
 what's still unproven on a real board. Since `v0.06` there is one firmware build: debug
 mode starts off at every power-on and can be toggled by holding BOOT and
@@ -706,8 +712,10 @@ on the former production build `v0.05+615a13ffae` (the server-down test
 below). On 2026-10-21 (UTC), with `v0.05+615a13ffae`, ingest was
 stopped with a test trip queued. Both upload attempts returned `HTTP -1` (connection failure),
 and the trip stayed queued. The next retry after ingest restarted received
-HTTP 200 and deleted the local file. LittleFS uploads remain untested on
-the Supreme.
+HTTP 200 and deleted the local file. LittleFS uploads were checked on the
+road on 2026-11-02 and 2026-11-03 (UTC): six trips recorded with no card
+uploaded, including three that waited through power-offs away from home, and
+each was deleted after its HTTP 200.
 
 USB insertion powered the board on at 04:14:50Z on 2026-10-21. Boot was
 clean, GPS configured on attempt 1, and the FAT32 card had 29.71 GiB free.
@@ -817,13 +825,21 @@ app-only update (or cleanup) for a tracker already running this project.
 
 **Erase-all also wipes the board's settings memory (NVS):** the trip
 counter (`tripno`), diagnostic journal boot counter and consumed enrollment
-ID (`diag/enroll`), among other settings. If `DIAGNOSTICS_ENROLLMENT_ID`
+ID (`diag/enroll`) and revision recovery witness (`diag/revstate`), among other
+settings. An intact enrolled SD card can restore the missing witness and seed
+the erased LittleFS journal automatically; ready mounted copies must agree on
+their recovery epoch. A suspended card alone stays blocked. Erasing loses any
+record that a card was stale: it may send history with low revisions while
+Device health stays old, or hit a revision conflict that requires re-enrollment.
+Keep erase disabled for updates and check Device health after any erase.
+If `DIAGNOSTICS_ENROLLMENT_ID`
 and `DIAGNOSTICS_STATUS_HIGH_WATER` are still defined in `secrets.h`, the
 next boot can consume that ID again and re-enroll from its possibly stale
 high-water value. Follow [deployment Step 8](../DEPLOY_DEBIAN.md#one-time-diagnostics-enrollment),
 then remove both defines after the first successful diagnostics upload and
-reflash with erase disabled. If you must erase an enrolled board later,
-read a fresh server high-water and choose a higher enrollment ID first.
+reflash with erase disabled. If automatic recovery is blocked after an erase,
+read a fresh server high-water and local revision bounds, then choose a higher
+enrollment ID; see [revision recovery](../DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery).
 
 Watch the Serial Monitor. If LittleFS mounts, startup uses it normally.
 Otherwise the firmware reads **every byte** of the `spiffs` data partition.
@@ -1039,8 +1055,8 @@ How it behaves once flashed:
   the one in progress. For LittleFS, free space excludes the unused part
   of the separate 64 KiB diagnostics reserve. Card free space uses the
   card's own total and used bytes. Accepted uploads freed space by deleting
-  the local SD files on 2026-10-21 (UTC). The same deletion path for
-  LittleFS uploads remains untested on the Supreme.
+  the local SD files on 2026-10-21 (UTC), and LittleFS uploads deleted
+  their local files the same way on 2026-11-03 (UTC).
 
 Watch the Serial Monitor (115200) for state transitions:
 `Trip started` → (drive) → `Trip finalized`, then
@@ -1344,7 +1360,8 @@ Successful diagnostics uploads print nothing on serial. Confirm them in
 the ingest log or Device health. That build showed `Firmware: Not reported`
 because it predates version reporting; stamped builds report their version
 number plus Git commit (see [version stamping](#upload-a-sketch-and-read-its-messages)).
-LittleFS uploads and HTTP 413 handling remain untested on the Supreme.
+HTTP 413 handling remains untested on the Supreme; LittleFS uploads were
+checked on the road on 2026-11-03 (UTC).
 The 2026-11-01 (UTC) bench checks verified wrong-token/server-error recovery
 and diagnostics deduplication; see [upload checks](#check-recording-and-uploads).
 Trip uploads with debug mode off and server-down retry were verified
@@ -1401,15 +1418,32 @@ verified new identity), using [deployment Step 8](../DEPLOY_DEBIAN.md#one-time-d
 Then uncomment/set `DIAGNOSTICS_STATUS_HIGH_WATER` and
 `DIAGNOSTICS_ENROLLMENT_ID` in private `secrets.h`. The enrollment ID must be
 positive and greater than any previously used on this board. NVS consumes it
-before restoring the SD allocator; a failed enrollment requires a higher ID.
+before restoring every mounted journal; a failed enrollment requires a higher ID.
+Choose a value at least as high as either local revision too; refused enrollment
+prints `local minimum high-water` on serial, including the internal-flash copy.
 After the first successful diagnostics upload, remove both defines and
-reflash with erase disabled. Existing SD metadata works on later boots
+reflash with erase disabled. Existing SD/LittleFS metadata works on later boots
 without them. The first real test consumed enrollment ID 1 after the
 deployment Step 8 command returned high-water 0 (no `events.db` yet).
 Re-enrollment needs a fresh server read and an ID of at least 2, higher
 than every ID already used. Never reuse a fresh-identity zero after
 changing/corrupting cards: inspect the server again.
-Without an enrolled writable SD revision authority, events remain local and
+An enrolled v1.00 card seeds internal flash at the first allocation after
+upgrading. An upgrade with the card missing needs that card once or explicit
+re-enrollment. After that, a card-out boot sends `littlefs` snapshots with E4001
+active and uploads flash events; a replacement card adopts the flash revision.
+NVS records suspension and stores that miss allocations. A stale store alone
+cannot allocate: reconnect a current copy or re-enroll. Each allocation attempts
+to save both mounted journals; a load/write/read-back failure on one
+does not block a healthy current authority on the other. NVS marks the failed
+copy stale before transmission, then clears the bit after synchronization.
+Unreadable SD event batches do not block flash or RAM history, so an enrolled
+flash copy can report a card that mounted but then failed, including E4006.
+Erase-all can adopt an intact enrolled card's epoch as described in the flashing
+section; missing NVS keys permit adoption, NVS errors do not. Each allocation adds
+one 80-byte metadata-slot write on wear-levelled LittleFS, at most about once
+per 30-second awake network tick while home, never per scan/event.
+Without current writable revision authority, events remain local and
 GPX upload logic remains available independently of diagnostics enrollment.
 See [revision enrollment and recovery](../DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
 for the complete procedure and snapshot-conflict recovery.

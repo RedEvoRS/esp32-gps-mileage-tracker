@@ -27,10 +27,10 @@ when GPS time is unavailable.
 The tracker and server are in daily use. **v1.00**, the first public
 release of both the firmware and the server, came out on 2026-11-01 (UTC),
 after a week of everyday driving on the release candidate in which every trip
-was recorded, uploaded and exported correctly. Still unproven on the Supreme:
-uploads from the internal-flash fallback (used when no microSD card mounts),
-trips that end in a parking garage, and distance accuracy against the car's
-odometer. Open work is tracked in
+was recorded, uploaded and exported correctly. Firmware **v1.01** followed on
+2026-11-03 (UTC): it keeps reporting the board's health when the microSD card
+is missing or failing. Still unproven on the Supreme: trips that end in a
+parking garage, and distance accuracy against the car's odometer. Open work is tracked in
 [GitHub issues](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/issues).
 
 **Have the older T-Beam V1.2?** This project started on the LilyGO TTGO
@@ -55,9 +55,10 @@ POST /upload (GPX) --> mileage-ingest --> GPX + JSON summary
 ```
 
 If no card mounts at boot, the logger stores trips in the board's internal
-flash instead, and is designed to upload them from there; that upload path
-remains untested on the Supreme. Diagnostics uploads need a working SD card:
-without one, the health journal stays local, even if trip uploads work.
+flash instead (about 5–6 hours of driving between uploads) and uploads them
+from there; that was checked on the road on 2026-11-03 (UTC). From firmware
+v1.01 the health journal keeps uploading without the card too, so the viewer's
+Device health shows the missing card as error E4001.
 
 Alongside the trips, the board keeps a small journal of its own health:
 numbered error codes such as a lost GPS antenna, a full card or a refused
@@ -308,7 +309,7 @@ bash flash.sh --server '<user>@<host>' --cleanup
 
 This selects `firmware-out/cleanup/`, removes the one-use enrollment values,
 and writes only the app. It preserves the board's settings, trip counter,
-SD diagnostics metadata and queued trips. It tries automatic download mode,
+diagnostics metadata and queued trips. It tries automatic download mode,
 with button instructions if needed. [Enrollment and recovery](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
 explains why those values must be removed.
 

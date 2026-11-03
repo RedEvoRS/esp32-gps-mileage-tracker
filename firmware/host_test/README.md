@@ -66,6 +66,11 @@ Inspect every `SKIPPED` line. The final `grep` exits 1 when there are no matches
 that means no skips, not a test failure. Keep the displayed run status separate
 from `grep`'s status.
 
+Every build uses `-UNDEBUG` and force-includes `assertions_enabled.h`, which
+rejects `NDEBUG`. This matters with Zig C++ at `-O1`: otherwise `assert()` can
+silently disappear. A separate negative probe with the same flags and
+`int main() { assert(false); }` must fail when run, never exit successfully.
+
 ## What a full run covers
 
 `run.sh` builds **26 C++ test sources in 30 build variants**, plus six Python
@@ -101,6 +106,20 @@ connect and upload). They check E5001, **"Home access point not seen"**, as a
 counter; one-use enrollment of diagnostic status numbering; and isolation of
 a single rejected event so it cannot block the queue. See
 [DIAGNOSTICS.md](../../DIAGNOSTICS.md) for enrollment and isolation details.
+
+Revision regressions cover SD/LittleFS mirroring, card removal/return, empty-card
+adoption, v1.00 metadata migration, enrollment bounds on either copy, durable
+suspension, stale-only boots and journal/NVS failure paths. The worker/protocol
+bridge also posts a three-boot card lifecycle into one disposable ingest
+database: E4001 becomes active with `littlefs`, then clears with newer SD health,
+while retained flash events are accepted and deduplicated.
+Mounted-store regressions inject write failures followed by read failures on SD,
+deliver the production E4006 trip-create fault through the worker and real local
+ingest, then verify resynchronization. Symmetric LittleFS failure keeps SD
+diagnostics working. Journal tests prove unreadable partial batches cannot leak
+cursors or corruption counts into flash/RAM acknowledgments, refusals preserve
+the last authority, missing-witness epoch adoption survives erase-all, and new
+enrollment never reuses a loaded epoch after NVS reset.
 
 **Display**
 

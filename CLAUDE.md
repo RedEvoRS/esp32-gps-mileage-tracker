@@ -41,8 +41,9 @@ trips queued (E5008) and they uploaded after recovery; a wrong token (401)
 gave E5004 on a small file and a broken send (E5003, `HTTP -3`) on a ~3 MB
 file; diagnostics dedupe held. The release-candidate driving week on firmware
 v0.11 passed on 2026-11-01, and firmware and server v1.00, the first public
-release, followed the same day. LittleFS uploads and HTTP 413 remain untested on
-the Supreme. Other hardware acceptance is tracked under `supreme-port`.
+release, followed the same day. LittleFS uploads were verified on the road on
+2026-11-03 (UTC), and firmware v1.01 the same day keeps diagnostics running
+without the card. HTTP 413 remains untested on the Supreme. Other hardware acceptance is tracked under `supreme-port`.
 Don't assume a Supreme pin, rail or peripheral works until its port issue
 is closed and it's verified on the bench.
 
@@ -213,7 +214,7 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   ON at 1.8 V: switch it off, set 3.3 V, then enable. Stage 4 picks its
   trip store once at boot, never formats the card, falls back to LittleFS,
   attempts uploads from both stores, and unmounts both before `PMU.shutdown()`.
-  SD uploads were verified on 2026-10-21 (UTC); LittleFS uploads remain untested
+  SD uploads were verified on 2026-10-21 (UTC), LittleFS uploads on 2026-11-03 (UTC)
 - Build: `esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled`
   (8 MB flash, 8 MB QSPI PSRAM, native USB). Download mode, the factory
   flash backup and its Windows read quirk: `firmware/README.md`
@@ -279,12 +280,15 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   after 24 hours without contact (first boot contact age is unknown).
   Successful diagnostics uploads print nothing on serial; confirm them
   in ingest logs or Device health.
-- Snapshot enrollment: the SD-only snapshot revision allocator needs explicit
+- Snapshot enrollment: the journal snapshot revision allocator needs explicit
   one-use enrollment in `secrets.h` against the server high-water: the server's
   highest accepted `status_sequence` for the device (see `DIAGNOSTICS.md`).
   Remove `DIAGNOSTICS_ENROLLMENT_ID` and `DIAGNOSTICS_STATUS_HIGH_WATER`
   after the first good diagnostics upload and reflash with erase disabled;
-  normal boots use existing SD metadata. Re-enrollment needs a new ID
+  normal boots use existing journal metadata. Revisions mirror to usable SD
+  and LittleFS journals, so either healthy authority can report storage failure.
+  NVS preserves suspension/stale state; a missing witness adopts agreeing ready epochs.
+  Re-enrollment needs a new ID
   greater than any used (at least 2 after ID 1) and a fresh server high-water
   read. Missing revision authority retains diagnostics locally without
   blocking GPX.
