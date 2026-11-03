@@ -13,7 +13,9 @@ shutdown; Stage 2 checks it before the GPS and trip-logging stages.
 
 All four stages run on the Supreme. Firmware `v1.00` (tag `fw-v1.00`), the
 first public release, came out on 2026-11-01 (UTC) with server `v1.00`, after
-the release candidate `v0.11` passed a week of normal driving. On
+the release candidate `v0.11` passed a week of normal driving. Firmware
+`v1.01` (tag `fw-v1.01`) followed on 2026-11-03 (UTC): it keeps sending
+diagnostics when the microSD card is missing or failing. On
 2026-10-21 (UTC), an earlier Stage 4 build uploaded
 four real trips from microSD to the deployed server, then delivered all 115
 pending diagnostic events and a current snapshot. Uploads with debug mode
@@ -694,7 +696,7 @@ For why it works this way, see [the firmware design](DESIGN.md).
 
 The `04_trip_logger/` sketch detects trips, accumulates mileage and writes
 GPS Exchange Format (GPX) files to the microSD card, with internal LittleFS
-as fallback. The current release is `v1.00`; it uploads trips from
+as fallback. The current release is `v1.01`; it uploads trips from
 the card, and the [top-level README](../README.md#where-its-at) has the current status and
 what's still unproven on a real board. Since `v0.06` there is one firmware build: debug
 mode starts off at every power-on and can be toggled by holding BOOT and
@@ -710,8 +712,10 @@ on the former production build `v0.05+615a13ffae` (the server-down test
 below). On 2026-10-21 (UTC), with `v0.05+615a13ffae`, ingest was
 stopped with a test trip queued. Both upload attempts returned `HTTP -1` (connection failure),
 and the trip stayed queued. The next retry after ingest restarted received
-HTTP 200 and deleted the local file. LittleFS uploads remain untested on
-the Supreme.
+HTTP 200 and deleted the local file. LittleFS uploads were checked on the
+road on 2026-11-02 and 2026-11-03 (UTC): six trips recorded with no card
+uploaded, including three that waited through power-offs away from home, and
+each was deleted after its HTTP 200.
 
 USB insertion powered the board on at 04:14:50Z on 2026-10-21. Boot was
 clean, GPS configured on attempt 1, and the FAT32 card had 29.71 GiB free.
@@ -1051,8 +1055,8 @@ How it behaves once flashed:
   the one in progress. For LittleFS, free space excludes the unused part
   of the separate 64 KiB diagnostics reserve. Card free space uses the
   card's own total and used bytes. Accepted uploads freed space by deleting
-  the local SD files on 2026-10-21 (UTC). The same deletion path for
-  LittleFS uploads remains untested on the Supreme.
+  the local SD files on 2026-10-21 (UTC), and LittleFS uploads deleted
+  their local files the same way on 2026-11-03 (UTC).
 
 Watch the Serial Monitor (115200) for state transitions:
 `Trip started` → (drive) → `Trip finalized`, then
@@ -1356,7 +1360,8 @@ Successful diagnostics uploads print nothing on serial. Confirm them in
 the ingest log or Device health. That build showed `Firmware: Not reported`
 because it predates version reporting; stamped builds report their version
 number plus Git commit (see [version stamping](#upload-a-sketch-and-read-its-messages)).
-LittleFS uploads and HTTP 413 handling remain untested on the Supreme.
+HTTP 413 handling remains untested on the Supreme; LittleFS uploads were
+checked on the road on 2026-11-03 (UTC).
 The 2026-11-01 (UTC) bench checks verified wrong-token/server-error recovery
 and diagnostics deduplication; see [upload checks](#check-recording-and-uploads).
 Trip uploads with debug mode off and server-down retry were verified
