@@ -272,10 +272,13 @@ with the current default; they do not scroll or flash.
   BOOT during power-up instead selects the chip's download mode.
 - A long POWER press on USB leaves the board on and shows `USB power` /
   `Unplug USB` / `to switch off` for the normal card duration in either mode.
-  Unplug USB first, then long-press for a clean shutdown. A roughly six-second
-  hold forces PMU power-off without closing files. Before removing the card,
-  tap POWER briefly and check that the screen stays dark; follow the
-  [card precautions](firmware/README.md#microsd-card).
+  Unplug USB, hold POWER for 1–2 s and release. Watch for `Switching off`,
+  then a dark screen, and wait a few seconds for shutdown to finish. Pull
+  the card **without pressing anything**. Any POWER press, even a tap,
+  switches an off board on. A roughly six-second hold forces PMU power-off
+  without closing files. If in doubt, use the 10-minute battery idle fallback
+  and its conditions in the [card precautions](firmware/README.md#microsd-card).
+  Failed displays and degraded startup skip the shutdown card.
 
 Short-press actions need a successfully read power-management interrupt batch;
 unknown reads cannot request a card or toggle debug. Degraded startup does not

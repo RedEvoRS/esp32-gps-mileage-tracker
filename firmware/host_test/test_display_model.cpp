@@ -58,6 +58,14 @@ static void usbPowerRegressions() {
     in.shutdown = true; assert(!model.update(in).powered); ++cases;
 }
 int main() {
+    {
+        DisplayModel model; DisplayModel::Input in;
+        in.switchingOff = in.suspended = in.usbPowerRequest = true;
+        assert(model.update(in).card == Card::SwitchingOffCard);
+        assert(model.update(in).powered);
+        in.shutdown = true; assert(!model.update(in).powered);
+        ++cases;
+    }
     usbPowerRegressions();
     DisplayModel model; DisplayModel::Input in;
     // The runtime's first update implies boot, without a trusted GPS fix.

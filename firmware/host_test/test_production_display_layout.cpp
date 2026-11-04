@@ -25,6 +25,9 @@ static void fits(const Layout& pixels) {
 }
 int main() {
     assert(layout({}).count == 0);
+    const auto off = layout(switchingOffCard()); fits(off);
+    assert(off.count == 1 && off.text[0].font == Font::Codes);
+    assert(!std::strcmp(off.text[0].value, "Switching off"));
     const auto usb = layout(usbPowerCard()); fits(usb);
     assert(usb.count == 3);
     const char* usbText[] = {"USB power", "Unplug USB", "to switch off"};
