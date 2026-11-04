@@ -124,9 +124,11 @@ public:
     // bounds are work limits, NOT a time guarantee: schedule away from GPS writes
     // and measure adapter latency; do not leave GPS waiting through maintenance.
     void service(size_t maxRecords = 4);
-    // Oldest retained records on SD first, then flash, then RAM. A byte budget
-    // of 30 KiB leaves room for #125's current snapshot in the 32 KiB request.
-    // Re-read without ack returns identical JSON/identity. One outstanding batch.
+    // Oldest retained records, normally SD first, then flash, then RAM. A failed
+    // durable ack gives the other store boot-local priority until recovery.
+    // The deferred store remains eligible when the preferred store is empty.
+    // A 30 KiB byte budget leaves room for #125's current snapshot in the
+    // 32 KiB request. Re-reads preserve record JSON/identity. One outstanding batch.
     bool nextBatch(Batch& batch, size_t maxEvents = 64, size_t byteBudget = 30 * 1024);
     // Pass the complete server accepted-ID list; exact set required. No partial
     // acceptance. False leaves data retryable; true means durable metadata.
@@ -204,6 +206,7 @@ private:
     Backend backend_ = Backend::Ram;
     uint64_t ticket_ = 0, issued_ = 0;
     Backend issuedBackend_ = Backend::Ram;
+    Backend ackDeferredBackend_ = Backend::Ram; // cleared by its next durable ack
     Cursor issuedEnd_;
     EventIdentity issuedIds_[64];
     size_t issuedCount_ = 0;

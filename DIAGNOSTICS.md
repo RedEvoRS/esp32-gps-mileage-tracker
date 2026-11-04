@@ -921,7 +921,7 @@ remounting media; do not reuse cached state for a different card.
   calling producers or a logging sink. Known drop totals survive in metadata
   once a backend is writable; RAM-only records/counts are lost on reset.
 - `nextBatch` exports up to 64 unchanged protocol-v1 JSON events and their
-  IDs, oldest segment first on SD, then LittleFS, then RAM. Cross-backend order
+  IDs, oldest segment first, normally on SD, then LittleFS, then RAM. Cross-backend order
   is not event-time order. The default 30 KiB events-array budget leaves room
   for the current check-in; the worker also enforces the full 32 KiB request.
   Re-reads preserve exact JSON, including original timestamps and identity.
@@ -934,6 +934,14 @@ remounting media; do not reuse cached state for a different card.
   its uncommitted corruption count/cursor are discarded before trying the next
   store or RAM. Its records are retried after recovery; another store's ack
   cannot advance its cursor or charge its corrupt frames as losses.
+  After an acknowledgment load/save failure, the other persistent store gets
+  priority for the rest of the boot, including later drain opportunities. The
+  failed store remains eligible when the preferred store has no events, so it
+  can recover without rebooting. A successful durable ack on the deferred store
+  restores normal ordering. This preference is RAM-only; failed acknowledgments
+  leave that store's cursor and loss accounting unchanged. Keeping the preference
+  across drains lets new flash history progress despite repeated SD ack failures,
+  while the worker retains its existing independent retry backoff.
 - `acknowledge(batch, accepted_ids)` requires the exact complete ID set, with
   no missing, unexpected or duplicate IDs. Persistent data advances only after
   the new metadata slot is durably written and read back. A failed ack retains

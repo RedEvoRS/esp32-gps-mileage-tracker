@@ -144,6 +144,38 @@ static void mountedStoreFailures() {
     assert(eventSnapshot() && !(Preferences::durable64["revstate"] & 6));
     std::puts("Event upload: mounted SD write then read failure, real E4006 delivery, persistent-read progress, recovery/resync and healthy-SD/failed-LittleFS passed");
 }
+static void readOnlyAckFallback() {
+    uploadWorld(); records(3);
+    g_sdDisk.writesFail = true; records(2); // card remains mounted and readable
+    const auto retainedSd = g_sdDisk.files;
+    gNetRetryMs = 240000; gNetLastAttemptMs = 123;
+    drainEvents();
+    assert(g_httpBodies.size() == 1 && eventCount(g_httpBodies[0]) == 3);
+    assert(backlog().records == 5 && gEventRetry.delay == 60000);
+    assert(g_sdDisk.files == retainedSd && gJournal.stats().dropped == 0 && gJournal.stats().pendingLoss == 0);
+    const auto sdEvents = g_httpBodies[0].substr(g_httpBodies[0].find("\"events\":"));
+    drainEvents(); assert(g_httpBodies.size() == 1); // retain independent backoff
+    g_millis += gEventRetry.delay; drainEvents();
+    assert(g_httpBodies.size() == 3 && eventCount(g_httpBodies[1]) == 2);
+    assert(g_httpBodies[2].substr(g_httpBodies[2].find("\"events\":")) == sdEvents);
+    assert(backlog().records == 3); // both flash events were durably acknowledged
+    assert(g_sdDisk.files == retainedSd && gJournal.stats().dropped == 0 && gJournal.stats().pendingLoss == 0);
+    records(2); g_millis += gEventRetry.delay; drainEvents();
+    assert(g_httpBodies.size() == 5 && eventCount(g_httpBodies[3]) == 2);
+    assert(g_httpBodies[4].substr(g_httpBodies[4].find("\"events\":")) == sdEvents);
+    assert(backlog().records == 3 && gEventRetry.delay == 60000);
+    assert(gNetRetryMs == 240000 && gNetLastAttemptMs == 123);
+    assert(g_sdDisk.files == retainedSd && gJournal.stats().dropped == 0 && gJournal.stats().pendingLoss == 0);
+    g_sdDisk.writesFail = false; g_millis += gEventRetry.delay; drainEvents();
+    assert(g_httpBodies.size() == 6 && !gEventRetry.delay && backlog().records == 0);
+    assert(g_httpBodies[5].substr(g_httpBodies[5].find("\"events\":")) == sdEvents);
+    // Reopening both journals proves that neither flash batch can replay, and
+    // the recovered card's original cursor has now persisted too.
+    gJournal.~EventLog(); new (&gJournal) EventLog(&gSdJournalFs, &gFlashJournalFs, uploadJournalConfig(&gRevisionState));
+    assert(gJournal.begin(gJournalBoot.id, 1, "test-ack-recovery"));
+    assert(backlog().records == 0 && gJournal.stats().dropped == 0 && gJournal.stats().pendingLoss == 0);
+    std::puts("Event upload: readable SD ack-save failure, flash batches durably drained across retries, unchanged SD cursor/loss and recovery passed");
+}
 static void allocationFailure(bool missing) {
     uploadWorld();
     g_psramAvailable = !missing; g_psramAllocationFails = !missing;
@@ -419,6 +451,7 @@ int main(int argc, char** argv) {
     std::puts("Event upload: one-use enrollment, card adoption, total authority loss and GPX independence passed");
     collect(); cardRemovalAndReturn(); collect();
     mountedStoreFailures(); collect();
+    readOnlyAckFallback(); collect();
     // Refusal is actionable even when the flash copy cannot be read on a PC.
     uploadWorld(); Preferences::durable64["enroll"] = 0;
     assert(enrollAt(321)); drainEvents();

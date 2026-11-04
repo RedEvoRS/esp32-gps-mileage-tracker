@@ -549,7 +549,9 @@ bool EventLog::nextBatch(Batch& batch, size_t maxEvents, size_t byteBudget) {
     batch.count = 0; batch.bytes = 2; batch.ticket = 0; issued_ = 0;
     maxEvents = std::min<size_t>(64, maxEvents); byteBudget = std::min<size_t>(30 * 1024, byteBudget);
     if (!begun_ || !maxEvents || byteBudget < 2 || ticket_ == kMaxEventInteger) return false;
-    for (unsigned i = 0; i < 2; ++i) {
+    unsigned first = ackDeferredBackend_ == Backend::Sd ? 1 : 0;
+    for (unsigned n = 0; n < 2; ++n) {
+        unsigned i = (first + n) % 2;
         Store& store = stores_[i];
         if (!load(store)) { if (store.fs) fail(); continue; }
         uint64_t corrupt = 0;
@@ -621,13 +623,14 @@ bool EventLog::acknowledge(const Batch& batch, const EventIdentity* accepted, si
         if (!valid) return false;
     } else {
         Store& store = stores_[static_cast<unsigned>(issuedBackend_)];
-        if (!load(store)) { fail(); return false; }
+        if (!load(store)) { ackDeferredBackend_ = issuedBackend_; fail(); return false; }
         Meta next = store.meta; next.ack = issuedEnd_;
         // Corruption is explicit loss, never successful delivery. Persist the
         // loss with the cursor before allowing normal segment reclamation.
         next.dropped = sum(next.dropped, issuedCorrupt_);
         next.pending = sum(next.pending, issuedCorrupt_);
-        if (!save(store, next)) { fail(); return false; }
+        if (!save(store, next)) { ackDeferredBackend_ = issuedBackend_; fail(); return false; }
+        if (ackDeferredBackend_ == issuedBackend_) ackDeferredBackend_ = Backend::Ram;
     }
     issued_ = 0; return true;
 }
