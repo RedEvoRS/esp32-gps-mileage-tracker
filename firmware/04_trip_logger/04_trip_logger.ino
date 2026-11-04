@@ -340,7 +340,7 @@ static bool gJournalBootReported = false;
 // Single writer per array/builder. Only EventLog's try-lock crosses cores.
 static diagnostics::RuntimeFaults::Condition gLoopConditions[] = {
     {2001}, {2002}, {2003}, {2004}, {2005}, {2006}, {2008}, {3001}, {3002}, {3005}, {3006}, {3007}, {3008}, {3009},
-    {4001}, {4002}, {4003}, {4004}, {4005}, {4006}, {6001}
+    {4001}, {4002}, {4003}, {4004}, {4005}, {4006}, {4008}, {6001}
 };
 static diagnostics::RuntimeFaults::Condition gNetConditions[] = {
     {1007}, {5002}, {5003}, {5004}, {5005}, {5006}, {5007}, {5008}, {5009}
@@ -348,7 +348,7 @@ static diagnostics::RuntimeFaults::Condition gNetConditions[] = {
 static diagnostics::RuntimeFaults gLoopFaults(gJournal, gLoopConditions, sizeof(gLoopConditions) / sizeof(gLoopConditions[0]));
 static diagnostics::RuntimeFaults gNetFaults(gJournal, gNetConditions, sizeof(gNetConditions) / sizeof(gNetConditions[0]));
 static diagnostics::RuntimeFaults::Condition gEventConditions[] = {
-    {5003}, {5004}, {5005}, {5006}, {5007}, {5008}, {5009}, {5010}
+    {4008}, {5003}, {5004}, {5005}, {5006}, {5007}, {5008}, {5009}, {5010}
 };
 static diagnostics::RuntimeFaults gEventFaults(gJournal, gEventConditions, sizeof(gEventConditions) / sizeof(gEventConditions[0]));
 static uint32_t gContactTick = 0;
@@ -473,6 +473,17 @@ static bool journalMayRun() {
            (!gEventIoBudget || (!gNetAbort.load() && uint32_t(millis() - gEventIoStarted) < diagnostics::kDrainMs));
 }
 
+static void journalStorageFaults() {
+    // Consumer only, never called by fail() or submit(). Normal boots use core
+    // 0's existing builder; degraded boots have only the core-1 loop consumer.
+    auto fault = gJournal.storageFault();
+    if (!fault.observed) return;
+    auto& faults = gDegraded.mode() == startup::Mode::Normal ? gEventFaults : gLoopFaults;
+    faults.event(4008, millis()).enumeration("operation", fault.operation)
+        .enumeration("backend", fault.backend == diagnostics::EventLog::Backend::Sd ? "sd" : "littlefs")
+        .condition(fault.active);
+}
+
 static void serviceJournal() {
     if (!gJournalReady) return;
     bool sealing = gJournalSealRequested.load() && !gJournalSealDone.load();
@@ -489,6 +500,7 @@ static void serviceJournal() {
     }
     // Boot recovery and later maintenance each service exactly one record.
     gJournal.service(1);
+    journalStorageFaults();
     if (debugMode() && !gJournalBootReported) {
         auto backlog = gJournal.backlog();
         backlog.complete = backlog.complete && journalMayRun();
@@ -508,7 +520,9 @@ static void serviceJournal() {
         // bounded shutdown deadline. Never submit a second accepted notice.
     }
     if (sealing && !gPowerOffEventPending.load()) {
-        gJournalSealOk.store(gJournal.seal());
+        bool sealed = gJournal.seal();
+        journalStorageFaults();
+        gJournalSealOk.store(sealed && gJournal.stats().queued == 0);
         gJournalSealDone.store(true);
     }
     // A cancelled metadata read must not remain cached as "missing metadata".

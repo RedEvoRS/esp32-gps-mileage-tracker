@@ -20,6 +20,7 @@ constexpr uint64_t kMaxEventInteger = INT64_MAX;
 // or external changes; successful operations update its cached inventory.
 class EventLogFs {
 public:
+    enum class Operation : uint8_t { Open, Write, Close, Rename, Ack };
     enum class Result { Ok, End, Error };
     struct Entry { char name[40]; uint32_t size; };
     virtual ~EventLogFs() = default;
@@ -29,6 +30,9 @@ public:
     virtual bool write(const char* path, const void* data, size_t size, bool append) = 0;
     virtual bool rename(const char* from, const char* to) = 0; // never overwrite
     virtual bool remove(const char* path) = 0;
+    // write() includes open/sync/close. Adapters can identify its first failure.
+    virtual Operation writeFailure() const { return Operation::Write; }
+    virtual bool deferred() const { return false; } // cooperative yield, not failed media
 };
 
 enum class EventTransition : uint8_t { Notice, Raise, Repeat, Clear };
@@ -138,6 +142,15 @@ public:
     // it is bounded loss, counted durably with the cursor (never server ack).
     bool isolateRejected(const Batch& singleton);
     Stats stats();
+    // Single consumer, no I/O. Each failed store needs a successful append or
+    // durable event ack; ack failures specifically need verified metadata/ack.
+    // SD supplies context while both fail. No cross-store recovery.
+    struct StorageFault {
+        bool observed = false, active = false;
+        Backend backend = Backend::Ram;
+        const char* operation = "write";
+    };
+    StorageFault storageFault() const;
     // Single consumer, under FS_LOCK. Startup inventory counts physical valid
     // unacknowledged frames (duplicates after uncertain I/O may be counted).
     struct Backlog { uint64_t records = 0; size_t segments = 0; bool complete = true; };
@@ -187,6 +200,10 @@ private:
         size_t count = 0;
         Meta meta;
         bool loaded = false;
+        EventLogFs::Operation operation = EventLogFs::Operation::Open;
+        EventLogFs::Operation failedOperation = EventLogFs::Operation::Open;
+        EventLogFs::Operation recoveryOperation = EventLogFs::Operation::Write;
+        bool observed = false, failed = false;
     };
     Store stores_[2];
     Config config_;
@@ -204,6 +221,7 @@ private:
     uint64_t ramPending_ = 0;
     uint32_t failures_ = 0;
     Backend backend_ = Backend::Ram;
+    Backend recoveredBackend_ = Backend::Ram;
     uint64_t ticket_ = 0, issued_ = 0;
     Backend issuedBackend_ = Backend::Ram;
     Backend ackDeferredBackend_ = Backend::Ram; // cleared by its next durable ack
@@ -230,5 +248,7 @@ private:
     bool acknowledged(const Store& store, const Segment& segment) const;
     uint64_t lostIn(Store& store, const Segment& segment);
     void fail();
+    void fail(Store& store);
+    void recovered(Store& store);
 };
 } // namespace diagnostics

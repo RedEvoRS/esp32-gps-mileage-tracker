@@ -60,14 +60,20 @@ public:
         return ok;
     }
     bool write(const char* relative, const void* data, size_t size, bool append) {
+        writeFailure_ = EventLogFs::Operation::Open;
         char path[96]; if (!full(relative, path)) return false;
         int fd = ::open(path, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC), 0600);
         if (fd < 0) return false;
+        writeFailure_ = EventLogFs::Operation::Write;
         bool ok = ::write(fd, data, size) == static_cast<ssize_t>(size);
         if (::fsync(fd)) ok = false;
-        if (::close(fd)) ok = false;
+        if (::close(fd)) {
+            if (ok) writeFailure_ = EventLogFs::Operation::Close;
+            ok = false;
+        }
         return ok;
     }
+    EventLogFs::Operation writeFailure() const { return writeFailure_; }
     bool rename(const char* from, const char* to) {
         char a[96], b[96]; if (!full(from, a) || !full(to, b)) return false;
         struct stat info;
@@ -80,6 +86,7 @@ public:
     }
 private:
     const char* mount_;
+    EventLogFs::Operation writeFailure_ = EventLogFs::Operation::Write;
     bool full(const char* relative, char (&path)[96]) {
         int n = std::snprintf(path, sizeof(path), "%s%s", mount_, relative);
         return n > 0 && static_cast<size_t>(n) < sizeof(path);

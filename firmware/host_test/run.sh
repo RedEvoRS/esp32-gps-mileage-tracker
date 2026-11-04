@@ -106,6 +106,11 @@ echo "== test_event_log"
 "$build/test_event_log.exe" || status=1
 "${PYTHON:-python}" "$here/check_event_log_protocol.py" "$build/test_event_log.exe" || status=1
 
+echo "== test_journal_faults (E4008 accounting, recovery and bounded feedback)"
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -O1 -Wall -Wextra -pedantic -pthread "${incs[@]}" \
+    "$here/test_journal_faults.cpp" "$here/../04_trip_logger/event_log.cpp" -o "$build/test_journal_faults.exe"
+"$build/test_journal_faults.exe" || status=1
+
 echo "== test_fs"
 "${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_fs.cpp" "$here/../04_trip_logger/event_log.cpp" -o "$build/test_fs.exe"
 run_modes "$build/test_fs.exe" "$build/out"

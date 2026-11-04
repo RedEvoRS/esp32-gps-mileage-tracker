@@ -32,6 +32,8 @@ public:
     bool remove(const char* path) override {
         return allowed() && pathOk(path) && io_.remove(path);
     }
+    Operation writeFailure() const override { return io_.writeFailure(); }
+    bool deferred() const override { return allow_ && !allow_(); }
     uint32_t allocatedBytes(uint32_t unit) {
         // Called by trip free-space checks with FS_LOCK, independently of the
         // maintenance gate. Count existing allocation, not reserved ack slots.

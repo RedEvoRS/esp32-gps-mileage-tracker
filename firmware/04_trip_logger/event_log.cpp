@@ -238,6 +238,33 @@ EventLog::Submit EventLog::submit(const EventInput& input, EventIdentity* id) {
     queueLock_.clear(std::memory_order_release); return result;
 }
 void EventLog::fail() { if (failures_ != UINT32_MAX) ++failures_; } // no sink callback/recursive event
+void EventLog::fail(Store& store) {
+    fail();
+    if (store.fs->deferred()) return;
+    store.observed = store.failed = true;
+    store.failedOperation = store.operation;
+}
+void EventLog::recovered(Store& store) {
+    if (store.failed) recoveredBackend_ = static_cast<Backend>(&store - stores_);
+    store.recoveryOperation = store.operation;
+    store.observed = true; store.failed = false;
+}
+EventLog::StorageFault EventLog::storageFault() const {
+    static const char* operations[] = {"open", "write", "close", "rename", "ack"};
+    StorageFault result;
+    for (unsigned i = 0; i < 2; ++i) {
+        const auto& store = stores_[i];
+        if (!store.observed) continue;
+        if (result.active) continue;
+        result = {true, store.failed, static_cast<Backend>(i),
+                  operations[static_cast<unsigned>(store.failed ? store.failedOperation : store.recoveryOperation)]};
+    }
+    if (!result.active && recoveredBackend_ != Backend::Ram) {
+        const auto& store = stores_[static_cast<unsigned>(recoveredBackend_)];
+        result = {true, false, recoveredBackend_, operations[static_cast<unsigned>(store.recoveryOperation)]};
+    }
+    return result;
+}
 
 uint64_t EventLog::allocated(const Store& store, uint32_t bytes) const {
     return ((static_cast<uint64_t>(bytes) + store.unit - 1) / store.unit) * store.unit;
@@ -291,6 +318,7 @@ bool EventLog::inventory(Store& store) {
 }
 bool EventLog::load(Store& store) {
     if (store.loaded) return true;
+    store.operation = EventLogFs::Operation::Open;
     if (!store.fs || !store.fs->begin() || !inventory(store)) return false;
     Meta best;
     for (unsigned slot = 0; slot < 2; ++slot) {
@@ -324,6 +352,7 @@ bool EventLog::load(Store& store) {
 }
 bool EventLog::save(Store& store, Meta next) {
     if (!load(store)) return false;
+    store.operation = EventLogFs::Operation::Ack;
     if (store.meta.generation == kMaxEventInteger || store.quota < 2 * allocated(store, kMetaBytes)) return false;
     next.generation = store.meta.generation + 1;
     uint8_t data[kMetaBytes] = {}, check[kMetaBytes];
@@ -340,7 +369,11 @@ bool EventLog::save(Store& store, Meta next) {
     unsigned slot = next.generation % 2;
     store.used -= static_cast<uint32_t>(allocated(store, store.metaSizes[slot]) - allocated(store, kMetaBytes));
     store.metaSizes[slot] = kMetaBytes;
-    store.meta = next; return true;
+    store.meta = next;
+    // Metadata proves recovery of metadata failure, not frame/rename failure.
+    // Otherwise filename reservations could clear an ongoing failed append.
+    if (store.failed && store.failedOperation == EventLogFs::Operation::Ack) recovered(store);
+    return true;
 }
 bool EventLog::acknowledged(const Store& store, const Segment& segment) const {
     return segment.id < store.meta.ack.segment ||
@@ -390,6 +423,7 @@ uint64_t EventLog::lostIn(Store& store, const Segment& segment) {
     return lost;
 }
 bool EventLog::makeRoom(Store& store, size_t bytes) {
+    store.operation = EventLogFs::Operation::Write;
     if (bytes + 2 * allocated(store, kMetaBytes) > store.quota) return false;
     // Reclaim only sealed, acknowledged data normally. A discarded segment was
     // explicitly loss-accounted BEFORE deleting, so a reset can finish deletion.
@@ -408,6 +442,7 @@ bool EventLog::makeRoom(Store& store, size_t bytes) {
             if (!save(store, next)) return false;
         }
         char path[40]; segmentPath(path, s.id, s.ready);
+        store.operation = EventLogFs::Operation::Write;
         if (!store.fs->remove(path)) { store.loaded = false; return false; }
         issued_ = 0; // a batch referencing removed storage must be read again
         store.used -= static_cast<uint32_t>(allocated(store, s.size));
@@ -418,6 +453,7 @@ bool EventLog::makeRoom(Store& store, size_t bytes) {
 }
 bool EventLog::append(Store& store, const Frame& frame) {
     if (!load(store)) return false;
+    store.operation = EventLogFs::Operation::Open;
     // At boot or after a failed append, never append to an uncertain tail. A
     // complete valid tail may be reused across boots; a torn one is sealed.
     Segment* open = nullptr;
@@ -435,6 +471,7 @@ bool EventLog::append(Store& store, const Frame& frame) {
                     segment.size + frame.size <= config_.segmentBytes && i + 1 == store.count;
         if (keep) { open = &segment; continue; }
         char from[40], to[40]; segmentPath(from, segment.id, false); segmentPath(to, segment.id, true);
+        store.operation = EventLogFs::Operation::Rename;
         if (!store.fs->rename(from, to)) { store.loaded = false; return false; }
         segment.ready = true;
     }
@@ -444,6 +481,7 @@ bool EventLog::append(Store& store, const Frame& frame) {
     uint64_t growth = allocated(store, oldSize + frame.size) - allocated(store, oldSize);
     if (open && (static_cast<uint64_t>(store.used) + growth > store.quota)) {
         char from[40], to[40]; segmentPath(from, open->id, false); segmentPath(to, open->id, true);
+        store.operation = EventLogFs::Operation::Rename;
         if (!store.fs->rename(from, to)) { store.loaded = false; return false; }
         open->ready = true; open = nullptr;
         oldSize = 0; growth = allocated(store, frame.size);
@@ -459,10 +497,17 @@ bool EventLog::append(Store& store, const Frame& frame) {
         if (!save(store, next)) return false;
     }
     char path[40]; segmentPath(path, openId, false);
-    if (!store.fs->write(path, frame.data, frame.size, true)) { store.loaded = false; return false; }
+    store.operation = EventLogFs::Operation::Write;
+    if (!store.fs->write(path, frame.data, frame.size, true)) {
+        store.operation = store.fs->writeFailure();
+        store.loaded = false; return false;
+    }
     store.used += static_cast<uint32_t>(growth);
     if (!open) store.segments[store.count++] = {openId, frame.size, false, true};
     else store.segments[store.count - 1].size = oldSize + frame.size;
+    // Appending to an existing segment need not touch metadata. It cannot
+    // prove recovery of an ack failure; save()/acknowledge() must do that.
+    if (!store.failed || store.failedOperation != EventLogFs::Operation::Ack) recovered(store);
     return true;
 }
 
@@ -481,7 +526,7 @@ void EventLog::service(size_t maxRecords) {
             backend_ = Backend::Ram;
             for (unsigned i = 0; i < 2; ++i) {
                 if (append(stores_[i], frame)) { backend_ = static_cast<Backend>(i); headStored_ = true; break; }
-                if (stores_[i].fs) fail();
+                if (stores_[i].fs) fail(stores_[i]);
             }
         }
         if (!headStored_) break; // preserve bounded RAM, retry next service step
@@ -503,7 +548,7 @@ void EventLog::service(size_t maxRecords) {
         if (ramPending_) {
             Meta next = store.meta; next.dropped = sum(next.dropped, ramPending_);
             next.pending = sum(next.pending, ramPending_);
-            if (!save(store, next)) { fail(); continue; }
+            if (!save(store, next)) { fail(store); continue; }
             ramPending_ = 0;
         }
         if (!store.meta.pending) continue;
@@ -520,9 +565,9 @@ void EventLog::service(size_t maxRecords) {
             queueLock_.clear(std::memory_order_release);
             if (!encoded) { fail(); break; }
         }
-        if (!append(store, lossNotice_[i])) { fail(); break; }
+        if (!append(store, lossNotice_[i])) { fail(store); break; }
         Meta next = store.meta; next.pending -= lossReported_[i];
-        if (!save(store, next)) fail();
+        if (!save(store, next)) fail(store);
         else lossReported_[i] = 0;
         backend_ = static_cast<Backend>(i);
         break; // one notice at most per service step
@@ -553,7 +598,7 @@ bool EventLog::nextBatch(Batch& batch, size_t maxEvents, size_t byteBudget) {
     for (unsigned n = 0; n < 2; ++n) {
         unsigned i = (first + n) % 2;
         Store& store = stores_[i];
-        if (!load(store)) { if (store.fs) fail(); continue; }
+        if (!load(store)) { if (store.fs) fail(store); continue; }
         uint64_t corrupt = 0;
         bool readable = true;
         for (size_t j = 0; readable && j < store.count; ++j) {
@@ -623,14 +668,15 @@ bool EventLog::acknowledge(const Batch& batch, const EventIdentity* accepted, si
         if (!valid) return false;
     } else {
         Store& store = stores_[static_cast<unsigned>(issuedBackend_)];
-        if (!load(store)) { ackDeferredBackend_ = issuedBackend_; fail(); return false; }
+        if (!load(store)) { ackDeferredBackend_ = issuedBackend_; fail(store); return false; }
         Meta next = store.meta; next.ack = issuedEnd_;
         // Corruption is explicit loss, never successful delivery. Persist the
         // loss with the cursor before allowing normal segment reclamation.
         next.dropped = sum(next.dropped, issuedCorrupt_);
         next.pending = sum(next.pending, issuedCorrupt_);
-        if (!save(store, next)) { ackDeferredBackend_ = issuedBackend_; fail(); return false; }
+        if (!save(store, next)) { ackDeferredBackend_ = issuedBackend_; fail(store); return false; }
         if (ackDeferredBackend_ == issuedBackend_) ackDeferredBackend_ = Backend::Ram;
+        recovered(store);
     }
     issued_ = 0; return true;
 }
@@ -654,6 +700,7 @@ bool EventLog::isolateRejected(const Batch& batch) {
         // exists. Standalone callers without that reserve need free space.
         if (uint64_t(store.used) + (config_.reserveRejected ? 0 : allocated(store, frame.size)) > store.quota) continue;
         if (!store.fs->write("/diag/rejected", frame.data, frame.size, false)) {
+            store.operation = store.fs->writeFailure(); fail(store);
             store.loaded = false; continue;
         }
         Frame verify;
@@ -709,13 +756,14 @@ bool EventLog::seal() {
     bool ok = stats().queued == 0;
     for (auto& store : stores_) {
         if (!store.fs) continue;
-        if (!load(store)) { ok = false; continue; }
+        if (!load(store)) { fail(store); ok = false; continue; }
         for (size_t i = 0; i < store.count; ++i) {
             auto& segment = store.segments[i];
             if (segment.ready) continue;
             char from[40], to[40];
             segmentPath(from, segment.id, false); segmentPath(to, segment.id, true);
-            if (!store.fs->rename(from, to)) { store.loaded = false; ok = false; break; }
+            store.operation = EventLogFs::Operation::Rename;
+            if (!store.fs->rename(from, to)) { fail(store); store.loaded = false; ok = false; break; }
             segment.ready = true;
         }
     }
@@ -769,7 +817,7 @@ bool EventLog::revisionStores(uint8_t& mounted, uint64_t& highest) {
     for (unsigned i = 0; i < 2; ++i) {
         auto& store = stores_[i];
         if (!store.fs) continue; // mounted stores are fixed before consumers start
-        if (!load(store)) { fail(); continue; }
+        if (!load(store)) { fail(store); continue; }
         mounted |= 2u << i;
         highest = std::max(highest, store.meta.revision);
         revisionEpochFloor_ = std::max(revisionEpochFloor_, store.meta.revisionEpoch);
@@ -799,7 +847,7 @@ bool EventLog::restoreStatusSequence(uint64_t highWater) {
         Meta next = store.meta; next.revision = highWater; next.revisionReady = true;
         next.revisionSuspended = false; next.revisionEpoch = epoch;
         if (save(store, next)) saved |= 2u << i;
-        else fail();
+        else fail(store);
     }
     if (!saved || !writeRevisionState(epoch | (6 & ~saved))) return false;
     revisionFloor_ = highWater; revisionBlocked_ = false; return true;
@@ -827,7 +875,7 @@ bool EventLog::allocateStatusSequence(uint64_t& sequence) {
         Meta next = store.meta; next.revision = revisionFloor_; next.revisionReady = true;
         next.revisionSuspended = false; next.revisionEpoch = epoch;
         if (save(store, next)) saved |= 2u << i;
-        else fail();
+        else fail(store);
     }
     // A stale/new copy cannot rescue the loss of the last current authority.
     // Do not mark that authority stale on refusal: no snapshot was exposed.
@@ -849,9 +897,9 @@ bool EventLog::suspendStatusSequence() {
     // fails. Explicit suspended differs from a fresh, adoptable empty store.
     for (auto& store : stores_) {
         if (!store.fs) continue;
-        if (!load(store)) { ok = false; continue; }
+        if (!load(store)) { fail(store); ok = false; continue; }
         Meta next = store.meta; next.revisionReady = false; next.revisionSuspended = true;
-        if (!save(store, next)) ok = false;
+        if (!save(store, next)) { fail(store); ok = false; }
     }
     return ok;
 }

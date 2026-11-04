@@ -111,14 +111,15 @@ static void mountedStoreFailures() {
     g_sdDisk.writesFail = true; // still mounted, reads initially work
     g_sdDisk.failNextOpens = 1;
     assert(!beginTrip(Fix{})); // production trip-create hook raises E4006
-    serviceJournal(); records(2);
+    serviceJournal(); records(2); serviceJournal(); // also persist the journal's E4008
     assert(eventSnapshot()); // LittleFS authority already works before reads fail
     assert(Preferences::durable64["revstate"] & 2);
     g_sdDisk.readsFail = true;
     drainEvents();
     assert(gSdMounted && g_httpBodies.size() == 1);
     const auto& failed = g_httpBodies.front();
-    assert(eventCount(failed) == 3 && failed.find("\"code\":4006,") != std::string::npos);
+    assert(eventCount(failed) == 4 && failed.find("\"code\":4006,") != std::string::npos);
+    assert(eventCondition(4008).episode && failed.find("\"code\":4008,") != std::string::npos);
     assert(failed.find("\"storage_backend\":\"littlefs\"") != std::string::npos);
     assert(failed.find("\"active\":[{\"code\":4006,") != std::string::npos);
     assert(gJournal.stats().storageFailures > 0 && gJournal.stats().queued == 0);
@@ -129,19 +130,23 @@ static void mountedStoreFailures() {
     failedCardLifecycle.push_back(g_httpBodies.front()); collect();
     g_sdDisk.writesFail = g_sdDisk.readsFail = false;
     tripWriteResult(SD, true, "write"); // measured-recovery hook, no pending trip
-    serviceJournal(); drainEvents();
-    assert(g_httpBodies.size() == 1 && eventCount(g_httpBodies.front()) == 2);
+    serviceJournal(); assert(eventSnapshot()); // verify recovery of the failed SD revision metadata
+    serviceJournal(); drainEvents(); // measured E4008 clear also reaches storage
+    assert(g_httpBodies.size() == 1 && eventCount(g_httpBodies.front()) == 3);
+    assert(!eventCondition(4008).episode);
     assert(!(Preferences::durable64["revstate"] & 6) && backlog().records == 0);
     failedCardLifecycle.push_back(g_httpBodies.front()); collect();
 
     // The symmetric failure must retain v1.00's healthy-SD behavior.
     uploadWorld(); g_disk.writesFail = true; records(2);
-    g_disk.readsFail = true; drainEvents();
-    assert(g_httpBodies.size() == 1 && eventCount(g_httpBodies.front()) == 2);
+    g_disk.readsFail = true;
+    assert(eventSnapshot()); serviceJournal(); drainEvents(); // persist metadata-failure E4008 on SD
+    assert(g_httpBodies.size() == 1 && eventCount(g_httpBodies.front()) == 3);
     assert(g_httpBodies.front().find("\"storage_backend\":\"sd\"") != std::string::npos);
     assert(Preferences::durable64["revstate"] & 4);
     g_disk.writesFail = g_disk.readsFail = false;
     assert(eventSnapshot() && !(Preferences::durable64["revstate"] & 6));
+    assert(!eventCondition(4008).episode); // verified flash metadata recovers its ack failure
     std::puts("Event upload: mounted SD write then read failure, real E4006 delivery, persistent-read progress, recovery/resync and healthy-SD/failed-LittleFS passed");
 }
 static void readOnlyAckFallback() {

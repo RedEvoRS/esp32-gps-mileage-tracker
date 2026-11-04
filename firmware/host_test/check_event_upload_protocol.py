@@ -92,8 +92,16 @@ with tempfile.TemporaryDirectory(prefix="failed-card-") as temp:
         previous = snapshot["status_sequence"]
         assert snapshot["storage_backend"] == ("littlefs" if index in (1, 2) else "sd")
         assert any(item["code"] == 4006 for item in snapshot["active"]) == (index in (1, 2))
+        assert any(item["code"] == 4008 for item in snapshot["active"]) == (index in (1, 2))
         if index == 1:
             assert any(event["code"] == 4006 and event["context"] == {"backend": "sd", "operation": "open"}
+                       for event in request["events"])
+            assert any(event["code"] == 4008 and event["transition"] == "raise" and
+                       event["context"] == {"backend": "sd", "operation": "write"}
+                       for event in request["events"])
+        if index == 3:
+            assert any(event["code"] == 4008 and event["transition"] == "clear" and
+                       event["context"] == {"backend": "sd", "operation": "ack"}
                        for event in request["events"])
         total_events += len(request["events"])
         for replay in range(2):
@@ -106,7 +114,7 @@ with tempfile.TemporaryDirectory(prefix="failed-card-") as temp:
                              (HEADERS["X-Device-Id"],)).fetchone()
             assert row[0] == previous and json.loads(row[1])["active"] == snapshot["active"]
             assert db.execute("SELECT count(*) FROM events").fetchone()[0] == total_events
-    assert total_events == 7
-print("Failed-card ingest: 4 increasing snapshots, E4006 active/clear, 7 events including retained SD history and dedupe passed")
+    assert total_events == 9
+print("Failed-card ingest: 4 increasing snapshots, E4006/E4008 active/clear, 9 events including retained SD history and dedupe passed")
 print(f"Event-upload protocol: all {len(requests)} firmware bodies validated; "
       f"{2 * len(requests)} real local ingest commits/replays passed")
