@@ -101,6 +101,7 @@ static bme280_temp::Sensor gDebugTempBme;
 #include "production_display.h"
 static display::DisplayModel gDisplayModel;
 static bool gDisplayTripFinalized = false, gDisplayUserRequest = false;
+static bool gDisplayUsbPowerRequest = false; // core-1 power handler -> renderer
 #include "debug_gsv.h"
 #include "debug_rf.h"
 #include "gps_antenna.h"
@@ -1552,6 +1553,8 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
     // board would stay off until USB was unplugged and replugged (#106).
     VbusState entryVbus = vbusState();
     if (entryVbus != VbusState::Absent) {
+        if (entryVbus == VbusState::Present && strcmp(reason, "user_long_press") == 0)
+            gDisplayUsbPowerRequest = true;
         Serial.println(entryVbus == VbusState::Unknown ? VBUS_UNREADABLE :
                        "VBUS present -- staying awake instead of powering off.");
         gVbusRetry = entryVbus == VbusState::Unknown ? VbusRetry::Seed : VbusRetry::None;
@@ -1625,6 +1628,8 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
     } else {
         Serial.println(finalVbus == VbusState::Unknown ? VBUS_UNREADABLE :
                        "VBUS returned -- PMU power-off cancelled.");
+        if (finalVbus == VbusState::Present && strcmp(reason, "user_long_press") == 0)
+            gDisplayUsbPowerRequest = true;
     }
 
     // An upload that outlived the abort timeout may still own a File from
@@ -2869,6 +2874,7 @@ static const display::Output& serviceProductionDisplay(bool render = true) {
         fresh, gps.speed.mps(), END_MPS);
     input.tripFinalized = gDisplayTripFinalized; gDisplayTripFinalized = false;
     input.userRequest = gDisplayUserRequest; gDisplayUserRequest = false;
+    input.usbPowerRequest = gDisplayUsbPowerRequest; gDisplayUsbPowerRequest = false;
     input.heard = gDebugGsv.signal(now).heard;
     input.conditions = gDisplayMerged; input.count = merged;
     const auto& output = gDisplayModel.update(input);
@@ -2884,6 +2890,7 @@ static void toggleRuntimeDebug() {
     gDebugMode.store(enabled);
     gDisplayModel.dismiss();
     gDisplayUserRequest = gDisplayTripFinalized = false;
+    gDisplayUsbPowerRequest = false;
     gModeFeedback = true; gModeFeedbackMs = millis();
     // Drop an unfinished BME conversion; the next entry starts a fresh cycle.
     gDebugTempPending = false;

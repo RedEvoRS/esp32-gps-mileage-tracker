@@ -128,10 +128,10 @@ enrollment never reuses a loaded epoch after NVS reset.
 **Display**
 
 - `test_debug_display`: simulated OLED (small screen) bus failures during initialization/drawing and safe display disablement.
-- `test_display_model`: status-card timing, motion/fault queues and debug suppression, at default and 10-second durations (two builds).
+- `test_display_model`: status-card timing, motion/fault queues and debug suppression, at default and 10-second durations (two builds). USB-power refusal cards preserve interrupted/queued faults, allow later status taps, expire across timer rollover and are dismissed on mode changes.
 - `test_production_display_layout`: text bounds/spacing from checked-in glyph metrics (character sizes), including worst-case satellite counts/error codes.
 - `test_production_display`: renderer initialization, drawing/power-save bus failures and disablement, plus the Debug ON card's full 32-character version wrapped across two small-text lines (no version on Debug OFF).
-- `test_display_runtime` **[TinyGPSPlus]**: sketch integration, button/debounce behavior, runtime debug switching, fault cards and continued logging with a failed display.
+- `test_display_runtime` **[TinyGPSPlus]**: sketch integration, button/debounce behavior, runtime debug switching, fault cards and continued logging with a failed display. Refused user long presses select the three-line USB card in both modes; automatic shutdown reasons and unknown USB state do not. Drawing stays in the core-1 display service.
 
 **Power management and peripheral bus**
 

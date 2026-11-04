@@ -270,6 +270,12 @@ with the current default; they do not scroll or flash.
   debug page. A two-second message confirms the change. POWER alone can overlay
   a status card in debug mode. Debug is not saved across power cycles; holding
   BOOT during power-up instead selects the chip's download mode.
+- A long POWER press on USB leaves the board on and shows `USB power` /
+  `Unplug USB` / `to switch off` for the normal card duration in either mode.
+  Unplug USB first, then long-press for a clean shutdown. A roughly six-second
+  hold forces PMU power-off without closing files. Before removing the card,
+  tap POWER briefly and check that the screen stays dark; follow the
+  [card precautions](firmware/README.md#microsd-card).
 
 Short-press actions need a successfully read power-management interrupt batch;
 unknown reads cannot request a card or toggle debug. Degraded startup does not
@@ -1751,8 +1757,15 @@ Production policy:
   The single build always includes `XPOWERS_AXP2101_PKEY_SHORT_IRQ` in the
   shared enabled/batch mask and tests `irq.has(...)` only after a known batch,
   outside degraded mode. BOOT held toggles debug instead. Unknown batches
-  request no card and cannot toggle debug. Long press keeps
-  the existing clean battery power-off/USB-ignore meaning. A new error preempts a routine status card;
+  request no card and cannot toggle debug. Long press keeps the existing
+  clean battery power-off behavior. Only a `user_long_press` refused with
+  confirmed USB power requests a UsbPowerCard, through a core-1 flag consumed
+  by the renderer. It uses three lines in the 14-point font and the normal
+  `DISPLAY_CARD_MS` interval; it can replace a status card, and a later short
+  tap can request status again. An interrupted error card resumes afterward,
+  followed by queued errors. Debug off dismisses the message and pending
+  errors, so they cannot replay after a mode switch.
+  A new error preempts a routine status card;
   a user request can replace the current card and holds its full
   `DISPLAY_CARD_MS` (default 30 seconds) before queued errors resume.
   Routine status cards blank when motion becomes Moving; Unknown does not

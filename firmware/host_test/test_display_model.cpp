@@ -10,7 +10,55 @@ using namespace display;
 static_assert(DisplayModel::kDurationMs == kExpectedDurationMs,
               "card duration must use the 30 s default or the build override");
 static unsigned cases = 0;
+static void usbPowerRegressions() {
+    DisplayModel model; DisplayModel::Input in;
+    in.motion = Motion::Moving;
+    in.now = UINT32_MAX - DisplayModel::kDurationMs / 2;
+    in.usbPowerRequest = in.userRequest = true;
+    assert(model.update(in).card == Card::UsbPowerCard);
+    const uint32_t until = in.now + DisplayModel::kDurationMs;
+    in.usbPowerRequest = in.userRequest = false;
+    in.now = until - 1;
+    assert(model.update(in).card == Card::UsbPowerCard && model.update(in).until == until);
+    in.now = until; assert(!model.update(in).powered); ++cases;
+
+    // Short taps still select status, and cannot leave a refusal to replay.
+    in.usbPowerRequest = true; model.update(in); in.usbPowerRequest = false;
+    ++in.now; in.userRequest = true;
+    assert(model.update(in).card == Card::StatusCard);
+    in.userRequest = false; in.now += DisplayModel::kDurationMs;
+    assert(!model.update(in).powered); ++cases;
+
+    // Refusal feedback retains the interrupted error and the remaining queue.
+    model = DisplayModel{}; in = {}; in.motion = Motion::Moving;
+    Condition errors[] = {{4003, 1, 0}, {4002, 2, 0}};
+    in.conditions = errors; in.count = 2;
+    assert(model.update(in).errorCode == 4003);
+    ++in.now; in.usbPowerRequest = true;
+    assert(model.update(in).card == Card::UsbPowerCard);
+    ++in.now; assert(model.update(in).card == Card::UsbPowerCard); // repeated press
+    in.usbPowerRequest = false;
+    in.now += DisplayModel::kDurationMs;
+    assert(model.update(in).errorCode == 4003);
+    in.now += DisplayModel::kDurationMs;
+    assert(model.update(in).errorCode == 4002);
+    in.now += DisplayModel::kDurationMs; assert(!model.update(in).powered); ++cases;
+
+    // Debug accepts explicit feedback, consumes hidden faults, and expires it.
+    model = DisplayModel{}; in = {}; in.suspended = true; in.usbPowerRequest = true;
+    assert(model.update(in).card == Card::UsbPowerCard);
+    in.usbPowerRequest = false; in.conditions = errors; in.count = 2;
+    ++in.now; assert(model.update(in).card == Card::UsbPowerCard);
+    in.now = DisplayModel::kDurationMs; assert(!model.update(in).powered);
+    in.suspended = false; assert(!model.update(in).powered); ++cases;
+
+    in.usbPowerRequest = true; model.update(in); in.usbPowerRequest = false;
+    model.dismiss(); assert(!model.update(in).powered); // no stale mode-switch card
+    in.usbPowerRequest = true; model.update(in); in.usbPowerRequest = false;
+    in.shutdown = true; assert(!model.update(in).powered); ++cases;
+}
 int main() {
+    usbPowerRegressions();
     DisplayModel model; DisplayModel::Input in;
     // The runtime's first update implies boot, without a trusted GPS fix.
     in.now = 100;

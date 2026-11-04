@@ -275,7 +275,7 @@ port on the right. The buttons sit along the bottom edge:
 | Button | Where | What it does |
 |---|---|---|
 | **RESET** | Left of the close pair near the middle | Restarts the ESP32 |
-| **POWER** | Right of that pair | Tap for a status card. While running, hold BOOT then tap POWER to toggle debug. ~1 s switches the board on; a shorter long press on battery shuts down cleanly; ~6 s forces it off (see [Normal operation](#normal-operation)) |
+| **POWER** | Right of that pair | Tap for a status card. While running, hold BOOT then tap POWER to toggle debug. ~1 s switches the board on. To switch off cleanly, unplug USB first, then hold for 1–2 s and release. On USB, that long press shows a message and leaves the board on. ~6 s forces it off at the PMU (see [Normal operation](#normal-operation)) |
 | **BOOT** | On its own, further right | GPIO 0. While running, hold it then tap POWER to toggle debug. Held while powering up, it still selects download mode |
 
 ### Board settings
@@ -371,7 +371,12 @@ a card. Stage 4 has since recorded two real drives on the card.
   about an hour for 32 GB and is worth doing once.
 - **Only insert or remove the card with the board switched off.** The slot
   has no card-detect switch, and the firmware picks its trip storage once,
-  at boot.
+  at boot. With Stage 4 running, unplug USB first, hold POWER for 1–2 s,
+  then release and let shutdown finish. Before pulling the card, tap POWER
+  briefly and check that the screen stays dark. A running board normally
+  sleeps its screen between cards, so a dark screen alone does not mean off.
+  If the screen was already failing to respond, this check cannot confirm
+  shutdown; resolve that before removing the card.
 - **The firmware never formats the card.** A card that won't mount is left
   untouched, and trips go to internal flash instead.
 - **At boot** the log says which storage it chose:
@@ -874,7 +879,10 @@ trip. Erase-all does not erase the removable card, but it does reset NVS.
 
 #### If the trip storage won't mount later
 
-For microSD trips, switch the board off and read or copy the card on a PC.
+For microSD trips, unplug USB, hold POWER for 1–2 s and release to switch
+the board off cleanly. Before pulling the card, tap POWER briefly and check
+that the screen stays dark; follow the [card precautions](#microsd-card).
+Then read or copy the card on a PC.
 Check its seating and FAT32 format before trying it again; the firmware
 never formats it. Preserve its data before any repair or reformat.
 
@@ -1027,13 +1035,18 @@ How it behaves once flashed:
 - **Buttons:** on battery, hold **POWER** for a second or two and release
   well before 6 s for a clean shutdown: finalize the trip, stop networking,
   seal the journal and unmount storage before switching off. With USB
-  plugged in, the request is ignored and Serial prints
+  plugged in, a long press **does not switch the board off**. In either
+  screen mode, a three-line card says `USB power` / `Unplug USB` /
+  `to switch off`, and Serial prints
   `VBUS present -- staying awake instead of powering off.` An unreadable
   USB state also keeps it awake and prints
   `VBUS state unreadable -- staying awake instead of powering off.`
   USB switches the board on only when power arrives: shutting it down
   while USB remained connected would leave it off until power was cut and
-  restored. Unplug USB first to switch it off. Press POWER for about 1 s
+  restored. **Unplug USB first, then hold POWER for 1–2 s and release** to
+  switch it off cleanly. Before pulling the microSD card, tap POWER briefly
+  and check that the screen stays dark; see the [card precautions](#microsd-card).
+  Press POWER for about 1 s
   or insert USB power to switch it back on. A 6 s hold forces the PMU's
   hard power-off with no file closing; any open trip needs boot repair and
   unwritten diagnostics are lost. Use that only if the board stops responding.
@@ -1257,8 +1270,10 @@ Things to know:
   to 10 seconds after the first road tests. A short press of
   **POWER** shows a status card in any motion state after a verified PMU
   INTSTS1..3 batch, outside degraded mode. The short-key IRQ is always enabled;
-  BOOT is sampled and debounced on the loop task. Long press keeps its
-  existing clean power-off behavior on battery and is ignored on USB.
+  BOOT is sampled and debounced on the loop task. A long press switches off
+  cleanly on battery. On USB it leaves the board on and shows `USB power` /
+  `Unplug USB` / `to switch off` for the same card duration, in either mode.
+  A short tap can replace that message with the normal status card.
   GSV/MON-RF antenna checking and NAV-PVT speed accuracy gating stay enabled
   in both runtime modes. On **2026-10-20**, the owner saw the working production
   screen on hardware and requested much larger text filling the panel,
@@ -1565,8 +1580,9 @@ Do this before a test drive, not during a trip.
 1. After flashing, look for these lines:
    - `Trip storage: microSD (... GiB free); internal flash queue mounted.`
      Trips go to the card (the free-space figure depends on your card). If it says `WARNING: microSD unavailable -- using
-     internal flash`, the card didn't mount: switch off, check it's FAT32 and
-     seated, and switch on again.
+     internal flash`, the card didn't mount: unplug USB and switch off using
+     the [card precautions](#microsd-card), check it's FAT32 and seated, and
+     switch on again.
    - `Setup complete. Logging trips.`
    - A line starting `DEGRADED:` means the board is **not recording trips**,
      because neither storage worked or the power chip didn't answer. It
@@ -1641,7 +1657,8 @@ discarded as noise has nothing to upload. Then look for the upload result:
   different contents or from another device, or its stored summary is
   damaged; the ingest log gives the exact reason. Look at the matching
   `data/YYYY-MM/<trip>.gpx` and `.json` on the server, or move the file aside
-  on the card if you don't want it uploaded.
+  on the card if you don't want it uploaded, following the
+  [card precautions](#microsd-card) before removing it.
 - `Network: home WiFi not found` or `Network: couldn't join home WiFi`:
   the message names the configured SSID; a join failure also reports
   `status N` (`4` can indicate a wrong password). Check the name and
@@ -1686,7 +1703,11 @@ laptop and watch the Serial Monitor.
   10 minutes, then off. It hasn't died; plug USB back in, or press
   **POWER** for about a second, to switch it on. On battery, holding
   **POWER** for a second or two (let go well before 6 s) switches it off
-  cleanly. **With USB plugged in, that press is ignored**, because USB
+  cleanly. **With USB plugged in, that press leaves the board on** and shows
+  `USB power` / `Unplug USB` / `to switch off`. Unplug USB first, then
+  long-press POWER for a clean shutdown. Before removing the microSD card,
+  tap POWER briefly and check that the screen stays dark; see the
+  [card precautions](#microsd-card). USB
   power only switches the board on at the moment it arrives: a board
   switched off with USB still in would stay off until the car's port next
   went off and on. Holding **POWER** for 6 s cuts power without closing

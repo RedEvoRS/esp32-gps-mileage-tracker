@@ -25,6 +25,13 @@ static void fits(const Layout& pixels) {
 }
 int main() {
     assert(layout({}).count == 0);
+    const auto usb = layout(usbPowerCard()); fits(usb);
+    assert(usb.count == 3);
+    const char* usbText[] = {"USB power", "Unplug USB", "to switch off"};
+    for (unsigned i = 0; i < 3; ++i) {
+        assert(!std::strcmp(usb.text[i].value, usbText[i]));
+        assert(usb.text[i].font == Font::Codes);
+    }
     auto pixels = layout(statusCard(99, nullptr, 0));
     fits(pixels);
     assert(pixels.count == 2 && !std::strcmp(pixels.text[0].value, "Sats: 99"));
