@@ -151,6 +151,30 @@ distance, and GPS noise can add some, so the total is an estimate.
 > LoRa, but the antenna must stay on until this project's firmware is
 > flashed (Step 2).
 
+> [!CAUTION]
+> **Hot climates: the 18650 battery can overheat in a parked car.** A car
+> left in the sun can get hot enough inside to damage a lithium-ion cell,
+> and a damaged or overheated cell can swell, leak, vent or catch fire. The
+> firmware pauses charging when the board's power chip reports a high
+> temperature, but that's an indirect estimate, not a reading of the cell,
+> and it can't cool a cell that heats up while the car is parked.
+>
+> To lower the risk:
+>
+> - **Keep the board out of direct sunlight and mount it as low in the car
+>   as you can**, such as a footwell or under a seat. The dashboard and rear
+>   shelf get the hottest. With an external GPS antenna, the antenna can
+>   sit where it sees the sky while the board stays low; check that your
+>   home WiFi still reaches the board there.
+> - **Replace the cell** if it's swollen, dented, leaking or its wrap is
+>   torn.
+>
+> **You build and use this at your own risk.** The authors and contributors
+> accept no liability for any damage, injury, fire or other loss arising
+> from the hardware, the battery or the software. See [License](#license):
+> it comes with no warranty. More on the battery in
+> [Put it in the car](firmware/README.md#put-it-in-the-car).
+
 ## Setting it up
 
 The setup scripts download from GitHub: the scripts and source bundle come
