@@ -22,7 +22,10 @@ contact services outside it:
 
 - The viewer fetches OpenStreetMap tiles to draw maps.
 - If you turn on place lookup, the viewer sends the trip endpoint you click
-  to the provider you configure, which may be outside your network.
+  to the provider you configure. That provider can be your own Nominatim
+  server on your network, which keeps lookups completely local; it needs
+  disk space and memory for your area's map data. See
+  [place suggestions](server/README.md#endpoint-place-suggestions).
 - The tracker asks an internet time server for the time when GPS time isn't
   available.
 
@@ -70,7 +73,8 @@ The board writes each GPS point to the trip file and closes the file straight
 away, to limit data loss if power is cut. Recovery from a power cut during a
 write hasn't been tested on the board.
 
-The board runs from the car's USB port, with the 18650 battery as backup.
+The board gets power from the car's USB port, with the 18650 battery as
+backup.
 When the port goes dead, it closes the trip and stays on battery for 10 more
 minutes to upload over home WiFi (longer if an upload is still running). Then
 it switches itself off completely, and switches back on when the USB port
@@ -86,20 +90,16 @@ every code.
 
 If no card mounts at boot, the board stores trips in its internal flash
 instead (about 5–6 hours of driving between uploads) and uploads them from
-there. This has been tested on the road. If the board detects that the card
-has stopped responding while it runs, new trips use internal flash, if
-available, until restart; the current trip stays on the card for recovery.
+there. If the board detects that the card has stopped responding while it
+runs, new trips use internal flash, if available, until restart; the current
+trip stays on the card for recovery.
 Either way, Device health shows the missing card as error E4001.
 
 The server adds up distance between GPS points. A step counts only when at
 least one end is above 2 mph, so wobble while parked doesn't add miles. Bad
 fixes and impossible jumps are skipped, and a gap in coverage, like a tunnel
-or parking garage, is joined with a straight line.
-
-That straight line can miss road distance, and GPS noise can add some, so the
-total is an estimate. Accuracy against the car's odometer hasn't been
-measured: the driving week checked that every trip was recorded, not how
-accurate its distance was.
+or parking garage, is joined with a straight line. That line can miss road
+distance, and GPS noise can add some, so the total is an estimate.
 
 ## What you need
 
@@ -108,10 +108,16 @@ accurate its distance was.
   **microSD card formatted FAT32**. A SanDisk 32 GB Max Endurance is the
   tested card; exFAT is unsupported. See
   [microSD card](firmware/README.md#microsd-card).
-- **Antennas:** attach the GPS antenna to **GPS** and the correct **915 MHz
-  LoRa antenna before inserting the battery or connecting USB**. Factory
-  firmware may transmit even though this project doesn't use LoRa, and
-  transmitting without an antenna can damage the radio.
+- **An external GPS antenna (recommended).** The small GPS antenna that
+  comes with the board has a short cable and sits inside the case, where it
+  won't have a clear view of the sky from inside a car. Use an external
+  active GPS antenna that works at 3.3 V, with an SMA plug, plus a short
+  IPEX (u.FL) to SMA adapter cable for the board's **GPS** socket. Mount the
+  antenna where it can see the sky, such as the dashboard or rear shelf.
+  Tested with a Geekstory active GPS+GLONASS antenna (3–5 V, SMA male, 3 m
+  cable, magnetic base); any antenna with those specs should work.
+- **The board's 915 MHz LoRa antenna**, fitted before the board first gets
+  power; see the warning below.
 - **A car USB port that switches off with the ignition.** The board uses
   that power cut to end the trip and, later, the power coming back to
   switch on.
@@ -134,6 +140,14 @@ accurate its distance was.
   tar and jq; see [flashing prerequisites](firmware/README.md#flash-from-the-server-build).
 - **Visible 2.4 GHz home WiFi** reaching your parking spot; 5 GHz and hidden
   networks do not work.
+
+> [!CAUTION]
+> **Attach the 915 MHz LoRa antenna before the board gets any power:**
+> before inserting the battery and before plugging in USB. The board ships
+> with factory firmware that can transmit, and transmitting without an
+> antenna can permanently damage the LoRa radio. This project doesn't use
+> LoRa, but the antenna must stay on until this project's firmware is
+> flashed (Step 2).
 
 ## Setting it up
 
@@ -209,7 +223,7 @@ return to your PC.
 ### Step 2 — Flash the tracker
 
 **On the PC connected to the board**, close any serial monitor and run the
-command for your OS. The commands printed by Step 1 select the release you
+command below for your operating system. The commands printed by Step 1 select the release you
 installed. For a custom server folder, use its Windows saved-script command
 or its macOS/Linux command. The examples below use the latest release and the
 default folder.
@@ -275,6 +289,11 @@ steps and asks for the new port if it changed.
 When writing finishes, the script resets the board. If it stays in download
 mode, press RESET with BOOT released. See the
 [firmware guide](firmware/README.md#flash-from-the-server-build) for details.
+
+**After the first install, you can remove the LoRa antenna.** This
+project's firmware switches the LoRa radio's power off at startup and checks
+that it's off. Put the antenna back before flashing anything else onto the
+board, such as the factory backup or Meshtastic.
 
 <a id="4-check-it-works"></a>
 <a id="5-put-it-in-the-car"></a>
@@ -380,7 +399,9 @@ to re-read every track to list them. Trimmed down, one looks like this:
 On the board, the GPX files stay on the microSD card (or in internal flash,
 without a card) until the server accepts them; see
 [microSD card](firmware/README.md#microsd-card). You can also take the card
-out, with the board switched off, and read the files on a PC.
+out and read the files on a PC. Switch the board off first, following the
+[card precautions](firmware/README.md#microsd-card), and don't press POWER
+again before pulling the card: any press, even a tap, switches it back on.
 
 Once a trip is on the server, its files are never edited. The viewer mounts
 the trip folder read-only and keeps your notes in its own SQLite database, so
