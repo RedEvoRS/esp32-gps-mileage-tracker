@@ -737,8 +737,9 @@ for all four trips, and stored each as `data/YYYY-MM/<trip>.gpx` plus
 At boot it uses the [Supreme pins and rails](#supreme-pin-and-power-reference):
 it verifies LoRa power off first, switches SD power and VBACKUP off, and
 enables the GPS rail. Storage setup then powers and mounts the card. It
-chooses its trip store once per boot and attempts uploads from both mounted
-stores.
+selects SD first and attempts uploads from both mounted stores. If SD later
+stops responding, it can select the mounted internal flash queue between trips;
+see the card-failure notes under normal operation.
 
 Before flashing:
 
@@ -1054,9 +1055,23 @@ How it behaves once flashed:
   must have at least 64 KiB free to start a trip; below 24 KiB it ends
   the one in progress. For LittleFS, free space excludes the unused part
   of the separate 64 KiB diagnostics reserve. Card free space uses the
-  card's own total and used bytes. Accepted uploads freed space by deleting
+  card's own total and used bytes. E4004 means space is low; E4005 means
+  it is below the stop reserve. These codes apply only to available storage.
+  Accepted uploads freed space by deleting
   the local SD files on 2026-10-21 (UTC), and LittleFS uploads deleted
   their local files the same way on 2026-11-03 (UTC).
+- **Card stops responding:** a failed SD capacity query raises E4001
+  (card unavailable), rather than E4004/E4005 (space low/full). The checks run
+  at trip admission and at 30-second intervals in the normal GPS loop.
+  The current SD trip stays on the card and ends through the write-failure
+  path, E4006; it may need repair on a later boot. Once that trip has ended,
+  new trips use the already-mounted internal flash queue. Its capacity and
+  free-space guards still apply. With no mounted flash queue, new trips are
+  refused as storage unavailable. Finished SD files stay on the card, and
+  uploads skip it until reboot. Power off before checking/reseating the card,
+  then restart; reinserting it while running does not re-enable SD storage.
+  This runtime fallback has host-test coverage but still needs a real-board
+  removal-during-recording/upload check.
 
 Watch the Serial Monitor (115200) for state transitions:
 `Trip started` → (drive) → `Trip finalized`, then

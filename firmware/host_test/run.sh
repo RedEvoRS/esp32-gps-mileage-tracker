@@ -115,6 +115,11 @@ echo "== test_fs"
 "${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_fs.cpp" "$here/../04_trip_logger/event_log.cpp" -o "$build/test_fs.exe"
 run_modes "$build/test_fs.exe" "$build/out"
 
+echo "== test_sd_runtime (removed SD classification and between-trip fallback)"
+"${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_sd_runtime.cpp" \
+    "$here/../04_trip_logger/event_log.cpp" -o "$build/test_sd_runtime.exe"
+run_modes "$build/test_sd_runtime.exe"
+
 echo "== test_journal (Stage 4 mounted adapter/service integration)"
 "${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_journal.cpp" \
     "$here/../04_trip_logger/event_log.cpp" -o "$build/test_journal.exe"

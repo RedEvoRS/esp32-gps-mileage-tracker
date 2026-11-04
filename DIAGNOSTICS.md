@@ -25,8 +25,11 @@ server internals and backups. Hardware acceptance limits remain explicit there.
   revisions are mirrored to SD and LittleFS, the internal flash filesystem.
   After enrollment or migration, internal flash can send current health and
   events without a card, including active **E4001 (SD_UNAVAILABLE)**. If a
-  mounted card starts failing, a healthy enrolled flash copy can still report
-  **E4006 (TRIP_WRITE_FAILED)** and upload its retained events. A failed flash
+  mounted card stops responding, **E4001** reports that failure instead of
+  claiming the card is full. New trips use the already-mounted internal flash
+  queue once any current SD trip has ended; that current trip can fail with
+  **E4006 (TRIP_WRITE_FAILED)**. A healthy enrolled flash copy can still upload
+  these events. A failed flash
   journal likewise does not block a healthy enrolled card.
 - A reachable ingest server and the same private bearer token and `DEVICE_ID`
   configured in the firmware. The device label is not authentication. See
@@ -1157,9 +1160,13 @@ after explicit enrollment on normal boots; degraded boots never start networking
 
 #### Stage 4 boot and shutdown plumbing (#124 part A)
 
-The boot-time trip-store selection is unchanged: SD when mounted, otherwise
-LittleFS, with no destination changes during a trip. Diagnostics try that boot's
-mounted SD first, then mounted LittleFS, then the existing 16-record RAM queue.
+The boot-time trip-store selection is SD when mounted, otherwise LittleFS.
+If the selected SD later fails its capacity query, core 1 latches it unavailable
+until reboot and selects already-mounted LittleFS between trips. No trip changes
+destination while it is open. Diagnostics skip that failed SD through its adapter
+gate, then try mounted LittleFS and the existing 16-record RAM queue. The existing
+revision allocator marks SD stale when a current flash copy saves a revision;
+the availability latch does not reset revision metadata or the NVS witness.
 An absent store is never mounted later just for diagnostics. SD allocation units
 come from its FAT boot sector (including an MBR primary partition); unreadable
 geometry disables SD journaling for this boot while leaving trip storage alone.
@@ -1363,11 +1370,11 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E3007 | RTC has no ACK, or its initial boot register read fails | Verified RTC setting after trusted GPS/SNTP time; at most three attempts per boot, at least a minute apart after failures | none |
 | E3008 | Readable RTC has STOP/VL, invalid BCD/calendar, unsupported year, or a later read/write/verification failure | Verified RTC setting from GPS/SNTP clears the condition; normal transition/repeat policy | `reason=stopped\|invalid_date\|out_of_range\|read_failed` on failure |
 | E3009 | At 30 s MON-RF boundaries, valid AGC >=70% and fresh GSV (a complete group within 15 s) with zero satellites >=30 dBHz, continuously for >=120 s from the first suspect sample | One valid AGC <=50% sample **or** fresh GSV with at least one satellite >=30 dBHz; missing/stale/intermediate evidence resets the hold and retains an active warning | `agc_pct` (0-100) when MON-RF valid; `max_cno` (0-99) when GSV fresh |
-| E4001 | SD did not mount, including when no trip store works | Observed SD mount; current boot does not hot-switch backends | none |
+| E4001 | SD did not mount, or the selected SD trip store returns zero total capacity at runtime (failed filesystem query) | Successful SD mount on a later boot; runtime failure stays latched until reboot | none |
 | E4002 | LittleFS unavailable during no-storage degraded startup | RAM-only raise/repeat; retained as failed until restart discards the queue | none |
 | E4003 | Neither trip store is usable at startup | Only a normal boot with a mounted trip store observes healthy; successful degraded retry restarts without clearing | none |
-| E4004 | Guarded trip free space <64 KiB start reserve | >=64 KiB | `backend`, `free_bytes` |
-| E4005 | Guarded trip free space <24 KiB stop reserve | >=24 KiB | `backend`, `free_bytes` |
+| E4004 | Available selected trip store has guarded free space <64 KiB start reserve | >=64 KiB on the selected store, or condition no longer applies because that store is unavailable | `backend`, `free_bytes` only when available |
+| E4005 | Available selected trip store has guarded free space <24 KiB stop reserve | >=24 KiB on the selected store, or condition no longer applies because that store is unavailable | `backend`, `free_bytes` only when available |
 | E4006 | Trip create/open, point commit or finalization fails | Next verified trip create/write/finalize or successful repair | `backend`, `operation=open\|write\|close` |
 | E4007 | Boot fsck directory/read, ambiguous repair, write or publish fails; also runtime repair failure | Per-occurrence notice; no clear | `backend`, `reason=read\|parse\|write\|rename` |
 | E4008 | Journal preparation, event append, sealing or metadata persistence fails | All failed stores must later append an event or durably ack an event batch; 15-minute repeats, no recursive submission | `backend`, `operation=open\|write\|close\|rename\|ack` |
@@ -1429,8 +1436,25 @@ missing evidence, with normal 15-minute repeats; only measured recovery clears.
 Storage space is checked at boot, on admission, during trips and every 30 s while
 idle so uploads can produce observed recovery on core 1. LittleFS free space
 already excludes the unused journal reserve. Below 64 KiB a new trip is refused;
-below 24 KiB a running trip is finalized. These hooks do not read or modify
-EventLog's own storage failure path. Arduino's void close cannot independently
+below 24 KiB a running trip is finalized. On ESP32 Arduino core 3.3.11,
+`SD.totalBytes()` returns zero if its FAT free-space query fails. `cardType()`
+keeps the cached mount-time type and is not a removal check. Zero total capacity
+raises E4001; it never raises E4004/E4005 for that SD. A genuinely full readable
+card still has nonzero total capacity and keeps the normal space warnings.
+An earlier space condition is cleared when it no longer applies; that clear
+does not mean an unavailable card has recovered, and carries no `free_bytes`.
+
+If internal flash was mounted at boot, new trips use its queue after the current
+SD trip ends. The current trip stays on SD and ends through E4006 on its next
+attempted write; it is left for repair on a later boot with a working card.
+Uploads and diagnostics skip the known failed SD, keeping its files untouched.
+No card is remounted or formatted at runtime. Reinserting it does not resume SD
+use: power off, check/reseat or replace the card, then restart. With no mounted
+flash fallback, new trips are refused as storage unavailable. Flash still needs
+the same free-space reserves; if it fills, E4004/E4005 name `littlefs`.
+This runtime switch has host-test coverage; removal during a real trip, upload
+timing, and recovery of the removed card still need a board check.
+These hooks do not modify EventLog's revision/failure rules. Arduino's void close cannot independently
 report close errors; E4006 `close` means the verified finalization commit failed.
 HTTP error classes stay active across different errors and clear only on 200.
 Existing quarantine/retry behavior is unchanged; intentional network aborts do

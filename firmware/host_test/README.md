@@ -82,6 +82,7 @@ sources that require that optional library.
 **Storage and trip lifecycle**
 
 - `test_fs`: GPX (GPS track) file writing, trip states, buffered gaps/untimed points, write/full-store failures, safe first-use formatting, upload queues/retries, boot/shutdown recovery, microSD selection/flash fallback, FAT (card filesystem) interrupted-repair recovery and trip splitting at the size limit.
+- `test_sd_runtime`: removed/unresponsive SD classification, E4001 repeats, real full-card warnings, between-trip internal-flash fallback, retained SD uploads skipped, active-trip E4006, flash capacity guards and diagnostics delivered through the existing revision allocator.
 - `test_journal`: diagnostic journal integration with SD, LittleFS (internal-flash filesystem) and RAM fallback, quotas, trip priority, lock contention, shutdown sealing and remount recovery.
 - `test_journal_vfs`: production filesystem adapter using temporary host files, including sync/close/list errors and path isolation.
 
