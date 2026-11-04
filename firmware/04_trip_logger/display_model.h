@@ -19,7 +19,7 @@ inline Motion motion(bool vbusLost, bool idle, bool tripMoving,
     if (idle && trustedFreshSpeed && speed < endSpeed) return Motion::Parked;
     return Motion::Unknown;
 }
-enum class Card { Blank, StatusCard, ErrorCard, UsbPowerCard };
+enum class Card { Blank, StatusCard, ErrorCard, UsbPowerCard, SwitchingOffCard };
 struct Condition {
     uint16_t code = 0;
     uint64_t episode = 0; // accepted raise sequence; zero means inactive/unknown
@@ -42,6 +42,10 @@ inline unsigned rank(uint16_t code) {
 inline Output errorCard(uint16_t code) {
     Output out; out.card = Card::ErrorCard; out.powered = true;
     out.errorCode = code;
+    return out;
+}
+inline Output switchingOffCard() {
+    Output out; out.card = Card::SwitchingOffCard; out.powered = true;
     return out;
 }
 inline Output usbPowerCard() {
@@ -81,7 +85,7 @@ public:
         uint32_t now = 0;
         Motion motion = Motion::Unknown;
         bool boot = false, tripFinalized = false, userRequest = false, shutdown = false;
-        bool usbPowerRequest = false;
+        bool usbPowerRequest = false, switchingOff = false;
         bool suspended = false; // debug owns panel; still consume observed episodes
         int heard = -1;
         const Condition* conditions = nullptr;
@@ -89,6 +93,7 @@ public:
     };
     const Output& update(const Input& in) {
         if (in.shutdown) { out_ = {}; return out_; }
+        if (in.switchingOff) { out_ = switchingOffCard(); return out_; }
         // The runtime's first call is boot; later routine triggers wait for Parked.
         const bool boot = in.boot || bootPending_;
         bootPending_ = false;

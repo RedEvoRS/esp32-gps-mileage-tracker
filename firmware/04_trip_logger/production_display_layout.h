@@ -44,6 +44,14 @@ inline void centre(Text& text, int left, int width) {
 inline Layout layout(const Output& out) {
     Layout result;
     if (!out.powered || out.card == Card::Blank) return result;
+    if (out.card == Card::SwitchingOffCard) {
+        auto& text = result.text[result.count++];
+        std::snprintf(text.value, sizeof text.value, "Switching off");
+        auto bounds = textBounds(text.font, text.value);
+        text.baseline = (kPanelHeight - (bounds.bottom - bounds.top)) / 2 - bounds.top;
+        centre(text, 0, kPanelWidth);
+        return result;
+    }
     if (out.card == Card::UsbPowerCard) {
         const char* lines[] = {"USB power", "Unplug USB", "to switch off"};
         for (unsigned i = 0; i < 3; ++i) {

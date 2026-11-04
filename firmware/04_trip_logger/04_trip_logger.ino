@@ -1591,6 +1591,23 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
         if (!gJournalSealDone.load() || !gJournalSealOk.load())
             Serial.println("Journal: shutdown drain/seal incomplete; RAM records may be lost.");
     }
+    // pollPmu() and both idle paths run on loop/core 1, the OLED owner.
+    // Draw synchronously: no wait for another task or display acknowledgment.
+    // The adapter latches the first bus failure (10 ms Wire timeout); a failed
+    // draw skips the hold. Only a user request gets this bounded 1 s pause.
+    if (strcmp(reason, "user_long_press") == 0 &&
+        gDegraded.mode() == startup::Mode::Normal &&
+        !gDebugDisplayFailed && !gProductionDisplayFailed &&
+        gProductionDisplayReady && vbusState() == VbusState::Absent) {
+        if (gDisplayOwner == DisplayOwner::Debug) debugDisplayPowerSave(true);
+        if (!gDebugDisplayFailed) {
+            gDisplayOwner = DisplayOwner::Production;
+            gProductionHaveOutput = false; // redraw and wake even from debug
+            display::DisplayModel::Input switchingOff; switchingOff.switchingOff = true;
+            drawProductionDisplay(gDisplayModel.update(switchingOff));
+            if (!gProductionDisplayFailed) vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
     // Keep the lock through power-off, so even a network task
     // that never stopped can't reach the filesystem once it's unmounted.
     FS_LOCK();

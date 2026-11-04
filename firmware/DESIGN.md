@@ -132,10 +132,20 @@ request; `serviceProductionDisplay()` consumes it on that same core, just
 like a short-tap status request. The USB-power card overlays either runtime
 screen mode for the normal card interval. Automatic idle/critical-battery
 requests and unknown VBUS readings do not request it. Debug mode changes
-dismiss it with the other old cards. Unplug USB before a clean long-press
-shutdown; holding about six seconds instead forces PMU power-off without
-closing files. Before removing the card, briefly tap POWER and confirm the
-screen stays dark; see the [card precautions](README.md#microsd-card).
+dismiss it with the other old cards. For an accepted user shutdown, core 1
+synchronously draws the single-line `Switching off` card after trip closure
+and core-0 journal sealing, then holds it for one second before unmounting.
+The adapter's 10 ms bus timeout and first-error latch bound failed drawing;
+there is no display acknowledgment wait. A failed display, degraded startup
+or an automatic shutdown reason skips the card and hold. The final VBUS
+check still immediately precedes PMU shutdown. USB returning during the
+card or later preparation can cancel shutdown and show the USB-power card.
+Unplug USB, hold POWER for 1–2 s and release, watch for `Switching off` then
+a dark screen, and wait a few seconds. Pull the card **without pressing
+anything**. Any POWER press, even a tap, switches an off board on. Holding
+about six seconds forces power-off without closing files. If in doubt,
+use the 10-minute battery idle fallback with the exact conditions in the
+[card precautions](README.md#microsd-card).
 
 ## Compact GPX with recoverable tails
 

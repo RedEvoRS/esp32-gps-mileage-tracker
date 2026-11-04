@@ -279,7 +279,7 @@ port on the right. The buttons sit along the bottom edge:
 | Button | Where | What it does |
 |---|---|---|
 | **RESET** | Left of the close pair near the middle | Restarts the ESP32 |
-| **POWER** | Right of that pair | Tap for a status card. While running, hold BOOT then tap POWER to toggle debug. ~1 s switches the board on. To switch off cleanly, unplug USB first, then hold for 1–2 s and release. On USB, that long press shows a message and leaves the board on. ~6 s forces it off at the PMU (see [Normal operation](#normal-operation)) |
+| **POWER** | Right of that pair | Tap for a status card. While running, hold BOOT then tap POWER to toggle debug. Any press, even a tap, switches an off board on. To switch off cleanly, unplug USB first, then hold for 1–2 s and release. On USB, that long press shows a message and leaves the board on. ~6 s forces it off at the PMU (see [Normal operation](#normal-operation)) |
 | **BOOT** | On its own, further right | GPIO 0. While running, hold it then tap POWER to toggle debug. Held while powering up, it still selects download mode |
 
 ### Board settings
@@ -376,12 +376,34 @@ a card. Stage 4 has since recorded two real drives on the card.
 - **Only insert or remove the card with the board switched off.** The slot
   has no card-detect switch. The firmware picks its trip storage at boot
   and only moves new trips to internal flash if the card stops responding;
-  a card put back in while running isn't used until the next restart. With Stage 4 running, unplug USB first, hold POWER for 1–2 s,
-  then release and let shutdown finish. Before pulling the card, tap POWER
-  briefly and check that the screen stays dark. A running board normally
-  sleeps its screen between cards, so a dark screen alone does not mean off.
-  If the screen was already failing to respond, this check cannot confirm
-  shutdown; resolve that before removing the card.
+  a card put back in while running isn't used until the next restart.
+  Removing it while running can lose unwritten trip points or damage the
+  filesystem. With Stage 4 running:
+
+  1. Unplug USB. With USB present, a long press refuses shutdown and shows
+     `USB power` / `Unplug USB` / `to switch off`.
+  2. Hold POWER for 1–2 s and release. Do not keep holding: about 6 s forces
+     power off without closing files.
+  3. Watch for `Switching off`, then a dark screen. Wait a few seconds for
+     shutdown to finish before touching the card. The message appears for
+     about one second after trip closure and journal sealing, before storage
+     is unmounted and power is cut. A failed display or degraded startup
+     skips the message. A dark screen by itself does not mean off: the
+     running board normally sleeps its screen between cards.
+  4. Pull the card **without pressing anything**. Any POWER press, even a
+     tap, switches an off board on. Pressing it to check can leave the board
+     running when you remove the card.
+
+  If in doubt, leave the board on battery for 10 minutes without pressing
+  anything. With USB confirmed absent and the trip state continuously IDLE
+  (no trip in progress), the idle power-off switches it off. The timer resets
+  when USB returns or the trip state leaves IDLE. An upload already running
+  gets up to 16 additional minutes to finish; shutdown then allows up to
+  15 s for network abort and up to 15 s for journal sealing before unmounting.
+  Allow those waits too before removing the card. Unknown USB state refuses
+  shutdown, so this fallback requires working power control. In degraded
+  startup with no storage, confirmed USB absence still starts the 10-minute
+  timer; untrusted PMU startup does not run this power-off path.
 - **The firmware never formats the card.** A card that won't mount is left
   untouched, and trips go to internal flash instead.
 - **At boot** the log says which storage it chose:
@@ -885,8 +907,10 @@ trip. Erase-all does not erase the removable card, but it does reset NVS.
 #### If the trip storage won't mount later
 
 For microSD trips, unplug USB, hold POWER for 1–2 s and release to switch
-the board off cleanly. Before pulling the card, tap POWER briefly and check
-that the screen stays dark; follow the [card precautions](#microsd-card).
+the board off cleanly. Watch for `Switching off`, then a dark screen, and
+wait a few seconds. Pull the card **without pressing anything**; any POWER
+press, even a tap, switches an off board on. If in doubt, use the 10-minute
+battery idle fallback and its conditions in the [card precautions](#microsd-card).
 Then read or copy the card on a PC.
 Check its seating and FAT32 format before trying it again; the firmware
 never formats it. Preserve its data before any repair or reformat.
@@ -1049,10 +1073,11 @@ How it behaves once flashed:
   USB switches the board on only when power arrives: shutting it down
   while USB remained connected would leave it off until power was cut and
   restored. **Unplug USB first, then hold POWER for 1–2 s and release** to
-  switch it off cleanly. Before pulling the microSD card, tap POWER briefly
-  and check that the screen stays dark; see the [card precautions](#microsd-card).
-  Press POWER for about 1 s
-  or insert USB power to switch it back on. A 6 s hold forces the PMU's
+  switch it off cleanly. Watch for `Switching off`, then a dark screen, and
+  wait a few seconds. Pull the microSD card **without pressing anything**.
+  Any POWER press, even a tap, switches an off board on; inserting USB also
+  switches it on. If in doubt, use the 10-minute battery idle fallback with
+  the conditions in the [card precautions](#microsd-card). A 6 s hold forces the PMU's
   hard power-off with no file closing; any open trip needs boot repair and
   unwritten diagnostics are lost. Use that only if the board stops responding.
   A short POWER press alone requests a status card in either mode. While
@@ -1706,13 +1731,15 @@ laptop and watch the Serial Monitor.
   the trip, stays on battery for 10 minutes to upload (up to 16 minutes more
   if an upload is still running), then switches itself off completely. Unplugged from USB, on your desk say, it does the same:
   10 minutes, then off. It hasn't died; plug USB back in, or press
-  **POWER** for about a second, to switch it on. On battery, holding
+  **POWER**, even briefly, to switch it on. On battery, holding
   **POWER** for a second or two (let go well before 6 s) switches it off
   cleanly. **With USB plugged in, that press leaves the board on** and shows
   `USB power` / `Unplug USB` / `to switch off`. Unplug USB first, then
-  long-press POWER for a clean shutdown. Before removing the microSD card,
-  tap POWER briefly and check that the screen stays dark; see the
-  [card precautions](#microsd-card). USB
+  hold POWER for 1–2 s and release for a clean shutdown. Watch for
+  `Switching off`, then a dark screen, and wait a few seconds. Pull the
+  microSD card **without pressing anything**. Any POWER press, even a tap,
+  switches an off board on. If in doubt, use the 10-minute battery idle
+  fallback and its conditions in the [card precautions](#microsd-card). USB
   power only switches the board on at the moment it arrives: a board
   switched off with USB still in would stay off until the car's port next
   went off and on. Holding **POWER** for 6 s cuts power without closing

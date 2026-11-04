@@ -12,6 +12,45 @@ static void holdBoot() {
     bootLow = true; pollPmu();
     g_millis += runtime_debug::BootButton::kDebounceMs;
 }
+static unsigned switchingOffHolds = 0;
+static void switchingOffRegressions() {
+    for (bool debug : {false, true}) {
+        for (int scenario = 0; scenario < 7; ++scenario) {
+            faultWorld(); gDegraded = startup::DegradedPolicy();
+            gDebugMode = debug; beginProductionDisplay(); serviceDisplay();
+            PMU.vbusIn = false; gJournalReady = false;
+            if (scenario == 2) gProductionDisplayFailed = true;
+            if (scenario == 6) gDebugDisplayFailed = true;
+            if (scenario == 3) gDegraded.begin(startup::Mode::NoStorage, millis());
+            switchingOffHolds = 0;
+            TwoWire::transaction = [scenario](TwoWire& bus, bool) -> uint8_t {
+                assert(&bus == &Wire && g_currentCore == 1);
+                return scenario == 4 ? 5 : 0;
+            };
+            g_taskDelayHook = [](uint32_t ms) {
+                if (gProductionLastOutput.card == display::Card::SwitchingOffCard &&
+                    !gProductionDisplayFailed && ms == 1000) {
+                    assert(!PMU.shutdownCalls && gSdMounted && gFlashMounted);
+                    assert(gProductionOled.text.size() == 1);
+                    assert(gProductionOled.text[0].value == "Switching off");
+                    ++switchingOffHolds;
+                }
+            };
+            const uint32_t start = millis();
+            try { powerOffForVbus(scenario == 1 ? "battery_critical" :
+                                 scenario == 5 ? "idle_battery" : "user_long_press"); assert(false); }
+            catch (const PoweredOff&) {}
+            assert(PMU.shutdownCalls == 1);
+            assert(switchingOffHolds == (scenario == 0 ? 1u : 0u));
+            assert(uint32_t(millis() - start) == (scenario == 0 ? 1000u : 0u));
+            g_taskDelayHook = nullptr; TwoWire::transaction = nullptr;
+            g_lockDepth = 0; // successful simulated power-off deliberately retains it
+            ++cases;
+        }
+    }
+    faultWorld(); gDegraded = startup::DegradedPolicy();
+    g_lockDepth = 0; // release simulated successful shutdown's held FS lock
+}
 static void usbPowerRegressions() {
     for (bool debug : {false, true}) {
         faultWorld(); gDebugMode = debug; beginProductionDisplay(); serviceDisplay();
@@ -334,6 +373,7 @@ int main() {
     try { powerOffForVbus(); assert(false); } catch (const PoweredOff&) {}
     assert(!gProductionLastOutput.powered && gProductionOled.sleeps >= 2); ++cases;
     g_lockDepth = 0;
+    switchingOffRegressions();
     usbPowerRegressions();
     toggleRegressions();
     std::printf("test_display_runtime: %u scenarios passed (runtime toggle and panel ownership)\n", cases);
