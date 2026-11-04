@@ -152,34 +152,70 @@ static void mountedStoreFailures() {
 static void readOnlyAckFallback() {
     uploadWorld(); records(3);
     g_sdDisk.writesFail = true; records(2); // card remains mounted and readable
+    serviceJournal(); // E4008 occupied a queue slot; persist the last flash notice too
+    const auto episode = eventCondition(4008).episode;
+    assert(episode && gJournal.stats().queued == 0);
     const auto retainedSd = g_sdDisk.files;
+    auto unchangedSd = [&]() {
+        assert(g_sdDisk.files == retainedSd && gJournal.stats().dropped == 0 && gJournal.stats().pendingLoss == 0);
+        assert(gJournal.storageFault().active && eventCondition(4008).episode == episode);
+        assert(gJournal.stats().queued == 0); // no raise/clear churn from failed acks
+    };
+    auto events = [](const std::string& body) { return body.substr(body.find("\"events\":")); };
     gNetRetryMs = 240000; gNetLastAttemptMs = 123;
     drainEvents();
     assert(g_httpBodies.size() == 1 && eventCount(g_httpBodies[0]) == 3);
-    assert(backlog().records == 5 && gEventRetry.delay == 60000);
-    assert(g_sdDisk.files == retainedSd && gJournal.stats().dropped == 0 && gJournal.stats().pendingLoss == 0);
-    const auto sdEvents = g_httpBodies[0].substr(g_httpBodies[0].find("\"events\":"));
+    assert(backlog().records == 6 && gEventRetry.delay == 60000); // five notices plus E4008
+    unchangedSd();
+    const auto sdEvents = events(g_httpBodies[0]);
     drainEvents(); assert(g_httpBodies.size() == 1); // retain independent backoff
-    g_millis += gEventRetry.delay; drainEvents();
-    assert(g_httpBodies.size() == 3 && eventCount(g_httpBodies[1]) == 2);
-    assert(g_httpBodies[2].substr(g_httpBodies[2].find("\"events\":")) == sdEvents);
-    assert(backlog().records == 3); // both flash events were durably acknowledged
-    assert(g_sdDisk.files == retainedSd && gJournal.stats().dropped == 0 && gJournal.stats().pendingLoss == 0);
-    records(2); g_millis += gEventRetry.delay; drainEvents();
-    assert(g_httpBodies.size() == 5 && eventCount(g_httpBodies[3]) == 2);
-    assert(g_httpBodies[4].substr(g_httpBodies[4].find("\"events\":")) == sdEvents);
-    assert(backlog().records == 3 && gEventRetry.delay == 60000);
+    g_millis += gEventRetry.delay - 1; drainEvents(); assert(g_httpBodies.size() == 1);
+    ++g_millis; drainEvents();
+    assert(g_httpBodies.size() == 3 && eventCount(g_httpBodies[1]) == 3);
+    assert(events(g_httpBodies[2]) == sdEvents);
+    const auto raised = events(g_httpBodies[1]);
+    assert(raised.find("\"code\":4008,\"transition\":\"raise\"") != std::string::npos);
+    assert(raised.find("\"operation\":\"write\",\"backend\":\"sd\"") != std::string::npos);
+    assert(backlog().records == 3); // both flash notices and E4008 durably acknowledged
+    unchangedSd();
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        records(2); g_millis += gEventRetry.delay;
+        const auto before = g_httpBodies.size(); drainEvents();
+        assert(g_httpBodies.size() == before + 2 && eventCount(g_httpBodies[before]) == 2);
+        assert(events(g_httpBodies[before]).find("\"code\":4008,") == std::string::npos);
+        assert(events(g_httpBodies[before + 1]) == sdEvents);
+        assert(backlog().records == 3 && gEventRetry.delay == 60000);
+        unchangedSd();
+    }
+    // Without a successful flash batch the same independent retry doubles.
+    g_millis += gEventRetry.delay;
+    auto before = g_httpBodies.size(); drainEvents();
+    assert(g_httpBodies.size() == before + 1 && events(g_httpBodies.back()) == sdEvents);
+    assert(gEventRetry.delay == 120000); unchangedSd();
     assert(gNetRetryMs == 240000 && gNetLastAttemptMs == 123);
-    assert(g_sdDisk.files == retainedSd && gJournal.stats().dropped == 0 && gJournal.stats().pendingLoss == 0);
+    records(1); // still drains ahead of SD, even after snapshot metadata recovers
+    before = g_httpBodies.size();
     g_sdDisk.writesFail = false; g_millis += gEventRetry.delay; drainEvents();
-    assert(g_httpBodies.size() == 6 && !gEventRetry.delay && backlog().records == 0);
-    assert(g_httpBodies[5].substr(g_httpBodies[5].find("\"events\":")) == sdEvents);
-    // Reopening both journals proves that neither flash batch can replay, and
+    assert(g_httpBodies.size() == before + 3 && !gEventRetry.delay && backlog().records == 0);
+    assert(eventCount(g_httpBodies[before]) == 1 && events(g_httpBodies[before + 1]) == sdEvents);
+    const auto cleared = events(g_httpBodies.back());
+    assert(eventCount(g_httpBodies.back()) == 1 && !eventCondition(4008).episode && !gJournal.storageFault().active);
+    assert(cleared.find("\"code\":4008,\"transition\":\"clear\"") != std::string::npos);
+    assert(cleared.find("\"operation\":\"ack\",\"backend\":\"sd\"") != std::string::npos);
+    const auto episodeId = std::string("\"episode_id\":\"") + gJournalBoot.id + ":" + std::to_string(episode) + "\"";
+    assert(raised.find(episodeId) != std::string::npos && cleared.find(episodeId) != std::string::npos);
+    assert(gNetRetryMs == 240000 && gNetLastAttemptMs == 123);
+    // This drain captured its snapshot before metadata recovered. The next
+    // opportunity publishes the clear without inventing another transition.
+    before = g_httpBodies.size(); drainEvents();
+    assert(g_httpBodies.size() == before + 1 && eventCount(g_httpBodies.back()) == 0);
+    assert(g_httpBodies.back().find("\"active\":[]") != std::string::npos);
+    // Reopening both journals proves that no flash batch can replay, and
     // the recovered card's original cursor has now persisted too.
     gJournal.~EventLog(); new (&gJournal) EventLog(&gSdJournalFs, &gFlashJournalFs, uploadJournalConfig(&gRevisionState));
     assert(gJournal.begin(gJournalBoot.id, 1, "test-ack-recovery"));
     assert(backlog().records == 0 && gJournal.stats().dropped == 0 && gJournal.stats().pendingLoss == 0);
-    std::puts("Event upload: readable SD ack-save failure, flash batches durably drained across retries, unchanged SD cursor/loss and recovery passed");
+    std::puts("Event upload: readable SD ack-save failure, repeated flash progress, unchanged SD cursor/loss, independent backoff and one E4008 raise/clear passed");
 }
 static void allocationFailure(bool missing) {
     uploadWorld();

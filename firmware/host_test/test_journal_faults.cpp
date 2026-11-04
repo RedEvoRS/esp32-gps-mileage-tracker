@@ -74,16 +74,25 @@ static void faultAckRecovery() {
     assert(!log->acknowledge(batch, batch.ids, batch.count));
     assert(log->storageFault().active && !std::strcmp(log->storageFault().operation, "ack"));
     observe(*log, faults, 1000);
+    const auto episode = slot.episode;
+    assert(episode);
     add(*log); // successful existing-segment append cannot recover broken ack metadata
+    log->service(1); // persist the notice queued behind the E4008 raise
     observe(*log, faults, 1001);
     assert(log->storageFault().active && slot.episode);
+    for (uint32_t now : {61000, 121000, 181000}) {
+        assert(read(*log) == 3); // original notice, one raise, appended notice
+        assert(!log->acknowledge(batch, batch.ids, batch.count));
+        observe(*log, faults, now);
+        assert(log->storageFault().active && slot.episode == episode && log->stats().queued == 0);
+    }
     assert(read(*log)); // refresh the ticket after appending
     std::string raised;
     for (size_t i = 0; i < batch.count; ++i) raised += batch.events[i];
     assert(raised.find("\"transition\":\"raise\"") != std::string::npos);
     sd.reject = nullptr;
     assert(log->acknowledge(batch, batch.ids, batch.count));
-    observe(*log, faults, 1001);
+    observe(*log, faults, 181001);
     assert(!slot.episode && !log->storageFault().active);
     auto json = events(*log);
     assert(json.find("\"transition\":\"clear\"") != std::string::npos);
