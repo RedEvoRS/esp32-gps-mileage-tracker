@@ -26,8 +26,10 @@ contact services outside it:
   server on your network, which keeps lookups completely local; it needs
   disk space and memory for your area's map data. See
   [place suggestions](server/README.md#endpoint-place-suggestions).
-- The tracker asks an internet time server for the time when GPS time isn't
-  available.
+- When GPS time isn't available yet, the tracker asks the public time
+  servers `pool.ntp.org` (first) and `time.nist.gov` (backup) for the time,
+  only while it's on your home WiFi to upload. These addresses are built
+  into the firmware.
 
 ## Where it's at
 
