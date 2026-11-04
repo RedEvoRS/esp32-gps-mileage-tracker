@@ -678,6 +678,48 @@ static void unreadableBatchFallback() {
     assert(read(*log) == 0);
     std::cout << "Batches: unreadable SD partial batch discarded, flash/RAM not starved, cursors and per-store corrupt losses preserved passed\n";
 }
+static void ackFailureBatchFallback() {
+    MemoryFs sd, flash; auto log = logger(&sd, &flash);
+    add(*log, 3);
+    sd.readOnly = true; add(*log, 2);
+    // Crossing corrupt data must not charge a loss until this store's ack saves.
+    sd.files[sd.segments().front()].insert(0, "damaged\n");
+    log->invalidateStorage();
+    const auto retainedSd = sd.files;
+    assert(read(*log) == 3 && batch.ids[0].sequence == 1);
+    // Invalid server acknowledgments must not change store preference.
+    assert(!log->acknowledge(batch, batch.ids, 2));
+    assert(read(*log) == 3 && batch.ids[0].sequence == 1);
+    auto failures = log->stats().storageFailures;
+    assert(!log->acknowledge(batch, batch.ids, batch.count));
+    assert(log->stats().storageFailures == failures + 1);
+    assert(sd.files == retainedSd && log->stats().dropped == 0 && log->stats().pendingLoss == 0);
+    assert(read(*log) == 2 && batch.ids[0].sequence == 4); ack(*log);
+    assert(sd.files == retainedSd && log->stats().dropped == 0 && log->stats().pendingLoss == 0);
+    // Successful flash acks do not undo the boot-local preference. New flash
+    // history must also drain before another attempt at the read-only card.
+    add(*log, 2);
+    assert(read(*log) == 2 && batch.ids[0].sequence == 6); ack(*log);
+    assert(read(*log) == 3 && batch.ids[0].sequence == 1);
+    assert(!log->acknowledge(batch, batch.ids, batch.count));
+    assert(sd.files == retainedSd && log->stats().dropped == 0 && log->stats().pendingLoss == 0);
+    // With flash drained the SD batch remains eligible, with its original IDs.
+    sd.readOnly = false;
+    assert(read(*log) == 3 && batch.ids[0].sequence == 1); ack(*log);
+    assert(log->stats().dropped == 1 && log->stats().pendingLoss == 1);
+    assert(read(*log) == 0);
+    log->service(0); // write the one recovered corruption notice, then drain it
+    assert(read(*log) == 1 && std::strstr(batch.events[0], "\"code\":4009,")); ack(*log);
+    EventIdentity nextSd, nextFlash;
+    assert(log->submit(notice(), &nextSd) == EventLog::Submit::Accepted); log->service(1);
+    sd.readOnly = true;
+    assert(log->submit(notice(), &nextFlash) == EventLog::Submit::Accepted); log->service(1);
+    sd.readOnly = false;
+    assert(read(*log) == 1 && batch.ids[0].sequence == nextSd.sequence); ack(*log);
+    assert(read(*log) == 1 && batch.ids[0].sequence == nextFlash.sequence); ack(*log);
+    assert(read(*log) == 0 && log->stats().dropped == 1 && log->stats().pendingLoss == 0);
+    std::cout << "Batches: readable/read-only SD ack failure, repeated flash progress, unchanged SD cursor/loss and recovery/order restored passed\n";
+}
 static void validationAndConcurrency() {
     MemoryFs sd; auto log = logger(&sd);
     EventInput input = notice(); input.code = 5001; assert(log->submit(input) == EventLog::Submit::Invalid);
@@ -734,6 +776,7 @@ int main(int argc, char** argv) {
     std::cerr << "quota\n"; quotaAndRetention(); rejectedIsolation();
     std::cerr << "counters\n"; countersAndRevisions();
     mirroredRevisions(); revisionFailures(); refusalPreservesAuthority(); missingWitnessRecovery(); unreadableBatchFallback();
+    ackFailureBatchFallback();
     std::cerr << "validation\n"; validationAndConcurrency();
     std::cout << "EventLog: identity, recovery, faults, quota, fallback, protocol and concurrency passed\n";
 }

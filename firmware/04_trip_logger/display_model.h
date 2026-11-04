@@ -19,7 +19,7 @@ inline Motion motion(bool vbusLost, bool idle, bool tripMoving,
     if (idle && trustedFreshSpeed && speed < endSpeed) return Motion::Parked;
     return Motion::Unknown;
 }
-enum class Card { Blank, StatusCard, ErrorCard };
+enum class Card { Blank, StatusCard, ErrorCard, UsbPowerCard };
 struct Condition {
     uint16_t code = 0;
     uint64_t episode = 0; // accepted raise sequence; zero means inactive/unknown
@@ -42,6 +42,10 @@ inline unsigned rank(uint16_t code) {
 inline Output errorCard(uint16_t code) {
     Output out; out.card = Card::ErrorCard; out.powered = true;
     out.errorCode = code;
+    return out;
+}
+inline Output usbPowerCard() {
+    Output out; out.card = Card::UsbPowerCard; out.powered = true;
     return out;
 }
 inline Output statusCard(int heard, const Condition* conditions, size_t count) {
@@ -77,6 +81,7 @@ public:
         uint32_t now = 0;
         Motion motion = Motion::Unknown;
         bool boot = false, tripFinalized = false, userRequest = false, shutdown = false;
+        bool usbPowerRequest = false;
         bool suspended = false; // debug owns panel; still consume observed episodes
         int heard = -1;
         const Condition* conditions = nullptr;
@@ -111,17 +116,28 @@ public:
         if (in.suspended) {
             pendingStatus_ = false;
             head_ = queued_ = 0;
+            interruptedError_ = 0;
             if (!userCard_) out_ = {};
         }
         if (out_.powered && uint32_t(in.now - started_) >= kDurationMs) out_ = {};
         // A routine status card must not remain visible after driving resumes.
         if (out_.card == Card::StatusCard && !userCard_ && in.motion == Motion::Moving) out_ = {};
-        if (in.userRequest) {
+        if (in.usbPowerRequest) {
+            // Give the user immediate feedback without losing an error that
+            // was already on screen. Queued faults retain their normal order.
+            if (out_.card == Card::ErrorCard) interruptedError_ = out_.errorCode;
+            show(usbPowerCard(), in.now); userCard_ = true;
+        } else if (in.userRequest) {
             show(statusCard(in.heard, in.conditions, in.count), in.now); userCard_ = true;
             if (in.motion == Motion::Parked) pendingStatus_ = false;
-        } else if (queued_ && out_.card != Card::ErrorCard && !(out_.powered && userCard_)) {
-            show(errorCard(queue_[head_]), in.now);
-            head_ = (head_ + 1) % kCapacity; --queued_; userCard_ = false;
+        } else if ((interruptedError_ || queued_) && out_.card != Card::ErrorCard && !(out_.powered && userCard_)) {
+            if (interruptedError_) {
+                show(errorCard(interruptedError_), in.now); interruptedError_ = 0;
+            } else {
+                show(errorCard(queue_[head_]), in.now);
+                head_ = (head_ + 1) % kCapacity; --queued_;
+            }
+            userCard_ = false;
         } else if (!in.suspended && ((boot && in.motion != Motion::Moving) ||
                    (pendingStatus_ && in.motion == Motion::Parked)) &&
                    (!out_.powered || (in.tripFinalized && out_.card == Card::StatusCard))) {
@@ -140,6 +156,7 @@ public:
     void dismiss() {
         out_ = {}; bootPending_ = pendingStatus_ = userCard_ = false;
         head_ = queued_ = 0;
+        interruptedError_ = 0;
     }
 private:
     void show(Output card, uint32_t now) { out_ = card; started_ = now; out_.until = now + kDurationMs; }
@@ -150,5 +167,6 @@ private:
     Condition seen_[kCapacity] = {};
     size_t seenCount_ = 0, head_ = 0, queued_ = 0;
     uint16_t queue_[kCapacity] = {};
+    uint16_t interruptedError_ = 0;
 };
 } // namespace display

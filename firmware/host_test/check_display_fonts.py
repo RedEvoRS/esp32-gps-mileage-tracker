@@ -10,7 +10,7 @@ import string
 import sys
 
 FONTS = ("logisoso26_tr", "helvB14_tr", "logisoso38_tr")
-CHARS = " +-0123456789:EKOSast"
+CHARS = " +-0123456789:BEKOSUacefghilnoprstuw"
 TARGET = Path(__file__).resolve().parents[1] / "04_trip_logger/display_font_metrics.h"
 
 

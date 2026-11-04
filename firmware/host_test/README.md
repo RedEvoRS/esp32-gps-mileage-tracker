@@ -73,7 +73,7 @@ silently disappear. A separate negative probe with the same flags and
 
 ## What a full run covers
 
-`run.sh` builds **26 C++ test sources in 30 build variants**, plus six Python
+`run.sh` builds **27 C++ test sources in 31 build variants**, plus six Python
 checks. Extra builds cover stamped/fallback versions, a second display-card
 duration and three sketch copies of bus recovery. Many integration binaries
 also run with runtime debug off and on. **[TinyGPSPlus]** marks the eight
@@ -82,6 +82,7 @@ sources that require that optional library.
 **Storage and trip lifecycle**
 
 - `test_fs`: GPX (GPS track) file writing, trip states, buffered gaps/untimed points, write/full-store failures, safe first-use formatting, upload queues/retries, boot/shutdown recovery, microSD selection/flash fallback, FAT (card filesystem) interrupted-repair recovery and trip splitting at the size limit.
+- `test_sd_runtime`: removed/unresponsive SD classification, E4001 repeats, real full-card warnings, between-trip internal-flash fallback, retained SD uploads skipped, active-trip E4006, flash capacity guards and diagnostics delivered through the existing revision allocator.
 - `test_journal`: diagnostic journal integration with SD, LittleFS (internal-flash filesystem) and RAM fallback, quotas, trip priority, lock contention, shutdown sealing and remount recovery.
 - `test_journal_vfs`: production filesystem adapter using temporary host files, including sync/close/list errors and path isolation.
 
@@ -96,6 +97,7 @@ sources that require that optional library.
 - `test_build_version`: fallback and stamped firmware-version strings (two builds).
 - `test_diag_catalog`: diagnostic codes, severity, display strings and event-storage policy.
 - `test_event_log`: event identity, damaged/torn records, acknowledgment recovery, quotas, fallback, concurrency and bounded rejected-record/loss recovery.
+- `test_journal_faults`: E4008 open/write/close/rename/ack observations, same-store append/ack recovery, aggregate faults, 15-minute repeats, cooperative cancellation and bounded event growth through 10,000 all-store failure service calls.
 - `test_battery_events`: checked boot/shutdown battery samples, failed reads and shutdown journal ordering with a full queue.
 - `test_event_upload`: production delivery, PSRAM (external RAM) buffer allocation/reuse/failure with continued local journaling/GPX delivery, 64-record/32 KiB limits, consistent status snapshots, old-boot history, trip priority, deadlines, HTTP/acknowledgment failures, retries, heartbeat and rejected-record recovery.
 - `test_fault_hooks` **[TinyGPSPlus]**: real sketch paths raising, repeating and clearing power/GPS/storage/network/display faults, plus a normal drive/upload without spurious faults.
@@ -116,7 +118,9 @@ while retained flash events are accepted and deduplicated.
 Mounted-store regressions inject write failures followed by read failures on SD,
 deliver the production E4006 trip-create fault through the worker and real local
 ingest, then verify resynchronization. Symmetric LittleFS failure keeps SD
-diagnostics working. Journal tests prove unreadable partial batches cannot leak
+diagnostics working. The failed-card bridge also validates real E4008 raise/clear
+records, their exact context and active/recovered snapshots through local ingest.
+Journal tests prove unreadable partial batches cannot leak
 cursors or corruption counts into flash/RAM acknowledgments, refusals preserve
 the last authority, missing-witness epoch adoption survives erase-all, and new
 enrollment never reuses a loaded epoch after NVS reset.
@@ -124,10 +128,10 @@ enrollment never reuses a loaded epoch after NVS reset.
 **Display**
 
 - `test_debug_display`: simulated OLED (small screen) bus failures during initialization/drawing and safe display disablement.
-- `test_display_model`: status-card timing, motion/fault queues and debug suppression, at default and 10-second durations (two builds).
+- `test_display_model`: status-card timing, motion/fault queues and debug suppression, at default and 10-second durations (two builds). USB-power refusal cards preserve interrupted/queued faults, allow later status taps, expire across timer rollover and are dismissed on mode changes.
 - `test_production_display_layout`: text bounds/spacing from checked-in glyph metrics (character sizes), including worst-case satellite counts/error codes.
 - `test_production_display`: renderer initialization, drawing/power-save bus failures and disablement, plus the Debug ON card's full 32-character version wrapped across two small-text lines (no version on Debug OFF).
-- `test_display_runtime` **[TinyGPSPlus]**: sketch integration, button/debounce behavior, runtime debug switching, fault cards and continued logging with a failed display.
+- `test_display_runtime` **[TinyGPSPlus]**: sketch integration, button/debounce behavior, runtime debug switching, fault cards and continued logging with a failed display. Refused user long presses select the three-line USB card in both modes; automatic shutdown reasons and unknown USB state do not. Drawing stays in the core-1 display service.
 
 **Power management and peripheral bus**
 

@@ -14,7 +14,7 @@
 #include <io.h>
 #include <direct.h>
 #endif
-static bool failSync = false, failClose = false, failList = false;
+static bool failSync = false, failClose = false, failList = false, failOpen = false;
 static int checkedSync(int fd) {
     if (failSync) { errno = EIO; return -1; }
 #ifdef _WIN32
@@ -40,6 +40,7 @@ static int checkedMkdir(const char* path, int mode) {
 #endif
 }
 static int checkedOpen(const char* path, int flags, int mode = 0) {
+    if (failOpen) { errno = EIO; return -1; }
 #ifdef _WIN32
     return ::open(path, flags | _O_BINARY, mode);
 #else
@@ -68,6 +69,7 @@ int main(int argc, char** argv) {
     bool mounted = true;
     diagnostics::MountedJournalFs<diagnostics::JournalVfs> adapter(io, mounted, nullptr);
     using Result = diagnostics::EventLogFs::Result;
+    using Operation = diagnostics::EventLogFs::Operation;
     assert(adapter.begin());
     diagnostics::EventLogFs::Entry entry;
     assert(adapter.list(0, entry) == Result::End);
@@ -83,10 +85,18 @@ int main(int argc, char** argv) {
     assert(adapter.rename("/diag/seg-00000001.open", "/diag/seg-00000001.ready"));
     assert(adapter.write("/diag/seg-00000002.open", "keep", 4, false));
     assert(!adapter.rename("/diag/seg-00000002.open", "/diag/seg-00000001.ready"));
-    failSync = true;
+    failOpen = true;
     assert(!adapter.write("/diag/ack-0", "test", 4, false));
+    assert(adapter.writeFailure() == Operation::Open);
+    failOpen = false; failSync = true;
+    assert(!adapter.write("/diag/ack-0", "test", 4, false));
+    assert(adapter.writeFailure() == Operation::Write);
+    failClose = true;
+    assert(!adapter.write("/diag/ack-0", "test", 4, false));
+    assert(adapter.writeFailure() == Operation::Write); // preserve the first error
     failSync = false; failClose = true;
     assert(!adapter.write("/diag/ack-0", "test", 4, false));
+    assert(adapter.writeFailure() == Operation::Close);
     assert(!adapter.read("/diag/ack-0", 0, buffer, 4));
     failClose = false; failList = true;
     assert(adapter.list(0, entry) == Result::Error);

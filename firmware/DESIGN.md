@@ -126,6 +126,17 @@ requests journal sealing, locks and unmounts storage, rechecks VBUS and
 requests PMU shutdown. USB insertion powers it on again. These handoffs
 exclude filesystem access while storage is unmounted.
 
+A user long press calls `powerOffForVbus("user_long_press")` from
+`pollPmu()` on core 1. Confirmed VBUS refuses shutdown and sets a display
+request; `serviceProductionDisplay()` consumes it on that same core, just
+like a short-tap status request. The USB-power card overlays either runtime
+screen mode for the normal card interval. Automatic idle/critical-battery
+requests and unknown VBUS readings do not request it. Debug mode changes
+dismiss it with the other old cards. Unplug USB before a clean long-press
+shutdown; holding about six seconds instead forces PMU power-off without
+closing files. Before removing the card, briefly tap POWER and confirm the
+screen stays dark; see the [card precautions](README.md#microsd-card).
+
 ## Compact GPX with recoverable tails
 
 The GPS Exchange Format (GPX) output is version 1.0 (`GPX_PROLOGUE`,

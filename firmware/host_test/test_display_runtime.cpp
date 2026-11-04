@@ -12,6 +12,88 @@ static void holdBoot() {
     bootLow = true; pollPmu();
     g_millis += runtime_debug::BootButton::kDebounceMs;
 }
+static void usbPowerRegressions() {
+    for (bool debug : {false, true}) {
+        faultWorld(); gDebugMode = debug; beginProductionDisplay(); serviceDisplay();
+        unsigned transfers = 0;
+        TwoWire::transaction = [&](TwoWire& bus, bool) -> uint8_t {
+            assert(&bus == &Wire && g_currentCore == 1); ++transfers; return 0;
+        };
+        // A checked long-key IRQ queues feedback; it never draws inline.
+        PMU.vbusIn = true;
+        PMU.registerReadOverride[XPOWERS_AXP2101_INTSTS2] = 0x04;
+        gPmuIrqFlag = true; pollPmu();
+        PMU.registerReadOverride.erase(XPOWERS_AXP2101_INTSTS2);
+        assert(gDisplayUsbPowerRequest && !gDisplayUserRequest && !transfers);
+        assert(!PMU.shutdownCalls && gSdMounted && gFlashMounted);
+        serviceDisplay();
+        assert(!gDisplayUsbPowerRequest && gDisplayOwner == DisplayOwner::Production);
+        assert(gProductionLastOutput.card == display::Card::UsbPowerCard);
+        assert(gProductionOled.text.size() == 3 && transfers);
+        assert(gProductionOled.text[0].value == "USB power");
+        assert(gProductionOled.text[1].value == "Unplug USB");
+        assert(gProductionOled.text[2].value == "to switch off");
+        const uint32_t until = gProductionLastOutput.until;
+        g_millis = until - 1; serviceDisplay();
+        assert(gProductionLastOutput.card == display::Card::UsbPowerCard);
+        ++g_millis; serviceDisplay();
+        assert(gDisplayOwner == (debug ? DisplayOwner::Debug : DisplayOwner::Production));
+        if (!debug) assert(!gProductionLastOutput.powered);
+        TwoWire::transaction = nullptr; ++cases;
+
+        // A short tap still selects status in either mode, then expires normally.
+        powerOffForVbus("user_long_press"); serviceDisplay();
+        shortTap(); serviceDisplay();
+        assert(gProductionLastOutput.card == display::Card::StatusCard);
+        g_millis += display::DisplayModel::kDurationMs; serviceDisplay();
+        assert(gDisplayOwner == (debug ? DisplayOwner::Debug : DisplayOwner::Production));
+        if (!debug) assert(!gProductionLastOutput.powered);
+        ++cases;
+
+        // Neither the queued request nor a visible message survives a mode toggle.
+        for (bool visible : {false, true}) {
+            powerOffForVbus("user_long_press");
+            if (visible) serviceDisplay();
+            toggleRuntimeDebug();
+            assert(!gDisplayUsbPowerRequest);
+            g_millis += DEBUG_FEEDBACK_MS; serviceDisplay();
+            assert(gDisplayOwner == (debugMode() ? DisplayOwner::Debug : DisplayOwner::Production));
+            if (!debugMode()) assert(!gProductionLastOutput.powered);
+            ++cases;
+        }
+    }
+    // Automatic shutdown reasons and an unknown VBUS level never ask for it.
+    faultWorld(); gDebugMode = false; PMU.vbusIn = true;
+    for (const char* reason : {"idle_battery", "battery_critical"}) {
+        powerOffForVbus(reason);
+        assert(!gDisplayUsbPowerRequest && !PMU.shutdownCalls); ++cases;
+    }
+    PMU.failRegisterReadAt[XPOWERS_AXP2101_STATUS1] = PMU.registerReadCalls[XPOWERS_AXP2101_STATUS1] + 1;
+    powerOffForVbus("user_long_press");
+    assert(!gDisplayUsbPowerRequest && !PMU.shutdownCalls); ++cases;
+    // A combined short/long batch selects refusal, then retains later faults.
+    faultWorld(); gDebugMode = false; beginProductionDisplay(); PMU.vbusIn = true;
+    PMU.registerReadOverride[XPOWERS_AXP2101_INTSTS2] = 0x0c;
+    gPmuIrqFlag = true; pollPmu(); serviceDisplay();
+    assert(gProductionLastOutput.card == display::Card::UsbPowerCard);
+    gLoopFaults.event(4003, g_millis).condition(true); serviceDisplay();
+    assert(gProductionLastOutput.card == display::Card::UsbPowerCard);
+    g_millis += display::DisplayModel::kDurationMs; serviceDisplay();
+    assert(gProductionLastOutput.errorCode == 4003); ++cases;
+    // USB returning at the final pre-shutdown read also refuses a user request.
+    faultWorld(); gDebugMode = false; beginProductionDisplay(); PMU.vbusIn = false;
+    gJournalReady = false;
+    g_sdDisk.onUnmount = [] { PMU.vbusIn = true; };
+    powerOffForVbus("user_long_press");
+    assert(gDisplayUsbPowerRequest && !PMU.shutdownCalls && !g_lockDepth);
+    serviceDisplay(); assert(gProductionLastOutput.card == display::Card::UsbPowerCard); ++cases;
+    // Display failure still latches off, including a refused long press.
+    faultWorld(); gDebugMode = false; beginProductionDisplay(); PMU.vbusIn = true;
+    TwoWire::transaction = [](TwoWire& bus, bool) -> uint8_t { assert(&bus == &Wire); return 5; };
+    powerOffForVbus("user_long_press"); serviceDisplay();
+    assert(gProductionDisplayFailed && !PMU.shutdownCalls);
+    TwoWire::transaction = nullptr; ++cases;
+}
 static void toggleRegressions() {
     faultWorld(); gDebugMode = false; beginProductionDisplay();
     gState = ACTIVE;
@@ -252,6 +334,7 @@ int main() {
     try { powerOffForVbus(); assert(false); } catch (const PoweredOff&) {}
     assert(!gProductionLastOutput.powered && gProductionOled.sleeps >= 2); ++cases;
     g_lockDepth = 0;
+    usbPowerRegressions();
     toggleRegressions();
     std::printf("test_display_runtime: %u scenarios passed (runtime toggle and panel ownership)\n", cases);
 }

@@ -142,6 +142,7 @@ static void resetWorld() {
     gProductionOled = U8G2_SH1106_128X64_NONAME_F_HW_I2C(U8G2_R0, U8X8_PIN_NONE);
     gDisplayModel = display::DisplayModel();
     gDisplayTripFinalized = gDisplayUserRequest = false;
+    gDisplayUsbPowerRequest = false;
     for (auto& count : gDisplayConditionCounts) count = 0;
 
     GPSSerial = HardwareSerial(1);

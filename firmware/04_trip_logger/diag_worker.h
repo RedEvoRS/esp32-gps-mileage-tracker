@@ -58,6 +58,7 @@ static bool eventLock() {
     return true;
 }
 static void eventUnlock() {
+    journalStorageFaults();
     if (!journalMayRun()) gJournal.invalidateStorage();
     xSemaphoreGive(gFsMutex);
 }

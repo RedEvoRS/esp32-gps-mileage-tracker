@@ -59,6 +59,14 @@ int main() {
     for (unsigned i = 1; i < 5; ++i) assert(gProductionOled.text[i].font == u8g2_font_helvB14_tr);
     ++cases;
     ends = Wire.ends;
+    drawProductionDisplay(display::usbPowerCard());
+    assert(gProductionOled.text.size() == 3);
+    assert(gProductionOled.text[0].value == "USB power");
+    assert(gProductionOled.text[1].value == "Unplug USB");
+    assert(gProductionOled.text[2].value == "to switch off");
+    for (const auto& line : gProductionOled.text) assert(line.font == u8g2_font_helvB14_tr);
+    ends = Wire.ends;
+    drawProductionDisplay(display::usbPowerCard()); assert(Wire.ends == ends); ++cases;
     Wire.failAt = ends + 2; drawProductionDisplay(card);
     assert(Wire.ends == ends + 2); stopped();
     reset(); beginProductionDisplay(); ends = Wire.ends; Wire.writeOk = false;

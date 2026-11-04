@@ -101,6 +101,7 @@ static bme280_temp::Sensor gDebugTempBme;
 #include "production_display.h"
 static display::DisplayModel gDisplayModel;
 static bool gDisplayTripFinalized = false, gDisplayUserRequest = false;
+static bool gDisplayUsbPowerRequest = false; // core-1 power handler -> renderer
 #include "debug_gsv.h"
 #include "debug_rf.h"
 #include "gps_antenna.h"
@@ -235,9 +236,10 @@ static startup::DegradedPolicy gDegraded;
 SemaphoreHandle_t gFsMutex;     // serializes ALL filesystem access
 SPIClass          gSdSpi(HSPI); // dedicated bus instance; radio is never initialized
 fs::FS*           gTripFS = &LittleFS;
-// Store membership is fixed for this boot, including recovery after unmount.
-// Do not switch destinations mid-trip or remount an absent card at runtime.
+// Mount membership stays fixed for shutdown. A failed SD is latched out until
+// reboot; core 1 may select the mounted flash queue only between trips.
 bool              gSdMounted = false, gFlashMounted = false;
+static std::atomic<bool> gSdUnavailable{false};
 volatile bool     gVbusLost   = false;
 volatile bool     gPmuIrqFlag = false;
 // Shared by core 0 (SNTP) and core 1 (GPS/fix construction).
@@ -327,8 +329,9 @@ static bool gJournalSealing = false; // core-0 only, while holding the mutex
 static bool gEventIoBudget = false; // core-0 only, cooperative VFS deadline
 static uint32_t gEventIoStarted = 0;
 static bool journalMayRun();
+static bool sdJournalMayRun();
 static JournalPlatformIo gSdJournalIo("/sd"), gFlashJournalIo("/littlefs");
-static diagnostics::MountedJournalFs<JournalPlatformIo> gSdJournalFs(gSdJournalIo, gSdMounted, journalMayRun);
+static diagnostics::MountedJournalFs<JournalPlatformIo> gSdJournalFs(gSdJournalIo, gSdMounted, sdJournalMayRun);
 static diagnostics::MountedJournalFs<JournalPlatformIo> gFlashJournalFs(gFlashJournalIo, gFlashMounted, journalMayRun);
 // Static storage, never the 12 KiB network task stack.
 static diagnostics::NvsRevisionState gRevisionState;
@@ -340,7 +343,7 @@ static bool gJournalBootReported = false;
 // Single writer per array/builder. Only EventLog's try-lock crosses cores.
 static diagnostics::RuntimeFaults::Condition gLoopConditions[] = {
     {2001}, {2002}, {2003}, {2004}, {2005}, {2006}, {2008}, {3001}, {3002}, {3005}, {3006}, {3007}, {3008}, {3009},
-    {4001}, {4002}, {4003}, {4004}, {4005}, {4006}, {6001}
+    {4001}, {4002}, {4003}, {4004}, {4005}, {4006}, {4008}, {6001}
 };
 static diagnostics::RuntimeFaults::Condition gNetConditions[] = {
     {1007}, {5002}, {5003}, {5004}, {5005}, {5006}, {5007}, {5008}, {5009}
@@ -348,7 +351,7 @@ static diagnostics::RuntimeFaults::Condition gNetConditions[] = {
 static diagnostics::RuntimeFaults gLoopFaults(gJournal, gLoopConditions, sizeof(gLoopConditions) / sizeof(gLoopConditions[0]));
 static diagnostics::RuntimeFaults gNetFaults(gJournal, gNetConditions, sizeof(gNetConditions) / sizeof(gNetConditions[0]));
 static diagnostics::RuntimeFaults::Condition gEventConditions[] = {
-    {5003}, {5004}, {5005}, {5006}, {5007}, {5008}, {5009}, {5010}
+    {4008}, {5003}, {5004}, {5005}, {5006}, {5007}, {5008}, {5009}, {5010}
 };
 static diagnostics::RuntimeFaults gEventFaults(gJournal, gEventConditions, sizeof(gEventConditions) / sizeof(gEventConditions[0]));
 static uint32_t gContactTick = 0;
@@ -448,6 +451,10 @@ static bool heartbeatDue() {
 
 static const char* tripBackend(fs::FS& storage) { return &storage == &SD ? "sd" : "littlefs"; }
 
+static bool tripStoreAvailable(fs::FS& storage) {
+    return &storage == &SD ? gSdMounted && !gSdUnavailable.load() : gFlashMounted;
+}
+
 static void tripWriteResult(fs::FS& storage, bool ok, const char* operation) {
     if (gJournalReady) gLoopFaults.event(4006, millis()).enumeration("backend", tripBackend(storage))
         .enumeration("operation", operation).condition(!ok);
@@ -462,15 +469,34 @@ static void batteryCondition(uint16_t code, bool active, uint32_t now) {
 
 static void storageConditions(uint64_t freeB, uint32_t now) {
     if (!gJournalReady) return;
-    gLoopFaults.event(4004, now).enumeration("backend", tripBackend(*gTripFS))
-        .integer("free_bytes", freeB).condition(freeB < FS_START_FREE);
-    gLoopFaults.event(4005, now).enumeration("backend", tripBackend(*gTripFS))
-        .integer("free_bytes", freeB).condition(freeB < FS_STOP_FREE);
+    gLoopFaults.event(4001, now).condition(!gSdMounted || gSdUnavailable.load());
+    bool available = tripStoreAvailable(*gTripFS);
+    gLoopFaults.event(4004, now).enumeration("backend", tripBackend(*gTripFS));
+    if (available) gLoopFaults.integer("free_bytes", freeB);
+    gLoopFaults.condition(available && freeB < FS_START_FREE);
+    gLoopFaults.event(4005, now).enumeration("backend", tripBackend(*gTripFS));
+    if (available) gLoopFaults.integer("free_bytes", freeB);
+    gLoopFaults.condition(available && freeB < FS_STOP_FREE);
 }
 
 static bool journalMayRun() {
     return gFsDemand.load() == 0 && (gJournalSealing || !gNetHold.load()) &&
            (!gEventIoBudget || (!gNetAbort.load() && uint32_t(millis() - gEventIoStarted) < diagnostics::kDrainMs));
+}
+
+static bool sdJournalMayRun() {
+    return !gSdUnavailable.load() && journalMayRun();
+}
+
+static void journalStorageFaults() {
+    // Consumer only, never called by fail() or submit(). Normal boots use core
+    // 0's existing builder; degraded boots have only the core-1 loop consumer.
+    auto fault = gJournal.storageFault();
+    if (!fault.observed) return;
+    auto& faults = gDegraded.mode() == startup::Mode::Normal ? gEventFaults : gLoopFaults;
+    faults.event(4008, millis()).enumeration("operation", fault.operation)
+        .enumeration("backend", fault.backend == diagnostics::EventLog::Backend::Sd ? "sd" : "littlefs")
+        .condition(fault.active);
 }
 
 static void serviceJournal() {
@@ -480,7 +506,7 @@ static void serviceJournal() {
     gJournalSealing = sealing;
     if (!journalMayRun()) { gJournalSealing = false; xSemaphoreGive(gFsMutex); return; }
     if (!gJournalStarted) {
-        uint32_t cluster = gSdMounted ? diagnostics::journalSdCluster(SD, journalMayRun) : 0;
+        uint32_t cluster = tripStoreAvailable(SD) ? diagnostics::journalSdCluster(SD, journalMayRun) : 0;
         // A trip arriving during geometry probing gets the lock next. Retry
         // initialization later instead of permanently disabling a healthy SD.
         if (!journalMayRun()) { gJournalSealing = false; xSemaphoreGive(gFsMutex); return; }
@@ -489,6 +515,7 @@ static void serviceJournal() {
     }
     // Boot recovery and later maintenance each service exactly one record.
     gJournal.service(1);
+    journalStorageFaults();
     if (debugMode() && !gJournalBootReported) {
         auto backlog = gJournal.backlog();
         backlog.complete = backlog.complete && journalMayRun();
@@ -508,7 +535,9 @@ static void serviceJournal() {
         // bounded shutdown deadline. Never submit a second accepted notice.
     }
     if (sealing && !gPowerOffEventPending.load()) {
-        gJournalSealOk.store(gJournal.seal());
+        bool sealed = gJournal.seal();
+        journalStorageFaults();
+        gJournalSealOk.store(sealed && gJournal.stats().queued == 0);
         gJournalSealDone.store(true);
     }
     // A cancelled metadata read must not remain cached as "missing metadata".
@@ -805,7 +834,12 @@ static bool tripShouldSplit(size_t bytes, size_t pendingCount) {
 // Only called before workers start or with FS_LOCK held. SD capacity must
 // stay 64 bit: size_t on the ESP32 cannot represent a 32 GB card.
 static uint64_t storageFreeBytes(fs::FS& storage) {
+    if (!tripStoreAvailable(storage)) return 0;
     uint64_t total = &storage == &SD ? SD.totalBytes() : LittleFS.totalBytes();
+    // ESP32 Arduino 3.3.x SD.cpp returns 0 when f_getfree fails; cardType()
+    // only returns the cached mount-time type. A full readable card still
+    // has nonzero total capacity. Never turn a failed query into "full".
+    if (&storage == &SD && total == 0) { gSdUnavailable.store(true); return 0; }
     uint64_t used = &storage == &SD ? SD.usedBytes() : LittleFS.usedBytes();
     uint64_t free = used < total ? total - used : 0;
     if (&storage == &LittleFS)
@@ -817,6 +851,11 @@ static uint64_t storageFreeBytes(fs::FS& storage) {
 static uint64_t fsFreeBytes() {
     FS_LOCK();
     uint64_t free = storageFreeBytes(*gTripFS);
+    if (gTripFS == &SD && gSdUnavailable.load() && !gTripPath[0] && gFlashMounted) {
+        gTripFS = &LittleFS;
+        free = storageFreeBytes(LittleFS);
+        Serial.println("SD unavailable -- new trips use the internal flash queue until reboot.");
+    }
     FS_UNLOCK();
     return free;
 }
@@ -828,7 +867,9 @@ static bool roomForNewTrip(uint32_t now) {
     storageConditions(freeB, now);
     if (freeB >= FS_START_FREE) return true;
     if (!gFullWarned || now - gFullWarnT0 >= 60000) {
-        Serial.printf("ERROR: trip storage full (%llu bytes free) -- NOT recording. "
+        if (!tripStoreAvailable(*gTripFS))
+            Serial.println("ERROR: trip storage unavailable -- NOT recording. Reboot with working storage.");
+        else Serial.printf("ERROR: trip storage full (%llu bytes free) -- NOT recording. "
                       "Upload at home to free space.\n", (unsigned long long)freeB);
         gFullWarned = true;
         gFullWarnT0 = now;
@@ -843,6 +884,7 @@ static bool tripStorageLow(uint32_t now) {
     gFsCheckT0 = now;
     uint64_t freeB = fsFreeBytes();
     storageConditions(freeB, now);
+    if (!tripStoreAvailable(*gTripFS)) return false; // E4006 owns failed trip writes
     if (freeB >= FS_STOP_FREE) return false;
     Serial.printf("ERROR: trip storage nearly full (%llu bytes free) -- ending trip.\n",
                   (unsigned long long)freeB);
@@ -932,13 +974,13 @@ static bool beginTrip(const Fix& fx, bool continuation = false) {
 static bool writeOrBufferTrkpt(const Fix& fx) {
     fs::FS& storage = *gTripFS;
     if (gTripPath[0] == 0) return true;
-    if (!fx.hasUtc && gPendCount < PENDING_CAPACITY) {
+    if (!fx.hasUtc && gPendCount < PENDING_CAPACITY && tripStoreAvailable(storage)) {
         pushPending(fx);
         return true;
     }
     FS_LOCK();
     bool ok = false;
-    File f = storage.open(gTripPath, FILE_APPEND);
+    File f = tripStoreAvailable(storage) ? storage.open(gTripPath, FILE_APPEND) : File();
     const char* operation = f ? "write" : "open";
     // FILE_APPEND creates a missing file. A real trip file always holds at
     // least the prologue, so an empty one means ours is gone -- never write
@@ -991,13 +1033,13 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
     // A successful continuation starts with the shared boundary fix (pending
     // if untimed). Keep even a stopped tail, including a lone boundary point,
     // so per-piece thresholds never discard recorded points from a split trip.
-    if (discardIfMicro && micro && !gTripContinuation) {
+    if (discardIfMicro && micro && !gTripContinuation && tripStoreAvailable(storage)) {
         Serial.printf("Discarding micro-trip (%.0f m, %lu ms)\n",
                       gTripMeters, (unsigned long)tripMs);
         storage.remove(gTripPath);
     } else {
         bool ok = false;
-        if (!gTripWriteFailed) {
+        if (!gTripWriteFailed && tripStoreAvailable(storage)) {
             File f = storage.open(gTripPath, FILE_APPEND);
             // Same guard as writeOrBufferTrkpt: never turn a missing trip
             // file into one holding only the epilogue.
@@ -1018,10 +1060,11 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
         // the document there. If even that fails (e.g. no room for the
         // repair copy) the file stays incomplete -- never uploaded -- and
         // the boot-time fsck retries it.
-        if (!ok) {
+        if (!ok && tripStoreAvailable(storage)) {
             ok = repairIfNeeded(storage, gTripPath);
             tripWriteResult(storage, ok, "close");
         }
+        if (!tripStoreAvailable(storage)) tripWriteResult(storage, false, "close");
 
         if (ok) {
             Serial.printf("Trip finalized: %s (%.2f mi)\n",
@@ -1510,6 +1553,8 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
     // board would stay off until USB was unplugged and replugged (#106).
     VbusState entryVbus = vbusState();
     if (entryVbus != VbusState::Absent) {
+        if (entryVbus == VbusState::Present && strcmp(reason, "user_long_press") == 0)
+            gDisplayUsbPowerRequest = true;
         Serial.println(entryVbus == VbusState::Unknown ? VBUS_UNREADABLE :
                        "VBUS present -- staying awake instead of powering off.");
         gVbusRetry = entryVbus == VbusState::Unknown ? VbusRetry::Seed : VbusRetry::None;
@@ -1583,6 +1628,8 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
     } else {
         Serial.println(finalVbus == VbusState::Unknown ? VBUS_UNREADABLE :
                        "VBUS returned -- PMU power-off cancelled.");
+        if (finalVbus == VbusState::Present && strcmp(reason, "user_long_press") == 0)
+            gDisplayUsbPowerRequest = true;
     }
 
     // An upload that outlived the abort timeout may still own a File from
@@ -1924,6 +1971,7 @@ static bool isCompleteFile(File& f) {
 
 static bool isComplete(fs::FS& storage, const char* path) {
     FS_LOCK();
+    if (!tripStoreAvailable(storage)) { FS_UNLOCK(); return false; }
     File f = storage.open(path, FILE_READ);
     bool ok = isCompleteFile(f);
     if (f) f.close();
@@ -1967,6 +2015,7 @@ static bool uploadFile(fs::FS& storage, const char* path) {
     HTTPClient http;
 
     FS_LOCK();
+    if (!tripStoreAvailable(storage)) { FS_UNLOCK(); return false; }
     File f = storage.open(path, FILE_READ);
     if (!f) {
         FS_UNLOCK();
@@ -2045,6 +2094,7 @@ static bool uploadPending(fs::FS& storage) {
     int    count = 0;
 
     FS_LOCK();
+    if (!tripStoreAvailable(storage)) { FS_UNLOCK(); return false; }
     File dir = storage.open(TRIP_DIR);
     if (dir && dir.isDirectory()) {
         File e = dir.openNextFile();
@@ -2063,7 +2113,7 @@ static bool uploadPending(fs::FS& storage) {
 
     // A sleep request (gNetHold) lets the current file finish, then stops.
     bool uploaded = false;
-    for (int i = 0; i < count && !gNetHold.load() && !gNetAbort.load(); ++i) {
+    for (int i = 0; i < count && !gNetHold.load() && !gNetAbort.load() && tripStoreAvailable(storage); ++i) {
         if (isComplete(storage, pending[i].c_str())) {
             if (uploadFile(storage, pending[i].c_str())) uploaded = true;
         }
@@ -2076,6 +2126,7 @@ static bool hasPending(fs::FS& storage) {
     // them so a complete trip later in directory order is still found.
     bool found = false;
     FS_LOCK();
+    if (!tripStoreAvailable(storage)) { FS_UNLOCK(); return false; }
     File dir = storage.open(TRIP_DIR);
     if (dir && dir.isDirectory()) {
         File e = dir.openNextFile();
@@ -2100,13 +2151,13 @@ static bool uploadPending() {
     // trips. A filename can exist on both stores: every operation keeps its
     // filesystem identity, and only the recording store has an active file.
     bool uploaded = false;
-    if (gSdMounted) uploaded = uploadPending(SD);
+    if (gSdMounted && !gSdUnavailable.load()) uploaded = uploadPending(SD);
     if (gFlashMounted) uploaded = uploadPending(LittleFS) || uploaded;
     return uploaded;
 }
 
 static bool hasPending() {
-    return (gSdMounted && hasPending(SD)) || (gFlashMounted && hasPending(LittleFS));
+    return (gSdMounted && !gSdUnavailable.load() && hasPending(SD)) || (gFlashMounted && hasPending(LittleFS));
 }
 
 #include "diag_worker.h"
@@ -2118,11 +2169,12 @@ static bool hasPending() {
 static unsigned debugPendingCount(fs::FS& storage) {
     unsigned count = 0;
     FS_LOCK();
+    if (!tripStoreAvailable(storage)) { FS_UNLOCK(); return 0; }
     File dir = storage.open(TRIP_DIR);
     bool directory = dir && dir.isDirectory();
     FS_UNLOCK();
     if (directory) {
-        while (debugMode() && !gNetHold.load() && !gNetAbort.load()) {
+        while (debugMode() && !gNetHold.load() && !gNetAbort.load() && tripStoreAvailable(storage)) {
             FS_LOCK();
             File e = dir.openNextFile();
             bool end = !e;
@@ -2143,7 +2195,7 @@ static unsigned debugPendingCount(fs::FS& storage) {
 
 static void refreshDebugPending() {
     unsigned count = 0;
-    if (gSdMounted) count += debugPendingCount(SD);
+    if (gSdMounted && !gSdUnavailable.load()) count += debugPendingCount(SD);
     if (gFlashMounted) count += debugPendingCount(LittleFS);
     if (!debugMode() || gNetHold.load() || gNetAbort.load()) return; // partial count is unknown
     portENTER_CRITICAL(&gDebugNetMux);
@@ -2457,7 +2509,7 @@ static void serviceRuntimeDiagnostics() {
         if (gAntennaSignal.heard >= 0) gLoopFaults.integer("max_cno", gAntennaSignal.maxCno);
         gLoopFaults.condition(gGpsAntenna.active());
     }
-    gLoopFaults.event(4001, now).condition(!gSdMounted);
+    gLoopFaults.event(4001, now).condition(!gSdMounted || gSdUnavailable.load());
     // Check idle storage too, so a successful core-0 upload can be observed as
     // recovery on core 1 without sharing producer state across tasks.
     if (uint32_t(now - gStorageDiagMs) >= FS_CHECK_MS) {
@@ -2775,7 +2827,7 @@ static void serviceDebugDisplay() {
     s.trip = gTripPath[0] != 0;
     s.tripMs = now - gTripT0;
     s.tripMiles = gTripMeters / 1609.344;
-    s.store = gSdMounted ? "SD" : (gFlashMounted ? "FLASH" : "NONE");
+    s.store = tripStoreAvailable(*gTripFS) ? (gTripFS == &SD ? "SD" : "FLASH") : "NONE";
     portENTER_CRITICAL(&gDebugNetMux);
     s.net = gDebugNet;
     portEXIT_CRITICAL(&gDebugNetMux);
@@ -2822,6 +2874,7 @@ static const display::Output& serviceProductionDisplay(bool render = true) {
         fresh, gps.speed.mps(), END_MPS);
     input.tripFinalized = gDisplayTripFinalized; gDisplayTripFinalized = false;
     input.userRequest = gDisplayUserRequest; gDisplayUserRequest = false;
+    input.usbPowerRequest = gDisplayUsbPowerRequest; gDisplayUsbPowerRequest = false;
     input.heard = gDebugGsv.signal(now).heard;
     input.conditions = gDisplayMerged; input.count = merged;
     const auto& output = gDisplayModel.update(input);
@@ -2837,6 +2890,7 @@ static void toggleRuntimeDebug() {
     gDebugMode.store(enabled);
     gDisplayModel.dismiss();
     gDisplayUserRequest = gDisplayTripFinalized = false;
+    gDisplayUsbPowerRequest = false;
     gModeFeedback = true; gModeFeedbackMs = millis();
     // Drop an unfinished BME conversion; the next entry starts a fresh cycle.
     gDebugTempPending = false;

@@ -361,6 +361,7 @@ inline std::vector<std::string> g_powerEvents;
 struct SDStub : fs::FS {
     bool cardPresent = false;
     int begins = 0, ends = 0;
+    int capacityQueries = 0;
     int cs = -1, maxFiles = 0;
     uint32_t hz = 0;
     SPIClass* spi = nullptr;
@@ -378,8 +379,9 @@ struct SDStub : fs::FS {
         if (g_disk.onUnmount) g_disk.onUnmount();
     }
     uint8_t cardType() { return g_disk.mounted ? CARD_SDHC : CARD_NONE; }
-    uint64_t totalBytes() { return g_disk.capacity; }
-    uint64_t usedBytes() { return g_disk.used(); }
+    // Core 3.3.x keeps cardType cached but returns zero on f_getfree error.
+    uint64_t totalBytes() { ++capacityQueries; return cardPresent && !g_disk.readsFail ? g_disk.capacity : 0; }
+    uint64_t usedBytes() { return cardPresent && !g_disk.readsFail ? g_disk.used() : 0; }
     bool readRAW(uint8_t* data, uint32_t sector) {
         if (sector || !g_disk.mounted) return false;
         memset(data, 0, 512); data[11] = 0; data[12] = 2; data[13] = 64;

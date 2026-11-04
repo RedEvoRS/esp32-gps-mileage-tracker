@@ -25,8 +25,11 @@ server internals and backups. Hardware acceptance limits remain explicit there.
   revisions are mirrored to SD and LittleFS, the internal flash filesystem.
   After enrollment or migration, internal flash can send current health and
   events without a card, including active **E4001 (SD_UNAVAILABLE)**. If a
-  mounted card starts failing, a healthy enrolled flash copy can still report
-  **E4006 (TRIP_WRITE_FAILED)** and upload its retained events. A failed flash
+  mounted card stops responding, **E4001** reports that failure instead of
+  claiming the card is full. New trips use the already-mounted internal flash
+  queue once any current SD trip has ended; that current trip can fail with
+  **E4006 (TRIP_WRITE_FAILED)**. A healthy enrolled flash copy can still upload
+  these events. A failed flash
   journal likewise does not block a healthy enrolled card.
 - A reachable ingest server and the same private bearer token and `DEVICE_ID`
   configured in the firmware. The device label is not authentication. See
@@ -267,6 +270,12 @@ with the current default; they do not scroll or flash.
   debug page. A two-second message confirms the change. POWER alone can overlay
   a status card in debug mode. Debug is not saved across power cycles; holding
   BOOT during power-up instead selects the chip's download mode.
+- A long POWER press on USB leaves the board on and shows `USB power` /
+  `Unplug USB` / `to switch off` for the normal card duration in either mode.
+  Unplug USB first, then long-press for a clean shutdown. A roughly six-second
+  hold forces PMU power-off without closing files. Before removing the card,
+  tap POWER briefly and check that the screen stays dark; follow the
+  [card precautions](firmware/README.md#microsd-card).
 
 Short-press actions need a successfully read power-management interrupt batch;
 unknown reads cannot request a card or toggle debug. Degraded startup does not
@@ -334,7 +343,7 @@ exists, not that every occurrence is guaranteed durable or already road-tested.
 | E4005 | `STORAGE_FULL` | critical | `transitions` | Yes |
 | E4006 | `TRIP_WRITE_FAILED` | critical | `transitions` | Yes |
 | E4007 | `TRIP_RECOVERY_FAILED` | error | `per_occurrence` | Yes |
-| E4008 | `EVENT_WRITE_FAILED` | error | `transitions` | No; catalog only (internal I/O counter) |
+| E4008 | `EVENT_WRITE_FAILED` | error | `transitions` | Yes |
 | E4009 | `EVENTS_DROPPED` | warning | `per_occurrence` | Yes |
 | E4010 | `TRIP_RECOVERED` | info | `per_occurrence` | Yes |
 | E5001 | `HOME_AP_ABSENT` | info | `counter` | Counter only; snapshot, no journal event |
@@ -350,8 +359,10 @@ exists, not that every occurrence is guaranteed durable or already road-tested.
 | E6001 | `DISPLAY_UNAVAILABLE` | warning | `transitions` | Yes |
 | E7001 | `DEVICE_SILENT` | warning | `transitions` | No; server monitor only |
 
-E4009 loss notices come from EventLog itself. Journal input/output (I/O) failures increment
-its internal `storageFailures` counter; they do not currently emit E4008.
+E4009 loss notices come from EventLog itself. Journal storage failures increment
+its internal `storageFailures` counter and raise E4008 through the consumer's
+normal transition producer. A healthy fallback store does not clear a failed
+store; see [journal failure reporting](#journal-failure-reporting-e4008).
 E7001 is derived on the server from time since accepted contact, not emitted by
 the board. E5001 counts successful scans that miss the configured home access
 point; it is expected away from home and does not flood journal history.
@@ -917,11 +928,12 @@ remounting media; do not reuse cached state for a different card.
 - `service(maxRecords=4)` is single-consumer work under the existing FS_LOCK.
   It tries SD, then LittleFS, retaining the queue in RAM when neither accepts
   a frame. It drains at most 16 ordinary records per call and attempts at most
-  one coalesced E4009 notice. Storage errors increment a status counter without
-  calling producers or a logging sink. Known drop totals survive in metadata
+  one coalesced E4009 notice. Storage errors increment a status counter and latch
+  per-store failure observations without calling producers or a logging sink.
+  The consumer reports E4008 after the journal call. Known drop totals survive in metadata
   once a backend is writable; RAM-only records/counts are lost on reset.
 - `nextBatch` exports up to 64 unchanged protocol-v1 JSON events and their
-  IDs, oldest segment first on SD, then LittleFS, then RAM. Cross-backend order
+  IDs, oldest segment first, normally on SD, then LittleFS, then RAM. Cross-backend order
   is not event-time order. The default 30 KiB events-array budget leaves room
   for the current check-in; the worker also enforces the full 32 KiB request.
   Re-reads preserve exact JSON, including original timestamps and identity.
@@ -934,11 +946,68 @@ remounting media; do not reuse cached state for a different card.
   its uncommitted corruption count/cursor are discarded before trying the next
   store or RAM. Its records are retried after recovery; another store's ack
   cannot advance its cursor or charge its corrupt frames as losses.
+  After an acknowledgment load/save failure, the other persistent store gets
+  priority for the rest of the boot, including later drain opportunities. The
+  failed store remains eligible when the preferred store has no events, so it
+  can recover without rebooting. A successful durable ack on the deferred store
+  restores normal ordering. This preference is RAM-only; failed acknowledgments
+  leave that store's cursor and loss accounting unchanged. Keeping the preference
+  across drains lets new flash history progress despite repeated SD ack failures,
+  while the worker retains its existing independent retry backoff.
 - `acknowledge(batch, accepted_ids)` requires the exact complete ID set, with
   no missing, unexpected or duplicate IDs. Persistent data advances only after
   the new metadata slot is durably written and read back. A failed ack retains
   retryability; RAM acknowledgments remove only matching queue heads. #125
   still owns parsing/validating the HTTP acknowledgment and E5010 policy.
+
+##### Journal failure reporting (E4008)
+
+`EventLog::fail(Store&)` latches the failed store and operation, alongside the
+existing saturating `storageFailures` counter. `storageFault()` reads that state
+without filesystem work or event submission. E4008 has exactly two context keys:
+`operation` (`open|write|close|rename|ack`) and `backend` (`sd|littlefs`). Opening
+or preparing a store (including inventory failure) uses `open`; event-frame
+write/sync, quota refusal or reclamation failure uses `write`; a checked close
+failure after a successful write/sync uses `close`; sealing/rolling uses `rename`;
+metadata persistence or read-back failure uses `ack`, including filename
+reservations, loss accounting and snapshot revisions. The VFS preserves the first
+write/sync/close error. Read-only frame-export errors remain counter-only because
+the catalog has no `read` operation. Cooperative cancellation for trip demand,
+network hold/abort or the I/O deadline does not latch a media fault.
+
+There is one aggregate condition per boot, with a latch for each store. Any
+failed store keeps E4008 active. While both fail, SD supplies the context; a
+changed operation/backend updates subsequent repeats without starting a new
+episode. A later successful event append (including a diagnostic event) or
+verified durable event acknowledgment clears **only that store's** latch.
+Verified metadata persistence also recovers an `ack` failure on that store;
+this lets a failing flash revision mirror recover while SD handles event frames.
+An existing-segment append alone cannot recover an `ack` failure, since it need
+not touch metadata. Metadata alone cannot recover an `open|write|close|rename` failure: otherwise
+successful filename reservations could repeatedly clear failed event appends.
+Reads, successful sealing and writes/acks on a different store do not establish
+recovery. When every failed store has recovered,
+the producer emits one clear, with the last recovered store and its successful
+`write` or `ack` operation. A first healthy append silently observes the condition
+healthy; stores that have never been exercised remain unobserved.
+
+`journalStorageFaults()` uses **core 0's existing static `gEventFaults` builder**
+after journal service and at upload-worker unlocks. That task owns both journal
+I/O and its failure observations; core 1 sees only the builder's atomic
+publication for the OLED. In degraded boots there is no network task: the sole
+core-1 journal consumer instead uses its own static `gLoopFaults` builder. No
+builder crosses cores, no new task/stack is allocated, and `fail()` never calls
+the producer. Shutdown also publishes failures found while sealing; a queued
+transition after the final seal makes the shutdown report incomplete durability.
+
+An E4008 raise/repeat/clear goes through the same bounded `submit()` queue and
+SD -> LittleFS -> RAM fallback as any event. Its own failed write only updates
+the latches; it cannot recursively submit an event. The existing producer policy
+allows at most one repeat per 15 minutes and retries a full/busy submission no
+faster than once per minute while the observation is unchanged. The 16-frame
+volatile queue and existing coalesced loss accounting remain the only fallback;
+there is no extra persistence, retry loop or metadata write for these latches.
+All-store failure therefore retains bounded RAM history, which is lost on reset.
 
 Stage 4 runs `service(1)` on the **existing core-0 network task**, with a
 zero-wait take of the same filesystem mutex used by FS_LOCK. It releases that
@@ -1097,9 +1166,13 @@ after explicit enrollment on normal boots; degraded boots never start networking
 
 #### Stage 4 boot and shutdown plumbing (#124 part A)
 
-The boot-time trip-store selection is unchanged: SD when mounted, otherwise
-LittleFS, with no destination changes during a trip. Diagnostics try that boot's
-mounted SD first, then mounted LittleFS, then the existing 16-record RAM queue.
+The boot-time trip-store selection is SD when mounted, otherwise LittleFS.
+If the selected SD later fails its capacity query, core 1 latches it unavailable
+until reboot and selects already-mounted LittleFS between trips. No trip changes
+destination while it is open. Diagnostics skip that failed SD through its adapter
+gate, then try mounted LittleFS and the existing 16-record RAM queue. The existing
+revision allocator marks SD stale when a current flash copy saves a revision;
+the availability latch does not reset revision metadata or the NVS witness.
 An absent store is never mounted later just for diagnostics. SD allocation units
 come from its FAT boot sector (including an MBR primary partition); unreadable
 geometry disables SD journaling for this boot while leaving trip storage alone.
@@ -1248,10 +1321,10 @@ complete the real parked-data acceptance step.
 owning task. Core 1 owns GPS, power, trip storage/recovery and display hooks;
 core 0 owns WiFi/HTTP/stack and the AP-absence counter. The builders only call
 EventLog's bounded, nonblocking `submit`, never filesystem APIs or ISRs. Journal
-adapter/service errors do not enter these hooks. EventLog emits E4009 loss
-notices internally. E4008 is catalog-defined but is not currently emitted;
-journal I/O failures only increment the internal `storageFailures` counter
-(`EventLog::fail()` / `stats()`), without producing an event. The trip/FS operations being measured keep their existing locks.
+adapter/service errors are latched by EventLog and reported as E4008 by the
+owning consumer, as defined under [journal failure reporting](#journal-failure-reporting-e4008).
+EventLog emits E4009 loss notices internally. The trip/FS operations being
+measured keep their existing locks.
 
 Continuing conditions emit one accepted `raise`, no hot-loop records, at most
 one `repeat` per **15 minutes**, and one accepted `clear` on measured recovery.
@@ -1303,13 +1376,14 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E3007 | RTC has no ACK, or its initial boot register read fails | Verified RTC setting after trusted GPS/SNTP time; at most three attempts per boot, at least a minute apart after failures | none |
 | E3008 | Readable RTC has STOP/VL, invalid BCD/calendar, unsupported year, or a later read/write/verification failure | Verified RTC setting from GPS/SNTP clears the condition; normal transition/repeat policy | `reason=stopped\|invalid_date\|out_of_range\|read_failed` on failure |
 | E3009 | At 30 s MON-RF boundaries, valid AGC >=70% and fresh GSV (a complete group within 15 s) with zero satellites >=30 dBHz, continuously for >=120 s from the first suspect sample | One valid AGC <=50% sample **or** fresh GSV with at least one satellite >=30 dBHz; missing/stale/intermediate evidence resets the hold and retains an active warning | `agc_pct` (0-100) when MON-RF valid; `max_cno` (0-99) when GSV fresh |
-| E4001 | SD did not mount, including when no trip store works | Observed SD mount; current boot does not hot-switch backends | none |
+| E4001 | SD did not mount, or the selected SD trip store returns zero total capacity at runtime (failed filesystem query) | Successful SD mount on a later boot; runtime failure stays latched until reboot | none |
 | E4002 | LittleFS unavailable during no-storage degraded startup | RAM-only raise/repeat; retained as failed until restart discards the queue | none |
 | E4003 | Neither trip store is usable at startup | Only a normal boot with a mounted trip store observes healthy; successful degraded retry restarts without clearing | none |
-| E4004 | Guarded trip free space <64 KiB start reserve | >=64 KiB | `backend`, `free_bytes` |
-| E4005 | Guarded trip free space <24 KiB stop reserve | >=24 KiB | `backend`, `free_bytes` |
+| E4004 | Available selected trip store has guarded free space <64 KiB start reserve | >=64 KiB on the selected store, or condition no longer applies because that store is unavailable | `backend`, `free_bytes` only when available |
+| E4005 | Available selected trip store has guarded free space <24 KiB stop reserve | >=24 KiB on the selected store, or condition no longer applies because that store is unavailable | `backend`, `free_bytes` only when available |
 | E4006 | Trip create/open, point commit or finalization fails | Next verified trip create/write/finalize or successful repair | `backend`, `operation=open\|write\|close` |
 | E4007 | Boot fsck directory/read, ambiguous repair, write or publish fails; also runtime repair failure | Per-occurrence notice; no clear | `backend`, `reason=read\|parse\|write\|rename` |
+| E4008 | Journal preparation, event append, sealing or metadata persistence fails | All failed stores must later append an event or durably ack an event batch; 15-minute repeats, no recursive submission | `backend`, `operation=open\|write\|close\|rename\|ack` |
 | E4010 | Actual repaired trip, published verified repair or recovered orphan | Per-occurrence notice; complete untouched files and garbage cleanup stay silent | `backend`, `points` when counted |
 | E5001 | Completed successful scan does not see the configured AP | **Counter only**, boot-local, saturates at 2^63-1; failed/aborted scans do not increment | none; future check-in counter |
 | E5002 | Completed 15 s WiFi join attempt fails | Next successful join; AP absence is not recovery | `attempts` (saturates at 255, resets on join) |
@@ -1368,8 +1442,25 @@ missing evidence, with normal 15-minute repeats; only measured recovery clears.
 Storage space is checked at boot, on admission, during trips and every 30 s while
 idle so uploads can produce observed recovery on core 1. LittleFS free space
 already excludes the unused journal reserve. Below 64 KiB a new trip is refused;
-below 24 KiB a running trip is finalized. These hooks do not read or modify
-EventLog's own storage failure path. Arduino's void close cannot independently
+below 24 KiB a running trip is finalized. On ESP32 Arduino core 3.3.11,
+`SD.totalBytes()` returns zero if its FAT free-space query fails. `cardType()`
+keeps the cached mount-time type and is not a removal check. Zero total capacity
+raises E4001; it never raises E4004/E4005 for that SD. A genuinely full readable
+card still has nonzero total capacity and keeps the normal space warnings.
+An earlier space condition is cleared when it no longer applies; that clear
+does not mean an unavailable card has recovered, and carries no `free_bytes`.
+
+If internal flash was mounted at boot, new trips use its queue after the current
+SD trip ends. The current trip stays on SD and ends through E4006 on its next
+attempted write; it is left for repair on a later boot with a working card.
+Uploads and diagnostics skip the known failed SD, keeping its files untouched.
+No card is remounted or formatted at runtime. Reinserting it does not resume SD
+use: power off, check/reseat or replace the card, then restart. With no mounted
+flash fallback, new trips are refused as storage unavailable. Flash still needs
+the same free-space reserves; if it fills, E4004/E4005 name `littlefs`.
+This runtime switch has host-test coverage; removal during a real trip, upload
+timing, and recovery of the removed card still need a board check.
+These hooks do not modify EventLog's revision/failure rules. Arduino's void close cannot independently
 report close errors; E4006 `close` means the verified finalization commit failed.
 HTTP error classes stay active across different errors and clear only on 200.
 Existing quarantine/retry behavior is unchanged; intentional network aborts do
@@ -1666,8 +1757,15 @@ Production policy:
   The single build always includes `XPOWERS_AXP2101_PKEY_SHORT_IRQ` in the
   shared enabled/batch mask and tests `irq.has(...)` only after a known batch,
   outside degraded mode. BOOT held toggles debug instead. Unknown batches
-  request no card and cannot toggle debug. Long press keeps
-  the existing clean battery power-off/USB-ignore meaning. A new error preempts a routine status card;
+  request no card and cannot toggle debug. Long press keeps the existing
+  clean battery power-off behavior. Only a `user_long_press` refused with
+  confirmed USB power requests a UsbPowerCard, through a core-1 flag consumed
+  by the renderer. It uses three lines in the 14-point font and the normal
+  `DISPLAY_CARD_MS` interval; it can replace a status card, and a later short
+  tap can request status again. An interrupted error card resumes afterward,
+  followed by queued errors. Debug off dismisses the message and pending
+  errors, so they cannot replay after a mode switch.
+  A new error preempts a routine status card;
   a user request can replace the current card and holds its full
   `DISPLAY_CARD_MS` (default 30 seconds) before queued errors resume.
   Routine status cards blank when motion becomes Moving; Unknown does not

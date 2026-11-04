@@ -6,6 +6,7 @@
 // POSIX sync/close/EOF handling is separately exercised by test_journal_vfs.
 class JournalPlatformIo {
     fs::FS& fs_;
+    diagnostics::EventLogFs::Operation writeFailure_ = diagnostics::EventLogFs::Operation::Write;
 public:
     explicit JournalPlatformIo(const char* mount) : fs_(std::strcmp(mount, "/sd") == 0 ?
         static_cast<fs::FS&>(SD) : static_cast<fs::FS&>(LittleFS)) {}
@@ -40,14 +41,16 @@ public:
     }
     bool write(const char* path, const void* data, size_t bytes, bool append) {
         assertLocked();
+        writeFailure_ = diagnostics::EventLogFs::Operation::Write;
         if (fs_.g_disk.writesFail) return false;
         size_t old = append && fs_.g_disk.files.count(path) ? fs_.g_disk.files[path].size() : 0;
         auto file = fs_.open(path, append ? FILE_APPEND : FILE_WRITE);
-        if (!file) return false;
+        if (!file) { writeFailure_ = diagnostics::EventLogFs::Operation::Open; return false; }
         bool ok = file.write(static_cast<const uint8_t*>(data), bytes) == bytes;
         file.close();
         return ok && fs_.g_disk.files[path].size() == old + bytes;
     }
+    diagnostics::EventLogFs::Operation writeFailure() const { return writeFailure_; }
     bool rename(const char* from, const char* to) {
         assertLocked(); return !fs_.exists(to) && fs_.rename(from, to);
     }

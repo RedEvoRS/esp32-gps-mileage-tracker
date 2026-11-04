@@ -43,7 +43,9 @@ file; diagnostics dedupe held. The release-candidate driving week on firmware
 v0.11 passed on 2026-11-01, and firmware and server v1.00, the first public
 release, followed the same day. LittleFS uploads were verified on the road on
 2026-11-03 (UTC), and firmware v1.01 the same day keeps diagnostics running
-without the card. HTTP 413 remains untested on the Supreme. Other hardware acceptance is tracked under `supreme-port`.
+without the card. Firmware v1.02 (2026-11-04) reports a card lost while
+running as E4001 and moves new trips to LittleFS, shows a USB-power card on a
+refused long press, and raises E4008 for journal write failures. HTTP 413 remains untested on the Supreme. Other hardware acceptance is tracked under `supreme-port`.
 Don't assume a Supreme pin, rail or peripheral works until its port issue
 is closed and it's verified on the bench.
 
@@ -212,7 +214,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   powered from BLDO1, SPI MOSI 35 / SCK 36 / MISO 37, CS 47, IMU CS 34
   held high. BLDO1 powers up
   ON at 1.8 V: switch it off, set 3.3 V, then enable. Stage 4 picks its
-  trip store once at boot, never formats the card, falls back to LittleFS,
+  trip store at boot (a card that fails its capacity query at runtime raises
+  E4001 and is latched out until reboot; new trips then go to LittleFS, never
+  mid-trip), never formats the card, falls back to LittleFS,
   attempts uploads from both stores, and unmounts both before `PMU.shutdown()`.
   SD uploads were verified on 2026-10-21 (UTC), LittleFS uploads on 2026-11-03 (UTC)
 - Build: `esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled`
