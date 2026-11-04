@@ -29,7 +29,9 @@ release of both the firmware and the server, came out on 2026-11-01 (UTC),
 after a week of everyday driving on the release candidate in which every trip
 was recorded, uploaded and exported correctly. Firmware **v1.01** followed on
 2026-11-03 (UTC): it keeps reporting the board's health when the microSD card
-is missing or failing. Still unproven on the Supreme: trips that end in a
+is missing or failing. Firmware **v1.02** followed on 2026-11-04 (UTC): a card
+that stops responding while the board runs is reported as missing (E4001)
+rather than full, and new trips move to internal flash. Still unproven on the Supreme: trips that end in a
 parking garage, and distance accuracy against the car's odometer. Open work is tracked in
 [GitHub issues](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/issues).
 
@@ -58,7 +60,9 @@ If no card mounts at boot, the logger stores trips in the board's internal
 flash instead (about 5–6 hours of driving between uploads) and uploads them
 from there; that was checked on the road on 2026-11-03 (UTC). From firmware
 v1.01 the health journal keeps uploading without the card too, so the viewer's
-Device health shows the missing card as error E4001.
+Device health shows the missing card as error E4001. From v1.02, a card that
+fails or is pulled while the board is running is also reported as E4001, and
+the next trip records to internal flash until the board is restarted.
 
 Alongside the trips, the board keeps a small journal of its own health:
 numbered error codes such as a lost GPS antenna, a full card or a refused

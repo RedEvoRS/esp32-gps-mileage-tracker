@@ -15,7 +15,11 @@ All four stages run on the Supreme. Firmware `v1.00` (tag `fw-v1.00`), the
 first public release, came out on 2026-11-01 (UTC) with server `v1.00`, after
 the release candidate `v0.11` passed a week of normal driving. Firmware
 `v1.01` (tag `fw-v1.01`) followed on 2026-11-03 (UTC): it keeps sending
-diagnostics when the microSD card is missing or failing. On
+diagnostics when the microSD card is missing or failing. Firmware `v1.02`
+(tag `fw-v1.02`) followed on 2026-11-04 (UTC): a card that stops responding
+while running reports E4001 and new trips move to internal flash, a long
+POWER press on USB shows an on-screen message, and diagnostic journal write
+failures raise E4008. On
 2026-10-21 (UTC), an earlier Stage 4 build uploaded
 four real trips from microSD to the deployed server, then delivered all 115
 pending diagnostic events and a current snapshot. Uploads with debug mode
@@ -370,8 +374,9 @@ a card. Stage 4 has since recorded two real drives on the card.
   write-and-verify check with `f3` (Linux/WSL) or H2testw (Windows) takes
   about an hour for 32 GB and is worth doing once.
 - **Only insert or remove the card with the board switched off.** The slot
-  has no card-detect switch, and the firmware picks its trip storage once,
-  at boot. With Stage 4 running, unplug USB first, hold POWER for 1–2 s,
+  has no card-detect switch. The firmware picks its trip storage at boot
+  and only moves new trips to internal flash if the card stops responding;
+  a card put back in while running isn't used until the next restart. With Stage 4 running, unplug USB first, hold POWER for 1–2 s,
   then release and let shutdown finish. Before pulling the card, tap POWER
   briefly and check that the screen stays dark. A running board normally
   sleeps its screen between cards, so a dark screen alone does not mean off.
@@ -701,7 +706,7 @@ For why it works this way, see [the firmware design](DESIGN.md).
 
 The `04_trip_logger/` sketch detects trips, accumulates mileage and writes
 GPS Exchange Format (GPX) files to the microSD card, with internal LittleFS
-as fallback. The current release is `v1.01`; it uploads trips from
+as fallback. The current release is `v1.02`; it uploads trips from
 the card, and the [top-level README](../README.md#where-its-at) has the current status and
 what's still unproven on a real board. Since `v0.06` there is one firmware build: debug
 mode starts off at every power-on and can be toggled by holding BOOT and
