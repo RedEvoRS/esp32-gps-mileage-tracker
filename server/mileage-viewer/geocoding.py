@@ -185,7 +185,9 @@ class Geocoder:
             # process makes DNS, connect, TLS, headers and chunk framing all
             # cancellable together; killing it also closes every provider socket.
             process = subprocess.Popen(
-                [sys.executable, os.path.abspath(__file__)],
+                # -I: ignore PYTHON* variables and keep /app off sys.path, so the
+                # child loads only the standard library and this file.
+                [sys.executable, "-I", os.path.abspath(__file__)],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
