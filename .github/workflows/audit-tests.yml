@@ -418,6 +418,27 @@ jobs:
           cat metrics-check.log
           test "$(grep -c '  FAIL  ' metrics-check.log)" = 0
           grep -q 'Metrics answer with the token (200)' metrics-check.log
+          # The Compose hash comparison must work on real Docker, not fall back.
+          grep -q 'running with the settings in monitor.env and its Compose configuration' metrics-check.log
+          # An edited tuning value that hasn't been applied is reported, then
+          # restoring the file makes the hashes match again without a restart.
+          pointer=$(sudo sed -n 's/^MONITOR_ENV_FILE=//p' "$dir/.env" | tail -n 1)
+          case $pointer in /*) monitor_file=$pointer ;; *) monitor_file=$dir/${pointer#./} ;; esac
+          sudo grep -q '^MONITOR_STALE_DAYS=7$' "$monitor_file"
+          sudo -u "$TEST_USER" sed -i 's/^MONITOR_STALE_DAYS=7$/MONITOR_STALE_DAYS=8/' "$monitor_file"
+          if sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+              bash "$INSTALLER" --check < /dev/null > stale-monitor.log 2>&1; then
+            cat stale-monitor.log
+            echo "--check passed with an unapplied monitor.env edit"
+            exit 1
+          fi
+          cat stale-monitor.log
+          grep -q 'The monitor is running with older settings than monitor.env' stale-monitor.log
+          test "$(grep -c '  FAIL  ' stale-monitor.log)" = 1
+          sudo -u "$TEST_USER" sed -i 's/^MONITOR_STALE_DAYS=8$/MONITOR_STALE_DAYS=7/' "$monitor_file"
+          sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+            bash "$INSTALLER" --check < /dev/null > metrics-check2.log 2>&1
+          grep -q 'running with the settings in monitor.env and its Compose configuration' metrics-check2.log
       - name: --check reports a stopped viewer without blaming its config
         run: |
           docker stop mileage-viewer

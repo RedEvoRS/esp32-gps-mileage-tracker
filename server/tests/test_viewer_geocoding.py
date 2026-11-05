@@ -10,11 +10,12 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
 from openpyxl import load_workbook
@@ -31,6 +32,7 @@ class EndpointPlaceTests(unittest.TestCase):
         cls.status = 200
         cls.body = b'{"display_name":"Invented workshop, Example Road"}'
         cls.drip = 0
+        cls.mode = "normal"
         cls.entered = threading.Event()
         cls.release = threading.Event()
         cls.release.set()
@@ -40,6 +42,35 @@ class EndpointPlaceTests(unittest.TestCase):
                 cls.received.append((self.path, dict(self.headers)))
                 cls.entered.set()
                 cls.release.wait(5)
+                try:
+                    if cls.mode == "silent":
+                        time.sleep(0.8)
+                        return
+                    if cls.mode == "headers":
+                        for byte in b"HTTP/1.1 200 OK\r\nX-Slow: value\r\n\r\n":
+                            self.wfile.write(bytes([byte]))
+                            self.wfile.flush()
+                            time.sleep(.06)
+                        return
+                    if cls.mode == "chunked_body":
+                        self.wfile.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        for byte in cls.body:
+                            self.wfile.write(b"1\r\n" + bytes([byte]) + b"\r\n")
+                            self.wfile.flush()
+                            time.sleep(.06)
+                        self.wfile.write(b"0\r\n\r\n")
+                        return
+                    if cls.mode == "chunked":
+                        self.wfile.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        # Drip a chunk-size extension: read1 itself blocks in
+                        # framing even though socket operations keep succeeding.
+                        for byte in b"1;slow=" + b"x" * 40:
+                            self.wfile.write(bytes([byte]))
+                            self.wfile.flush()
+                            time.sleep(.06)
+                        return
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    return
                 self.send_response(cls.status)
                 self.send_header("Content-Type", "application/json")
                 if cls.status == 302:
@@ -99,6 +130,7 @@ class EndpointPlaceTests(unittest.TestCase):
         cls.received.clear()
         cls.status = 200
         cls.drip = 0
+        cls.mode = "normal"
         cls.body = b'{"display_name":"Invented workshop, Example Road"}'
         cls.entered.clear()
         cls.release.set()
@@ -279,7 +311,8 @@ class EndpointPlaceTests(unittest.TestCase):
         self.assertFalse(any("should-not-be-followed" in p for p, _ in self.received))
 
     def test_timeout_is_generic_and_not_cached(self):
-        with patch("geocoding.build_opener") as factory:
+        with patch("geocoding.build_opener") as factory, patch.object(
+                self.viewer.GEOCODER, "_fetch", self.viewer.GEOCODER._fetch_direct):
             call = factory.return_value.open
             call.side_effect = TimeoutError("private endpoint")
             response = self.post()
@@ -426,6 +459,98 @@ class EndpointPlaceTests(unittest.TestCase):
         self.assertLess(elapsed, 1.5)
         self.assertIsNone(self.viewer.GEOCODER.cached(2, 4))
         self.assertEqual(self.post().status_code, 429)
+
+    def test_stalled_headers_and_chunk_framing_are_killed_and_cooled_down(self):
+        import geocoding
+        geocoder = self.viewer.GEOCODER
+        for mode in ("silent", "headers", "chunked", "chunked_body"):
+            with self.subTest(mode=mode):
+                self.reset_gate()
+                self.entered.clear()
+                type(self).mode = mode
+                started = time.monotonic()
+                with patch.object(geocoder, "RESPONSE_BUDGET", .45):
+                    with self.assertRaises(self.viewer.GeocodeError) as error:
+                        geocoder.lookup(2, 4)
+                self.assertEqual(error.exception.status, 503)
+                self.assertTrue(self.entered.is_set())
+                self.assertGreaterEqual(time.monotonic() - started, .45)
+                self.assertLess(time.monotonic() - started, 1.5)
+                self.assertIsNotNone(geocoding._fetch_process.poll())
+                self.assertIsNone(geocoder.cached(2, 4))
+                with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn:
+                    next_allowed = conn.execute("SELECT next_allowed FROM geocode_gate").fetchone()[0]
+                self.assertGreater(next_allowed, time.time() + 295)
+                self.assertEqual(self.post().status_code, 429)
+                # Failure gate expires and a subsequent lookup can succeed.
+                type(self).mode = "normal"
+                with patch("geocoding.time.time", return_value=next_allowed + 1):
+                    self.assertTrue(geocoder.lookup(2, 4))
+                self.clear_cache()
+
+    def test_repeated_deadlines_leave_no_children_or_fetch_threads(self):
+        import geocoding
+        type(self).mode = "headers"
+        threads = {thread.ident for thread in threading.enumerate()}
+        for _ in range(5):
+            self.reset_gate()
+            with patch.object(self.viewer.GEOCODER, "RESPONSE_BUDGET", .3):
+                self.assertEqual(self.post().status_code, 503)
+            self.assertIsNotNone(geocoding._fetch_process.poll())
+        # Only local fake-provider handlers may have been added.
+        added = [thread for thread in threading.enumerate() if thread.ident not in threads]
+        self.assertTrue(all("process_request_thread" in thread.name for thread in added))
+
+    def test_lease_is_derived_from_deadline_and_cleanup_with_margin(self):
+        geocoder = self.viewer.GEOCODER
+        for budget in (.1, 10, 120):
+            with patch.object(geocoder, "RESPONSE_BUDGET", budget):
+                self.assertGreater(geocoder.LEASE, budget + geocoder.CLEANUP_BUDGET)
+
+    def test_dns_stall_is_killed_at_whole_request_deadline(self):
+        import geocoding
+        original = subprocess.Popen
+
+        def stalled_dns(command, **kwargs):
+            # Patch DNS in the actual isolated interpreter, before running its
+            # normal entry point. No external DNS or provider is contacted.
+            script = ("import socket,time,runpy,sys; "
+                      "socket.getaddrinfo=lambda *a,**k: time.sleep(60); "
+                      "runpy.run_path(sys.argv[1],run_name='__main__')")
+            return original([command[0], "-c", script, command[1]], **kwargs)
+
+        started = time.monotonic()
+        with patch("geocoding.subprocess.Popen", side_effect=stalled_dns), \
+             patch.object(self.viewer.GEOCODER, "RESPONSE_BUDGET", .4):
+            with self.assertRaises(self.viewer.GeocodeError):
+                self.viewer.GEOCODER.lookup(2, 4)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertIsNotNone(geocoding._fetch_process.poll())
+        self.assertEqual(self.received, [])
+        self.assertEqual(self.post().status_code, 429)
+
+    def test_child_pending_cleanup_refuses_replacement(self):
+        child = Mock()
+        child.poll.return_value = None
+        with patch("geocoding._fetch_process", child), \
+             patch("geocoding.subprocess.Popen") as spawn:
+            with self.assertRaises(self.viewer.GeocodeError):
+                self.viewer.GEOCODER.lookup(2, 4)
+        spawn.assert_not_called()
+        self.assertEqual(self.post().status_code, 429)
+
+    def test_only_reservation_holder_releases_gate(self):
+        def replaced_reservation(*args):
+            with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn, conn:
+                conn.execute("UPDATE geocode_gate SET token = 'other', next_allowed = 99999999999")
+            raise self.viewer.GeocodeError("The address provider is unavailable. Try again later.")
+
+        with patch.object(self.viewer.GEOCODER, "_fetch", side_effect=replaced_reservation):
+            with self.assertRaises(self.viewer.GeocodeError):
+                self.viewer.GEOCODER.lookup(2, 4)
+        with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn:
+            self.assertEqual(conn.execute("SELECT token, next_allowed FROM geocode_gate").fetchone(),
+                             ("other", 99999999999))
 
     def test_aborted_worker_retains_failure_cooldown(self):
         for abort in (SystemExit, KeyboardInterrupt):

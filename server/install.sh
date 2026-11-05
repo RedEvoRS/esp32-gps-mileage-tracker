@@ -3392,8 +3392,30 @@ monitor_startup_line() {
         | grep -E 'Monitor (enabled|disabled)|Invalid monitor configuration' | sed -n '$p' || true
 }
 
+# Compare only hashes, never expose resolved config or Compose errors (either
+# can contain credentials). Resolve env_file first: older Compose v2 versions
+# skip it in config --hash, although up resolves it before stamping the label.
+# Return 0 for a match, 1 for older settings, 2 when comparison is unavailable.
+monitor_config_matches() {
+    local current id running
+    current=$(compose --profile monitor config < /dev/null 2> /dev/null \
+        | compose --profile monitor -f - config --hash mileage-monitor 2> /dev/null) || return 2
+    if [[ $current =~ ^mileage-monitor[[:space:]]+([0-9a-f]{64})$ ]]; then
+        current=${BASH_REMATCH[1]}
+    else
+        return 2
+    fi
+    id=$(compose --profile monitor ps -a -q mileage-monitor < /dev/null 2> /dev/null) || return 2
+    [[ -n $id && $id != *$'\n'* ]] || return 2
+    running=$("${DOCKER[@]}" inspect -f '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$id" \
+        < /dev/null 2> /dev/null) || return 2
+    [[ $running =~ ^[0-9a-f]{64}$ ]] || return 2
+    [[ $current == "$running" ]]
+}
+
 # After the monitor is started: wait until it's running with these settings,
 # or report the refusal or crash it gave.
+# The preceding up -d applies Compose config; here we wait for app readiness.
 wait_monitor_start() {
     local deadline=$((SECONDS + 90)) state line expected
     expected=$(expected_startup)
@@ -3473,7 +3495,7 @@ check_metrics() {
 # Read-only checks of what monitor.env turns on, in both modes. Nothing is
 # sent to a phone, Graylog or Loki from here.
 check_outputs() {
-    local list monitor_ok=no pointer
+    local list monitor_ok=no pointer config_status=0
     if ! find_monitor_file; then
         pointer=$(env_raw .env MONITOR_ENV_FILE)
         if [[ -n $pointer ]]; then
@@ -3497,12 +3519,22 @@ check_outputs() {
     if [[ $(service_state mileage-monitor monitor) != running ]]; then
         problem "The monitor isn't running" \
             "Start it with: docker compose --profile monitor up -d mileage-monitor"
-    elif [[ $(monitor_startup_line) == *"$(expected_startup)"* ]]; then
-        ok "The monitor is running with the settings in monitor.env"
-        monitor_ok=yes
     else
-        problem "The monitor is running with other settings than monitor.env" \
-            "Apply them: docker compose --profile monitor up -d mileage-monitor"
+        monitor_config_matches || config_status=$?
+        if (( config_status == 1 )); then
+            problem "The monitor is running with older settings than monitor.env" \
+                "Apply them: docker compose --profile monitor up -d mileage-monitor"
+        fi
+        if [[ $(monitor_startup_line) != *"$(expected_startup)"* ]]; then
+            problem "The monitor is running with other settings than monitor.env" \
+                "Apply them: docker compose --profile monitor up -d mileage-monitor"
+        elif (( config_status == 0 )); then
+            ok "The monitor is running with the settings in monitor.env and its Compose configuration"
+            monitor_ok=yes
+        elif (( config_status == 2 )); then
+            ok "The monitor is running with the selected outputs (settings comparison unavailable)"
+            monitor_ok=yes
+        fi
     fi
 
     if output_on ntfy; then
