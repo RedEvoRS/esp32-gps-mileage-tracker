@@ -8,10 +8,18 @@ import json
 import math
 import os
 import sqlite3
+import subprocess
+import sys
+import threading
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+
+# One child at most per Gunicorn worker, including a child awaiting OS cleanup.
+_fetch_lock = threading.Lock()
+_fetch_process = None
 
 
 class GeocodeError(Exception):
@@ -32,10 +40,17 @@ class Geocoder:
     MAX_RESPONSE = 65536
     MAX_LABEL = 1000
     INTERVAL = 1.1
-    LEASE = 60
     RESPONSE_BUDGET = 10
+    CLEANUP_BUDGET = 1
+    LEASE_MARGIN = 5
     # Bump when the label format changes so older cached labels are not served.
     LABEL_FORMAT = 2
+
+    @property
+    def LEASE(self):
+        # Include bounded child cleanup and scheduling/transaction headroom.
+        # Derive this on access so a changed fetch budget cannot outgrow it.
+        return self.RESPONSE_BUDGET + self.CLEANUP_BUDGET + self.LEASE_MARGIN
 
     def __init__(self, db_path):
         self.db_path = db_path
@@ -154,6 +169,60 @@ class Geocoder:
                 )
 
     def _fetch(self, latitude, longitude):
+        global _fetch_process
+        unavailable = "The address provider is unavailable. Try again later."
+        if not _fetch_lock.acquire(blocking=False):
+            raise GeocodeError(unavailable)
+        process = None
+        deadline = time.monotonic() + self.RESPONSE_BUDGET
+        try:
+            if _fetch_process is not None and _fetch_process.poll() is None:
+                raise GeocodeError(unavailable)
+            if _fetch_process is not None:
+                for stream in (_fetch_process.stdin, _fetch_process.stdout):
+                    stream.close()
+            # getaddrinfo cannot be interrupted from a Python thread. A child
+            # process makes DNS, connect, TLS, headers and chunk framing all
+            # cancellable together; killing it also closes every provider socket.
+            process = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            _fetch_process = process
+            payload = json.dumps({
+                "url": self.url, "user_agent": self.user_agent,
+                "latitude": latitude, "longitude": longitude,
+                "budget": self.RESPONSE_BUDGET,
+            }).encode()
+            output, _ = process.communicate(
+                payload, timeout=max(0, deadline - time.monotonic()))
+            if process.returncode or time.monotonic() >= deadline:
+                raise GeocodeError(unavailable)
+            result = json.loads(output)
+            if "cooldown" in result:
+                raise GeocodeError(unavailable, cooldown=result["cooldown"])
+            return result["label"]
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            raise GeocodeError(unavailable) from None
+        finally:
+            if process is not None:
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=self.CLEANUP_BUDGET)
+                except (OSError, subprocess.TimeoutExpired):
+                    # Keep the process reference: another call must not spawn
+                    # a replacement until the OS has confirmed this one's exit.
+                    pass
+                finally:
+                    if process.poll() is not None:
+                        for stream in (process.stdin, process.stdout):
+                            stream.close()
+            _fetch_lock.release()
+
+    def _fetch_direct(self, latitude, longitude):
         query = urlencode({
             "lat": latitude, "lon": longitude, "format": "jsonv2",
             "zoom": 18, "addressdetails": 1, "accept-language": "en",
@@ -251,3 +320,16 @@ class Geocoder:
             return max(300, min(delay, 7 * 86400))
         except (ValueError, TypeError, OverflowError):
             return 300
+
+
+if __name__ == "__main__":
+    # Private pipes only: positions/configuration never enter argv or logs.
+    config = json.load(sys.stdin)
+    worker = Geocoder.__new__(Geocoder)
+    worker.url, worker.user_agent = config["url"], config["user_agent"]
+    worker.RESPONSE_BUDGET = config["budget"]
+    try:
+        result = {"label": worker._fetch_direct(config["latitude"], config["longitude"])}
+    except GeocodeError as exc:
+        result = {"cooldown": exc.cooldown}
+    json.dump(result, sys.stdout)

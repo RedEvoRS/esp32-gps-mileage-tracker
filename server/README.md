@@ -852,9 +852,9 @@ without deleting the cache or changing saved destinations. To refresh all result
 stop the viewer, back up the database, delete rows from `geocode_cache` using
 SQLite, then restart. A future lookup will query the configured provider again.
 
-A shared gate normally serializes requests across workers, with at least 1.1
-seconds after each successful call by default. Its reservation expires after
-60 seconds, so a longer stalled call can overlap a later lookup.
+A shared gate serializes requests across workers, with at least 1.1
+seconds after each successful call by default. Its reservation covers the
+entire lookup deadline and cleanup period, plus a five-second safety margin.
 Set `VIEWER_GEOCODER_INTERVAL` in `viewer.env` to change the normal gap
 (0.1 to 60 seconds); leaving it unset or empty keeps the default, which suits
 providers with a one-request-per-second policy. Use values below 1 second only
@@ -862,17 +862,14 @@ with self-hosted Nominatim or a provider that explicitly permits them.
 Provider failures trigger a five-minute cooldown (longer `Retry-After` values are
 honoured up to seven days). There are no automatic retries,
 redirects, or ambient HTTP proxies. Responses have a 64 KiB size limit and a
-ten-second monotonic deadline checked between reads, with five-second socket
-timeouts. A single read can overrun the deadline, particularly while parsing
-chunked response framing. DNS resolution and initial response headers are not
-covered by the read checks. The viewer uses Gunicorn's `gthread` workers
-(two processes, four request threads each), whose
-[worker timeout](https://gunicorn.org/reference/settings/#timeout) does not
-limit an individual request. There is no hard whole-request deadline for
-lookup: a stalled provider can keep a thread occupied, and repeated stalls
-can exhaust the viewer's threads. If this happens, clear `VIEWER_GEOCODER_URL`
-in `viewer.env` and run `docker compose up -d mileage-viewer` to disable lookup
-and release the stalled threads.
+ten-second whole-request deadline, including DNS resolution, connection,
+TLS, response headers, body and chunked framing. Each lookup runs in a
+short-lived subprocess; at the deadline the viewer kills it, closing its
+sockets, and allows up to one additional second for cleanup. A timeout returns
+"provider unavailable" with the usual failure cooldown, freeing the viewer
+request thread. Each viewer worker allows at most one provider subprocess,
+including any child still awaiting operating-system cleanup. This limit does
+not depend on Gunicorn's worker timeout.
 Ordinary busy/unavailable/no-match responses leave the map,
 manual annotations and exports usable. Lookup is authenticated and CSRF-protected;
 upstream errors, response bodies, coordinates and URLs are not logged by lookup.
