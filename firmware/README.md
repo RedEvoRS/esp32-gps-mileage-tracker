@@ -19,7 +19,9 @@ diagnostics when the microSD card is missing or failing. Firmware `v1.02`
 (tag `fw-v1.02`) followed on 2026-11-04 (UTC): a card that stops responding
 while running reports E4001 and new trips move to internal flash, a long
 POWER press on USB shows an on-screen message, and diagnostic journal write
-failures raise E4008. On
+failures raise E4008. Firmware `v1.03` (tag `fw-v1.03`) followed the same
+day: a long POWER press on battery shows **Switching off** for about a
+second before the screen goes dark. On
 2026-10-21 (UTC), an earlier Stage 4 build uploaded
 four real trips from microSD to the deployed server, then delivered all 115
 pending diagnostic events and a current snapshot. Uploads with debug mode
@@ -728,7 +730,7 @@ For why it works this way, see [the firmware design](DESIGN.md).
 
 The `04_trip_logger/` sketch detects trips, accumulates mileage and writes
 GPS Exchange Format (GPX) files to the microSD card, with internal LittleFS
-as fallback. The current release is `v1.02`; it uploads trips from
+as fallback. The current release is `v1.03`; it uploads trips from
 the card, and the [top-level README](../README.md#where-its-at) has the current status and
 what's still unproven on a real board. Since `v0.06` there is one firmware build: debug
 mode starts off at every power-on and can be toggled by holding BOOT and
