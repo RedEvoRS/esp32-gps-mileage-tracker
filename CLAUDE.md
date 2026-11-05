@@ -45,7 +45,9 @@ release, followed the same day. LittleFS uploads were verified on the road on
 2026-11-03 (UTC), and firmware v1.01 the same day keeps diagnostics running
 without the card. Firmware v1.02 (2026-11-04) reports a card lost while
 running as E4001 and moves new trips to LittleFS, shows a USB-power card on a
-refused long press, and raises E4008 for journal write failures. HTTP 413 remains untested on the Supreme. Other hardware acceptance is tracked under `supreme-port`.
+refused long press, and raises E4008 for journal write failures. Firmware
+v1.03 (2026-11-04) shows a "Switching off" card before a user long-press
+power-off on battery. HTTP 413 remains untested on the Supreme. Other hardware acceptance is tracked under `supreme-port`.
 Don't assume a Supreme pin, rail or peripheral works until its port issue
 is closed and it's verified on the bench.
 
