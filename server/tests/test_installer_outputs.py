@@ -42,6 +42,11 @@ HARNESS = textwrap.dedent("""\
 
     # Docker: every inspect answers with the state the test set.
     docker() {
+        if [[ $* == *com.docker.compose.config-hash* ]]; then
+            printf '%s\\n' "${FAKE_CONTAINER_HASH:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+            printf '%s' "${FAKE_HASH_ERROR-}" >&2
+            return "${FAKE_INSPECT_RC:-0}"
+        fi
         case $1 in
             inspect) printf '%s\\n' "${FAKE_STATUS:-running}" ;;
         esac
@@ -58,6 +63,15 @@ HARNESS = textwrap.dedent("""\
             if [[ $a == -c ]]; then next=1; fi
         done
         case "$*" in
+            "--profile monitor config")
+                printf '%s\\n' "${FAKE_RESOLVED_CONFIG:-resolved config}"
+                printf '%s' "${FAKE_HASH_ERROR-}" >&2
+                return "${FAKE_CONFIG_RC:-0}" ;;
+            "--profile monitor -f - config --hash mileage-monitor")
+                cat > /dev/null
+                printf '%s\\n' "${FAKE_CURRENT_HASH:-mileage-monitor aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+                printf '%s' "${FAKE_HASH_ERROR-}" >&2
+                return "${FAKE_HASH_RC:-0}" ;;
             *" ps -a -q "*)
                 if [[ " ${FAKE_RUNNING-} " == *" ${!#} "* ]]; then printf 'cid-%s\\n' "${!#}"; fi
                 return 0 ;;
@@ -512,6 +526,51 @@ class InstallerOutputs(unittest.TestCase):
         for action in ("up -d", " stop ", "user add", "token add", "access "):
             self.assertNotIn(action, log)
         self.assertFalse((self.work / "stdin.log").exists())
+
+    def test_check_monitor_hash_matches(self):
+        self.run_step(INSTALL_OUTPUTS="metrics")
+        secret = "synthetic-resolved-config-secret"
+        result = self.run_step(mode="check", FAKE_RESOLVED_CONFIG=secret)
+        self.assertIn("settings in monitor.env and its Compose configuration", result.stdout)
+        self.assertIn("FAILURES=0", result.stdout)
+        self.assertIn("--profile monitor -f - config --hash mileage-monitor", self.compose_log())
+        self.assert_no_secret(result, secret, self.setting("METRICS_TOKEN"), "a" * 64)
+        self.assertNotIn(secret, self.compose_log())
+
+    def test_check_monitor_hash_differs_even_with_matching_output_flags(self):
+        self.run_step(INSTALL_OUTPUTS="metrics")
+        with (self.work / "monitor.env").open("a") as handle:
+            handle.write("MONITOR_STALE_DAYS=14\n")
+        result = self.run_step(mode="check", FAKE_CONTAINER_HASH="b" * 64)
+        self.assertIn("The monitor is running with older settings than monitor.env", result.stdout)
+        self.assertIn("Apply them: docker compose --profile monitor up -d mileage-monitor", result.stdout)
+        self.assertIn("FAILURES=1", result.stdout)
+        self.assertNotIn("The monitor is running with the settings in", result.stdout)
+        self.assert_no_secret(result, self.setting("METRICS_TOKEN"), "a" * 64, "b" * 64)
+
+    def test_check_monitor_hash_unavailable_uses_honest_fallback(self):
+        self.run_step(INSTALL_OUTPUTS="metrics")
+        secret = "synthetic-compose-diagnostic-secret"
+        cases = [dict(FAKE_HASH_RC="1"), dict(FAKE_CONFIG_RC="1"),
+                 dict(FAKE_INSPECT_RC="1"), dict(FAKE_CONTAINER_HASH="<no value>"),
+                 dict(FAKE_CURRENT_HASH="unexpected config with " + secret)]
+        for fakes in cases:
+            with self.subTest(fakes=fakes):
+                result = self.run_step(mode="check", FAKE_HASH_ERROR=secret, **fakes)
+                self.assertIn("selected outputs (settings comparison unavailable)", result.stdout)
+                self.assertIn("FAILURES=0", result.stdout)
+                self.assertNotIn("settings in monitor.env", result.stdout)
+                self.assert_no_secret(result, secret, self.setting("METRICS_TOKEN"))
+
+    def test_check_monitor_startup_still_checked_with_matching_or_unavailable_hash(self):
+        self.run_step(INSTALL_OUTPUTS="metrics")
+        for hash_rc in ("0", "1"):
+            with self.subTest(hash_rc=hash_rc):
+                result = self.run_step(mode="check", FAKE_HASH_RC=hash_rc,
+                                       FAKE_LOGS_ALWAYS="1", FAKE_LOGS="Invalid monitor configuration")
+                self.assertIn("The monitor is running with other settings than monitor.env", result.stdout)
+                self.assertIn("FAILURES=1", result.stdout)
+                self.assertNotIn("  OK  The monitor is running", result.stdout)
 
     def test_graylog_url_comments_out_a_tls_setting_that_only_applies_to_tcp(self):
         (self.work / "monitor.env").write_text(

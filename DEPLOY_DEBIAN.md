@@ -1764,9 +1764,12 @@ destination must be reachable from the monitor, metrics must refuse a request
 without the token, and the bundled ntfy must refuse anonymous reads. Outputs that are off are reported as "off", never as
 problems, so a check with nothing turned on passes.
 
-This does not prove every edited URL, credential or tuning value was loaded.
-After editing `monitor.env`, recreate the monitor as in 11c and check delivery
-at each destination.
+It also compares the container's Compose configuration hash with the current
+configuration, including URLs, credentials and tuning values in `monitor.env`,
+without displaying them. Older settings are reported with a command to apply
+them. If Compose cannot supply the hash, the message says only the selected
+outputs were checked. After editing `monitor.env`, recreate the monitor as in
+11c and check delivery at each destination; these checks do not prove delivery.
 
 For an unattended install, every question has an environment variable. Set
 `INSTALL_OUTPUTS` to `none` or a list such as `ntfy,metrics`. Set
