@@ -1958,9 +1958,10 @@ belongs to #121.
 
 Conditions are grouped active / unknown / clear from `device_conditions`.
 Never-observed catalog conditions with `journal=transitions` also appear as
-unknown (server-raised 7xxx codes excluded), folded into a collapsed section
-because it is usually most of the catalog. Each known code has its current
-catalog severity, title, OLED text,
+unknown (server-raised 7xxx codes excluded). Unknown and Clear start collapsed
+because either can contain most of the catalog; click their headings to expand
+them. Each heading keeps its condition count visible. Active stays expanded.
+Each known code has its current catalog severity, title, OLED text,
 explanation and recovery. Unknown codes show `Unknown E####` without severity.
 Older events and boots never alter current conditions in the viewer.
 

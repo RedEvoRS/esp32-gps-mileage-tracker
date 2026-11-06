@@ -11,6 +11,7 @@ import time
 import unittest
 from contextlib import closing
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +23,31 @@ from common.diagnostics import validate_request
 
 BOOT = "00000000000000000000000000000001"
 RECEIPT = "2027-01-01T07:59:00+00:00"
+
+
+class ConditionGroupParser(HTMLParser):
+    """Record condition headings and their disclosure ancestors."""
+
+    def __init__(self, html):
+        super().__init__()
+        self.parents = []
+        self.headings = []
+        self.feed(html)
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"details", "summary", "h3"}:
+            element = {"tag": tag, "attrs": dict(attrs), "text": ""}
+            if tag == "h3":
+                self.headings.append((element, list(self.parents)))
+            self.parents.append(element)
+
+    def handle_endtag(self, tag):
+        if tag in {"details", "summary", "h3"}:
+            self.parents.pop()
+
+    def handle_data(self, data):
+        if self.parents and self.parents[-1]["tag"] == "h3":
+            self.parents[-1]["text"] += data
 
 
 class ViewerDiagnostics(unittest.TestCase):
@@ -171,6 +197,22 @@ os._exit(0)
         self.assertEqual([c["code"] for c in groups["clear"]], [4001])
         self.assertIn(1001, [c["code"] for c in groups["unknown"]])
         self.assertNotIn(7001, [c["code"] for g in groups.values() for c in g])  # server-raised
+
+    def test_only_active_conditions_start_expanded(self):
+        self.fixture()
+        groups = self.viewer.read_diagnostics(1, None, "")["devices"][0]["groups"]
+        headings = ConditionGroupParser(self.page()).headings
+        self.assertEqual([heading["text"] for heading, _ in headings], [
+            f"{state.capitalize()} conditions ({len(conditions)})"
+            for state, conditions in groups.items()
+        ])
+        for (state, _), (_, parents) in zip(groups.items(), headings):
+            with self.subTest(state=state):
+                if state == "active":
+                    self.assertEqual(parents, [])
+                else:
+                    self.assertEqual([parent["tag"] for parent in parents], ["details", "summary"])
+                    self.assertNotIn("open", parents[0]["attrs"])
 
     def test_gpx_only_contact_has_no_snapshot(self):
         self.store.refresh_contact("tracker-1")
