@@ -1081,6 +1081,52 @@ def fmt_speed(value):
     return "—" if value is None else f"{value:.1f}"
 
 
+def fmt_uptime(ms):
+    """Device uptime from a snapshot, in the trip-duration style.
+
+    The protocol guarantees a non-negative integer, but a damaged/edited DB
+    may hold anything: show such a value as stored text (autoescaped).
+    """
+    if type(ms) is not int or ms < 0:
+        return str(ms)
+    seconds = ms // 1000
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    d, h = divmod(h, 24)
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+STORAGE_LABELS = {"sd": "SD card", "littlefs": "Internal flash", "ram": "RAM only", "none": "None"}
+
+
+def storage_label(value):
+    return STORAGE_LABELS.get(value, value) if isinstance(value, str) else str(value)
+
+
+def split_version(stamp):
+    """('v1.03', '+5c8ae745cf') so the commit can be muted; joined text is unchanged."""
+    text = str(stamp)
+    release, plus, commit = text.partition("+")
+    return release, plus + commit
+
+
+def snapshot_counters(snapshot):
+    """Boot-local counters, numerically sorted, with current-catalog titles."""
+    rows = []
+    for key, count in (snapshot or {}).get("counters", {}).items():
+        number = int(key) if isinstance(key, str) and key.isascii() and key.isdigit() else None
+        title = diagnostics_definition(number)["title"] if number is not None else "Unknown counter"
+        rows.append({"label": f"E{key}" if number is not None else key, "title": title,
+                     "count": count, "sort": (number is None, number or 0, str(key))})
+    return sorted(rows, key=lambda row: row["sort"])
+
+
 def _parse(iso):
     if not iso:
         return None
@@ -1478,7 +1524,9 @@ def _abort_if_key_in_closed_year(conn, *keys):
 
 app.jinja_env.globals.update(
     fmt_date=fmt_date, fmt_day=fmt_day, fmt_trip_date=fmt_trip_date, fmt_duration=fmt_duration,
-    fmt_speed=fmt_speed, csrf_token=_csrf_token, annotation_max=ANNOTATION_MAX_CHARS
+    fmt_speed=fmt_speed, csrf_token=_csrf_token, annotation_max=ANNOTATION_MAX_CHARS,
+    fmt_uptime=fmt_uptime, storage_label=storage_label, split_version=split_version,
+    snapshot_counters=snapshot_counters,
 )
 
 
@@ -2089,6 +2137,19 @@ DEVICE_HEALTH_HTML = """
   .oled { white-space: pre-wrap; }
   .condition { border-bottom: 1px solid var(--border); padding: 8px 0; }
   summary > h3 { display: inline; }
+  /* Snapshot: small label/value boxes, side by side when they fit, stacked on phones. */
+  .snapshot { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+              gap: 10px; margin: 12px 0 18px; }
+  .snapshot-group { border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; min-width: 0; }
+  .snapshot-group h3 { margin: 0 0 6px; font-size: 12px; font-weight: 600; text-transform: uppercase;
+                       letter-spacing: .05em; color: var(--muted); }
+  .snapshot-group dl { display: grid; grid-template-columns: max-content minmax(0, 1fr);
+                       gap: 4px 14px; margin: 0; font-size: 14px; }
+  .snapshot-group dt { color: var(--muted); }
+  .snapshot-group dd { margin: 0; overflow-wrap: anywhere; }
+  .snapshot-group .commit { color: var(--muted); font-size: 12px; }
+  .snapshot-group .not-reported { color: var(--muted); font-style: italic; margin: 0; font-size: 14px; }
+  .snapshot-group .count { font-weight: 600; white-space: nowrap; }
 </style></head><body>
 <header><a href="{{ url_for('index') }}">← Trips</a>
   <div class="header-actions">
@@ -2107,26 +2168,41 @@ DEVICE_HEALTH_HTML = """
 {% else %}
   <p class="muted">Times shown in {{ timezone }}. Contact can be recent while a snapshot is stale.
     Unknown means the condition has not been observed in the latest snapshot; it does not prove recovery.</p>
+  {% macro not_reported() %}<span class="not-reported">Not reported</span>{% endmacro %}
+  {% macro version(stamp) %}{% if stamp is none %}{{ not_reported() }}{% else %}{% set parts = split_version(stamp) %}{{ parts[0] }}{% if parts[1] %}<span class="commit">{{ parts[1] }}</span>{% endif %}{% endif %}{% endmacro %}
+  {% macro reported(s, key, fmt=none) %}{% if key in s %}{{ fmt(s[key]) if fmt else s[key] }}{% else %}{{ not_reported() }}{% endif %}{% endmacro %}
   {% for d in devices %}
   <section><h2>{{ d.device_id }}</h2>
     <p>Last server contact: {{ fmt_date(d.last_contact_at) }} ({{ d.contact_age }})</p>
     {% if d.snapshot is not none %}
     <p>Snapshot received: {{ fmt_date(d.snapshot_received_at) }} ({{ d.snapshot_age }}).
       Snapshot age measures staleness; contact does not refresh it.</p>
-    <dl>
-    {% for key, label in [('firmware_version', 'Firmware'), ('storage_backend', 'Storage backend'),
-        ('pending_events', 'Pending events'), ('dropped_events', 'Dropped events'),
-        ('boot_counter', 'Boot counter'), ('uptime_ms', 'Uptime (ms)')] %}
-      <dt>{{ label }}</dt><dd>{{ d.snapshot.get(key, 'Not reported') }}</dd>
-      {% if key == 'firmware_version' %}<dt>Server</dt><dd>{{ server_version }}</dd>{% endif %}
-    {% endfor %}
-      <dt>Status revision</dt><dd>{{ d.status_sequence }}</dd>
-      <dt>Counters (boot-local)</dt><dd>
-      {% for key, value in d.snapshot.get('counters', {}).items() %}
-        <div>E{{ key }} = {{ value }}</div>
-      {% else %}Not reported{% endfor %}</dd>
-    </dl>
-    {% else %}<p>No health snapshot received. Contact alone does not establish device health.</p><dl><dt>Server</dt><dd>{{ server_version }}</dd></dl>{% endif %}
+    {% else %}<p>No health snapshot received. Contact alone does not establish device health.</p>{% endif %}
+    {% set s = d.snapshot or {} %}
+    <div class="snapshot">
+      <div class="snapshot-group"><h3 class="snapshot-title">Software</h3><dl>
+        {% if d.snapshot is not none %}<dt>Firmware</dt><dd>{{ version(s.get('firmware_version')) }}</dd>{% endif %}
+        <dt>Server</dt><dd>{{ version(server_version) }}</dd>
+      </dl></div>
+      {% if d.snapshot is not none %}
+      <div class="snapshot-group"><h3 class="snapshot-title">Device</h3><dl>
+        <dt>Uptime</dt><dd>{{ reported(s, 'uptime_ms', fmt_uptime) }}</dd>
+        <dt>Boot counter</dt><dd>{{ reported(s, 'boot_counter') }}</dd>
+        <dt>Storage</dt><dd>{{ reported(s, 'storage_backend', storage_label) }}</dd>
+      </dl></div>
+      <div class="snapshot-group"><h3 class="snapshot-title">Event journal</h3><dl>
+        <dt>Pending</dt><dd>{{ reported(s, 'pending_events') }}</dd>
+        <dt>Dropped</dt><dd>{{ reported(s, 'dropped_events') }}</dd>
+        <dt>Status revision</dt><dd>{{ d.status_sequence }}</dd>
+      </dl></div>
+      <div class="snapshot-group"><h3 class="snapshot-title">Counters (since boot)</h3>
+        {% set counters = snapshot_counters(s) %}
+        {% if counters %}<dl>
+        {% for c in counters %}<dt>{{ c.label }}</dt><dd>{{ c.title }} <span class="count">×{{ c.count }}</span></dd>{% endfor %}
+        </dl>{% else %}<p class="not-reported">{{ 'None' if 'counters' in s else 'Not reported' }}</p>{% endif %}
+      </div>
+      {% endif %}
+    </div>
     {% for state_name, conditions in d.groups.items() %}
     {# Unknown and Clear can fill most of the catalog; fold both so Active stays prominent. #}
     {% if state_name in ('unknown', 'clear') %}<details><summary>{% endif %}
