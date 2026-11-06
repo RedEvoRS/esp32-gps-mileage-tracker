@@ -252,12 +252,14 @@ class ServiceVersions(unittest.TestCase):
         with patch.dict(os.environ, SERVER_VERSION="v0.01+abcdef1234"), \
                 patch.object(self.viewer, "read_diagnostics", return_value=data):
             html = client.get("/device-health").get_data(as_text=True)
-        self.assertRegex(html, r"<dt>Firmware</dt><dd>v0.06\+0123456789</dd>\s*<dt>Server</dt><dd>v0.01\+abcdef1234</dd>")
+        self.assertRegex(html, r'<dt>Firmware</dt><dd>v0.06<span class="commit">\+0123456789</span></dd>\s*'
+                               r'<dt>Server</dt><dd>v0.01<span class="commit">\+abcdef1234</span></dd>')
         data["devices"][0]["snapshot"] = None
         with patch.dict(os.environ, SERVER_VERSION="v0.01+abcdef1234"), \
                 patch.object(self.viewer, "read_diagnostics", return_value=data):
             html = client.get("/device-health").get_data(as_text=True)
-        self.assertIn("<dt>Server</dt><dd>v0.01+abcdef1234</dd>", html)
+        self.assertIn('<dt>Server</dt><dd>v0.01<span class="commit">+abcdef1234</span></dd>', html)
+        self.assertNotIn("<dt>Firmware</dt>", html)
         self.assertIn("No health snapshot received", html)
 
     def test_version_on_http_errors_preserves_status_and_headers(self):

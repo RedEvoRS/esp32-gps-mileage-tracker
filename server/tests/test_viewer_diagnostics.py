@@ -37,7 +37,8 @@ class ConditionGroupParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
         if tag in {"details", "summary", "h3"}:
             element = {"tag": tag, "attrs": dict(attrs), "text": ""}
-            if tag == "h3":
+            # Snapshot box titles are h3 too, but are not condition groups.
+            if tag == "h3" and element["attrs"].get("class") != "snapshot-title":
                 self.headings.append((element, list(self.parents)))
             self.parents.append(element)
 
@@ -187,8 +188,11 @@ os._exit(0)
     def test_current_conditions_and_snapshot_fields(self):
         self.fixture()
         page = self.page()
-        for value in ("tracker-1", "test-1.0", "Storage backend", "Pending events", "Dropped events",
-                      "E5001 = 3", "Active conditions (1)", "Clear conditions (1)",
+        for value in ("tracker-1", "test-1.0", "<dt>Storage</dt><dd>SD card</dd>", "<dt>Pending</dt><dd>7</dd>",
+                      "<dt>Dropped</dt><dd>2</dd>", "<dt>Uptime</dt><dd>1s</dd>",
+                      '<dt>Boot counter</dt><dd><span class="not-reported">Not reported</span></dd>',
+                      '<dt>E5001</dt><dd>Home access point not seen <span class="count">×3</span>',
+                      "Active conditions (1)", "Clear conditions (1)",
                       "Unknown conditions", "Snapshot age measures staleness", "OLED:", "Recovery:"):
             self.assertIn(value, page)
         data = self.viewer.read_diagnostics(1, None, "")
@@ -319,6 +323,49 @@ os._exit(0)
             event.update(utc_ms=None, time_source="unknown", sync_age_ms=None)
             db.execute("UPDATE events SET canonical_json=?", (json.dumps(event),))
         self.assertIn("Device clock unknown", self.page())
+
+    def test_snapshot_value_formatting(self):
+        v = self.viewer
+        for ms, text in ((0, "0s"), (999, "0s"), (59_999, "59s"), (1_729_210, "28m 49s"),
+                         (3_600_000, "1h 0m"), (11_520_000, "3h 12m"), (187_200_000, "2d 4h")):
+            with self.subTest(ms=ms):
+                self.assertEqual(v.fmt_uptime(ms), text)
+        for damaged in (-1, True, "12", None, 1.5):  # never crash on an edited DB
+            self.assertEqual(v.fmt_uptime(damaged), str(damaged))
+        self.assertEqual([v.storage_label(x) for x in ("sd", "littlefs", "ram", "none", "odd", 3)],
+                         ["SD card", "Internal flash", "RAM only", "None", "odd", "3"])
+        self.assertEqual(v.split_version("v1.03+5c8ae745cf"), ("v1.03", "+5c8ae745cf"))
+        self.assertEqual(v.split_version("unversioned"), ("unversioned", ""))
+        rows = v.snapshot_counters({"counters": {"9999": 1, "x": 2, "5001": 7, "５": 3}})
+        self.assertEqual([(r["label"], r["title"], r["count"]) for r in rows], [
+            ("E5001", "Home access point not seen", 7), ("E9999", "Unknown E9999", 1),
+            ("x", "Unknown counter", 2), ("５", "Unknown counter", 3)])
+        self.assertEqual(v.snapshot_counters(None), [])
+        self.assertEqual(v.snapshot_counters({}), [])
+
+    def test_snapshot_groups_and_missing_values(self):
+        self.fixture()
+        page = self.page()
+        titles = [h for h in ("Software", "Device", "Event journal", "Counters (since boot)")
+                  if f'<h3 class="snapshot-title">{h}</h3>' in page]
+        self.assertEqual(len(titles), 4)
+        self.assertIn('<dt>Status revision</dt><dd>1</dd>', page)
+        self.assertIn('<dt>Firmware</dt><dd>test-1.0</dd>', page)
+        with closing(sqlite3.connect(self.store.path)) as db, db:
+            snapshot = json.loads(db.execute("SELECT snapshot_json FROM devices").fetchone()[0])
+            for key in ("firmware_version", "storage_backend", "pending_events", "counters"):
+                snapshot.pop(key, None)
+            snapshot["uptime_ms"] = "damaged"
+            db.execute("UPDATE devices SET snapshot_json=?", (json.dumps(snapshot),))
+        page = self.page()
+        for label in ("Firmware", "Storage", "Pending", "Boot counter"):
+            self.assertIn(f'<dt>{label}</dt><dd><span class="not-reported">Not reported</span></dd>', page)
+        self.assertIn('<p class="not-reported">Not reported</p>', page)  # counters absent
+        self.assertIn("<dt>Uptime</dt><dd>damaged</dd>", page)
+        with closing(sqlite3.connect(self.store.path)) as db, db:
+            snapshot["counters"] = {}
+            db.execute("UPDATE devices SET snapshot_json=?", (json.dumps(snapshot),))
+        self.assertIn('<p class="not-reported">None</p>', self.page())
 
     def test_hostile_stored_text_is_autoescaped(self):
         self.fixture()
