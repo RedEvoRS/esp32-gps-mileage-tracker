@@ -2088,6 +2088,7 @@ DEVICE_HEALTH_HTML = """
   .health-table td { vertical-align: top; overflow-wrap: anywhere; }
   .oled { white-space: pre-wrap; }
   .condition { border-bottom: 1px solid var(--border); padding: 8px 0; }
+  summary > h3 { display: inline; }
 </style></head><body>
 <header><a href="{{ url_for('index') }}">← Trips</a>
   <div class="header-actions">
@@ -2127,10 +2128,10 @@ DEVICE_HEALTH_HTML = """
     </dl>
     {% else %}<p>No health snapshot received. Contact alone does not establish device health.</p><dl><dt>Server</dt><dd>{{ server_version }}</dd></dl>{% endif %}
     {% for state_name, conditions in d.groups.items() %}
-    {# Unknown is usually most of the catalog; keep it folded away. #}
-    {% if state_name == 'unknown' %}<details><summary>{% endif %}
-    <h3 style="display:inline">{{ state_name|capitalize }} conditions ({{ conditions|length }})</h3>
-    {% if state_name == 'unknown' %}</summary>{% endif %}
+    {# Unknown and Clear can fill most of the catalog; fold both so Active stays prominent. #}
+    {% if state_name in ('unknown', 'clear') %}<details><summary>{% endif %}
+    <h3>{{ state_name|capitalize }} conditions ({{ conditions|length }})</h3>
+    {% if state_name in ('unknown', 'clear') %}</summary>{% endif %}
     {% for c in conditions %}
       <div class="condition"><b>E{{ c.code }} · {{ c.title }}</b>
         {% if c.severity %}<span class="tag">{{ c.severity }}</span>{% endif %}
@@ -2139,7 +2140,7 @@ DEVICE_HEALTH_HTML = """
         <p>{{ c.explanation }} Recovery: {{ c.recovery }}</p>
       </div>
     {% else %}<p class="muted">None recorded.</p>{% endfor %}
-    {% if state_name == 'unknown' %}</details>{% endif %}
+    {% if state_name in ('unknown', 'clear') %}</details>{% endif %}
     {% endfor %}
   </section>
   {% else %}<p>No devices recorded yet.</p>{% endfor %}
