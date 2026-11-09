@@ -139,6 +139,7 @@ class GelfConfig:
 
 def _ssl_context(config):
     context = ssl.create_default_context(cafile=config.ca_file or None)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     if not config.tls_verify:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE

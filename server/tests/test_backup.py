@@ -581,6 +581,27 @@ fi
         self.assertTrue(any(c.startswith("stop mileage-ingest mileage-viewer") for c in calls))
         self.assertEqual(calls[-1], "up -d")
 
+    def test_device_suffixed_trip_and_annotation_survive_backup_restore(self):
+        key = "2026-10/2026-10-01T15-00-00Z-012345abcdef"
+        self.add_trip(key, "second-device")
+        with sqlite3.connect(self.db_dir / "annotations.db") as conn:
+            conn.execute("INSERT INTO annotations VALUES (?, ?, ?, ?, ?)",
+                         (key, "business", "second device visit", "", ""))
+        conn.close()
+        self.run_script("backup.sh")
+        for suffix in (".gpx", ".json"):
+            (self.data / (key + suffix)).unlink()
+        with sqlite3.connect(self.db_dir / "annotations.db") as conn:
+            conn.execute("DELETE FROM annotations WHERE trip_key=?", (key,))
+        conn.close()
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+        for suffix in (".gpx", ".json"):
+            self.assertEqual((self.data / (key + suffix)).read_text(), "second-device" + suffix)
+        with sqlite3.connect(self.db_dir / "annotations.db") as conn:
+            self.assertEqual(conn.execute("SELECT purpose_note FROM annotations WHERE trip_key=?",
+                                          (key,)).fetchone(), ("second device visit",))
+        conn.close()
+
     def test_restore_needs_confirmation(self):
         self.run_script("backup.sh")
         result = self.run_script("restore.sh", "restore", "latest", check=False)

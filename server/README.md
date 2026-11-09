@@ -433,12 +433,19 @@ for storage, Python fallback and service setup.
    token generated in step 3.
 
    A timed GPX always gets its ID from its earliest point time (or metadata
-   time when no point is timed), in UTC. `X-Trip-Id` is used only when the GPX
-   has no usable point or metadata timestamp; otherwise it is ignored.
-   It can then name that upload, except that timestamp-shaped IDs
-   are reserved for timed GPX. Firmware never sends that header: local
-   filenames (`t000001.gpx`, for example) use a counter kept in the board's
-   flash settings (NVS, the ESP32's non-volatile storage), while each
+   time when no point is timed), in UTC: `YYYY-MM-DDTHH-MM-SSZ`. If that ID
+   already holds different GPX from another device, ingest appends `-` and the
+   first 12 lowercase hexadecimal characters of the SHA-256 of this upload's
+   device ID (UTF-8), from `X-Device-Id` or the GPX creator fallback. Retries
+   keep the same ID and original receipt metadata. Different GPX from the same
+   device, a conflicting suffixed ID, or an unreadable/missing original device
+   identity still returns 409; ingest never overwrites another trip.
+   `X-Trip-Id` is used only when the GPX has no usable point or metadata
+   timestamp; otherwise it is ignored.
+   It can then name that upload, except that timestamp-shaped IDs, with or
+   without this device suffix, are reserved for timed GPX. Firmware never sends
+   that header: local filenames (`t000001.gpx`, for example) use a counter kept
+   in the board's flash settings (NVS, the ESP32's non-volatile storage), while each
    uploaded size-split piece starts at its own boundary fix. Retries search
    all month directories under the upload lock and keep the original folder,
    including after a `DISPLAY_TZ` change. Existing duplicate folders require

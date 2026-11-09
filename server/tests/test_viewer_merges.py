@@ -109,6 +109,72 @@ class ViewerMerges(unittest.TestCase):
         self.assertNotIn("Inside a merged trip", self.client.get("/?year=2026").get_data(as_text=True))
         self.assertIn("Trips inside a merged trip (0)", self.client.get("/admin/year/2026").get_data(as_text=True))
 
+    def test_colliding_ingest_ids_support_routes_annotations_exports_history_and_merges(self):
+        from test_ingest_safety import load_ingest
+        from test_ingest_audit import gpx
+        ingest = load_ingest(self.data)
+        uploader = ingest.app.test_client()
+        keys = []
+        for device, speed in (("device-a", "1"), ("device-b", "2")):
+            raw = gpx("2026-04-14T12:00:00Z", speed=speed)
+            response = uploader.post("/upload", data=raw, headers={
+                "Authorization": "Bearer test-token", "X-Device-Id": device})
+            self.assertEqual(response.status_code, 200)
+            key = Path(response.json["stored_as"]).with_suffix("").as_posix()
+            keys.append(key)
+            self.assertEqual(self.annotate(key, "business", device).status_code, 302)
+            self.assertEqual(self.client.get(f"/trip/{key}").status_code, 200)
+            track = self.client.get(f"/gpx/{key}")
+            try:
+                self.assertEqual(track.status_code, 200)
+                self.assertEqual(track.data, raw)
+            finally:
+                track.close()
+        self.assertTrue(keys[1].startswith(keys[0] + "-"))
+        trips, unreadable = self.viewer.load_trips()
+        self.assertFalse(unreadable)
+        self.assertEqual({t["trip_key"] for t in trips}, set(keys))
+        rows = list(csv.DictReader(io.StringIO(self.client.get("/export.csv").data.decode())))
+        self.assertEqual({r["trip_id"] for r in rows if r["row_type"] == "trip"},
+                         {k.split("/")[1] for k in keys})
+        book = load_workbook(io.BytesIO(self.client.get("/export.xlsx").data))
+        try:
+            headers, *values = list(book["Mileage"].values)
+            self.assertEqual({dict(zip(headers, row))["trip_id"] for row in values},
+                             {k.split("/")[1] for k in keys})
+        finally:
+            book.close()
+        key = keys[1]
+        for action in ("remove", "restore"):
+            response = self.client.post(f"/trip/{key}/{action}", data={
+                "csrf_token": "test-csrf", "reason": "test removal"})
+            self.assertEqual(response.status_code, 302)
+        with closing(sqlite3.connect(self.db)) as conn:
+            actions = conn.execute("SELECT action FROM trip_history WHERE trip_key=?", (key,)).fetchall()
+        self.assertIn(("remove",), actions)
+        self.assertIn(("restore",), actions)
+        following = self.trip("later", 180, device="device-b")
+        merged = self.merged_key(self.merge(key, following))
+        rows = list(csv.DictReader(io.StringIO(self.client.get("/export.csv").data.decode())))
+        row = next(r for r in rows if r["trip_id"] == key.split("/")[1])
+        self.assertEqual(row["gpx_file"], f"{key}.gpx; {following}.gpx")
+        self.assertEqual(self.split(merged).status_code, 302)
+        self.assertEqual(self.viewer.get_annotations()[key]["purpose_note"], "device-b")
+
+    def test_damaged_summary_device_suffix_preserves_timestamp_adjacency_evidence(self):
+        a, b = self.trip("a", 0), self.trip("b", 120)
+        old = self.trip("2026-03-14T12-00-00Z-012345abcdef", -31 * 86400)
+        self.damage_summary(old, start_time=None, device_id=None)
+        with self.assertLogs(self.viewer.app.logger, "WARNING"):
+            page = self.client.get(f"/trip/{a}").get_data(as_text=True)
+        self.assertIn(">Merge with next trip</button>", page)
+        between = self.trip("2026-04-14T12-01-30Z-012345abcdef", 90)
+        self.damage_summary(between, start_time=None, device_id=None)
+        with self.assertLogs(self.viewer.app.logger, "WARNING"):
+            response = self.merge(a, b)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("may fall between these recordings", response.get_data(as_text=True))
+
     def damage_summary(self, key, **fields):
         path = self.data / (key + ".json")
         summary = json.loads(path.read_text(encoding="utf-8"))

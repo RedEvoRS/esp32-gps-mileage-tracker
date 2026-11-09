@@ -703,8 +703,10 @@ def _safe_trip_paths(ym, trip_id):
     root = DATA_ROOT.resolve()
     if root != base and root not in base.parents:
         abort(404)
-    gpx = base / f"{trip_id}.gpx"
-    json_path = base / f"{trip_id}.json"
+    gpx = (base / f"{trip_id}.gpx").resolve()
+    json_path = (base / f"{trip_id}.json").resolve()
+    if any(root not in path.parents for path in (gpx, json_path)):
+        abort(404)
     return gpx, json_path
 
 
@@ -766,7 +768,10 @@ def read_summary(json_path):
             summary = json.load(fh)
     except FileNotFoundError:
         problem = "the file is missing"
-    except (OSError, ValueError) as exc:  # ValueError: bad JSON or bad UTF-8
+    except OSError:
+        app.logger.warning("Failed to read trip summary %s", json_path, exc_info=True)
+        problem = "the file could not be read"
+    except ValueError as exc:  # bad JSON or bad UTF-8
         problem = str(exc)
     else:
         problem = _summary_problem(summary)

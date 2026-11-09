@@ -19,8 +19,9 @@ and identifies the trip with two optional headers:
     X-Trip-Id:   2026-04-14T13-45-22
 
 The T-Beam sends only X-Device-Id. Without X-Device-Id we use the GPX
-`creator` attribute. Timed uploads always use the trip's start time in UTC
-(2026-04-14T13-45-22Z); X-Trip-Id is used only for untimed uploads.
+`creator` attribute. Timed uploads use the trip's start time in UTC
+(2026-04-14T13-45-22Z), with a device hash suffix only for a collision with
+another device; X-Trip-Id is used only for untimed uploads.
 
 For each upload we write two files into /data/YYYY-MM/ (bucketed by the
 trip's end time, or its first upload for an undated trip). All retries
@@ -547,7 +548,9 @@ def upload_trip():
     safe_id = _safe_id(trip_id) or (
         "untimed-" + hashlib.sha256(raw).hexdigest()[:12]
     )
-    if anchor is None and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}Z", safe_id):
+    if anchor is None and re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}Z(?:-[0-9a-f]{12})?", safe_id
+    ):
         return jsonify(error="untimed X-Trip-Id cannot use the timestamp trip ID namespace"), 400
 
     # -----------------------------------------------------------------
@@ -585,19 +588,27 @@ def upload_trip():
         with _upload_lock():
             # Lookup and creation share the lock, including timed trips whose
             # local month changes after DISPLAY_TZ is corrected.
-            existing_dirs = _stored_trip_directories(safe_id)
-            if len(existing_dirs) > 1:
-                return jsonify({"error": "trip ID exists in multiple month directories"}), 409
-            if existing_dirs:
-                target_dir = existing_dirs[0]
-            gpx_file = target_dir / f"{safe_id}.gpx"
-            json_file = target_dir / f"{safe_id}.json"
+            for attempt in range(2):
+                existing_dirs = _stored_trip_directories(safe_id)
+                if len(existing_dirs) > 1:
+                    return jsonify({"error": "trip ID exists in multiple month directories"}), 409
+                target_dir = existing_dirs[0] if existing_dirs else DATA_ROOT / year_month
+                gpx_file = target_dir / f"{safe_id}.gpx"
+                json_file = target_dir / f"{safe_id}.json"
+                if not gpx_file.exists() or gpx_file.read_bytes() == raw:
+                    break
+                # Only a different device with different GPX gets one stable
+                # fallback. Missing/damaged identity and suffix collisions stay
+                # conflicts; never overwrite a source or keep adding suffixes.
+                existing = _stored_summary(json_file) if json_file.exists() else None
+                if (anchor is None or attempt or existing is None
+                        or existing["device_id"] == device_id):
+                    return jsonify({"error": "trip ID already contains different GPX data"}), 409
+                trip_id += "-" + hashlib.sha256(device_id.encode("utf-8")).hexdigest()[:12]
+                safe_id = trip_id
+                record.update(trip_id=trip_id, gpx_file=f"{safe_id}.gpx")
             target_dir.mkdir(parents=True, exist_ok=True)
             _sync_directory(DATA_ROOT)
-            # An ID can be retried, but must never replace another trip's
-            # immutable source (including sanitized-ID/device collisions).
-            if gpx_file.exists() and gpx_file.read_bytes() != raw:
-                return jsonify({"error": "trip ID already contains different GPX data"}), 409
             if json_file.exists():
                 existing = _stored_summary(json_file)
                 if existing is None:

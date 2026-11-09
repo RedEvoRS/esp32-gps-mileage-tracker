@@ -3,6 +3,7 @@
 import io
 import json
 import sqlite3
+from pathlib import Path
 import unittest
 from contextlib import closing
 from unittest.mock import patch
@@ -22,6 +23,68 @@ class ViewerHardeningTests(unittest.TestCase):
     seed_editor = roles.ViewerRolesTests.seed_editor
     signed_in = roles.ViewerRolesTests.signed_in
     login = roles.ViewerRolesTests.login
+
+    def test_unreadable_summary_hides_os_error_paths_but_logs_details(self):
+        self.signed_in("admin")
+        summary = self.viewer.DATA_ROOT / "2026-01/drive.json"
+        real_open = open
+        private_path = "/private-storage/example/drive.json"
+
+        def read_error(path, *args, **kwargs):
+            if Path(path) == summary:
+                raise PermissionError(13, "Permission denied", private_path)
+            return real_open(path, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=read_error), \
+                self.assertLogs(self.viewer.app.logger, "WARNING") as logs:
+            for path, status in (("/", 200), ("/trip/2026-01/drive", 404),
+                                 ("/export.csv", 200), ("/export.xlsx", 200)):
+                response = self.client.get(path)
+                self.assertEqual(response.status_code, status)
+                if path.endswith(".xlsx"):
+                    workbook = load_workbook(io.BytesIO(response.data))
+                    try:
+                        text = str([list(sheet.values) for sheet in workbook])
+                    finally:
+                        workbook.close()
+                else:
+                    text = response.get_data(as_text=True)
+                self.assertNotIn(private_path, text)
+                self.assertNotIn("Permission denied", text)
+                if not path.startswith("/export"):
+                    self.assertIn("the file could not be read", text)
+                response.close()
+        self.assertIn(private_path, "\n".join(logs.output))
+        self.assertIn("Permission denied", "\n".join(logs.output))
+
+    def test_final_trip_symlinks_cannot_escape_data_root(self):
+        self.signed_in("admin")
+        outside = self.db.parent / "outside"
+        outside.mkdir()
+        for extension in ("gpx", "json"):
+            target = outside / ("private." + extension)
+            target.write_text("private-file-sentinel", encoding="utf-8")
+            link = self.viewer.DATA_ROOT / f"2026-01/linked.{extension}"
+            try:
+                link.symlink_to(target)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink creation unavailable: {type(exc).__name__}")
+            try:
+                for route in ("trip", "gpx"):
+                    with self.subTest(extension=extension, route=route):
+                        response = self.client.get(f"/{route}/2026-01/linked")
+                        self.assertEqual(response.status_code, 404)
+                        self.assertNotIn(b"private-file-sentinel", response.data)
+                        response.close()
+            finally:
+                link.unlink()
+
+    def test_safe_trip_paths_allow_missing_files_and_resolved_data_root(self):
+        with self.viewer.app.test_request_context():
+            paths = self.viewer._safe_trip_paths("2026-02", "missing")
+        root = self.viewer.DATA_ROOT.resolve()
+        self.assertEqual(paths, (root / "2026-02/missing.gpx", root / "2026-02/missing.json"))
+        self.assertFalse(any(p.exists() for p in paths))
 
     # -- framing and sniffing headers -------------------------------------
 

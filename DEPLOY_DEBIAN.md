@@ -713,7 +713,11 @@ it in your shell history.
 Ingest names a trip with timestamps after those timestamps (here
 `2026-04-14T14-30-00Z`, from the first point's time, in UTC). It ignores any
 `X-Trip-Id` header on such a trip, so the test needs none. (The header only
-names a GPX with no timestamps at all.)
+names a GPX with no timestamps at all, outside the reserved timed namespace.)
+If another device already owns that timestamp ID with different GPX, ingest
+adds `-` plus the first 12 lowercase SHA-256 hex characters of the uploading
+device ID (UTF-8). Same-device data conflicts and conflicts at that suffixed
+ID remain 409. See [the naming rules](server/README.md#first-time-setup) for details.
 
 Expect a JSON success body with `distance_miles` ≈ **0.30** over 45 seconds at
 ~24 mph (that's what `sample.gpx` encodes — if the number is wildly different,
@@ -2383,8 +2387,10 @@ GPX even when your server login has another numeric user ID (as in Step 6).
 `sudo` passes the header on standard input through to `curl` unchanged.
 
 `X-Device-Id` is the firmware's `DEVICE_ID`. Ingest gives a timed trip the
-same name again from its timestamps (it ignores `X-Trip-Id` for a GPX that has
-them), so nothing else is needed. (For a GPX with no timestamps at all, add
+same name again from its timestamps and, if another device owns the plain ID,
+its device suffix (it ignores `X-Trip-Id` for a GPX that has timestamps).
+Keep that device ID unchanged when repairing a suffixed trip.
+(For a GPX with no timestamps at all, add
 `-H "X-Trip-Id: ${TRIP#*/}"`.) The reply's `stored_as` should be `$TRIP.gpx`.
 If it differs, that trip was filed under a custom `X-Trip-Id` by an older
 version of ingest; see [server/README.md](server/README.md) before sending it
