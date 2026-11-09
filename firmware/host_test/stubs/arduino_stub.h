@@ -755,18 +755,27 @@ struct HTTPClient {
         g_httpRequests++;
         g_httpLastBody.clear();
         bool events = url.find("/v1/device-events") != std::string::npos;
-        if (events && !client->connect("test.invalid", 8090, connectTimeout)) return -1;
+        if (!client->connect("test.invalid", 8090, connectTimeout)) return -1;
+        if (!events) client->setTimeout(readTimeout);
         if (g_httpHook) g_httpHook();
         char buf[1436];
-        while (g_httpLastBody.size() < size && s->available() > 0) {
+        // Match core 3.3.11: the final available() follows the last socket
+        // write even when the specified body length has been consumed.
+        while (s->available() > -1 && g_httpLastBody.size() < size) {
+            if (s->available() <= 0) break;
             size_t want = std::min(sizeof buf, size - g_httpLastBody.size());
             size_t n = s->readBytes(buf, want);
             if (n == 0) break;
             g_httpLastBody.append(buf, n);
+            if (!events && client->write(reinterpret_cast<const uint8_t*>(buf), n) != n) return -3;
         }
         g_httpBodies.push_back(g_httpLastBody);
         g_httpUrls.push_back(url); g_httpHeaders.push_back(headers);
         if (g_httpLastBody.size() != size) return -3;   // HTTPC_ERROR_SEND_PAYLOAD_FAILED
+        if (!events) {
+            g_millis += std::min(g_httpHeaderMs, readTimeout);
+            return g_httpHeaderMs > readTimeout ? -11 : g_httpCode;
+        }
         if (events) {
             if (client->write(reinterpret_cast<const uint8_t*>(g_httpLastBody.data()), size) != size) return -3;
             uint32_t headerStart = g_millis;

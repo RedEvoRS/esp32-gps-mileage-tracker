@@ -174,6 +174,12 @@ static constexpr uint32_t IDLE_BATT_SLEEP_MS = 10UL * 60 * 1000;
 // to close the file and switch WiFi off. A cut-off trip stays queued.
 static constexpr uint32_t NET_DRAIN_MS = 16UL * 60 * 1000;
 static constexpr uint32_t NET_ABORT_MS = 15UL * 1000;
+static constexpr uint32_t TRIP_CONNECT_TIMEOUT_MS = 5000;
+// An 8 MiB trip parses in about 0.4 s on a desktop. Allow slower CPUs and
+// durable disk writes 10 s to reply, while leaving margin in the 15 s
+// shutdown handshake: gNetAbort cannot interrupt HTTPClient's reply wait.
+static constexpr uint16_t TRIP_REPLY_TIMEOUT_MS = 10000;
+static_assert(TRIP_REPLY_TIMEOUT_MS < NET_ABORT_MS, "trip reply must fit the shutdown abort window");
 
 // How often the networking task wakes to look for pending uploads.
 static constexpr uint32_t NET_TICK_MS     = 30000;
@@ -2008,22 +2014,35 @@ static bool isComplete(fs::FS& storage, const char* path) {
 // sending and fails the request, so a cut-off upload ends within a chunk.
 class LockedFileStream : public Stream {
     File& _f;
+    size_t _remaining;
+    bool _replyStarted = false;
+    uint32_t _replyStartMs = 0;
 public:
-    explicit LockedFileStream(File& f) : _f(f) {}
+    LockedFileStream(File& f, size_t size) : _f(f), _remaining(size) {}
     int available() override {
+        // Core 3.3.11's HTTPClient checks available() again AFTER the final
+        // socket write, before testing its remaining length and reading the
+        // response. Recording EOF here includes the last socket write in
+        // send time, unlike timing the final filesystem read.
+        if (!_remaining && !_replyStarted) { _replyStarted = true; _replyStartMs = millis(); }
         if (gNetAbort.load()) return -1;
         FS_LOCK(); int n = _f.available(); FS_UNLOCK(); return n;
     }
     int read() override {
-        FS_LOCK(); int c = _f.read(); FS_UNLOCK(); return c;
+        FS_LOCK(); int c = _f.read(); FS_UNLOCK();
+        if (c >= 0 && _remaining) --_remaining;
+        return c;
     }
     size_t readBytes(char* buf, size_t len) override {
-        FS_LOCK(); size_t n = _f.read((uint8_t*)buf, len); FS_UNLOCK(); return n;
+        FS_LOCK(); size_t n = _f.read((uint8_t*)buf, len); FS_UNLOCK();
+        _remaining -= min(n, _remaining);
+        return n;
     }
     int peek() override {
         FS_LOCK(); int c = _f.peek(); FS_UNLOCK(); return c;
     }
     size_t write(uint8_t) override { return 0; }   // read-only proxy
+    uint32_t replyWaitMs(uint32_t ended) const { return _replyStarted ? uint32_t(ended - _replyStartMs) : 0; }
 };
 
 static bool uploadFile(fs::FS& storage, const char* path) {
@@ -2042,8 +2061,10 @@ static bool uploadFile(fs::FS& storage, const char* path) {
     size_t sz = f.size();
     FS_UNLOCK();
 
-    LockedFileStream body(f);
+    LockedFileStream body(f, sz);
     http.begin(client, url);
+    http.setConnectTimeout(TRIP_CONNECT_TIMEOUT_MS);
+    http.setTimeout(TRIP_REPLY_TIMEOUT_MS);
     http.addHeader("Content-Type", "application/gpx+xml");
     http.addHeader("Authorization", String("Bearer ") + AUTH_TOKEN);
     http.addHeader("X-Device-Id", DEVICE_ID);
@@ -2056,10 +2077,15 @@ static bool uploadFile(fs::FS& storage, const char* path) {
     // the server's worker timeout (900 s) bounds how slow it can be.
     uint32_t t0 = millis();
     int code = http.sendRequest("POST", &body, sz);
+    uint32_t ended = millis();
+    uint32_t elapsed = ended - t0;
+    uint32_t replyMs = body.replyWaitMs(ended);
+    float sendSecs = (elapsed - replyMs) / 1000.0f;
+    float replySecs = replyMs / 1000.0f;
     http.end();
     if (code == 200) serverContact();
     uploadDiagnostics(code);
-    float secs = (millis() - t0) / 1000.0f;
+    float secs = elapsed / 1000.0f;
     reportNetworkStack("after HTTP upload");
 
     FS_LOCK();
@@ -2087,18 +2113,18 @@ static bool uploadFile(fs::FS& storage, const char* path) {
     if (ok && !deleted) {
         // HTTP success still clears upload backoff; the queued copy may retry.
         Serial.printf("Upload %s (%u B, %.1f s) -> HTTP 200, but deleting the local file failed "
-                      "(will re-upload; the server ignores identical copies)\n",
-                      path, (unsigned)sz, secs);
+                      "(will re-upload; the server ignores identical copies); send %.1f s, reply %.1f s\n",
+                      path, (unsigned)sz, secs, sendSecs, replySecs);
     } else if (ok) {
-        Serial.printf("Upload %s (%u B, %.1f s) -> HTTP 200 (deleted)\n",
-                      path, (unsigned)sz, secs);
+        Serial.printf("Upload %s (%u B, %.1f s) -> HTTP 200 (deleted); send %.1f s, reply %.1f s\n",
+                      path, (unsigned)sz, secs, sendSecs, replySecs);
     } else if (rejected) {
-        Serial.printf("ERROR: upload %s (%u B, %.1f s) -> HTTP %d: server rejected the file -- %s\n",
+        Serial.printf("ERROR: upload %s (%u B, %.1f s) -> HTTP %d: server rejected the file -- %s; send %.1f s, reply %.1f s\n",
                       path, (unsigned)sz, secs, code,
-                      setAside ? "kept as .bad, not retried" : "rename failed, will retry");
+                      setAside ? "kept as .bad, not retried" : "rename failed, will retry", sendSecs, replySecs);
     } else {
-        Serial.printf("Upload %s (%u B, %.1f s) -> HTTP %d (will retry)\n",
-                      path, (unsigned)sz, secs, code);
+        Serial.printf("Upload %s (%u B, %.1f s) -> HTTP %d (will retry); send %.1f s, reply %.1f s\n",
+                      path, (unsigned)sz, secs, code, sendSecs, replySecs);
     }
     return ok;
 }

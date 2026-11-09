@@ -62,6 +62,8 @@ static void resetWorld() {
     gPmuIrqRetry = false; gPmuIrqReadMs = 0; gBatteryThresholds = -1;
     g_httpCode = 200; g_httpRequests = 0; g_httpLastBody.clear(); g_httpHook = nullptr;
     g_httpBodies.clear();
+    g_httpConnectMs = g_httpWriteMs = g_httpHeaderMs = g_httpByteMs = 0;
+    g_httpConnectTimeouts.clear(); g_httpReadTimeouts.clear();
     gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0; gChargeCheckT0 = 0;
     gNetBusy = false; gNetHold = false; gNetAbort = false;
     gNetLastAttemptMs = 0; gNetRetryMs = 0; gNetRetryNow = false; WiFi = WiFiStub();
@@ -1958,6 +1960,34 @@ int main(int argc, char** argv) {
         }
     }
 
+    printf("T66 explicit trip HTTP budgets and separate send/reply timing\n");
+    for (int status : {200, 503, 400}) {
+        resetWorld(); drive(15, 40); endTrip(false);
+        std::string path = tripFiles()[0];
+        size_t bytes = g_disk.files.at(path).size();
+        g_httpCode = status;
+        g_httpConnectMs = 200; g_httpWriteMs = 300; g_httpHeaderMs = 1200;
+        g_millis = UINT32_MAX - 500; // both timings must survive millis wrap
+        CHECK(uploadFile(LittleFS, path.c_str()) == (status == 200), "HTTP result policy is preserved");
+        CHECK(g_httpConnectTimeouts.back() == TRIP_CONNECT_TIMEOUT_MS &&
+              g_httpReadTimeouts.back() == TRIP_REPLY_TIMEOUT_MS, "trip request sets both named timeouts");
+        char timing[80];
+        float sent = (200 + ((bytes + 1435) / 1436) * 300) / 1000.0f;
+        snprintf(timing, sizeof timing, "; send %.1f s, reply 1.2 s", sent);
+        CHECK(logHas(timing), "send includes connect and final socket write; reply is separate");
+    }
+    resetWorld(); drive(15, 40); endTrip(false);
+    std::string timeoutPath = tripFiles()[0];
+    g_httpHeaderMs = TRIP_REPLY_TIMEOUT_MS + 500;
+    uint32_t requestStart = millis();
+    CHECK(!uploadFile(LittleFS, timeoutPath.c_str()) && g_disk.files.count(timeoutPath) &&
+          uint32_t(millis() - requestStart) == TRIP_REPLY_TIMEOUT_MS &&
+          logHas("HTTP -11 (will retry); send 0.0 s, reply 10.0 s"), "reply timeout keeps the trip and fits NET_ABORT_MS");
+    resetWorld(); drive(15, 40); endTrip(false);
+    std::string connectPath = tripFiles()[0];
+    g_httpConnectMs = TRIP_CONNECT_TIMEOUT_MS + 1;
+    CHECK(!uploadFile(LittleFS, connectPath.c_str()) && g_disk.files.count(connectPath) &&
+          logHas("send 5.0 s, reply 0.0 s"), "failed connect has no reply wait");
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
     return g_fail ? 1 : 0;
 }
