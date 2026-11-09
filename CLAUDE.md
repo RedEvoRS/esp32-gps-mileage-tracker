@@ -340,8 +340,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   `server/tests/`). GPX with a DTD/entities, times before 2000 or more than a
   day ahead, or non-finite derived numbers gets 400 before anything is written.
   Timed GPX ignores `X-Trip-Id` and uses its timestamp-derived UTC ID (no device
-  part: two trackers starting in the same second get 409, a documented
-  limitation in server/README.md, not a planned code change); untimed
+  part: two trackers per server isn't advised; a same-second start gets 409,
+  documented in server/README.md, not a planned code change); untimed
   uploads may use a custom ID outside that namespace (installer test uploads are
   untimed copies of `sample.gpx`). Every upload looks for its ID in all month
   folders under the upload lock, so a `DISPLAY_TZ` change can't duplicate a trip.

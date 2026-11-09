@@ -839,7 +839,7 @@ Before flashing:
 | `SERVER_HOST` | Only the server's IP address or hostname, from `install.sh` on the server. Do not include `http://`, a port, or `/upload`. |
 | `SERVER_PORT` | `8090`. |
 | `AUTH_TOKEN` | The token from `install.sh` on the server. It has to match `INGEST_AUTH_TOKEN` in the server's `.env` exactly, or every upload is refused. |
-| `DEVICE_ID` | A name for this board. The default, `tbeam-01`, is fine. A different one must be 1–32 characters: lowercase letters, digits, `_` or `-`, starting with a letter or digit (so `Car 1` is invalid). An invalid ID still uploads trips, but the server rejects its diagnostics, so the tracker never appears in Device health. Running a second tracker on the same server? Give it a different ID and read [the note on more than one tracker](../server/README.md#first-time-setup). |
+| `DEVICE_ID` | A name for this board. The default, `tbeam-01`, is fine. A different one must be 1–32 characters: lowercase letters, digits, `_` or `-`, starting with a letter or digit (so `Car 1` is invalid). An invalid ID still uploads trips, but the server rejects its diagnostics, so the tracker never appears in Device health. Running a second tracker on the same server isn't advised; if you do, give it a different ID and read [the note on more than one tracker](../server/README.md#first-time-setup) first. |
 
 Leave `USE_BSSID_FILTER` at 0 unless you want to restrict uploads to one
 router; the example explains it. Keep `secrets.h` private and gitignored.

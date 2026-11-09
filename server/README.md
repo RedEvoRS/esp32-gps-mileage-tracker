@@ -447,17 +447,22 @@ for storage, Python fallback and service setup.
    names on disk. Review those pairs before re-uploading: the new timestamp ID
    can create another record. Firmware uploads already use timestamp IDs.
 
-   **More than one tracker on one server:** trip IDs don't include the
-   device. If two trackers start recording trips in the same second, the
-   second upload gets HTTP 409, the ingest log names the conflict, and Device
-   health shows E5007 for that tracker. The trip stays queued on that
-   tracker and is retried on every visit home, but it never arrives on its
-   own. Two cars rarely start within the same second, so this is unlikely.
-   To clear it, copy the file off the card and move it aside, as described
-   under `HTTP 409` in
-   [Check recording and uploads](../firmware/README.md#check-recording-and-uploads).
-   Give each tracker its own `DEVICE_ID` so the logs and Device health can
-   tell them apart.
+   **More than one tracker on one server (not advised):** this project is
+   built and tested for one tracker per server, and running two trackers at
+   the same time isn't an advised use case. Nothing stops it, but it isn't
+   tested. If you really want to do it:
+
+   - Give each tracker its own `DEVICE_ID`, so the ingest log and Device
+     health can tell them apart.
+   - Know the limitation: trip IDs don't include the device. If two trackers
+     start recording trips in the same second, the second upload gets HTTP
+     409, the ingest log names the conflict, and Device health shows E5007
+     for that tracker. The trip stays queued on that tracker and is retried
+     on every visit home, but it never arrives on its own. Both cars have to
+     start within the same second, so this is unlikely.
+   - To clear a stuck trip, copy the file off the card and move it aside, as
+     described under `HTTP 409` in
+     [Check recording and uploads](../firmware/README.md#check-recording-and-uploads).
 
    Ingest rejects GPX document types/entities, unknown XML encodings, timestamps
    before 2000-01-01 or more than one day after server receipt, and non-finite
