@@ -148,7 +148,7 @@ def email_allowed(addr):
     local, _, domain = addr.lower().rpartition("@")
     return (local in ("noreply", "git")
             or addr.lower() == "support@github.com"
-            or domain.endswith("users.noreply.github.com")
+            or domain == "users.noreply.github.com"
             or domain in ("example.com", "example.org", "example.net")
             or domain.rsplit(".", 1)[-1] in ("lan", "local", "test", "invalid", "example"))
 

@@ -2,6 +2,7 @@
 
 import json
 import socket
+import ssl
 import sqlite3
 import tempfile
 import threading
@@ -303,6 +304,32 @@ class Receiver(BaseHTTPRequestHandler):
 
 
 class GelfTransportTests(unittest.TestCase):
+    def test_https_and_tls_tcp_require_tls_1_2_with_either_verification_setting(self):
+        for verify in (True, False):
+            for protocol in ("https", "tcp"):
+                config = gelf.GelfConfig(enabled=True, tls_verify=verify,
+                                        url="https://graylog.example.lan/gelf" if protocol == "https" else "",
+                                        tcp_host="graylog.example.lan", tcp_port=12201, tls=protocol == "tcp")
+                # Start below the required version so this detects an explicit
+                # policy even on Python builds whose defaults already enforce it.
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                context.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
+                with self.subTest(verify=verify, protocol=protocol), \
+                        mock.patch.object(gelf.ssl, "create_default_context", return_value=context), \
+                        mock.patch.object(gelf.socket, "create_connection"), \
+                        mock.patch.object(context, "wrap_socket", return_value=mock.MagicMock()) as wrap:
+                    sender = gelf.transport(config)
+                    if protocol == "https":
+                        handler = next(h for h in sender.opener.handlers
+                                       if isinstance(h, gelf.urllib.request.HTTPSHandler))
+                        self.assertIs(handler._context, context)
+                    else:
+                        self.assertEqual(sender([b"{}"]), 1)
+                        wrap.assert_called_once()
+                    self.assertEqual(context.minimum_version, ssl.TLSVersion.TLSv1_2)
+                    self.assertEqual(context.check_hostname, verify)
+                    self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED if verify else ssl.CERT_NONE)
+
     def serve(self, status):
         handler = type("Handler", (Receiver,), {"status": status, "received": []})
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)

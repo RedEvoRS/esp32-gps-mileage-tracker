@@ -80,6 +80,14 @@ class Emails(unittest.TestCase):
         # Only GitHub's support address, not any github.com one.
         self.assertFalse(check_pii.email_allowed("alice" + "@" + "github.com"))
 
+    def test_github_noreply_domain_must_match_exactly(self):
+        self.assertTrue(check_pii.email_allowed("12345+user@users.noreply.github.com"))
+        for domain in ("xusers.noreply.github.com", "sub.users.noreply.github.com"):
+            address = "a" + "@" + domain
+            with self.subTest(domain=domain):
+                self.assertFalse(check_pii.email_allowed(address))
+                self.assertTrue(hits(address))
+
 
 class Macs(unittest.TestCase):
     def test_real_bssid_is_flagged(self):
