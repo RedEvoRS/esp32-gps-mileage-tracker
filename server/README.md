@@ -449,8 +449,7 @@ for storage, Python fallback and service setup.
 
    **More than one tracker on one server (not advised):** this project is
    built and tested for one tracker per server, and running two trackers at
-   the same time isn't an advised use case. Nothing stops it, but it isn't
-   tested. If you really want to do it:
+   the same time isn't an advised use case. If you really want to do it:
 
    - Give each tracker its own `DEVICE_ID`, so the ingest log and Device
      health can tell them apart.
