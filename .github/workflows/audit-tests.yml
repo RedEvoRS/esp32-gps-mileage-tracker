@@ -55,7 +55,7 @@ jobs:
           python -m pip install -r tools/lint/requirements.txt
           ruff check
       - name: Install service dependencies
-        run: python -m pip install -r server/mileage-ingest/requirements.txt -r server/mileage-viewer/requirements.txt
+        run: python -m pip install --require-hashes -r server/mileage-ingest/requirements.txt -r server/mileage-viewer/requirements.txt
       - name: Install backup test tools
         # test_backup skips without these; make sure CI never skips it.
         run: command -v rsync || (sudo apt-get update && sudo apt-get install -y rsync)
@@ -77,7 +77,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install local diagnostics ingest bridge dependencies
-        run: python -m pip install -r server/mileage-ingest/requirements.txt
+        run: python -m pip install --require-hashes -r server/mileage-ingest/requirements.txt
       - name: Check out TinyGPSPlus 1.0.3
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

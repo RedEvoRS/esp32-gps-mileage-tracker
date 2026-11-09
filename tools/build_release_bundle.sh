@@ -53,6 +53,12 @@ tar -xzf "$bundle" -C "$extracted"
 (
   cd "$extracted/$prefix"
   test ! -e .git
+  # Ship the lock inputs and regeneration helper with the compiled locks.
+  test -f server/update_python_dependencies.sh
+  for service in mileage-ingest mileage-viewer; do
+    test -f "server/$service/requirements.in"
+    test -f "server/$service/requirements.txt"
+  done
   server_stamp=$(python3 server/stamp_version.py)
   firmware_stamp=$(python3 tools/stamp_firmware_version.py)
   echo "Server stamp: $server_stamp"

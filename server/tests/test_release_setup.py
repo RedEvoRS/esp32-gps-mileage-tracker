@@ -65,6 +65,11 @@ class ReleaseSetup(unittest.TestCase):
             "server/.env.example": "BIND_ADDR=\n",
             "server/docker-compose.yml": "services: {}\n",
             "server/backup/backup.sh": "# public backup helper\n",
+            "server/update_python_dependencies.sh": "# public dependency helper\n",
+            "server/mileage-ingest/requirements.in": "flask==3.1.3\n",
+            "server/mileage-ingest/requirements.txt": "# ingest lock\n",
+            "server/mileage-viewer/requirements.in": "flask==3.1.3\n",
+            "server/mileage-viewer/requirements.txt": "# viewer lock\n",
             "firmware/VERSION": "v0.10\n",
             "firmware/COMMIT": commit + "\n",
             "firmware/secrets.h.example": "// template only\n",
@@ -107,6 +112,9 @@ class ReleaseSetup(unittest.TestCase):
         self.assert_ok(result)
         dest = self.destination
         for name in ("install.sh", ".dockerignore", ".env.example", "backup/backup.sh",
+                     "update_python_dependencies.sh", "mileage-ingest/requirements.in",
+                     "mileage-ingest/requirements.txt", "mileage-viewer/requirements.in",
+                     "mileage-viewer/requirements.txt",
                      "firmware-src/firmware/04_trip_logger/04_trip_logger.ino",
                      "firmware-src/firmware/COMMIT", "firmware-src/firmware/secrets.h.example",
                      "firmware-src/tools/stamp_firmware_version.py"):
