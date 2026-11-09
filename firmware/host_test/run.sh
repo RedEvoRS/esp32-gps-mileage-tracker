@@ -28,8 +28,9 @@ fi
 # Optimizing compilers (including zig c++) may define NDEBUG implicitly.
 # Apply these flags to EVERY build, including the C++14-only tests below.
 assert_flags=(-UNDEBUG -include "$here/assertions_enabled.h")
-flags=("${assert_flags[@]}" -std=gnu++20 -O1 -w -DJOURNAL_HOST_TEST)
-incs=(-I"$here/stubs" -I"$here/../04_trip_logger" -I"$build/include" -I"$here/display_stubs")
+flags=("${assert_flags[@]}" -std=gnu++20 -O1 -Wall -Wextra -Werror -DJOURNAL_HOST_TEST)
+project_incs=(-I"$here/../04_trip_logger" -I"$build/include" -I"$here/display_stubs")
+incs=(-I"$here/stubs" "${project_incs[@]}")
 status=0
 # Each test binary runs twice; HOST_DEBUG is read only by host stubs.
 run_modes() {
@@ -43,27 +44,27 @@ for base in fallback stamped; do
     if [ "$base" = stamped ]; then
         version_args=('-DFIRMWARE_VERSION_BASE="v0.05+0123456789-dirty"' -DFIRMWARE_VERSION_REQUIRE_STAMP)
     fi
-    "${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -pedantic \
+    "${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -Werror -pedantic \
         "${version_args[@]}" -I"$here/../04_trip_logger" \
         "$here/test_build_version.cpp" -o "$build/test_build_version.exe"
     "$build/test_build_version.exe" || status=1
 done
 
 echo "== test_temperature (Bosch compensation and checked debug probes)"
-"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -O1 -Wall -Wextra -pedantic \
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -O1 -Wall -Wextra -Werror -pedantic \
     "$here/test_temperature.cpp" -o "$build/test_temperature.exe"
 "$build/test_temperature.exe" || status=1
 
 echo "== test_degraded_policy"
-"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -pedantic "$here/test_degraded_policy.cpp" -o "$build/test_degraded_policy.exe"
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -Werror -pedantic "$here/test_degraded_policy.cpp" -o "$build/test_degraded_policy.exe"
 "$build/test_degraded_policy.exe" || status=1
 
 echo "== test_rtc (pure calendar and clock confidence)"
-"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -O1 "${incs[@]}" "$here/test_rtc.cpp" -o "$build/test_rtc.exe"
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -O1 -Wall -Wextra -Werror "${incs[@]}" "$here/test_rtc.cpp" -o "$build/test_rtc.exe"
 "$build/test_rtc.exe" || status=1
 
 echo "== test_gps_antenna"
-"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -pedantic \
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -Werror -pedantic \
     "$here/test_gps_antenna.cpp" -o "$build/test_gps_antenna.exe"
 "$build/test_gps_antenna.exe" || status=1
 
@@ -74,13 +75,13 @@ echo "== test_debug_display (bus fault injection)"
 
 for test in test_display_model test_production_display_layout test_production_display; do
     echo "== $test"
-    "${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -pedantic \
+    "${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -Werror -pedantic \
         -I"$here/display_stubs" -I"$here/../04_trip_logger" "$here/$test.cpp" -o "$build/$test.exe"
     "$build/$test.exe" || status=1
 done
 
 echo "== test_display_model (DISPLAY_CARD_MS=10000)"
-"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -pedantic \
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -Werror -pedantic \
     -DDISPLAY_CARD_MS=10000 -I"$here/../04_trip_logger" \
     "$here/test_display_model.cpp" -o "$build/test_display_model_10s.exe"
 "$build/test_display_model_10s.exe" || status=1
@@ -93,7 +94,7 @@ else
 fi
 
 echo "== test_diag_catalog"
-"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -pedantic "$here/test_diag_catalog.cpp" -o "$build/test_diag_catalog.exe"
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -Werror -pedantic "$here/test_diag_catalog.cpp" -o "$build/test_diag_catalog.exe"
 "$build/test_diag_catalog.exe" || status=1
 
 echo "== test_pmu_startup_event"
@@ -101,13 +102,13 @@ echo "== test_pmu_startup_event"
 "$build/test_pmu_startup_event.exe" || status=1
 
 echo "== test_event_log"
-"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -O1 -Wall -Wextra -pedantic -pthread "${incs[@]}" \
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -O1 -Wall -Wextra -Werror -pedantic -pthread "${incs[@]}" \
     "$here/test_event_log.cpp" "$here/../04_trip_logger/event_log.cpp" -o "$build/test_event_log.exe"
 "$build/test_event_log.exe" || status=1
 "${PYTHON:-python}" "$here/check_event_log_protocol.py" "$build/test_event_log.exe" || status=1
 
 echo "== test_journal_faults (E4008 accounting, recovery and bounded feedback)"
-"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -O1 -Wall -Wextra -pedantic -pthread "${incs[@]}" \
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -O1 -Wall -Wextra -Werror -pedantic -pthread "${incs[@]}" \
     "$here/test_journal_faults.cpp" "$here/../04_trip_logger/event_log.cpp" -o "$build/test_journal_faults.exe"
 "$build/test_journal_faults.exe" || status=1
 
@@ -156,9 +157,23 @@ done
 tinygps="${TINYGPS_DIR:-$HOME/Documents/Arduino/libraries/TinyGPSPlus/src}"
 echo "== test_gps"
 if [ -f "$tinygps/TinyGPS++.cpp" ]; then
-    # Real library dir first, so <TinyGPSPlus.h> resolves to it, not the stub.
-    "${cxx[@]}" "${flags[@]}" -DARDUINO=100 -I"$tinygps" "${incs[@]}" \
-        "$here/test_gps.cpp" "$here/../04_trip_logger/event_log.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_gps.exe"
+    # Keep project stubs warning-checked, but omit the compile-only GPS stub
+    # so the real library can be a system include without being shadowed.
+    gps_stubs="$build/gps-stubs"
+    mkdir -p "$gps_stubs"
+    for header in "$here/stubs/"*.h; do
+        if [ "$(basename "$header")" != TinyGPSPlus.h ]; then cp "$header" "$gps_stubs/"; fi
+    done
+    gps_incs=(-isystem "$tinygps" -I"$gps_stubs" "${project_incs[@]}")
+    # Compile upstream implementation as a system include too: TinyGPSPlus
+    # 1.0.3 has an intentional switch fallthrough without a GCC annotation.
+    # Project sources and stubs still build with the same strict flags.
+    tinygps_source="$build/tinygps_library.cpp"
+    printf '#include <TinyGPS++.cpp>\n' > "$tinygps_source"
+    "${cxx[@]}" "${flags[@]}" -DARDUINO=100 "${gps_incs[@]}" \
+        -c "$tinygps_source" -o "$build/tinygps_library.o"
+    "${cxx[@]}" "${flags[@]}" -DARDUINO=100 "${gps_incs[@]}" \
+        "$here/test_gps.cpp" "$here/../04_trip_logger/event_log.cpp" "$build/tinygps_library.o" -o "$build/test_gps.exe"
     HOST_DEBUG=0 "$build/test_gps.exe" "$build/out" || status=1
     mkdir -p "$build/out-debug"
     HOST_DEBUG=1 "$build/test_gps.exe" "$build/out-debug" || status=1
@@ -167,15 +182,15 @@ if [ -f "$tinygps/TinyGPS++.cpp" ]; then
     done
     for test in test_temperature_runtime test_degraded test_rtc_runtime test_display_runtime test_fault_hooks test_pmu_verification; do
         echo "== $test (single binary, runtime modes)"
-        "${cxx[@]}" "${flags[@]}" -DARDUINO=100 -I"$tinygps" "${incs[@]}" \
-            "$here/$test.cpp" "$here/../04_trip_logger/event_log.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/$test.exe"
+        "${cxx[@]}" "${flags[@]}" -DARDUINO=100 "${gps_incs[@]}" \
+            "$here/$test.cpp" "$here/../04_trip_logger/event_log.cpp" "$build/tinygps_library.o" -o "$build/$test.exe"
         run_modes "$build/$test.exe"
     done
     run_modes "${PYTHON:-python}" "$here/check_rtc_protocol.py" "$build/test_rtc_runtime.exe" || status=1
     run_modes "${PYTHON:-python}" "$here/check_fault_hooks_protocol.py" "$build/test_fault_hooks.exe" || status=1
     echo "== test_debug_status (formatting and real GSV parser)"
-    "${cxx[@]}" "${flags[@]}" -DARDUINO=100 -I"$tinygps" "${incs[@]}" \
-        "$here/test_debug_status.cpp" "$tinygps/TinyGPS++.cpp" -o "$build/test_debug_status.exe"
+    "${cxx[@]}" "${flags[@]}" -DARDUINO=100 "${gps_incs[@]}" \
+        "$here/test_debug_status.cpp" "$build/tinygps_library.o" -o "$build/test_debug_status.exe"
     "$build/test_debug_status.exe" || status=1
 else
     echo "SKIPPED: TinyGPSPlus not found (set TINYGPS_DIR to its src/ folder)"

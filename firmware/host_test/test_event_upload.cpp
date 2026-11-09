@@ -229,7 +229,7 @@ static void allocationFailure(bool missing) {
     assert(g_psramAllocations == 1 && !gEventBuffers);
     records(3);
     assert(backlog().records == 3 && !eventsDue() && !eventSnapshot());
-    unsigned scans = WiFi.scans;
+    auto scans = WiFi.scans;
     for (unsigned i = 0; i < 10; ++i) { drainEvents(); netCycle(); }
     assert(g_httpRequests == 0 && WiFi.scans == scans && backlog().records == 3);
     assert(logLines("WARNING: diagnostics upload disabled:") == 1);
@@ -389,7 +389,7 @@ int main(int argc, char** argv) {
         assert(gNetRetryMs == 240000 && gNetLastAttemptMs == 123);
         assert(readBatch() && batch.ids[0].sequence == 1);
         assert(std::strstr(batch.events[0], "\"code\":1000"));
-        unsigned requestsBefore = g_httpRequests;
+        auto requestsBefore = g_httpRequests;
         drainEvents(); assert(g_httpRequests == requestsBefore); // no recursive storm
         // GPX is allowed immediately despite diagnostic failure/backoff.
         trip(); g_httpCode = 200; gNetRetryMs = 0;
@@ -464,10 +464,10 @@ int main(int argc, char** argv) {
     uploadWorld(); records(1); g_httpCode = 503; drainEvents();
     g_millis += gEventRetry.delay; g_httpCode = 200; drainEvents();
     assert(backlog().records == 0 && eventSnapshotChanged());
-    unsigned recoveryRequests = g_httpRequests; netCycle();
+    auto recoveryRequests = g_httpRequests; netCycle();
     assert(g_httpRequests == recoveryRequests + 1 && !eventSnapshotChanged());
     uploadWorld(); g_httpCode = 503; netCycle(); assert(gEventRetry.delay);
-    unsigned scans = WiFi.scans; netCycle(); assert(WiFi.scans == scans);
+    auto scans = WiFi.scans; netCycle(); assert(WiFi.scans == scans);
     uploadWorld(); records(2); WiFi.scanSsids.clear(); netCycle();
     assert(gEventRetry.delay && gNetRetryMs == 0);
     scans = WiFi.scans; for (int i = 0; i < 10; ++i) netCycle(); assert(WiFi.scans == scans);
@@ -480,7 +480,7 @@ int main(int argc, char** argv) {
     g_sdDisk.files.erase("/diag/ack-0"); g_sdDisk.files.erase("/diag/ack-1");
     gJournal.~EventLog(); new (&gJournal) EventLog(&gSdJournalFs, &gFlashJournalFs, uploadJournalConfig(&gRevisionState));
     assert(gJournal.begin(gJournalBoot.id, 1, "test-recovery"));
-    gEnrollmentChecked = false; gEventRetry = {}; unsigned before = g_httpRequests;
+    gEnrollmentChecked = false; gEventRetry = {}; auto before = g_httpRequests;
     drainEvents(); assert(g_httpRequests > before); // blank card adopts the flash revision
     g_sdDisk.files.erase("/diag/ack-0"); g_sdDisk.files.erase("/diag/ack-1");
     g_disk.files.erase("/diag/ack-0"); g_disk.files.erase("/diag/ack-1");

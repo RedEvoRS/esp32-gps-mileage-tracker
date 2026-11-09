@@ -48,7 +48,7 @@ struct Epoch { int t; double lat, lon; float mps; bool fix; };
 
 // One second of default M8N output. ggaFirst swaps the RMC/GGA order.
 static std::vector<std::string> sentences(const Epoch& e, bool ggaFirst = false) {
-    char hms[16], b[200];
+    char hms[20], b[200]; // allow the full int-derived minute field in fixtures
     int s = 30 * 60 + e.t;   // epoch 0 = 14:30:00
     snprintf(hms, sizeof hms, "14%02d%02d.00", s / 60, s % 60);
     std::string ll = coord(e.lat, true) + "," + coord(e.lon, false);

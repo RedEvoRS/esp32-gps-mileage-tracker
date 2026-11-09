@@ -32,7 +32,7 @@ static dirent* checkedReadDir(DIR* dir) {
     if (failList) { errno = EIO; return nullptr; }
     return ::readdir(dir);
 }
-static int checkedMkdir(const char* path, int mode) {
+static int checkedMkdir(const char* path, [[maybe_unused]] int mode) {
 #ifdef _WIN32
     return ::_mkdir(path);
 #else

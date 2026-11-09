@@ -180,7 +180,8 @@ int main(int argc, char**) {
     rtcWorld(false); beginRtc(); take(); failWrite = true; setTrusted(fakeEpoch,101);
     serviceRtc(); assert(writes == 0); g_millis += 899;
     serviceRtc(); assert(writes == 1); take(); before = transactions;
-    for (unsigned i = 0; i < 100; ++i) serviceRtc(); assert(writes == 1);
+    for (unsigned i = 0; i < 100; ++i) serviceRtc();
+    assert(writes == 1);
     g_millis += 59999; serviceRtc(); assert(writes == 1 && transactions == before);
     ++g_millis; serviceRtc(); assert(writes == 2);
     g_millis += 60000; serviceRtc(); assert(writes == 3);

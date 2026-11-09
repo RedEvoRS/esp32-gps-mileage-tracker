@@ -713,7 +713,9 @@ struct WiFiClient : Stream {
         nextByte = g_millis + g_httpByteMs; return uint8_t(response[position++]);
     }
     virtual int read(uint8_t* out, size_t size) {
-        if (!size || !available()) return 0; *out = read(); return 1;
+        if (!size || !available()) return 0;
+        *out = read();
+        return 1;
     }
     int peek() override { return available() ? uint8_t(response[position]) : -1; }
     size_t write(uint8_t) override { return 1; }

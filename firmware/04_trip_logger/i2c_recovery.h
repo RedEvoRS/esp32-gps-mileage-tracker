@@ -11,7 +11,7 @@ struct I2cRecoveryResult {
 };
 
 // Allow up to 1 ms of clock stretching at each release; never wait forever.
-static bool waitI2cClockHigh(int scl) {
+static inline bool waitI2cClockHigh(int scl) {
     for (unsigned waited = 0; waited < 1000; waited += 5) {
         if (digitalRead(scl) == HIGH) return true;
         delayMicroseconds(5);
@@ -19,7 +19,7 @@ static bool waitI2cClockHigh(int scl) {
     return digitalRead(scl) == HIGH;
 }
 
-static I2cRecoveryResult recoverI2cBus(int sda, int scl) {
+static inline I2cRecoveryResult recoverI2cBus(int sda, int scl) {
     pinMode(sda, INPUT_PULLUP);
     pinMode(scl, INPUT_PULLUP);
     delayMicroseconds(5);  // Let the released lines rise before sampling.
@@ -69,7 +69,7 @@ struct PmuStartupResult {
 };
 
 // Save results without Serial/allocation: Stage 4 must disable LoRa first.
-static bool beginPmuWithRecovery(TwoWire& bus, XPowersAXP2101& pmu, int sda, int scl,
+static inline bool beginPmuWithRecovery(TwoWire& bus, XPowersAXP2101& pmu, int sda, int scl,
                                  PmuStartupResult& result) {
     result = PmuStartupResult();
     for (uint8_t attempt = 0; attempt < PMU_STARTUP_ATTEMPTS; ++attempt) {
@@ -92,7 +92,7 @@ static bool beginPmuWithRecovery(TwoWire& bus, XPowersAXP2101& pmu, int sda, int
     return false;
 }
 
-static void printPmuStartup(const PmuStartupResult& result) {
+static inline void printPmuStartup(const PmuStartupResult& result) {
     for (uint8_t i = 0; i < result.attempts; ++i) {
         if (i) Serial.printf("PMU startup retry %u/%u.\n", (unsigned)i + 1, (unsigned)PMU_STARTUP_ATTEMPTS);
         const I2cRecoveryResult& recovery = result.recovery[i];

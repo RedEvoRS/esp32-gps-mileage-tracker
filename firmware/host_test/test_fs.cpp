@@ -134,7 +134,8 @@ static std::vector<std::string> times(const std::string& d) {
 }
 static std::string iso(uint64_t ms) { char b[25]; isoFromEpochMs(ms, b, sizeof b); return b; }
 static bool logHas(const char* frag) {
-    for (auto& l : Serial.log) if (l.find(frag) != std::string::npos) return true; return false;
+    for (auto& l : Serial.log) if (l.find(frag) != std::string::npos) return true;
+    return false;
 }
 static bool wellFormedShape(const std::string& d) {
     // prologue at start, epilogue at end, every trkpt line complete
@@ -152,7 +153,6 @@ static void padTripTo(size_t bytes) {
 }
 // setup()'s halt loops never return: a delay() hook throws this to stop one.
 struct Halted {};
-static int  g_haltSecs = 0;
 static bool g_chargeAtMount = false, g_chargeWhileHot = false, g_chargeWhenCool = false;
 
 static void dump(const char* test) {
@@ -1786,7 +1786,7 @@ int main(int argc, char** argv) {
         CHECK(gTripMeters == 0 && gTripT0 == gLastFix.monoMs &&
               gLastMoveMs == gTripT0 && gPendCount == 0 && gArmCount == 0 &&
               gTripBytes == g_sdDisk.files.at(second).size(),
-              "new piece starts with fresh distance, speed, time and byte count");
+              "new piece starts with fresh distance, time and byte count");
         drive(5, 1);
         CHECK(gTripMeters > 4 && gTripMeters < 6 && count(g_sdDisk.files.at(second), "<trkpt ") == 2,
               "next fix adds one step from the shared boundary point");

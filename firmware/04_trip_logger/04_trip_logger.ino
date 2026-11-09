@@ -92,6 +92,7 @@ static constexpr uint32_t DEBUG_FEEDBACK_MS = 2000;
 #endif
 #include "build_version.h"
 #include "debug_display.h"
+static uint32_t gDebugDrawMs = 0; // loop-owned redraw cadence, not renderer state
 #include "debug_temperature.h"
 static float gDebugTempDie = NAN;
 static uint32_t gDebugTempDieMs = 0, gDebugTempLogMs = 0;
@@ -700,7 +701,7 @@ static void setClockFromGps(uint64_t* rmcUtcMs = nullptr) {
     bool rawGP = validRmcClockFields(gRmcTimeGP, gRmcDateGP);
     bool fresh = (rawGN || rawGP) && gps.date.isValid() && gps.time.isValid() &&
                  gps.time.isUpdated() && gps.date.age() < 2000 && gps.time.age() < 2000;
-    struct tm tmv = {0};
+    struct tm tmv = {};
     tmv.tm_year = gps.date.year() - 1900;
     tmv.tm_mon  = gps.date.month() - 1;
     tmv.tm_mday = gps.date.day();
@@ -2591,7 +2592,7 @@ static void receiveGpsByte(uint8_t c) {
         }
         if (rx.checksumA && c == rx.b && rx.cls == 0x01 && rx.id == 0x07 && rx.len == 92) {
             // Explicit little-endian reads avoid alignment and host-endian assumptions.
-            const auto u4 = [&rx](size_t off) -> uint32_t {
+            const auto u4 = [](size_t off) -> uint32_t {
                 return uint32_t(rx.payload[off]) | uint32_t(rx.payload[off + 1]) << 8 |
                        uint32_t(rx.payload[off + 2]) << 16 | uint32_t(rx.payload[off + 3]) << 24;
             };
@@ -2762,7 +2763,7 @@ static void beginDebugTemperature() {
     // batches) all run serially on core 1; the ISR only sets a flag. There is
     // no PMU access from the networking task and no PMU mutex to acquire.
     gDebugTempTs = debug_temperature::setupTs(PMU);
-    char control[8] = "--", adc[8] = "--";
+    char control[11] = "--", adc[11] = "--"; // room for the API's full int range
     if (gDebugTempTs.control >= 0) snprintf(control, sizeof control, "0x%02X", gDebugTempTs.control);
     if (gDebugTempTs.adc >= 0) snprintf(adc, sizeof adc, "0x%02X", gDebugTempTs.adc);
     Serial.printf("Temp setup: TS %s, REG50 %s, REG30 %s (target external input, 50 uA).\n",
@@ -2797,7 +2798,7 @@ static void serviceDebugTemperature() {
     }
     const auto p = debug_temperature::samplePower(PMU, now);
     char die[40] = "-- C", estimate[16] = "--", ts[16] = "--", tsRaw[8] = "--";
-    char bme[16] = "--", volts[16] = "--", percent[8] = "--";
+    char bme[16] = "--", volts[16] = "--", percent[12] = "--";
     // Independent 30 s schedules can drift. Reuse the latest guard sample
     // through one guard interval plus 5 s, and report its age explicitly.
     uint32_t dieAgeMs = uint32_t(now - gDebugTempDieMs);
