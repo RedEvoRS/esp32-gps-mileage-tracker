@@ -308,6 +308,9 @@ jobs:
             INSTALL_OUTPUTS=none \
             bash "$INSTALLER" < /dev/null
           test "$(docker exec mileage-viewer printenv DISPLAY_TZ)" = America/Chicago
+          for container in mileage-ingest mileage-viewer; do
+            test "$(docker inspect -f '{{.HostConfig.LogConfig.Type}}:{{index .HostConfig.LogConfig.Config "max-size"}}:{{index .HostConfig.LogConfig.Config "max-file"}}' "$container")" = json-file:10m:3
+          done
           # Backups are private to the backup user (umask 077).
           test -n "$(sudo ls /srv/offhost/snapshots)"
           systemctl is-enabled "mileage-backup@$TEST_USER.timer"

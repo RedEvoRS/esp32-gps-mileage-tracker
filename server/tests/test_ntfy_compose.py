@@ -31,11 +31,15 @@ class NtfyComposeTests(unittest.TestCase):
                                       ("NTFY_BEHIND_PROXY=false\n", "false")):
                 with self.subTest(setting=setting):
                     (root / ".env").write_text(setting, encoding="utf-8")
-                    result = subprocess.run(["docker", "compose", "--profile", "ntfy",
+                    result = subprocess.run(["docker", "compose", "--profile", "ntfy", "--profile", "monitor",
                                              "config", "--format", "json"], cwd=root,
                                             env=env, capture_output=True, text=True, check=True)
                     services = json.loads(result.stdout)["services"]
+                    self.assertEqual(set(services), {"mileage-ingest", "mileage-viewer", "mileage-monitor", "ntfy"})
                     self.assertEqual(services["ntfy"]["environment"]["NTFY_BEHIND_PROXY"], expected)
                     for name, service in services.items():
+                        self.assertEqual(service["logging"], {
+                            "driver": "json-file", "options": {"max-size": "10m", "max-file": "3"},
+                        }, name)
                         if name != "ntfy":
                             self.assertNotIn("NTFY_BEHIND_PROXY", service.get("environment", {}))

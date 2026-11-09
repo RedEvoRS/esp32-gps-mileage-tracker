@@ -498,6 +498,14 @@ Check the logs when you want to see what's happening:
 
     docker compose logs -f mileage-ingest
 
+Every service, including optional monitor and ntfy, keeps at most three 10 MB
+Docker log files per container. This protects the server's Docker storage from
+growing logs. The limit applies after containers are recreated: the installer
+update does this when the Compose settings change, including enabled optional
+services. Existing logs are not trimmed in place; recreating a container
+discards its old logs, so save any you need first. `install.sh --check` warns
+when a running container still has older log settings.
+
 After changing `.env` or `viewer.env`, recreate the containers so they
 pick up the new values (Compose only recreates the ones that changed):
 

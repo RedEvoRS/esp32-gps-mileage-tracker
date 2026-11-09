@@ -316,6 +316,7 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 
 ### Server
 
+- Container logs: every service uses Docker `json-file`, three 10 MB files; updates recreate changed containers, and `install.sh --check` warns on older log settings.
 - Unraid: detect `/etc/unraid-version` (`version=` starts with a digit);
   `MILEAGE_PLATFORM=debian|unraid` overrides detection. Root-only, no sudo,
   apt or systemd. Installer writes `RESTART_POLICY=always`; unset Compose

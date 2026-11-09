@@ -1536,6 +1536,33 @@ verify_services() {
     fi
 }
 
+# Inspect the containers, not just the Compose file: older containers retain
+# their original log settings until Compose recreates them. Optional services
+# have project-derived names, so discover their IDs through their profiles.
+verify_log_limits() {
+    local svc id config
+    for svc in mileage-ingest mileage-viewer mileage-monitor ntfy; do
+        id=$svc
+        case $svc in
+            mileage-monitor|ntfy)
+                id=$({ compose --profile monitor --profile ntfy ps -a -q "$svc" < /dev/null 2> /dev/null || true; } | head -n 1)
+                [[ -n $id ]] || continue ;;
+        esac
+        [[ $(container_state "$id") == running ]] || continue
+        if ! config=$("${DOCKER[@]}" inspect -f '{{json .HostConfig.LogConfig}}' "$id" 2> /dev/null); then
+            warn "Couldn't check $svc's container log limit" \
+                "Check Docker access, then run install.sh --check again."
+        elif jq -e '.Type == "json-file" and .Config["max-size"] == "10m" and .Config["max-file"] == "3"' \
+                <<< "$config" > /dev/null 2>&1; then
+            ok "$svc container logs are limited to three 10 MB files"
+        else
+            warn "$svc isn't using the three-file, 10 MB container log limit" \
+                "Update the server files, then recreate containers: docker compose --profile monitor --profile ntfy up -d --force-recreate --no-deps $svc" \
+                "This discards that container's old logs; save any you need first. Existing logs aren't trimmed in place."
+        fi
+    done
+}
+
 # --- End to end --------------------------------------------------------
 
 # Keep TEST_TRIP set if removal fails or either file remains. A failed
@@ -3857,6 +3884,7 @@ main() {
     verify_reboots
     setup_backups
     setup_outputs
+    verify_log_limits
     summary
 }
 

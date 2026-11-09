@@ -28,8 +28,16 @@
 # does not filter Docker-published ports, so the bind address is the
 # only thing keeping them off other interfaces.
 
+# Applies when containers are created; Compose recreates them when this changes.
+x-logging: &bounded-logs
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   mileage-ingest:
+    logging: *bounded-logs
     build:
       context: .
       dockerfile: mileage-ingest/Dockerfile
@@ -76,6 +84,7 @@ services:
   # owned by the ingest service) and keeps its own annotations database
   # in a separate named volume.
   mileage-viewer:
+    logging: *bounded-logs
     build:
       context: .
       dockerfile: mileage-viewer/Dockerfile
@@ -130,6 +139,7 @@ services:
   # Opt in with --profile monitor. Port 8093 serves only optional, token-protected
   # Prometheus metrics; the service has no ingest or viewer credentials.
   mileage-monitor:
+    logging: *bounded-logs
     profiles: ["monitor"]
     build:
       context: .
@@ -151,6 +161,7 @@ services:
 
   # Opt in separately: an existing self-hosted ntfy can be used instead.
   ntfy:
+    logging: *bounded-logs
     profiles: ["ntfy"]
     image: binwiederhier/ntfy:v2.31.0
     command: ["serve"]
