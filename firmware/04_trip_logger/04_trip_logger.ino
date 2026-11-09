@@ -139,6 +139,9 @@ static constexpr unsigned RESUME_FIXES    = 3; // consecutive trusted moving fix
 // Arrival-time association, allowing either UBX/NMEA ordering at 1 Hz.
 static constexpr uint32_t NAV_PVT_FRESH_MS = 1500;
 static constexpr uint32_t NAV_PVT_FALLBACK_MS = 10000;
+// Let core 1 idle between bursts. At 9600 baud, 5 ms is about five bytes,
+// far below the 2048-byte RX buffer; check the UART again just before resting.
+static constexpr uint32_t LOOP_IDLE_MS = 5;
 static constexpr float    MIN_TRIP_METERS = 160.0f;          // ~0.1 mi
 static constexpr uint32_t MIN_TRIP_MS     = 30UL  * 1000;
 static constexpr size_t   TRIP_SPLIT_BYTES = 8 * 1024 * 1024; // half the server cap
@@ -3262,4 +3265,5 @@ void loop() {
     }
     serviceDisplay();
     if (debugMode()) serviceDebugTemperature();
+    if (GPSSerial.available() == 0) vTaskDelay(pdMS_TO_TICKS(LOOP_IDLE_MS));
 }

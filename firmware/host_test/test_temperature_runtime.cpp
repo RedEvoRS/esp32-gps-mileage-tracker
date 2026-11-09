@@ -125,6 +125,12 @@ int main() {
     }
     prepare(); g_millis = UINT32_MAX - 100; gDebugTempLogMs = gChargeCheckT0 = g_millis; tick();
     REQUIRE(tempLine().find("die 30.0 C") != std::string::npos);
+    // No manually advanced conversion clock: an idle pass starts the forced
+    // conversion, sleeps 5 ms, and the next pass consumes it exactly once.
+    prepare(); gRtc = diagnostics::RtcRuntime();
+    g_millis = gDebugTempLogMs + 30000;
+    loop(); REQUIRE(gDebugTempPending && tempLine().empty());
+    loop(); REQUIRE(!gDebugTempPending && tempLine().find("BME280 25.08 C") != std::string::npos);
     prepare(); gDegraded.begin(startup::Mode::NoStorage,g_millis);
     operations = PMU.operations.size(); starts = bmeTransactions;
     g_millis += 30000; serviceDebugTemperature();

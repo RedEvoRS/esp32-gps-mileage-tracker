@@ -226,6 +226,13 @@ int main(int argc, char**) {
         rtcWorld(); Preferences::durable64["rtc_set"] = saved; beginRtc();
         gLoopFaults.event(3003,millis()).notice(); has(take()[0],"\"sync_age_ms\":null");
     }
+    // Advance only via the production loop's 5 ms pause. Its service must
+    // still catch the first 100 ms of a later second without spending retries.
+    rtcWorld(false); beginRtc(); take(); setTrusted(fakeEpoch, 101);
+    uint32_t alignedStart = millis();
+    while (!writes && uint32_t(millis() - alignedStart) < 1000) loop();
+    assert(writes == 1 && uint32_t(millis() - alignedStart) <= 905);
+    assert((g_epochBaseMs + millis() - LOOP_IDLE_MS) % 1000 < 100);
     if (exportJson) for (auto& row : exported) std::printf("EVENT %s\n",row.c_str());
-    std::printf("RTC runtime: 20 scenario groups passed (runtime debug=%d)\n",debugMode());
+    std::printf("RTC runtime: 21 scenario groups passed (runtime debug=%d)\n",debugMode());
 }

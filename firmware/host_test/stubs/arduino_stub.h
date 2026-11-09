@@ -629,8 +629,8 @@ struct XPowersAXP2101 {
     }
 };
 // GPS UART: tests append NMEA/UBX bytes to rx and inspect what the sketch
-// sends in tx. Polling an empty port advances the clock 1 ms, so timeout
-// loops in the sketch terminate instead of spinning.
+// sends in tx. loop() advances time through its explicit vTaskDelay, like
+// the scheduler; checking an empty UART itself takes no simulated time.
 struct HardwareSerial {
     std::string rx, tx;
     size_t rxPos = 0;
@@ -640,7 +640,7 @@ struct HardwareSerial {
     void setRxBufferSize(int) {}
     void begin(int b, int, int rx, int tx) { baud = b; rxPin = rx; txPin = tx; }
     int available() {
-        if (rxPos >= rx.size()) { g_millis += 1; return 0; }
+        if (rxPos >= rx.size()) return 0;
         return (int)(rx.size() - rxPos);
     }
     int read() { return rxPos < rx.size() ? (uint8_t)rx[rxPos++] : -1; }

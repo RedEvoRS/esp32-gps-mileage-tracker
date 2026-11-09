@@ -180,7 +180,7 @@ if [ -f "$tinygps/TinyGPS++.cpp" ]; then
     for file in "$build/out-debug/"*.gpx; do
         cmp "$file" "$build/out/$(basename "$file")" || status=1
     done
-    for test in test_temperature_runtime test_degraded test_rtc_runtime test_display_runtime test_fault_hooks test_pmu_verification; do
+    for test in test_loop_runtime test_temperature_runtime test_degraded test_rtc_runtime test_display_runtime test_fault_hooks test_pmu_verification; do
         echo "== $test (single binary, runtime modes)"
         "${cxx[@]}" "${flags[@]}" -DARDUINO=100 "${gps_incs[@]}" \
             "$here/$test.cpp" "$here/../04_trip_logger/event_log.cpp" "$build/tinygps_library.o" -o "$build/$test.exe"
