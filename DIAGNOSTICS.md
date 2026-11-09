@@ -1203,6 +1203,14 @@ the active backend and physical unacknowledged valid-frame/segment counts;
 uncertain inventory is labeled incomplete. Ambiguous writes can retain duplicate
 IDs, so physical frame counts can exceed distinct event counts.
 
+Firmware v1.04 enrolls the main loop in a 60-second task watchdog after
+normal or degraded startup. Expiry requests a panic and restart; the next
+boot records the existing E1003 notice and still runs ordinary trip-file
+repair. Startup and the core-0 network task are outside this loop protection.
+The watchdog and its intentional-hang bench hook are **not yet bench-checked**;
+see [the firmware guide](firmware/README.md#watchdog-bench-check). No catalog or
+diagnostics-protocol change is needed.
+
 After trusted PMU/LoRa startup, charging is disabled and battery detection/ADC
 are enabled before display/USB waits. After the existing one-second USB wait,
 the raw battery registers are sampled once, before storage, GPS startup and the

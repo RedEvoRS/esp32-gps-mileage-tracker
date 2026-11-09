@@ -66,18 +66,23 @@ Inspect every `SKIPPED` line. The final `grep` exits 1 when there are no matches
 that means no skips, not a test failure. Keep the displayed run status separate
 from `grep`'s status.
 
-Every build uses `-UNDEBUG` and force-includes `assertions_enabled.h`, which
-rejects `NDEBUG`. This matters with Zig C++ at `-O1`: otherwise `assert()` can
-silently disappear. A separate negative probe with the same flags and
+Every build uses `-Wall -Wextra -Werror`, plus `-UNDEBUG` and a forced include of
+`assertions_enabled.h`, which rejects `NDEBUG`. This matters with Zig C++ at
+`-O1`: otherwise `assert()` can silently disappear. A separate negative
+probe with the same flags and
 `int main() { assert(false); }` must fail when run, never exit successfully.
 
 ## What a full run covers
 
-`run.sh` builds **27 C++ test sources in 31 build variants**, plus six Python
+Real TinyGPSPlus headers and implementation are system includes; project
+sources and stubs remain warning-checked. U8g2's real font source is read by
+Python for the glyph check, while renderer tests use project-owned stubs.
+
+`run.sh` builds **30 C++ test sources in 35 build variants**, plus six Python
 checks. Extra builds cover stamped/fallback versions, a second display-card
-duration and three sketch copies of bus recovery. Many integration binaries
-also run with runtime debug off and on. **[TinyGPSPlus]** marks the eight
-sources that require that optional library.
+duration, the watchdog bench hook and three sketch copies of bus recovery.
+Many integration binaries also run with runtime debug off and on.
+**[TinyGPSPlus]** marks the ten sources that require that optional library.
 
 **Storage and trip lifecycle**
 
@@ -89,6 +94,8 @@ sources that require that optional library.
 **GPS input and signal health**
 
 - `test_gps` **[TinyGPSPlus]**: real GPS sentence parsing through the sketch's loop, one point per second, receiver configuration/replies, fix-quality gates, gaps, UTC (universal time) timestamps/clock corrections and debug-mode GPX parity.
+- `test_loop_runtime` **[TinyGPSPlus]**: real 5 ms idle cadence, UART drain and late arrivals, latched IRQs, BOOT debounce, ACK deadlines, NAV-PVT freshness and one-second debug redraw. RTC and temperature runtime suites also exercise alignment/conversion through the pause.
+- `test_watchdog` **[TinyGPSPlus]**: late one-time enrollment, slow boot scans and fsck outside coverage, E1003 plus repair on watchdog boot, degraded modes, runtime repair progress, bounded shutdown stages, blocked lock without feeds, core-0 exclusion and enrollment failures. A second build tests the intentional bench hang and watchdog-reset skip; neither build proves real timer expiry or board reset.
 - `test_gps_antenna`: antenna-warning evidence, hold times, missing/stale observations, recovery and timer wraparound.
 - `test_debug_status` **[TinyGPSPlus]**: real satellite-message parsing, satellite deduplication/freshness and bounded screen/serial formatting, including release-version fit/omit cases in the top row.
 
@@ -167,7 +174,7 @@ the version pinned by CI. Point to its **`src/` folder**, containing
 export TINYGPS_DIR="<library-dir>/TinyGPSPlus/src"
 ```
 
-Without it, the runner prints `SKIPPED` and can still exit 0: **all eight
+Without it, the runner prints `SKIPPED` and can still exit 0: **all ten
 [TinyGPSPlus] C++ suites above and the RTC/fault Python bridges are omitted**.
 The default searched is `~/Documents/Arduino/libraries/TinyGPSPlus/src`;
 if your IDE uses a different sketchbook folder, set the variable explicitly.

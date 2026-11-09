@@ -21,7 +21,10 @@ while running reports E4001 and new trips move to internal flash, a long
 POWER press on USB shows an on-screen message, and diagnostic journal write
 failures raise E4008. Firmware `v1.03` (tag `fw-v1.03`) followed the same
 day: a long POWER press on battery shows **Switching off** for about a
-second before the screen goes dark. On
+second before the screen goes dark. Firmware `v1.04` adds a short pause when
+the GPS UART is empty, a 60-second watchdog for the main loop, and explicit
+trip-upload timeouts with separate send/reply timings. The loop pause and
+watchdog are **not yet bench-checked**. On
 2026-10-21 (UTC), an earlier Stage 4 build uploaded
 four real trips from microSD to the deployed server, then delivered all 115
 pending diagnostic events and a current snapshot. Uploads with debug mode
@@ -1005,6 +1008,24 @@ How it behaves once flashed:
   reset. On boot the firmware attempts to repair incomplete files, keeping
   ambiguous or damaged files for inspection. Hardware power-cut testing
   is still needed; there is no verified one-point loss limit.
+- **Main-loop rest and recovery:** after each normal pass, the GPS loop pauses
+  for 5 ms only if no UART bytes are waiting. It rechecks after other work so
+  a new burst is read on the next pass without an added pause. This gives
+  core 1 time to idle; battery and temperature improvements have not been
+  measured. The existing degraded loop keeps its 20 ms pause.
+  A 60-second task watchdog is armed after normal or degraded startup ends.
+  The Arduino core feeds it before each loop pass. A stuck filesystem lock
+  or driver call then requests a panic and board restart. Slow runtime trip
+  repair feeds it only as bytes are successfully scanned or copied; bounded
+  shutdown stages feed it between stages, never inside their polling waits.
+  Startup is deliberately outside this protection: mounting storage, the
+  first card free-space scan, journal setup and boot repair can take a long
+  time. A hang there is not covered by the loop watchdog. The network task
+  on core 0 is not enrolled: a trip upload may legitimately take 15 minutes.
+  After a watchdog reset, boot records E1003 and runs the usual trip repair
+  before logging resumes. The untimed points still in RAM can be lost.
+  The loop pause and watchdog are **not yet bench-checked**; host tests do
+  not establish reset timing, battery savings or real-card recovery.
 - **Time:** each trackpoint uses the UTC date and time from the same RMC
   sentence as its position, including centiseconds. Zero centiseconds use
   whole seconds (`...SSZ`); otherwise GPX writes three fractional digits
@@ -1131,6 +1152,17 @@ The trip is safely on the server; the copy is uploaded again at the next
 chance, and the server answers identical copies with 200 without storing a
 duplicate.
 
+New upload lines keep the same status text and append, for example,
+`; send 2.4 s, reply 0.3 s`. The time beside the byte count is the whole HTTP
+request. `send` includes connecting and sending headers/body through the
+last socket write; `reply` is the subsequent wait for response headers.
+Connecting has an explicit 5-second timeout, and the reply wait has a
+10-second timeout. That gives a slower server more time to parse and save a
+large trip while staying below the 15-second shutdown-abort window. A timeout
+keeps the trip queued. Historical log examples above retain their original form.
+The reply setting limits time without incoming data; it is not a deadline
+for the entire response. A server that trickles headers can extend the total wait.
+
 Server-down retry was verified on 2026-10-21 (UTC): the trip stayed queued
 after two `HTTP -1` failures and uploaded with HTTP 200 after ingest
 restarted. Wrong-token and server-error retries were bench-checked on
@@ -1171,6 +1203,23 @@ Unknown contents, unequal copies, and names that collide with a quarantined
 inspection; they may continue to consume storage. Failed storage operations
 leave recoverable copies available for the next boot. Hardware power-cut
 testing remains necessary to verify the flash driver's behavior.
+
+#### Watchdog bench check
+
+The loop watchdog is **not yet bench-checked**. For a supervised bench test,
+use a spare card and the normal Supreme build settings. Add
+`--build-property compiler.cpp.extra_flags=-DWATCHDOG_BENCH_HANG` to the
+`arduino-cli compile` command, keeping the normal version-stamping step and
+Stage 4 size limit. This compile-time hook is absent from normal builds.
+It prints `WATCHDOG BENCH: blocking loop until watchdog reset.` after startup
+and deliberately stops feeding the loop watchdog while yielding to other tasks.
+Expect a restart after about 60 seconds. A boot whose reset reason is already
+a watchdog reset skips the deliberate hang, so that reset can record E1003,
+repair an incomplete trip and continue logging. A later non-watchdog boot
+with this bench build will hang again; rebuild without the flag afterward.
+The hook runs before a new trip starts. To check boot repair as well, prepare
+an incomplete test GPX on the spare card while the board is off; the hook
+alone does not prove recovery of a trip interrupted during recording.
 
 #### Startup failures
 

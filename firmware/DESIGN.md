@@ -26,6 +26,18 @@ receive buffer to 2,048 bytes **before** `GPSSerial.begin()`. At 9,600 baud
 that is only about two seconds of incoming data, so buffering supplements
 the core split rather than making long stalls safe.
 
+At the end of a normal pass, `loop()` checks the UART again and calls
+`vTaskDelay` for 5 ms only if it is empty. Bytes arriving during display or
+power work suppress that pause. At 9,600 baud, about five bytes can arrive
+during 5 ms, compared with the 2,048-byte buffer. This lets core 1 idle
+between bursts. The 40 ms BOOT debounce and latched PMU IRQ still run each
+pass; the debug page keeps its one-second redraw, and the BME280 conversion
+can finish on a later pass after its 5 ms wait. The RTC still waits for the
+first 100 ms of a second, GPS configuration keeps its two-second ACK window,
+and NAV-PVT keeps its 1,500 ms freshness limit. Host regressions exercise
+these with time advancing through the pause. The degraded loop keeps its
+20 ms delay. Battery savings and peripheral timing are **not yet bench-checked**.
+
 The cores have distinct owners and narrow sharing points:
 
 - Core 1 constructs `Fix` objects, owns trip state and writes the active
@@ -51,6 +63,62 @@ recorded 7,436 bytes free during real trip and diagnostics uploads with GPS
 logging active; the allocation was retained. `uploadFile()` uses plain
 HTTP with `WiFiClient`, without Transport Layer Security (TLS). A future
 TLS path would need its own stack measurement.
+
+Trip uploads explicitly set a five-second connect timeout and ten-second
+reply timeout. A `static_assert` keeps the latter below the 15-second
+network-abort deadline: `gNetAbort` can interrupt the body stream but cannot
+interrupt HTTPClient's wait for a reply. An 8 MiB trip takes about 0.4 s to
+parse on a desktop; ten seconds allows slower processors and durable disk
+writes more margin. Existing upload status text is preserved, with send and
+reply seconds appended. In core 3.3.11, HTTPClient asks the body stream for
+availability after its final socket write, before checking remaining length
+and reading response headers. `LockedFileStream` records that boundary;
+send time includes connection/headers/body, and reply time begins afterward.
+An early send failure has no reply wait. Both timings use unsigned elapsed
+milliseconds so timer rollover is safe.
+HTTPClient resets its read timer when response data arrives: this is an
+inactivity limit, so trickling response headers can extend the total wait
+beyond ten seconds. The assertion bounds the configured timeout, not the
+entire HTTP request.
+
+## Main-loop watchdog
+
+The installed ESP32-S3 core 3.3.11 initializes the task watchdog at five
+seconds with panic enabled, watches the core-0 idle task, and leaves the
+Arduino loop task unenrolled. `armLoopWatchdog()` reconfigures that shared
+watchdog to `LOOP_WDT_TIMEOUT_MS` (60 seconds), explicitly enables panic,
+preserves the configured idle-task subscriptions and enrolls the loop task
+with `enableLoopWDT()`. Enrollment is checked; failure requests a restart.
+The installed panic configuration prints and reboots. This also extends
+the existing core-0 idle-task watchdog timeout to 60 seconds.
+
+Enrollment occurs at the end of normal setup and after every degraded
+startup. All initial PMU/display work, SD/LittleFS mounting, first free-space
+query, full erased-partition scan, journal initialization and boot fsck run
+before enrollment. This avoids false resets on a slow but progressing boot;
+it also leaves a boot-time hang outside the loop watchdog's coverage.
+Degraded storage retry only probes mounts, then restarts into full setup
+for the first free-space scan and recovery. No boot repair decision depends
+on reset reason: watchdog boots still run fsck and emit existing E1003 history.
+
+Arduino's `main.cpp` feeds before each `loop()` call, covering normal and
+degraded modes. Runtime scan, prefix comparison and repair-copy loops feed
+only after successful byte progress. Power-off feeds after its two bounded
+15-second network/journal handoffs, returned unmount, returned shutdown hold
+and completed remount. Its display hold and post-shutdown hold are one second
+each. The watchdog remains armed through driver calls and restart requests;
+there is no feed inside `FS_LOCK()` acquisition or a polling wait. A stalled
+driver or lock is meant to expire, while ordinary 20 ms degraded passes and
+bounded I2C/display operations fit well inside the interval. Normal journal
+disk recovery is deferred to core 0; degraded service processes one queued
+record per pass. The core-0 network task is not enrolled or fed by these
+helpers, since a healthy upload may run for 15 minutes.
+
+`WATCHDOG_BENCH_HANG`, off by default, deliberately blocks the loop without
+feeding; watchdog-reset boots skip the hook and continue through ordinary
+recovery. See the [bench instructions](README.md#watchdog-bench-check).
+The watchdog and loop pause are **not yet bench-checked**. Host control-flow
+tests and real board builds do not prove electrical restart or SD durability.
 
 ## Firmware identity on the debug screen
 
