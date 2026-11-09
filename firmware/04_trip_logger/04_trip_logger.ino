@@ -577,7 +577,6 @@ static void armBufPush(const Fix& fx) {
     if (gArmCount < 16) gArmCount++;
     else gArmHead = (gArmHead + 1) % 16;
 }
-static float     gMaxSpeedMps = 0;
 static char      gTripPath[48] = {0};   // active file, "" when none
 static bool      gTripWriteFailed = false;  // a write to gTripPath didn't land
 static bool      gHaveLastFix = false;
@@ -899,7 +898,6 @@ static bool beginTrip(const Fix& fx, bool continuation = false) {
     gTripContinuation = false;
     fs::FS& storage = *gTripFS;
     gTripMeters = 0;
-    gMaxSpeedMps = fx.speedMps;
     gTripBytes = 0;
     gTripWriteFailed = false;
     gTripT0 = gArmCount ? gArmBuf[gArmHead].monoMs : fx.monoMs;
@@ -954,7 +952,6 @@ static bool beginTrip(const Fix& fx, bool continuation = false) {
             const Fix& a = gArmBuf[(gArmHead + i - 1) % 16];
             gTripMeters += haversineM(a.lat, a.lon, b.lat, b.lon);
         }
-        if (b.speedMps > gMaxSpeedMps) gMaxSpeedMps = b.speedMps;
     }
     armBufReset();
     gCoolT0 = fx.monoMs;
@@ -1098,7 +1095,6 @@ static void tripFsmOnFix(const Fix& fx) {
             gTripMeters += haversineM(gLastFix.lat, gLastFix.lon, fx.lat, fx.lon);
         gLastMoveMs = now;
     }
-    if (speed > gMaxSpeedMps) gMaxSpeedMps = speed;
 
     switch (gState) {
     case IDLE:

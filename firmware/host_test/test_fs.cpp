@@ -1783,7 +1783,7 @@ int main(int argc, char** argv) {
         CHECK(times(g_sdDisk.files.at(first)).back() == times(g_sdDisk.files.at(second)).front() &&
               count(g_sdDisk.files.at(second), "<trkpt ") == 1,
               "boundary point belongs to both pieces without an arming gap");
-        CHECK(gTripMeters == 0 && gMaxSpeedMps == 5 && gTripT0 == gLastFix.monoMs &&
+        CHECK(gTripMeters == 0 && gTripT0 == gLastFix.monoMs &&
               gLastMoveMs == gTripT0 && gPendCount == 0 && gArmCount == 0 &&
               gTripBytes == g_sdDisk.files.at(second).size(),
               "new piece starts with fresh distance, speed, time and byte count");
@@ -1824,7 +1824,7 @@ int main(int argc, char** argv) {
         padTripTo(TRIP_SPLIT_BYTES - (TRKPT_LINE_BYTES - 1) - strlen(GPX_EPILOGUE) - 1);
         drive(0, 1);
         CHECK(gState == COOLDOWN && first != gTripPath && gCoolT0 == coolT0 &&
-              gTripMeters == 0 && gMaxSpeedMps == 0 && gTripT0 == gLastFix.monoMs,
+              gTripMeters == 0 && gTripT0 == gLastFix.monoMs,
               "stationary split keeps the original cooldown deadline and resets per-piece stats");
         drive(0, kCooldownSeconds - 101);
         CHECK(gState == IDLE && gTripPath[0] == 0,
