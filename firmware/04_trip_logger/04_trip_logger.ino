@@ -11,12 +11,12 @@
 //   2. GPX logging to microSD (LittleFS fallback) -- one line per timed fix,
 //      file.close() after every write to limit power-cut data loss.
 //      The latest 90 untimed points are buffered in RAM; older ones spill
-//      to flash without times. Boot-time "fsck" attempts
+//      to the selected trip store without times. Boot-time "fsck" attempts
 //      repair; a maximum loss bound still needs hardware validation.
 //   3. A FreeRTOS networking task pinned to core 0 that, when parked on
 //      home WiFi, uploads finished .gpx files to the ingest server and
 //      deletes them locally on success. GPS parsing stays on core 1 and
-//      is never blocked by networking.
+//      shares storage only for individual reads/writes.
 //   4. AXP2101 VBUS-loss handling: when the car turns off (USB power
 //      goes away), finalize the current trip cleanly and keep the file
 //      for the next time we're home.
@@ -35,11 +35,11 @@
 // New trips use SD when it mounts at boot. Both mounted stores are repaired
 // and drained, SD first, so flash trips from a previous boot are not stranded.
 //
-// NOTE: compiles on ESP32 Arduino core 3.3.11 (XPowersLib 0.3.3,
-// TinyGPSPlus 1.0.3) but has not yet had its on-hardware shakedown --
-// do that pass before trusting it in the car (see the README).
+// NOTE: targets ESP32 Arduino core 3.3.11 (XPowersLib 0.3.3,
+// TinyGPSPlus 1.0.3). Recorded hardware checks are in the README;
+// the loop pause and task watchdog are not yet bench-checked.
 // 2026-06-09 review fixes: per-chunk FS locking during upload, battery
-// idle deep-sleep, ARMING-phase point capture, stationary-jitter distance
+// idle power-off, ARMING-phase point capture, stationary-jitter distance
 // gate, fix-loss trip finalization. See ../../docs/history/CODE_REVIEW_2026-06-09.md.
 // =================================================================
 
@@ -57,6 +57,7 @@
 #include <vector>
 #include <esp_sntp.h>
 #include <esp_partition.h>
+#include <esp_task_wdt.h>
 #include <atomic>
 #include <new>
 #include <cmath>
@@ -118,7 +119,7 @@ static bool gDisplayUsbPowerRequest = false; // core-1 power handler -> renderer
 #define GPS_BAUD     9600
 #define PMU_IRQ_PIN  40   // active-low; not an RTC GPIO on the S3
 // LilyGO utilities.h / LoRaBoards.cpp at 1991b1ed70915d4f246b841f99f6027166ea7330.
-// SD wiring still needs Stage 2 d on the bench. Board uses QSPI, not octal PSRAM.
+// SD wiring checked by Stage 2 d, 2026-10-18. Board uses QSPI, not octal PSRAM.
 static constexpr int SD_MOSI = 35, SD_SCK = 36, SD_MISO = 37, SD_CS = 47, IMU_CS = 34;
 static constexpr uint32_t SD_SPI_HZ = 4000000; // core default; ample for ~119 B/s GPX
 static constexpr uint32_t SD_SETTLE_MS = 250;
@@ -142,6 +143,10 @@ static constexpr uint32_t NAV_PVT_FALLBACK_MS = 10000;
 // Let core 1 idle between bursts. At 9600 baud, 5 ms is about five bytes,
 // far below the 2048-byte RX buffer; check the UART again just before resting.
 static constexpr uint32_t LOOP_IDLE_MS = 5;
+// Normal passes take milliseconds; shutdown has two bounded 15 s handoffs.
+// Allow 60 s for slow card/driver calls without masking a stuck loop task.
+// Large boot scans run before enrollment; runtime repair feeds on byte progress.
+static constexpr uint32_t LOOP_WDT_TIMEOUT_MS = 60000;
 static constexpr float    MIN_TRIP_METERS = 160.0f;          // ~0.1 mi
 static constexpr uint32_t MIN_TRIP_MS     = 30UL  * 1000;
 static constexpr size_t   TRIP_SPLIT_BYTES = 8 * 1024 * 1024; // half the server cap
@@ -453,6 +458,39 @@ static uint64_t contactUptime() {
     return gContactUptime;
 }
 static bool debugMode() { return gDebugMode.load(); }
+
+static bool gLoopWatchdogArmed = false; // loop task only, never core 0
+static void armLoopWatchdog() {
+    if (gLoopWatchdogArmed) return;
+    uint32_t idleMask = 0;
+#if CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0
+    idleMask |= 1U;
+#endif
+#if CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1
+    idleMask |= 2U;
+#endif
+    // Keep the core's idle-task subscriptions. The installed S3 core starts
+    // TWDT at 5 s with panic enabled; explicitly retain panic (reset), not
+    // just a warning, when extending the shared watchdog to 60 s.
+    const esp_task_wdt_config_t config = {LOOP_WDT_TIMEOUT_MS, idleMask, true};
+    esp_err_t error = esp_task_wdt_reconfigure(&config);
+    if (error == ESP_ERR_INVALID_STATE) error = esp_task_wdt_init(&config);
+    if (error == ESP_OK) {
+        enableLoopWDT(); // core 3.3.11 then feeds immediately before each loop()
+        if (esp_task_wdt_status(nullptr) == ESP_OK) {
+            gLoopWatchdogArmed = true;
+            return;
+        }
+    }
+    Serial.println("ERROR: loop watchdog could not be armed; restarting.");
+    ESP.restart();
+}
+
+static void feedLoopWatchdogProgress() {
+    // Some file helpers are shared. Never feed or enroll the core-0 network
+    // task, and never feed while waiting to acquire FS_LOCK or for another task.
+    if (xPortGetCoreID() == 1 && gLoopWatchdogArmed) feedLoopWDT();
+}
 
 static void serverContact() { gLastContact = contactUptime(); gContactKnown = true; }
 static bool heartbeatDue() {
@@ -1224,6 +1262,7 @@ static long findLastTrkptEnd(File& f, uint32_t* points = nullptr) {
         carryLen = min(tl - 1, rl);
         memmove(region, region + rl - carryLen, carryLen);
         pos += n;
+        feedLoopWatchdogProgress(); // another verified scan block
     }
     return last;
 }
@@ -1240,6 +1279,7 @@ static bool sameFilePrefix(File& a, File& b, size_t bytes, bool* readFailed = nu
         }
         if (memcmp(ab, bb, n) != 0) return false;
         bytes -= n;
+        feedLoopWatchdogProgress(); // another verified matching block
     }
     return true;
 }
@@ -1252,6 +1292,7 @@ static bool fileMatchesText(File& f, const char* text, size_t bytes, bool* readF
         if (memcmp(buf, text, n) != 0) return false;
         text += n;
         bytes -= n;
+        feedLoopWatchdogProgress();
     }
     return true;
 }
@@ -1377,7 +1418,9 @@ static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result) 
         int n = f.read(b, want);
         if (n <= 0) break;
         w.put((const char*)b, n);
+        if (!w.ok) break;
         remaining -= n;
+        feedLoopWatchdogProgress(); // copied bytes, never a stalled read/write
     }
     w.put("\n");
     w.put(GPX_EPILOGUE);
@@ -1575,6 +1618,7 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
     Serial.println("Preparing PMU power-off (battery critical / idle).");
     if (gTripPath[0]) endTrip(/*discardIfMicro=*/false);
     stopNetworkTask();
+    feedLoopWatchdogProgress(); // bounded abort handoff completed, <=15 s
     // The core-0 consumer closes each append itself; ask it to drain and seal
     // before unmount. A stuck network task cannot delay power safety forever.
     if (gJournalReady) {
@@ -1597,6 +1641,7 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
         if (!gJournalSealDone.load() || !gJournalSealOk.load())
             Serial.println("Journal: shutdown drain/seal incomplete; RAM records may be lost.");
     }
+    feedLoopWatchdogProgress(); // bounded journal handoff completed, <=15 s
     // pollPmu() and both idle paths run on loop/core 1, the OLED owner.
     // Draw synchronously: no wait for another task or display acknowledgment.
     // The adapter latches the first bus failure (10 ms Wire timeout); a failed
@@ -1619,6 +1664,7 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
     FS_LOCK();
     if (gSdMounted) SD.end();
     if (gFlashMounted) LittleFS.end();
+    feedLoopWatchdogProgress(); // unmount returned; no feed while acquiring lock
     // Only the current owner sleeps the shared panel, before the final VBUS
     // read. A latched failure must not retry via the other adapter.
     display::DisplayModel::Input displayOff; displayOff.shutdown = true;
@@ -1645,6 +1691,7 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
         // before treating a returning call as failure; don't spin or leave
         // the logger alive with storage unmounted if power stays on.
         vTaskDelay(pdMS_TO_TICKS(1000));
+        feedLoopWatchdogProgress(); // shutdown returned after the bounded hold
         Serial.println(gDegraded.mode() == startup::Mode::Normal ?
             "ERROR: PMU.shutdown() did not power off -- resuming logging." :
             "ERROR: PMU.shutdown() did not power off -- resuming degraded service.");
@@ -1673,6 +1720,7 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
         ESP.restart();
         return;
     }
+    feedLoopWatchdogProgress(); // completed remount, before journal recovery
     gJournal.invalidateStorage(); // same boot/queue, reload metadata after remount
     gJournalStarted = false; // recheck FAT allocation geometry on core 0
     gPowerOffEventPending.store(false); // consumer excluded by FS_LOCK
@@ -2722,7 +2770,7 @@ static bool mountSdStorage() {
     return false;
 }
 
-static bool mountTripStorage(bool allowProvision = true) {
+static bool mountTripStorage(bool allowProvision = true, bool reportFreeSpace = true) {
     gSdMounted = mountSdStorage();
     // Keep the existing preservation-first provisioning rule for flash.
     // If flash is damaged but SD works, record to SD and preserve flash
@@ -2733,6 +2781,10 @@ static bool mountTripStorage(bool allowProvision = true) {
         if (!gFlashMounted) LittleFS.end();
     }
     gTripFS = gSdMounted ? static_cast<fs::FS*>(&SD) : static_cast<fs::FS*>(&LittleFS);
+    // Degraded retry only probes mounts, then restarts through full setup.
+    // Leave the potentially slow first FAT free-cluster scan to that startup,
+    // before watchdog enrollment, rather than repeat it on the watched loop.
+    if (!reportFreeSpace) return gSdMounted || gFlashMounted;
     if (gSdMounted) {
         Serial.printf("Trip storage: microSD (%.2f GiB free); internal flash queue %s.\n",
                       storageFreeBytes(SD) / (1024.0 * 1024 * 1024),
@@ -3041,6 +3093,7 @@ static void enterDegraded(startup::Mode mode) {
             "DEGRADED: power chip not responding -- not recording; no charge or rail control. Retrying in 60 s." :
             "DEGRADED: power chip state untrusted -- not recording; no further charge or rail control. Retrying in 60 s.");
     }
+    armLoopWatchdog(); // degraded boots have a loop task too, but no network task
 }
 
 static void degradedLoop() {
@@ -3066,7 +3119,7 @@ static void degradedLoop() {
         bool recovered = false;
         if (mode == Mode::NoStorage) {
             // No format, fsck, trip activity or journal migration on this probe.
-            recovered = mountTripStorage(false);
+            recovered = mountTripStorage(false, false);
             if (gSdMounted) { SD.end(); gSdSpi.end(); }
             if (gFlashMounted) LittleFS.end();
             gSdMounted = gFlashMounted = false;
@@ -3232,9 +3285,20 @@ void setup() {
     }
 
     Serial.println("Setup complete. Logging trips.");
+    // Mount, first free-space scan, erased-partition scan, journal begin and
+    // fsck may legitimately be slow. Enroll only after ALL startup work.
+    armLoopWatchdog();
 }
 
 void loop() {
+#ifdef WATCHDOG_BENCH_HANG
+    // Deliberately no feed: the next watchdog-reset boot skips this hook,
+    // runs ordinary fsck, records E1003 and continues instead of reset-looping.
+    if (std::strcmp(diagnostics::journalResetReason(esp_reset_reason()), "watchdog") != 0) {
+        Serial.println("WATCHDOG BENCH: blocking loop until watchdog reset.");
+        for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+#endif
     if (gDegraded.mode() != startup::Mode::Normal) {
         degradedLoop();
         return;

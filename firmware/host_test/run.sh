@@ -180,12 +180,16 @@ if [ -f "$tinygps/TinyGPS++.cpp" ]; then
     for file in "$build/out-debug/"*.gpx; do
         cmp "$file" "$build/out/$(basename "$file")" || status=1
     done
-    for test in test_loop_runtime test_temperature_runtime test_degraded test_rtc_runtime test_display_runtime test_fault_hooks test_pmu_verification; do
+    for test in test_watchdog test_loop_runtime test_temperature_runtime test_degraded test_rtc_runtime test_display_runtime test_fault_hooks test_pmu_verification; do
         echo "== $test (single binary, runtime modes)"
         "${cxx[@]}" "${flags[@]}" -DARDUINO=100 "${gps_incs[@]}" \
             "$here/$test.cpp" "$here/../04_trip_logger/event_log.cpp" "$build/tinygps_library.o" -o "$build/$test.exe"
         run_modes "$build/$test.exe"
     done
+    echo "== test_watchdog (WATCHDOG_BENCH_HANG)"
+    "${cxx[@]}" "${flags[@]}" -DARDUINO=100 -DWATCHDOG_BENCH_HANG "${gps_incs[@]}" \
+        "$here/test_watchdog.cpp" "$here/../04_trip_logger/event_log.cpp" "$build/tinygps_library.o" -o "$build/test_watchdog_bench.exe"
+    run_modes "$build/test_watchdog_bench.exe"
     run_modes "${PYTHON:-python}" "$here/check_rtc_protocol.py" "$build/test_rtc_runtime.exe" || status=1
     run_modes "${PYTHON:-python}" "$here/check_fault_hooks_protocol.py" "$build/test_fault_hooks.exe" || status=1
     echo "== test_debug_status (formatting and real GSV parser)"

@@ -30,6 +30,7 @@ static std::string g_outDir;
 static double gLat = 37.0, gLon = -122.0;
 
 static void resetWorld() {
+    g_watchdog = WatchdogStub(); loopTaskWDTEnabled = false; gLoopWatchdogArmed = false;
     gDebugMode.store(hostDebugMode());
     gProductionDisplayReady = gProductionDisplayFailed = gProductionDisplayBegun = false;
     gProductionHaveOutput = gProductionWireReady = false;

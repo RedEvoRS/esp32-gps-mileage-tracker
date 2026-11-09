@@ -105,6 +105,7 @@ static void run(float mps, int seconds, bool fix = true, bool ggaFirst = false,
 }
 
 static void resetWorld() {
+    g_watchdog = WatchdogStub(); loopTaskWDTEnabled = false; gLoopWatchdogArmed = false;
     gDebugMode.store(hostDebugMode());
     gBootButton = runtime_debug::BootButton();
     gModeFeedback = false; gDisplayOwner = DisplayOwner::Production;

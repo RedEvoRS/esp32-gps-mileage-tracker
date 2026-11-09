@@ -362,6 +362,7 @@ struct SDStub : fs::FS {
     bool cardPresent = false;
     int begins = 0, ends = 0;
     int capacityQueries = 0;
+    std::function<void()> onCapacity;
     int cs = -1, maxFiles = 0;
     uint32_t hz = 0;
     SPIClass* spi = nullptr;
@@ -380,7 +381,11 @@ struct SDStub : fs::FS {
     }
     uint8_t cardType() { return g_disk.mounted ? CARD_SDHC : CARD_NONE; }
     // Core 3.3.x keeps cardType cached but returns zero on f_getfree error.
-    uint64_t totalBytes() { ++capacityQueries; return cardPresent && !g_disk.readsFail ? g_disk.capacity : 0; }
+    uint64_t totalBytes() {
+        ++capacityQueries;
+        if (onCapacity) onCapacity();
+        return cardPresent && !g_disk.readsFail ? g_disk.capacity : 0;
+    }
     uint64_t usedBytes() { return cardPresent && !g_disk.readsFail ? g_disk.used() : 0; }
     bool readRAW(uint8_t* data, uint32_t sector) {
         if (sector || !g_disk.mounted) return false;
@@ -419,7 +424,9 @@ inline void portEXIT_CRITICAL(portMUX_TYPE*) {}
 inline bool g_failMutexCreate = false;
 inline SemaphoreHandle_t xSemaphoreCreateMutex() { return g_failMutexCreate ? nullptr : (void*)1; }
 extern int g_lockDepth;
+inline std::function<void(uint32_t)> g_semaphoreTakeHook;
 inline int xSemaphoreTake(SemaphoreHandle_t, uint32_t wait) {
+    if (g_semaphoreTakeHook) g_semaphoreTakeHook(wait);
     if (!wait && g_lockDepth) return 0;
     if (g_lockDepth != 0) { fprintf(stderr, "FATAL: re-entrant FS_LOCK (would deadlock)\n"); exit(3); }
     g_lockDepth++; return 1;

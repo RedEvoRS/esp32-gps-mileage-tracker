@@ -3,7 +3,8 @@
 #include "esp_partition.h"
 // ESP-IDF's typed lookup distinguishes an absent key from an I/O failure.
 using nvs_handle_t = unsigned;
-constexpr int ESP_ERR_NVS_NOT_FOUND = 1, ESP_FAIL = 2;
+#include "esp_err.h"
+constexpr int ESP_ERR_NVS_NOT_FOUND = 1;
 constexpr int NVS_READONLY = 0;
 inline esp_err_t nvs_open(const char*, int, nvs_handle_t* handle) {
     if (Preferences::failBegin) return ESP_FAIL;
