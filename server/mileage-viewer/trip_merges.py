@@ -190,12 +190,9 @@ def _unreadable_start(trip):
     # establish chronology. Legacy/non-timestamp IDs give no timing evidence.
     key = trip.get("parts", [trip["trip_key"]])[0]
     trip_id = key.split("/")[-1]
-    match = re.fullmatch(
-        r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}Z)(?:-[0-9a-f]{12})?", trip_id
-    )
-    if match:
+    if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}Z", trip_id):
         try:
-            return datetime.strptime(match[1], "%Y-%m-%dT%H-%M-%SZ").replace(tzinfo=timezone.utc)
+            return datetime.strptime(trip_id, "%Y-%m-%dT%H-%M-%SZ").replace(tzinfo=timezone.utc)
         except ValueError:
             pass
     return None

@@ -433,19 +433,12 @@ for storage, Python fallback and service setup.
    token generated in step 3.
 
    A timed GPX always gets its ID from its earliest point time (or metadata
-   time when no point is timed), in UTC: `YYYY-MM-DDTHH-MM-SSZ`. If that ID
-   already holds different GPX from another device, ingest appends `-` and the
-   first 12 lowercase hexadecimal characters of the SHA-256 of this upload's
-   device ID (UTF-8), from `X-Device-Id` or the GPX creator fallback. Retries
-   keep the same ID and original receipt metadata. Different GPX from the same
-   device, a conflicting suffixed ID, or an unreadable/missing original device
-   identity still returns 409; ingest never overwrites another trip.
-   `X-Trip-Id` is used only when the GPX has no usable point or metadata
-   timestamp; otherwise it is ignored.
-   It can then name that upload, except that timestamp-shaped IDs, with or
-   without this device suffix, are reserved for timed GPX. Firmware never sends
-   that header: local filenames (`t000001.gpx`, for example) use a counter kept
-   in the board's flash settings (NVS, the ESP32's non-volatile storage), while each
+   time when no point is timed), in UTC. `X-Trip-Id` is used only when the GPX
+   has no usable point or metadata timestamp; otherwise it is ignored.
+   It can then name that upload, except that timestamp-shaped IDs
+   are reserved for timed GPX. Firmware never sends that header: local
+   filenames (`t000001.gpx`, for example) use a counter kept in the board's
+   flash settings (NVS, the ESP32's non-volatile storage), while each
    uploaded size-split piece starts at its own boundary fix. Retries search
    all month directories under the upload lock and keep the original folder,
    including after a `DISPLAY_TZ` change. Existing duplicate folders require
@@ -453,6 +446,18 @@ for storage, Python fallback and service setup.
    Older third-party timed uploads named with a custom header keep their old
    names on disk. Review those pairs before re-uploading: the new timestamp ID
    can create another record. Firmware uploads already use timestamp IDs.
+
+   **More than one tracker on one server:** trip IDs don't include the
+   device. If two trackers start recording trips in the same second, the
+   second upload gets HTTP 409, the ingest log names the conflict, and Device
+   health shows E5007 for that tracker. The trip stays queued on that
+   tracker and is retried on every visit home, but it never arrives on its
+   own. Two cars rarely start within the same second, so this is unlikely.
+   To clear it, copy the file off the card and move it aside, as described
+   under `HTTP 409` in
+   [Check recording and uploads](../firmware/README.md#check-recording-and-uploads).
+   Give each tracker its own `DEVICE_ID` so the logs and Device health can
+   tell them apart.
 
    Ingest rejects GPX document types/entities, unknown XML encodings, timestamps
    before 2000-01-01 or more than one day after server receipt, and non-finite
