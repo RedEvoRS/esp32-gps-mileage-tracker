@@ -1,0 +1,5 @@
+target-version = "py312"
+include = ["server/**/*.py", "tools/**/*.py", "install/**/*.py"]
+
+[lint]
+select = ["F", "E9", "B"]

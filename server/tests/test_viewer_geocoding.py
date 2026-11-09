@@ -401,7 +401,7 @@ class EndpointPlaceTests(unittest.TestCase):
         self.assertEqual(rows[0]["destination"], "'" + hostile)
         workbook = load_workbook(io.BytesIO(self.client.get("/export.xlsx").data))
         try:
-            cells = dict(zip((c.value for c in workbook.active[1]), workbook.active[2]))
+            cells = dict(zip((c.value for c in workbook.active[1]), workbook.active[2], strict=True))
             self.assertEqual(cells["destination"].value, hostile)
             self.assertEqual(cells["destination"].data_type, "s")
         finally:

@@ -308,7 +308,7 @@ def scan_file_versions(paths, deny, tag):
         return
     types = git("cat-file", "--batch-check=%(objectname) %(objecttype)",
                 data="\n".join(paths).encode()).decode().split()
-    blobs = [sha for sha, kind in zip(types[::2], types[1::2]) if kind == "blob"]
+    blobs = [sha for sha, kind in zip(types[::2], types[1::2], strict=True) if kind == "blob"]
     if not blobs:
         return
     out = git("cat-file", "--batch", data=("\n".join(blobs) + "\n").encode())

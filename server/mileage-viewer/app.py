@@ -1175,7 +1175,7 @@ def _history_trip_keys(conn, trip_key, parts=()):
 
 def _history_row_dict(row):
     fields = ("id", "trip_key", "actor", "actor_role", "at", "action", "details")
-    return dict(row) if isinstance(row, sqlite3.Row) else dict(zip(fields, row))
+    return dict(row) if isinstance(row, sqlite3.Row) else dict(zip(fields, row, strict=True))
 
 
 def _history_order(value):
@@ -3384,6 +3384,7 @@ def track_endpoints(trip):
     return dict(zip(
         ("start_latitude", "start_longitude", "end_latitude", "end_longitude"),
         (*first, *last),
+        strict=True,
     ))
 
 

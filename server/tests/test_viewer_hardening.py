@@ -216,7 +216,7 @@ class ViewerHardeningTests(unittest.TestCase):
     def test_xlsx_export_survives_old_bad_values(self):
         # A value saved before the check, or a device ID from an upload.
         bad = {name: "Client" + char + "visit" for name, char in self.ILLEGAL.items()}
-        for index, (name, text) in enumerate(bad.items()):
+        for name, text in bad.items():
             with closing(sqlite3.connect(self.db)) as conn, conn:
                 conn.execute("UPDATE annotations SET purpose_note=?, destination=? WHERE trip_key='2026-01/drive'",
                              (text, text))

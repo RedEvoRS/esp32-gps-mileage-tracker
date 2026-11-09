@@ -206,7 +206,7 @@ class ViewerSecurityTests(unittest.TestCase):
         workbook = load_workbook(io.BytesIO(response.data), data_only=False)
         try:
             rows = list(workbook.active.iter_rows())
-            cells = dict(zip((cell.value for cell in rows[0]), rows[1]))
+            cells = dict(zip((cell.value for cell in rows[0]), rows[1], strict=True))
             for name in ("device_id", "purpose_note"):
                 self.assertEqual(cells[name].value, "=1+2")
                 self.assertEqual(cells[name].data_type, "s")

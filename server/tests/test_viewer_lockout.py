@@ -3,7 +3,6 @@
 import importlib.util
 import os
 import sqlite3
-import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -209,9 +208,9 @@ class ViewerLockoutTests(unittest.TestCase):
     def test_documented_manual_unlock_fully_unlocks(self):
         # DEPLOY_DEBIAN.md: DELETE FROM login_attempts. It must clear the lock
         # and leave no per-name leftovers that a later success could subtract.
-        for i in range(2):
+        for _ in range(2):
             self.attempt('helper', 'wrong')
-        for i in range(3):
+        for _ in range(3):
             self.attempt('driver', 'wrong')
         self.assertEqual(self.attempt('driver', 'test-password'), 429)
         with closing(sqlite3.connect(self.db)) as conn, conn:
@@ -238,7 +237,7 @@ class ViewerLockoutTests(unittest.TestCase):
         self.assertEqual(self.row()[0], 4)
 
     def test_lock_resets_the_per_name_counts(self):
-        for i in range(5):
+        for _ in range(5):
             self.attempt('helper', 'wrong')
         self.assertIsNotNone(self.row()[1])
         with closing(sqlite3.connect(self.db)) as conn:

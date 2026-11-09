@@ -151,6 +151,8 @@ cancelled. The PII/tools job is skipped for Dependabot PRs:
   before pushing; it also checks every file version and path the range adds,
   even ones later removed) and `python -m unittest discover -s tools`.
   The scanner checks positions and new commit dates; commit with TZ=UTC.
+- Python lint: `python -m pip install -r tools/lint/requirements.txt`, then
+  `ruff check` (server, tools and install; rules F, E9 and B).
 - Server: `python -m unittest discover -s server/tests`,
   `python tools/generate_error_catalog.py --check`,
   `node server/tests/test_viewer_map.js` and `node server/tests/test_viewer_places.js`.

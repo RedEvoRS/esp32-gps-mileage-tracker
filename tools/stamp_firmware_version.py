@@ -91,6 +91,6 @@ if __name__ == "__main__":
     try:
         print(stamp())
     except ValueError as error:
-        raise SystemExit(f"Cannot stamp firmware version: {error}")
+        raise SystemExit(f"Cannot stamp firmware version: {error}") from None
     except (OSError, subprocess.CalledProcessError):
-        raise SystemExit("Cannot stamp firmware version: check Git and the repository checkout")
+        raise SystemExit("Cannot stamp firmware version: check Git and the repository checkout") from None

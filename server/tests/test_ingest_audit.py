@@ -1,7 +1,6 @@
 """Regressions from the ingest/diagnostics October 2026 audit."""
 
 import io
-import json
 import os
 import signal
 import sqlite3

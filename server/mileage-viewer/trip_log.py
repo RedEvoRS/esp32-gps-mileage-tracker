@@ -46,7 +46,7 @@ def removal(conn, key):
     row = conn.execute(
         "SELECT reason, removed_by, removed_at FROM trip_removals WHERE trip_key=?", (key,)
     ).fetchone()
-    return dict(zip(("reason", "removed_by", "removed_at"), row)) if row else None
+    return dict(zip(("reason", "removed_by", "removed_at"), row, strict=True)) if row else None
 
 
 def removals(conn):

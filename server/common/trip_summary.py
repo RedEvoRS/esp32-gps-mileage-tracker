@@ -95,7 +95,7 @@ def parse_gpx(raw_bytes, *, time_bounds=None):
         parser.Parse(raw_bytes, True)
         root = ET.fromstring(raw_bytes)
     except (ET.ParseError, expat.ExpatError, LookupError) as e:
-        raise ValueError(f"not valid XML: {e}")
+        raise ValueError(f"not valid XML: {e}") from e
 
     if _local(root.tag) != "gpx":
         raise ValueError(f"root element is <{_local(root.tag)}>, expected <gpx>")

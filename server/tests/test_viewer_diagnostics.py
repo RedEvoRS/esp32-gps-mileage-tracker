@@ -210,7 +210,7 @@ os._exit(0)
             f"{state.capitalize()} conditions ({len(conditions)})"
             for state, conditions in groups.items()
         ])
-        for (state, _), (_, parents) in zip(groups.items(), headings):
+        for (state, _), (_, parents) in zip(groups.items(), headings, strict=True):
             with self.subTest(state=state):
                 if state == "active":
                     self.assertEqual(parents, [])

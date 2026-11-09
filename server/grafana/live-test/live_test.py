@@ -163,7 +163,7 @@ def test_prometheus():
           any(t["health"] == "up" and t["labels"]["job"] == "mileage-tracker" for t in targets),
           [(t["scrapeUrl"], t["health"], t["lastError"]) for t in targets])
     for metric, labels in METRIC_LABELS.items():
-        wait_for(metric, lambda: bool(prom_query(metric)), 150)
+        wait_for(metric, lambda metric=metric: bool(prom_query(metric)), 150)
         series = prom_query(metric)
         seen = [set(s["metric"]) - {"__name__", "job", "instance"} for s in series]
         check(metric + " present with documented labels",
@@ -184,7 +184,7 @@ def test_prometheus():
 def test_alert_rules():
     print("== Prometheus alert rules")
     for name in ("TrackerActiveErrorOrCriticalFault", "TrackerNoContact"):
-        fired = wait_for(name, lambda: any(
+        fired = wait_for(name, lambda name=name: any(
             a["labels"]["alertname"] == name and a["state"] == "firing"
             for a in get_json(PROM + "/api/v1/alerts")[1]["data"]["alerts"]), 330)
         check("alert %s fires on the test data" % name, fired)
@@ -201,7 +201,7 @@ def test_loki():
     expected = [(0, "code", "1002"), (1, "code", "1001"), (2, "device_id", DEVICE), (3, "code", "1002")]
     for index, label, value in expected:
         query = examples[index]
-        wait_for("LogQL example %d" % (index + 1), lambda: any(
+        wait_for("LogQL example %d" % (index + 1), lambda label=label, value=value, query=query: any(
             r["metric"].get(label) == value for r in (loki_query(query)[1] or [])
             if isinstance(r, dict)), 330)
         status, result = loki_query(query)

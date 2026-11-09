@@ -58,7 +58,7 @@ def pair_events(events):
         boots = [e for rows in histories.values() for e in rows if e["code"] == 1000]
         counters = Counter(e["boot_counter"] for e in boots)
         known = sorted((e for e in boots if e["utc_ms"] is not None), key=lambda e: e["utc_ms"])
-        for previous, boot in zip(known, known[1:]):
+        for previous, boot in zip(known, known[1:], strict=False):
             counter = previous["boot_counter"]
             if (counter <= 0 or boot["boot_counter"] != counter + 1
                     or counters[counter] != 1 or counters[counter + 1] != 1
@@ -137,9 +137,9 @@ def main(argv=None):
                      "rebound_offset_mv", "rebound_spread_mv", "rebound_status",
                      "corrected_mv_drop", "corrected_mv_per_hour", "resolution_mv", "drain_status"])
     for pair in pairs:
-        def utc(key):
+        def utc(key, pair=pair):
             return datetime.fromtimestamp(pair[key] / 1000, timezone.utc).isoformat()
-        def number(key):
+        def number(key, pair=pair):
             return "unknown" if pair[key] is None else f"{pair[key]:.3f}"
         writer.writerow([pair["device_id"], utc("off_utc_ms"), utc("boot_utc_ms"),
                          number("hours_parked"), number("mv_drop"), number("mv_per_hour"),

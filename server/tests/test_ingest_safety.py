@@ -310,7 +310,7 @@ class UploadSafety(unittest.TestCase):
         results = ctx.Queue()
         processes = [ctx.Process(target=upload_worker,
                                  args=(str(self.root), payload, barrier, results, headers, instant))
-                     for payload, instant in zip(payloads, instants or [None] * len(payloads))]
+                     for payload, instant in zip(payloads, instants or [None] * len(payloads), strict=True)]
         try:
             for process in processes:
                 process.start()

@@ -144,7 +144,7 @@ class ViewerHistoryTests(unittest.TestCase):
         workbook = load_workbook(io.BytesIO(self.admin.get("/export.xlsx").data))
         try:
             headers = [cell.value for cell in workbook["Mileage"][1]]
-            cells = dict(zip(headers, workbook["Mileage"][2]))
+            cells = dict(zip(headers, workbook["Mileage"][2], strict=True))
             self.assertEqual(headers[-3:], ["last_edited_by", "last_edited_at", "received_after_close"])
             self.assertEqual((cells["last_edited_by"].value, cells["last_edited_at"].value),
                              ("helper", "2026-01-04T04:00:00-08:00"))
@@ -177,7 +177,7 @@ class ViewerHistoryTests(unittest.TestCase):
         try:
             self.assertEqual([cell.value for cell in workbook["Unreadable trips"][1]],
                              list(self.viewer.UNREADABLE_COLUMNS))
-            values = dict(zip(self.viewer.UNREADABLE_COLUMNS, workbook["Unreadable trips"][2]))
+            values = dict(zip(self.viewer.UNREADABLE_COLUMNS, workbook["Unreadable trips"][2], strict=True))
             self.assertEqual((values["last_edited_by"].value, values["last_edited_at"].value),
                              ("unknown", "2025-01-05T04:00:00-08:00"))
         finally:
@@ -371,7 +371,7 @@ class ViewerHistoryTests(unittest.TestCase):
         workbook = load_workbook(io.BytesIO(self.admin.get("/export.xlsx").data), data_only=False)
         try:
             headers = [cell.value for cell in workbook["Mileage"][1]]
-            cells = dict(zip(headers, workbook["Mileage"][2]))
+            cells = dict(zip(headers, workbook["Mileage"][2], strict=True))
             self.assertEqual(cells["last_edited_by"].value, "=1+2")
             self.assertEqual(cells["last_edited_by"].data_type, "s")
         finally:

@@ -239,7 +239,7 @@ class ParkedDrainTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             ing = load_ingest(temp)
             # Reverse arrival: the future boot is received before old segments.
-            for i, (device, row) in enumerate(reversed(history())):
+            for i, (_device, row) in enumerate(reversed(history())):
                 body = batch(i + 1); body["events"] = [row]
                 response = ing.app.test_client().post("/v1/device-events", json=body, headers=HEADERS)
                 self.assertEqual(response.status_code, 200)
