@@ -22,10 +22,13 @@ POWER press on USB shows an on-screen message, and diagnostic journal write
 failures raise E4008. Firmware `v1.03` (tag `fw-v1.03`) followed the same
 day: a long POWER press on battery shows **Switching off** for about a
 second before the screen goes dark. Firmware `v1.04` adds a short pause when
-the GPS UART is empty, a 60-second watchdog for the main loop, and explicit
-trip-upload timeouts with separate send/reply timings. The watchdog reset
-and the loop pause were bench-checked on USB power on 2026-11-10 (UTC); the
-battery paths were not (see [Watchdog bench check](#watchdog-bench-check)). On
+the GPS UART is empty, a 60-second watchdog for the main loop, a
+120-second watchdog for each startup step that skips a hanging card after two
+startup hangs, a retry for an unreadable first charge temperature, and
+explicit trip-upload timeouts with separate send/reply timings. Both watchdog
+resets, the card skip and the loop pause were bench-checked on USB power on
+2026-11-10 (UTC); the battery paths and a start from fully off were not (see
+[Watchdog bench check](#watchdog-bench-check)). On
 2026-10-21 (UTC), an earlier Stage 4 build uploaded
 four real trips from microSD to the deployed server, then delivered all 115
 pending diagnostic events and a current snapshot. Uploads with debug mode
@@ -1027,9 +1030,13 @@ How it behaves once flashed:
   the card and use internal flash with E4001. Other repeated startup hangs,
   or another hang with the card skipped, select no-storage degraded mode and
   disable storage recovery probes. The fallback lasts until a real power-on.
-  Each watchdog-reset boot records E1003; serial names the hung stage/count.
-  These startup limits and fallbacks have host tests only and are unverified
-  on the board. Slow full-card scans and large repairs have not been timed.
+  Each watchdog-reset boot queues E1003; serial names the hung stage/count.
+  A boot that hangs again before its events are saved loses them, so a card
+  that hangs every time gives one E1003 for the two resets. The card skip
+  was bench-checked on 2026-11-10 (UTC) (see
+  [Watchdog bench check](#watchdog-bench-check)); no-storage mode and the
+  clearing at a real power-on were not. Slow full-card scans and large
+  repairs have not been timed.
   The network task
   on core 0 is not enrolled: a trip upload may legitimately take 15 minutes.
   Boot repairs the stores still in use before logging resumes. Untimed points
@@ -1132,8 +1139,9 @@ How it behaves once flashed:
   E2006 is raised and retries return to 30 seconds. Runtime garbage after a
   good reading pauses charging and raises E2006 at once. Invalid readings
   never clear hot/cold faults or appear as real debug temperatures.
-  This first-reading retry is covered by host tests only and is unverified
-  on the board.
+  This first-reading retry is covered by host tests only. The 2026-11-10
+  (UTC) bench boots were USB resets whose first reading was already usable,
+  so a start from fully off is still unchecked.
   The guard verifies every charger on/off command with a checked register read
   and retries unconfirmed commands at the sampling cadence; E2008 means three attempts failed
   to confirm the requested state, so charging may still be on or remain off.
@@ -1240,10 +1248,40 @@ v1.04 build from before the merge:
   no warnings or resets. The power chip ran 9.2 C above the board's air
   sensor, against 10.4 C on v1.03 in the same session.
 
+Startup watchdog result, 2026-11-10 (UTC), same setup, using the v1.04 build
+at commit `741d099` with the card fitted. Every boot was a USB reset, never a
+start from fully off:
+
+- With the startup bench hook, the boot stopped at
+  `WATCHDOG BENCH: blocking card mount until startup watchdog reset.` About
+  120 seconds later `task_wdt` named `loopTask (CPU 1)` and the board
+  restarted (`rst:0xc (RTC_SW_CPU_RST)`). The next boot printed
+  `STARTUP WATCHDOG: previous hang in card mount; consecutive startup hangs 1.`
+  and hung again. After the second reset it printed `consecutive startup
+  hangs 2.` and `STARTUP WATCHDOG: skipping card until next power-on; using
+  internal flash for trips.`, used internal flash (2.30 MiB free) and
+  finished setup. The server received E1003 and E4001 from that boot. The
+  boot after the first reset hung before its events were saved, so there was
+  one E1003 for the two resets.
+- The loop bench build was then flashed with the card still skipped: the
+  USB reset kept the skip. The loop was reset after 60 seconds, and the next
+  boot printed no `previous hang` line, so a loop reset did not count as a
+  startup hang. The server received E1003 and E4001.
+- A normal build with the card still skipped ran eight minutes without a
+  reset. A bench-only build that treated its boot as a power-on cleared the
+  record and mounted the card again. This stands in for a real power-on,
+  which was not tried.
+- The normal `741d099` build then mounted the card (29.71 GiB free),
+  finished setup in about one second, read 33.7 C on its first charge-guard
+  check with charging on, and ran 5.6 hours with no reset.
+
 Not checked: battery savings, the idle and long-press power-off paths (no
 battery was fitted), the buttons and screen, the RTC write (the clock needed
-no correction), upload timings (nothing was queued), and recovery of a trip
-cut off mid-recording.
+no correction), upload timings (nothing was queued), recovery of a trip
+cut off mid-recording, a start from fully off (the first-temperature retry
+and clearing the card skip), no-storage mode after a non-card hang, and
+startup timing with a full card, a large repair or an erased flash
+partition.
 
 To repeat the supervised bench test,
 use a spare card and the normal Supreme build settings. Add
@@ -1273,8 +1311,9 @@ skipped across resets and completed boots until a real power-on, when this
 bench build will hang again. Rebuild without the flag afterward. Use each
 bench flag separately.
 
-This startup hook and fallback have host tests only; they have not been run
-on the board. The timeout is unmeasured for a full 32 GB card, an 8 MiB repair
+This startup hook and the card skip were run on the board on 2026-11-10
+(UTC), as above; no-storage mode was not. The timeout is unmeasured for a
+full 32 GB card, an 8 MiB repair
 or the full 2.375 MB erased-partition scan. Successful block/copy progress
 feeds the watchdog, so a healthy repair may take longer overall. With a card
 that always hangs, each power-on waits about four minutes (two 120-second

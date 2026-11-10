@@ -1214,8 +1214,12 @@ The checksummed RTC-memory fallback lasts until a real power-on. Corrupt
 history is ignored; running-loop watchdog resets do not add startup hangs.
 Serial names the stage and count; each watchdog-reset boot enqueues E1003.
 Repairs run on the stores still in use. The core-0 network task is unenrolled.
-The startup watchdog, limits and fallback have host tests only and remain
-unverified on the board. Full-card/large-repair startup timing is unmeasured.
+The card skip was bench-checked on 2026-11-10 (UTC) with the startup-hang
+bench build: two resets 120 seconds apart, then a boot that used LittleFS.
+The server received E1003 and E4001 from that boot. The boot after the first
+reset hung again before its events were saved, so one E1003 arrived for the
+pair. No-storage mode, a real power-on clearing the latch and
+full-card/large-repair startup timing remain unverified.
 The watchdog and its intentional-hang bench hook were bench-checked on
 2026-11-10 (UTC): the reset arrived after 60 seconds and the server received
 E1003 from the following boot. See
@@ -1442,7 +1446,9 @@ for ten seconds. There is no E2006 during that grace window. Expiry pauses
 charging with E2006 and returns to 30-second checks. A plausible hot reading
 still raises E2004 immediately. Invalid readings never drive or clear hot/cold
 conditions, carry temperature context or appear as real debug temperatures.
-The first-reading retry has host tests only and remains unverified on the board.
+The first-reading retry has host tests only. Bench boots on 2026-11-10 (UTC)
+were USB resets whose first reading was already usable, so a start from fully
+off remains unchecked.
 
 The charge guard uses its existing die proxy and hysteresis; diagnostic context
 never presents that die reading as a measured cell temperature. Each enable/disable

@@ -228,7 +228,8 @@ is simulated, and sequential host calls do not prove real multicore timing.
 This does not replace the on-hardware shakedown: it checks logic, not the flash
 driver, GPS reception or power behavior.
 
-The startup watchdog, its unmeasured 120-second stage limit, retained fallback
-and first charge-temperature retry are covered by host tests only and remain
-unverified on the board. Full 32 GB card scans, 8 MiB repairs, erased-flash scan
-timings and actual watchdog-reset retention still need hardware measurement.
+The startup watchdog's card skip, including retention of its record through
+real watchdog resets, was bench-checked on 2026-11-10 (UTC). No-storage mode,
+a real power-on clearing the fallback and the first charge-temperature retry
+are covered by host tests only. Full 32 GB card scans, 8 MiB repairs and
+erased-flash scan timings still need hardware measurement.

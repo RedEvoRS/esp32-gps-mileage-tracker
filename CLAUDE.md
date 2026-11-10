@@ -267,8 +267,12 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   for the loop. Verified scan/repair progress feeds it; waits and locks do not.
   Two startup hangs skip a failing card for LittleFS, or use no-storage mode
   after other hangs. The latch lasts until a real power-on; no-storage mode
-  suppresses storage probes. The startup limits and fallback have host tests
-  only and are unverified on the board. The network task remains unenrolled.
+  suppresses storage probes. The card skip was bench-checked 2026-11-10 (UTC)
+  on USB with a bench build that hangs the card mount: two resets 120 s apart,
+  the retained RTC record survived both, and the third boot used LittleFS and
+  reported E1003/E4001. A USB reset kept the skip; a loop reset did not count.
+  No-storage mode, a real power-on clearing the latch and slow-boot timings
+  are unverified. The network task remains unenrolled.
   The existing loop watchdog and pause were bench-checked
   2026-11-10 (UTC) on USB with no battery: a deliberately blocked loop was
   reset after 60 s, rebooted, carried on and reported E1003; the loop pause
@@ -291,7 +295,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   An unreadable first sample keeps charging off and retries each second for
   ten seconds before E2006; plausible hot/cold samples act immediately.
   Invalid samples never create hot/cold history or real debug temperatures.
-  The first-reading retry has host tests only and is unverified on the board.
+  The first-reading retry has host tests only: bench boots on 2026-11-10 (UTC)
+  were USB resets with a usable first reading, so a start from fully off is
+  unchecked.
 - Diagnostic journal: the network task services one queued record at a time
   using a zero-wait filesystem lock and yields maintenance to trip/upload
   demand. Mounted SD has a 16 MiB journal quota; LittleFS has a 64 KiB reserve

@@ -118,8 +118,9 @@ more, so the loop can still be watched at its own limit.
 `startup_watchdog.h` decides how to handle repeated startup hangs. A small
 `RTC_NOINIT_ATTR` record holds the active stage, hang count, fallback, magic
 and checksum. This section is separate from cleared RTC BSS. The S3 task-watchdog
-panic path restarts the CPUs without clearing it. This is source-supported;
-retention through a real panic reset has not been checked on this board.
+panic path restarts the CPUs without clearing it. On 2026-11-10 (UTC) the
+record survived two real task-watchdog resets on this board
+(`rst:0xc (RTC_SW_CPU_RST)`).
 A corrupt record means no history. Only a watchdog reset with an active
 startup stage increments the streak. Loop watchdog resets do not count.
 Other resets break the streak, while preserving a fallback already latched.
@@ -144,8 +145,9 @@ Full 32 GB card scans, 8 MiB repairs and the 2.375 MB erased-flash scan have
 not been timed. A card that hangs at every mount costs two 120-second waits
 per power-on, about four minutes plus reboot and healthy flash startup, before
 trips can use internal flash. Progressing flash repair has no fixed total limit.
-The startup watchdog, limits and fallback are covered by host tests only and
-remain unverified on the board.
+The card-skip path was bench-checked on 2026-11-10 (UTC). No-storage mode, a
+real power-on clearing the latch and the stage timings above remain unchecked
+on the board.
 
 Arduino's `main.cpp` feeds before each `loop()` call, covering normal and
 degraded modes. Runtime scan, prefix comparison and repair-copy loops feed
@@ -162,7 +164,8 @@ helpers, since a healthy upload may run for 15 minutes.
 
 `WATCHDOG_BENCH_STARTUP_HANG`, off by default, blocks each unskipped card-mount
 stage without feeds. After two simulated resets, host tests verify a LittleFS
-trip and E1003/E4001. The real reset sequence still needs a supervised bench run.
+trip and E1003/E4001. The real reset sequence was bench-checked on 2026-11-10
+(UTC).
 `WATCHDOG_BENCH_HANG`, also off by default, deliberately blocks the loop without
 feeding; watchdog-reset boots skip the hook and continue through ordinary
 recovery. See the [bench instructions](README.md#watchdog-bench-check).
@@ -188,7 +191,8 @@ E2006, prints one serial line saying charging stays off, and returns to
 Any implausible sample after the first good one immediately follows the normal
 unreadable path. Invalid readings never clear hot/cold episodes, supply event
 temperature context or appear as real debug temperatures. The retry is covered
-by host tests only and is unverified on the board.
+by host tests only. The 2026-11-10 (UTC) bench boots were USB resets whose
+first reading was already usable, so the retry is unchecked on the board.
 
 ## Firmware identity on the debug screen
 
