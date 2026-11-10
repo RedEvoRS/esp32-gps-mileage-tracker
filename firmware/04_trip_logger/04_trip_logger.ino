@@ -482,8 +482,9 @@ static void armLoopWatchdog() {
             return;
         }
     }
-    Serial.println("ERROR: loop watchdog could not be armed; restarting.");
-    ESP.restart();
+    // Carry on without it. Recording trips matters more than the safety net,
+    // and restarting here would loop forever if arming can never succeed.
+    Serial.println("ERROR: loop watchdog could not be armed; running without it.");
 }
 
 static void feedLoopWatchdogProgress() {
@@ -1430,7 +1431,9 @@ static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result) 
     out.close();
     f.close();
     if (!ok) {
-        result.reason = remaining ? "read" : "write";
+        // The copy loop stops at the first failed write, with bytes still
+        // unread, so check the writer before blaming the read.
+        result.reason = (!w.ok || !remaining) ? "write" : "read";
         storage.remove(tmp.c_str());
         Serial.printf("fsck: could not repair %s (write failed)\n", path);
         return false;

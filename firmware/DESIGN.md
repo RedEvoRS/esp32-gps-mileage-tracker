@@ -88,8 +88,11 @@ seconds with panic enabled, watches the core-0 idle task, and leaves the
 Arduino loop task unenrolled. `armLoopWatchdog()` reconfigures that shared
 watchdog to `LOOP_WDT_TIMEOUT_MS` (60 seconds), explicitly enables panic,
 preserves the configured idle-task subscriptions and enrolls the loop task
-with `enableLoopWDT()`. Enrollment is checked; failure requests a restart.
-The installed panic configuration prints and reboots. This also extends
+with `enableLoopWDT()`. Enrollment is checked. If it fails, the firmware
+prints an error and carries on without the watchdog: restarting would loop
+forever when arming can never succeed, and recording trips matters more than
+the safety net. When the watchdog does expire, the installed panic
+configuration prints and reboots. This also extends
 the existing core-0 idle-task watchdog timeout to 60 seconds.
 
 Enrollment occurs at the end of normal setup and after every degraded

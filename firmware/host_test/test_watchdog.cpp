@@ -204,9 +204,14 @@ int main() {
         setup(); checkArmed(); assert(g_watchdog.initializes == (initialized ? 0u : 1u));
     }
     for (bool addFailure : {false, true}) {
+        // Arming failure must not restart: a persistent failure would reboot
+        // forever and record nothing. Setup finishes and logging carries on
+        // unwatched, with no progress feeds for a task that is not enrolled.
         watchdogWorld(); g_watchdog.failAdd = addFailure; g_watchdog.failConfigure = !addFailure;
-        try { setup(); assert(false); } catch (const Restarted&) {}
-        assert(!gLoopWatchdogArmed && !g_watchdog.feeds);
+        setup();
+        assert(!gLoopWatchdogArmed && !g_watchdog.feeds && g_restarts == 0 && g_taskCreates == 1);
+        loop(); feedLoopWatchdogProgress();
+        assert(!gLoopWatchdogArmed && !g_watchdog.feeds && g_restarts == 0);
     }
     watchdogWorld(); g_failMutexCreate = true;
     try { setup(); assert(false); } catch (const Restarted&) {}
