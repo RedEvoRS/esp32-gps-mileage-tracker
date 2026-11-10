@@ -329,6 +329,15 @@ int main() {
         loop(); feedLoopWatchdogProgress();
         assert(!gLoopWatchdogArmed && !g_watchdog.feeds && g_restarts == 0);
     }
+    // A failed early arm leaves startup unwatched, but the end of setup
+    // tries once more, so the loop is still watched at its own limit.
+    watchdogWorld(); g_watchdog.failConfigure = true;
+    g_delayHook = [](uint32_t ms) { g_watchdog.failConfigure = false; g_millis += ms; };
+    setup();
+    assert(logCount("startup is not watched") == 1 && !logCount("carrying on"));
+    assert(gLoopWatchdogArmed && loopTaskWDTEnabled && g_watchdog.enrollments == 1 && g_restarts == 0);
+    assert((g_watchdog.timeouts == std::vector<uint32_t>{LOOP_WDT_TIMEOUT_MS}) && !gStartupWatchdog.active());
+    arduinoPass(); assert(g_watchdog.feeds >= 1);
     watchdogWorld(); g_failMutexCreate = true;
     try { setup(); assert(false); } catch (const Restarted&) {}
     assert(gLoopWatchdogArmed && g_watchdog.enrollments == 1 && g_watchdog.config.timeout_ms == startup_watchdog::STARTUP_WDT_TIMEOUT_MS);

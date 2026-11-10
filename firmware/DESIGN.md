@@ -111,7 +111,9 @@ At the end of normal or degraded startup, the limit becomes
 `esp_task_wdt_reconfigure()` retains subscriptions and restarts its timer under
 a spinlock. The sketch feeds around this change and never removes the loop
 task. It preserves the idle-task mask. A failed arm or reconfiguration prints
-an error and carries on; it never deliberately restarts the board.
+an error and carries on; it never deliberately restarts the board. If the
+early arm fails, startup runs unwatched and the end of startup tries once
+more, so the loop can still be watched at its own limit.
 
 `startup_watchdog.h` decides how to handle repeated startup hangs. A small
 `RTC_NOINIT_ATTR` record holds the active stage, hang count, fallback, magic
@@ -128,8 +130,10 @@ The startup journal stage is shared RAM/NVS work, not a card-only operation:
 disk journal loading is deferred to the service task. Two hangs in another
 stage, or another startup hang with the card already skipped, select
 `NoStorage`. That mode skips all mounts, provisioning, NVS boot counting and
-storage recovery probes. Diagnostics remain in RAM; power management and the
-charge guard keep running. The fallback stays latched through completed boots
+storage recovery probes. It also skips display and RTC setup, because the
+hang may have been there. The PMU setup is the same as for an ordinary mount
+failure, including the 4.1 V charge target. Diagnostics remain in RAM; power
+management and the charge guard keep running. The fallback stays latched through completed boots
 and resets until a real power-on. That power-on clears the history and tries
 normal storage again. Serial output identifies the previous stage/count and
 the applied fallback. Watchdog boots still enqueue E1003.
@@ -179,7 +183,8 @@ the reading is implausible. The loop retries every `CHG_FIRST_RETRY_MS`
 During this grace period there is no hot/cold event or E2006. A plausible
 reading immediately uses the existing thresholds and charger read-back rules;
 a plausible hot reading still raises E2004 at once. Grace expiry raises
-E2006 and returns to 30-second sampling. Later plausible recovery clears it.
+E2006, prints one serial line saying charging stays off, and returns to
+30-second sampling. Later plausible recovery clears it.
 Any implausible sample after the first good one immediately follows the normal
 unreadable path. Invalid readings never clear hot/cold episodes, supply event
 temperature context or appear as real debug temperatures. The retry is covered

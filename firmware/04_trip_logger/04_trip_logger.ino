@@ -521,14 +521,15 @@ static void startupStage(startup_watchdog::Stage stage) {
     saveStartupWatchdog();
 }
 static void finishStartupWatchdog() {
-    // Do not retry failed enrollment or restart. Keep logging without it.
-    if (gLoopWatchdogArmed) armLoopWatchdog();
+    // Switch to the loop limit. If the early arm failed, this is one more
+    // try; a second failure prints an error and logging carries on unwatched.
+    armLoopWatchdog();
     gStartupWatchdog.complete();
     saveStartupWatchdog();
 }
 static void printStartupWatchdog() {
     using startup_watchdog::Stage;
-    if (!gLoopWatchdogArmed) Serial.println("ERROR: startup watchdog could not be armed; running without it.");
+    if (!gLoopWatchdogArmed) Serial.println("ERROR: startup watchdog could not be armed; startup is not watched.");
     if (gStartupWatchdog.hungStage() != Stage::None)
         Serial.printf("STARTUP WATCHDOG: previous hang in %s; consecutive startup hangs %lu.\n",
             startup_watchdog::stageText(gStartupWatchdog.hungStage()), (unsigned long)gStartupWatchdog.hangs());
@@ -1892,9 +1893,9 @@ static void serviceChargeTemp() {
     if (gChargeChecked && uint32_t(now - gChargeCheckT0) <
         (gChargeFirstResolved ? CHG_CHECK_MS : CHG_FIRST_RETRY_MS)) return;
     gChargeCheckT0 = now;
-    bool first = !gChargeChecked;
-    if (first) gChargeFirstMs = now;
+    if (!gChargeChecked) gChargeFirstMs = now;
     gChargeChecked = true;
+    bool first = !gChargeFirstResolved; // no decision made yet this boot
 
     float die = PMU.getTemperature();
     // XPowersLib AXP2101: 22 + (7274 - raw) / 20. Raw zero is 385.7 C,
@@ -1963,6 +1964,11 @@ static void serviceChargeTemp() {
         if (gChargeState != pmu_read::ChargeState::Unconfirmed || gChargeFailures >= CHG_FAILURE_LIMIT)
             gLoopFaults.event(2008, now).condition(gChargeFailures >= CHG_FAILURE_LIMIT);
     }
+    // Charging was already commanded off during the retries, so the state
+    // block above prints nothing when the window ends without a reading.
+    if (first && !firstGrace && !std::isfinite(die))
+        Serial.printf("Charge guard: no plausible temperature in the first %lu s; charging stays off.\n",
+                      (unsigned long)(CHG_FIRST_GRACE_MS / 1000));
 }
 
 // Once USB power has been off for VBUS_OFF_CONFIRM_MS, the car is off:
@@ -3312,15 +3318,6 @@ void setup() {
 
     if (!createFsMutex()) return;
 
-    if (gStartupWatchdog.noStorage()) {
-        // Skip all storage work, including flash journal mounts and probes.
-        // Keep only the trusted power services needed by NoStorage mode.
-        PMU.enableTemperatureMeasure(); PMU.enableVbusVoltageMeasure(); PMU.enableSystemVoltageMeasure();
-        setupPmuIrq(); seedVbusState(); gIdleSince = millis();
-        enterDegraded(startup::Mode::NoStorage);
-        return;
-    }
-
     // --- Supreme GPS: ALDO4 at 3.3 V, GPS_EN HIGH as in LilyGO's setup ---
     pinMode(GPS_EN_PIN, OUTPUT);
     digitalWrite(GPS_EN_PIN, HIGH);
@@ -3349,6 +3346,8 @@ void setup() {
                   gVbusLost ? "absent (on battery)" : "present");
 
     // --- Storage + boot-time repair ---
+    // A latched no-storage fallback returns false here before any mount, so
+    // it takes the same degraded path, with the same PMU setup, as a failure.
     if (!mountTripStorage()) {
         enterDegraded(startup::Mode::NoStorage);
         return;

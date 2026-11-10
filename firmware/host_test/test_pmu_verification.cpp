@@ -41,6 +41,9 @@ int main() {
         PMU.dieC = 33; ++g_millis;
         if (degraded) degradedLoop(); else serviceChargeTemp();
         assert(PMU.chargeEnabled && gChargeState == ChargeState::Charging);
+        // The retried reading is still this boot's first decision.
+        assert(logCount("Charge guard: die 33.0 C") == 1);
+        assert(!logCount("Charging resumed") && !logCount("Charging paused") && !logCount("no plausible"));
         rows = bootRows();
         for (int code : {2004, 2005, 2006}) assert(codeRows(rows, code).empty());
         ++cases;
@@ -53,10 +56,13 @@ int main() {
     g_millis += CHG_FIRST_RETRY_MS; serviceChargeTemp();
     auto unreadable = one(2006, "raise");
     assert(unreadable.find("temperature_mc") == std::string::npos);
+    // The pause was commanded silently during the retries; say so once now.
+    assert(logCount("no plausible temperature in the first 10 s; charging stays off") == 1);
+    assert(!logCount("Charging paused") && !logCount("Charge guard: die"));
     auto n = calls("getTemperature");
     g_millis += CHG_CHECK_MS - 1; serviceChargeTemp(); assert(calls("getTemperature") == n);
     PMU.dieC = 33; ++g_millis; serviceChargeTemp(); one(2006, "clear");
-    assert(PMU.chargeEnabled); ++cases;
+    assert(PMU.chargeEnabled && logCount("Charging resumed (die 33.0 C") == 1 && logCount("no plausible") == 1); ++cases;
     // A dead sensor can outlive millis() rollover. Exhausted startup grace
     // must never reopen even if elapsed time again resembles the first second.
     pmuWorld(); PMU.dieC = NAN; serviceChargeTemp();
