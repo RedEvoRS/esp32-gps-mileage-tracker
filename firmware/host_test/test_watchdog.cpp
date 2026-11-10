@@ -24,18 +24,17 @@ static void watchdogWorld() {
     g_sdDisk.mounted = g_disk.mounted = false;
     g_sdDisk.capacity = 32 * 1024 * 1024;
     g_resetReason = ESP_RST_POWERON;
-    g_delayHook = [](uint32_t ms) {
-        assert(!gLoopWatchdogArmed && !g_watchdog.feeds);
-        g_millis += ms;
-    };
+    g_delayHook = [](uint32_t ms) { g_millis += ms; };
 }
 static void checkArmed() {
     assert(gLoopWatchdogArmed && loopTaskWDTEnabled);
-    assert(g_watchdog.enrollments == 1 && g_watchdog.reconfigures == 1);
+    assert(g_watchdog.enrollments == 1 && g_watchdog.reconfigures == 2);
     assert(g_watchdog.config.timeout_ms == LOOP_WDT_TIMEOUT_MS && LOOP_WDT_TIMEOUT_MS == 60000);
     assert(g_watchdog.config.trigger_panic && g_watchdog.config.idle_core_mask == 1);
-    assert(g_watchdog.feeds == 0);
-    armLoopWatchdog(); assert(g_watchdog.enrollments == 1 && g_watchdog.reconfigures == 1);
+    assert((g_watchdog.timeouts == std::vector<uint32_t>{startup_watchdog::STARTUP_WDT_TIMEOUT_MS, LOOP_WDT_TIMEOUT_MS}));
+    assert(g_watchdog.feeds > 0 && !gStartupWatchdog.active());
+    auto feeds = g_watchdog.feeds;
+    armLoopWatchdog(); assert(g_watchdog.enrollments == 1 && g_watchdog.reconfigures == 2 && g_watchdog.feeds == feeds);
     g_delayHook = [](uint32_t ms) { g_millis += ms; };
 }
 static void arduinoPass() {
@@ -44,6 +43,17 @@ static void arduinoPass() {
     loop();
 }
 #ifndef WATCHDOG_BENCH_HANG
+static void nextBoot(startup_watchdog::Record saved, esp_reset_reason_t reason) {
+    watchdogWorld();
+    gStartupWatchdogRecord.magic = saved.magic;
+    gStartupWatchdogRecord.stage = saved.stage;
+    gStartupWatchdogRecord.hangs = saved.hangs;
+    gStartupWatchdogRecord.fallback = saved.fallback;
+    gStartupWatchdogRecord.checksum = saved.checksum;
+    g_resetReason = reason;
+}
+#endif
+#if !defined(WATCHDOG_BENCH_HANG) && !defined(WATCHDOG_BENCH_STARTUP_HANG)
 static std::string largeOpenTrip() {
     std::string data = GPX_PROLOGUE;
     // Generate wholly synthetic points with the production serializer rather
@@ -59,18 +69,24 @@ static std::string largeOpenTrip() {
 }
 static void startupAndRecovery() {
     watchdogWorld();
-    // Both long boot operations exceed the timeout in fake elapsed time.
-    // Neither may enroll or feed before setup finishes.
+    // Each operation exceeds the startup limit in total, but successful
+    // block/copy progress feeds it. Individual waits never feed it.
     g_disk.failMount = true;
     g_partition.partition.size = 0x260000;
     g_partition.bytes.assign(g_partition.partition.size, 0xff);
     g_sdDisk.capacity = 32 * 1024 * 1024;
     g_sdDisk.files["/trips/interrupted.gpx"] = largeOpenTrip();
     g_sdDisk.onRead = []() {
-        assert(!gLoopWatchdogArmed && !g_watchdog.feeds);
+        assert(gLoopWatchdogArmed && g_watchdog.config.timeout_ms == startup_watchdog::STARTUP_WDT_TIMEOUT_MS);
+        assert(uint32_t(millis() - g_watchdog.lastResetMs) < 1000);
         g_millis += 100;
     };
-    SD.onCapacity = []() { assert(!gLoopWatchdogArmed && !g_watchdog.feeds); };
+    unsigned delayFeeds = 0;
+    g_delayHook = [](uint32_t ms) {
+        if (ms == 1) g_millis += 100; // erased block scan exceeds 120 s
+        else g_millis += ms;
+    };
+    SD.onCapacity = []() { assert(gLoopWatchdogArmed && g_watchdog.feeds); };
     g_resetReason = ESP_RST_TASK_WDT;
     setup(); checkArmed();
     assert(g_partition.readBytes == g_partition.partition.size && g_disk.formatAttempts == 1);
@@ -81,7 +97,8 @@ static void startupAndRecovery() {
     FS_LOCK(); auto rows = take(); FS_UNLOCK();
     assert(codeRows(rows, 1003).size() == 1);
     has(codeRows(rows, 1000)[0], "\"reset_reason\":\"watchdog\"");
-    arduinoPass(); assert(g_watchdog.feeds == 1);
+    delayFeeds = g_watchdog.feeds;
+    arduinoPass(); assert(g_watchdog.feeds == delayFeeds + 1);
     // Network maintenance and uploads run on core 0, never enrolled/fed.
     g_currentCore = 0;
     unsigned feeds = g_watchdog.feeds;
@@ -97,15 +114,76 @@ static void degradedCoverage() {
         if (mode == startup::Mode::NoStorage) { SD.cardPresent = false; g_disk.failMount = true; }
         setup(); checkArmed();
         assert(gDegraded.mode() == mode && g_taskCreates == 0);
-        arduinoPass(); assert(g_watchdog.feeds == 1); // existing 20 ms delay, core's feed
+        unsigned before = g_watchdog.feeds;
+        arduinoPass(); assert(g_watchdog.feeds == before + 1); // core's feed
         if (mode == startup::Mode::NoStorage) {
             SD.cardPresent = true;
             SD.onCapacity = []() { assert(false); }; // defer first capacity scan to reboot
             g_millis += gDegraded.waitMs();
             try { arduinoPass(); assert(false); } catch (const Restarted&) {}
-            assert(g_watchdog.enrollments == 1 && g_watchdog.feeds == 2);
+            assert(g_watchdog.enrollments == 1 && g_watchdog.feeds == before + 2);
             SD.onCapacity = nullptr;
         }
+    }
+}
+struct StartupExpired {};
+static void hangStage() {
+    assert(gLoopWatchdogArmed && g_watchdog.config.timeout_ms == startup_watchdog::STARTUP_WDT_TIMEOUT_MS);
+    unsigned feeds = g_watchdog.feeds;
+    g_millis += startup_watchdog::STARTUP_WDT_TIMEOUT_MS;
+    assert(g_watchdog.feeds == feeds);
+    throw StartupExpired{};
+}
+static void startupFallback() {
+    using namespace startup_watchdog;
+    for (Stage target : {Stage::CardMount, Stage::CardSpace, Stage::CardRepair, Stage::FlashMount}) {
+        Record saved{};
+        for (uint32_t attempt = 0; attempt < STARTUP_HANG_LIMIT; ++attempt) {
+            nextBoot(saved, attempt ? ESP_RST_TASK_WDT : ESP_RST_POWERON);
+            if (target == Stage::CardMount) g_sdDisk.onMount = hangStage;
+            if (target == Stage::FlashMount) g_disk.onMount = hangStage;
+            if (target == Stage::CardSpace) SD.onCapacity = hangStage;
+            if (target == Stage::CardRepair) {
+                g_sdDisk.files["/trips/interrupted.gpx"] = largeOpenTrip();
+                g_sdDisk.onRead = hangStage;
+            }
+            try { setup(); assert(false); } catch (const StartupExpired&) {}
+            saved = gStartupWatchdog.record();
+            assert(saved.stage == uint32_t(target) && saved.hangs == attempt && valid(saved));
+            if (attempt) assert(logCount(stageText(target)) > 0 && logCount("consecutive startup hangs 1") == 1);
+        }
+        nextBoot(saved, ESP_RST_TASK_WDT);
+        unsigned nvsBegins = Preferences::begins;
+        setup(); checkArmed();
+        assert(gStartupWatchdog.skipCard() && SD.begins == 0);
+        assert(logCount("consecutive startup hangs 2") == 1 && logCount("until next power-on") >= 1);
+        FS_LOCK(); auto rows = take(); FS_UNLOCK();
+        assert(codeRows(rows, 1003).size() == 1 && codeRows(rows, 4001).size() == 1);
+        if (cardOnly(target)) {
+            assert(gDegraded.mode() == startup::Mode::Normal && gFlashMounted && gTripFS == &LittleFS);
+            Fix fix{}; fix.monoMs = millis(); fix.speedMps = 10; fix.hdop = 1;
+            assert(beginTrip(fix));
+            assert(!g_disk.files.empty());
+            // Completed fallback boots keep their latch through loop resets.
+            saved = gStartupWatchdog.record();
+            nextBoot(saved, ESP_RST_TASK_WDT); setup();
+            assert(gStartupWatchdog.hangs() == 0 && gStartupWatchdog.hungStage() == Stage::None && !gSdMounted);
+            // A later startup hang with the card already skipped escalates.
+            gStartupWatchdog.stage(Stage::FlashMount); saved = gStartupWatchdog.record();
+            nextBoot(saved, ESP_RST_TASK_WDT); setup();
+            assert(gStartupWatchdog.noStorage() && gDegraded.mode() == startup::Mode::NoStorage);
+        } else {
+            assert(gStartupWatchdog.noStorage() && gDegraded.mode() == startup::Mode::NoStorage);
+            assert(codeRows(rows, 4002).size() == 1 && codeRows(rows, 4003).size() == 1);
+            assert(g_disk.mountAttempts == 0 && g_sdDisk.mountAttempts == 0);
+            assert(!gJournalBoot.counterPersisted); // RAM-only boot: never revisit NVS
+            assert(Preferences::begins == nvsBegins);
+            g_millis += gDegraded.waitMs(); arduinoPass();
+            assert(g_restarts == 0 && g_disk.mountAttempts == 0 && SD.begins == 0);
+        }
+        saved = gStartupWatchdog.record();
+        nextBoot(saved, ESP_RST_POWERON); setup();
+        assert(!gStartupWatchdog.skipCard() && gSdMounted && gDegraded.mode() == startup::Mode::Normal);
     }
 }
 static void repairProgress() {
@@ -130,6 +208,17 @@ static void repairProgress() {
     g_sdDisk.failReadAfter = 0;
     File failed = SD.open("/trips/runtime.gpx"); assert(findLastTrkptEnd(failed) == -2);
     assert(g_watchdog.feeds == before); failed.close();
+}
+static void handoverNearDeadline() {
+    watchdogWorld();
+    gStartupWatchdog.boot({}, true, false); saveStartupWatchdog();
+    armLoopWatchdog(startup_watchdog::STARTUP_WDT_TIMEOUT_MS);
+    unsigned before = g_watchdog.feeds;
+    g_millis += startup_watchdog::STARTUP_WDT_TIMEOUT_MS - 1;
+    finishStartupWatchdog();
+    assert(gLoopWatchdogArmed && g_watchdog.enrollments == 1);
+    assert(g_watchdog.config.timeout_ms == LOOP_WDT_TIMEOUT_MS && g_watchdog.lastResetMs == millis());
+    assert(g_watchdog.feeds == before + 2 && !gStartupWatchdog.active());
 }
 static void boundedShutdownAndBlockedLock() {
     watchdogWorld(); setup(); checkArmed();
@@ -187,18 +276,45 @@ int main() {
     watchdogWorld(); setup(); checkArmed();
     struct Hung {};
     uint32_t start = millis();
+    unsigned before = g_watchdog.feeds;
     g_taskDelayHook = [](uint32_t ms) { assert(ms == 1000); if (millis() > LOOP_WDT_TIMEOUT_MS + 5000) throw Hung{}; };
     try { arduinoPass(); assert(false); } catch (const Hung&) {}
-    assert(uint32_t(millis() - start) >= LOOP_WDT_TIMEOUT_MS && g_watchdog.feeds == 1);
+    assert(uint32_t(millis() - start) >= LOOP_WDT_TIMEOUT_MS && g_watchdog.feeds == before + 1);
     g_taskDelayHook = nullptr;
     for (auto reason : {ESP_RST_TASK_WDT, ESP_RST_INT_WDT, ESP_RST_WDT}) {
         g_resetReason = reason;
         arduinoPass();
     }
-    assert(g_watchdog.enrollments == 1 && g_watchdog.feeds == 4);
+    assert(g_watchdog.enrollments == 1 && g_watchdog.feeds == before + 4);
     std::puts("Watchdog bench hook: intentional hang without feeds, watchdog-reset boots skip hang passed");
+#elif defined(WATCHDOG_BENCH_STARTUP_HANG)
+    startup_watchdog::Record saved{};
+    struct Hung {};
+    for (uint32_t attempt = 0; attempt < startup_watchdog::STARTUP_HANG_LIMIT; ++attempt) {
+        nextBoot(saved, attempt ? ESP_RST_TASK_WDT : ESP_RST_POWERON);
+        static unsigned before = 0;
+        before = 0;
+        g_taskDelayHook = [](uint32_t ms) {
+            assert(ms == 1000 && gStartupWatchdog.record().stage == uint32_t(startup_watchdog::Stage::CardMount));
+            if (!before) before = g_watchdog.feeds;
+            assert(g_watchdog.feeds == before);
+            if (uint32_t(millis() - g_watchdog.lastResetMs) >= startup_watchdog::STARTUP_WDT_TIMEOUT_MS) throw Hung{};
+        };
+        try { setup(); assert(false); } catch (const Hung&) {}
+        assert(SD.begins == 0 && g_watchdog.feeds == before);
+        saved = gStartupWatchdog.record();
+    }
+    nextBoot(saved, ESP_RST_TASK_WDT); setup(); checkArmed();
+    assert(!gSdMounted && gFlashMounted && gTripFS == &LittleFS);
+    assert(gDegraded.mode() == startup::Mode::Normal && logCount("skipping card until next power-on") == 1);
+    Fix fix{}; fix.monoMs = millis(); fix.speedMps = 10; fix.hdop = 1;
+    assert(beginTrip(fix));
+    FS_LOCK(); auto rows = take(); FS_UNLOCK();
+    assert(codeRows(rows, 4001).size() == 1 && codeRows(rows, 1003).size() == 1);
+    unsigned before = g_watchdog.feeds; arduinoPass(); assert(g_watchdog.feeds == before + 1);
+    std::puts("Startup watchdog bench hook: two un-fed 120 s hangs, retained count, skipped card, LittleFS trip and E1003/E4001 passed");
 #else
-    startupAndRecovery(); degradedCoverage(); repairProgress(); boundedShutdownAndBlockedLock();
+    startupAndRecovery(); degradedCoverage(); startupFallback(); handoverNearDeadline(); repairProgress(); boundedShutdownAndBlockedLock();
     for (bool initialized : {false, true}) {
         watchdogWorld(); g_watchdog.initialized = initialized;
         setup(); checkArmed(); assert(g_watchdog.initializes == (initialized ? 0u : 1u));
@@ -215,7 +331,7 @@ int main() {
     }
     watchdogWorld(); g_failMutexCreate = true;
     try { setup(); assert(false); } catch (const Restarted&) {}
-    assert(!gLoopWatchdogArmed && !g_watchdog.enrollments && !g_watchdog.feeds);
-    std::puts("Watchdog: late enrollment, boot repair/E1003, degraded modes, long progress, shutdown bounds, blocked lock and core-0 exclusion passed");
+    assert(gLoopWatchdogArmed && g_watchdog.enrollments == 1 && g_watchdog.config.timeout_ms == startup_watchdog::STARTUP_WDT_TIMEOUT_MS);
+    std::puts("Watchdog: staged startup, retained fallback, boot repair/E1003, degraded modes, hand-over, long progress, shutdown bounds, blocked lock and core-0 exclusion passed");
 #endif
 }

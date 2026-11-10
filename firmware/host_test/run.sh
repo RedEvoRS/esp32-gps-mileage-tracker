@@ -59,6 +59,10 @@ echo "== test_degraded_policy"
 "${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -Werror -pedantic "$here/test_degraded_policy.cpp" -o "$build/test_degraded_policy.exe"
 "$build/test_degraded_policy.exe" || status=1
 
+echo "== test_startup_watchdog"
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -Werror -pedantic "$here/test_startup_watchdog.cpp" -o "$build/test_startup_watchdog.exe"
+"$build/test_startup_watchdog.exe" || status=1
+
 echo "== test_rtc (pure calendar and clock confidence)"
 "${cxx[@]}" "${assert_flags[@]}" -std=c++14 -O1 -Wall -Wextra -Werror "${incs[@]}" "$here/test_rtc.cpp" -o "$build/test_rtc.exe"
 "$build/test_rtc.exe" || status=1
@@ -190,6 +194,10 @@ if [ -f "$tinygps/TinyGPS++.cpp" ]; then
     "${cxx[@]}" "${flags[@]}" -DARDUINO=100 -DWATCHDOG_BENCH_HANG "${gps_incs[@]}" \
         "$here/test_watchdog.cpp" "$here/../04_trip_logger/event_log.cpp" "$build/tinygps_library.o" -o "$build/test_watchdog_bench.exe"
     run_modes "$build/test_watchdog_bench.exe"
+    echo "== test_watchdog (WATCHDOG_BENCH_STARTUP_HANG)"
+    "${cxx[@]}" "${flags[@]}" -DARDUINO=100 -DWATCHDOG_BENCH_STARTUP_HANG "${gps_incs[@]}" \
+        "$here/test_watchdog.cpp" "$here/../04_trip_logger/event_log.cpp" "$build/tinygps_library.o" -o "$build/test_watchdog_startup_bench.exe"
+    run_modes "$build/test_watchdog_startup_bench.exe"
     run_modes "${PYTHON:-python}" "$here/check_rtc_protocol.py" "$build/test_rtc_runtime.exe" || status=1
     run_modes "${PYTHON:-python}" "$here/check_fault_hooks_protocol.py" "$build/test_fault_hooks.exe" || status=1
     echo "== test_debug_status (formatting and real GSV parser)"

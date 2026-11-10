@@ -57,6 +57,7 @@
 #include <esp_sntp.h>
 #include <esp_partition.h>
 #include <esp_task_wdt.h>
+#include <esp_attr.h>
 #include <atomic>
 #include <new>
 #include <cmath>
@@ -69,6 +70,7 @@
 #include "journal_boot.h"
 #include "revision_nvs.h"
 #include "degraded_policy.h"
+#include "startup_watchdog.h"
 #include "journal_sd_geometry.h"
 #include "diag_upload.h"
 #include "journal_platform.h"
@@ -460,8 +462,22 @@ static uint64_t contactUptime() {
 static bool debugMode() { return gDebugMode.load(); }
 
 static bool gLoopWatchdogArmed = false; // loop task only, never core 0
-static void armLoopWatchdog() {
-    if (gLoopWatchdogArmed) return;
+static uint32_t gLoopWatchdogTimeoutMs = 0;
+static RTC_NOINIT_ATTR volatile startup_watchdog::Record gStartupWatchdogRecord;
+static startup_watchdog::Policy gStartupWatchdog;
+static void saveStartupWatchdog() {
+    auto r = gStartupWatchdog.record();
+    // Invalidate first, publish magic last. A reset during these stores
+    // leaves either a complete record or invalid history, never a false latch.
+    gStartupWatchdogRecord.magic = 0;
+    gStartupWatchdogRecord.stage = r.stage;
+    gStartupWatchdogRecord.hangs = r.hangs;
+    gStartupWatchdogRecord.fallback = r.fallback;
+    gStartupWatchdogRecord.checksum = r.checksum;
+    gStartupWatchdogRecord.magic = r.magic;
+}
+static void armLoopWatchdog(uint32_t timeoutMs = LOOP_WDT_TIMEOUT_MS, bool reportError = true) {
+    if (gLoopWatchdogArmed && gLoopWatchdogTimeoutMs == timeoutMs) return;
     uint32_t idleMask = 0;
 #if CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0
     idleMask |= 1U;
@@ -471,26 +487,54 @@ static void armLoopWatchdog() {
 #endif
     // Keep the core's idle-task subscriptions. The installed S3 core starts
     // TWDT at 5 s with panic enabled; explicitly retain panic (reset), not
-    // just a warning, when extending the shared watchdog to 60 s.
-    const esp_task_wdt_config_t config = {LOOP_WDT_TIMEOUT_MS, idleMask, true};
+    // just a warning, with the longer startup/runtime limits.
+    // IDF 5.5.5 reconfigure stops/restarts the timer under its spinlock and
+    // retains task subscriptions. Never unenroll at the startup hand-over.
+    if (gLoopWatchdogArmed) feedLoopWDT(); // previous stage has returned
+    const esp_task_wdt_config_t config = {timeoutMs, idleMask, true};
     esp_err_t error = esp_task_wdt_reconfigure(&config);
     if (error == ESP_ERR_INVALID_STATE) error = esp_task_wdt_init(&config);
     if (error == ESP_OK) {
-        enableLoopWDT(); // core 3.3.11 then feeds immediately before each loop()
+        if (!gLoopWatchdogArmed) enableLoopWDT(); // core feeds before loop()
         if (esp_task_wdt_status(nullptr) == ESP_OK) {
             gLoopWatchdogArmed = true;
+            gLoopWatchdogTimeoutMs = timeoutMs;
+            feedLoopWDT();
             return;
         }
     }
     // Carry on without it. Recording trips matters more than the safety net,
     // and restarting here would loop forever if arming can never succeed.
-    Serial.println("ERROR: loop watchdog could not be armed; running without it.");
+    if (reportError) Serial.println("ERROR: loop watchdog could not be armed/configured; carrying on.");
 }
 
 static void feedLoopWatchdogProgress() {
     // Some file helpers are shared. Never feed or enroll the core-0 network
     // task, and never feed while waiting to acquire FS_LOCK or for another task.
     if (xPortGetCoreID() == 1 && gLoopWatchdogArmed) feedLoopWDT();
+}
+
+static void startupStage(startup_watchdog::Stage stage) {
+    if (!gStartupWatchdog.active()) return; // runtime mounts are not startup
+    feedLoopWatchdogProgress(); // only after the previous stage returned
+    gStartupWatchdog.stage(stage);
+    saveStartupWatchdog();
+}
+static void finishStartupWatchdog() {
+    // Do not retry failed enrollment or restart. Keep logging without it.
+    if (gLoopWatchdogArmed) armLoopWatchdog();
+    gStartupWatchdog.complete();
+    saveStartupWatchdog();
+}
+static void printStartupWatchdog() {
+    using startup_watchdog::Stage;
+    if (!gLoopWatchdogArmed) Serial.println("ERROR: startup watchdog could not be armed; running without it.");
+    if (gStartupWatchdog.hungStage() != Stage::None)
+        Serial.printf("STARTUP WATCHDOG: previous hang in %s; consecutive startup hangs %lu.\n",
+            startup_watchdog::stageText(gStartupWatchdog.hungStage()), (unsigned long)gStartupWatchdog.hangs());
+    if (gStartupWatchdog.skipCard()) Serial.println(gStartupWatchdog.noStorage() ?
+        "STARTUP WATCHDOG: skipping all storage and recovery probes until next power-on; no trip recording." :
+        "STARTUP WATCHDOG: skipping card until next power-on; using internal flash for trips.");
 }
 
 static void serverContact() { gLastContact = contactUptime(); gContactKnown = true; }
@@ -1491,13 +1535,17 @@ static void fsckAllTrips(fs::FS& storage) {
                 if (!seen) paths.push_back(name);
             }
             e.close();
+            feedLoopWatchdogProgress(); // another directory entry completed
             e = dir.openNextFile();
         }
     }
     // LittleFS directory cursors can change when repair creates, removes or
     // renames entries. Finish enumeration and close every handle first.
     dir.close();
-    for (const String& path : paths) repairIfNeeded(storage, path.c_str());
+    for (const String& path : paths) {
+        repairIfNeeded(storage, path.c_str());
+        feedLoopWatchdogProgress(); // another file checked, even if no repair
+    }
     FS_UNLOCK();
 }
 
@@ -2732,6 +2780,7 @@ static bool tripPartitionIsErased() {
             }
         }
         offset += n;
+        feedLoopWatchdogProgress(); // verified another erased block, not a wait
         delay(1);  // yield during the full-partition scan on a new board
     }
     return true;
@@ -2755,6 +2804,7 @@ static bool mountFlashStorage(bool allowProvision = true) {
 }
 
 static bool mountSdStorage() {
+    if (gStartupWatchdog.skipCard()) return false;
     // Also used for cancelled/failed shutdown recovery, under FS_LOCK and
     // gNetHold, with no live handles. Never provision or format the card.
     if (!PMU.disableBLDO1() || !PMU.setBLDO1Voltage(3300) || !PMU.enableBLDO1()) {
@@ -2788,10 +2838,19 @@ static bool mountSdStorage() {
 }
 
 static bool mountTripStorage(bool allowProvision = true, bool reportFreeSpace = true) {
+    if (gStartupWatchdog.noStorage()) return false;
+    startupStage(startup_watchdog::Stage::CardMount);
+#ifdef WATCHDOG_BENCH_STARTUP_HANG
+    if (gStartupWatchdog.active() && !gStartupWatchdog.skipCard()) {
+        Serial.println("WATCHDOG BENCH: blocking card mount until startup watchdog reset.");
+        for (;;) vTaskDelay(pdMS_TO_TICKS(1000)); // deliberately never feed
+    }
+#endif
     gSdMounted = mountSdStorage();
     // Keep the existing preservation-first provisioning rule for flash.
     // If flash is damaged but SD works, record to SD and preserve flash
     // for recovery; degraded service handles both stores being unavailable.
+    startupStage(startup_watchdog::Stage::FlashMount);
     gFlashMounted = mountFlashStorage(allowProvision);
     if (gFlashMounted && !LittleFS.exists(TRIP_DIR)) {
         gFlashMounted = LittleFS.mkdir(TRIP_DIR);
@@ -2800,13 +2859,15 @@ static bool mountTripStorage(bool allowProvision = true, bool reportFreeSpace = 
     gTripFS = gSdMounted ? static_cast<fs::FS*>(&SD) : static_cast<fs::FS*>(&LittleFS);
     // Degraded retry only probes mounts, then restarts through full setup.
     // Leave the potentially slow first FAT free-cluster scan to that startup,
-    // before watchdog enrollment, rather than repeat it on the watched loop.
+    // under the longer startup limit, rather than repeat it on the loop.
     if (!reportFreeSpace) return gSdMounted || gFlashMounted;
     if (gSdMounted) {
+        startupStage(startup_watchdog::Stage::CardSpace);
         Serial.printf("Trip storage: microSD (%.2f GiB free); internal flash queue %s.\n",
                       storageFreeBytes(SD) / (1024.0 * 1024 * 1024),
                       gFlashMounted ? "mounted" : "unavailable -- preserved for recovery");
     } else if (gFlashMounted) {
+        startupStage(startup_watchdog::Stage::FlashSpace);
         Serial.printf("WARNING: microSD unavailable -- using internal flash (%.2f MiB free).\n",
                       storageFreeBytes(LittleFS) / (1024.0 * 1024));
     } else {
@@ -3056,10 +3117,13 @@ static void serviceDisplay() {
 
 // Shared boot producers, including failed startup's retained E2007 notice.
 static void beginJournal() {
+    // EventLog::begin is RAM-only. Disk journal loading is deferred to the
+    // service task; this shared startup stage includes the NVS boot counter.
+    startupStage(startup_watchdog::Stage::Journal);
     gJournal.~EventLog();
     new (&gJournal) diagnostics::EventLog(gSdMounted ? &gSdJournalFs : nullptr,
                                          gFlashMounted ? &gFlashJournalFs : nullptr, diagnostics::uploadJournalConfig(&gRevisionState));
-    gJournalBoot = diagnostics::newJournalBoot();
+    gJournalBoot = diagnostics::newJournalBoot(!gStartupWatchdog.noStorage());
     gJournalReady = gJournal.begin(gJournalBoot.id, gJournalBoot.counter, firmware::kVersion);
     gJournal.setTimeProvider(stampDiagnosticTime);
     if (gJournalReady) diagnostics::submitJournalBoot(gJournal, esp_reset_reason(), gPmuStartup, millis(), gBootBattery);
@@ -3085,7 +3149,9 @@ static void enterDegraded(startup::Mode mode) {
         gLoopFaults.event(4001, millis()).condition(true);
         gLoopFaults.event(4002, millis()).condition(true);
         gLoopFaults.event(4003, millis()).condition(true);
-        Serial.println("DEGRADED: no usable trip storage -- not recording trips. Power management and charge guard active. Retrying storage in 60 s.");
+        Serial.println(gStartupWatchdog.noStorage() ?
+            "DEGRADED: no trip storage; power management and charge guard active. Storage recovery disabled until next power-on." :
+            "DEGRADED: no usable trip storage -- not recording trips. Power management and charge guard active. Retrying storage in 60 s.");
         // The loop retries an implausible first conversion without blocking.
         serviceChargeTemp();
     } else {
@@ -3102,14 +3168,15 @@ static void enterDegraded(startup::Mode mode) {
         }
         if (!createFsMutex()) return;
         // Internal flash only, journal only. Never provision/format or use SD.
-        gFlashMounted = LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL);
+        startupStage(startup_watchdog::Stage::FlashMount);
+        gFlashMounted = !gStartupWatchdog.noStorage() && LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL);
         beginJournal();
         gLoopFaults.event(2001, millis()).condition(true);
         Serial.println(mode == startup::Mode::PmuMissing ?
             "DEGRADED: power chip not responding -- not recording; no charge or rail control. Retrying in 60 s." :
             "DEGRADED: power chip state untrusted -- not recording; no further charge or rail control. Retrying in 60 s.");
     }
-    armLoopWatchdog(); // degraded boots have a loop task too, but no network task
+    finishStartupWatchdog(); // degraded boots have a loop task too
 }
 
 static void degradedLoop() {
@@ -3131,7 +3198,7 @@ static void degradedLoop() {
     }
     gLoopFaults.event(6001, millis()).condition(gProductionDisplayFailed);
     serviceJournal(); // single consumer; no network task in any degraded mode
-    if (gDegraded.retryDue(millis())) {
+    if (!(mode == Mode::NoStorage && gStartupWatchdog.noStorage()) && gDegraded.retryDue(millis())) {
         bool recovered = false;
         if (mode == Mode::NoStorage) {
             // No format, fsck, trip activity or journal migration on this probe.
@@ -3165,6 +3232,15 @@ void setup() {
     // and initialization, BEFORE Serial, storage or GPS setup can block.
     bool pmuReady = beginPmuWithRecovery(Wire1, PMU, I2C_SDA, I2C_SCL, gPmuStartup);
     bool radioOff = pmuReady && PMU.disableALDO3() && aldo3State() == Aldo3State::Off;
+    // Bounded PMU/bus recovery and the radio-off safety command come first.
+    // Enroll before display, USB waits, filesystems, NVS or any storage call.
+    startup_watchdog::Record saved{gStartupWatchdogRecord.magic, gStartupWatchdogRecord.stage,
+        gStartupWatchdogRecord.hangs, gStartupWatchdogRecord.fallback, gStartupWatchdogRecord.checksum};
+    auto reason = esp_reset_reason();
+    gStartupWatchdog.boot(saved, reason == ESP_RST_POWERON,
+        reason == ESP_RST_TASK_WDT || reason == ESP_RST_INT_WDT || reason == ESP_RST_WDT);
+    saveStartupWatchdog();
+    armLoopWatchdog(startup_watchdog::STARTUP_WDT_TIMEOUT_MS, false);
     bool aldo1Warning = false;
     gBootBattery = diagnostics::BatterySample();
     if (radioOff) {
@@ -3190,7 +3266,7 @@ void setup() {
     }
     // SH1106 can retain its state across an ESP32 reset. Put it to sleep
     // before either degraded startup branch; never touch the PMU's Wire1.
-    beginProductionDisplay();
+    if (!gStartupWatchdog.noStorage()) beginProductionDisplay();
     gDebugMode.store(false); // boot-local, never restored from NVS
     pinMode(DEBUG_BOOT_PIN, INPUT_PULLUP); // ROM has already sampled the strap
     gBootButton = runtime_debug::BootButton();
@@ -3201,6 +3277,7 @@ void setup() {
         delay(1000); // Allow native USB to become ready before boot messages.
         Serial.println("\n=== Stage 4: Trip Logger ===");
         Serial.printf("Firmware: %s\n", firmware::kVersion);
+        printStartupWatchdog();
         printPmuStartup(gPmuStartup);
         enterDegraded(powerMode);
         return;
@@ -3217,13 +3294,14 @@ void setup() {
     // Never touch DCDC1 (ESP32).
 
     Serial.begin(115200);
-    gRtc.begin(Wire1, gDiagnosticClock);
+    if (!gStartupWatchdog.noStorage()) gRtc.begin(Wire1, gDiagnosticClock);
     delay(1000);
     // ADC has had a conversion interval, charger still disabled. Retain this
     // early sample across storage startup; never re-read it after charge guard.
     gBootBattery = diagnostics::readBatterySample(PMU);
     Serial.println("\n=== Stage 4: Trip Logger ===");
     Serial.printf("Firmware: %s\n", firmware::kVersion);
+    printStartupWatchdog();
     printPmuStartup(gPmuStartup);
     if (aldo1Warning)
         Serial.println("WARNING: ALDO1 3.3 V/on setup unconfirmed; OLED/BME280/magnetometer may be unavailable.");
@@ -3233,6 +3311,15 @@ void setup() {
                   (unsigned)PMU.getPowerOnSource(), (unsigned)PMU.getPowerOffSource());
 
     if (!createFsMutex()) return;
+
+    if (gStartupWatchdog.noStorage()) {
+        // Skip all storage work, including flash journal mounts and probes.
+        // Keep only the trusted power services needed by NoStorage mode.
+        PMU.enableTemperatureMeasure(); PMU.enableVbusVoltageMeasure(); PMU.enableSystemVoltageMeasure();
+        setupPmuIrq(); seedVbusState(); gIdleSince = millis();
+        enterDegraded(startup::Mode::NoStorage);
+        return;
+    }
 
     // --- Supreme GPS: ALDO4 at 3.3 V, GPS_EN HIGH as in LilyGO's setup ---
     pinMode(GPS_EN_PIN, OUTPUT);
@@ -3266,6 +3353,7 @@ void setup() {
         enterDegraded(startup::Mode::NoStorage);
         return;
     }
+    startupStage(startup_watchdog::Stage::Services);
     // --- GPS UART. setRxBufferSize MUST precede begin(). ---
     GPSSerial.setRxBufferSize(2048);
     GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
@@ -3278,10 +3366,12 @@ void setup() {
         gLoopFaults.event(2001, millis()).condition(false);
         gLoopFaults.event(4003, millis()).condition(false);
         gLoopFaults.event(4001, millis()).condition(!gSdMounted);
+        startupStage(gSdMounted ? startup_watchdog::Stage::CardSpace : startup_watchdog::Stage::FlashSpace);
         storageConditions(storageFreeBytes(*gTripFS), millis());
     }
-    if (gSdMounted) fsckAllTrips(SD);
-    if (gFlashMounted) fsckAllTrips(LittleFS);
+    if (gSdMounted) { startupStage(startup_watchdog::Stage::CardRepair); fsckAllTrips(SD); }
+    if (gFlashMounted) { startupStage(startup_watchdog::Stage::FlashRepair); fsckAllTrips(LittleFS); }
+    startupStage(startup_watchdog::Stage::Services);
 
     // Start a bounded readiness wait; loop() receives NMEA and configures
     // the receiver without blocking trip logging or power/charge checks.
@@ -3300,9 +3390,7 @@ void setup() {
     }
 
     Serial.println("Setup complete. Logging trips.");
-    // Mount, first free-space scan, erased-partition scan, journal begin and
-    // fsck may legitimately be slow. Enroll only after ALL startup work.
-    armLoopWatchdog();
+    finishStartupWatchdog();
 }
 
 void loop() {

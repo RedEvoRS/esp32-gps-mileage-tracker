@@ -106,6 +106,8 @@ static void run(float mps, int seconds, bool fix = true, bool ggaFirst = false,
 
 static void resetWorld() {
     g_watchdog = WatchdogStub(); loopTaskWDTEnabled = false; gLoopWatchdogArmed = false;
+    gLoopWatchdogTimeoutMs = 0; gStartupWatchdog = startup_watchdog::Policy(); gStartupWatchdogRecord.magic = 0;
+    g_resetReason = ESP_RST_POWERON;
     gDebugMode.store(hostDebugMode());
     gBootButton = runtime_debug::BootButton();
     gModeFeedback = false; gDisplayOwner = DisplayOwner::Production;

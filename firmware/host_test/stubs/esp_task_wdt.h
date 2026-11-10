@@ -13,6 +13,8 @@ struct WatchdogStub {
     esp_task_wdt_config_t config{5000, 1, true};
     bool initialized = true, failConfigure = false, failAdd = false;
     unsigned reconfigures = 0, initializes = 0, enrollments = 0, feeds = 0;
+    uint32_t lastResetMs = 0;
+    std::vector<uint32_t> timeouts;
     std::function<void()> onFeed;
 };
 inline WatchdogStub g_watchdog;
@@ -21,12 +23,14 @@ inline esp_err_t esp_task_wdt_reconfigure(const esp_task_wdt_config_t* config) {
     ++g_watchdog.reconfigures;
     if (!g_watchdog.initialized) return ESP_ERR_INVALID_STATE;
     if (g_watchdog.failConfigure) return ESP_FAIL;
-    g_watchdog.config = *config; return ESP_OK;
+    g_watchdog.config = *config; g_watchdog.lastResetMs = millis();
+    g_watchdog.timeouts.push_back(config->timeout_ms); return ESP_OK;
 }
 inline esp_err_t esp_task_wdt_init(const esp_task_wdt_config_t* config) {
     ++g_watchdog.initializes;
     if (g_watchdog.failConfigure) return ESP_FAIL;
-    g_watchdog.initialized = true; g_watchdog.config = *config; return ESP_OK;
+    g_watchdog.initialized = true; g_watchdog.config = *config;
+    g_watchdog.lastResetMs = millis(); g_watchdog.timeouts.push_back(config->timeout_ms); return ESP_OK;
 }
 inline void enableLoopWDT() {
     assert(g_currentCore == 1);
@@ -40,5 +44,6 @@ inline esp_err_t esp_task_wdt_status(void*) {
 inline void feedLoopWDT() {
     assert(g_currentCore == 1 && loopTaskWDTEnabled);
     ++g_watchdog.feeds;
+    g_watchdog.lastResetMs = millis();
     if (g_watchdog.onFeed) g_watchdog.onFeed();
 }

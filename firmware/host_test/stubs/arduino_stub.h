@@ -399,7 +399,8 @@ inline SDStub SD;
 // ---- Preferences ----------------------------------------------------------
 struct Preferences {
     std::map<std::string, uint32_t> kv;
-    bool begin(const char*, bool) { return !failBegin; }
+    inline static unsigned begins = 0;
+    bool begin(const char*, bool) { ++begins; return !failBegin; }
     uint32_t getUInt(const char* k, uint32_t d) { auto it = kv.find(k); return it == kv.end() ? d : it->second; }
     void putUInt(const char* k, uint32_t v) { kv[k] = v; }
     inline static std::map<std::string, uint64_t> durable64;
