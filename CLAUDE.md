@@ -92,6 +92,7 @@ server/
   viewer.env.example     Copy to viewer.env, set the admin login
   monitor.env.example    Disabled defaults; private monitor.env selected via MONITOR_ENV_FILE
   install.sh             First-time install with checks; --check re-verifies
+  update_python_dependencies.sh  Regenerates both services' hashed requirements.txt
   mileage-ingest/        Flask ingest (app.py), diagnostics SQLite (diag_store.py), Dockerfile
   mileage-viewer/        Flask trip viewer/export + Device health
                         (app.py, users.py, manage_users.py, trip_log.py, geocoding.py, static/)
@@ -106,6 +107,8 @@ server/
 
 tools/check_pii.py                  Personal-info scan (CI runs it; see Do Not)
 tools/generate_error_catalog.py     Generates sketch-local diag_catalog.h
+tools/lint/requirements.txt         Pinned ruff for the CI lint step
+ruff.toml                           Lint rules (F, E9, B) for server, tools and install
 DEPLOY_UNRAID.md                   Unraid install, cron backups and Debian migration
 DIAGNOSTICS.md                     Framework reference and issue delivery map
 .github/workflows/release.yml       Published-release bundle, scripts and checksums
