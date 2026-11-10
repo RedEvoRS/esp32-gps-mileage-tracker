@@ -47,7 +47,7 @@ public:
     virtual bool write(uint64_t state) = 0;
 };
 struct EventContext {
-    enum class Type : uint8_t { Integer, Boolean, Enum };
+    using Type = ContextType;
     char key[24] = {};
     Type type = Type::Integer;
     int64_t number = 0;

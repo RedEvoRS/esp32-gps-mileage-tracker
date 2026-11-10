@@ -164,6 +164,20 @@ class CatalogTests(unittest.TestCase):
                 self.assertEqual(generator.main(["--check"]), 1)
                 self.assertEqual(path.read_text(), "stale")
 
+    def test_generated_context_drift_and_lf_bytes(self):
+        changed = copy.deepcopy(self.catalog)
+        changed["codes"][0]["context"]["battery_mv"]["max"] -= 1
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "diag_catalog.h"
+            with mock.patch.object(generator, "OUTPUT", path):
+                self.assertEqual(generator.main([]), 0)
+                original = path.read_bytes()
+                self.assertNotIn(b"\r", original)
+                self.assertEqual(original, generator.render(self.catalog).encode("utf-8"))
+                with mock.patch.object(generator, "load_catalog", return_value=changed):
+                    self.assertEqual(generator.main(["--check"]), 1)
+                self.assertEqual(path.read_bytes(), original)
+
     def test_catalog_edits_require_version_bump(self):
         self.assertEqual(generator.catalog_digest(self.catalog),
                          PUBLISHED_CATALOGS[self.catalog["catalog_version"]])

@@ -614,8 +614,9 @@ not render the `oled` field. The historical compact-text geometry is U8g2
 `u8g2_font_5x8_tf`, with 5-pixel advances and 8-pixel rows: 21 characters
 occupy 105 pixels. Never scroll or shrink text to work around a catalog
 violation. The C++ table includes code,
-symbol, severity, OLED lines, title, notify and journal policy; longer recovery
-and context definitions stay in the JSON for the server.
+symbol, severity, OLED lines, title, notify and journal policy, plus generated
+context keys, types, integer bounds and enum values used by EventLog. Longer
+recovery text stays in the JSON for the server.
 
 #### Updating the catalog
 

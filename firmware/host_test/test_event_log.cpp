@@ -118,8 +118,8 @@ static void protocolInputs() {
     std::string line;
     while (std::getline(std::cin, line)) {
         std::istringstream in(line);
-        int code, mode, type; std::string key, value;
-        in >> code >> mode >> key >> type >> value;
+        int code, mode, type, valid; std::string key, value;
+        in >> code >> mode >> key >> type >> value >> valid;
         EventInput input; input.code = static_cast<uint16_t>(code);
         input.transition = mode ? EventTransition::Raise : EventTransition::Notice;
         if (key != "-") {
@@ -128,7 +128,14 @@ static void protocolInputs() {
                                type == 1 ? EventContext::boolean(key.c_str(), value == "true") :
                                            EventContext::enumeration(key.c_str(), value.c_str());
         }
-        assert(log->submit(input) == EventLog::Submit::Accepted); log->service(1);
+        auto result = log->submit(input);
+        if (!valid) {
+            assert(result == EventLog::Submit::Invalid);
+            assert(read(*log) == 0);
+            std::cout << "invalid\n";
+            continue;
+        }
+        assert(result == EventLog::Submit::Accepted); log->service(1);
         assert(read(*log) == 1); std::cout << batch.events[0] << '\n'; ack(*log);
     }
 }

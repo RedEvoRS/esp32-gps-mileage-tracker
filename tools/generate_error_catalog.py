@@ -45,6 +45,24 @@ def render(catalog):
         lines.append("    {Code::%s, %s, Severity::%s, {%s}, %d, %s, %s, Journal::%s}," % (
             row["symbol"], quote(row["symbol"]), row["severity"].title(), oled,
             len(row["oled"]), quote(row["title"]), str(row["notify"]).lower(), modes[row["journal"]]))
+    lines += ["};", "enum class ContextType : std::uint8_t { Integer, Boolean, Enum };",
+              "struct ContextField {", "    Code code;", "    const char* key;",
+              "    ContextType type;", "    std::int64_t min, max;",
+              "    const char* const* values;", "    std::size_t valueCount;", "};"]
+    for row in rows:
+        for key, spec in sorted(row["context"].items()):
+            if spec["type"] == "enum":
+                values = ", ".join(quote(value) for value in spec["values"])
+                lines.append(f'constexpr const char* kValues_{row["symbol"]}_{key}[] = {{{values}}};')
+    lines.append("constexpr ContextField kContextFields[] = {")
+    for row in rows:
+        for key, spec in sorted(row["context"].items()):
+            kind = spec["type"]
+            lo, hi = (spec["min"], spec["max"]) if kind == "integer" else (0, int(kind == "boolean"))
+            values = f'kValues_{row["symbol"]}_{key}' if kind == "enum" else "nullptr"
+            count = len(spec["values"]) if kind == "enum" else 0
+            lines.append(f'    {{Code::{row["symbol"]}, {quote(key)}, ContextType::{kind.title()}, '
+                         f'{lo}LL, {hi}LL, {values}, {count}}},')
     lines += ["};", "constexpr std::size_t kCatalogSize = sizeof(kCatalog) / sizeof(kCatalog[0]);",
               "constexpr const CatalogEntry* find(std::uint16_t code) {",
               "    for (std::size_t i = 0; i < kCatalogSize; ++i) {",
