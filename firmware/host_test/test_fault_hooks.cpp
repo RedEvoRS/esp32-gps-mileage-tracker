@@ -23,6 +23,7 @@ static void faultWorld() {
     gNetFaults.~RuntimeFaults(); new (&gNetFaults) RuntimeFaults(gJournal, gNetConditions, sizeof(gNetConditions)/sizeof(gNetConditions[0]));
     gBatteryDiagChecked = false; gStorageDiagMs = g_millis;
     gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0; gChargeCheckT0 = 0;
+    gChargeFirstResolved = false; gChargeFirstMs = 0;
     gJoinFailures = gTransportFailures = 0;
     gClockSet = true; gNetAbort = gNetHold = gNetBusy = false;
     gPmuIrqFlag = false; PMU = XPowersAXP2101(); WiFi = WiFiStub();

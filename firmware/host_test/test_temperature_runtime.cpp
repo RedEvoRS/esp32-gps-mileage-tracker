@@ -76,6 +76,9 @@ int main() {
     bmeMissing = true; tick();
     REQUIRE(tempLine() == "Temp: die -- C, guard_est -- C, TS -- V, TS_raw --, BME280 -- C, chg --, phase --, batt -- V, pct --, VBUS --\n");
     REQUIRE(gDebugDisplayReady && !gDebugDisplayFailed); // missing BME never latches OLED fault
+    prepare(); PMU.dieC = 385.7f; tick();
+    REQUIRE(std::isnan(gDebugTempDie));
+    REQUIRE(tempLine().find("die -- C, guard_est -- C") != std::string::npos);
 
     // Sensor recovers on the next 30 s attempt. OLED may already be disabled;
     // temperature logs continue using a bounded, once-per-line power snapshot.

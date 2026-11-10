@@ -23,6 +23,7 @@ static void world() {
     gJournalSealRequested = gJournalSealDone = gJournalSealOk = false;
     gEventIoBudget = false; g_taskDelayHook = nullptr;
     gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0;
+    gChargeFirstResolved = false; gChargeFirstMs = 0;
     gBatteryDiagChecked = false;
     gVbusOffPending = false;
     gPmuIrqFlag = false;

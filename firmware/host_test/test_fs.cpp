@@ -66,6 +66,7 @@ static void resetWorld() {
     g_httpConnectMs = g_httpWriteMs = g_httpHeaderMs = g_httpByteMs = 0;
     g_httpConnectTimeouts.clear(); g_httpReadTimeouts.clear();
     gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0; gChargeCheckT0 = 0;
+    gChargeFirstResolved = false; gChargeFirstMs = 0;
     gNetBusy = false; gNetHold = false; gNetAbort = false;
     gNetLastAttemptMs = 0; gNetRetryMs = 0; gNetRetryNow = false; WiFi = WiFiStub();
     g_failMutexCreate = false; g_taskCreates = 0; g_restarts = 0;
@@ -904,7 +905,9 @@ int main(int argc, char** argv) {
         g_disk.failMount = true;
         PMU.chargeEnabled = true;                    // left on by the last boot
         PMU.dieC = 60;                               // parked in the sun
-        g_disk.onMount = [] { g_chargeAtMount = PMU.chargeEnabled; };
+        // Capture startup only; nonblocking first-read retries also move the
+        // degraded recovery schedule, whose later mounts must not overwrite it.
+        g_disk.onMount = [] { if (g_disk.mountAttempts == 1) g_chargeAtMount = PMU.chargeEnabled; };
         g_delayHook = [](uint32_t ms) { g_millis += ms; };
         setup();
         CHECK(gDegraded.mode() == startup::Mode::NoStorage, "storage failure enters degraded loop");

@@ -64,6 +64,7 @@
 #include "secrets.h"
 #include "pmu_startup_event.h"
 #include "pmu_read_state.h"
+#include "charge_temperature.h"
 #include "journal_fs.h"
 #include "journal_boot.h"
 #include "revision_nvs.h"
@@ -1825,10 +1826,14 @@ static constexpr float    CHG_HOT_RESUME_C  = 38.0f + DIE_OFFSET_C;   // battery
 static constexpr float    CHG_COLD_PAUSE_C  =  0.0f + DIE_OFFSET_C;   // battery ~0 C
 static constexpr float    CHG_COLD_RESUME_C =  5.0f + DIE_OFFSET_C;   // battery ~5 C
 static constexpr uint32_t CHG_CHECK_MS      = 30UL * 1000;
+static constexpr uint32_t CHG_FIRST_RETRY_MS = 1000;
+static constexpr uint32_t CHG_FIRST_GRACE_MS = 10000;
 // The first temperature check must command/verify explicitly: the charger
 // keeps its state across ESP32 resets. Only matching read-back confirms it.
 static pmu_read::ChargeState gChargeState = pmu_read::ChargeState::Unconfirmed;
 static bool     gChargeChecked = false;
+static bool     gChargeFirstResolved = false; // plausible read OR grace exhausted; never reopens on rollover
+static uint32_t gChargeFirstMs = 0;
 static bool     gChargePauseRequested = false; // hysteresis follows intent, even on failure
 static uint8_t  gChargeFailures = 0;
 static constexpr uint8_t CHG_FAILURE_LIMIT = 3;
@@ -1836,12 +1841,21 @@ static uint32_t gChargeCheckT0 = 0;
 
 static void serviceChargeTemp() {
     uint32_t now = millis();
-    if (gChargeChecked && uint32_t(now - gChargeCheckT0) < CHG_CHECK_MS) return;
+    if (gChargeChecked && uint32_t(now - gChargeCheckT0) <
+        (gChargeFirstResolved ? CHG_CHECK_MS : CHG_FIRST_RETRY_MS)) return;
     gChargeCheckT0 = now;
     bool first = !gChargeChecked;
+    if (first) gChargeFirstMs = now;
     gChargeChecked = true;
 
     float die = PMU.getTemperature();
+    // XPowersLib AXP2101: 22 + (7274 - raw) / 20. Raw zero is 385.7 C,
+    // consistent with the cold-start ADC not having completed a conversion.
+    // Treat implausible values exactly like a failed read, including debug.
+    if (!charge_temperature::plausible(die)) die = NAN;
+    if (std::isfinite(die) || uint32_t(now - gChargeFirstMs) >= CHG_FIRST_GRACE_MS)
+        gChargeFirstResolved = true;
+    bool firstGrace = !gChargeFirstResolved;
     // Reuse this exact sample, including NAN on failure. No second PMU read.
     gDebugTempDie = die;
     gDebugTempDieMs = now;
@@ -1857,7 +1871,7 @@ static void serviceChargeTemp() {
         pause = die >= CHG_HOT_PAUSE_C || die <= CHG_COLD_PAUSE_C;
         why = die >= CHG_HOT_PAUSE_C ? "too hot" : "too cold";
     }
-    gChargePauseRequested = pause;
+    if (!firstGrace) gChargePauseRequested = pause;
 
     const auto intended = pause ? pmu_read::ChargeState::Paused : pmu_read::ChargeState::Charging;
     if (gChargeState != intended) {
@@ -1869,13 +1883,14 @@ static void serviceChargeTemp() {
         gChargeState = actual == intended ? intended : pmu_read::ChargeState::Unconfirmed;
         if (gChargeState == pmu_read::ChargeState::Unconfirmed) {
             if (gChargeFailures < CHG_FAILURE_LIMIT) ++gChargeFailures;
-            Serial.println("Charge control unconfirmed; retrying in 30 s.");
+            Serial.printf("Charge control unconfirmed; retrying in %lu s.\n",
+                (unsigned long)((firstGrace ? CHG_FIRST_RETRY_MS : CHG_CHECK_MS) / 1000));
         } else {
             gChargeFailures = 0;
-            if (pause) {
+            if (pause && !firstGrace) {
                 Serial.printf("Charging paused: %s (die %.1f C, battery ~%.0f C)\n",
                               why, die, die - DIE_OFFSET_C);
-            } else {
+            } else if (!pause) {
                 Serial.printf(first ? "Charge guard: die %.1f C (battery ~%.0f C), charging on.\n"
                                     : "Charging resumed (die %.1f C, battery ~%.0f C)\n",
                               die, die - DIE_OFFSET_C);
@@ -1896,7 +1911,7 @@ static void serviceChargeTemp() {
                 gLoopFaults.condition(pause && (code == 2004 ? die > CHG_HOT_RESUME_C : die < CHG_COLD_RESUME_C));
             }
         }
-        gLoopFaults.event(2006, now).condition(unreadable);
+        if (!firstGrace) gLoopFaults.event(2006, now).condition(unreadable);
         if (gChargeState != pmu_read::ChargeState::Unconfirmed || gChargeFailures >= CHG_FAILURE_LIMIT)
             gLoopFaults.event(2008, now).condition(gChargeFailures >= CHG_FAILURE_LIMIT);
     }
@@ -3071,8 +3086,7 @@ static void enterDegraded(startup::Mode mode) {
         gLoopFaults.event(4002, millis()).condition(true);
         gLoopFaults.event(4003, millis()).condition(true);
         Serial.println("DEGRADED: no usable trip storage -- not recording trips. Power management and charge guard active. Retrying storage in 60 s.");
-        // Measurements have been enabled; allow the ADC its first conversion.
-        delay(1000);
+        // The loop retries an implausible first conversion without blocking.
         serviceChargeTemp();
     } else {
         if (mode == startup::Mode::PmuUntrusted) {
@@ -3274,9 +3288,8 @@ void setup() {
     configureGps();
 
     // First charge-temperature check now, not 30 s in: charging has been off
-    // since the PMU setup, and this turns it back on if it's safe. (The
-    // temperature ADC was enabled well over a conversion time ago, with the
-    // PMU.)
+    // since PMU setup. A cold-start ADC can still be unready: the loop retries
+    // once a second for ten seconds, keeping charging off until a valid read.
     serviceChargeTemp();
 
     initEventUpload();
