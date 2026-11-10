@@ -279,6 +279,8 @@ Keep one setting per line and use literal values rather than `$OTHER` or
 guessing Compose's interpolation context. Full examples and error behavior
 are in DEPLOY_DEBIAN.md Step 11b. On Unraid, one disposable Python checker
 serves all Notifications questions; secrets travel on stdin, never argv.
+The checker stays off when `--check` has no selected monitor file and when a
+fresh install chooses no outputs. Existing monitor heartbeat checks still run.
 
 Optionally, the monitor also sends diagnostics as GELF (Graylog Extended Log
 Format) to a Graylog you run elsewhere (`GRAYLOG_*` in `monitor.env`, off by

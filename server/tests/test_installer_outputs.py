@@ -40,6 +40,19 @@ HARNESS = textwrap.dedent("""\
     BIND_ADDR=${FAKE_BIND-}
     DOCKER=(docker)
 
+    # A first checker start must happen in the parent, before any $(mon_value).
+    eval "$(declare -f settings_start | sed '1s/settings_start/settings_start_real/')"
+    settings_start() {
+        if [[ -z $SETTINGS_PID && $BASH_SUBSHELL -ne 0 ]]; then
+            printf 'Checker started in a command substitution\\n' >&2
+            exit 98
+        fi
+        settings_start_real
+    }
+    if [[ ${FAKE_FORBID_CHECKER:-no} == yes ]]; then
+        host_python() { printf 'Unexpected checker startup\\n' >&2; return 99; }
+    fi
+
     # Docker: every inspect answers with the state the test set.
     docker() {
         if [[ $* == *'.State.Health'* ]]; then
@@ -227,7 +240,7 @@ class InstallerOutputs(unittest.TestCase):
             self.assertNotIn(secret, result.stdout + result.stderr)
 
     def test_none_writes_a_disabled_monitor_env_and_one_pointer(self):
-        result = self.run_step(INSTALL_OUTPUTS="none")
+        result = self.run_step(INSTALL_OUTPUTS="none", FAKE_FORBID_CHECKER="yes")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Notification outputs: off", result.stdout)
         self.assertEqual(self.setting("MONITOR_ENABLED"), "false")
@@ -238,6 +251,9 @@ class InstallerOutputs(unittest.TestCase):
         self.assertEqual(added, {"MONITOR_ENV_FILE=./monitor.env"})
         self.assertFalse((self.work / "viewer.env").exists())
         self.assertNotIn("up -d --build", self.compose_log())
+        self.assertNotIn("Installer Python:", result.stderr)
+        self.assertIn("stop mileage-monitor", self.compose_log())
+        self.assertIn("stop ntfy", self.compose_log())
 
     def test_metrics_only_by_environment_variables(self):
         result = self.run_step(INSTALL_OUTPUTS="metrics", INSTALL_STALE_DAYS="7")
@@ -637,11 +653,28 @@ class InstallerOutputs(unittest.TestCase):
         self.assertEqual(self.sent(), [])
 
     def test_check_without_monitor_has_no_optional_health_warning(self):
-        result = self.run_step(mode="check", FAKE_RUNNING="")
+        result = self.run_step(mode="check", FAKE_RUNNING="", FAKE_FORBID_CHECKER="yes")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("FAILURES=0", result.stdout)
         self.assertNotIn("heartbeat", result.stdout)
         self.assertNotIn("unhealthy", result.stdout)
+        self.assertNotIn("Installer Python:", result.stderr)
+
+    def test_check_missing_monitor_file_never_starts_checker(self):
+        with self.env_file.open("a", encoding="utf-8") as handle:
+            handle.write("MONITOR_ENV_FILE=./missing-monitor.env\n")
+        result = self.run_step(mode="check", FAKE_FORBID_CHECKER="yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("which doesn't exist", result.stdout)
+        self.assertIn("The monitor heartbeat is healthy", result.stdout)
+        self.assertNotIn("Installer Python:", result.stderr)
+
+    def test_check_without_monitor_env_still_reports_unhealthy_existing_monitor(self):
+        result = self.run_step(mode="check", FAKE_FORBID_CHECKER="yes", FAKE_MONITOR_HEALTH="unhealthy")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("The monitor is unhealthy", result.stdout)
+        self.assertIn("FAILURES=1", result.stdout)
+        self.assertNotIn("Installer Python:", result.stderr)
 
     def test_check_healthy_starting_and_older_monitor_states(self):
         for health, message in (("healthy", "The monitor heartbeat is healthy"),

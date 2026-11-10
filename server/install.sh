@@ -3400,17 +3400,24 @@ write_monitor_settings() {
     fi
 }
 
-# Make the containers match monitor.env. Works from the file, not from this
-# run's answers, so it serves new answers and kept outputs alike. The bundled
+# Make the containers match monitor.env. The optional "none" argument is used
+# only just after writing all outputs off, so that path needs no settings read.
+# Otherwise this reads the file for new answers and kept outputs alike. The bundled
 # ntfy is started if it's on. The monitor is brought up with --build, which
 # recreates it only when its image or settings changed (a re-run after new
 # server code therefore picks the code up). Nothing is sent by this function,
 # and the ingest and viewer are never restarted here.
 apply_outputs() {
-    if output_on ntfy && ntfy_bundled; then
+    local have_outputs=no use_bundled_ntfy=no
+    if [[ ${1:-} != none ]]; then
+        settings_start
+        if [[ -n $(outputs_on) ]]; then have_outputs=yes; fi
+        if output_on ntfy && ntfy_bundled; then use_bundled_ntfy=yes; fi
+    fi
+    if [[ $use_bundled_ntfy == yes ]]; then
         start_bundled_ntfy
     fi
-    if [[ -n $(outputs_on) ]]; then
+    if [[ $have_outputs == yes ]]; then
         if [[ $(service_state mileage-monitor monitor) != running ]]; then
             check_port_free mileage-monitor 8093 monitor
         fi
@@ -3425,7 +3432,7 @@ apply_outputs() {
         fi
         ok "Stopped the monitor, since no output is on"
     fi
-    if [[ $(service_state ntfy ntfy) == running ]] && ! { output_on ntfy && ntfy_bundled; }; then
+    if [[ $(service_state ntfy ntfy) == running && $use_bundled_ntfy == no ]]; then
         if ! compose --profile ntfy stop ntfy < /dev/null 2>&1 | indent; then
             die "docker compose couldn't stop the bundled ntfy (output above)."
         fi
@@ -3573,7 +3580,6 @@ check_monitor_health() {
 # Read-only checks of what monitor.env turns on, in both modes. Nothing is
 # sent to a phone, Graylog or Loki from here.
 check_outputs() {
-    settings_start
     local list monitor_ok=no pointer config_status=0
     check_monitor_health
     if ! find_monitor_file; then
@@ -3586,6 +3592,7 @@ check_outputs() {
         fi
         return 0
     fi
+    settings_start
     monitor_env_readable
     list=$(outputs_on | paste -sd, -)
     if [[ -z $list ]]; then
@@ -3762,16 +3769,16 @@ wait_for_bundled_ntfy() {
 # Check mode only checks. Install mode asks, applies and checks; a kept set of
 # outputs is applied without any question and without any test being sent.
 setup_outputs() {
-    settings_start
     section "Notifications"
     if [[ $MODE == check ]]; then
         check_outputs
         return 0
     fi
     ensure_monitor_file
-    monitor_env_readable
     local default=none current
     if [[ $MONITOR_CONFIGURED == yes ]]; then
+        settings_start
+        monitor_env_readable
         current=$(outputs_on | paste -sd, -)
         note "Notification outputs now: $(outputs_text "$current")"
         # A preset list means "set them to this", so it doesn't need the keep
@@ -3794,6 +3801,8 @@ setup_outputs() {
     ask_outputs "$default"
 
     if (( ${#CHOSEN[@]} )); then
+        settings_start
+        monitor_env_readable
         ask_stale_days
         if chosen_output ntfy; then ask_ntfy; fi
         if chosen_output graylog; then ask_graylog; fi
@@ -3803,13 +3812,14 @@ setup_outputs() {
     # Every answer is in. Now make the changes.
     if chosen_output ntfy; then prepare_ntfy; fi
     write_monitor_settings
-    apply_outputs
     if (( ${#CHOSEN[@]} )); then
+        apply_outputs
         wait_monitor_start
         wait_for_bundled_ntfy
         check_outputs
         send_tests
     else
+        apply_outputs none
         ok "Notification outputs: off"
     fi
 }

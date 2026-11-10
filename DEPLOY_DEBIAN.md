@@ -1795,6 +1795,9 @@ kept in `monitor.env`, never printed.
 The questions and the monitor use the same settings rules. The installer
 checks them with host Python, or one disposable Python container on Unraid;
 it reuses that checker across questions and sends secrets on standard input.
+The checker starts only when settings need reading or an output is chosen.
+A check with no selected monitor file, or a fresh install choosing `none`,
+does not start it. An existing monitor's heartbeat is still checked.
 Topic names and bundled phone usernames use 1–64 letters, digits, `_` or `-`.
 The phone password needs at least eight characters and is stored by ntfy,
 not in `monitor.env`. Silence accepts at least one second (`1/86400` days)
