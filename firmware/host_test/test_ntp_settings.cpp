@@ -20,17 +20,23 @@ int main() {
     constexpr const char* first = network_time::server1();
     constexpr const char* second = network_time::server2();
 #if defined(TEST_NTP_EMPTY_PRIMARY) || defined(TEST_NTP_EMPTY_BOTH)
-    assert(!first);
+    static_assert(!network_time::kUseServer1, "Empty first server must be unused");
+    static_assert(first == nullptr, "Empty first server must pass nullptr to configTime");
 #elif defined(TEST_NTP_OVERRIDES)
+    static_assert(network_time::kUseServer1, "First override must be used");
     assert(!std::strcmp(first, "clock.example"));
 #else
+    static_assert(network_time::kUseServer1, "First default must be used");
     assert(!std::strcmp(first, "pool.ntp.org"));
 #endif
 #if defined(TEST_NTP_EMPTY_SECONDARY) || defined(TEST_NTP_EMPTY_BOTH)
-    assert(!second);
+    static_assert(!network_time::kUseServer2, "Empty second server must be unused");
+    static_assert(second == nullptr, "Empty second server must pass nullptr to configTime");
 #elif defined(TEST_NTP_OVERRIDES)
+    static_assert(network_time::kUseServer2, "Second override must be used");
     assert(!std::strcmp(second, "192.0.2.123"));
 #else
+    static_assert(network_time::kUseServer2, "Second default must be used");
     assert(!std::strcmp(second, "time.nist.gov"));
 #endif
     std::cout << "NTP settings: static server pointers and empty-slot policy passed\n";

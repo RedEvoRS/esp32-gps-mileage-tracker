@@ -2129,7 +2129,7 @@ static void uploadDiagnostics(int status) {
 // Only an actual completion from this attempt makes its timestamps trusted.
 static void trySntp() {
     if (gClockSet.load()) return;
-    if (!network_time::server1() && !network_time::server2()) return;
+    if (!network_time::kUseServer1 && !network_time::kUseServer2) return;
     esp_sntp_stop();
     esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
     esp_sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);

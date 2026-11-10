@@ -12,6 +12,8 @@ namespace network_time {
 // bytes live for the entire boot, never temporary buffers on the net stack.
 constexpr char kServer1[] = NTP_SERVER_1;
 constexpr char kServer2[] = NTP_SERVER_2;
-constexpr const char* server1() { return kServer1[0] ? kServer1 : nullptr; }
-constexpr const char* server2() { return kServer2[0] ? kServer2 : nullptr; }
+constexpr bool kUseServer1 = kServer1[0] != '\0';
+constexpr bool kUseServer2 = kServer2[0] != '\0';
+constexpr const char* server1() { return kUseServer1 ? kServer1 : nullptr; }
+constexpr const char* server2() { return kUseServer2 ? kServer2 : nullptr; }
 } // namespace network_time
