@@ -55,6 +55,14 @@ echo "== test_temperature (Bosch compensation and checked debug probes)"
     "$here/test_temperature.cpp" -o "$build/test_temperature.exe"
 "$build/test_temperature.exe" || status=1
 
+for variant in DEFAULT OVERRIDES EMPTY_PRIMARY EMPTY_SECONDARY EMPTY_BOTH; do
+    echo "== test_ntp_settings ($variant)"
+    "${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -Werror -pedantic \
+        "-DTEST_NTP_$variant" -I"$here/../04_trip_logger" \
+        "$here/test_ntp_settings.cpp" -o "$build/test_ntp_settings.exe"
+    "$build/test_ntp_settings.exe" || status=1
+done
+
 echo "== test_degraded_policy"
 "${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -Werror -pedantic "$here/test_degraded_policy.cpp" -o "$build/test_degraded_policy.exe"
 "$build/test_degraded_policy.exe" || status=1

@@ -1339,6 +1339,21 @@ before relying on the tracker; see [degraded startup details](../DIAGNOSTICS.md#
 
 #### RTC
 
+When already connected to home WiFi, Stage 4 asks `pool.ntp.org` and
+`time.nist.gov` for network time only if GPS has not set the clock yet.
+To change them, add optional `NTP_SERVER_1` and `NTP_SERVER_2` string settings
+to `secrets.h`, as shown in [the settings example](secrets.h.example), then
+rebuild and flash. Use hostnames or IPv4 addresses without a URL, port or path.
+Set **both** to your router or local time server to keep time requests on the
+LAN; changing one leaves the other public default. Omitting a setting keeps
+its default. An explicit empty string leaves that server slot unused; both
+empty means the clock waits for GPS without trying network time. If a name
+is wrong or neither server answers during the five-second attempt, the clock
+waits for GPS. Uploads still work, and time requests contain no trip data.
+For server-built firmware, use the optional `TRACKER_NTP_SERVER_1/2`
+[builder environment settings](../server/firmware-builder/README.md); empty
+or unset environment values retain the firmware defaults.
+
 The PCF8563 real-time clock (RTC) supplies diagnostic event timestamps
 before GPS or Simple Network Time Protocol (SNTP) sync, never GPX times.
 The `RTC:` boot line reports whether its clock is

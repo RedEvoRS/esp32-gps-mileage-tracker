@@ -89,7 +89,11 @@ inline struct tm* gmtime_r_stub(const time_t* t, struct tm* out) {
     return out;
 }
 #define gmtime_r gmtime_r_stub
-inline void configTime(int, int, const char*, const char*) {}
+static const char* g_ntpServers[2] = {};
+static unsigned g_ntpConfigCalls = 0;
+inline void configTime(int, int, const char* first, const char* second) {
+    g_ntpServers[0] = first; g_ntpServers[1] = second; ++g_ntpConfigCalls;
+}
 // Mirrors Arduino's plausibility test, including a retained RTC with drift.
 // It deliberately does not prove that an SNTP response was received.
 inline bool getLocalTime(struct tm* out, uint32_t) {

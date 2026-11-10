@@ -63,6 +63,7 @@
 #include <cmath>
 
 #include "secrets.h"
+#include "ntp_settings.h"
 #include "pmu_startup_event.h"
 #include "pmu_read_state.h"
 #include "charge_temperature.h"
@@ -2128,10 +2129,11 @@ static void uploadDiagnostics(int status) {
 // Only an actual completion from this attempt makes its timestamps trusted.
 static void trySntp() {
     if (gClockSet.load()) return;
+    if (!network_time::server1() && !network_time::server2()) return;
     esp_sntp_stop();
     esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
     esp_sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    configTime(0, 0, network_time::server1(), network_time::server2());
     uint32_t start = millis();
     while (!gClockSet.load() && !gNetAbort.load() && millis() - start < 5000) {
         if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {

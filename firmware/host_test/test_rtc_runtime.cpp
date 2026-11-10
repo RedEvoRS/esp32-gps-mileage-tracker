@@ -199,7 +199,11 @@ int main(int argc, char**) {
     // SNTP publication from core 0 does no RTC work; core 1 later repairs it.
     rtcWorld(false); beginRtc(); take(); before = transactions; g_currentCore = 0;
     g_sntpCompleteAfterPolls = 1; g_sntpEpochMs = uint64_t(fakeEpoch)*1000;
+    g_ntpConfigCalls = 0;
     trySntp(); assert(gClockSet && transactions == before && writes == 0);
+    assert(g_ntpConfigCalls == 1);
+    assert(g_ntpServers[0] == network_time::server1() && g_ntpServers[1] == network_time::server2());
+    trySntp(); assert(g_ntpConfigCalls == 1); // GPS/SNTP already trusted: no new request
     gNetFaults.event(diagnostics::Code::NET_STACK_LOW,millis()).integer("free_bytes",1000).condition(true);
     has(one(1007,"raise"),"\"time_source\":\"sntp\"");
     g_currentCore = 1; serviceRtc(); one(3008,"clear"); assert(writes == 1 && rtcLog("set from sntp, verified"));
