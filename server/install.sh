@@ -3519,10 +3519,32 @@ check_metrics() {
     fi
 }
 
+# Check an existing running monitor even when it uses the disabled defaults.
+# A deployment with no monitor container has no optional-health warning.
+check_monitor_health() {
+    local id health
+    [[ $(service_state mileage-monitor monitor) == running ]] || return 0
+    id=$(compose --profile monitor ps -a -q mileage-monitor < /dev/null 2> /dev/null) || return 0
+    [[ -n $id && $id != *$'\n'* ]] || return 0
+    health=$("${DOCKER[@]}" inspect -f \
+        '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id" \
+        < /dev/null 2> /dev/null) || health=unknown
+    case $health in
+        healthy) ok "The monitor heartbeat is healthy" ;;
+        starting) note "The monitor heartbeat health check is still starting; run --check again shortly" ;;
+        none) warn "The monitor has no heartbeat health check (older container)" \
+            "Rebuild and recreate it: docker compose --profile monitor up -d --build mileage-monitor" ;;
+        *) problem "The monitor is unhealthy (heartbeat health: $health)" \
+            "Check its log and state-volume access: docker compose --profile monitor logs --tail 50 mileage-monitor" \
+            "A stuck tick, unexpected exception or unreadable diagnostics can stop the heartbeat." ;;
+    esac
+}
+
 # Read-only checks of what monitor.env turns on, in both modes. Nothing is
 # sent to a phone, Graylog or Loki from here.
 check_outputs() {
     local list monitor_ok=no pointer config_status=0
+    check_monitor_health
     if ! find_monitor_file; then
         pointer=$(env_raw .env MONITOR_ENV_FILE)
         if [[ -n $pointer ]]; then

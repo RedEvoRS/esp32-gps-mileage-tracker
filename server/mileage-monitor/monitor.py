@@ -240,6 +240,7 @@ class Monitor:
             raise ValueError("Cannot start monitor: missing or invalid diagnostics catalog.json") from exc
         self.codes = {row["code"]: row for row in self.catalog["codes"]}
         self.events_path, self.state_path = Path(events_path), Path(state_path)
+        self.heartbeat_path = self.state_path.with_name("heartbeat")
         if self.events_path.resolve() == self.state_path.resolve():
             raise ValueError("monitor state must be separate from diagnostics")
         self.clock = clock
@@ -436,7 +437,13 @@ class Monitor:
 
     def tick(self):
         try:
-            return self._tick()
+            completed = self._tick()
+            if completed:
+                # Disabled and not-yet-enrolled installs are healthy. Unreadable
+                # diagnostics return False; no useful monitoring completed.
+                self.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+                self.heartbeat_path.touch()
+            return completed
         except sqlite3.Error:
             if self.metrics_snapshot is not None:
                 self.metrics_snapshot.record_read_error()
@@ -685,6 +692,26 @@ class Monitor:
             LOG.info("Loki accepted %s log line(s)", len(push_items))
 
 
+def log_unexpected_tick(exc):
+    """Log a traceback without exception text, source, locals or private paths."""
+    frames = ["Traceback (frames only; exception messages, source and locals omitted):"]
+    trace = exc.__traceback__
+    while trace is not None:
+        code = trace.tb_frame.f_code
+        # Only these reviewed source names/functions can enter the log. A
+        # library or dynamically compiled filename might itself contain secrets.
+        filename = Path(code.co_filename)
+        if (filename.parent == Path(__file__).parent and filename.name in
+                {"monitor.py", "shared.py", "gelf.py", "loki.py", "prometheus.py"}):
+            name, function = filename.name, code.co_name
+        else:
+            name, function = "<external>", "<external>"
+        frames.append(f'  File "{name}", line {trace.tb_lineno}, in {function}')
+        trace = trace.tb_next
+    LOG.error("Unexpected monitor tick failure (%s); retry next tick\n%s",
+              type(exc).__name__, "\n".join(frames))
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     LOG.info("Server version: %s", server_version())
@@ -713,6 +740,8 @@ def main():
             monitor.tick()
         except (sqlite3.Error, OSError, ValueError) as exc:
             LOG.error("Monitor state unavailable (%s); retry next tick", type(exc).__name__)
+        except Exception as exc:
+            log_unexpected_tick(exc)
         stop.wait(TICK_SECONDS)
     if metrics_server is not None:
         metrics_server.shutdown()

@@ -174,6 +174,22 @@ host `python3`: that fallback works only inside `install.sh`, not in commands
 pasted into the shell. Its systemd, sudo and Debian firewall instructions do
 not apply on Unraid.
 
+The optional monitor has a local heartbeat health check. Every completed
+one-minute tick touches `/state/heartbeat` in `monitor-state`; disabled ticks
+and a missing diagnostics database count as completed. Unreadable diagnostics
+or a failed tick do not refresh it. Unexpected exceptions log their type and
+traceback frames without exception text, source, local variables or private
+paths, then wait for the next tick. Docker checks every 30 seconds (five-second
+timeout, 90-second startup grace, two failures, maximum file age 180 seconds).
+A stuck running monitor usually becomes `(unhealthy)` in `docker ps` after
+about 3.5-4 minutes without progress; `bash install.sh --check` reports it,
+including a running disabled monitor. Without a monitor container there is no
+optional-health warning. Health does not prove delivery, and Docker does not
+restart a running container solely because it is unhealthy. Inspect its log:
+`docker compose --profile monitor logs --tail 50 mileage-monitor`. Rebuild
+and recreate older monitor containers to add the check. No credentials,
+network request or external alive-ping service are used by this probe.
+
 ## Step 3 — Understand restarts
 
 The Unraid installer writes `RESTART_POLICY=always` into `.env`. All four

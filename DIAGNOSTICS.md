@@ -2108,6 +2108,21 @@ timeout and a consistent read transaction, closing every connection. No
 initialization, migration or recovery is attempted there. An absent DB means
 nothing to do. A read/schema/lock/hot-journal failure logs unavailable and
 suspends all sends, including pending retries, until a successful read.
+Each completed tick refreshes `/state/heartbeat` beside `monitor.db`.
+Disabled ticks and an absent events.db count as completed; a diagnostics
+read/schema/lock failure does not. Unexpected per-tick exceptions are caught
+as `Exception`, never `BaseException`: log the type and reviewed traceback
+frame locations, with no exception text, source lines, locals or private paths,
+then wait 60 seconds as usual. Failed ticks do not refresh the heartbeat.
+Compose checks the file locally every 30 seconds (five-second timeout,
+180-second maximum age, two failures, 90-second startup grace). Three missed
+ticks plus the probe allowance normally mark a stalled running monitor
+unhealthy after about 3.5-4 minutes. `docker ps` exposes this status and
+`install.sh --check` reports it for an existing running monitor, even when
+disabled; an absent optional container causes no health warning. This checks
+progress, not delivery. No credentials, network or outbound alive-ping URL
+are involved; a long export can also delay progress.
+
 Snapshot parse/validation failures are isolated per device, including snapshots
 that no longer satisfy the current catalog. That device's fault conditions
 become unknown: they cannot trigger fault alerts, reminders or resolutions.

@@ -42,7 +42,10 @@ HARNESS = textwrap.dedent("""\
 
     # Docker: every inspect answers with the state the test set.
     docker() {
-        if [[ $* == *com.docker.compose.config-hash* ]]; then
+        if [[ $* == *'.State.Health'* ]]; then
+            printf '%s\\n' "${FAKE_MONITOR_HEALTH:-healthy}"
+            return 0
+        elif [[ $* == *com.docker.compose.config-hash* ]]; then
             printf '%s\\n' "${FAKE_CONTAINER_HASH:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
             printf '%s' "${FAKE_HASH_ERROR-}" >&2
             return "${FAKE_INSPECT_RC:-0}"
@@ -620,6 +623,31 @@ class InstallerOutputs(unittest.TestCase):
         self.assertIn("FAIL", result.stdout)
         self.assertIn("The monitor isn't running", result.stdout)
         self.assertIn("FAILURES=1", result.stdout)
+
+    def test_check_reports_unhealthy_monitor_even_with_disabled_defaults(self):
+        result = self.run_step(mode="check", FAKE_MONITOR_HEALTH="unhealthy")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("The monitor is unhealthy (heartbeat health: unhealthy)", result.stdout)
+        self.assertIn("FAILURES=1", result.stdout)
+        self.assertIn("Notification outputs: off", result.stdout)
+        self.assertEqual(self.sent(), [])
+
+    def test_check_without_monitor_has_no_optional_health_warning(self):
+        result = self.run_step(mode="check", FAKE_RUNNING="")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("FAILURES=0", result.stdout)
+        self.assertNotIn("heartbeat", result.stdout)
+        self.assertNotIn("unhealthy", result.stdout)
+
+    def test_check_healthy_starting_and_older_monitor_states(self):
+        for health, message in (("healthy", "The monitor heartbeat is healthy"),
+                                ("starting", "health check is still starting"),
+                                ("none", "The monitor has no heartbeat health check")):
+            with self.subTest(health=health):
+                result = self.run_step(mode="check", FAKE_MONITOR_HEALTH=health)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(message, result.stdout)
+                self.assertIn("FAILURES=0", result.stdout)
 
     def test_check_reports_an_unreachable_graylog(self):
         self.run_step(INSTALL_OUTPUTS="graylog", INSTALL_GRAYLOG_TARGET="graylog.invalid:12201",

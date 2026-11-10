@@ -1762,7 +1762,9 @@ described near the top of this runbook.) It verifies what is on: the monitor
 must be running and its startup log must show the selected outputs, each
 destination must be reachable from the monitor, metrics must refuse a request
 without the token, and the bundled ntfy must refuse anonymous reads. Outputs that are off are reported as "off", never as
-problems, so a check with nothing turned on passes.
+problems. A deployment without a monitor container has no monitor-health
+warning. An existing running monitor is also checked for heartbeat health,
+even when its settings disable every output.
 
 It also compares the container's Compose configuration hash with the current
 configuration, including URLs, credentials and tuning values in `monitor.env`,
@@ -1931,6 +1933,34 @@ UTF-8 bytes; unsent work persists and is rechecked before delivery. Failed
 posts retry after 60, 120, 240 seconds, and so on, capped at an hour. Delivery
 is **at least once**: a crash after ntfy accepts a message but before success
 is recorded can produce a duplicate.
+
+The monitor also checks its own progress without a network request: each
+completed tick touches `/state/heartbeat` in `monitor-state`. Disabled ticks
+count as completed without reading databases, as does a missing `events.db`
+before the first upload. Unreadable diagnostics or a failed tick do not
+refresh it, so a persistent database problem also becomes unhealthy.
+Unexpected tick exceptions log the type and traceback frames only (no
+exception message, source lines, local variables or private paths), then
+wait the usual 60 seconds and try again. KeyboardInterrupt and SystemExit
+still stop the process.
+
+Compose probes the local file every 30 seconds with a five-second timeout,
+a 90-second startup grace and two consecutive failures required. The file
+may be at most 180 seconds old, allowing three missed one-minute ticks:
+a stalled running monitor normally turns `(unhealthy)` in `docker ps` about
+3.5-4 minutes after its last completed tick. `install.sh --check` reports
+that failure too, including a disabled monitor that is still running.
+An old container without this check needs rebuilding and recreating.
+Health measures tick progress; it does not confirm delivery, and a long
+export can delay it. Docker does not restart a running container just for
+being unhealthy. Check the cause with:
+
+```bash
+docker compose --profile monitor logs --tail 50 mileage-monitor
+```
+
+The health probe uses no credentials or network. An external alive-ping URL
+is not configured; a separately chosen service could be a future addition.
 
 ### 11c — Check delivery and turn it off
 

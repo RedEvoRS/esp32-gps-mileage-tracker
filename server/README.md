@@ -202,15 +202,38 @@ Its versioned state DB, `/state/monitor.db` in `monitor-state`, persists
 episodes, delivery intent, digest overflow, reminders, rolling-hour cap and
 retry backoff. Use one replica and preserve the volume to retain deduplication.
 
+Each completed monitor tick touches `/state/heartbeat` in that same volume.
+Disabled ticks still refresh it without reading a database; a missing
+`events.db` before the first upload is normal too. Unreadable diagnostics,
+failed state access and unexpected exceptions leave the heartbeat unchanged.
+Unexpected tick errors log the exception type and traceback frames without
+exception text, source lines, local variables or private paths, then wait the
+usual 60 seconds before trying again. KeyboardInterrupt and SystemExit still
+stop the process.
+
+Docker checks this local file every 30 seconds, with a five-second timeout,
+90 seconds of startup grace and two failures allowed. A heartbeat at most
+180 seconds old is healthy: three missed ticks plus the probe allowance
+usually make a stalled running monitor unhealthy after about 3.5-4 minutes.
+No network or credentials are used. `docker ps` shows `(unhealthy)`, and
+`install.sh --check` reports it even for a running disabled monitor. A normal
+deployment without the monitor container has no optional-health warning.
+An older container with no heartbeat check prompts a rebuild and recreation.
+Health measures tick progress, not successful ntfy, Graylog or Loki delivery;
+a long-running export can also delay progress. Docker does not restart a
+running container solely because it is unhealthy. Inspect
+`docker compose --profile monitor logs --tail 50 mileage-monitor` to find the
+cause. No extra outbound alive-ping service is configured.
+
 Fault notifications require eligible severity from the current catalog and
 a snapshot at most 24 hours old (including exactly 24 hours). Every output
 uses the same state rule: an accepted snapshot determines faults, and server
 contact age determines E7001 silence, independently of snapshot age. Stored
 condition rows do not override a fresh snapshot. Catalog severity and `notify`
 filter phone delivery only; Prometheus and Loki condition lines retain current
-catalog codes, while Graylog also describes unknown codes. Hold defaults to 300 seconds (critical skips
-it), reminders to 24 hours, and the cap to six successful posts per rolling
-hour. Overflow becomes bounded digests. Recovery needs an actually sent alert
+catalog codes, while Graylog also describes unknown codes. Hold defaults to
+300 seconds (critical skips it), reminders to 24 hours, and the cap to six
+successful posts per rolling hour. Overflow becomes bounded digests. Recovery needs an actually sent alert
 and an ordered explicit clear; unknown, reboot or historical events do not
 resolve faults. Delivery is at least once, with exponential retries from one
 minute to one hour; a crash after acceptance can duplicate a message. Bodies

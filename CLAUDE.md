@@ -449,7 +449,14 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   resolves on newer contact. Separate `monitor.env` (selected by
   `MONITOR_ENV_FILE` in `.env`) holds only
   monitor settings/token, defaults to disabled `monitor.env.example` for normal
-  install/--check. Disabled monitor idles without DB reads. Optional `ntfy`
+  install/--check. Disabled monitor idles without DB reads and still touches
+  `/state/heartbeat` each completed tick. Missing events.db is normal; unreadable
+  diagnostics and failed ticks do not refresh it. Unexpected tick exceptions
+  log their type and a frames-only traceback without messages, source, locals
+  or private paths, then wait the usual 60 s. Compose checks the local heartbeat
+  every 30 s (180 s maximum age, two failures, 90 s startup grace); `docker ps`
+  and `install.sh --check` report an unhealthy running monitor, including a
+  disabled one. Health does not confirm output delivery. Optional `ntfy`
   profile uses port 8092 with `BIND_ADDR`, deny-all auth and `ntfy-state` cache/auth
   volume. `.env` `NTFY_BASE_URL` and `NTFY_BEHIND_PROXY` (default false)
   survive updates; hand edits to shipped `ntfy/server.yml` do not.
