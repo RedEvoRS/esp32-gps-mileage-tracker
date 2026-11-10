@@ -1,24 +1,35 @@
 // Task-owned producer state only: no filesystem, waits, allocation or ISR use.
 #pragma once
 #include "event_log.h"
+#ifdef JOURNAL_HOST_TEST
+#include <cassert>
+#endif
 
 namespace diagnostics {
+// Keep the existing HTTP error order explicit without integer-code arithmetic.
+constexpr Code kHttpFaultCodes[] = {
+    Code::UPLOAD_TRANSPORT_FAILED, Code::UPLOAD_AUTH_FAILED, Code::UPLOAD_TOO_LARGE,
+    Code::UPLOAD_INVALID, Code::UPLOAD_CONFLICT, Code::UPLOAD_SERVER_FAILED,
+    Code::UPLOAD_HTTP_OTHER
+};
 class RuntimeFaults {
 public:
     static constexpr uint32_t kRepeatMs = 15 * 60 * 1000, kRetryMs = 60 * 1000;
     struct Condition {
         uint16_t code = 0;
+        constexpr Condition() = default;
+        constexpr Condition(Code value) : code(static_cast<uint16_t>(value)) {}
         bool observed = false, desired = false, failed = false;
         uint64_t episode = 0;
         uint32_t attemptedMs = 0, acceptedMs = 0;
     };
     // One instance per task. The fixed input buffer belongs in static storage,
     // as do the condition slots; never construct EventInput on the net stack.
-    RuntimeFaults(EventLog& log, Condition* slots, size_t count)
-        : log_(log), slots_(slots), count_(count) {}
+    RuntimeFaults(EventLog& log, Condition* slots, size_t count, void (*missingCondition)(Code) = nullptr)
+        : log_(log), slots_(slots), count_(count), missingCondition_(missingCondition) {}
 
-    RuntimeFaults& event(uint16_t code, uint32_t now) {
-        input_.code = code; input_.uptimeMs = now;
+    RuntimeFaults& event(Code code, uint32_t now) {
+        input_.code = static_cast<uint16_t>(code); input_.uptimeMs = now;
         input_.contextCount = 0; input_.episodeSequence = 0;
         log_.stamp(input_);
         return *this;
@@ -36,7 +47,13 @@ public:
     void condition(bool active) {
         Condition* slot = nullptr;
         for (size_t i = 0; i < count_; ++i) if (slots_[i].code == input_.code) { slot = &slots_[i]; break; }
-        if (!slot) return;
+        if (!slot) {
+            if (missingCondition_) missingCondition_(static_cast<Code>(input_.code));
+#ifdef JOURNAL_HOST_TEST
+            assert(slot && "RuntimeFaults condition missing from task table");
+#endif
+            return;
+        }
         // Publish only atomic values across cores. A reader never copies the
         // producer's mutable Condition or EventInput while it is being changed.
         struct Publish {
@@ -101,6 +118,7 @@ private:
     EventLog& log_;
     Condition* slots_;
     size_t count_;
+    void (*missingCondition_)(Code);
     EventInput input_;
     uint64_t homeApMisses_ = 0;
     std::atomic<unsigned> revision_{0};

@@ -18,7 +18,7 @@ struct FaultFs : MemoryFs {
 static void observe(EventLog& log, RuntimeFaults& faults, uint32_t now) {
     auto state = log.storageFault();
     if (state.observed)
-        faults.event(4008, now).enumeration("operation", state.operation)
+        faults.event(diagnostics::Code::EVENT_WRITE_FAILED, now).enumeration("operation", state.operation)
             .enumeration("backend", state.backend == EventLog::Backend::Sd ? "sd" : "littlefs")
             .condition(state.active);
 }
@@ -36,7 +36,7 @@ static void operations() {
                     EventLogFs::Operation::Ack}) {
         FaultFs sd, flash;
         auto log = logger(&sd, &flash, boot1, kSdJournalQuota, 512);
-        RuntimeFaults::Condition slot{4008}; RuntimeFaults faults(*log, &slot, 1);
+        RuntimeFaults::Condition slot{diagnostics::Code::EVENT_WRITE_FAILED}; RuntimeFaults faults(*log, &slot, 1);
         add(*log); // good initial segment; next frame must roll
         events(*log);
         if (op == EventLogFs::Operation::Rename) sd.failRename = true;
@@ -68,7 +68,7 @@ static void operations() {
 static void faultAckRecovery() {
     FaultFs sd, flash;
     auto log = logger(&sd, &flash); add(*log);
-    RuntimeFaults::Condition slot{4008}; RuntimeFaults faults(*log, &slot, 1);
+    RuntimeFaults::Condition slot{diagnostics::Code::EVENT_WRITE_FAILED}; RuntimeFaults faults(*log, &slot, 1);
     assert(read(*log) == 1);
     sd.reject = "/diag/ack-";
     assert(!log->acknowledge(batch, batch.ids, batch.count));
@@ -102,7 +102,7 @@ static void boundedFailure() {
     FaultFs sd, flash;
     sd.readOnly = flash.readOnly = true;
     auto log = logger(&sd, &flash);
-    RuntimeFaults::Condition slot{4008}; RuntimeFaults faults(*log, &slot, 1);
+    RuntimeFaults::Condition slot{diagnostics::Code::EVENT_WRITE_FAILED}; RuntimeFaults faults(*log, &slot, 1);
     assert(log->submit(notice()) == EventLog::Submit::Accepted);
     log->service(1); observe(*log, faults, 1);
     assert(log->stats().queued == 2 && slot.episode);

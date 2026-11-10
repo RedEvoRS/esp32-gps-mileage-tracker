@@ -7,6 +7,12 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "server"))
 from common.diagnostics import validate_request
 
+missing = subprocess.run([str(Path(sys.argv[1]).resolve()), "--missing-condition"],
+                         capture_output=True, text=True)
+assert missing.returncode != 0, "missing condition did not assert"
+assert "RuntimeFaults condition missing from task table" in missing.stderr, missing.stderr
+print("Runtime-hook missing-condition assertion is active")
+
 result = subprocess.run([str(Path(sys.argv[1]).resolve()), "--export"],
                         capture_output=True, text=True, check=True)
 events = [json.loads(line[6:]) for line in result.stdout.splitlines() if line.startswith("EVENT ")]

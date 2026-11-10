@@ -614,8 +614,9 @@ not render the `oled` field. The historical compact-text geometry is U8g2
 `u8g2_font_5x8_tf`, with 5-pixel advances and 8-pixel rows: 21 characters
 occupy 105 pixels. Never scroll or shrink text to work around a catalog
 violation. The C++ table includes code,
-symbol, severity, OLED lines, title, notify and journal policy; longer recovery
-and context definitions stay in the JSON for the server.
+symbol, severity, OLED lines, title, notify and journal policy, plus generated
+context keys, types, integer bounds and enum values used by EventLog. Longer
+recovery text stays in the JSON for the server.
 
 #### Updating the catalog
 
@@ -924,7 +925,9 @@ remounting media; do not reuse cached state for a different card.
 - `submit(EventInput, optional_identity)` uses a 16-frame fixed RAM queue and
   one try-lock, with no waits or filesystem calls. It is task-safe, not ISR/
   panic-safe. Full/contention increments an atomic 32-bit drop accumulator
-  (saturating near 2^31 between service calls); invalid input is rejected.
+  (saturating near 2^31 between service calls); invalid input is rejected and increments a separate atomic 32-bit,
+  saturating boot-local counter. The debug journal serial line shows `invalid submits`;
+  the count is never uploaded, persisted or treated as dropped records.
   Records validate catalog policy, all current context keys/types/ranges/enums,
   episode references, time consistency and the complete 502-byte JSON budget.
   Unknown device codes have empty context. No unbounded text enters a frame.
@@ -940,7 +943,7 @@ remounting media; do not reuse cached state for a different card.
   is not event-time order. The default 30 KiB events-array budget leaves room
   for the current check-in; the worker also enforces the full 32 KiB request.
   Re-reads preserve exact JSON, including original timestamps and identity.
-  On the Windows host ABI, `sizeof(EventLog)` is **25,176 bytes** and
+  On the Windows host ABI, `sizeof(EventLog)` is **25,184 bytes** and
   `sizeof(EventLog::Batch)` is **35,288 bytes**; the host test prints both.
   ABI/alignment can differ on the ESP32-S3. #124 must place both objects in
   **static DRAM or PSRAM**, never on a task stack. Only one batch ticket is
@@ -1344,7 +1347,11 @@ complete the real parked-data acceptance step.
 #### Stage 4 runtime fault hooks (#124 part B)
 
 `runtime_faults.h` holds fixed condition slots and one static event builder per
-owning task. Core 1 owns GPS, power, trip storage/recovery and display hooks;
+owning task. Event calls and condition tables use generated `diagnostics::Code`
+names. A condition missing from its task table asserts in host tests; on the
+board it prints a warning only while runtime debug is on, at most once per
+code per boot across both cores. Debug-off observations do not consume that
+warning. Core 1 owns GPS, power, trip storage/recovery and display hooks;
 core 0 owns WiFi/HTTP/stack and the AP-absence counter. The builders only call
 EventLog's bounded, nonblocking `submit`, never filesystem APIs or ISRs. Journal
 adapter/service errors are latched by EventLog and reported as E4008 by the

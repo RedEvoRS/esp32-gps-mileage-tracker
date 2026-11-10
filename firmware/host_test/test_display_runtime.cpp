@@ -115,7 +115,7 @@ static void usbPowerRegressions() {
     PMU.registerReadOverride[XPOWERS_AXP2101_INTSTS2] = 0x0c;
     gPmuIrqFlag = true; pollPmu(); serviceDisplay();
     assert(gProductionLastOutput.card == display::Card::UsbPowerCard);
-    gLoopFaults.event(4003, g_millis).condition(true); serviceDisplay();
+    gLoopFaults.event(diagnostics::Code::NO_RECORDING_STORAGE, g_millis).condition(true); serviceDisplay();
     assert(gProductionLastOutput.card == display::Card::UsbPowerCard);
     g_millis += display::DisplayModel::kDurationMs; serviceDisplay();
     assert(gProductionLastOutput.errorCode == 4003); ++cases;
@@ -170,7 +170,7 @@ static void toggleRegressions() {
     assert(gDisplayOwner == DisplayOwner::Debug && gDebugOled.frames == debugFrames + 1);
     // Observe error and trip-end episodes in debug, then toggle off promptly:
     // neither an old card nor a fault seen in the hidden model can replay.
-    gLoopFaults.event(4003, g_millis).condition(true);
+    gLoopFaults.event(diagnostics::Code::NO_RECORDING_STORAGE, g_millis).condition(true);
     gDisplayTripFinalized = true; serviceDisplay();
     holdBoot(); shortTap();
     assert(!debugMode() && gModeFeedback && logCount("Debug mode: off") == 1);
@@ -184,7 +184,7 @@ static void toggleRegressions() {
     // A genuinely new episode while feedback is visible is still due afterward.
     holdBoot(); shortTap(); g_millis += DEBUG_FEEDBACK_MS; serviceDisplay();
     holdBoot(); shortTap();
-    gLoopFaults.event(4002, g_millis).condition(true);
+    gLoopFaults.event(diagnostics::Code::LITTLEFS_UNAVAILABLE, g_millis).condition(true);
     g_millis += DEBUG_FEEDBACK_MS; serviceDisplay();
     assert(gProductionLastOutput.errorCode == 4002);
     g_digitalReadHook = nullptr; bootLow = false; ++cases;
@@ -307,12 +307,12 @@ int main() {
     diagnosticFix(g_millis + 1000, 7000);
     assert(!gLatestSpeedTrusted);
     feed(nmea("GPGSV,1,1,04,01,40,083,15,02,17,308,16,03,07,344,18,04,22,228,20,1"));
-    gLoopFaults.event(3006, g_millis).condition(true);
+    gLoopFaults.event(diagnostics::Code::UTC_UNAVAILABLE, g_millis).condition(true);
     auto frames = gProductionOled.frames; serviceDisplay();
     assert(gProductionOled.frames == frames + 1 && gProductionOled.text[0].value == "Sats: 4");
     assert(gProductionLastOutput.codeCount == 1 && gProductionLastOutput.codes[0] == 3006);
     assert(gProductionLastOutput.until == indoorEnd);
-    gLoopFaults.event(3006, g_millis).condition(false); serviceDisplay();
+    gLoopFaults.event(diagnostics::Code::UTC_UNAVAILABLE, g_millis).condition(false); serviceDisplay();
     assert(!gProductionLastOutput.codeCount && gProductionOled.text[1].value == "OK");
     assert(gProductionLastOutput.until == indoorEnd);
     g_millis = indoorEnd - 1; serviceDisplay(); assert(gProductionLastOutput.powered);
@@ -337,8 +337,8 @@ int main() {
     g_millis = bootEnd; serviceProductionDisplay(); assert(!gProductionLastOutput.powered); ++cases;
 
     faultWorld(); gDebugMode = false; beginProductionDisplay(); gState = ACTIVE;
-    gLoopFaults.event(4003, g_millis).condition(true);
-    gNetFaults.event(5004, g_millis).enumeration("target", "trip").integer("http_status", 401).condition(true);
+    gLoopFaults.event(diagnostics::Code::NO_RECORDING_STORAGE, g_millis).condition(true);
+    gNetFaults.event(diagnostics::Code::UPLOAD_AUTH_FAILED, g_millis).enumeration("target", "trip").integer("http_status", 401).condition(true);
     serviceProductionDisplay();
     assert(gProductionLastOutput.errorCode == 4003);
     g_millis += display::DisplayModel::kDurationMs; serviceProductionDisplay();

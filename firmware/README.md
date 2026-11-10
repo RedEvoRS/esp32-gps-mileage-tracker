@@ -28,7 +28,10 @@ startup hangs, a retry for an unreadable first charge temperature, and
 explicit trip-upload timeouts with separate send/reply timings. Both watchdog
 resets, the card skip and the loop pause were bench-checked on USB power on
 2026-11-10 (UTC); the battery paths and a start from fully off were not (see
-[Watchdog bench check](#watchdog-bench-check)). On
+[Watchdog bench check](#watchdog-bench-check)). Firmware `v1.05` lets
+`secrets.h` choose the network time servers (see
+[Network time settings](#network-time-settings)), and makes a wrong error
+code a build failure or a debug warning instead of a silent drop. On
 2026-10-21 (UTC), an earlier Stage 4 build uploaded
 four real trips from microSD to the deployed server, then delivered all 115
 pending diagnostic events and a current snapshot. Uploads with debug mode
@@ -851,6 +854,23 @@ Before flashing:
 Leave `USE_BSSID_FILTER` at 0 unless you want to restrict uploads to one
 router; the example explains it. Keep `secrets.h` private and gitignored.
 
+##### Network time settings
+
+When already connected to home WiFi, Stage 4 asks `pool.ntp.org` and
+`time.nist.gov` for network time only if GPS has not set the clock yet.
+To change them, add optional `NTP_SERVER_1` and `NTP_SERVER_2` string settings
+to `secrets.h`, as shown in [the settings example](secrets.h.example), then
+rebuild and flash. Use hostnames or IPv4 addresses without a URL, port or path.
+Set **both** to your router or local time server to keep time requests on the
+LAN; changing one leaves the other public default. Omitting a setting keeps
+its default. An explicit empty string leaves that server slot unused; both
+empty means the clock waits for GPS without trying network time. If a name
+is wrong or neither server answers during the five-second attempt, the clock
+waits for GPS. Uploads still work, and time requests contain no trip data.
+For server-built firmware, use the optional `TRACKER_NTP_SERVER_1/2`
+[builder environment settings](../server/firmware-builder/README.md); empty
+or unset environment values retain the firmware defaults.
+
 #### First flash on a new board
 
 Back up the factory flash before installing any project sketch. For the
@@ -1339,6 +1359,8 @@ before relying on the tracker; see [degraded startup details](../DIAGNOSTICS.md#
 
 #### RTC
 
+For network-time server settings, see [Network time settings](#network-time-settings).
+
 The PCF8563 real-time clock (RTC) supplies diagnostic event timestamps
 before GPS or Simple Network Time Protocol (SNTP) sync, never GPX times.
 The `RTC:` boot line reports whether its clock is
@@ -1595,6 +1617,12 @@ LittleFS trip start/stop guards protect the unused part of that reserve;
 existing diagnostic allocation is already counted as used space. No trip is
 deleted to make journal space, and diagnostics never mount or format media.
 RAM records are lost on reset or power-off.
+
+With runtime debug on, the `Journal:` serial line also shows `invalid submits`:
+events rejected locally because their code, context or other fields are invalid.
+This counter starts at zero each boot; it is not uploaded or counted as lost
+events. A condition missing from its owning task's table prints a debug warning
+at most once per code per boot. These warnings are for firmware developers.
 
 The existing core-0 network task drains one record per service slice, yielding
 the filesystem lock to trip writes and uploads. It also handles shutdown

@@ -68,6 +68,19 @@ def parse_env(content, key):
     return value
 
 
+def validate_host(host, label):
+    """Match the server's hostname/IPv4 syntax without resolving or sending packets."""
+    try:
+        address = ipaddress.IPv4Address(host)
+    except ipaddress.AddressValueError:
+        if len(host) > 253 or not all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", part)
+                                      for part in host.split(".")):
+            raise ValueError(f"{label} must be an IPv4 address or hostname, without URL or port") from None
+    else:
+        if address.is_unspecified or address.is_multicast:
+            raise ValueError(f"{label} must be a reachable address")
+
+
 def validate_settings(settings):
     if not DEVICE.fullmatch(settings["device_id"]):
         raise ValueError("DEVICE_ID must match [a-z0-9][a-z0-9_-]{0,31}")
@@ -77,16 +90,10 @@ def validate_settings(settings):
         value = settings[key]
         if not minimum <= len(value.encode("utf-8")) <= maximum or any(ord(c) < 32 or ord(c) == 127 for c in value):
             raise ValueError(f"Invalid {key} length or control character")
-    host = settings["host"]
-    try:
-        address = ipaddress.IPv4Address(host)
-    except ipaddress.AddressValueError:
-        if len(host) > 253 or not all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
-                                      for label in host.split(".")):
-            raise ValueError("Server host must be an IPv4 address or hostname, without URL or port") from None
-    else:
-        if address.is_unspecified or address.is_multicast:
-            raise ValueError("Server host must be a reachable LAN address")
+    validate_host(settings["host"], "Server host")
+    for key in ("ntp_server_1", "ntp_server_2"):
+        if settings.get(key, ""):
+            validate_host(settings[key], key.upper())
     if not re.fullmatch(r"[0-9]{1,5}", str(settings["port"])) or not 1 <= int(settings["port"]) <= 65535:
         raise ValueError("Server port must be 1..65535")
 
@@ -104,6 +111,9 @@ def secrets_header(settings, enroll=False, high_water=None):
                         ("host", "SERVER_HOST"), ("token", "AUTH_TOKEN"), ("device_id", "DEVICE_ID")):
         lines.append(f"#define {define} {c_string(settings[key])}")
     lines.append(f'#define SERVER_PORT {int(settings["port"])}')
+    for key in ("ntp_server_1", "ntp_server_2"):
+        if settings.get(key, ""):
+            lines.append(f"#define {key.upper()} {c_string(settings[key])}")
     lines.append(f'#define USE_BSSID_FILTER {int(bool(settings["bssid"]))}')
     octets = settings["bssid"].split(":") if settings["bssid"] else ["00"] * 6
     lines.append("static const uint8_t WIFI_BSSID[6] = {" + ", ".join("0x" + x for x in octets) + "};")
@@ -177,6 +187,9 @@ def configure(install, private, noninteractive):
             settings[key] = os.environ.get(env, default)
         else:
             settings[key] = ask(prompt, default, secret)
+    # Advanced settings are environment-only in both modes; no extra prompts.
+    for key in ("ntp_server_1", "ntp_server_2"):
+        settings[key] = os.environ.get("TRACKER_" + key.upper(), "")
     validate_settings(settings)
     private_write(private / "normal.h", secrets_header(settings))
     write_json(private / "plan.json", {"device_id": settings["device_id"]})

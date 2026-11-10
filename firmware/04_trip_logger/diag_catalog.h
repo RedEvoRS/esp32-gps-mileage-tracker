@@ -119,6 +119,98 @@ constexpr CatalogEntry kCatalog[] = {
     {Code::DISPLAY_UNAVAILABLE, "DISPLAY_UNAVAILABLE", Severity::Warning, {"Display unavailable", "", ""}, 1, "OLED display unavailable", true, Journal::Transitions},
     {Code::DEVICE_SILENT, "DEVICE_SILENT", Severity::Warning, {"Device silent", "", ""}, 1, "Device has not contacted the server", true, Journal::Transitions},
 };
+enum class ContextType : std::uint8_t { Integer, Boolean, Enum };
+struct ContextField {
+    Code code;
+    const char* key;
+    ContextType type;
+    std::int64_t min, max;
+    const char* const* values;
+    std::size_t valueCount;
+};
+constexpr const char* kValues_BOOT_reset_reason[] = {"power_on", "deep_sleep", "software", "watchdog", "brownout", "panic", "other"};
+constexpr const char* kValues_PMU_STARTUP_RECOVERY_recovery_state[] = {"not_needed", "recovered", "sda_stuck", "scl_stuck"};
+constexpr const char* kValues_BATTERY_POWER_OFF_reason[] = {"idle_battery", "battery_critical", "user_long_press"};
+constexpr const char* kValues_RTC_TIME_INVALID_reason[] = {"stopped", "invalid_date", "out_of_range", "read_failed"};
+constexpr const char* kValues_STORAGE_LOW_backend[] = {"sd", "littlefs", "ram", "none"};
+constexpr const char* kValues_STORAGE_FULL_backend[] = {"sd", "littlefs", "ram", "none"};
+constexpr const char* kValues_TRIP_WRITE_FAILED_backend[] = {"sd", "littlefs", "ram", "none"};
+constexpr const char* kValues_TRIP_WRITE_FAILED_operation[] = {"open", "write", "close", "rename"};
+constexpr const char* kValues_TRIP_RECOVERY_FAILED_backend[] = {"sd", "littlefs", "ram", "none"};
+constexpr const char* kValues_TRIP_RECOVERY_FAILED_reason[] = {"read", "parse", "write", "rename"};
+constexpr const char* kValues_EVENT_WRITE_FAILED_backend[] = {"sd", "littlefs", "ram", "none"};
+constexpr const char* kValues_EVENT_WRITE_FAILED_operation[] = {"open", "write", "close", "rename", "ack"};
+constexpr const char* kValues_EVENTS_DROPPED_backend[] = {"sd", "littlefs", "ram", "none"};
+constexpr const char* kValues_TRIP_RECOVERED_backend[] = {"sd", "littlefs", "ram", "none"};
+constexpr const char* kValues_UPLOAD_TRANSPORT_FAILED_target[] = {"trip", "events"};
+constexpr const char* kValues_UPLOAD_AUTH_FAILED_target[] = {"trip", "events"};
+constexpr const char* kValues_UPLOAD_TOO_LARGE_target[] = {"trip", "events"};
+constexpr const char* kValues_UPLOAD_INVALID_target[] = {"trip", "events"};
+constexpr const char* kValues_UPLOAD_CONFLICT_target[] = {"trip", "events"};
+constexpr const char* kValues_UPLOAD_SERVER_FAILED_target[] = {"trip", "events"};
+constexpr const char* kValues_UPLOAD_HTTP_OTHER_target[] = {"trip", "events"};
+constexpr const char* kValues_EVENT_ACK_INVALID_reason[] = {"parse", "missing_ids", "unexpected_ids", "duplicate_ids"};
+constexpr ContextField kContextFields[] = {
+    {Code::BOOT, "battery_mv", ContextType::Integer, 1LL, 6000LL, nullptr, 0},
+    {Code::BOOT, "battery_pct", ContextType::Integer, 0LL, 100LL, nullptr, 0},
+    {Code::BOOT, "reset_reason", ContextType::Enum, 0LL, 0LL, kValues_BOOT_reset_reason, 7},
+    {Code::NET_STACK_LOW, "free_bytes", ContextType::Integer, 0LL, 1048576LL, nullptr, 0},
+    {Code::BATTERY_LOW, "battery_mv", ContextType::Integer, 0LL, 6000LL, nullptr, 0},
+    {Code::BATTERY_CRITICAL, "battery_mv", ContextType::Integer, 0LL, 6000LL, nullptr, 0},
+    {Code::CHARGE_HOT, "temperature_mc", ContextType::Integer, -50000LL, 150000LL, nullptr, 0},
+    {Code::CHARGE_COLD, "temperature_mc", ContextType::Integer, -50000LL, 150000LL, nullptr, 0},
+    {Code::PMU_STARTUP_RECOVERY, "attempt_count", ContextType::Integer, 1LL, 3LL, nullptr, 0},
+    {Code::PMU_STARTUP_RECOVERY, "clock_count", ContextType::Integer, 0LL, 27LL, nullptr, 0},
+    {Code::PMU_STARTUP_RECOVERY, "pmu_ready", ContextType::Boolean, 0LL, 1LL, nullptr, 0},
+    {Code::PMU_STARTUP_RECOVERY, "recovery_state", ContextType::Enum, 0LL, 0LL, kValues_PMU_STARTUP_RECOVERY_recovery_state, 4},
+    {Code::PMU_STARTUP_RECOVERY, "wire_end_failed", ContextType::Boolean, 0LL, 1LL, nullptr, 0},
+    {Code::BATTERY_POWER_OFF, "battery_mv", ContextType::Integer, 1LL, 6000LL, nullptr, 0},
+    {Code::BATTERY_POWER_OFF, "battery_pct", ContextType::Integer, 0LL, 100LL, nullptr, 0},
+    {Code::BATTERY_POWER_OFF, "reason", ContextType::Enum, 0LL, 0LL, kValues_BATTERY_POWER_OFF_reason, 3},
+    {Code::GPS_NO_DATA, "elapsed_ms", ContextType::Integer, 0LL, 9223372036854775807LL, nullptr, 0},
+    {Code::GPS_NO_FIX, "elapsed_ms", ContextType::Integer, 0LL, 9223372036854775807LL, nullptr, 0},
+    {Code::GPS_NO_FIX, "satellites", ContextType::Integer, 0LL, 255LL, nullptr, 0},
+    {Code::GPS_CONFIG_NACK, "message_class", ContextType::Integer, 0LL, 255LL, nullptr, 0},
+    {Code::GPS_CONFIG_NACK, "message_id", ContextType::Integer, 0LL, 255LL, nullptr, 0},
+    {Code::GPS_CONFIG_TIMEOUT, "message_class", ContextType::Integer, 0LL, 255LL, nullptr, 0},
+    {Code::GPS_CONFIG_TIMEOUT, "message_id", ContextType::Integer, 0LL, 255LL, nullptr, 0},
+    {Code::GPS_TRIP_FIX_LOST, "elapsed_ms", ContextType::Integer, 0LL, 9223372036854775807LL, nullptr, 0},
+    {Code::RTC_TIME_INVALID, "reason", ContextType::Enum, 0LL, 0LL, kValues_RTC_TIME_INVALID_reason, 4},
+    {Code::GPS_ANTENNA_SUSPECT, "agc_pct", ContextType::Integer, 0LL, 100LL, nullptr, 0},
+    {Code::GPS_ANTENNA_SUSPECT, "max_cno", ContextType::Integer, 0LL, 99LL, nullptr, 0},
+    {Code::STORAGE_LOW, "backend", ContextType::Enum, 0LL, 0LL, kValues_STORAGE_LOW_backend, 4},
+    {Code::STORAGE_LOW, "free_bytes", ContextType::Integer, 0LL, 9223372036854775807LL, nullptr, 0},
+    {Code::STORAGE_FULL, "backend", ContextType::Enum, 0LL, 0LL, kValues_STORAGE_FULL_backend, 4},
+    {Code::STORAGE_FULL, "free_bytes", ContextType::Integer, 0LL, 9223372036854775807LL, nullptr, 0},
+    {Code::TRIP_WRITE_FAILED, "backend", ContextType::Enum, 0LL, 0LL, kValues_TRIP_WRITE_FAILED_backend, 4},
+    {Code::TRIP_WRITE_FAILED, "operation", ContextType::Enum, 0LL, 0LL, kValues_TRIP_WRITE_FAILED_operation, 4},
+    {Code::TRIP_RECOVERY_FAILED, "backend", ContextType::Enum, 0LL, 0LL, kValues_TRIP_RECOVERY_FAILED_backend, 4},
+    {Code::TRIP_RECOVERY_FAILED, "reason", ContextType::Enum, 0LL, 0LL, kValues_TRIP_RECOVERY_FAILED_reason, 4},
+    {Code::EVENT_WRITE_FAILED, "backend", ContextType::Enum, 0LL, 0LL, kValues_EVENT_WRITE_FAILED_backend, 4},
+    {Code::EVENT_WRITE_FAILED, "operation", ContextType::Enum, 0LL, 0LL, kValues_EVENT_WRITE_FAILED_operation, 5},
+    {Code::EVENTS_DROPPED, "backend", ContextType::Enum, 0LL, 0LL, kValues_EVENTS_DROPPED_backend, 4},
+    {Code::EVENTS_DROPPED, "count", ContextType::Integer, 0LL, 2147483647LL, nullptr, 0},
+    {Code::TRIP_RECOVERED, "backend", ContextType::Enum, 0LL, 0LL, kValues_TRIP_RECOVERED_backend, 4},
+    {Code::TRIP_RECOVERED, "points", ContextType::Integer, 0LL, 2147483647LL, nullptr, 0},
+    {Code::WIFI_JOIN_FAILED, "attempts", ContextType::Integer, 0LL, 255LL, nullptr, 0},
+    {Code::UPLOAD_TRANSPORT_FAILED, "attempts", ContextType::Integer, 0LL, 255LL, nullptr, 0},
+    {Code::UPLOAD_TRANSPORT_FAILED, "target", ContextType::Enum, 0LL, 0LL, kValues_UPLOAD_TRANSPORT_FAILED_target, 2},
+    {Code::UPLOAD_AUTH_FAILED, "http_status", ContextType::Integer, 100LL, 599LL, nullptr, 0},
+    {Code::UPLOAD_AUTH_FAILED, "target", ContextType::Enum, 0LL, 0LL, kValues_UPLOAD_AUTH_FAILED_target, 2},
+    {Code::UPLOAD_TOO_LARGE, "http_status", ContextType::Integer, 100LL, 599LL, nullptr, 0},
+    {Code::UPLOAD_TOO_LARGE, "target", ContextType::Enum, 0LL, 0LL, kValues_UPLOAD_TOO_LARGE_target, 2},
+    {Code::UPLOAD_INVALID, "http_status", ContextType::Integer, 100LL, 599LL, nullptr, 0},
+    {Code::UPLOAD_INVALID, "target", ContextType::Enum, 0LL, 0LL, kValues_UPLOAD_INVALID_target, 2},
+    {Code::UPLOAD_CONFLICT, "http_status", ContextType::Integer, 100LL, 599LL, nullptr, 0},
+    {Code::UPLOAD_CONFLICT, "target", ContextType::Enum, 0LL, 0LL, kValues_UPLOAD_CONFLICT_target, 2},
+    {Code::UPLOAD_SERVER_FAILED, "http_status", ContextType::Integer, 100LL, 599LL, nullptr, 0},
+    {Code::UPLOAD_SERVER_FAILED, "target", ContextType::Enum, 0LL, 0LL, kValues_UPLOAD_SERVER_FAILED_target, 2},
+    {Code::UPLOAD_HTTP_OTHER, "http_status", ContextType::Integer, 100LL, 599LL, nullptr, 0},
+    {Code::UPLOAD_HTTP_OTHER, "target", ContextType::Enum, 0LL, 0LL, kValues_UPLOAD_HTTP_OTHER_target, 2},
+    {Code::EVENT_ACK_INVALID, "reason", ContextType::Enum, 0LL, 0LL, kValues_EVENT_ACK_INVALID_reason, 4},
+    {Code::DEVICE_SILENT, "age_seconds", ContextType::Integer, 0LL, 9223372036854775807LL, nullptr, 0},
+    {Code::DEVICE_SILENT, "threshold_seconds", ContextType::Integer, 0LL, 9223372036854775807LL, nullptr, 0},
+};
 constexpr std::size_t kCatalogSize = sizeof(kCatalog) / sizeof(kCatalog[0]);
 constexpr const CatalogEntry* find(std::uint16_t code) {
     for (std::size_t i = 0; i < kCatalogSize; ++i) {
