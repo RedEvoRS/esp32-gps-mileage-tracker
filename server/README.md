@@ -286,8 +286,9 @@ push does not stop ntfy or Graylog. Only HTTP 400 (including too-old lines)
 and 422 (unusable content) skip the batch and advance its cursors. All other
 HTTP errors retry without advancing, including wrong token/tenant/address
 errors and 413 (a possibly temporary or adjustable size limit). A retryable
-4xx logs the status and settings to check once per retry episode; fixing the
-settings lets queued history resume. JSON lines use only current catalog fields and bounded context, with
+4xx logs the status, settings to check and delay on each retry, bounded by
+backoff. Fixing the settings lets queued history resume. JSON lines use only
+current catalog fields and bounded context, with
 `job`, validated `device_id` and catalog `severity` as the only labels set by
 the monitor. Loki 3 can add its own `service_name` label and `detected_level`
 metadata to query results.

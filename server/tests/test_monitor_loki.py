@@ -428,22 +428,24 @@ class LokiPolicyTests(unittest.TestCase):
     def test_http_429_backs_off_without_advancing_cursors(self):
         self.assert_transient_status_retries(429)
 
-    def test_configuration_warning_once_per_episode_including_restart(self):
+    def test_configuration_warning_on_each_retry_including_restart(self):
         _, sender, url = self.serve_loki([401, 401, 204, 401], b"private rejection details")
         self.worker = self.make_monitor(loki_sender=sender)
         self.post(events=[(1000, "notice", {})])
-        with self.assertLogs("mileage-monitor", "DEBUG") as logs:
+        with self.assertLogs("mileage-monitor", "INFO") as logs:
             self.worker.tick()
+            self.assertEqual(len(logs.output), 1)
             self.tick(59)  # No attempt, no repeated warning.
+            self.assertEqual(len(logs.output), 1)
             self.worker = self.make_monitor(loki_sender=sender)
-            self.tick(1)  # Repeated rejection after a restart is debug-only.
-            self.tick(120)  # Success resets the persisted retry episode.
+            self.tick(1)  # A repeated rejection after a restart still warns.
+            self.tick(120)  # Success resets the persisted retry backoff.
             self.post(events=[(1000, "notice", {})])
             self.tick(60)
         warnings = [line for line in logs.output if line.startswith("WARNING:")]
-        self.assertEqual(len(warnings), 2)
-        self.assertEqual(sum(line.startswith("DEBUG:") for line in logs.output), 1)
-        for line in warnings:
+        self.assertEqual(len(warnings), 3)
+        for line, delay in zip(warnings, (60, 120, 60), strict=True):
+            self.assertIn(f"retry in {delay} seconds", line)
             for hint in ("HTTP 401", "token", "tenant", "push URL", "proxy", "without advancing cursors"):
                 self.assertIn(hint, line)
         text = "\n".join(logs.output)

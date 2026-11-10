@@ -2227,8 +2227,9 @@ proxy size limit can be adjusted, and this status can be temporary.
 
 A wrong token or address produces a warning such as `Loki delivery failed
 (HTTP 401); check token, tenant, push URL or proxy; retry in 60 seconds
-without advancing cursors`. The full warning appears once per retry episode;
-repeated rejections use debug logging until a successful push resets it.
+without advancing cursors`. Every retryable 4xx response logs this warning,
+including repeated rejections. The retry backoff limits its frequency from
+once a minute to once an hour, so settings failures remain visible in the log.
 Credentials, response bodies and the configured URL are never logged. Nothing
 is discarded while these settings errors are retried. Correct `monitor.env`
 and recreate `mileage-monitor` to apply it; retained history then resumes.

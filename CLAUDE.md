@@ -491,7 +491,7 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   lower restored events.db rowid or a changed event at the cursor; real timestamps (Loki 2.4+), backlog first. Network
   failures and all HTTP errors except content rejections 400/422 retry without
   advancing cursors, including wrong-token/tenant/URL/proxy errors and 413.
-  Content rejections skip the batch; retryable 4xx warn once per retry episode. The condition table and cursor are additive to monitor
+  Content rejections skip the batch; retryable 4xx warn on each retry. The condition table and cursor are additive to monitor
   schema v1. Setup and LogQL examples: DEPLOY_DEBIAN Step 11f.
 - Backups: `server/backup/backup.sh` saves trips plus consistent SQLite
   snapshots of viewer annotations, ingest diagnostics (`events.db`), and optional

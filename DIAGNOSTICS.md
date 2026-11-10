@@ -2311,8 +2311,9 @@ redirects. Network failures and all HTTP errors except 400/422 back off
 from 60 seconds to one hour without advancing event, condition or decision
 progress. This includes token/tenant errors (401/403), URL/proxy problems
 (404/405/407), timeouts, rate limits, 5xx and 413 (possibly temporary or an
-adjustable proxy size limit). Retryable 4xx warn once per retry episode with
-the status and settings to check; repeats are debug-only until success.
+adjustable proxy size limit). Every retryable 4xx response logs a warning with
+the status, settings to check, retry delay and confirmation that cursors are
+kept. The existing backoff bounds how often these warnings appear.
 Only 400 (including too-old lines) and 422 (unusable content) skip the rejected
 batch and advance its cursors; that history is not retried. Neither status
 can be fixed by resending unchanged content under the same receiver policy.
