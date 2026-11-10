@@ -264,8 +264,11 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 - FreeRTOS: networking on core 0, GPS on core 1; normal loop pauses 5 ms
   only with an empty UART. Firmware v1.04 arms a 60 s loop watchdog after
   normal/degraded setup; progressing runtime repairs feed it, lock waits do not.
-  Startup and the network task are outside that coverage. Loop pause and
-  watchdog are not yet bench-checked.
+  Startup and the network task are outside that coverage. Bench-checked
+  2026-11-10 (UTC) on USB with no battery: a deliberately blocked loop was
+  reset after 60 s, rebooted, carried on and reported E1003; the loop pause
+  ran 22 minutes with normal GPS and sampling. Battery savings, power-off
+  paths and recovery of a trip cut off mid-recording remain unverified.
 - Trip HTTP: explicit 5 s connect / 10 s reply timeouts (reply <15 s abort);
   upload logs append separate send/reply times after the existing status text.
 - Stage 4 diagnostics: static EventLog, random boot identity and a boot

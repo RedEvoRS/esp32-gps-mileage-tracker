@@ -36,8 +36,7 @@
 // and drained, SD first, so flash trips from a previous boot are not stranded.
 //
 // NOTE: targets ESP32 Arduino core 3.3.11 (XPowersLib 0.3.3,
-// TinyGPSPlus 1.0.3). Recorded hardware checks are in the README;
-// the loop pause and task watchdog are not yet bench-checked.
+// TinyGPSPlus 1.0.3). Recorded hardware checks are in the README.
 // 2026-06-09 review fixes: per-chunk FS locking during upload, battery
 // idle power-off, ARMING-phase point capture, stationary-jitter distance
 // gate, fix-loss trip finalization. See ../../docs/history/CODE_REVIEW_2026-06-09.md.

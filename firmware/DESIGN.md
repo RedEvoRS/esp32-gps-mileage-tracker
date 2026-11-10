@@ -36,7 +36,9 @@ can finish on a later pass after its 5 ms wait. The RTC still waits for the
 first 100 ms of a second, GPS configuration keeps its two-second ACK window,
 and NAV-PVT keeps its 1,500 ms freshness limit. Host regressions exercise
 these with time advancing through the pause. The degraded loop keeps its
-20 ms delay. Battery savings and peripheral timing are **not yet bench-checked**.
+20 ms delay. A 22-minute bench run on 2026-11-10 (UTC) showed normal GPS,
+clock and temperature sampling with the pause; battery savings have not
+been measured.
 
 The cores have distinct owners and narrow sharing points:
 
@@ -120,8 +122,9 @@ helpers, since a healthy upload may run for 15 minutes.
 `WATCHDOG_BENCH_HANG`, off by default, deliberately blocks the loop without
 feeding; watchdog-reset boots skip the hook and continue through ordinary
 recovery. See the [bench instructions](README.md#watchdog-bench-check).
-The watchdog and loop pause are **not yet bench-checked**. Host control-flow
-tests and real board builds do not prove electrical restart or SD durability.
+The watchdog reset was bench-checked on 2026-11-10 (UTC); the results and
+what remains unchecked are in the same README section. Host control-flow
+tests and real board builds do not prove SD durability.
 
 ## Firmware identity on the debug screen
 

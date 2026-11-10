@@ -23,8 +23,9 @@ failures raise E4008. Firmware `v1.03` (tag `fw-v1.03`) followed the same
 day: a long POWER press on battery shows **Switching off** for about a
 second before the screen goes dark. Firmware `v1.04` adds a short pause when
 the GPS UART is empty, a 60-second watchdog for the main loop, and explicit
-trip-upload timeouts with separate send/reply timings. The loop pause and
-watchdog are **not yet bench-checked**. On
+trip-upload timeouts with separate send/reply timings. The watchdog reset
+and the loop pause were bench-checked on USB power on 2026-11-10 (UTC); the
+battery paths were not (see [Watchdog bench check](#watchdog-bench-check)). On
 2026-10-21 (UTC), an earlier Stage 4 build uploaded
 four real trips from microSD to the deployed server, then delivered all 115
 pending diagnostic events and a current snapshot. Uploads with debug mode
@@ -1024,8 +1025,9 @@ How it behaves once flashed:
   on core 0 is not enrolled: a trip upload may legitimately take 15 minutes.
   After a watchdog reset, boot records E1003 and runs the usual trip repair
   before logging resumes. The untimed points still in RAM can be lost.
-  The loop pause and watchdog are **not yet bench-checked**; host tests do
-  not establish reset timing, battery savings or real-card recovery.
+  The watchdog reset and the loop pause were bench-checked on USB power on
+  2026-11-10 (UTC). Battery savings, the power-off paths and recovery of a
+  trip cut off mid-recording have not been checked on the board.
 - **Time:** each trackpoint uses the UTC date and time from the same RMC
   sentence as its position, including centiseconds. Zero centiseconds use
   whole seconds (`...SSZ`); otherwise GPX writes three fractional digits
@@ -1206,7 +1208,26 @@ testing remains necessary to verify the flash driver's behavior.
 
 #### Watchdog bench check
 
-The loop watchdog is **not yet bench-checked**. For a supervised bench test,
+Bench result, 2026-11-10 (UTC), on USB power with no battery fitted, using a
+v1.04 build from before the merge:
+
+- With the bench hook, the loop blocked right after `Setup complete`. Sixty
+  seconds later the serial log showed `task_wdt: Task watchdog got triggered`
+  naming `loopTask (CPU 1)`, then `Rebooting...`. The next boot skipped the
+  hang, configured GPS and carried on with no second reset. The network task
+  kept running while the loop was blocked. The server received E1003 from
+  that boot.
+- With a normal build and debug mode on for 22 minutes: one GPS clock sync a
+  minute, an RF line and a `Temp:` line every 30 seconds, 12 satellites used,
+  no warnings or resets. The power chip ran 9.2 C above the board's air
+  sensor, against 10.4 C on v1.03 in the same session.
+
+Not checked: battery savings, the idle and long-press power-off paths (no
+battery was fitted), the buttons and screen, the RTC write (the clock needed
+no correction), upload timings (nothing was queued), and recovery of a trip
+cut off mid-recording.
+
+To repeat the supervised bench test,
 use a spare card and the normal Supreme build settings. Add
 `--build-property compiler.cpp.extra_flags=-DWATCHDOG_BENCH_HANG` to the
 `arduino-cli compile` command, keeping the normal version-stamping step and
