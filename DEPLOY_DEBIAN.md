@@ -2186,10 +2186,24 @@ The startup line should say `Loki enabled`; once it has new records, the log
 reports how many lines Loki accepted. On first enable, the separate persisted
 event cursor starts at rowid zero, so stored history is sent in batches of at
 most 200 lines per tick without an age filter. Loki may reject history older
-than its configured retention window. A permanent HTTP 4xx rejection other
-than 408 or 429 skips the entire rejected batch and advances its cursors; that
-history is not retried, and later batches continue. Network failures, 408, 429
-and 5xx responses back off and retry without advancing the cursors.
+than its configured retention window. Only HTTP **400** (including too-old
+lines) and **422** (unusable content) skip the entire rejected batch and
+advance its cursors; that history is not retried, and later batches continue.
+All other HTTP errors and network failures back off from one minute to one
+hour without advancing event, condition or delivered-decision progress. This
+includes 401/403 (token or tenant), 404/405 (push URL or proxy route), 407
+(proxy authentication), 408, 429 and 5xx. HTTP 413 also retains the batch: a
+proxy size limit can be adjusted, and this status can be temporary.
+
+A wrong token or address produces a warning such as `Loki delivery failed
+(HTTP 401); check token, tenant, push URL or proxy; retry in 60 seconds
+without advancing cursors`. The full warning appears once per retry episode;
+repeated rejections use debug logging until a successful push resets it.
+Credentials, response bodies and the configured URL are never logged. Nothing
+is discarded while these settings errors are retried. Correct `monitor.env`
+and recreate `mileage-monitor` to apply it; retained history then resumes.
+Loki can still reject old history with 400 after a long outage, under the
+content-rejection rule above.
 
 Loki also receives one `condition_change` line when a device/code condition
 changes to active, clear or unknown, including E7001 silence and recovery.

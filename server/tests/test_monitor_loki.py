@@ -339,17 +339,21 @@ class LokiPolicyTests(unittest.TestCase):
             self.assertIsNotNone(db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='loki_conditions'").fetchone())
 
-    def test_permanent_400_skips_batch_and_later_rows_still_deliver(self):
-        handler, sender, url = self.serve_loki([400, 204], b"private rejection details")
+    def assert_content_status_skips(self, status):
+        handler, sender, url = self.serve_loki([status, 204], b"private rejection details")
         self.worker = self.make_monitor(loki_sender=sender)
         self.post(events=[(1000, "notice", {})])
+        self.sql("INSERT INTO loki_decisions(occurred_at,device,code,decision) VALUES (?,?,?,?)",
+                 (self.now, "tracker-1", 4003, "alert"), state=True)
         with self.assertLogs("mileage-monitor", "WARNING") as logs:
             self.assertTrue(self.worker.tick())
         text = "\n".join(logs.output)
-        self.assertIn("400", text)
+        self.assertIn(str(status), text)
         self.assertNotIn(url, text)
         self.assertNotIn("private rejection details", text)
-        self.assertEqual(self.sql("SELECT event_rowid,decision_id FROM loki_cursor", state=True), [(1, 0)])
+        self.assertEqual(self.sql("SELECT event_rowid,decision_id FROM loki_cursor", state=True), [(1, 1)])
+        self.assertEqual(self.sql("SELECT state FROM loki_conditions", state=True), [("clear",)])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM loki_decisions", state=True), [(0,)])
         self.assertEqual(self.sql("SELECT attempts,next_attempt FROM loki_retry", state=True), [(0, 0.0)])
 
         self.post(events=[(1000, "notice", {})])
@@ -360,15 +364,24 @@ class LokiPolicyTests(unittest.TestCase):
         self.assertEqual([line["sequence"] for line in lines if line.get("kind") == "event"], [2])
         self.assertEqual(self.sql("SELECT event_rowid FROM loki_cursor", state=True), [(2,)])
 
+    def test_permanent_400_skips_batch_and_later_rows_still_deliver(self):
+        self.assert_content_status_skips(400)
+
+    def test_permanent_422_skips_batch_and_later_rows_still_deliver(self):
+        self.assert_content_status_skips(422)
+
     def assert_transient_status_retries(self, status):
         handler, sender, _ = self.serve_loki([status, 204])
         self.worker = self.make_monitor(loki_sender=sender)
         self.post(events=[(1000, "notice", {})])
+        self.sql("INSERT INTO loki_decisions(occurred_at,device,code,decision) VALUES (?,?,?,?)",
+                 (self.now, "tracker-1", 4003, "alert"), state=True)
         with self.assertLogs("mileage-monitor", "WARNING"):
             self.assertTrue(self.worker.tick())
         self.assertEqual(len(handler.received), 1)
-        self.assertEqual(self.sql("SELECT event_rowid FROM loki_cursor", state=True), [(0,)])
+        self.assertEqual(self.sql("SELECT event_rowid,decision_id FROM loki_cursor", state=True), [(0, 0)])
         self.assertEqual(self.sql("SELECT COUNT(*) FROM loki_conditions", state=True), [(0,)])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM loki_decisions", state=True), [(1,)])
         self.assertEqual(self.sql("SELECT attempts,next_attempt FROM loki_retry", state=True),
                          [(1, self.now + 60)])
 
@@ -377,18 +390,65 @@ class LokiPolicyTests(unittest.TestCase):
         self.assertEqual(self.sql("SELECT event_rowid FROM loki_cursor", state=True), [(0,)])
         self.assertEqual(self.tick(1), [])
         self.assertEqual(len(handler.received), 2)
-        self.assertEqual(self.sql("SELECT event_rowid FROM loki_cursor", state=True), [(1,)])
+        self.assertEqual(self.sql("SELECT event_rowid,decision_id FROM loki_cursor", state=True), [(1, 1)])
         self.assertEqual(self.sql("SELECT COUNT(*) FROM loki_conditions", state=True), [(1,)])
+        self.assertEqual(self.sql("SELECT COUNT(*) FROM loki_decisions", state=True), [(0,)])
         self.assertEqual(self.sql("SELECT attempts,next_attempt FROM loki_retry", state=True), [(0, 0.0)])
+
+    def test_http_401_preserves_cursors(self):
+        self.assert_transient_status_retries(401)
+
+    def test_http_403_preserves_cursors(self):
+        self.assert_transient_status_retries(403)
+
+    def test_http_404_preserves_cursors(self):
+        self.assert_transient_status_retries(404)
+
+    def test_http_405_preserves_cursors(self):
+        self.assert_transient_status_retries(405)
+
+    def test_http_407_preserves_cursors(self):
+        self.assert_transient_status_retries(407)
+
+    def test_http_413_preserves_cursors(self):
+        self.assert_transient_status_retries(413)
+
+    def test_other_4xx_conservatively_preserves_cursors(self):
+        self.assert_transient_status_retries(415)
 
     def test_http_500_backs_off_without_advancing_cursors(self):
         self.assert_transient_status_retries(500)
+
+    def test_http_503_backs_off_without_advancing_cursors(self):
+        self.assert_transient_status_retries(503)
 
     def test_http_408_backs_off_without_advancing_cursors(self):
         self.assert_transient_status_retries(408)
 
     def test_http_429_backs_off_without_advancing_cursors(self):
         self.assert_transient_status_retries(429)
+
+    def test_configuration_warning_once_per_episode_including_restart(self):
+        _, sender, url = self.serve_loki([401, 401, 204, 401], b"private rejection details")
+        self.worker = self.make_monitor(loki_sender=sender)
+        self.post(events=[(1000, "notice", {})])
+        with self.assertLogs("mileage-monitor", "DEBUG") as logs:
+            self.worker.tick()
+            self.tick(59)  # No attempt, no repeated warning.
+            self.worker = self.make_monitor(loki_sender=sender)
+            self.tick(1)  # Repeated rejection after a restart is debug-only.
+            self.tick(120)  # Success resets the persisted retry episode.
+            self.post(events=[(1000, "notice", {})])
+            self.tick(60)
+        warnings = [line for line in logs.output if line.startswith("WARNING:")]
+        self.assertEqual(len(warnings), 2)
+        self.assertEqual(sum(line.startswith("DEBUG:") for line in logs.output), 1)
+        for line in warnings:
+            for hint in ("HTTP 401", "token", "tenant", "push URL", "proxy", "without advancing cursors"):
+                self.assertIn(hint, line)
+        text = "\n".join(logs.output)
+        for private in (url, "loki-test-token", "private rejection details"):
+            self.assertNotIn(private, text)
 
     def test_loki_failure_does_not_prevent_ntfy_or_gelf_and_retries(self):
         self.worker = self.make_monitor(notify=True, graylog=True,

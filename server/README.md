@@ -259,9 +259,12 @@ decisions. Condition changes are independent of ntfy and deduplicated across
 deep-sleep wakes; delivered-decision lines exist only when ntfy accepted an
 alert. Loki is external and is not bundled in Compose. Its HTTP push has an
 independent cursor, retry state and timestamp order per stream; a failed Loki
-push does not stop ntfy or Graylog. Permanent HTTP 4xx rejections (except 408
-and 429) skip the batch and advance its cursors, so rejected history is not
-retried. JSON lines use only current catalog fields and bounded context, with
+push does not stop ntfy or Graylog. Only HTTP 400 (including too-old lines)
+and 422 (unusable content) skip the batch and advance its cursors. All other
+HTTP errors retry without advancing, including wrong token/tenant/address
+errors and 413 (a possibly temporary or adjustable size limit). A retryable
+4xx logs the status and settings to check once per retry episode; fixing the
+settings lets queued history resume. JSON lines use only current catalog fields and bounded context, with
 `job`, validated `device_id` and catalog `severity` as the only labels set by
 the monitor. Loki 3 can add its own `service_name` label and `detected_level`
 metadata to query results.

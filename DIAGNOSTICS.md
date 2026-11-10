@@ -2292,10 +2292,16 @@ events are sent, so the backlog stays oldest-first; condition changes and
 decisions follow once it catches up. History Loki rejects as too old is skipped.
 
 The monitor uses one HTTP push with a ten-second timeout and never follows
-redirects. Network failures, HTTP 408, HTTP 429 and 5xx responses back off
-from 60 seconds to one hour without advancing the batch. A permanent HTTP 4xx
-other than 408 or 429 logs only the status code, skips the rejected batch and
-advances its cursors; that history is not retried, and later rows continue.
+redirects. Network failures and all HTTP errors except 400/422 back off
+from 60 seconds to one hour without advancing event, condition or decision
+progress. This includes token/tenant errors (401/403), URL/proxy problems
+(404/405/407), timeouts, rate limits, 5xx and 413 (possibly temporary or an
+adjustable proxy size limit). Retryable 4xx warn once per retry episode with
+the status and settings to check; repeats are debug-only until success.
+Only 400 (including too-old lines) and 422 (unusable content) skip the rejected
+batch and advance its cursors; that history is not retried. Neither status
+can be fixed by resending unchanged content under the same receiver policy.
+Logs never include response bodies, credentials or the configured URL.
 Successful pushes advance the batch; an ambiguous response can be retried and
 duplicated. If `events.db` has a lower maximum rowid or a different event
 fingerprint at Loki's cursor, only that sink's event cursor resets and history

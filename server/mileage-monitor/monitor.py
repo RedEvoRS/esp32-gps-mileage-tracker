@@ -655,7 +655,14 @@ class Monitor:
                 with db:
                     db.execute("UPDATE loki_retry SET attempts=?,next_attempt=? WHERE singleton=1",
                                (attempts, now + delay))
-                LOG.warning("Loki delivery failed (%s); retry in %s seconds", type(exc).__name__, delay)
+                if isinstance(exc, urllib.error.HTTPError) and 400 <= exc.code < 500:
+                    # Persisted retry attempts suppress repeated full-volume
+                    # warnings across ticks and restarts until delivery recovers.
+                    log = LOG.warning if attempts == 1 else LOG.debug
+                    log("Loki delivery failed (HTTP %s); check token, tenant, push URL or proxy; "
+                        "retry in %s seconds without advancing cursors", exc.code, delay)
+                else:
+                    LOG.warning("Loki delivery failed (%s); retry in %s seconds", type(exc).__name__, delay)
                 return
 
         next_event = max(selected_events, default=event_cursor)

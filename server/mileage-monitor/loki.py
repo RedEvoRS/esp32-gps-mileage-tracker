@@ -20,6 +20,12 @@ SEVERITIES = ("info", "warning", "error", "critical", "unknown")
 DECISIONS = ("alert", "reminder", "resolution")
 SOURCE = "mileage-tracker"
 CONDITION_STATES = ("active", "clear", "unknown")
+# Only explicit content rejections skip a batch: 400 includes too-old lines,
+# and 422 rejects its meaning. Repeating unchanged content cannot fix these.
+# Other 4xx may be token/tenant, push URL, method or proxy settings problems.
+# Keep 413 too: RFC 9110 allows it to be temporary, and proxy size limits can
+# be fixed. This monitor does not split batches or inspect sensitive bodies.
+CONTENT_REJECTIONS = (400, 422)
 
 
 class PermanentRejection(Exception):
@@ -126,7 +132,7 @@ class HttpTransport:
         except urllib.error.HTTPError as exc:
             status_code = exc.code
             exc.close()
-            if 400 <= status_code < 500 and status_code not in (408, 429):
+            if status_code in CONTENT_REJECTIONS:
                 raise PermanentRejection(status_code) from None
             raise
 
