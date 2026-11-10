@@ -153,7 +153,7 @@ int main() {
     // No false raise or false clear while the threshold register is unreadable.
     for (bool active : {false, true}) {
         pmuWorld();
-        if (active) { batteryCondition(2002, true, g_millis); batteryCondition(2003, true, g_millis); take(); }
+        if (active) { batteryCondition(diagnostics::Code::BATTERY_LOW, true, g_millis); batteryCondition(diagnostics::Code::BATTERY_CRITICAL, true, g_millis); take(); }
         PMU.batteryPercent = active ? 100 : 0;
         failRead(XPOWERS_AXP2101_LOW_BAT_WARN_SET); serviceBatteryDiagnostics();
         assert(gBatteryThresholds < 0 && take().empty());

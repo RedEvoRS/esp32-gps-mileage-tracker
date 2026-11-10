@@ -139,6 +139,39 @@ static void protocolInputs() {
         assert(read(*log) == 1); std::cout << batch.events[0] << '\n'; ack(*log);
     }
 }
+static void invalidAccounting() {
+    EventLog unstarted(nullptr, nullptr);
+    assert(unstarted.submit(notice()) == EventLog::Submit::Invalid);
+    assert(unstarted.stats().invalidSubmits == 1);
+    MemoryFs sd; auto log = logger(&sd);
+    auto bad = notice(); bad.code = 7001; // server-only code
+    assert(log->submit(bad) == EventLog::Submit::Invalid);
+    bad = notice(); bad.contextCount = 1;
+    bad.context[0] = EventContext::integer("battery_mv", 6001);
+    assert(log->submit(bad) == EventLog::Submit::Invalid);
+    bad.context[0] = EventContext::enumeration("reset_reason", "invalid");
+    assert(log->submit(bad) == EventLog::Submit::Invalid);
+    assert(log->stats().invalidSubmits == 3);
+    assert(log->stats().dropped == 0 && log->stats().pendingLoss == 0 && log->stats().queued == 0);
+    assert(sd.calls == 0); // local accounting does not touch disk or create events
+    std::thread producers[2];
+    for (auto& producer : producers) producer = std::thread([&] {
+        for (unsigned i = 0; i < 100; ++i) {
+            EventLog::Submit result;
+            do { result = log->submit(bad); } while (result == EventLog::Submit::Busy);
+            assert(result == EventLog::Submit::Invalid);
+        }
+    });
+    for (auto& producer : producers) producer.join();
+    assert(log->stats().invalidSubmits == 203);
+    // Invalid attempts leave the next accepted event's wire identity alone.
+    EventIdentity id; assert(log->submit(notice(), &id) == EventLog::Submit::Accepted);
+    assert(id.sequence == 1);
+    log->service(); assert(read(*log) >= 1);
+    assert(log->stats().invalidSubmits == 203);
+    auto reboot = logger(&sd, nullptr, boot2);
+    assert(reboot->stats().invalidSubmits == 0); // never persisted
+}
 static void basicAndIdentity() {
     MemoryFs sd; auto log = logger(&sd, nullptr, boot1, kSdJournalQuota, 700);
     assert(EventLog::crc32("123456789", 9) == 0xcbf43926);
@@ -773,6 +806,7 @@ static void validationAndConcurrency() {
 }
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--protocol") { protocolInputs(); return 0; }
+    invalidAccounting();
     std::cout << "EventLog sizeof: " << sizeof(EventLog) << "; Batch sizeof: " << sizeof(EventLog::Batch) << " bytes\n";
     std::cerr << "identity\n"; basicAndIdentity();
     std::cerr << "cached append\n"; cachedAppendCost();

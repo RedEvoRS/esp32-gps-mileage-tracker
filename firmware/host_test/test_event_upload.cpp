@@ -86,7 +86,7 @@ static void cardRemovalAndReturn() {
     uploadWorld(); records(1); drainEvents();
     cardLifecycle.push_back(g_httpBodies.front()); collect();
     rebootStores(false);
-    gLoopFaults.event(4001, millis()).condition(true); // real missing-SD hook
+    gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, millis()).condition(true); // real missing-SD hook
     serviceJournal(); records(2); drainEvents();
     assert(!g_httpBodies.empty() && backlog().records == 0);
     const auto missing = g_httpBodies.front();
@@ -96,7 +96,7 @@ static void cardRemovalAndReturn() {
     cardLifecycle.push_back(missing); collect();
     records(2); // left on flash until the card returns; no SD writes exist
     rebootStores(true);
-    gLoopFaults.event(4001, millis()).condition(false);
+    gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, millis()).condition(false);
     drainEvents();
     assert(!g_httpBodies.empty() && backlog().records == 0);
     assert(g_httpBodies.front().find("\"storage_backend\":\"sd\"") != std::string::npos);
@@ -272,10 +272,10 @@ int main(int argc, char** argv) {
 
     // Worst-case full-size events plus every possible active/observed field.
     uploadWorld(); records(80);
-    for (size_t i = 0; i < 14; ++i) gLoopFaults.event(gLoopConditions[i].code, millis()).condition(true);
+    for (size_t i = 0; i < 14; ++i) gLoopFaults.event(static_cast<diagnostics::Code>(gLoopConditions[i].code), millis()).condition(true);
     for (unsigned i = 0; i < 5; ++i) gNetFaults.homeApAbsent();
-    gNetFaults.event(5008, millis()).enumeration("target", "trip").integer("http_status", 503).condition(true);
-    gEventFaults.event(5008, millis()).enumeration("target", "events").integer("http_status", 503).condition(true);
+    gNetFaults.event(diagnostics::Code::UPLOAD_SERVER_FAILED, millis()).enumeration("target", "trip").integer("http_status", 503).condition(true);
+    gEventFaults.event(diagnostics::Code::UPLOAD_SERVER_FAILED, millis()).enumeration("target", "events").integer("http_status", 503).condition(true);
     assert(eventSnapshot());
     assert(std::strstr(gEventBuffers->snapshot,
         (std::string("\"firmware_version\":\"") + firmware::kVersion + "\"").c_str()));
@@ -296,7 +296,7 @@ int main(int argc, char** argv) {
         auto& slot = maximum[i];
         slot.code = 60000 + i; slot.observed = slot.desired = true;
         slot.episode = kMaxEventInteger; slot.acceptedMs = millis();
-        gLoopFaults.event(slot.code, millis()).condition(true);
+        gLoopFaults.event(static_cast<diagnostics::Code>(slot.code), millis()).condition(true);
     }
     gJournalBoot.counter = gContactUptime = kMaxEventInteger;
     assert(enrollAt(kMaxEventInteger - 1));
@@ -313,7 +313,7 @@ int main(int argc, char** argv) {
     // catalog records. Whitespace padding is valid JSON and canonicalizes back
     // to the actual journal record; all successful bodies go through Python.
     uploadWorld(); records(64);
-    for (auto& slot : gLoopConditions) gLoopFaults.event(slot.code, millis()).condition(true);
+    for (auto& slot : gLoopConditions) gLoopFaults.event(static_cast<diagnostics::Code>(slot.code), millis()).condition(true);
     assert(eventSnapshot()); assert(eventLock());
     assert(gJournal.nextBatch(gEventBuffers->batch)); eventUnlock();
     for (size_t i = 0; i < gEventBuffers->batch.count; ++i) {

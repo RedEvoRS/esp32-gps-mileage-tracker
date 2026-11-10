@@ -182,6 +182,10 @@ EventLog::Submit EventLog::submit(const EventInput& input, EventIdentity* id) {
         if (id) { std::strcpy(id->bootId, bootId_); id->sequence = sequence_; }
         result = Submit::Accepted;
     }
+    // Producers on both cores share this counter with stats(). The queue lock
+    // serializes increments; the atomic load also permits an unlocked reader.
+    if (result == Submit::Invalid && invalidSubmits_.load(std::memory_order_relaxed) != UINT32_MAX)
+        invalidSubmits_.fetch_add(1, std::memory_order_relaxed);
     queueLock_.clear(std::memory_order_release); return result;
 }
 void EventLog::fail() { if (failures_ != UINT32_MAX) ++failures_; } // no sink callback/recursive event
@@ -667,6 +671,7 @@ bool EventLog::isolateRejected(const Batch& batch) {
 }
 EventLog::Stats EventLog::stats() {
     Stats result; result.backend = backend_; result.storageFailures = failures_;
+    result.invalidSubmits = invalidSubmits_.load(std::memory_order_relaxed);
     result.dropped = ramPending_; result.pendingLoss = ramPending_;
     for (const auto& store : stores_) {
         result.dropped = sum(result.dropped, store.meta.dropped);

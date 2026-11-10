@@ -91,7 +91,7 @@ public:
     };
     struct Stats {
         uint64_t dropped = 0, pendingLoss = 0;
-        uint32_t storageFailures = 0;
+        uint32_t storageFailures = 0, invalidSubmits = 0;
         size_t queued = 0;
         Backend backend = Backend::Ram;
     };
@@ -215,6 +215,7 @@ private:
     bool revisionBlocked_ = false; // also latch uncertain recovery-witness I/O
     std::atomic_flag queueLock_ = ATOMIC_FLAG_INIT;
     std::atomic<uint32_t> queueDrops_{0};
+    std::atomic<uint32_t> invalidSubmits_{0}; // boot-local; never loss/snapshot metadata
     Frame queue_[kEventQueueSize];
     size_t head_ = 0, count_ = 0;
     bool headStored_ = false;

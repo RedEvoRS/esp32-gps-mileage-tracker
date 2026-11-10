@@ -264,7 +264,33 @@ static inline void gpsFixGapRegressions() {
 }
 
 #ifndef FAULT_HOOKS_HELPERS_ONLY
-int main(int argc, char**) {
+static void missingConditionWarnings() {
+    bool saved = debugMode();
+    Serial.log.clear();
+    gDebugMode.store(false);
+    for (unsigned i = 0; i < 1000; ++i) reportMissingCondition(Code::EVENT_WRITE_FAILED);
+    assert(Serial.log.empty());
+    gDebugMode.store(true);
+    for (unsigned i = 0; i < 1000; ++i) {
+        reportMissingCondition(Code::EVENT_WRITE_FAILED);
+        reportMissingCondition(Code::GPS_NO_DATA);
+    }
+    assert(Serial.log.size() == 2);
+    assert(Serial.log[0].find("E4008 condition missing from task table") != std::string::npos);
+    assert(Serial.log[1].find("E3001 condition missing from task table") != std::string::npos);
+    gDebugMode.store(false); reportMissingCondition(Code::EVENT_WRITE_FAILED);
+    gDebugMode.store(true); reportMissingCondition(Code::EVENT_WRITE_FAILED);
+    assert(Serial.log.size() == 2); // toggling debug does not reset boot history
+    gDebugMode.store(saved);
+}
+int main(int argc, char** argv) {
+    if (argc > 1 && !std::strcmp(argv[1], "--missing-condition")) {
+        faultWorld();
+        // Valid catalog code on the wrong owning task: MUST assert, even -O1.
+        gLoopFaults.event(Code::WIFI_JOIN_FAILED, millis()).condition(true);
+        return 0;
+    }
+    missingConditionWarnings();
     exportJson = argc > 1;
     gpsAntennaRegressions();
     gpsFixGapRegressions();

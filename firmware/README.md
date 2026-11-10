@@ -1594,6 +1594,12 @@ LittleFS within a 64 KiB reserve, then retains the bounded RAM queue. The
 LittleFS trip start/stop guards protect the unused part of that reserve;
 existing diagnostic allocation is already counted as used space. No trip is
 deleted to make journal space, and diagnostics never mount or format media.
+
+With runtime debug on, the `Journal:` serial line also shows `invalid submits`:
+events rejected locally because their code, context or other fields are invalid.
+This counter starts at zero each boot; it is not uploaded or counted as lost
+events. A condition missing from its owning task's table prints a debug warning
+at most once per code per boot. These warnings are for firmware developers.
 RAM records are lost on reset or power-off.
 
 The existing core-0 network task drains one record per service slice, yielding

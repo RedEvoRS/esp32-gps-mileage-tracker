@@ -106,7 +106,7 @@ int main(int argc, char**) {
     assert(xSemaphoreTake(gFsMutex,0)); rows = take(); xSemaphoreGive(gFsMutex); assert(rows.size() == 3);
     for (auto& row : rows) has(row,"\"time_source\":\"rtc\"");
     // The internal loss notice bypasses RuntimeFaults, but uses the provider too.
-    for (unsigned i = 0; i < kEventQueueSize + 1; ++i) gLoopFaults.event(3003,millis()).notice();
+    for (unsigned i = 0; i < kEventQueueSize + 1; ++i) gLoopFaults.event(diagnostics::Code::GPS_CONFIG_NACK,millis()).notice();
     assert(xSemaphoreTake(gFsMutex,0)); gJournal.service(kEventQueueSize); rows = take(); xSemaphoreGive(gFsMutex);
     auto losses = codeRows(rows,4009); assert(losses.size() == 1);
     has(losses[0],"\"time_source\":\"rtc\"");
@@ -119,13 +119,13 @@ int main(int argc, char**) {
     // Feed a complete real RMC through the production GPS setter.
     auto ss = sentences({0,gLat,gLon,0,true}); feed(ss[0]);
     assert(gClockSet && gGpsClockSet);
-    gLoopFaults.event(3003,millis()).integer("message_class",6).integer("message_id",138).notice();
+    gLoopFaults.event(diagnostics::Code::GPS_CONFIG_NACK,millis()).integer("message_class",6).integer("message_id",138).notice();
     rows = take(); assert(rows.size() == 1);
     has(rows[0],"\"time_source\":\"gps\""); has(rows[0],"\"sync_age_ms\":0");
     // Both core-0 fault builders use the same provider, without I2C or NVS.
     unsigned before = transactions; g_currentCore = 0;
     g_stackHighWaterBytes = 1000; reportNetworkStack("test");
-    gEventFaults.event(5010,millis()).condition(true);
+    gEventFaults.event(diagnostics::Code::EVENT_ACK_INVALID,millis()).condition(true);
     trySntp(); serviceRtc(); // defensive guard also rejects accidental core-0 service
     assert(transactions == before && writes == 0);
     rows = take(); assert(rows.size() == 2);
@@ -143,7 +143,7 @@ int main(int argc, char**) {
     for (unsigned i = 0; i < 500; ++i) { g_millis += 1000; serviceRtc(); }
     assert(writes == 1 && take().empty());
     gClockSet = false;
-    gLoopFaults.event(3003,millis()).notice(); rows = take();
+    gLoopFaults.event(diagnostics::Code::GPS_CONFIG_NACK,millis()).notice(); rows = take();
     has(rows[0],"\"time_source\":\"rtc\""); has(rows[0],"\"sync_age_ms\":500000");
     // No ACK, and a boot register failure, are E3007 rather than read_failed.
     for (bool missing : {true,false}) {
@@ -200,7 +200,7 @@ int main(int argc, char**) {
     rtcWorld(false); beginRtc(); take(); before = transactions; g_currentCore = 0;
     g_sntpCompleteAfterPolls = 1; g_sntpEpochMs = uint64_t(fakeEpoch)*1000;
     trySntp(); assert(gClockSet && transactions == before && writes == 0);
-    gNetFaults.event(1007,millis()).integer("free_bytes",1000).condition(true);
+    gNetFaults.event(diagnostics::Code::NET_STACK_LOW,millis()).integer("free_bytes",1000).condition(true);
     has(one(1007,"raise"),"\"time_source\":\"sntp\"");
     g_currentCore = 1; serviceRtc(); one(3008,"clear"); assert(writes == 1 && rtcLog("set from sntp, verified"));
     // A drift read crossing into 2100 must not send an uninitialized calendar.
@@ -224,7 +224,7 @@ int main(int argc, char**) {
     // Missing/future NVS ages remain null; valid old age grows with uptime.
     for (uint64_t saved : {uint64_t(0),uint64_t(fakeEpoch+1)}) {
         rtcWorld(); Preferences::durable64["rtc_set"] = saved; beginRtc();
-        gLoopFaults.event(3003,millis()).notice(); has(take()[0],"\"sync_age_ms\":null");
+        gLoopFaults.event(diagnostics::Code::GPS_CONFIG_NACK,millis()).notice(); has(take()[0],"\"sync_age_ms\":null");
     }
     // Advance only via the production loop's 5 ms pause. Its service must
     // still catch the first 100 ms of a later second without spending retries.

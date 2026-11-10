@@ -65,19 +65,19 @@ static void eventUnlock() {
 static void eventHttpFault(int status, const char* ackError = nullptr) {
     if (gNetAbort.load() || gNetHold.load()) return;
     bool success = status >= 200 && status < 300 && !ackError;
-    uint16_t code = status <= 0 ? 5003 : status == 401 ? 5004 : status == 413 ? 5005 :
-        status == 400 ? 5006 : status == 409 ? 5007 : status >= 500 && status <= 599 ? 5008 : 5009;
+    diagnostics::Code code = status <= 0 ? diagnostics::Code::UPLOAD_TRANSPORT_FAILED : status == 401 ? diagnostics::Code::UPLOAD_AUTH_FAILED : status == 413 ? diagnostics::Code::UPLOAD_TOO_LARGE :
+        status == 400 ? diagnostics::Code::UPLOAD_INVALID : status == 409 ? diagnostics::Code::UPLOAD_CONFLICT : status >= 500 && status <= 599 ? diagnostics::Code::UPLOAD_SERVER_FAILED : diagnostics::Code::UPLOAD_HTTP_OTHER;
     if (status <= 0) gEventTransportFailures = min(unsigned(gEventTransportFailures) + 1, 255u);
     if (success) gEventTransportFailures = 0;
-    for (uint16_t c = 5003; c <= 5009; ++c) {
+    for (auto c : diagnostics::kHttpFaultCodes) {
         if (!success && (c != code || (status >= 200 && status < 300))) continue;
         gEventFaults.event(c, millis()).enumeration("target", "events");
-        if (c == 5003) gEventFaults.integer("attempts", gEventTransportFailures);
+        if (c == diagnostics::Code::UPLOAD_TRANSPORT_FAILED) gEventFaults.integer("attempts", gEventTransportFailures);
         else if (status >= 100 && status <= 599) gEventFaults.integer("http_status", status);
         gEventFaults.condition(!success);
     }
     if (ackError || success)
-        gEventFaults.event(5010, millis()).enumeration("reason", ackError ? ackError : "parse").condition(bool(ackError));
+        gEventFaults.event(diagnostics::Code::EVENT_ACK_INVALID, millis()).enumeration("reason", ackError ? ackError : "parse").condition(bool(ackError));
 }
 
 static bool appendObservations(const diagnostics::RuntimeFaults& faults, unsigned& revision) {
