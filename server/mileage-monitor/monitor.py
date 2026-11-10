@@ -6,9 +6,7 @@ All mutable policy, queue, retry and rate-limit state belongs to monitor.db.
 
 import json
 import logging
-import math
 import os
-import re
 import signal
 import sqlite3
 import threading
@@ -37,12 +35,13 @@ import gelf  # noqa: E402
 import loki as loki_module  # noqa: E402
 import prometheus  # noqa: E402
 import shared  # noqa: E402
-from shared import NoRedirect, SNAPSHOT_MAX_AGE_SECONDS, valid_host as _valid_host  # noqa: E402
+from shared import NoRedirect, SNAPSHOT_MAX_AGE_SECONDS  # noqa: E402
+import settings_rules  # noqa: E402
 
 
 
 LOG = logging.getLogger("mileage-monitor")
-SEVERITIES = ("info", "warning", "error", "critical")
+SEVERITIES = settings_rules.SEVERITIES
 TICK_SECONDS = 60
 MAX_BODY_BYTES = 3500  # Leave room below ntfy's default 4096-byte message limit.
 
@@ -68,7 +67,7 @@ class Config:
 
         def boolean(name):
             value = env.get(name, "false").lower()
-            if value not in ("true", "false"):
+            if not settings_rules.valid(name, value):
                 raise ValueError(name + " must be true or false")
             return value == "true"
 
@@ -83,40 +82,29 @@ class Config:
             return cls()  # Inactive profile can carry unfilled example settings.
         notify = boolean("NOTIFY_ENABLED")
 
-        def number(name, default, lower, upper, *, integer=False):
+        def number(name, default):
             try:
                 raw = env.get(name, str(default))
-                value = int(raw) if integer else float(raw)
-                if not math.isfinite(value) or not lower <= value <= upper:
+                value = int(raw) if settings_rules.NUMBERS[name][2] else float(raw)
+                if not settings_rules.valid(name, raw):
                     raise ValueError
             except (ValueError, TypeError, OverflowError):
                 raise ValueError(name + " is outside its supported numeric range") from None
             return value
 
         severity = env.get("NOTIFY_MIN_SEVERITY", "error")
-        if severity not in SEVERITIES:
+        if not settings_rules.valid("NOTIFY_MIN_SEVERITY", severity):
             raise ValueError("NOTIFY_MIN_SEVERITY must be info, warning, error or critical")
-        hold = number("NOTIFY_HOLD_SECONDS", 300, 0, 604800)
-        repeat = number("NOTIFY_REPEAT_HOURS", 24, 1 / 3600, 8760) * 3600
-        maximum = number("NOTIFY_MAX_PER_HOUR", 6, 1, 1000, integer=True)
-        stale = number("MONITOR_STALE_DAYS", 7, 1 / 86400, 36500) * 86400
+        hold = number("NOTIFY_HOLD_SECONDS", 300)
+        repeat = number("NOTIFY_REPEAT_HOURS", 24) * 3600
+        maximum = number("NOTIFY_MAX_PER_HOUR", 6)
+        stale = number("MONITOR_STALE_DAYS", 7) * 86400
         url, token = env.get("NTFY_URL", ""), env.get("NTFY_TOKEN", "")
         if notify:
-            try:
-                parsed = urllib.parse.urlsplit(url)
-                host = parsed.hostname or ""
-                valid_host = _valid_host(host)
-                valid = (parsed.scheme in ("http", "https") and parsed.hostname
-                         and valid_host
-                         and parsed.port != 0 and parsed.username is None
-                         and parsed.password is None and not parsed.query and not parsed.fragment
-                         and re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", parsed.path.rsplit("/", 1)[-1])
-                         and not any(c.isspace() for c in url))
-            except ValueError:
-                valid = False
+            valid = settings_rules.valid("NTFY_URL", url)
             if not valid:
                 raise ValueError("NTFY_URL must be an http(s) topic URL without credentials, query or fragment")
-            if not token or token == "<token>" or any(not 33 <= ord(c) <= 126 for c in token):
+            if not settings_rules.valid("NTFY_TOKEN", token):
                 raise ValueError("NTFY_TOKEN must be a nonempty access token without whitespace")
         return cls(enabled=enabled, notify=notify, url=url, token=token,
                    min_severity=severity, hold_seconds=hold, repeat_seconds=repeat,

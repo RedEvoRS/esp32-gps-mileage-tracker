@@ -91,6 +91,7 @@ FAILURES=0
 BUILD_SERVER_VERSION=unversioned
 BOOT_UNVERIFIED=no
 PYTHON_ROUTE=
+SETTINGS_IN='' SETTINGS_OUT='' SETTINGS_PID='' SETTINGS_REPLY=''
 
 # --- Output ------------------------------------------------------------
 
@@ -148,6 +149,7 @@ cleanup() {
     # A last try at deleting the test trip. If it's still there, say so and
     # exit non-zero, whatever the run reported before.
     local left=no
+    settings_stop
     if [[ -n $TEST_TRIP ]] && ! remove_test_trip; then
         printf '\n  %sFAIL%s  The test trip is still on disk\n' "$RED" "$PLAIN"
         test_trip_left
@@ -274,7 +276,7 @@ select_python() {
 
 # Only public inputs needed by this step are visible to the Python container.
 # Config values and address lists arrive through arguments/stdin, never mounts.
-host_python() {  # stamp|proxy|address PYTHON_ARGUMENTS...
+host_python() {  # stamp|proxy|address|settings PYTHON_ARGUMENTS...
     local step=$1 image file mounts=()
     shift
     select_python
@@ -296,8 +298,55 @@ host_python() {  # stamp|proxy|address PYTHON_ARGUMENTS...
         shift
         set -- /work/stamp_version.py "$@"
     fi
+    if [[ $step == settings ]]; then
+        mounts+=(-v "$SCRIPT_DIR/mileage-monitor/settings_rules.py:/work/settings_rules.py:ro")
+        set -- /work/settings_rules.py
+    fi
     "${DOCKER[@]}" run --rm -i --network none --user "$CONTAINER_UID:$CONTAINER_UID" \
         "${mounts[@]}" -w /work -e PYTHONPATH=/work -e PYTHONDONTWRITEBYTECODE=1 "$image" python3 "$@"
+}
+
+# One stdlib checker for all Notifications prompts and saved values. On Unraid
+# host_python starts one disposable, network-disabled container, not one per
+# question. Duplicate coproc descriptors so command substitutions inherit them.
+# Only public code is mounted; credentials travel on stdin, never argv.
+settings_start() {
+    [[ -z $SETTINGS_PID ]] || return 0
+    coproc MONITOR_RULES { host_python settings "$SCRIPT_DIR/mileage-monitor/settings_rules.py"; }
+    SETTINGS_PID=$MONITOR_RULES_PID
+    local reader=${MONITOR_RULES[0]} writer=${MONITOR_RULES[1]}
+    exec {SETTINGS_IN}>&"$writer" {SETTINGS_OUT}<&"$reader"
+    exec {writer}>&- {reader}<&-
+    if ! IFS= read -r -d '' -u "$SETTINGS_OUT" SETTINGS_REPLY || [[ $SETTINGS_REPLY != +ready ]]; then
+        die "The monitor settings checker stopped." "Check Python or Docker, then run install.sh again." >&2
+    fi
+}
+
+settings_stop() {
+    if [[ -n $SETTINGS_PID ]]; then
+        exec {SETTINGS_IN}>&- {SETTINGS_OUT}<&-
+        wait "$SETTINGS_PID" || true
+        SETTINGS_PID='' SETTINGS_IN='' SETTINGS_OUT=''
+    fi
+}
+
+settings_request() {  # RULE|quote|value VALUE; result in SETTINGS_REPLY
+    settings_start
+    if ! (trap '' PIPE; printf '%s\0%s\0' "$1" "$2" >&"$SETTINGS_IN") 2> /dev/null \
+        || ! IFS= read -r -d '' -u "$SETTINGS_OUT" SETTINGS_REPLY; then
+        die "The monitor settings checker stopped." "Check Python or Docker, then run install.sh again." >&2
+    fi
+    if [[ $SETTINGS_REPLY != +* ]]; then
+        die "A monitor.env value could not be read safely." \
+            "Use one line per setting and single-quote literal dollar signs (DEPLOY_DEBIAN.md Step 11b)." >&2
+    fi
+    SETTINGS_REPLY=${SETTINGS_REPLY:1}
+}
+
+settings_valid() { settings_request "$1" "$2"; [[ $SETTINGS_REPLY == yes ]]; }
+monitor_env_set() {
+    settings_request quote "$3"
+    env_set "$1" "$2" "$SETTINGS_REPLY"
 }
 
 # Default provenance changes image IDs on Docker's containerd store even for
@@ -483,7 +532,7 @@ preflight() {
         mileage-ingest/{Dockerfile,app.py,diag_store.py,reset_high_water.py,requirements.txt} \
         mileage-viewer/{Dockerfile,app.py,geocoding.py,trip_merges.py,trip_log.py,users.py,manage_users.py,requirements.txt} \
         mileage-viewer/static/{leaflet.js,leaflet.css,gpx.js,endpoint-places.js} \
-        mileage-monitor/{Dockerfile,monitor.py,gelf.py,prometheus.py,loki.py,shared.py} ntfy/server.yml \
+        mileage-monitor/{Dockerfile,monitor.py,gelf.py,prometheus.py,loki.py,shared.py,settings_rules.py} ntfy/server.yml \
         backup/{backup.sh,restore.sh,lib.sh,backup.conf.example} \
         backup/mileage-backup@.{service,timer}; do
         if [[ ! -e $f ]]; then missing+=("$f"); fi
@@ -2670,7 +2719,6 @@ MONITOR_FILE=       # absolute path of monitor.env, from find_monitor_file
 MONITOR_CONFIGURED=no
 CHOSEN=()           # the outputs answered for this run, in OUTPUT_NAMES order
 BAD_WORD=           # the word parse_outputs rejected
-URL_PATH=           # the path of the URL valid_http_url last checked
 NEW_TOKEN=          # the token ntfy_new_token made
 NTFY_MODE_NEW='' NTFY_TOPIC_NEW='' NTFY_USER_NEW='' NTFY_PW_NEW=''
 NTFY_USER_EXISTS=no
@@ -2783,27 +2831,50 @@ except OSError as exc:
     raise SystemExit(1)
 print("accepted")'
 
-# The value of KEY in monitor.env, as the monitor will see it, for defaults,
-# kept secrets and mode decisions. One matching pair of quotes is removed
-# (Compose strips either kind, and a hand-written file may use double quotes).
-# A template placeholder such as <host> or <token>, which the example ships
-# with, counts as unset, and so does any value containing < or >: valid
-# answers never contain them (valid_secret and the URL and token checks
-# refuse them), so nothing real is lost. Empty if unset.
+# Read quoted monitor.env values without treating punctuation as a placeholder.
+# Only known example markers are unset; real secrets may contain < >.
 mon_value() {
-    local raw
-    raw=$(env_raw "$1" "$2")
-    if (( ${#raw} >= 2 )) && { [[ $raw == \'*\' ]] || [[ $raw == \"*\" ]]; }; then
-        raw=${raw:1:${#raw}-2}
-    fi
-    if [[ $raw == *[\<\>]* ]]; then raw=; fi
-    printf '%s' "$raw"
+    settings_request value "$(env_raw "$1" "$2")"
+    case $2 in
+        NTFY_URL | LOKI_PUSH_URL | GRAYLOG_GELF_URL | GRAYLOG_GELF_TCP)
+            if [[ $SETTINGS_REPLY == *'<host>'* || $SETTINGS_REPLY == *'<topic>'* ]]; then return 0; fi ;;
+        NTFY_TOKEN | METRICS_TOKEN | LOKI_BEARER_TOKEN)
+            if [[ $SETTINGS_REPLY == '<token>' ]]; then return 0; fi ;;
+    esac
+    printf '%s' "$SETTINGS_REPLY"
+}
+
+# Check in the parent shell before defaults are read in command substitutions.
+# Otherwise a malformed quote/reference could be mistaken for an empty default
+# by a caller using an `if` condition (where Bash disables errexit).
+monitor_env_readable() {
+    local line key value
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%$'\r'}
+        if [[ $line =~ ^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*= ]]; then
+            settings_request value "${line#*=}"
+            value=$SETTINGS_REPLY
+            key=${line%%=*}
+            key=${key//[[:space:]]/}
+            case $key in
+                MONITOR_ENABLED | NOTIFY_ENABLED | METRICS_ENABLED | GRAYLOG_ENABLED | GRAYLOG_GELF_TLS | GRAYLOG_GELF_TLS_VERIFY)
+                    if ! settings_valid "$key" "$value"; then
+                        die "$key in monitor.env must be true or false (any case)." >&2
+                    fi ;;
+            esac
+        elif [[ ! $line =~ ^[[:space:]]*(#.*)?$ ]]; then
+            die "monitor.env needs one KEY=value setting per line." \
+                "Use literal values and the quoting in DEPLOY_DEBIAN.md Step 11b." >&2
+        fi
+    done < "$MONITOR_FILE"
 }
 
 # Whether monitor.env sets KEY to true.
 mon_flag() {
     local value
     value=$(mon_value "$MONITOR_FILE" "$1")
+    if [[ -z $value ]] && ! grep -Eq "^[[:space:]]*$1=" "$MONITOR_FILE"; then value=false; fi
+    if ! settings_valid "$1" "$value"; then die "$1 in monitor.env must be true or false (any case)." >&2; fi
     [[ ${value,,} == true ]]
 }
 
@@ -2912,64 +2983,23 @@ ask_outputs() {
     done
 }
 
-# Checks for answers. Each takes one value and returns 0 if it's usable.
-valid_topic() { [[ $1 =~ ^[A-Za-z0-9_-]{1,64}$ ]]; }
-valid_ntfy_user() { [[ $1 =~ ^[A-Za-z0-9_-]{1,64}$ ]]; }
-valid_ntfy_mode() { case $1 in bundled | existing) ;; *) return 1 ;; esac; }
-valid_ntfy_token() { [[ $1 =~ ^[A-Za-z0-9._~+/=-]{8,}$ ]]; }
-valid_severity() { case $1 in info | warning | error | critical) ;; *) return 1 ;; esac; }
-valid_loki_auth() { case $1 in none | bearer | basic) ;; *) return 1 ;; esac; }
-valid_days() { [[ $1 =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v d="$1" 'BEGIN { exit !(d > 0 && d <= 36500) }'; }
-
-# An http or https URL with a host, optional port and optional path. Only
-# characters Compose won't expand, and no credentials, query or fragment.
-# Sets URL_PATH.
-valid_http_url() {
-    local port
-    URL_PATH=
-    [[ $1 =~ ^https?://(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:([0-9]{1,5}))?(/[A-Za-z0-9._~%/+-]*)?$ ]] || return 1
-    port=${BASH_REMATCH[3]}
-    if [[ -n $port ]] && (( 10#$port < 1 || 10#$port > 65535 )); then return 1; fi
-    URL_PATH=${BASH_REMATCH[4]}
-}
-
-valid_ntfy_url() {
-    valid_http_url "$1" || return 1
-    [[ ${URL_PATH##*/} =~ ^[A-Za-z0-9_-]{1,64}$ ]]
-}
-
-valid_loki_url() {
-    valid_http_url "$1" || return 1
-    [[ ${URL_PATH%/} == */loki/api/v1/push ]]
-}
-
-# A GELF HTTP URL, or host:port of a GELF TCP input.
-valid_graylog_target() {
-    local port
-    case $1 in
-        http://* | https://*) valid_http_url "$1" ;;
-        *)
-            [[ $1 =~ ^([A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\]):([0-9]{1,5})$ ]] || return 1
-            port=${BASH_REMATCH[2]}
-            (( 10#$port >= 1 && 10#$port <= 65535 ))
-            ;;
-    esac
-}
-
-# Free-form secrets go into monitor.env in single quotes, which Compose reads
-# literally (the viewer's hash works the same way). So they can't hold quotes,
-# backslashes, spaces or control characters.
-# < and > are refused too: mon_value reads them as a template placeholder.
-valid_secret() { [[ -n $1 && $1 =~ ^[!-~]+$ && $1 != *\'* && $1 != *\\* && $1 != *[\<\>]* ]]; }
-valid_basic_user() { valid_secret "$1" && [[ $1 != *:* ]]; }
-valid_tenant() {
-    [[ -z $1 || $1 == - ]] && return 0
-    valid_secret "$1" && (( ${#1} <= 128 ))
-}
-
-# What the monitor accepts as METRICS_TOKEN: 32 or more printable characters,
-# not a template placeholder.
-valid_metrics_token() { [[ ${#1} -ge 32 && $1 =~ ^[!-~]+$ && $1 != *[\<\>]* ]]; }
+# Rules live in mileage-monitor/settings_rules.py, shared with the monitor.
+valid_topic() { settings_valid NTFY_TOPIC "$1"; }
+valid_ntfy_user() { settings_valid NTFY_USER "$1"; }
+valid_ntfy_mode() { settings_valid NTFY_MODE "$1"; }
+valid_ntfy_token() { settings_valid NTFY_TOKEN "$1"; }
+valid_severity() { settings_valid NOTIFY_MIN_SEVERITY "$1"; }
+valid_loki_auth() { settings_valid LOKI_AUTH "$1"; }
+valid_days() { settings_valid MONITOR_STALE_DAYS "$1"; }
+valid_http_url() { settings_valid HTTP_URL "$1"; }
+valid_ntfy_url() { settings_valid NTFY_URL "$1"; }
+valid_loki_url() { settings_valid LOKI_PUSH_URL "$1"; }
+valid_graylog_target() { settings_valid GRAYLOG_TARGET "$1"; }
+valid_secret() { settings_valid LOKI_BEARER_TOKEN "$1"; }
+valid_basic_user() { settings_valid LOKI_BASIC_AUTH_USER "$1"; }
+valid_basic_password() { settings_valid LOKI_BASIC_AUTH_PASSWORD "$1"; }
+valid_tenant() { settings_valid LOKI_TENANT_ID "$1"; }
+valid_metrics_token() { settings_valid METRICS_TOKEN "$1"; }
 
 # ask_checked VAR NAME "Question" DEFAULT CHECK "Hint"
 # Asks until CHECK accepts the answer. A preset CHECK rejects is an error,
@@ -3037,7 +3067,7 @@ ask_stale_days() {
     note "How long a tracker can go without uploading before it counts as silent. Trips" \
         "upload when you park somewhere with WiFi, so a car parked for weeks is normal."
     ask_checked STALE_DAYS_NEW STALE_DAYS "Days without an upload before a silence alert" "${current:-7}" \
-        valid_days "Use a number of days above 0 and up to 36500 (decimals are fine)."
+        valid_days "Use at least one second (e.g. 0.000012 days) and at most 36500 days; decimals or scientific notation are fine."
 }
 
 # ntfy: a bundled server here, or an existing one.
@@ -3056,11 +3086,11 @@ ask_ntfy() {
     else
         ask_checked NTFY_URL_NEW NTFY_URL "Topic URL of the existing ntfy (its address, then the topic name)" \
             "$current_url" valid_ntfy_url \
-            "Use http or https, the server's address, then the topic: letters, digits, _ or -, with no username, ? or #."
+            "Use http(s), a valid DNS/IP host, then a topic of 1-64 letters, digits, _ or -. No credentials, query or fragment. Controls cannot be saved safely in monitor.env."
         keep=
         if [[ $current_url != http://ntfy:80/* ]]; then keep=$(mon_value "$MONITOR_FILE" NTFY_TOKEN); fi
         ask_secret_keep NTFY_TOKEN_NEW NTFY_TOKEN "Access token for that topic" "$keep" valid_ntfy_token \
-            "A token starts with tk_ and has no spaces."
+            "Use a nonempty printable ASCII token without spaces or control characters; replace <token>."
     fi
     current_sev=$(mon_value "$MONITOR_FILE" NOTIFY_MIN_SEVERITY)
     ask_checked NTFY_SEVERITY_NEW NOTIFY_MIN_SEVERITY \
@@ -3104,8 +3134,8 @@ ask_graylog() {
         "Graylog confirms each message), or host:port of a GELF TCP input."
     ask_checked GRAYLOG_VALUE GRAYLOG_TARGET "GELF HTTP URL (its address, ending in /gelf) or TCP host:port" \
         "${current_url:-$current_tcp}" valid_graylog_target \
-        "Use http(s)://host:port/path, or host:port for TCP."
-    case $GRAYLOG_VALUE in
+        "Use http(s)://host:port/path, or host:port for TCP, with a valid DNS/IP host and port 1-65535. Controls cannot be saved safely in monitor.env."
+    case ${GRAYLOG_VALUE,,} in
         http://* | https://*) GRAYLOG_KIND=url ;;
         *) GRAYLOG_KIND=tcp ;;
     esac
@@ -3126,7 +3156,7 @@ ask_loki() {
     fi
     note "Loki is a log store you run; its push URL ends in /loki/api/v1/push."
     ask_checked LOKI_URL_NEW LOKI_URL "Loki push URL (its address, ending in /loki/api/v1/push)" "$cur_url" valid_loki_url \
-        "Use http(s)://host[:port]/loki/api/v1/push, with no username, ? or #."
+        "Use http(s)://host[:port]/loki/api/v1/push with a valid DNS/IP host, no credentials, query or fragment. Controls cannot be saved safely in monitor.env."
     ask_checked LOKI_AUTH_NEW LOKI_AUTH "Loki login: none, bearer or basic" "$cur_auth" valid_loki_auth \
         "Answer none, bearer or basic."
     case $LOKI_AUTH_NEW in
@@ -3134,21 +3164,21 @@ ask_loki() {
             keep=
             if [[ $cur_auth == bearer ]]; then keep=$cur_token; fi
             ask_secret_keep LOKI_TOKEN_NEW LOKI_BEARER_TOKEN "Loki bearer token" "$keep" valid_secret \
-                "Use a token with no spaces, quotes or backslashes."
+                "Use 1 to 1024 printable ASCII characters without spaces or control characters; replace <token>."
             ;;
         basic)
             ukeep=
             pkeep=
             if [[ $cur_auth == basic ]]; then ukeep=$cur_user; pkeep=$cur_pw; fi
             ask_checked LOKI_USER_NEW LOKI_BASIC_AUTH_USER "Loki username" "$ukeep" valid_basic_user \
-                "Use a username with no colon, spaces, quotes or backslashes."
-            ask_secret_keep LOKI_PW_NEW LOKI_BASIC_AUTH_PASSWORD "Loki password" "$pkeep" valid_secret \
-                "Use a password with no spaces, quotes or backslashes."
+                "Use 1 to 1024 printable ASCII characters, with no colon or control characters."
+            ask_secret_keep LOKI_PW_NEW LOKI_BASIC_AUTH_PASSWORD "Loki password" "$pkeep" valid_basic_password \
+                "Use 1 to 1024 printable ASCII characters, including spaces; no control characters."
             ;;
     esac
     ask_checked LOKI_TENANT_NEW LOKI_TENANT_ID \
         "Loki tenant ID for X-Scope-OrgID (Enter keeps the current one; - clears it; Enter if none)" \
-        "$cur_tenant" valid_tenant "Use up to 128 characters without spaces, quotes or backslashes."
+        "$cur_tenant" valid_tenant "Use up to 128 printable ASCII characters, including spaces; no control characters."
     if [[ $LOKI_TENANT_NEW == - ]]; then LOKI_TENANT_NEW=; fi
 }
 
@@ -3299,8 +3329,8 @@ write_monitor_settings() {
     if chosen_output ntfy; then
         env_set "$f" NOTIFY_ENABLED true
         env_set "$f" NOTIFY_MIN_SEVERITY "$NTFY_SEVERITY_NEW"
-        env_set "$f" NTFY_URL "$NTFY_URL_NEW"
-        env_set "$f" NTFY_TOKEN "$NTFY_TOKEN_OUT"
+        monitor_env_set "$f" NTFY_URL "$NTFY_URL_NEW"
+        monitor_env_set "$f" NTFY_TOKEN "$NTFY_TOKEN_OUT"
     else
         env_set "$f" NOTIFY_ENABLED false
     fi
@@ -3318,9 +3348,9 @@ write_monitor_settings() {
     if chosen_output graylog; then
         env_set "$f" GRAYLOG_ENABLED true
         if [[ $GRAYLOG_KIND == url ]]; then
-            env_set "$f" GRAYLOG_GELF_URL "$GRAYLOG_VALUE"
+            monitor_env_set "$f" GRAYLOG_GELF_URL "$GRAYLOG_VALUE"
             env_set "$f" GRAYLOG_GELF_TCP ""
-            if [[ $(mon_value "$f" GRAYLOG_GELF_TLS) == true ]]; then
+            if mon_flag GRAYLOG_GELF_TLS; then
                 env_comment "$f" GRAYLOG_GELF_TLS
                 warn "GRAYLOG_GELF_TLS=true was commented out" \
                     "It only applies to TCP, and an https:// URL already uses TLS."
@@ -3339,16 +3369,16 @@ write_monitor_settings() {
     fi
 
     if chosen_output loki; then
-        env_set "$f" LOKI_PUSH_URL "$LOKI_URL_NEW"
+        monitor_env_set "$f" LOKI_PUSH_URL "$LOKI_URL_NEW"
         case $LOKI_AUTH_NEW in
             bearer)
-                env_set "$f" LOKI_BEARER_TOKEN "'$LOKI_TOKEN_NEW'"
+                monitor_env_set "$f" LOKI_BEARER_TOKEN "$LOKI_TOKEN_NEW"
                 env_set "$f" LOKI_BASIC_AUTH_USER ""
                 env_set "$f" LOKI_BASIC_AUTH_PASSWORD ""
                 ;;
             basic)
-                env_set "$f" LOKI_BASIC_AUTH_USER "'$LOKI_USER_NEW'"
-                env_set "$f" LOKI_BASIC_AUTH_PASSWORD "'$LOKI_PW_NEW'"
+                monitor_env_set "$f" LOKI_BASIC_AUTH_USER "$LOKI_USER_NEW"
+                monitor_env_set "$f" LOKI_BASIC_AUTH_PASSWORD "$LOKI_PW_NEW"
                 env_set "$f" LOKI_BEARER_TOKEN ""
                 ;;
             none)
@@ -3358,7 +3388,7 @@ write_monitor_settings() {
                 ;;
         esac
         if [[ -n $LOKI_TENANT_NEW ]]; then
-            env_set "$f" LOKI_TENANT_ID "'$LOKI_TENANT_NEW'"
+            monitor_env_set "$f" LOKI_TENANT_ID "$LOKI_TENANT_NEW"
         else
             env_set "$f" LOKI_TENANT_ID ""
         fi
@@ -3543,6 +3573,7 @@ check_monitor_health() {
 # Read-only checks of what monitor.env turns on, in both modes. Nothing is
 # sent to a phone, Graylog or Loki from here.
 check_outputs() {
+    settings_start
     local list monitor_ok=no pointer config_status=0
     check_monitor_health
     if ! find_monitor_file; then
@@ -3555,6 +3586,7 @@ check_outputs() {
         fi
         return 0
     fi
+    monitor_env_readable
     list=$(outputs_on | paste -sd, -)
     if [[ -z $list ]]; then
         ok "Notification outputs: off"
@@ -3730,12 +3762,14 @@ wait_for_bundled_ntfy() {
 # Check mode only checks. Install mode asks, applies and checks; a kept set of
 # outputs is applied without any question and without any test being sent.
 setup_outputs() {
+    settings_start
     section "Notifications"
     if [[ $MODE == check ]]; then
         check_outputs
         return 0
     fi
     ensure_monitor_file
+    monitor_env_readable
     local default=none current
     if [[ $MONITOR_CONFIGURED == yes ]]; then
         current=$(outputs_on | paste -sd, -)

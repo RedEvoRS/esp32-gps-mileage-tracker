@@ -10,7 +10,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 
-from shared import NoRedirect, event_fields, valid_host as _valid_host
+from shared import NoRedirect, event_fields
+import settings_rules
 from common.diagnostics import validate_device_id, validate_request
 
 
@@ -80,27 +81,18 @@ class LokiConfig:
             if user or password or token or tenant:
                 raise ValueError("LOKI_PUSH_URL is required when Loki credentials or tenant are set")
             return cls()
-        try:
-            parsed = urllib.parse.urlsplit(url)
-            valid_url = (parsed.scheme in ("http", "https") and _valid_host(parsed.hostname or "")
-                         and parsed.port != 0 and parsed.username is None and parsed.password is None
-                         and not parsed.query and not parsed.fragment
-                         and parsed.path.rstrip("/").endswith("/loki/api/v1/push")
-                         and not any(char.isspace() for char in url))
-        except ValueError:
-            valid_url = False
+        valid_url = settings_rules.valid("LOKI_PUSH_URL", url)
         if not valid_url:
             raise ValueError("LOKI_PUSH_URL must be an http(s) Loki /loki/api/v1/push URL without credentials or query")
         basic = bool(user or password)
-        if basic and (not user or not password or not _ascii_header(user)
-                      or ":" in user or not _ascii_header(password)):
+        if basic and (not settings_rules.valid("LOKI_BASIC_AUTH_USER", user)
+                      or not settings_rules.valid("LOKI_BASIC_AUTH_PASSWORD", password)):
             raise ValueError("Loki basic auth requires a printable username and password")
-        if token and (not _ascii_header(token) or token == "<token>"
-                      or any(char.isspace() for char in token)):
+        if token and not settings_rules.valid("LOKI_BEARER_TOKEN", token):
             raise ValueError("LOKI_BEARER_TOKEN must be a nonempty printable ASCII token")
         if basic and token:
             raise ValueError("Configure Loki basic auth or bearer auth, not both")
-        if tenant and not _ascii_header(tenant, 128):
+        if not settings_rules.valid("LOKI_TENANT_ID", tenant):
             raise ValueError("LOKI_TENANT_ID must be at most 128 printable ASCII characters")
         return cls(True, url, user, password, token, tenant)
 

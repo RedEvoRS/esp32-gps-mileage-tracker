@@ -257,6 +257,29 @@ only a free wake-up poke, not message text. Android needs no relay.
 [ntfy documents the settings](https://docs.ntfy.sh/config/).
 An existing self-hosted ntfy can be selected with `NTFY_URL` instead.
 
+Installer questions and monitor startup use the same rules in
+`mileage-monitor/settings_rules.py`. Topic names and bundled ntfy usernames
+use 1–64 letters, digits, `_` or `-`. An ntfy token is nonempty printable
+ASCII without spaces; a metrics token needs at least 32 such characters.
+Real punctuation such as `$`, `#`, `<`, `>`, quotes and backslashes is allowed.
+Loki bearer tokens have 1–1024 printable ASCII characters without spaces;
+basic usernames/passwords have 1–1024 printable ASCII characters including
+spaces (no colon in the username). Tenant IDs may be empty or up to 128
+printable ASCII characters including spaces. Control characters are refused.
+Silence accepts one second through 36500 days, including decimals or scientific
+notation. URLs require valid DNS/IP hosts and optional ports from 1 to 65535,
+without embedded credentials, queries, fragments, whitespace or controls.
+
+The installer quotes these values for Compose's `env_file` parser, including
+Compose 2.26. By hand, single-quote literal dollars, hashes, spaces and quotes;
+escape an apostrophe as `\'`. For values with backslashes use double quotes,
+escaping backslashes as `\\`, double quotes as `\"`, and dollars as `$$`.
+Keep one setting per line and use literal values rather than `$OTHER` or
+`${OTHER}` references: the installer reports those as ambiguous rather than
+guessing Compose's interpolation context. Full examples and error behavior
+are in DEPLOY_DEBIAN.md Step 11b. On Unraid, one disposable Python checker
+serves all Notifications questions; secrets travel on stdin, never argv.
+
 Optionally, the monitor also sends diagnostics as GELF (Graylog Extended Log
 Format) to a Graylog you run elsewhere (`GRAYLOG_*` in `monitor.env`, off by
 default; nothing here installs

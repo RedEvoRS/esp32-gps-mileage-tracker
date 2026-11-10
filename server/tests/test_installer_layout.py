@@ -65,7 +65,7 @@ class InstallerLayout(unittest.TestCase):
                          "common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json}",
                          "mileage-ingest/{Dockerfile,app.py,diag_store.py,reset_high_water.py,requirements.txt}",
                          "mileage-viewer/{Dockerfile,app.py,geocoding.py,trip_merges.py,trip_log.py,users.py,manage_users.py,requirements.txt}",
-                         "mileage-monitor/{Dockerfile,monitor.py,gelf.py,prometheus.py,loki.py,shared.py}",
+                         "mileage-monitor/{Dockerfile,monitor.py,gelf.py,prometheus.py,loki.py,shared.py,settings_rules.py}",
                          "monitor.env.example", "ntfy/server.yml"):
             self.assertIn(required, preflight)
         main = INSTALL.split("main() {", 1)[1]
@@ -135,7 +135,7 @@ class InstallerLayout(unittest.TestCase):
                                 "mileage-viewer/geocoding.py", "mileage-viewer/static/endpoint-places.js",
                                 "mileage-monitor/monitor.py", "mileage-monitor/gelf.py",
                                 "mileage-monitor/prometheus.py", "mileage-monitor/loki.py", "mileage-monitor/shared.py",
-                                "mileage-monitor/Dockerfile", "monitor.env.example", "ntfy/server.yml"):
+                                "mileage-monitor/settings_rules.py", "mileage-monitor/Dockerfile", "monitor.env.example", "ntfy/server.yml"):
                     file = tree / missing
                     content = file.read_bytes()
                     file.unlink()

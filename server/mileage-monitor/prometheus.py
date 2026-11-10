@@ -10,10 +10,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from common.diagnostics import validate_device_id
 from shared import condition_states
+import settings_rules
 
 
 PORT = 8093
-MIN_TOKEN_LENGTH = 32
 LOG = logging.getLogger("mileage-monitor")
 
 
@@ -25,13 +25,12 @@ class MetricsConfig:
     @classmethod
     def from_env(cls, env):
         value = env.get("METRICS_ENABLED", "false").lower()
-        if value not in ("true", "false"):
+        if not settings_rules.valid("METRICS_ENABLED", value):
             raise ValueError("METRICS_ENABLED must be true or false")
         if value == "false":
             return cls()
         token = env.get("METRICS_TOKEN", "")
-        if (len(token) < MIN_TOKEN_LENGTH or token == "<token>"
-                or any(not 33 <= ord(char) <= 126 for char in token)):
+        if not settings_rules.valid("METRICS_TOKEN", token):
             raise ValueError("METRICS_TOKEN must be at least 32 printable ASCII characters")
         return cls(True, token)
 

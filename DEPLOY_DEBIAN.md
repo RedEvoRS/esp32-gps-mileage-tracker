@@ -1792,6 +1792,14 @@ A preset that isn't usable stops the install with a message, as the other
 questions do. Metrics has no question of its own: its token is generated and
 kept in `monitor.env`, never printed.
 
+The questions and the monitor use the same settings rules. The installer
+checks them with host Python, or one disposable Python container on Unraid;
+it reuses that checker across questions and sends secrets on standard input.
+Topic names and bundled phone usernames use 1–64 letters, digits, `_` or `-`.
+The phone password needs at least eight characters and is stored by ntfy,
+not in `monitor.env`. Silence accepts at least one second (`1/86400` days)
+and at most 36500 days, including decimals or scientific notation.
+
 **Phone alerts only reach the phone where it can reach this server.** The
 bundled ntfy is published on your LAN address, port 8092, like the other
 ports. So the phone gets alerts on home WiFi or over a VPN into your network.
@@ -1911,6 +1919,26 @@ Hold accepts 0–604800 seconds, repeat 1 second–8760 hours, cap an integer
 Delivery requires an HTTP(S) topic URL without embedded credentials, query or
 fragment, ending in a 1–64 character topic (letters, digits, `_` or `-`), plus
 a token. `MONITOR_ENABLED=false` idles without DB reads.
+
+An ntfy token is nonempty printable ASCII without spaces; metrics tokens
+need at least 32 such characters. The literal example `<token>` is not a
+credential. Punctuation such as `$`, `#`, `<`, `>`, quotes and backslashes
+is allowed in real tokens. URLs need a valid DNS name or IP address and a
+port from 1 to 65535 if present; bracket an IPv6 address. URL whitespace and
+control characters are refused. An invalid setting stops the enabled output
+or monitor at startup with the setting's name, without printing the secret.
+
+The installer quotes and escapes values before writing them, so they survive
+Compose's `env_file` parsing, including Compose 2.26. When editing by hand,
+single-quote literal values containing `$`, `#`, spaces or quotes; for
+example, `NTFY_TOKEN='fake$literal#value<suffix>'`. In single quotes, write an
+apostrophe as `\'`. For a value containing backslashes, use double quotes,
+write each backslash as `\\`, each double quote as `\"`, and each dollar sign
+as `$$`. Do not use shell variable references such as `$OTHER` or `${OTHER}`
+in `monitor.env`: Compose expands unquoted and double-quoted references,
+while the installer refuses to guess their values. An unquoted ` #` begins a
+comment; inside quotes it is part of the value. Keep one setting per line.
+These are [Compose's environment-file rules](https://docs.docker.com/reference/compose-file/services/#env_file).
 
 Silence **E7001 DEVICE_SILENT** reads "No contact for N days", bypasses the
 device-fault severity threshold and hold, and shares reminders and the cap.
@@ -2203,7 +2231,15 @@ LOKI_BEARER_TOKEN=<token>
 ```
 
 If Loki has no authentication, leave all three auth settings blank. Do not put
-credentials in the URL or commit them. In `.env`, select the private file with
+credentials in the URL or commit them. A bearer token has 1–1024 printable
+ASCII characters without spaces and cannot be the example `<token>`. Basic
+usernames and passwords have 1–1024 printable ASCII characters, including
+spaces; the username cannot contain a colon. The optional tenant ID has at
+most 128 printable ASCII characters, including spaces. All reject control
+characters. Quote punctuation as described in 11b; the installer does this
+for you. At the tenant question, `-` clears the saved value.
+
+In `.env`, select the private file with
 `MONITOR_ENV_FILE=./monitor.env`, then recreate the monitor:
 
 ```bash

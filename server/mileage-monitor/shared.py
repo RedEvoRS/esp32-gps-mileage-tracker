@@ -1,7 +1,6 @@
 """Output-independent condition evidence, event fields and delivery helpers."""
 
 import hashlib
-import ipaddress
 import json
 import re
 import sqlite3
@@ -11,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from common.diagnostics import validate_device_id
+from settings_rules import host_valid
 
 
 SNAPSHOT_MAX_AGE_SECONDS = 86400
@@ -18,15 +18,8 @@ SILENCE = 7001
 FIELD = re.compile(r"[A-Za-z0-9_.\-]{1,64}")
 
 
-def valid_host(host):
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except ValueError:
-        return bool(host and len(host) <= 253 and all(
-            re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", label)
-            for label in host.rstrip(".").split(".")))
-
+# Keep the public helper name while the standalone installer checker owns the rule.
+valid_host = host_valid
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):

@@ -27,8 +27,9 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
-from common.settings import boolean as _boolean
-from shared import NoRedirect, epoch, event_fields, valid_host as _valid_host
+from settings_rules import boolean as _boolean
+import settings_rules
+from shared import NoRedirect, epoch, event_fields
 
 
 SOURCE = "mileage-tracker"  # GELF "host": one fixed value to filter streams on.
@@ -92,25 +93,16 @@ class GelfConfig:
             raise ValueError("GRAYLOG_GELF_CA_FILE must name a readable certificate file")
         host, port = "", 0
         if url:
-            try:
-                parsed = urllib.parse.urlsplit(url)
-                valid = (parsed.scheme in ("http", "https") and _valid_host(parsed.hostname or "")
-                         and parsed.port != 0 and parsed.username is None and parsed.password is None
-                         and not parsed.query and not parsed.fragment
-                         and not any(c.isspace() for c in url))
-            except ValueError:
-                valid = False
+            valid = settings_rules.valid("GRAYLOG_GELF_URL", url)
             if not valid:
                 raise ValueError("GRAYLOG_GELF_URL must be an http(s) URL without credentials, query or fragment")
             if tls:
                 raise ValueError("GRAYLOG_GELF_TLS applies to GRAYLOG_GELF_TCP; use an https URL instead")
         else:
-            match = re.fullmatch(r"\[([0-9A-Fa-f:.]+)\]:(\d{1,5})|([^:\[\]\s]+):(\d{1,5})", tcp)
-            if match:
-                host = match.group(1) or match.group(3)
-                port = int(match.group(2) or match.group(4))
-            if not match or not _valid_host(host) or not 1 <= port <= 65535:
+            target = settings_rules.tcp_address(tcp)
+            if target is None:
                 raise ValueError("GRAYLOG_GELF_TCP must be <host>:<port>")
+            host, port = target
         name, value = "", ""
         header = env.get("GRAYLOG_GELF_HEADER", "")
         if header:
