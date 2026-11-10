@@ -119,6 +119,9 @@ services:
       - VIEWER_DB_PATH=/db/annotations.db
       - VIEWER_TRUSTED_PROXIES=${VIEWER_TRUSTED_PROXIES:-}
       - VIEWER_COOKIE_SECURE=${VIEWER_COOKIE_SECURE:-false}
+      # Empty/unset keeps OSM; use none to draw the track without base tiles.
+      - MAP_TILE_URL=${MAP_TILE_URL:-}
+      - MAP_TILE_ATTRIBUTION=${MAP_TILE_ATTRIBUTION:-}
       # Timezone all trip times are displayed and exported in, from .env
       # (see the note on the ingest service).
       - DISPLAY_TZ=${DISPLAY_TZ:-}
@@ -158,6 +161,15 @@ services:
       - "${BIND_ADDR:-0.0.0.0}:8093:8093"
     depends_on:
       - mileage-ingest
+
+    # Three missed one-minute ticks, then two failed local probes. Disabled
+    # ticks still refresh this file; no network or credentials are needed.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import pathlib, sys, time; p = pathlib.Path('/state/heartbeat'); sys.exit(0 if p.is_file() and 0 <= time.time() - p.stat().st_mtime <= 180 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 2
+      start_period: 90s
 
   # Opt in separately: an existing self-hosted ntfy can be used instead.
   ntfy:

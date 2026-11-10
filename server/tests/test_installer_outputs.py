@@ -40,9 +40,25 @@ HARNESS = textwrap.dedent("""\
     BIND_ADDR=${FAKE_BIND-}
     DOCKER=(docker)
 
+    # A first checker start must happen in the parent, before any $(mon_value).
+    eval "$(declare -f settings_start | sed '1s/settings_start/settings_start_real/')"
+    settings_start() {
+        if [[ -z $SETTINGS_PID && $BASH_SUBSHELL -ne 0 ]]; then
+            printf 'Checker started in a command substitution\\n' >&2
+            exit 98
+        fi
+        settings_start_real
+    }
+    if [[ ${FAKE_FORBID_CHECKER:-no} == yes ]]; then
+        host_python() { printf 'Unexpected checker startup\\n' >&2; return 99; }
+    fi
+
     # Docker: every inspect answers with the state the test set.
     docker() {
-        if [[ $* == *com.docker.compose.config-hash* ]]; then
+        if [[ $* == *'.State.Health'* ]]; then
+            printf '%s\\n' "${FAKE_MONITOR_HEALTH:-healthy}"
+            return 0
+        elif [[ $* == *com.docker.compose.config-hash* ]]; then
             printf '%s\\n' "${FAKE_CONTAINER_HASH:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
             printf '%s' "${FAKE_HASH_ERROR-}" >&2
             return "${FAKE_INSPECT_RC:-0}"
@@ -173,6 +189,8 @@ class InstallerOutputs(unittest.TestCase):
     def setUp(self):
         self.work = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
+        (self.work / "mileage-monitor").mkdir()
+        shutil.copyfile(SERVER / "mileage-monitor/settings_rules.py", self.work / "mileage-monitor/settings_rules.py")
         (self.work / "grafana").mkdir()
         # Unix line endings, as preflight converts a Windows checkout to.
         (self.work / "ntfy").mkdir()
@@ -222,7 +240,7 @@ class InstallerOutputs(unittest.TestCase):
             self.assertNotIn(secret, result.stdout + result.stderr)
 
     def test_none_writes_a_disabled_monitor_env_and_one_pointer(self):
-        result = self.run_step(INSTALL_OUTPUTS="none")
+        result = self.run_step(INSTALL_OUTPUTS="none", FAKE_FORBID_CHECKER="yes")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Notification outputs: off", result.stdout)
         self.assertEqual(self.setting("MONITOR_ENABLED"), "false")
@@ -233,6 +251,9 @@ class InstallerOutputs(unittest.TestCase):
         self.assertEqual(added, {"MONITOR_ENV_FILE=./monitor.env"})
         self.assertFalse((self.work / "viewer.env").exists())
         self.assertNotIn("up -d --build", self.compose_log())
+        self.assertNotIn("Installer Python:", result.stderr)
+        self.assertIn("stop mileage-monitor", self.compose_log())
+        self.assertIn("stop ntfy", self.compose_log())
 
     def test_metrics_only_by_environment_variables(self):
         result = self.run_step(INSTALL_OUTPUTS="metrics", INSTALL_STALE_DAYS="7")
@@ -268,9 +289,9 @@ class InstallerOutputs(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.setting("NOTIFY_ENABLED"), "true")
-        self.assertEqual(self.setting("NTFY_URL"), "https://ntfy.invalid/mileage-tracker")
-        self.assertEqual(self.setting("NTFY_TOKEN"), NTFY_TOKEN)
-        self.assertEqual(self.setting("LOKI_PUSH_URL"), "https://loki.invalid/loki/api/v1/push")
+        self.assertEqual(self.setting("NTFY_URL"), "'https://ntfy.invalid/mileage-tracker'")
+        self.assertEqual(self.setting("NTFY_TOKEN"), f"'{NTFY_TOKEN}'")
+        self.assertEqual(self.setting("LOKI_PUSH_URL"), "'https://loki.invalid/loki/api/v1/push'")
         self.assertEqual(self.setting("LOKI_BEARER_TOKEN"), f"'{LOKI_BEARER}'")
         self.assertEqual(self.setting("LOKI_TENANT_ID"), "'tenant-a'")
         self.assertEqual(self.setting("LOKI_BASIC_AUTH_USER"), "")
@@ -295,8 +316,8 @@ class InstallerOutputs(unittest.TestCase):
         self.assertNotIn(PHONE_PASSWORD, log)
         self.assertIn("up -d ntfy", log)
         self.assertIn("exec -T ntfy ntfy access mileage mileage-tracker rw", log)
-        self.assertEqual(self.setting("NTFY_URL"), "http://ntfy:80/mileage-tracker")
-        self.assertEqual(self.setting("NTFY_TOKEN"), NTFY_TOKEN)
+        self.assertEqual(self.setting("NTFY_URL"), "'http://ntfy:80/mileage-tracker'")
+        self.assertEqual(self.setting("NTFY_TOKEN"), f"'{NTFY_TOKEN}'")
         self.assertIn("Phone setup (one time)", result.stdout)
         self.assert_no_secret(result, PHONE_PASSWORD, NTFY_TOKEN)
 
@@ -317,7 +338,7 @@ class InstallerOutputs(unittest.TestCase):
         self.assertNotIn("user add", log)
         self.assertNotIn("change-pass", log)
         self.assertIn("exec -T ntfy ntfy access mileage mileage-tracker rw", log)
-        self.assertEqual(self.setting("NTFY_TOKEN"), NTFY_TOKEN)
+        self.assertEqual(self.setting("NTFY_TOKEN"), f"'{NTFY_TOKEN}'")
         self.assertIn("Skipped the ntfy test", result.stdout)
         self.assert_no_secret(result, NTFY_TOKEN, PHONE_PASSWORD)
 
@@ -421,7 +442,7 @@ class InstallerOutputs(unittest.TestCase):
                                INSTALL_NTFY_READY="n")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.setting("NOTIFY_ENABLED"), "true")
-        self.assertEqual(self.setting("NTFY_TOKEN"), NTFY_TOKEN)
+        self.assertEqual(self.setting("NTFY_TOKEN"), f"'{NTFY_TOKEN}'")
         self.assertIsNone(self.setting("LOKI_PUSH_URL"))
         self.assertIn(f"#LOKI_BEARER_TOKEN='{LOKI_BEARER}'", self.text("monitor.env"))
         self.assert_no_secret(result, LOKI_BEARER)
@@ -483,7 +504,7 @@ class InstallerOutputs(unittest.TestCase):
              "INSTALL_LOKI_URL=https://loki.invalid/push isn't usable."),
             (dict(INSTALL_OUTPUTS="loki", INSTALL_STALE_DAYS="7",
                   INSTALL_LOKI_URL="https://loki.invalid/loki/api/v1/push", INSTALL_LOKI_AUTH="bearer",
-                  INSTALL_LOKI_BEARER_TOKEN="has'quote"),
+                  INSTALL_LOKI_BEARER_TOKEN="has space"),
              "INSTALL_LOKI_BEARER_TOKEN isn't usable."),
         ]
         for presets, message in cases:
@@ -573,17 +594,19 @@ class InstallerOutputs(unittest.TestCase):
                 self.assertNotIn("  OK  The monitor is running", result.stdout)
 
     def test_graylog_url_comments_out_a_tls_setting_that_only_applies_to_tcp(self):
-        (self.work / "monitor.env").write_text(
-            (self.work / "monitor.env.example").read_text(encoding="utf-8")
-            + "GRAYLOG_GELF_TLS=true\nGRAYLOG_GELF_TCP=old.invalid:12201\n")
-        result = self.run_step(INSTALL_KEEP_OUTPUTS="n", INSTALL_OUTPUTS="graylog",
-                               INSTALL_GRAYLOG_TARGET="https://graylog.invalid/gelf",
-                               INSTALL_GRAYLOG_ARRIVED="y")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.setting("GRAYLOG_GELF_URL"), "https://graylog.invalid/gelf")
-        self.assertEqual(self.setting("GRAYLOG_GELF_TCP"), "")
-        self.assertIn("#GRAYLOG_GELF_TLS=true", self.text("monitor.env"))
-        self.assertIn("GRAYLOG_GELF_TLS=true was commented out", result.stdout)
+        for tls in ("true", "TRUE"):
+            with self.subTest(tls=tls):
+                (self.work / "monitor.env").write_text(
+                    (self.work / "monitor.env.example").read_text(encoding="utf-8")
+                    + f"GRAYLOG_GELF_TLS={tls}\nGRAYLOG_GELF_TCP=old.invalid:12201\n")
+                result = self.run_step(INSTALL_KEEP_OUTPUTS="n", INSTALL_OUTPUTS="graylog",
+                                       INSTALL_GRAYLOG_TARGET="HTTPS://graylog.invalid/gelf",
+                                       INSTALL_GRAYLOG_ARRIVED="y")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.setting("GRAYLOG_GELF_URL"), "'HTTPS://graylog.invalid/gelf'")
+                self.assertEqual(self.setting("GRAYLOG_GELF_TCP"), "")
+                self.assertIn(f"#GRAYLOG_GELF_TLS={tls}", self.text("monitor.env"))
+                self.assertIn("GRAYLOG_GELF_TLS=true was commented out", result.stdout)
 
     def test_bundled_ntfy_password_change_for_an_existing_user(self):
         setup = self.run_step(INSTALL_OUTPUTS="ntfy", INSTALL_NTFY_MODE="bundled",
@@ -621,6 +644,48 @@ class InstallerOutputs(unittest.TestCase):
         self.assertIn("The monitor isn't running", result.stdout)
         self.assertIn("FAILURES=1", result.stdout)
 
+    def test_check_reports_unhealthy_monitor_even_with_disabled_defaults(self):
+        result = self.run_step(mode="check", FAKE_MONITOR_HEALTH="unhealthy")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("The monitor is unhealthy (heartbeat health: unhealthy)", result.stdout)
+        self.assertIn("FAILURES=1", result.stdout)
+        self.assertIn("Notification outputs: off", result.stdout)
+        self.assertEqual(self.sent(), [])
+
+    def test_check_without_monitor_has_no_optional_health_warning(self):
+        result = self.run_step(mode="check", FAKE_RUNNING="", FAKE_FORBID_CHECKER="yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("FAILURES=0", result.stdout)
+        self.assertNotIn("heartbeat", result.stdout)
+        self.assertNotIn("unhealthy", result.stdout)
+        self.assertNotIn("Installer Python:", result.stderr)
+
+    def test_check_missing_monitor_file_never_starts_checker(self):
+        with self.env_file.open("a", encoding="utf-8") as handle:
+            handle.write("MONITOR_ENV_FILE=./missing-monitor.env\n")
+        result = self.run_step(mode="check", FAKE_FORBID_CHECKER="yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("which doesn't exist", result.stdout)
+        self.assertIn("The monitor heartbeat is healthy", result.stdout)
+        self.assertNotIn("Installer Python:", result.stderr)
+
+    def test_check_without_monitor_env_still_reports_unhealthy_existing_monitor(self):
+        result = self.run_step(mode="check", FAKE_FORBID_CHECKER="yes", FAKE_MONITOR_HEALTH="unhealthy")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("The monitor is unhealthy", result.stdout)
+        self.assertIn("FAILURES=1", result.stdout)
+        self.assertNotIn("Installer Python:", result.stderr)
+
+    def test_check_healthy_starting_and_older_monitor_states(self):
+        for health, message in (("healthy", "The monitor heartbeat is healthy"),
+                                ("starting", "health check is still starting"),
+                                ("none", "The monitor has no heartbeat health check")):
+            with self.subTest(health=health):
+                result = self.run_step(mode="check", FAKE_MONITOR_HEALTH=health)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(message, result.stdout)
+                self.assertIn("FAILURES=0", result.stdout)
+
     def test_check_reports_an_unreachable_graylog(self):
         self.run_step(INSTALL_OUTPUTS="graylog", INSTALL_GRAYLOG_TARGET="graylog.invalid:12201",
                       INSTALL_GRAYLOG_ARRIVED="y", INSTALL_STALE_DAYS="7")
@@ -647,7 +712,7 @@ class InstallerOutputs(unittest.TestCase):
         self.assertNotIn("<token>", result.stdout)
         self.assertNotIn("<topic>", result.stdout)
         self.assertNotIn("Enter keeps the current one", result.stdout)
-        self.assertEqual(self.setting("NTFY_URL"), "http://ntfy:80/mileage-tracker")
+        self.assertEqual(self.setting("NTFY_URL"), "'http://ntfy:80/mileage-tracker'")
 
     def test_the_graylog_question_offers_no_placeholder(self):
         result = self.run_step(answers="\n", drop=("INSTALL_GRAYLOG_TARGET",), INSTALL_OUTPUTS="graylog")
@@ -686,16 +751,17 @@ class InstallerOutputs(unittest.TestCase):
             NTFY_TOKEN=plain
             A="it's"
             B='"quoted"'
-            C="mismatched'
+            C="matched"
             D=<host>
             E="<token>"
-            F=""
+            F="abc<def"
             """), encoding="utf-8")
         snippet = textwrap.dedent("""\
             source <(sed '$d' "$INSTALL")
             SCRIPT_DIR=$WORK
             cd "$WORK"
             MONITOR_FILE=$WORK/monitor.env
+            settings_start
             for key in MONITOR_ENABLED NOTIFY_ENABLED NTFY_URL NTFY_TOKEN A B C D E F; do
                 printf '%s=[%s]\\n' "$key" "$(mon_value "$MONITOR_FILE" "$key")"
             done
@@ -706,8 +772,8 @@ class InstallerOutputs(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.splitlines(), [
             "MONITOR_ENABLED=[true]", "NOTIFY_ENABLED=[true]", "NTFY_URL=[http://ntfy:80/x]",
-            "NTFY_TOKEN=[plain]", "A=[it's]", 'B=["quoted"]', "C=[\"mismatched']",
-            "D=[]", "E=[]", "F=[]", "ntfy-on"])
+            "NTFY_TOKEN=[plain]", "A=[it's]", 'B=["quoted"]', "C=[matched]",
+            "D=[<host>]", "E=[<token>]", "F=[abc<def]", "ntfy-on"])
 
 
     def bundled_setup(self, user, token_list=BOB_TOKEN_LIST):
@@ -719,7 +785,7 @@ class InstallerOutputs(unittest.TestCase):
 
     def test_a_rerun_offers_the_token_owner_and_keeps_the_token(self):
         self.bundled_setup("bob")
-        self.assertEqual(self.setting("NTFY_TOKEN"), NTFY_TOKEN)
+        self.assertEqual(self.setting("NTFY_TOKEN"), f"'{NTFY_TOKEN}'")
         (self.work / "compose.log").unlink()
         # Enter for the username (the default), Enter for the password (keep it).
         result = self.run_step(
@@ -734,7 +800,7 @@ class InstallerOutputs(unittest.TestCase):
         for action in ("user add", "change-pass", "token add"):
             self.assertNotIn(action, log)
         self.assertIn("ntfy access bob mileage-tracker rw", log)
-        self.assertEqual(self.setting("NTFY_TOKEN"), NTFY_TOKEN)
+        self.assertEqual(self.setting("NTFY_TOKEN"), f"'{NTFY_TOKEN}'")
         self.assertIn("Kept the access token already in monitor.env (it belongs to bob)", result.stdout)
         self.assertEqual(self.sent(), [])
         self.assert_no_secret(result, NTFY_TOKEN, PHONE_PASSWORD)
@@ -755,7 +821,7 @@ class InstallerOutputs(unittest.TestCase):
         log = self.compose_log()
         self.assertIn("ntfy token add carol", log)
         self.assertIn("ntfy access carol mileage-tracker rw", log)
-        self.assertEqual(self.setting("NTFY_TOKEN"), carol_token)
+        self.assertEqual(self.setting("NTFY_TOKEN"), f"'{carol_token}'")
         self.assert_no_secret(result, NTFY_TOKEN, carol_token, "carol-phone-pw")
 
         # An existing user who doesn't own the token: the token is replaced.
@@ -770,7 +836,7 @@ class InstallerOutputs(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("The token in monitor.env belongs to carol, not dave, so a new one is made.", result.stdout)
         self.assertIn("ntfy token add dave", self.compose_log())
-        self.assertEqual(self.setting("NTFY_TOKEN"), dave_token)
+        self.assertEqual(self.setting("NTFY_TOKEN"), f"'{dave_token}'")
         self.assert_no_secret(result, carol_token, dave_token)
 
     def test_the_token_owner_is_found_for_each_token_in_the_listing(self):

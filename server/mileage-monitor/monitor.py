@@ -5,11 +5,8 @@ All mutable policy, queue, retry and rate-limit state belongs to monitor.db.
 """
 
 import json
-import ipaddress
 import logging
-import math
 import os
-import re
 import signal
 import sqlite3
 import threading
@@ -37,12 +34,14 @@ from common.diagnostics import CatalogError, load_catalog, validate_device_id, v
 import gelf  # noqa: E402
 import loki as loki_module  # noqa: E402
 import prometheus  # noqa: E402
+import shared  # noqa: E402
+from shared import NoRedirect, SNAPSHOT_MAX_AGE_SECONDS  # noqa: E402
+import settings_rules  # noqa: E402
 
 
 
 LOG = logging.getLogger("mileage-monitor")
-SEVERITIES = ("info", "warning", "error", "critical")
-SNAPSHOT_MAX_AGE_SECONDS = 86400
+SEVERITIES = settings_rules.SEVERITIES
 TICK_SECONDS = 60
 MAX_BODY_BYTES = 3500  # Leave room below ntfy's default 4096-byte message limit.
 
@@ -68,7 +67,7 @@ class Config:
 
         def boolean(name):
             value = env.get(name, "false").lower()
-            if value not in ("true", "false"):
+            if not settings_rules.valid(name, value):
                 raise ValueError(name + " must be true or false")
             return value == "true"
 
@@ -83,46 +82,29 @@ class Config:
             return cls()  # Inactive profile can carry unfilled example settings.
         notify = boolean("NOTIFY_ENABLED")
 
-        def number(name, default, lower, upper, *, integer=False):
+        def number(name, default):
             try:
                 raw = env.get(name, str(default))
-                value = int(raw) if integer else float(raw)
-                if not math.isfinite(value) or not lower <= value <= upper:
+                value = int(raw) if settings_rules.NUMBERS[name][2] else float(raw)
+                if not settings_rules.valid(name, raw):
                     raise ValueError
             except (ValueError, TypeError, OverflowError):
                 raise ValueError(name + " is outside its supported numeric range") from None
             return value
 
         severity = env.get("NOTIFY_MIN_SEVERITY", "error")
-        if severity not in SEVERITIES:
+        if not settings_rules.valid("NOTIFY_MIN_SEVERITY", severity):
             raise ValueError("NOTIFY_MIN_SEVERITY must be info, warning, error or critical")
-        hold = number("NOTIFY_HOLD_SECONDS", 300, 0, 604800)
-        repeat = number("NOTIFY_REPEAT_HOURS", 24, 1 / 3600, 8760) * 3600
-        maximum = number("NOTIFY_MAX_PER_HOUR", 6, 1, 1000, integer=True)
-        stale = number("MONITOR_STALE_DAYS", 7, 1 / 86400, 36500) * 86400
+        hold = number("NOTIFY_HOLD_SECONDS", 300)
+        repeat = number("NOTIFY_REPEAT_HOURS", 24) * 3600
+        maximum = number("NOTIFY_MAX_PER_HOUR", 6)
+        stale = number("MONITOR_STALE_DAYS", 7) * 86400
         url, token = env.get("NTFY_URL", ""), env.get("NTFY_TOKEN", "")
         if notify:
-            try:
-                parsed = urllib.parse.urlsplit(url)
-                host = parsed.hostname or ""
-                try:
-                    ipaddress.ip_address(host)
-                    valid_host = True
-                except ValueError:
-                    valid_host = bool(host and len(host) <= 253 and all(
-                        re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", label)
-                        for label in host.rstrip(".").split(".")))
-                valid = (parsed.scheme in ("http", "https") and parsed.hostname
-                         and valid_host
-                         and parsed.port != 0 and parsed.username is None
-                         and parsed.password is None and not parsed.query and not parsed.fragment
-                         and re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", parsed.path.rsplit("/", 1)[-1])
-                         and not any(c.isspace() for c in url))
-            except ValueError:
-                valid = False
+            valid = settings_rules.valid("NTFY_URL", url)
             if not valid:
                 raise ValueError("NTFY_URL must be an http(s) topic URL without credentials, query or fragment")
-            if not token or token == "<token>" or any(not 33 <= ord(c) <= 126 for c in token):
+            if not settings_rules.valid("NTFY_TOKEN", token):
                 raise ValueError("NTFY_TOKEN must be a nonempty access token without whitespace")
         return cls(enabled=enabled, notify=notify, url=url, token=token,
                    min_severity=severity, hold_seconds=hold, repeat_seconds=repeat,
@@ -188,12 +170,6 @@ def read_devices(path, catalog):
         return devices
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        # Never forward the bearer token through a redirect.
-        return None
-
-
 class NtfySender:
     def __init__(self, config):
         self.config = config
@@ -252,6 +228,7 @@ class Monitor:
             raise ValueError("Cannot start monitor: missing or invalid diagnostics catalog.json") from exc
         self.codes = {row["code"]: row for row in self.catalog["codes"]}
         self.events_path, self.state_path = Path(events_path), Path(state_path)
+        self.heartbeat_path = self.state_path.with_name("heartbeat")
         if self.events_path.resolve() == self.state_path.resolve():
             raise ValueError("monitor state must be separate from diagnostics")
         self.clock = clock
@@ -328,31 +305,29 @@ class Monitor:
         previous = {tuple(row[:3]): row[3] for row in db.execute(
             "SELECT device,code,episode,eligible_since FROM episodes WHERE state='active'")}
         db.execute("UPDATE episodes SET state='unknown', eligible_since=NULL WHERE state!='clear'")
+        known = {(device, code) for device, code in db.execute("SELECT device,code FROM episodes")}
+        states = shared.condition_states(devices, known, now, self.config.stale_seconds)
+        by_device = {device["device_id"]: device for device in devices}
         clear_codes = set()
-        for device in devices:
-            name, contact = device["device_id"], device["contact"]
-            if contact is None:  # Damaged identity/contact cannot drive any policy.
+        for (name, code), (state, episode, contact) in states.items():
+            if state == "unknown":
                 continue
-            clear_codes.add((name, 7001))  # Per-episode contact comparison below.
-            # A contact is recovery only when it is genuinely newer than the
-            # contact on which this silence episode was based (not a clock jump).
-            db.execute("UPDATE episodes SET state='clear', eligible_since=NULL "
-                       "WHERE device=? AND code=7001 AND contact<?", (name, contact))
-            if now - contact >= self.config.stale_seconds:
-                episode = "silence:" + device["last_contact_at"]
-                self._active(db, name, 7001, episode, 0, contact, now, previous)
-            snapshot = device["snapshot"]
-            if snapshot is None or not 0 <= now - device["snapshot_at"] <= SNAPSHOT_MAX_AGE_SECONDS:
+            if code == shared.SILENCE:
+                clear_codes.add((name, code))
+                # Newer contact alone can resolve a silence episode; a clock
+                # jump with unchanged contact must never manufacture recovery.
+                db.execute("UPDATE episodes SET state='clear', eligible_since=NULL "
+                           "WHERE device=? AND code=? AND contact<?", (name, code, contact))
+                if state == "active":
+                    self._active(db, name, code, episode, 0, contact, now, previous)
                 continue
-            revision = snapshot["status_sequence"]
-            active = {item["code"]: item["episode_id"] for item in snapshot["active"]}
-            for code in set(snapshot.get("observed", [])) - set(active):
+            revision = by_device[name]["snapshot"]["status_sequence"]
+            if state == "clear":
                 clear_codes.add((name, code))
                 db.execute("UPDATE episodes SET state='clear', eligible_since=NULL "
                            "WHERE device=? AND code=? AND revision<?", (name, code, revision))
-            for code, episode in active.items():
-                if self.eligible(code):
-                    self._active(db, name, code, episode, revision, None, now, previous)
+            elif self.eligible(code):
+                self._active(db, name, code, episode, revision, None, now, previous)
         return clear_codes
 
     @staticmethod
@@ -450,7 +425,13 @@ class Monitor:
 
     def tick(self):
         try:
-            return self._tick()
+            completed = self._tick()
+            if completed:
+                # Disabled and not-yet-enrolled installs are healthy. Unreadable
+                # diagnostics return False; no useful monitoring completed.
+                self.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+                self.heartbeat_path.touch()
+            return completed
         except sqlite3.Error:
             if self.metrics_snapshot is not None:
                 self.metrics_snapshot.record_read_error()
@@ -492,7 +473,7 @@ class Monitor:
                     self.sender(body)
                 except Exception as exc:
                     attempts += 1
-                    delay = min(3600, 60 * 2 ** min(attempts - 1, 6))
+                    delay = shared.retry_delay(attempts)
                     with db:
                         db.execute("UPDATE retry SET attempts=?,next_attempt=? WHERE singleton=1",
                                    (attempts, now + delay))
@@ -540,7 +521,7 @@ class Monitor:
             return
         known = {(device, code): (state, episode) for device, code, state, episode in
                  db.execute("SELECT device,code,state,episode FROM gelf_conditions")}
-        changes = gelf.desired_conditions(devices, known, now, self.config.stale_seconds,
+        changes = shared.desired_conditions(devices, known, now, self.config.stale_seconds,
                                           SNAPSHOT_MAX_AGE_SECONDS)
         # Items are (kind, key, payload); payload None marks a damaged event
         # that is skipped but still advances the cursor once reached.
@@ -548,8 +529,8 @@ class Monitor:
                     self.codes, key[0], key[1], value[0], value[1], now, value[2]))
                  for key, value in sorted(changes.items())][:gelf.MAX_PER_TICK]
         cursor = db.execute("SELECT event_rowid FROM gelf_cursor WHERE singleton=1").fetchone()[0]
-        highest, rows, anchor = gelf.read_events(self.events_path, cursor, max(0, gelf.MAX_PER_TICK - len(items)))
-        if highest < cursor or gelf.cursor_changed(db, "gelf", cursor, anchor):
+        highest, rows, anchor = shared.read_events(self.events_path, cursor, max(0, gelf.MAX_PER_TICK - len(items)))
+        if highest < cursor or shared.cursor_changed(db, "gelf", cursor, anchor):
             # events.db was replaced (e.g. restored from a backup): start over.
             # Graylog may see duplicates; it never silently misses events.
             LOG.warning("Diagnostics event identity changed at the Graylog cursor; resending from the start")
@@ -557,7 +538,7 @@ class Monitor:
                 db.execute("UPDATE gelf_cursor SET event_rowid=0 WHERE singleton=1")
                 db.execute("DELETE FROM event_cursor_markers WHERE sink='gelf'")
             return
-        fingerprints = {row[0]: gelf.event_fingerprint(row) for row in rows}
+        fingerprints = {row[0]: shared.event_fingerprint(row) for row in rows}
         for row in rows:
             payload = gelf.event_message(self.codes, row)
             if payload is None:
@@ -585,12 +566,12 @@ class Monitor:
                                (device, code, state, episode))
                 else:
                     db.execute("UPDATE gelf_cursor SET event_rowid=? WHERE singleton=1", (key,))
-                    gelf.save_cursor_marker(db, "gelf", key, fingerprints[key])
+                    shared.save_cursor_marker(db, "gelf", key, fingerprints[key])
             if error is None:
                 db.execute("UPDATE gelf_retry SET attempts=0,next_attempt=0 WHERE singleton=1")
             else:
                 attempts += 1
-                delay = min(3600, 60 * 2 ** min(attempts - 1, 6))
+                delay = shared.retry_delay(attempts)
                 db.execute("UPDATE gelf_retry SET attempts=?,next_attempt=? WHERE singleton=1",
                            (attempts, now + delay))
         if error is None:
@@ -609,8 +590,8 @@ class Monitor:
             return
         event_cursor, decision_cursor = db.execute(
             "SELECT event_rowid,decision_id FROM loki_cursor WHERE singleton=1").fetchone()
-        highest, rows, anchor = gelf.read_events(self.events_path, event_cursor, loki_module.MAX_PER_TICK)
-        if highest < event_cursor or gelf.cursor_changed(db, "loki", event_cursor, anchor):
+        highest, rows, anchor = shared.read_events(self.events_path, event_cursor, loki_module.MAX_PER_TICK)
+        if highest < event_cursor or shared.cursor_changed(db, "loki", event_cursor, anchor):
             # A restored events.db can be shorter than this sink's cursor.
             # Start its history over without changing GELF progress.
             with db:
@@ -627,7 +608,7 @@ class Monitor:
         if not backlog:
             known_conditions = {(device, code): (state, episode) for device, code, state, episode in
                                 db.execute("SELECT device,code,state,episode FROM loki_conditions")}
-            changes = gelf.desired_conditions(devices, known_conditions, now, self.config.stale_seconds,
+            changes = shared.desired_conditions(devices, known_conditions, now, self.config.stale_seconds,
                                               SNAPSHOT_MAX_AGE_SECONDS)
             for key, value in sorted(changes.items())[:loki_module.MAX_PER_TICK - len(rows)]:
                 item = loki_module.condition_log(self.codes, key[0], key[1], value[0], now)
@@ -665,11 +646,17 @@ class Monitor:
                 rejection_status = exc.status_code
             except Exception as exc:
                 attempts += 1
-                delay = min(3600, 60 * 2 ** min(attempts - 1, 6))
+                delay = shared.retry_delay(attempts)
                 with db:
                     db.execute("UPDATE loki_retry SET attempts=?,next_attempt=? WHERE singleton=1",
                                (attempts, now + delay))
-                LOG.warning("Loki delivery failed (%s); retry in %s seconds", type(exc).__name__, delay)
+                if isinstance(exc, urllib.error.HTTPError) and 400 <= exc.code < 500:
+                    # Backoff already bounds retries; keep settings failures
+                    # visible at the default log level until delivery recovers.
+                    LOG.warning("Loki delivery failed (HTTP %s); check token, tenant, push URL or proxy; "
+                                "retry in %s seconds without advancing cursors", exc.code, delay)
+                else:
+                    LOG.warning("Loki delivery failed (%s); retry in %s seconds", type(exc).__name__, delay)
                 return
 
         next_event = max(selected_events, default=event_cursor)
@@ -678,7 +665,7 @@ class Monitor:
             db.execute("UPDATE loki_cursor SET event_rowid=?,decision_id=? WHERE singleton=1",
                        (next_event, next_decision))
             if rows:
-                gelf.save_cursor_marker(db, "loki", next_event, gelf.event_fingerprint(rows[-1]))
+                shared.save_cursor_marker(db, "loki", next_event, shared.event_fingerprint(rows[-1]))
             for (device, code), (state, episode, _), _ in condition_items:
                 db.execute("INSERT INTO loki_conditions VALUES (?,?,?,?) ON CONFLICT(device,code) "
                            "DO UPDATE SET state=excluded.state, episode=excluded.episode",
@@ -690,6 +677,26 @@ class Monitor:
                         rejection_status)
         elif push_items:
             LOG.info("Loki accepted %s log line(s)", len(push_items))
+
+
+def log_unexpected_tick(exc):
+    """Log a traceback without exception text, source, locals or private paths."""
+    frames = ["Traceback (frames only; exception messages, source and locals omitted):"]
+    trace = exc.__traceback__
+    while trace is not None:
+        code = trace.tb_frame.f_code
+        # Only these reviewed source names/functions can enter the log. A
+        # library or dynamically compiled filename might itself contain secrets.
+        filename = Path(code.co_filename)
+        if (filename.parent == Path(__file__).parent and filename.name in
+                {"monitor.py", "shared.py", "gelf.py", "loki.py", "prometheus.py"}):
+            name, function = filename.name, code.co_name
+        else:
+            name, function = "<external>", "<external>"
+        frames.append(f'  File "{name}", line {trace.tb_lineno}, in {function}')
+        trace = trace.tb_next
+    LOG.error("Unexpected monitor tick failure (%s); retry next tick\n%s",
+              type(exc).__name__, "\n".join(frames))
 
 
 def main():
@@ -720,6 +727,8 @@ def main():
             monitor.tick()
         except (sqlite3.Error, OSError, ValueError) as exc:
             LOG.error("Monitor state unavailable (%s); retry next tick", type(exc).__name__)
+        except Exception as exc:
+            log_unexpected_tick(exc)
         stop.wait(TICK_SECONDS)
     if metrics_server is not None:
         metrics_server.shutdown()

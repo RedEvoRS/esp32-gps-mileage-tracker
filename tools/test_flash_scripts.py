@@ -15,8 +15,12 @@ import subprocess
 import tempfile
 import unittest
 
+from test_flash_partition_limits import PARTITION_TABLE_OFFSET, partition_regions
+
 
 ROOT = Path(__file__).resolve().parents[1]
+REGIONS = partition_regions()
+APP_START, APP_END = REGIONS["factory"]
 
 
 def fixture(folder):
@@ -25,10 +29,10 @@ def fixture(folder):
         "version": "v0.08+0123456789", "commit": "0" * 40,
         "fqbn": "esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled",
         "flash_mode": "dio", "flash_freq": "80m", "flash_size": "8MB",
-        "device_id": "test-device", "app_offset": "0x10000", "parts": [],
+        "device_id": "test-device", "app_offset": hex(APP_START), "parts": [],
     }
-    for name, offset in (("bootloader", "0x0"), ("partitions", "0x8000"),
-                         ("boot_app0", "0xe000"), ("app", "0x10000")):
+    for name, offset in (("bootloader", "0x0"), ("partitions", hex(PARTITION_TABLE_OFFSET)),
+                         ("boot_app0", hex(REGIONS["otadata"][0])), ("app", hex(APP_START))):
         content = (name + " synthetic test bytes").encode("ascii")
         (folder / (name + ".bin")).write_bytes(content)
         manifest["parts"].append({"name": name, "file": name + ".bin",
@@ -95,8 +99,8 @@ class BashFlashTests(unittest.TestCase):
                 self.save({**self.manifest, **change})
                 self.run_bash('flash_validate "$1" false', success=False)
         for field, value in (("file", "../app.bin"), ("sha256", "0" * 64),
-                             ("offset", "0x9000"), ("offset", "0x190000"),
-                             ("offset", "0x10001"), ("offset", "0x1;id"),
+                             ("offset", hex(REGIONS["nvs"][0])), ("offset", hex(APP_END)),
+                             ("offset", hex(APP_START + 1)), ("offset", "0x1;id"),
                              ("name", "bootloader")):
             with self.subTest(field=field, value=value):
                 altered = copy.deepcopy(self.manifest)
@@ -125,12 +129,12 @@ class BashFlashTests(unittest.TestCase):
 
     def test_reserved_region_and_oversized_app(self):
         app = self.folder / "app.bin"
-        app.write_bytes(b"x" * (0x180001))
+        app.write_bytes(b"x" * (APP_END - APP_START + 1))
         self.manifest["parts"][3]["sha256"] = hashlib.sha256(app.read_bytes()).hexdigest()
         self.save(self.manifest)
         self.run_bash('flash_validate "$1" false', success=False)
         self.manifest = fixture(self.folder)
-        self.manifest["parts"][2]["offset"] = "0x9000"
+        self.manifest["parts"][2]["offset"] = hex(REGIONS["nvs"][0])
         self.save(self.manifest)
         self.run_bash('flash_validate "$1" false', success=False)
 

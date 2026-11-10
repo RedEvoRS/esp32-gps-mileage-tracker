@@ -13,6 +13,18 @@ $helpers = ($source -split '# BEGIN PURE HELPERS[^\r\n]*\r?\n', 2)[1] -split '# 
 $folder = Join-Path ([IO.Path]::GetTempPath()) ('flash-tests-' + [guid]::NewGuid().ToString('N'))
 [IO.Directory]::CreateDirectory($folder) | Out-Null
 $script:checks = 0
+# The partition-table address is the ESP32-S3 default, not a CSV partition.
+$partitionTableOffset = '0x8000'
+$regions = @{}
+$csv = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'firmware/04_trip_logger/partitions.csv'
+Get-Content -LiteralPath $csv | Where-Object { $_.Trim() -and -not $_.TrimStart().StartsWith('#') } | ForEach-Object {
+    $cells = $_.Split(',') | ForEach-Object { $_.Trim() }
+    $regions[$cells[0]] = @{ Offset = [Convert]::ToInt64($cells[3].Substring(2), 16); Size = [Convert]::ToInt64($cells[4].Substring(2), 16) }
+}
+$appStart = '0x{0:x}' -f $regions.factory.Offset
+$appEnd = '0x{0:x}' -f ($regions.factory.Offset + $regions.factory.Size)
+$nvsStart = '0x{0:x}' -f $regions.nvs.Offset
+
 function Assert-Equal($Actual, $Expected) {
     if ($Actual -cne $Expected) { throw ("Expected '$Expected'; got '$Actual' at test line " + (Get-PSCallStack)[1].ScriptLineNumber) }
     $script:checks++
@@ -24,7 +36,7 @@ function Assert-Rejected([scriptblock]$Code) {
 }
 function New-Fixture {
     $parts = @()
-    foreach ($pair in @(@('bootloader', '0x0'), @('partitions', '0x8000'), @('boot_app0', '0xe000'), @('app', '0x10000'))) {
+    foreach ($pair in @(@('bootloader', '0x0'), @('partitions', $partitionTableOffset), @('boot_app0', ('0x{0:x}' -f $regions.otadata.Offset)), @('app', $appStart))) {
         $file = Join-Path $folder ($pair[0] + '.bin')
         [IO.File]::WriteAllBytes($file, [Text.Encoding]::ASCII.GetBytes($pair[0] + ' synthetic test bytes'))
         $parts += @{ name = $pair[0]; offset = $pair[1]; file = $pair[0] + '.bin'; sha256 = (Get-FileHash $file).Hash }
@@ -32,7 +44,7 @@ function New-Fixture {
     return [pscustomobject]@{
         schema = 1; chip = 'esp32s3'; kind = 'enroll'; version = 'v0.08+0123456789'; commit = '0' * 40
         fqbn = 'esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled'
-        flash_mode = 'dio'; flash_freq = '80m'; flash_size = '8MB'; app_offset = '0x10000'; parts = $parts
+        flash_mode = 'dio'; flash_freq = '80m'; flash_size = '8MB'; app_offset = $appStart; parts = $parts
     }
 }
 function Save-Fixture($Manifest) {
@@ -76,8 +88,8 @@ try {
         $m = New-Fixture; $m.($change[0]) = $change[1]; Save-Fixture $m
         Assert-Rejected { Test-FlashManifest $folder $false }
     }
-    foreach ($change in @(@('file', '../app.bin'), @('sha256', ('0' * 64)), @('offset', '0x9000'),
-        @('offset', '0x190000'), @('offset', '0x10001'), @('offset', '0x1;id'), @('name', 'bootloader'))) {
+    foreach ($change in @(@('file', '../app.bin'), @('sha256', ('0' * 64)), @('offset', $nvsStart),
+        @('offset', $appEnd), @('offset', ('0x{0:x}' -f ($regions.factory.Offset + 1))), @('offset', '0x1;id'), @('name', 'bootloader'))) {
         $m = New-Fixture; $m.parts[3][$change[0]] = $change[1]; Save-Fixture $m
         Assert-Rejected { Test-FlashManifest $folder $false }
     }
@@ -87,10 +99,10 @@ try {
     Remove-Item (Join-Path $folder 'app.bin')
     Assert-Rejected { Test-FlashManifest $folder $false }
     $m = New-Fixture
-    [IO.File]::WriteAllBytes((Join-Path $folder 'app.bin'), [byte[]]::new(0x180001))
+    [IO.File]::WriteAllBytes((Join-Path $folder 'app.bin'), [byte[]]::new($regions.factory.Size + 1))
     $m.parts[3].sha256 = (Get-FileHash (Join-Path $folder 'app.bin')).Hash; Save-Fixture $m
     Assert-Rejected { Test-FlashManifest $folder $false }
-    $m = New-Fixture; $m.parts[2].offset = '0x9000'; Save-Fixture $m
+    $m = New-Fixture; $m.parts[2].offset = $nvsStart; Save-Fixture $m
     Assert-Rejected { Test-FlashManifest $folder $false }
     Assert-Equal (Select-FlashPort 'COMx' @() '') 'COMx'
     Assert-Equal (Select-FlashPort '' @('COMx') '') 'COMx'

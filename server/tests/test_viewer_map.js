@@ -12,6 +12,7 @@ const source = fs.readFileSync(appPath, 'utf8');
 const inlineMap = source.match(/<script>\s*(var map = L\.map[\s\S]*?)<\/script>/)[1];
 const popups = [];
 const geometry = [];
+const tileLayers = [];
 let activeOptions;
 let activeLayer;
 const trackLayer = { type: 'track' };
@@ -26,7 +27,7 @@ const L = {
     this.openPopup = () => this;
   },
   map: () => ({}),
-  tileLayer: () => ({ addTo: () => {} }),
+  tileLayer: (url, options) => { tileLayers.push({ url, options }); return { addTo: () => {} }; },
 };
 L.FeatureGroup.extend = definition => {
   function GPX(gpx, options) { definition.initialize.call(this, gpx, options); }
@@ -77,7 +78,15 @@ L.GPX.prototype._parse_segment = function(line, options, style, tag) {
   geometry.push(tag);
   return [trackLayer];
 };
-vm.runInContext(inlineMap, context);
+function drawMap(url, credit) {
+  vm.runInContext(inlineMap
+    .replace('{{ map_tile_url|tojson }}', JSON.stringify(url))
+    .replace('{{ map_tile_attribution|tojson }}', JSON.stringify(credit)), context);
+}
+drawMap('https://tiles.example.test/{z}/{x}/{y}.png', '&lt;img&gt; &amp; credit');
+assert.equal(tileLayers.length, 1);
+assert.equal(tileLayers[0].url, 'https://tiles.example.test/{z}/{x}/{y}.png');
+assert.equal(tileLayers[0].options.attribution, '&lt;img&gt; &amp; credit');
 
 assert.equal(popups.length, 0, 'uploaded waypoint markup must never reach popup HTML');
 assert.deepEqual(geometry, ['trkpt', 'trkpt'], 'both track segments must be rendered');
@@ -85,6 +94,11 @@ assert.equal(activeOptions.gpx_options.joinTrackSegments, false,
   'unrecorded gaps between merged parts must remain visible');
 assert.equal(activeLayer.get_name(), hostileName, 'metadata remains inert text');
 assert.equal(activeLayer.get_desc(), hostileDescription);
+
+geometry.length = 0;
+drawMap(null, 'unused');
+assert.equal(tileLayers.length, 1, 'none must make no tile requests');
+assert.deepEqual(geometry, ['trkpt', 'trkpt'], 'none must still draw both track segments');
 
 // Control: prove the fixture exercises the vulnerable vendor branch when
 // waypoint parsing is enabled, rather than silently passing a vacuous test.

@@ -16,22 +16,20 @@ the server; never free text, coordinates, SSIDs or credentials. Delivery is at
 least once with its own persistent retry state, independent of ntfy.
 """
 
-import hashlib
-import ipaddress
 import json
 import re
 import socket
-import sqlite3
 import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
-from common.settings import boolean as _boolean
+from settings_rules import boolean as _boolean
+import settings_rules
+from shared import NoRedirect, epoch, event_fields
 
 
 SOURCE = "mileage-tracker"  # GELF "host": one fixed value to filter streams on.
@@ -69,16 +67,6 @@ class DeliveryError(Exception):
         self.cause = cause
 
 
-def _valid_host(host):
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except ValueError:
-        return bool(host and len(host) <= 253 and all(
-            re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", label)
-            for label in host.rstrip(".").split(".")))
-
-
 @dataclass(frozen=True)
 class GelfConfig:
     enabled: bool = False
@@ -105,25 +93,16 @@ class GelfConfig:
             raise ValueError("GRAYLOG_GELF_CA_FILE must name a readable certificate file")
         host, port = "", 0
         if url:
-            try:
-                parsed = urllib.parse.urlsplit(url)
-                valid = (parsed.scheme in ("http", "https") and _valid_host(parsed.hostname or "")
-                         and parsed.port != 0 and parsed.username is None and parsed.password is None
-                         and not parsed.query and not parsed.fragment
-                         and not any(c.isspace() for c in url))
-            except ValueError:
-                valid = False
+            valid = settings_rules.valid("GRAYLOG_GELF_URL", url)
             if not valid:
                 raise ValueError("GRAYLOG_GELF_URL must be an http(s) URL without credentials, query or fragment")
             if tls:
                 raise ValueError("GRAYLOG_GELF_TLS applies to GRAYLOG_GELF_TCP; use an https URL instead")
         else:
-            match = re.fullmatch(r"\[([0-9A-Fa-f:.]+)\]:(\d{1,5})|([^:\[\]\s]+):(\d{1,5})", tcp)
-            if match:
-                host = match.group(1) or match.group(3)
-                port = int(match.group(2) or match.group(4))
-            if not match or not _valid_host(host) or not 1 <= port <= 65535:
+            target = settings_rules.tcp_address(tcp)
+            if target is None:
                 raise ValueError("GRAYLOG_GELF_TCP must be <host>:<port>")
+            host, port = target
         name, value = "", ""
         header = env.get("GRAYLOG_GELF_HEADER", "")
         if header:
@@ -146,17 +125,12 @@ def _ssl_context(config):
     return context
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None  # Never forward a configured header through a redirect.
-
-
 class HttpTransport:
     """GELF HTTP input: one message per POST; Graylog answers 202 Accepted."""
 
     def __init__(self, config):
         self.config = config
-        handlers = [_NoRedirect()]
+        handlers = [NoRedirect()]
         if config.url.startswith("https:"):
             handlers.append(urllib.request.HTTPSHandler(context=_ssl_context(config)))
         self.opener = urllib.request.build_opener(*handlers)
@@ -212,13 +186,6 @@ def transport(config):
     return HttpTransport(config) if config.url else TcpTransport(config)
 
 
-def _epoch(iso):
-    stamp = datetime.fromisoformat(iso)
-    if stamp.utcoffset() is None:
-        raise ValueError("naive timestamp")
-    return stamp.timestamp()
-
-
 def _describe(codes, code):
     definition = codes.get(code)
     if definition is None:
@@ -248,104 +215,15 @@ def condition_message(codes, device, code, state, episode, now, contact=None):
 
 
 def event_message(codes, row):
-    """Build an event message, or return None for a damaged stored row."""
-    _, device, boot_id, sequence, code, received_at, canonical = row
-    try:
-        event = json.loads(canonical)
-        timestamp = _epoch(received_at)
-        if not isinstance(event, dict) or not isinstance(event.get("context", {}), dict):
-            return None
-        title, symbol, severity, level = _describe(codes, code)
-        transition = event.get("transition")
-        if transition not in ("raise", "repeat", "clear", "notice"):
-            return None
-        message = {"version": "1.1", "host": SOURCE, "timestamp": round(timestamp, 3),
-                   "short_message": f"E{code} {title} ({transition}) on {device}",
-                   "level": CLEAR_LEVEL if transition == "clear" else level,
-                   "_kind": "event", "_device_id": device, "_code": code, "_symbol": symbol,
-                   "_severity": severity, "_title": title, "_transition": transition,
-                   "_boot_id": boot_id, "_sequence": sequence, "_received_at": received_at}
-        for key, field, kind in (("episode_id", "_episode_id", str), ("firmware_version", "_firmware_version", str),
-                                 ("time_source", "_time_source", str), ("utc_ms", "_device_utc_ms", int),
-                                 ("sync_age_ms", "_sync_age_ms", int), ("uptime_ms", "_uptime_ms", int)):
-            value = event.get(key)
-            if type(value) is kind and (kind is int or len(value) <= 80):
-                message[field] = value
-        for key, value in event.get("context", {}).items():
-            # Context was allowlisted by the catalog at ingest; re-check shape
-            # so a damaged row can't smuggle free text or odd field names out.
-            if not (isinstance(key, str) and FIELD.fullmatch(key) and len(key) <= 32):
-                continue
-            if type(value) is bool:
-                message["_ctx_" + key] = "true" if value else "false"
-            elif type(value) is int or (isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.\-]{1,32}", value)):
-                message["_ctx_" + key] = value
-        return _encode(message)
-    except (ValueError, TypeError, OverflowError, RecursionError):
+    """Wrap the shared, output-independent event fields in a GELF envelope."""
+    fields = event_fields(codes, row)
+    if fields is None:
         return None
-
-
-def desired_conditions(devices, known, now, stale_seconds, snapshot_max_age):
-    """Return {(device, code): (state, episode, contact)} that differ from ``known``.
-
-    ``known`` maps (device, code) to the (state, episode) last delivered. A
-    condition known to this sink but absent from current evidence becomes
-    unknown; an episode change while it stays active is not a change.
-    """
-    current = {}
-    for device in devices:
-        name, contact = device["device_id"], device.get("contact")
-        if contact is None:
-            continue  # damaged identity/contact: everything for it becomes unknown
-        silent = now - contact >= stale_seconds
-        current[(name, SILENCE)] = ("active" if silent else "clear",
-                                    "silence:" + device["last_contact_at"] if silent else None, contact)
-        snapshot = device.get("snapshot")
-        if snapshot is None or not 0 <= now - device["snapshot_at"] <= snapshot_max_age:
-            continue
-        active = {item["code"]: item["episode_id"] for item in snapshot["active"]}
-        for code in set(snapshot.get("observed", [])) - set(active):
-            current[(name, code)] = ("clear", None, None)
-        for code, episode in active.items():
-            current[(name, code)] = ("active", episode, None)
-    for key, (state, _) in known.items():
-        if key not in current and state != "unknown":
-            current[key] = ("unknown", None, None)
-    changes = {}
-    for key, (state, episode, contact) in current.items():
-        previous = known.get(key, ("unknown", None))[0]
-        if state != previous:
-            changes[key] = (state, episode, contact)
-    return changes
-
-
-def read_events(path, after_rowid, limit):
-    """Read rows and cursor identity from the same SQLite snapshot."""
-    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
-        db.execute("BEGIN")
-        highest = db.execute("SELECT COALESCE(MAX(rowid),0) FROM events").fetchone()[0]
-        rows = db.execute("SELECT rowid,device_id,boot_id,sequence,code,received_at,canonical_json "
-                          "FROM events WHERE rowid>? ORDER BY rowid LIMIT ?", (after_rowid, limit)).fetchall()
-        anchor = db.execute("SELECT rowid,device_id,boot_id,sequence,code,received_at,canonical_json "
-                            "FROM events WHERE rowid=?", (after_rowid,)).fetchone()
-        return highest, rows, event_fingerprint(anchor) if anchor else None
-
-
-def event_fingerprint(row):
-    return hashlib.sha256(json.dumps(row, ensure_ascii=True).encode("ascii")).hexdigest()
-
-
-def cursor_changed(db, sink, cursor, fingerprint):
-    if not cursor:
-        return False
-    stored = db.execute("SELECT event_rowid,fingerprint FROM event_cursor_markers WHERE sink=?",
-                        (sink,)).fetchone()
-    # A pre-marker monitor.db replays once on upgrade rather than trusting an
-    # unverifiable cursor that may already refer to a restored database.
-    return stored is None or tuple(stored) != (cursor, fingerprint)
-
-
-def save_cursor_marker(db, sink, cursor, fingerprint):
-    db.execute("INSERT INTO event_cursor_markers VALUES (?,?,?) ON CONFLICT(sink) DO UPDATE SET "
-               "event_rowid=excluded.event_rowid,fingerprint=excluded.fingerprint",
-               (sink, cursor, fingerprint))
+    code, device = fields["code"], fields["device_id"]
+    title, _, _, level = _describe(codes, code)
+    message = {"version": "1.1", "host": SOURCE,
+               "timestamp": round(epoch(fields["received_at"]), 3),
+               "short_message": f"E{code} {title} ({fields['transition']}) on {device}",
+               "level": CLEAR_LEVEL if fields["transition"] == "clear" else level}
+    message.update({"_" + key: value for key, value in fields.items()})
+    return _encode(message)

@@ -51,13 +51,21 @@ def allowed_files():
 
 
 class InstallerLayout(unittest.TestCase):
+    def test_monitor_image_copies_every_runtime_module(self):
+        modules = {path.relative_to(SERVER).as_posix()
+                   for path in (SERVER / "mileage-monitor").glob("*.py")}
+        self.assertFalse(modules - copy_sources(),
+                         f"Monitor modules missing from Dockerfile COPY: {sorted(modules - copy_sources())}")
+        self.assertFalse(modules - allowed_files(),
+                         f"Monitor modules excluded by .dockerignore: {sorted(modules - allowed_files())}")
+
     def test_preflight_checks_shared_build_inputs_in_both_modes(self):
         preflight = INSTALL.split("preflight() {", 1)[1].split("\n}\n", 1)[0]
         for required in (".dockerignore", "common/__init__.py",
                          "common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json}",
                          "mileage-ingest/{Dockerfile,app.py,diag_store.py,reset_high_water.py,requirements.txt}",
                          "mileage-viewer/{Dockerfile,app.py,geocoding.py,trip_merges.py,trip_log.py,users.py,manage_users.py,requirements.txt}",
-                         "mileage-monitor/{Dockerfile,monitor.py,gelf.py,prometheus.py,loki.py}",
+                         "mileage-monitor/{Dockerfile,monitor.py,gelf.py,prometheus.py,loki.py,shared.py,settings_rules.py}",
                          "monitor.env.example", "ntfy/server.yml"):
             self.assertIn(required, preflight)
         main = INSTALL.split("main() {", 1)[1]
@@ -126,8 +134,8 @@ class InstallerLayout(unittest.TestCase):
                                 "mileage-viewer/trip_log.py", "mileage-viewer/users.py", "mileage-viewer/manage_users.py",
                                 "mileage-viewer/geocoding.py", "mileage-viewer/static/endpoint-places.js",
                                 "mileage-monitor/monitor.py", "mileage-monitor/gelf.py",
-                                "mileage-monitor/prometheus.py", "mileage-monitor/loki.py",
-                                "mileage-monitor/Dockerfile", "monitor.env.example", "ntfy/server.yml"):
+                                "mileage-monitor/prometheus.py", "mileage-monitor/loki.py", "mileage-monitor/shared.py",
+                                "mileage-monitor/settings_rules.py", "mileage-monitor/Dockerfile", "monitor.env.example", "ntfy/server.yml"):
                     file = tree / missing
                     content = file.read_bytes()
                     file.unlink()

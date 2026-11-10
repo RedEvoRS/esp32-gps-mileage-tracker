@@ -202,10 +202,38 @@ Its versioned state DB, `/state/monitor.db` in `monitor-state`, persists
 episodes, delivery intent, digest overflow, reminders, rolling-hour cap and
 retry backoff. Use one replica and preserve the volume to retain deduplication.
 
+Each completed monitor tick touches `/state/heartbeat` in that same volume.
+Disabled ticks still refresh it without reading a database; a missing
+`events.db` before the first upload is normal too. Unreadable diagnostics,
+failed state access and unexpected exceptions leave the heartbeat unchanged.
+Unexpected tick errors log the exception type and traceback frames without
+exception text, source lines, local variables or private paths, then wait the
+usual 60 seconds before trying again. KeyboardInterrupt and SystemExit still
+stop the process.
+
+Docker checks this local file every 30 seconds, with a five-second timeout,
+90 seconds of startup grace and two failures allowed. A heartbeat at most
+180 seconds old is healthy: three missed ticks plus the probe allowance
+usually make a stalled running monitor unhealthy after about 3.5-4 minutes.
+No network or credentials are used. `docker ps` shows `(unhealthy)`, and
+`install.sh --check` reports it even for a running disabled monitor. A normal
+deployment without the monitor container has no optional-health warning.
+An older container with no heartbeat check prompts a rebuild and recreation.
+Health measures tick progress, not successful ntfy, Graylog or Loki delivery;
+a long-running export can also delay progress. Docker does not restart a
+running container solely because it is unhealthy. Inspect
+`docker compose --profile monitor logs --tail 50 mileage-monitor` to find the
+cause. No extra outbound alive-ping service is configured.
+
 Fault notifications require eligible severity from the current catalog and
-a snapshot at most 24 hours old. Hold defaults to 300 seconds (critical skips
-it), reminders to 24 hours, and the cap to six successful posts per rolling
-hour. Overflow becomes bounded digests. Recovery needs an actually sent alert
+a snapshot at most 24 hours old (including exactly 24 hours). Every output
+uses the same state rule: an accepted snapshot determines faults, and server
+contact age determines E7001 silence, independently of snapshot age. Stored
+condition rows do not override a fresh snapshot. Catalog severity and `notify`
+filter phone delivery only; Prometheus and Loki condition lines retain current
+catalog codes, while Graylog also describes unknown codes. Hold defaults to
+300 seconds (critical skips it), reminders to 24 hours, and the cap to six
+successful posts per rolling hour. Overflow becomes bounded digests. Recovery needs an actually sent alert
 and an ordered explicit clear; unknown, reboot or historical events do not
 resolve faults. Delivery is at least once, with exponential retries from one
 minute to one hour; a crash after acceptance can duplicate a message. Bodies
@@ -228,6 +256,31 @@ decides about remote access. iOS instant push needs
 only a free wake-up poke, not message text. Android needs no relay.
 [ntfy documents the settings](https://docs.ntfy.sh/config/).
 An existing self-hosted ntfy can be selected with `NTFY_URL` instead.
+
+Installer questions and monitor startup use the same rules in
+`mileage-monitor/settings_rules.py`. Topic names and bundled ntfy usernames
+use 1–64 letters, digits, `_` or `-`. An ntfy token is nonempty printable
+ASCII without spaces; a metrics token needs at least 32 such characters.
+Real punctuation such as `$`, `#`, `<`, `>`, quotes and backslashes is allowed.
+Loki bearer tokens have 1–1024 printable ASCII characters without spaces;
+basic usernames/passwords have 1–1024 printable ASCII characters including
+spaces (no colon in the username). Tenant IDs may be empty or up to 128
+printable ASCII characters including spaces. Control characters are refused.
+Silence accepts one second through 36500 days, including decimals or scientific
+notation. URLs require valid DNS/IP hosts and optional ports from 1 to 65535,
+without embedded credentials, queries, fragments, whitespace or controls.
+
+The installer quotes these values for Compose's `env_file` parser, including
+Compose 2.26. By hand, single-quote literal dollars, hashes, spaces and quotes;
+escape an apostrophe as `\'`. For values with backslashes use double quotes,
+escaping backslashes as `\\`, double quotes as `\"`, and dollars as `$$`.
+Keep one setting per line and use literal values rather than `$OTHER` or
+`${OTHER}` references: the installer reports those as ambiguous rather than
+guessing Compose's interpolation context. Full examples and error behavior
+are in DEPLOY_DEBIAN.md Step 11b. On Unraid, one disposable Python checker
+serves all Notifications questions; secrets travel on stdin, never argv.
+The checker stays off when `--check` has no selected monitor file and when a
+fresh install chooses no outputs. Existing monitor heartbeat checks still run.
 
 Optionally, the monitor also sends diagnostics as GELF (Graylog Extended Log
 Format) to a Graylog you run elsewhere (`GRAYLOG_*` in `monitor.env`, off by
@@ -254,9 +307,13 @@ decisions. Condition changes are independent of ntfy and deduplicated across
 deep-sleep wakes; delivered-decision lines exist only when ntfy accepted an
 alert. Loki is external and is not bundled in Compose. Its HTTP push has an
 independent cursor, retry state and timestamp order per stream; a failed Loki
-push does not stop ntfy or Graylog. Permanent HTTP 4xx rejections (except 408
-and 429) skip the batch and advance its cursors, so rejected history is not
-retried. JSON lines use only current catalog fields and bounded context, with
+push does not stop ntfy or Graylog. Only HTTP 400 (including too-old lines)
+and 422 (unusable content) skip the batch and advance its cursors. All other
+HTTP errors retry without advancing, including wrong token/tenant/address
+errors and 413 (a possibly temporary or adjustable size limit). A retryable
+4xx logs the status, settings to check and delay on each retry, bounded by
+backoff. Fixing the settings lets queued history resume. JSON lines use only
+current catalog fields and bounded context, with
 `job`, validated `device_id` and catalog `severity` as the only labels set by
 the monitor. Loki 3 can add its own `service_name` label and `detected_level`
 metadata to query results.
@@ -627,7 +684,21 @@ What it does:
   OpenStreetMap map (Leaflet). This is how you eyeball a trip for GPS
   errors before trusting its mileage. Your trip coordinates are served
   from the LAN and drawn in your browser; only the base map tiles come
-  from OpenStreetMap.
+  from OpenStreetMap by default. The browser sends the tile host its IP
+  address and the viewed areas and zoom levels, which over time can reveal
+  where the car parks. To use your own tile server, set
+  `MAP_TILE_URL=http://<host>/{z}/{x}/{y}.png` in `.env` and set
+  `MAP_TILE_ATTRIBUTION` to its plain text credit. The URL must use HTTP or
+  HTTPS, include `{z}`, `{x}`, `{y}` (optional `{s}`, `{r}`), be at most
+  2048 characters and contain no quotes, backslashes, angle brackets,
+  whitespace or control characters. Attribution is escaped as text, limited
+  to 2000 characters without controls. Invalid settings stop the viewer
+  at startup with the setting's name in the log. Unset or empty values keep
+  today's OSM URL and credit. `MAP_TILE_URL=none` makes no tile requests:
+  the track and endpoints still draw on a plain background that follows
+  light/dark mode. Run `docker compose up -d` after changes. These settings
+  go only to the viewer; installer reruns and release updates preserve them
+  in `.env` without asking new questions.
 - **Annotate** — tag each trip business / personal / other and add a
   note (e.g. "Client visit — Acme Corp") and destination / place. Annotations are stored in a
   SQLite database in a separate `viewer-db` volume, kept apart from the
@@ -675,6 +746,23 @@ the totals as trips.** XLSX keeps one trip per row on the `Mileage` sheet
 and puts year, display timezone, and totals on a separate `Totals` sheet.
 Totals are summed before rounding to three decimal places, matching stored
 distance precision. Unclassified totals include trips without a category.
+
+Each viewer worker keeps parsed summaries in memory, shared safely by its
+threads. It checks file identity, size and nanosecond modification time on
+each scan, rereads changed files and drops vanished entries. A restart clears
+the cache. Annotations, removals and year locks always come from the database.
+Ordinary reads use a consistent read transaction; only a changed merged
+summary (or an older fingerprint needing file identities) reserves the database
+writer and rechecks the log before saving. SQLite can still briefly delay a
+writer's commit until a read transaction finishes.
+
+File discovery still covers the log: the year menu needs years from other
+folders, every year review lists all undated trips, and a changed display
+timezone or rebuilt summary can move a trip across New Year. A known-device
+trip page also needs the full chronology for safe merge suggestions. Removed
+trip pages, unknown-device pages and redirects read only the requested trip's
+sources. The data mount remains read-only; none of these caches writes GPX
+or JSON files.
 
 A trip whose summary file can't be read (damaged on disk, edited by hand,
 or missing next to its GPX) has no miles the viewer can count. The trip list shows a warning
@@ -849,8 +937,11 @@ in a serialized SQLite transaction so concurrent workers preserve existing
 annotations. The original annotation rows remain intact. Back up this database
 alongside the trip files: losing it also loses merges.
 
-The cached summary is refreshed only when a part's GPX/JSON size or modification
-time changes. A change to the shared summary rules (`SUMMARY_VERSION`) does not
+The cached summary is refreshed only when a part's GPX/JSON inode (file identity),
+size or nanosecond modification time changes. An atomic file replacement is
+therefore noticed even if its size and timestamp stay the same. Older merge
+fingerprints gain file identities on first use without recalculating their
+stored mileage. A change to the shared summary rules (`SUMMARY_VERSION`) does not
 rebuild it by itself, the same as the plain trips' stored summaries, which keep the
 rules of the day they were written; otherwise one release would total merged
 trips under new rules and everything else under old ones. Ordinary list views

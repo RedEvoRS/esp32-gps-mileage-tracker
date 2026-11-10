@@ -425,7 +425,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   `trip_removals`, `trip_history` and `tax_years`. Optional `geocoding.py`
   sends a selected endpoint to an explicitly configured provider only on an
   authenticated, CSRF-protected click and caches suggestions in that database.
-  Configurable interval, default 1.1 s.
+  Configurable interval, default 1.1 s. Viewer-only `MAP_TILE_URL` selects
+  base tiles (default OSM; `none` disables); attribution is plain text.
   No lookup on page views, exports or uploads; never use public OSMF Nominatim.
   `/device-health` reads
   diagnostics schema v1 via `mode=ro` with a 2 s busy timeout, shows contact and
@@ -439,7 +440,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   suspends sends until a successful read. Own `/state/monitor.db` schema v1 in
   `monitor-state` stores episodes, pending work/outbox, successful delivery
   window and retry state. Every 60 s, all devices are watched, with no watchlist.
-  Freshness is 24 h of accepted snapshot receipt, independent of GPX contact.
+  One shared rule (`shared.py`) gives every output the same condition state;
+  snapshots win over stored condition rows, and E7001 uses only contact age.
+  Freshness is 24 h inclusive from snapshot receipt, independent of GPX contact.
   Catalog severity/notify control faults; 300 s hold (critical bypass), 24 h
   reminders, six successful posts per rolling hour including bounded digests
   and resolutions. Unknown/reboot is not recovery; explicit newer clear and
@@ -449,7 +452,11 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   resolves on newer contact. Separate `monitor.env` (selected by
   `MONITOR_ENV_FILE` in `.env`) holds only
   monitor settings/token, defaults to disabled `monitor.env.example` for normal
-  install/--check. Disabled monitor idles without DB reads. Optional `ntfy`
+  install/--check. Disabled monitor idles without DB reads. Each completed tick
+  (disabled included; not unreadable diagnostics or failed ticks) touches
+  `/state/heartbeat`. Compose marks the monitor unhealthy after ~3 missed ticks,
+  shown by `docker ps` and `--check`. Unexpected tick errors log type + frames
+  only and retry next tick. Health does not confirm delivery. Optional `ntfy`
   profile uses port 8092 with `BIND_ADDR`, deny-all auth and `ntfy-state` cache/auth
   volume. `.env` `NTFY_BASE_URL` and `NTFY_BEHIND_PROXY` (default false)
   survive updates; hand edits to shipped `ntfy/server.yml` do not.
@@ -481,9 +488,10 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   including E7001 silence and recovery) independent of ntfy, and successful
   ntfy alert/reminder/resolution decisions. Fixed labels are `job`, validated
   `device_id` and catalog severity. The independent event cursor resets on a
-  lower restored events.db rowid or a changed event at the cursor; real timestamps (Loki 2.4+), backlog first. Network
-  failures, 408, 429 and 5xx retry; other HTTP 4xx rejections skip the batch and
-  advance its cursors. The condition table and cursor are additive to monitor
+  lower restored events.db rowid or a changed event at the cursor; real
+  timestamps (Loki 2.4+), backlog first. HTTP 400/422 skip the batch; every other
+  error, including 401/403/404/413, retries without advancing cursors and warns
+  on each retry. The condition table and cursor are additive to monitor
   schema v1. Setup and LogQL examples: DEPLOY_DEBIAN Step 11f.
 - Backups: `server/backup/backup.sh` saves trips plus consistent SQLite
   snapshots of viewer annotations, ingest diagnostics (`events.db`), and optional

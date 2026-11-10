@@ -363,7 +363,8 @@ You should see `docker-compose.yml`, `.env.example`, `viewer.env.example`,
 `backup/`, `mileage-ingest/` (including `diag_store.py`), and `mileage-viewer/`
 (with `static/` holding
 `leaflet.js`, `leaflet.css`, `gpx.js` — those are vendored, so the viewer
-works with no internet except OSM map tiles).
+works with no internet except the default OSM map tiles; see the optional
+tile settings below).
 
 > **Watch for:** `scp -r` on Windows can silently skip dotfiles in some
 > OpenSSH builds. Confirm `.env.example` and `.dockerignore` made it:
@@ -913,6 +914,19 @@ an existing install keeps its current HTTP behavior:
   when the proxy is installed on the host or runs with host networking:
   it can reach `127.0.0.1:8091`, and plain HTTP is closed on the LAN.
   An IPv6 loopback bind (`::1`) is also supported if your Docker host has IPv6.
+- `MAP_TILE_URL` optionally selects a viewer base map, for example
+  `http://<host>/{z}/{x}/{y}.png`. HTTP/HTTPS and `{z}`, `{x}`, `{y}` are
+  required; `{s}` and `{r}` are optional. No quotes, backslashes, angle
+  brackets, whitespace or controls; maximum 2048 characters. The browser
+  sends the tile host its IP and the areas and zoom levels you view, which
+  can reveal parking locations over time. Use a household server to keep
+  this traffic local, or `MAP_TILE_URL=none` for tracks and endpoints on a
+  plain light/dark background with no tile requests. Unset/empty keeps OSM.
+  `MAP_TILE_ATTRIBUTION` is plain text credit (HTML is escaped), maximum
+  2000 characters without controls; unset/empty keeps the OSM credit.
+  Invalid settings stop the viewer at startup and name the setting in its
+  log. Set these in `.env`, then run `docker compose up -d`. Only the viewer
+  receives them; installer reruns and release updates preserve them.
 - `VIEWER_TRUSTED_PROXIES` is a comma-separated list of proxy peer IPs or
   CIDR network ranges (an address followed by a prefix length), IPv4 or
   IPv6, with optional spaces. Empty trusts no forwarded
@@ -1762,7 +1776,9 @@ described near the top of this runbook.) It verifies what is on: the monitor
 must be running and its startup log must show the selected outputs, each
 destination must be reachable from the monitor, metrics must refuse a request
 without the token, and the bundled ntfy must refuse anonymous reads. Outputs that are off are reported as "off", never as
-problems, so a check with nothing turned on passes.
+problems. A deployment without a monitor container has no monitor-health
+warning. An existing running monitor is also checked for heartbeat health,
+even when its settings disable every output.
 
 It also compares the container's Compose configuration hash with the current
 configuration, including URLs, credentials and tuning values in `monitor.env`,
@@ -1789,6 +1805,17 @@ the two. The rest:
 A preset that isn't usable stops the install with a message, as the other
 questions do. Metrics has no question of its own: its token is generated and
 kept in `monitor.env`, never printed.
+
+The questions and the monitor use the same settings rules. The installer
+checks them with host Python, or one disposable Python container on Unraid;
+it reuses that checker across questions and sends secrets on standard input.
+The checker starts only when settings need reading or an output is chosen.
+A check with no selected monitor file, or a fresh install choosing `none`,
+does not start it. An existing monitor's heartbeat is still checked.
+Topic names and bundled phone usernames use 1–64 letters, digits, `_` or `-`.
+The phone password needs at least eight characters and is stored by ntfy,
+not in `monitor.env`. Silence accepts at least one second (`1/86400` days)
+and at most 36500 days, including decimals or scientific notation.
 
 **Phone alerts only reach the phone where it can reach this server.** The
 bundled ntfy is published on your LAN address, port 8092, like the other
@@ -1910,6 +1937,26 @@ Delivery requires an HTTP(S) topic URL without embedded credentials, query or
 fragment, ending in a 1–64 character topic (letters, digits, `_` or `-`), plus
 a token. `MONITOR_ENABLED=false` idles without DB reads.
 
+An ntfy token is nonempty printable ASCII without spaces; metrics tokens
+need at least 32 such characters. The literal example `<token>` is not a
+credential. Punctuation such as `$`, `#`, `<`, `>`, quotes and backslashes
+is allowed in real tokens. URLs need a valid DNS name or IP address and a
+port from 1 to 65535 if present; bracket an IPv6 address. URL whitespace and
+control characters are refused. An invalid setting stops the enabled output
+or monitor at startup with the setting's name, without printing the secret.
+
+The installer quotes and escapes values before writing them, so they survive
+Compose's `env_file` parsing, including Compose 2.26. When editing by hand,
+single-quote literal values containing `$`, `#`, spaces or quotes; for
+example, `NTFY_TOKEN='fake$literal#value<suffix>'`. In single quotes, write an
+apostrophe as `\'`. For a value containing backslashes, use double quotes,
+write each backslash as `\\`, each double quote as `\"`, and each dollar sign
+as `$$`. Do not use shell variable references such as `$OTHER` or `${OTHER}`
+in `monitor.env`: Compose expands unquoted and double-quoted references,
+while the installer refuses to guess their values. An unquoted ` #` begins a
+comment; inside quotes it is part of the value. Keep one setting per line.
+These are [Compose's environment-file rules](https://docs.docker.com/reference/compose-file/services/#env_file).
+
 Silence **E7001 DEVICE_SILENT** reads "No contact for N days", bypasses the
 device-fault severity threshold and hold, and shares reminders and the cap.
 It resolves on genuinely newer contact. Parking away from WiFi can cause it.
@@ -1919,14 +1966,46 @@ or away from WiFi, so a parked tracker can still trigger this notification.
 The monitor does not wake the tracker. Retiring an obsolete identity needs a
 future explicit policy; all devices remain watched.
 
-Faults need a snapshot at most **24 hours** old; GPX contact alone does not
-refresh it. Old events, unknown conditions and a reboot do not imply recovery.
+All monitor outputs use the same current-condition rule. Faults need a
+snapshot at most **24 hours** old (including exactly 24 hours); GPX contact
+alone does not refresh it. The accepted snapshot takes precedence over stored
+condition rows; a missing or future snapshot means unknown. Severity and
+`notify` filter phone alerts only; Prometheus and Loki condition lines show
+current catalog codes, while Graylog also describes unknown codes. Old events, unknown conditions and a reboot do not imply recovery.
 A resolution needs a successfully sent alert and a newer snapshot explicitly
 observing that code clear. Overflow coalesces into digests of at most 3500
 UTF-8 bytes; unsent work persists and is rechecked before delivery. Failed
 posts retry after 60, 120, 240 seconds, and so on, capped at an hour. Delivery
 is **at least once**: a crash after ntfy accepts a message but before success
 is recorded can produce a duplicate.
+
+The monitor also checks its own progress without a network request: each
+completed tick touches `/state/heartbeat` in `monitor-state`. Disabled ticks
+count as completed without reading databases, as does a missing `events.db`
+before the first upload. Unreadable diagnostics or a failed tick do not
+refresh it, so a persistent database problem also becomes unhealthy.
+Unexpected tick exceptions log the type and traceback frames only (no
+exception message, source lines, local variables or private paths), then
+wait the usual 60 seconds and try again. KeyboardInterrupt and SystemExit
+still stop the process.
+
+Compose probes the local file every 30 seconds with a five-second timeout,
+a 90-second startup grace and two consecutive failures required. The file
+may be at most 180 seconds old, allowing three missed one-minute ticks:
+a stalled running monitor normally turns `(unhealthy)` in `docker ps` about
+3.5-4 minutes after its last completed tick. `install.sh --check` reports
+that failure too, including a disabled monitor that is still running.
+An old container without this check needs rebuilding and recreating.
+Health measures tick progress; it does not confirm delivery, and a long
+export can delay it. Docker does not restart a running container just for
+being unhealthy. Check the cause with:
+
+```bash
+docker compose --profile monitor logs --tail 50 mileage-monitor
+```
+
+The health probe uses no credentials or network. An external alive-ping URL
+is not configured; a separately chosen service could be a future addition.
 
 ### 11c — Check delivery and turn it off
 
@@ -2169,7 +2248,15 @@ LOKI_BEARER_TOKEN=<token>
 ```
 
 If Loki has no authentication, leave all three auth settings blank. Do not put
-credentials in the URL or commit them. In `.env`, select the private file with
+credentials in the URL or commit them. A bearer token has 1–1024 printable
+ASCII characters without spaces and cannot be the example `<token>`. Basic
+usernames and passwords have 1–1024 printable ASCII characters, including
+spaces; the username cannot contain a colon. The optional tenant ID has at
+most 128 printable ASCII characters, including spaces. All reject control
+characters. Quote punctuation as described in 11b; the installer does this
+for you. At the tenant question, `-` clears the saved value.
+
+In `.env`, select the private file with
 `MONITOR_ENV_FILE=./monitor.env`, then recreate the monitor:
 
 ```bash
@@ -2182,10 +2269,25 @@ The startup line should say `Loki enabled`; once it has new records, the log
 reports how many lines Loki accepted. On first enable, the separate persisted
 event cursor starts at rowid zero, so stored history is sent in batches of at
 most 200 lines per tick without an age filter. Loki may reject history older
-than its configured retention window. A permanent HTTP 4xx rejection other
-than 408 or 429 skips the entire rejected batch and advances its cursors; that
-history is not retried, and later batches continue. Network failures, 408, 429
-and 5xx responses back off and retry without advancing the cursors.
+than its configured retention window. Only HTTP **400** (including too-old
+lines) and **422** (unusable content) skip the entire rejected batch and
+advance its cursors; that history is not retried, and later batches continue.
+All other HTTP errors and network failures back off from one minute to one
+hour without advancing event, condition or delivered-decision progress. This
+includes 401/403 (token or tenant), 404/405 (push URL or proxy route), 407
+(proxy authentication), 408, 429 and 5xx. HTTP 413 also retains the batch: a
+proxy size limit can be adjusted, and this status can be temporary.
+
+A wrong token or address produces a warning such as `Loki delivery failed
+(HTTP 401); check token, tenant, push URL or proxy; retry in 60 seconds
+without advancing cursors`. Every retryable 4xx response logs this warning,
+including repeated rejections. The retry backoff limits its frequency from
+once a minute to once an hour, so settings failures remain visible in the log.
+Credentials, response bodies and the configured URL are never logged. Nothing
+is discarded while these settings errors are retried. Correct `monitor.env`
+and recreate `mileage-monitor` to apply it; retained history then resumes.
+Loki can still reject old history with 400 after a long outage, under the
+content-rejection rule above.
 
 Loki also receives one `condition_change` line when a device/code condition
 changes to active, clear or unknown, including E7001 silence and recovery.
@@ -2365,8 +2467,10 @@ changing or differs between workers. It must be a fixed value in
 `viewer.env`.
 
 **Viewer loads but the map is blank** — Leaflet/GPX are vendored locally, so
-the page frame works offline; only OSM *tiles* need internet. Blank tiles =
-the server (or your browser) can't reach `tile.openstreetmap.org`.
+the page frame works offline; the default OSM *tiles* need internet.
+Unexpected blank tiles mean your browser can't reach the configured tile
+host (default `tile.openstreetmap.org`). With `MAP_TILE_URL=none`, a plain
+background with the track and endpoints is expected.
 
 **The trip list says a trip summary file can't be read** — the `.json` next
 to that trip's GPX is damaged or missing (disk trouble, a hand edit, or a

@@ -237,7 +237,8 @@ class ReleaseSetup(unittest.TestCase):
                    "backup/state/last-attempt", "backup/logs/backup.log",
                    "data/trip.gpx", "firmware-out/current/app.bin")
         proxy_settings = ("VIEWER_BIND_ADDR=127.0.0.1\nVIEWER_COOKIE_SECURE=true\n"
-                          "VIEWER_TRUSTED_PROXIES=192.0.2.1,2001:db8::/64\n")
+                          "VIEWER_TRUSTED_PROXIES=192.0.2.1,2001:db8::/64\n"
+                          "MAP_TILE_URL=none\nMAP_TILE_ATTRIBUTION='Local tiles'\n")
         for name in private:
             path = self.destination / name
             path.parent.mkdir(parents=True, exist_ok=True)

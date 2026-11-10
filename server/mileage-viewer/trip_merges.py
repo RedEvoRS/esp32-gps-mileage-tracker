@@ -13,6 +13,10 @@ MERGE_MAX_GAP = timedelta(minutes=15)
 ANNOTATION_FIELDS = ("category", "purpose_note", "destination")
 
 
+class MergeRefreshNeeded(Exception):
+    """A read-only caller must restart under BEGIN IMMEDIATE and recheck."""
+
+
 def init_schema(conn):
     # Caller holds BEGIN IMMEDIATE, including during concurrent worker startup.
     conn.execute("""CREATE TABLE IF NOT EXISTS trip_merges (
@@ -65,7 +69,7 @@ def fingerprint(data_root, keys):
     for path in source_paths(data_root, keys):
         for source in (path, path.with_suffix(".json")):
             st = source.stat()
-            stamps.append((source.name, st.st_mtime_ns, st.st_size))
+            stamps.append((source.name, st.st_mtime_ns, st.st_size, st.st_ino))
     return json.dumps(stamps)
 
 
@@ -83,7 +87,16 @@ def same_sources(fresh, stored):
         if not isinstance(value, list):
             return None
         return value[1:] if value and isinstance(value[0], int) else value
-    return stamps(fresh) is not None and stamps(fresh) == stamps(stored)
+    left, right = stamps(fresh), stamps(stored)
+    if left is None or right is None or len(left) != len(right):
+        return False
+    # Upgrade older fingerprints without rebuilding under newer distance
+    # rules. Once upgraded, an atomic replacement with identical size/mtime
+    # also invalidates the merge. Keep the legacy version-prefix compatibility.
+    return all(isinstance(a, (list, tuple)) and isinstance(b, (list, tuple))
+               and len(a) in (3, 4) and len(b) in (3, 4)
+               and a[:3] == b[:3] and (len(a) == 3 or len(b) == 3 or a[3] == b[3])
+               for a, b in zip(left, right, strict=True))
 
 
 def parsed_parts(data_root, keys):
@@ -129,14 +142,16 @@ def combined_gpx(data_root, keys):
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
-def apply_merges(conn, data_root, trips, unreadable):
-    """Use persisted summaries, reparsing only when a source stamp/rules change.
+def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=None):
+    """Use persisted summaries, reparsing only when a source stamp changes.
 
     A broken/missing part makes the whole merged trip unreadable, rather than
     silently reverting to individual parts or counting an old cached distance.
-    Caller owns a database transaction for a consistent membership/annotation view.
+    Caller owns a database transaction for a consistent membership/annotation
+    view. With refresh=False, request a fresh write transaction only if needed.
     """
-    rows = conn.execute("SELECT * FROM trip_merges").fetchall()
+    rows = (conn.execute("SELECT * FROM trip_merges WHERE trip_key=?", (only_key,)).fetchall()
+            if only_key is not None else conn.execute("SELECT * FROM trip_merges").fetchall())
     originals = {t["trip_key"]: t for t in trips}
     identities = {t["trip_key"]: t for t in trips + unreadable}
     hidden = set()
@@ -159,6 +174,8 @@ def apply_merges(conn, data_root, trips, unreadable):
                 raise ValueError("A merge part's summary is unavailable")
             stamp = fingerprint(data_root, keys)
             if not same_sources(stamp, row["fingerprint"]):
+                if not refresh:
+                    raise MergeRefreshNeeded()
                 summary = combined_summary(data_root, keys)
                 if fingerprint(data_root, keys) != stamp:
                     raise ValueError("Merge part changed during refresh")
@@ -166,6 +183,12 @@ def apply_merges(conn, data_root, trips, unreadable):
                              (json.dumps(summary), stamp, key))
             else:
                 summary = json.loads(row["summary"])
+                # Record inode metadata for legacy rows without changing the
+                # stored summary's rules. This is a one-time cache upgrade.
+                if stamp != row["fingerprint"]:
+                    if not refresh:
+                        raise MergeRefreshNeeded()
+                    conn.execute("UPDATE trip_merges SET fingerprint=? WHERE trip_key=?", (stamp, key))
             t = {**summary, **t, "start_time": summary.get("start_time")}
             # The merged trip arrived when its last part did.
             received = trip_log.latest_stamp(originals[k].get("received_at") for k in keys)

@@ -2061,7 +2061,14 @@ MONITOR_STALE_DAYS=7
 Enabled settings are validated at startup; keep tokens in private environment
 files, never event context or public examples. Snapshot freshness is **24 hours
 inclusive**, aligned with the opportunistic heartbeat, measured from accepted snapshot receipt time.
-GPX-only contact does not make an old health snapshot fresh.
+GPX-only contact does not make an old health snapshot fresh. All outputs use
+`server/mileage-monitor/shared.py` for this state rule: active snapshot entries
+are active, observed entries absent from active are clear, and missing, future
+or stale snapshot evidence is unknown. Stored condition rows retain known
+codes but do not override the accepted snapshot. E7001 comes only from valid
+server contact age, even without a snapshot. Catalog severity and `notify`
+filter phone delivery, not state. Prometheus and Loki condition lines retain
+only current catalog codes; GELF also describes unknown codes.
 
 Alert only for catalog-eligible current faults in a fresh snapshot. Hold a new
 fault for 300 seconds by default; critical faults bypass that hold, while
@@ -2108,6 +2115,21 @@ timeout and a consistent read transaction, closing every connection. No
 initialization, migration or recovery is attempted there. An absent DB means
 nothing to do. A read/schema/lock/hot-journal failure logs unavailable and
 suspends all sends, including pending retries, until a successful read.
+Each completed tick refreshes `/state/heartbeat` beside `monitor.db`.
+Disabled ticks and an absent events.db count as completed; a diagnostics
+read/schema/lock failure does not. Unexpected per-tick exceptions are caught
+as `Exception`, never `BaseException`: log the type and reviewed traceback
+frame locations, with no exception text, source lines, locals or private paths,
+then wait 60 seconds as usual. Failed ticks do not refresh the heartbeat.
+Compose checks the file locally every 30 seconds (five-second timeout,
+180-second maximum age, two failures, 90-second startup grace). Three missed
+ticks plus the probe allowance normally mark a stalled running monitor
+unhealthy after about 3.5-4 minutes. `docker ps` exposes this status and
+`install.sh --check` reports it for an existing running monitor, even when
+disabled; an absent optional container causes no health warning. This checks
+progress, not delivery. No credentials, network or outbound alive-ping URL
+are involved; a long export can also delay progress.
+
 Snapshot parse/validation failures are isolated per device, including snapshots
 that no longer satisfy the current catalog. That device's fault conditions
 become unknown: they cannot trigger fault alerts, reminders or resolutions.
@@ -2292,10 +2314,17 @@ events are sent, so the backlog stays oldest-first; condition changes and
 decisions follow once it catches up. History Loki rejects as too old is skipped.
 
 The monitor uses one HTTP push with a ten-second timeout and never follows
-redirects. Network failures, HTTP 408, HTTP 429 and 5xx responses back off
-from 60 seconds to one hour without advancing the batch. A permanent HTTP 4xx
-other than 408 or 429 logs only the status code, skips the rejected batch and
-advances its cursors; that history is not retried, and later rows continue.
+redirects. Network failures and all HTTP errors except 400/422 back off
+from 60 seconds to one hour without advancing event, condition or decision
+progress. This includes token/tenant errors (401/403), URL/proxy problems
+(404/405/407), timeouts, rate limits, 5xx and 413 (possibly temporary or an
+adjustable proxy size limit). Every retryable 4xx response logs a warning with
+the status, settings to check, retry delay and confirmation that cursors are
+kept. The existing backoff bounds how often these warnings appear.
+Only 400 (including too-old lines) and 422 (unusable content) skip the rejected
+batch and advance its cursors; that history is not retried. Neither status
+can be fixed by resending unchanged content under the same receiver policy.
+Logs never include response bodies, credentials or the configured URL.
 Successful pushes advance the batch; an ambiguous response can be retried and
 duplicated. If `events.db` has a lower maximum rowid or a different event
 fingerprint at Loki's cursor, only that sink's event cursor resets and history
