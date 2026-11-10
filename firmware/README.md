@@ -28,7 +28,10 @@ startup hangs, a retry for an unreadable first charge temperature, and
 explicit trip-upload timeouts with separate send/reply timings. Both watchdog
 resets, the card skip and the loop pause were bench-checked on USB power on
 2026-11-10 (UTC); the battery paths and a start from fully off were not (see
-[Watchdog bench check](#watchdog-bench-check)). On
+[Watchdog bench check](#watchdog-bench-check)). Firmware `v1.05` lets
+`secrets.h` choose the network time servers (see
+[Network time settings](#network-time-settings)), and makes a wrong error
+code a build failure or a debug warning instead of a silent drop. On
 2026-10-21 (UTC), an earlier Stage 4 build uploaded
 four real trips from microSD to the deployed server, then delivered all 115
 pending diagnostic events and a current snapshot. Uploads with debug mode
