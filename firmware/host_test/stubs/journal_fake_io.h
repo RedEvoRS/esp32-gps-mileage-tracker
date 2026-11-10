@@ -37,7 +37,7 @@ public:
         assertLocked();
         if (fs_.g_disk.readsFail) return false;
         auto file = fs_.open(path);
-        return file && file.seek(offset) && file.read(static_cast<uint8_t*>(data), bytes) == bytes;
+        return file && file.seek(offset) && file.read(static_cast<uint8_t*>(data), bytes) == static_cast<int>(bytes);
     }
     bool write(const char* path, const void* data, size_t bytes, bool append) {
         assertLocked();

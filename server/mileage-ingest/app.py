@@ -69,8 +69,7 @@ for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resol
 
 from common.version import server_version
 from common.trip_summary import (
-    parse_gpx, summarize, SUMMARY_VERSION, METERS_PER_MILE, MPS_TO_MPH,
-    STATIONARY_MPS, MAX_PLAUSIBLE_MPS, MAX_HDOP, MAX_UPLOAD_TEXT, _haversine_m,
+    parse_gpx, summarize, MAX_UPLOAD_TEXT,
 )
 
 from common.diagnostics import CatalogError, ProtocolError, load_catalog, parse_request, validate_device_id

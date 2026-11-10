@@ -444,6 +444,15 @@ to confirm uploads and a fresh Device health snapshot.
 
 ## Troubleshooting
 
+View service logs with `docker compose logs --tail 50 mileage-ingest` (replace
+the service name as needed). Every service, including optional monitor and
+ntfy, keeps at most three 10 MB Docker log files per container to protect
+Unraid's Docker storage. The limit applies after containers are recreated;
+the installer update does this when their Compose settings change. Old logs
+are not trimmed in place. Recreating a container discards its old logs, so save
+any you need first. `bash install.sh --check` warns about older log settings
+and shows how to apply the limit.
+
 - **`docker compose` is missing:** install Compose Manager Plus and rerun
   `docker compose version`. Version 1 is unsupported. Do not install Debian
   packages on Unraid.

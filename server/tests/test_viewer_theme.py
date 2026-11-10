@@ -175,7 +175,7 @@ class ViewerThemeTests(unittest.TestCase):
 
         def luminance(color):
             return sum(w / 10000 * (c / 12.92 if c <= .04045 else ((c + .055) / 1.055) ** 2.4)
-                       for w, c in zip((2126, 7152, 722), color))
+                       for w, c in zip((2126, 7152, 722), color, strict=True))
 
         light = properties(self.viewer.THEME_CSS.split("@media")[0])
         dark = {**light, **properties(self.viewer.DARK_THEME_CSS)}
@@ -191,11 +191,11 @@ class ViewerThemeTests(unittest.TestCase):
                 opacity = float(version_style["opacity"])
                 header_bg = rgb(palette["header-bg"])
                 version_color = [fg * opacity + bg * (1 - opacity)
-                                 for fg, bg in zip(rgb(palette["header-text"]), header_bg)]
+                                 for fg, bg in zip(rgb(palette["header-text"]), header_bg, strict=True)]
                 values = sorted((luminance(version_color), luminance(header_bg)))
                 self.assertGreaterEqual((values[1] + .05) / (values[0] + .05), 4.5)
 
-            def background(name, under):
+            def background(name, under, palette=palette):
                 value = palette[name]
                 if value == "transparent":
                     return under

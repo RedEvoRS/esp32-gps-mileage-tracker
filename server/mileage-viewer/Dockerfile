@@ -5,7 +5,7 @@ RUN useradd --create-home --shell /bin/bash app
 WORKDIR /app
 
 COPY mileage-viewer/requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 COPY mileage-viewer/app.py /app/
 COPY mileage-viewer/geocoding.py mileage-viewer/trip_merges.py mileage-viewer/trip_log.py mileage-viewer/users.py mileage-viewer/manage_users.py /app/

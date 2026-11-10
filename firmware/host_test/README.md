@@ -66,18 +66,23 @@ Inspect every `SKIPPED` line. The final `grep` exits 1 when there are no matches
 that means no skips, not a test failure. Keep the displayed run status separate
 from `grep`'s status.
 
-Every build uses `-UNDEBUG` and force-includes `assertions_enabled.h`, which
-rejects `NDEBUG`. This matters with Zig C++ at `-O1`: otherwise `assert()` can
-silently disappear. A separate negative probe with the same flags and
+Every build uses `-Wall -Wextra -Werror`, plus `-UNDEBUG` and a forced include of
+`assertions_enabled.h`, which rejects `NDEBUG`. This matters with Zig C++ at
+`-O1`: otherwise `assert()` can silently disappear. A separate negative
+probe with the same flags and
 `int main() { assert(false); }` must fail when run, never exit successfully.
 
 ## What a full run covers
 
-`run.sh` builds **27 C++ test sources in 31 build variants**, plus six Python
+Real TinyGPSPlus headers and implementation are system includes; project
+sources and stubs remain warning-checked. U8g2's real font source is read by
+Python for the glyph check, while renderer tests use project-owned stubs.
+
+`run.sh` builds **31 C++ test sources in 37 build variants**, plus six Python
 checks. Extra builds cover stamped/fallback versions, a second display-card
-duration and three sketch copies of bus recovery. Many integration binaries
-also run with runtime debug off and on. **[TinyGPSPlus]** marks the eight
-sources that require that optional library.
+duration, both watchdog bench hooks and three sketch copies of bus recovery.
+Many integration binaries also run with runtime debug off and on.
+**[TinyGPSPlus]** marks the ten sources that require that optional library.
 
 **Storage and trip lifecycle**
 
@@ -89,6 +94,9 @@ sources that require that optional library.
 **GPS input and signal health**
 
 - `test_gps` **[TinyGPSPlus]**: real GPS sentence parsing through the sketch's loop, one point per second, receiver configuration/replies, fix-quality gates, gaps, UTC (universal time) timestamps/clock corrections and debug-mode GPX parity.
+- `test_loop_runtime` **[TinyGPSPlus]**: real 5 ms idle cadence, UART drain and late arrivals, latched IRQs, BOOT debounce, ACK deadlines, NAV-PVT freshness and one-second debug redraw. RTC and temperature runtime suites also exercise alignment/conversion through the pause.
+- `test_watchdog` **[TinyGPSPlus]**: early startup enrollment, slow progressing boot scans/repairs, the 120-to-60-second hand-over without re-enrollment, retained card/non-card hang sequences, LittleFS recording with E1003/E4001, no-storage mode without recovery probes, degraded startups, runtime repair progress, shutdown bounds, blocked locks, core-0 exclusion and enrollment failures. Two extra builds exercise the loop and startup bench flags. Fake-time expiry does not prove real timer expiry, RTC retention or board reset.
+- `test_startup_watchdog`: pure retained-record policy, every stage classification, consecutive hangs, escalation after card fallback, completed/loop/software resets, power-on clearing and corrupt records.
 - `test_gps_antenna`: antenna-warning evidence, hold times, missing/stale observations, recovery and timer wraparound.
 - `test_debug_status` **[TinyGPSPlus]**: real satellite-message parsing, satellite deduplication/freshness and bounded screen/serial formatting, including release-version fit/omit cases in the top row.
 
@@ -137,11 +145,11 @@ enrollment never reuses a loaded epoch after NVS reset.
 
 - `test_i2c`: I2C (two-wire peripheral bus) recovery and PMU (power-management chip) startup failures, built against `02_pmu_test`, `03_gps_test` and `04_trip_logger` (three builds).
 - `test_pmu_startup_event`: diagnostic boot-history policy from saved PMU startup/recovery results.
-- `test_pmu_verification` **[TinyGPSPlus]**: checked PMU register reads, interrupt decoding, charging thresholds/control read-back, hysteresis and retry timing.
+- `test_pmu_verification` **[TinyGPSPlus]**: checked PMU register reads, interrupt decoding, charging thresholds/control read-back, hysteresis and retry timing; plausible-reading boundaries, garbage-first recovery on normal/no-storage startup, grace expiry/recovery, hot first readings, runtime garbage and timer rollover.
 - `test_degraded_policy`: mode selection and bounded retry delays when power control or storage is unavailable/untrusted.
 - `test_degraded` **[TinyGPSPlus]**: real startup/loop behavior with PMU/storage failures, verified supply settings, retry/restart recovery and preserved trips.
 - `test_temperature`: BME280 temperature-sensor compensation, bounded bus operations and checked PMU temperature-input/battery probes.
-- `test_temperature_runtime` **[TinyGPSPlus]**: debug temperature sampling/logging, failed/stale samples, charge-guard freshness and debug-off behavior.
+- `test_temperature_runtime` **[TinyGPSPlus]**: debug temperature sampling/logging, failed/stale/implausible samples, charge-guard freshness and debug-off behavior.
 
 **RTC (real-time clock) and diagnostic time**
 
@@ -167,7 +175,7 @@ the version pinned by CI. Point to its **`src/` folder**, containing
 export TINYGPS_DIR="<library-dir>/TinyGPSPlus/src"
 ```
 
-Without it, the runner prints `SKIPPED` and can still exit 0: **all eight
+Without it, the runner prints `SKIPPED` and can still exit 0: **all ten
 [TinyGPSPlus] C++ suites above and the RTC/fault Python bridges are omitted**.
 The default searched is `~/Documents/Arduino/libraries/TinyGPSPlus/src`;
 if your IDE uses a different sketchbook folder, set the variable explicitly.
@@ -219,3 +227,9 @@ the real drivers, radio, allocator or reset mechanism. Network time transport
 is simulated, and sequential host calls do not prove real multicore timing.
 This does not replace the on-hardware shakedown: it checks logic, not the flash
 driver, GPS reception or power behavior.
+
+The startup watchdog's card skip, including retention of its record through
+real watchdog resets, was bench-checked on 2026-11-10 (UTC). No-storage mode,
+a real power-on clearing the fallback and the first charge-temperature retry
+are covered by host tests only. Full 32 GB card scans, 8 MiB repairs and
+erased-flash scan timings still need hardware measurement.

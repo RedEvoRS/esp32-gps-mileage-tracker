@@ -12,13 +12,14 @@ struct JournalBoot {
     uint64_t counter = 0;
     bool counterPersisted = false;
 };
-inline JournalBoot newJournalBoot() {
+inline JournalBoot newJournalBoot(bool useNvs = true) {
     JournalBoot boot;
     uint8_t random[16]; esp_fill_random(random, sizeof(random));
     const char* hex = "0123456789abcdef";
     for (size_t i = 0; i < sizeof(random); ++i) {
         boot.id[2*i] = hex[random[i] >> 4]; boot.id[2*i+1] = hex[random[i] & 15];
     }
+    if (!useNvs) return boot; // startup-hang fallback must not retry NVS
     Preferences counter;
     if (counter.begin("diag", false)) {
         uint64_t previous = counter.isKey("boots") ? counter.getULong64("boots", UINT64_MAX) : 0;

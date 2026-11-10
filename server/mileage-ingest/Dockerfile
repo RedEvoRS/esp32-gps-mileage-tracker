@@ -5,7 +5,7 @@ RUN useradd --create-home --shell /bin/bash app
 WORKDIR /app
 
 COPY mileage-ingest/requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 COPY mileage-ingest/app.py mileage-ingest/diag_store.py mileage-ingest/reset_high_water.py /app/
 COPY common/ /app/common/

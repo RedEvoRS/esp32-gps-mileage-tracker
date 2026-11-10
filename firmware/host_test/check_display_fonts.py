@@ -40,7 +40,9 @@ def font_glyphs(source, font):
 
 def generate(root):
     assert "version=2.36.18" in (root / "library.properties").read_text()
-    source = (root / "src/clib/u8g2_fonts.c").read_text()
+    # Upstream font comments include raw non-UTF-8 bytes. Preserve them on
+    # every host; the C string literals we parse use ASCII escape sequences.
+    source = (root / "src/clib/u8g2_fonts.c").read_text(encoding="latin-1")
     # The version card wraps at 21 columns, with baselines at 52 and 62.
     small = font_glyphs(source, "5x8_tf")
     big = font_glyphs(source, "helvB14_tr")

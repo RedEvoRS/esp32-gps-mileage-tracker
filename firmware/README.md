@@ -21,7 +21,14 @@ while running reports E4001 and new trips move to internal flash, a long
 POWER press on USB shows an on-screen message, and diagnostic journal write
 failures raise E4008. Firmware `v1.03` (tag `fw-v1.03`) followed the same
 day: a long POWER press on battery shows **Switching off** for about a
-second before the screen goes dark. On
+second before the screen goes dark. Firmware `v1.04` adds a short pause when
+the GPS UART is empty, a 60-second watchdog for the main loop, a
+120-second watchdog for each startup step that skips a hanging card after two
+startup hangs, a retry for an unreadable first charge temperature, and
+explicit trip-upload timeouts with separate send/reply timings. Both watchdog
+resets, the card skip and the loop pause were bench-checked on USB power on
+2026-11-10 (UTC); the battery paths and a start from fully off were not (see
+[Watchdog bench check](#watchdog-bench-check)). On
 2026-10-21 (UTC), an earlier Stage 4 build uploaded
 four real trips from microSD to the deployed server, then delivered all 115
 pending diagnostic events and a current snapshot. Uploads with debug mode
@@ -1005,6 +1012,38 @@ How it behaves once flashed:
   reset. On boot the firmware attempts to repair incomplete files, keeping
   ambiguous or damaged files for inspection. Hardware power-cut testing
   is still needed; there is no verified one-point loss limit.
+- **Main-loop rest and recovery:** after each normal pass, the GPS loop pauses
+  for 5 ms only if no UART bytes are waiting. It rechecks after other work so
+  a new burst is read on the next pass without an added pause. This gives
+  core 1 time to idle; battery and temperature improvements have not been
+  measured. The existing degraded loop keeps its 20 ms pause.
+  A task watchdog starts after bounded PMU recovery and the radio-off safety
+  command, before display or storage work. Startup has a generous 120-second
+  limit per stage; normal and degraded loops use 60 seconds afterward.
+  The Arduino core feeds it before each loop pass. A stuck filesystem lock
+  or driver call then requests a panic and board restart. Slow runtime trip
+  repair feeds it only as bytes are successfully scanned or copied; bounded
+  shutdown stages feed it between stages, never inside their polling waits.
+  Boot scans and repairs feed only on verified progress. Stage boundaries feed
+  after a call returns. The first card free-space query has no progress hook
+  and must return within 120 seconds. Two startup hangs in card-only work skip
+  the card and use internal flash with E4001. Other repeated startup hangs,
+  or another hang with the card skipped, select no-storage degraded mode and
+  disable storage recovery probes. The fallback lasts until a real power-on.
+  Each watchdog-reset boot queues E1003; serial names the hung stage/count.
+  A boot that hangs again before its events are saved loses them, so a card
+  that hangs every time gives one E1003 for the two resets. The card skip
+  was bench-checked on 2026-11-10 (UTC) (see
+  [Watchdog bench check](#watchdog-bench-check)); no-storage mode and the
+  clearing at a real power-on were not. Slow full-card scans and large
+  repairs have not been timed.
+  The network task
+  on core 0 is not enrolled: a trip upload may legitimately take 15 minutes.
+  Boot repairs the stores still in use before logging resumes. Untimed points
+  still in RAM can be lost.
+  The watchdog reset and the loop pause were bench-checked on USB power on
+  2026-11-10 (UTC). Battery savings, the power-off paths and recovery of a
+  trip cut off mid-recording have not been checked on the board.
 - **Time:** each trackpoint uses the UTC date and time from the same RMC
   sentence as its position, including centiseconds. Zero centiseconds use
   whole seconds (`...SSZ`); otherwise GPX writes three fractional digits
@@ -1093,8 +1132,18 @@ How it behaves once flashed:
   logs the readings it needs (the `Temp:` line under [The screen](#the-screen)).
   This is not a measurement of the battery cell or a guarantee of safe charging in a
   hot car. Logging continues while charging is paused.
+  A die reading must be finite and between -40 and 125 C to be usable.
+  An unreadable first sample keeps charging off and retries each second for
+  ten seconds, without blocking startup or raising E2004/E2005/E2006.
+  A plausible hot/cold reading acts immediately. If no usable reading arrives,
+  E2006 is raised and retries return to 30 seconds. Runtime garbage after a
+  good reading pauses charging and raises E2006 at once. Invalid readings
+  never clear hot/cold faults or appear as real debug temperatures.
+  This first-reading retry is covered by host tests only. The 2026-11-10
+  (UTC) bench boots were USB resets whose first reading was already usable,
+  so a start from fully off is still unchecked.
   The guard verifies every charger on/off command with a checked register read
-  and retries unconfirmed commands every 30 s; E2008 means three attempts failed
+  and retries unconfirmed commands at the sampling cadence; E2008 means three attempts failed
   to confirm the requested state, so charging may still be on or remain off.
 - **Storage full:** the selected trip store (microSD or internal flash)
   must have at least 64 KiB free to start a trip; below 24 KiB it ends
@@ -1130,6 +1179,17 @@ failing card, for example), the line instead reads
 The trip is safely on the server; the copy is uploaded again at the next
 chance, and the server answers identical copies with 200 without storing a
 duplicate.
+
+New upload lines keep the same status text and append, for example,
+`; send 2.4 s, reply 0.3 s`. The time beside the byte count is the whole HTTP
+request. `send` includes connecting and sending headers/body through the
+last socket write; `reply` is the subsequent wait for response headers.
+Connecting has an explicit 5-second timeout, and the reply wait has a
+10-second timeout. That gives a slower server more time to parse and save a
+large trip while staying below the 15-second shutdown-abort window. A timeout
+keeps the trip queued. Historical log examples above retain their original form.
+The reply setting limits time without incoming data; it is not a deadline
+for the entire response. A server that trickles headers can extend the total wait.
 
 Server-down retry was verified on 2026-10-21 (UTC): the trip stayed queued
 after two `HTTP -1` failures and uploaded with HTTP 200 after ingest
@@ -1171,6 +1231,96 @@ Unknown contents, unequal copies, and names that collide with a quarantined
 inspection; they may continue to consume storage. Failed storage operations
 leave recoverable copies available for the next boot. Hardware power-cut
 testing remains necessary to verify the flash driver's behavior.
+
+#### Watchdog bench check
+
+Bench result, 2026-11-10 (UTC), on USB power with no battery fitted, using a
+v1.04 build from before the merge:
+
+- With the bench hook, the loop blocked right after `Setup complete`. Sixty
+  seconds later the serial log showed `task_wdt: Task watchdog got triggered`
+  naming `loopTask (CPU 1)`, then `Rebooting...`. The next boot skipped the
+  hang, configured GPS and carried on with no second reset. The network task
+  kept running while the loop was blocked. The server received E1003 from
+  that boot.
+- With a normal build and debug mode on for 22 minutes: one GPS clock sync a
+  minute, an RF line and a `Temp:` line every 30 seconds, 12 satellites used,
+  no warnings or resets. The power chip ran 9.2 C above the board's air
+  sensor, against 10.4 C on v1.03 in the same session.
+
+Startup watchdog result, 2026-11-10 (UTC), same setup, using the v1.04 build
+at commit `741d099` with the card fitted. Every boot was a USB reset, never a
+start from fully off:
+
+- With the startup bench hook, the boot stopped at
+  `WATCHDOG BENCH: blocking card mount until startup watchdog reset.` About
+  120 seconds later `task_wdt` named `loopTask (CPU 1)` and the board
+  restarted (`rst:0xc (RTC_SW_CPU_RST)`). The next boot printed
+  `STARTUP WATCHDOG: previous hang in card mount; consecutive startup hangs 1.`
+  and hung again. After the second reset it printed `consecutive startup
+  hangs 2.` and `STARTUP WATCHDOG: skipping card until next power-on; using
+  internal flash for trips.`, used internal flash (2.30 MiB free) and
+  finished setup. The server received E1003 and E4001 from that boot. The
+  boot after the first reset hung before its events were saved, so there was
+  one E1003 for the two resets.
+- The loop bench build was then flashed with the card still skipped: the
+  USB reset kept the skip. The loop was reset after 60 seconds, and the next
+  boot printed no `previous hang` line, so a loop reset did not count as a
+  startup hang. The server received E1003 and E4001.
+- A normal build with the card still skipped ran eight minutes without a
+  reset. A bench-only build that treated its boot as a power-on cleared the
+  record and mounted the card again. This stands in for a real power-on,
+  which was not tried.
+- The normal `741d099` build then mounted the card (29.71 GiB free),
+  finished setup in about one second, read 33.7 C on its first charge-guard
+  check with charging on, and ran 5.6 hours with no reset.
+
+Not checked: battery savings, the idle and long-press power-off paths (no
+battery was fitted), the buttons and screen, the RTC write (the clock needed
+no correction), upload timings (nothing was queued), recovery of a trip
+cut off mid-recording, a start from fully off (the first-temperature retry
+and clearing the card skip), no-storage mode after a non-card hang, and
+startup timing with a full card, a large repair or an erased flash
+partition.
+
+To repeat the supervised bench test,
+use a spare card and the normal Supreme build settings. Add
+`--build-property compiler.cpp.extra_flags=-DWATCHDOG_BENCH_HANG` to the
+`arduino-cli compile` command, keeping the normal version-stamping step and
+Stage 4 size limit. This compile-time hook is absent from normal builds.
+It prints `WATCHDOG BENCH: blocking loop until watchdog reset.` after startup
+and deliberately stops feeding the loop watchdog while yielding to other tasks.
+Expect a restart after about 60 seconds. A boot whose reset reason is already
+a watchdog reset skips the deliberate hang, so that reset can record E1003,
+repair an incomplete trip and continue logging. A later non-watchdog boot
+with this bench build will hang again; rebuild without the flag afterward.
+The hook runs before a new trip starts. To check boot repair as well, prepare
+an incomplete test GPX on the spare card while the board is off; the hook
+alone does not prove recovery of a trip interrupted during recording.
+
+The separate `WATCHDOG_BENCH_STARTUP_HANG` flag is also off by default.
+Build it with
+`--build-property compiler.cpp.extra_flags=-DWATCHDOG_BENCH_STARTUP_HANG`.
+It prints `WATCHDOG BENCH: blocking card mount until startup watchdog reset.`
+on each boot where the card is not skipped, then yields without feeding.
+The expected sequence is two startup timeouts of about 120 seconds each,
+then a boot that skips SD, selects LittleFS, raises E4001 and records trips.
+A checksummed record in retained RTC memory counts only watchdog resets
+while a startup stage is active. A loop reset does not count. The card stays
+skipped across resets and completed boots until a real power-on, when this
+bench build will hang again. Rebuild without the flag afterward. Use each
+bench flag separately.
+
+This startup hook and the card skip were run on the board on 2026-11-10
+(UTC), as above; no-storage mode was not. The timeout is unmeasured for a
+full 32 GB card, an 8 MiB repair
+or the full 2.375 MB erased-partition scan. Successful block/copy progress
+feeds the watchdog, so a healthy repair may take longer overall. With a card
+that always hangs, each power-on waits about four minutes (two 120-second
+timeouts), plus reboot and healthy internal-flash startup, before trips can
+be recorded to flash. There is no fixed total bound for progressing repairs.
+If internal flash also hangs, the next startup hang latches no-storage mode;
+trips cannot be recorded, but charge and battery power management continue.
 
 #### Startup failures
 

@@ -123,7 +123,7 @@ class ViewerMerges(unittest.TestCase):
         book = load_workbook(io.BytesIO(self.client.get("/export.xlsx").data))
         try:
             headers, values = list(book[sheet].values)[:2]
-            row = dict(zip(headers, values))
+            row = dict(zip(headers, values, strict=True))
             self.assertEqual(row["trip_id"], trip_id)
             self.assertEqual(row["gpx_file"], files)
         finally:
@@ -485,7 +485,8 @@ class ViewerMerges(unittest.TestCase):
 
     def test_unidentified_damaged_device_outside_window_does_not_block(self):
         # A timestamp ID proves chronology whatever device recorded it.
-        a, b = self.trip("a", 0), self.trip("b", 120)
+        a = self.trip("a", 0)
+        self.trip("b", 120)
         for device in (None, "", "unknown", {"invalid": "device"}):
             key = self.trip("2026-03-14T12-00-00Z", -31 * 86400)
             self.damage_summary(key, device_id=device, start_time=None)

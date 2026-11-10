@@ -8,8 +8,8 @@
 # firmware/README.md.
 version: 2
 updates:
-  # Both services pin flask, gunicorn and tzdata, and those must stay in
-  # step, so one grouped PR updates both requirements files together.
+  # Paired requirements.in/requirements.txt files use pip-compile's Python
+  # 3.12 header. Keep direct and indirect updates together across services.
   - package-ecosystem: pip
     directories:
       - /server/mileage-ingest
@@ -18,11 +18,23 @@ updates:
       interval: monthly
     cooldown:
       default-days: 7
+    allow:
+      - dependency-type: all
     groups:
       server-python:
         patterns: ["*"]
     commit-message:
       prefix: "Server"
+
+  # Keep the small CI linter pin separate from the service dependencies.
+  - package-ecosystem: pip
+    directory: /tools/lint
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "CI"
 
   # The python:3.12-slim base images. A new Python minor here should also
   # move python-version in .github/workflows/audit-tests.yml, so CI tests

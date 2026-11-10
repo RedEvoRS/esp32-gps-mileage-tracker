@@ -92,6 +92,7 @@ server/
   viewer.env.example     Copy to viewer.env, set the admin login
   monitor.env.example    Disabled defaults; private monitor.env selected via MONITOR_ENV_FILE
   install.sh             First-time install with checks; --check re-verifies
+  update_python_dependencies.sh  Regenerates both services' hashed requirements.txt
   mileage-ingest/        Flask ingest (app.py), diagnostics SQLite (diag_store.py), Dockerfile
   mileage-viewer/        Flask trip viewer/export + Device health
                         (app.py, users.py, manage_users.py, trip_log.py, geocoding.py, static/)
@@ -106,6 +107,8 @@ server/
 
 tools/check_pii.py                  Personal-info scan (CI runs it; see Do Not)
 tools/generate_error_catalog.py     Generates sketch-local diag_catalog.h
+tools/lint/requirements.txt         Pinned ruff for the CI lint step
+ruff.toml                           Lint rules (F, E9, B) for server, tools and install
 DEPLOY_UNRAID.md                   Unraid install, cron backups and Debian migration
 DIAGNOSTICS.md                     Framework reference and issue delivery map
 .github/workflows/release.yml       Published-release bundle, scripts and checksums
@@ -151,6 +154,8 @@ cancelled. The PII/tools job is skipped for Dependabot PRs:
   before pushing; it also checks every file version and path the range adds,
   even ones later removed) and `python -m unittest discover -s tools`.
   The scanner checks positions and new commit dates; commit with TZ=UTC.
+- Python lint: `python -m pip install -r tools/lint/requirements.txt`, then
+  `ruff check` (server, tools and install; rules F, E9 and B).
 - Server: `python -m unittest discover -s server/tests`,
   `python tools/generate_error_catalog.py --check`,
   `node server/tests/test_viewer_map.js` and `node server/tests/test_viewer_places.js`.
@@ -256,7 +261,25 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   until boot GPS configuration succeeds or gives up after five attempts;
   after >10s without NAV-PVT from config end or the last NAV-PVT, warn once
   and fall back to RMC-only speed
-- FreeRTOS: networking on core 0, GPS on core 1
+- FreeRTOS: networking on core 0, GPS on core 1; normal loop pauses 5 ms
+  only with an empty UART. Firmware v1.04 watches startup at 120 s per stage
+  after bounded PMU recovery and radio-off safety setup, then switches to 60 s
+  for the loop. Verified scan/repair progress feeds it; waits and locks do not.
+  Two startup hangs skip a failing card for LittleFS, or use no-storage mode
+  after other hangs. The latch lasts until a real power-on; no-storage mode
+  suppresses storage probes. The card skip was bench-checked 2026-11-10 (UTC)
+  on USB with a bench build that hangs the card mount: two resets 120 s apart,
+  the retained RTC record survived both, and the third boot used LittleFS and
+  reported E1003/E4001. A USB reset kept the skip; a loop reset did not count.
+  No-storage mode, a real power-on clearing the latch and slow-boot timings
+  are unverified. The network task remains unenrolled.
+  The existing loop watchdog and pause were bench-checked
+  2026-11-10 (UTC) on USB with no battery: a deliberately blocked loop was
+  reset after 60 s, rebooted, carried on and reported E1003; the loop pause
+  ran 22 minutes with normal GPS and sampling. Battery savings, power-off
+  paths and recovery of a trip cut off mid-recording remain unverified.
+- Trip HTTP: explicit 5 s connect / 10 s reply timeouts (reply <15 s abort);
+  upload logs append separate send/reply times after the existing status text.
 - Stage 4 diagnostics: static EventLog, random boot identity and a boot
   counter in nonvolatile storage (NVS); early BOOT/pre-seal power-off battery
   samples and a read-only parked-drain helper (deploy the server catalog
@@ -268,6 +291,13 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   15-minute repeats; WiFi access point (AP) absence is a boot-local counter,
   never a scan event. Per-core static producer builders keep event buffers
   off task stacks. Bounded degraded startup retries restart on recovery.
+  The charge guard accepts finite die readings only from -40 to 125 C.
+  An unreadable first sample keeps charging off and retries each second for
+  ten seconds before E2006; plausible hot/cold samples act immediately.
+  Invalid samples never create hot/cold history or real debug temperatures.
+  The first-reading retry has host tests only: bench boots on 2026-11-10 (UTC)
+  were USB resets with a usable first reading, so a start from fully off is
+  unchecked.
 - Diagnostic journal: the network task services one queued record at a time
   using a zero-wait filesystem lock and yields maintenance to trip/upload
   demand. Mounted SD has a 16 MiB journal quota; LittleFS has a 64 KiB reserve
@@ -314,6 +344,14 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 
 ### Server
 
+- Container logs: every service uses Docker `json-file`, three 10 MB files;
+  updates recreate changed containers, and `install.sh --check` warns on
+  older log settings.
+- Python dependencies: each service's `requirements.in` lists the packages
+  it uses directly; the compiled `requirements.txt` pins every package with
+  hashes, and image builds and CI install it with `--require-hashes`.
+  Regenerate both with `server/update_python_dependencies.sh` in the
+  `python:3.12-slim` container (`server/README.md`), never on Windows.
 - Unraid: detect `/etc/unraid-version` (`version=` starts with a digit);
   `MILEAGE_PLATFORM=debian|unraid` overrides detection. Root-only, no sudo,
   apt or systemd. Installer writes `RESTART_POLICY=always`; unset Compose

@@ -23,8 +23,10 @@ static void world() {
     gJournalSealRequested = gJournalSealDone = gJournalSealOk = false;
     gEventIoBudget = false; g_taskDelayHook = nullptr;
     gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0;
+    gChargeFirstResolved = false; gChargeFirstMs = 0;
     gBatteryDiagChecked = false;
-    gVbusOffPending = gPmuIrqFlag = false;
+    gVbusOffPending = false;
+    gPmuIrqFlag = false;
     gVbusRetry = VbusRetry::None; gVbusRetryMs = gVbusOffReadMs = 0;
     gPmuIrqRetry = false; gPmuIrqReadMs = 0; gBatteryThresholds = -1;
     for (auto& slot : gLoopConditions) { auto code = slot.code; slot = {}; slot.code = code; }

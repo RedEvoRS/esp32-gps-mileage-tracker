@@ -23,6 +23,8 @@ _spec = importlib.util.spec_from_file_location("ingest", SERVER / "mileage-inges
 ing = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ing)
 
+from common.trip_summary import METERS_PER_MILE, MPS_TO_MPH, SUMMARY_VERSION, _haversine_m
+
 LAT0, LON0 = 37.0, -122.0
 # Degrees per metre on the same 6371 km sphere the haversine uses, so a
 # synthetic "900 m" measures as 900 m.
@@ -61,7 +63,7 @@ def summary(segments):
 
 
 def meters(s):
-    return s["distance_miles"] * ing.METERS_PER_MILE
+    return s["distance_miles"] * METERS_PER_MILE
 
 
 def drive(n0, t0, seconds, mps):
@@ -86,7 +88,7 @@ class DistanceModel(unittest.TestCase):
         s = ing.summarize(ing.parse_gpx((SERVER / "sample.gpx").read_bytes()))
         self.assertEqual(s["distance_miles"], 0.295)
         self.assertEqual(s["num_points"], 4)
-        self.assertEqual(s["summary_version"], ing.SUMMARY_VERSION)
+        self.assertEqual(s["summary_version"], SUMMARY_VERSION)
 
     def test_parked_jitter_adds_nothing(self):  # N1
         s = summary([[pt(0, 0, 0, 0.0)] + parked(0, 0, 180)])
@@ -108,7 +110,7 @@ class DistanceModel(unittest.TestCase):
         self.assertEqual(s["end_time"], (T0 + timedelta(seconds=60)).isoformat())
         self.assertEqual(s["recorded_until"], (T0 + timedelta(seconds=241)).isoformat())
         self.assertEqual(s["duration_seconds"], 60)
-        self.assertAlmostEqual(s["avg_speed_mph"], 15 * ing.MPS_TO_MPH, delta=0.2)
+        self.assertAlmostEqual(s["avg_speed_mph"], 15 * MPS_TO_MPH, delta=0.2)
 
     def test_tunnel_gap_is_bridged(self):  # N2
         a = [pt(0, 0, 0, 25.0)] + drive(0, 0, 40, 25.0)          # 0..1000 m
@@ -152,9 +154,9 @@ class DistanceModel(unittest.TestCase):
         moving = [pt(15 * i, 0, i, None) for i in range(61)]     # 900 m
         rnd = random.Random(2)
         still = [pt(900 + rnd.gauss(0, 0.3), rnd.gauss(0, 0.3), 61 + i, None) for i in range(120)]
-        unfiltered = sum(ing._haversine_m(LAT0 + a["n"] * M_LAT, LON0 + a["e"] * M_LON,
-                                          LAT0 + b["n"] * M_LAT, LON0 + b["e"] * M_LON)
-                         for a, b in zip(still, still[1:]))
+        unfiltered = sum(_haversine_m(LAT0 + a["n"] * M_LAT, LON0 + a["e"] * M_LON,
+                                     LAT0 + b["n"] * M_LAT, LON0 + b["e"] * M_LON)
+                         for a, b in zip(still, still[1:], strict=False))
         excess = meters(summary([moving + still])) - 900
         self.assertGreaterEqual(excess, -2)
         self.assertLess(excess, unfiltered * 0.35, f"{excess:.1f} m of {unfiltered:.1f} m jitter kept")
@@ -180,7 +182,7 @@ class DistanceModel(unittest.TestCase):
         timed = summary([[pt(0, 0, 0, 15), pt(15, 0, 1, 15)]])
         self.assertEqual(timed["timing_status"], "complete")
         self.assertEqual(timed["duration_seconds"], 1)
-        self.assertAlmostEqual(timed["avg_speed_mph"], 15 * ing.MPS_TO_MPH, delta=.2)
+        self.assertAlmostEqual(timed["avg_speed_mph"], 15 * MPS_TO_MPH, delta=.2)
         untimed = summary([[pt(0, 0, None, 15), pt(15, 0, None, 15)]])
         self.assertEqual(untimed["timing_status"], "untimed")
         self.assertIsNone(untimed["timed_from"])
@@ -210,8 +212,8 @@ class UploadEndToEnd(unittest.TestCase):
         self.assertEqual(stored.stem, "2026-04-14T14-30-00Z")
         self.assertEqual(rec["trip_id"], stored.stem)
         self.assertEqual(r.get_json()["trip_id"], stored.stem)
-        self.assertAlmostEqual(rec["distance_miles"] * ing.METERS_PER_MILE, 900, delta=4)
-        self.assertEqual(rec["summary_version"], ing.SUMMARY_VERSION)
+        self.assertAlmostEqual(rec["distance_miles"] * METERS_PER_MILE, 900, delta=4)
+        self.assertEqual(rec["summary_version"], SUMMARY_VERSION)
         self.assertEqual(rec["duration_seconds"], 60)
 
 

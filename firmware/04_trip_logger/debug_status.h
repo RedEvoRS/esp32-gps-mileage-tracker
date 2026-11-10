@@ -61,8 +61,15 @@ static inline void formatDebugStatus(const DebugStatus& s, char lines[8][22]) {
     debugCount(s.used, used, sizeof used);
     debugCount(s.agcPct < 0 ? -1 : (int)debugBound(s.agcPct, 100), agc, sizeof agc);
     // Keep the percent sign even with two 999 counts and full-scale AGC.
-    const char* gap = strlen(heard) + strlen(used) + strlen(agc) > 8 ? "" : " ";
-    snprintf(lines[1], 22, "SATS R:%s U:%s%sA%s%%", heard, used, gap, agc);
+    snprintf(lines[1], 22, "SATS R:%s U:%sA%s%%", heard, used, agc);
+    // The three bounded counts fit without a gap. Insert it only when there
+    // is a spare column; this also makes the bound visible to GCC's checker.
+    size_t satsLength = strlen(lines[1]);
+    if (satsLength < 21) {
+        size_t gapAt = 10 + strlen(heard) + strlen(used);
+        memmove(lines[1] + gapAt + 1, lines[1] + gapAt, satsLength - gapAt + 1);
+        lines[1][gapAt] = ' ';
+    }
     if (s.fixAgeMs == UINT32_MAX) snprintf(age, sizeof age, "--");
     else snprintf(age, sizeof age, "%u", debugBound(s.fixAgeMs / 1000, 999));
     if (!isfinite(s.hdop) || s.hdop < 0) snprintf(hdop, sizeof hdop, "--");

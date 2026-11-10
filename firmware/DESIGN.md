@@ -26,6 +26,20 @@ receive buffer to 2,048 bytes **before** `GPSSerial.begin()`. At 9,600 baud
 that is only about two seconds of incoming data, so buffering supplements
 the core split rather than making long stalls safe.
 
+At the end of a normal pass, `loop()` checks the UART again and calls
+`vTaskDelay` for 5 ms only if it is empty. Bytes arriving during display or
+power work suppress that pause. At 9,600 baud, about five bytes can arrive
+during 5 ms, compared with the 2,048-byte buffer. This lets core 1 idle
+between bursts. The 40 ms BOOT debounce and latched PMU IRQ still run each
+pass; the debug page keeps its one-second redraw, and the BME280 conversion
+can finish on a later pass after its 5 ms wait. The RTC still waits for the
+first 100 ms of a second, GPS configuration keeps its two-second ACK window,
+and NAV-PVT keeps its 1,500 ms freshness limit. Host regressions exercise
+these with time advancing through the pause. The degraded loop keeps its
+20 ms delay. A 22-minute bench run on 2026-11-10 (UTC) showed normal GPS,
+clock and temperature sampling with the pause; battery savings have not
+been measured.
+
 The cores have distinct owners and narrow sharing points:
 
 - Core 1 constructs `Fix` objects, owns trip state and writes the active
@@ -51,6 +65,134 @@ recorded 7,436 bytes free during real trip and diagnostics uploads with GPS
 logging active; the allocation was retained. `uploadFile()` uses plain
 HTTP with `WiFiClient`, without Transport Layer Security (TLS). A future
 TLS path would need its own stack measurement.
+
+Trip uploads explicitly set a five-second connect timeout and ten-second
+reply timeout. A `static_assert` keeps the latter below the 15-second
+network-abort deadline: `gNetAbort` can interrupt the body stream but cannot
+interrupt HTTPClient's wait for a reply. An 8 MiB trip takes about 0.4 s to
+parse on a desktop; ten seconds allows slower processors and durable disk
+writes more margin. Existing upload status text is preserved, with send and
+reply seconds appended. In core 3.3.11, HTTPClient asks the body stream for
+availability after its final socket write, before checking remaining length
+and reading response headers. `LockedFileStream` records that boundary;
+send time includes connection/headers/body, and reply time begins afterward.
+An early send failure has no reply wait. Both timings use unsigned elapsed
+milliseconds so timer rollover is safe.
+HTTPClient resets its read timer when response data arrives: this is an
+inactivity limit, so trickling response headers can extend the total wait
+beyond ten seconds. The assertion bounds the configured timeout, not the
+entire HTTP request.
+
+## Startup and main-loop watchdog
+
+The installed ESP32-S3 core 3.3.11 initializes the task watchdog at five
+seconds with panic enabled, watches the core-0 idle task, and leaves the
+Arduino loop task unenrolled. `armLoopWatchdog()` reconfigures that shared
+watchdog to `STARTUP_WDT_TIMEOUT_MS` (120 seconds), explicitly enables panic,
+preserves the configured idle-task subscriptions and enrolls the loop task
+with `enableLoopWDT()`. Enrollment is checked. If it fails, the firmware
+prints an error and carries on without the watchdog: restarting would loop
+forever when arming can never succeed, and recording trips matters more than
+the safety net. When the watchdog does expire, the installed panic
+configuration prints and reboots. This also extends
+the existing core-0 idle-task watchdog timeout too.
+
+Enrollment follows bounded PMU bus recovery and the LoRa-off safety command,
+before display setup, USB waits or storage. Degraded startups use it too.
+The initial PMU recovery itself is not watched by this helper. Stage boundaries
+feed only after the previous stage returned. Erased-partition reads, trip scans,
+directory entries and repair copies also feed on verified progress. Waits,
+mount retries and lock acquisition do not feed. A progressing operation can
+take longer than 120 seconds in total. Driver calls without visible progress,
+including the first FAT free-space query, must return within that limit.
+
+At the end of normal or degraded startup, the limit becomes
+`LOOP_WDT_TIMEOUT_MS` (60 seconds). ESP-IDF 5.5.5's
+`esp_task_wdt_reconfigure()` retains subscriptions and restarts its timer under
+a spinlock. The sketch feeds around this change and never removes the loop
+task. It preserves the idle-task mask. A failed arm or reconfiguration prints
+an error and carries on; it never deliberately restarts the board. If the
+early arm fails, startup runs unwatched and the end of startup tries once
+more, so the loop can still be watched at its own limit.
+
+`startup_watchdog.h` decides how to handle repeated startup hangs. A small
+`RTC_NOINIT_ATTR` record holds the active stage, hang count, fallback, magic
+and checksum. This section is separate from cleared RTC BSS. The S3 task-watchdog
+panic path restarts the CPUs without clearing it. On 2026-11-10 (UTC) the
+record survived two real task-watchdog resets on this board
+(`rst:0xc (RTC_SW_CPU_RST)`).
+A corrupt record means no history. Only a watchdog reset with an active
+startup stage increments the streak. Loop watchdog resets do not count.
+Other resets break the streak, while preserving a fallback already latched.
+
+After `STARTUP_HANG_LIMIT` (two) hangs, a card mount, free-space query or trip
+repair failure skips the card and records to LittleFS with existing E4001.
+The startup journal stage is shared RAM/NVS work, not a card-only operation:
+disk journal loading is deferred to the service task. Two hangs in another
+stage, or another startup hang with the card already skipped, select
+`NoStorage`. That mode skips all mounts, provisioning, NVS boot counting and
+storage recovery probes. It also skips display and RTC setup, because the
+hang may have been there. The PMU setup is the same as for an ordinary mount
+failure, including the 4.1 V charge target. Diagnostics remain in RAM; power
+management and the charge guard keep running. The fallback stays latched through completed boots
+and resets until a real power-on. That power-on clears the history and tries
+normal storage again. Serial output identifies the previous stage/count and
+the applied fallback. Watchdog boots still enqueue E1003.
+
+The startup limit is generous and **unmeasured**. Only nearly empty-card boots
+without repair have been observed at 1–2 seconds from banner to completion.
+Full 32 GB card scans, 8 MiB repairs and the 2.375 MB erased-flash scan have
+not been timed. A card that hangs at every mount costs two 120-second waits
+per power-on, about four minutes plus reboot and healthy flash startup, before
+trips can use internal flash. Progressing flash repair has no fixed total limit.
+The card-skip path was bench-checked on 2026-11-10 (UTC). No-storage mode, a
+real power-on clearing the latch and the stage timings above remain unchecked
+on the board.
+
+Arduino's `main.cpp` feeds before each `loop()` call, covering normal and
+degraded modes. Runtime scan, prefix comparison and repair-copy loops feed
+only after successful byte progress. Power-off feeds after its two bounded
+15-second network/journal handoffs, returned unmount, returned shutdown hold
+and completed remount. Its display hold and post-shutdown hold are one second
+each. The watchdog remains armed through driver calls and restart requests;
+there is no feed inside `FS_LOCK()` acquisition or a polling wait. A stalled
+driver or lock is meant to expire, while ordinary 20 ms degraded passes and
+bounded I2C/display operations fit well inside the interval. Normal journal
+disk recovery is deferred to core 0; degraded service processes one queued
+record per pass. The core-0 network task is not enrolled or fed by these
+helpers, since a healthy upload may run for 15 minutes.
+
+`WATCHDOG_BENCH_STARTUP_HANG`, off by default, blocks each unskipped card-mount
+stage without feeds. After two simulated resets, host tests verify a LittleFS
+trip and E1003/E4001. The real reset sequence was bench-checked on 2026-11-10
+(UTC).
+`WATCHDOG_BENCH_HANG`, also off by default, deliberately blocks the loop without
+feeding; watchdog-reset boots skip the hook and continue through ordinary
+recovery. See the [bench instructions](README.md#watchdog-bench-check).
+The watchdog reset was bench-checked on 2026-11-10 (UTC); the results and
+what remains unchecked are in the same README section. Host control-flow
+tests and real board builds do not prove SD durability.
+
+## First charge-temperature reading
+
+`charge_temperature.h` accepts only finite die readings from -40 to 125 C.
+These are plausibility bounds, not battery charging limits. XPowersLib 0.3.3
+uses `22 + (7274 - raw) / 20`; raw zero gives the observed 385.7 C cold-start
+sample. It is consistent with an ADC conversion not being ready.
+
+The first normal or no-storage check commands and verifies charging off if
+the reading is implausible. The loop retries every `CHG_FIRST_RETRY_MS`
+(one second) for `CHG_FIRST_GRACE_MS` (ten seconds), without a setup wait.
+During this grace period there is no hot/cold event or E2006. A plausible
+reading immediately uses the existing thresholds and charger read-back rules;
+a plausible hot reading still raises E2004 at once. Grace expiry raises
+E2006, prints one serial line saying charging stays off, and returns to
+30-second sampling. Later plausible recovery clears it.
+Any implausible sample after the first good one immediately follows the normal
+unreadable path. Invalid readings never clear hot/cold episodes, supply event
+temperature context or appear as real debug temperatures. The retry is covered
+by host tests only. The 2026-11-10 (UTC) bench boots were USB resets whose
+first reading was already usable, so the retry is unchecked on the board.
 
 ## Firmware identity on the debug screen
 

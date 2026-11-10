@@ -779,4 +779,5 @@ int main(int argc, char** argv) {
     ackFailureBatchFallback();
     std::cerr << "validation\n"; validationAndConcurrency();
     std::cout << "EventLog: identity, recovery, faults, quota, fallback, protocol and concurrency passed\n";
+    return 0;
 }

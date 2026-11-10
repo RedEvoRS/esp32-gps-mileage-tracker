@@ -180,7 +180,8 @@ int main(int argc, char**) {
     rtcWorld(false); beginRtc(); take(); failWrite = true; setTrusted(fakeEpoch,101);
     serviceRtc(); assert(writes == 0); g_millis += 899;
     serviceRtc(); assert(writes == 1); take(); before = transactions;
-    for (unsigned i = 0; i < 100; ++i) serviceRtc(); assert(writes == 1);
+    for (unsigned i = 0; i < 100; ++i) serviceRtc();
+    assert(writes == 1);
     g_millis += 59999; serviceRtc(); assert(writes == 1 && transactions == before);
     ++g_millis; serviceRtc(); assert(writes == 2);
     g_millis += 60000; serviceRtc(); assert(writes == 3);
@@ -225,6 +226,13 @@ int main(int argc, char**) {
         rtcWorld(); Preferences::durable64["rtc_set"] = saved; beginRtc();
         gLoopFaults.event(3003,millis()).notice(); has(take()[0],"\"sync_age_ms\":null");
     }
+    // Advance only via the production loop's 5 ms pause. Its service must
+    // still catch the first 100 ms of a later second without spending retries.
+    rtcWorld(false); beginRtc(); take(); setTrusted(fakeEpoch, 101);
+    uint32_t alignedStart = millis();
+    while (!writes && uint32_t(millis() - alignedStart) < 1000) loop();
+    assert(writes == 1 && uint32_t(millis() - alignedStart) <= 905);
+    assert((g_epochBaseMs + millis() - LOOP_IDLE_MS) % 1000 < 100);
     if (exportJson) for (auto& row : exported) std::printf("EVENT %s\n",row.c_str());
-    std::printf("RTC runtime: 20 scenario groups passed (runtime debug=%d)\n",debugMode());
+    std::printf("RTC runtime: 21 scenario groups passed (runtime debug=%d)\n",debugMode());
 }

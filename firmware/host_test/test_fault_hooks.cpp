@@ -23,6 +23,7 @@ static void faultWorld() {
     gNetFaults.~RuntimeFaults(); new (&gNetFaults) RuntimeFaults(gJournal, gNetConditions, sizeof(gNetConditions)/sizeof(gNetConditions[0]));
     gBatteryDiagChecked = false; gStorageDiagMs = g_millis;
     gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0; gChargeCheckT0 = 0;
+    gChargeFirstResolved = false; gChargeFirstMs = 0;
     gJoinFailures = gTransportFailures = 0;
     gClockSet = true; gNetAbort = gNetHold = gNetBusy = false;
     gPmuIrqFlag = false; PMU = XPowersAXP2101(); WiFi = WiFiStub();
@@ -66,7 +67,7 @@ static std::string one(int code, const char* transition) {
 }
 // Each condition is exercised through its real hook: first raise, hot-loop
 // suppression, one bounded repeat, same-episode clear, healthy silence.
-static void cycle(int code, const std::function<void(bool)>& path, const char* field = nullptr) {
+static inline void cycle(int code, const std::function<void(bool)>& path, const char* field = nullptr) {
     faultWorld();
     path(false); assert(take().empty());
     path(true); auto raised = one(code, "raise");
@@ -122,7 +123,7 @@ static void antennaInterval(int agc = 79, bool strong = false, bool fresh = true
     assert(!gDebugRf.valid); // prior reply consumed and next poll sent
 }
 
-static void gpsAntennaRegressions() {
+static inline void gpsAntennaRegressions() {
     for (bool strongRecovery : {false, true}) {
         faultWorld();
         gGpsConfig.state = GPS_WAIT_ACK;
@@ -175,7 +176,7 @@ static void gpsAntennaRegressions() {
     if (!exportJson) std::printf("GPS antenna integration: 2 recovery episodes passed (runtime debug=%d).\n", debugMode());
 }
 
-static void gpsFixGapRegressions() {
+static inline void gpsFixGapRegressions() {
     for (bool hadTrustedFix : {false, true}) {
         faultWorld();
         uint32_t anchor = gGpsDiagStartMs;
@@ -390,7 +391,8 @@ int main(int argc, char**) {
     faultWorld(); configureGps(); feed(nmea("GNTXT,01,01,02,ready"));
     while (gGpsConfig.state != GPS_CONFIG_DONE) { g_millis += 8000; serviceGpsConfiguration(); }
     auto timeout = one(3004, "notice"); has(timeout, "\"message_id\":138");
-    for (int i = 0; i < 10; ++i) serviceGpsConfiguration(); assert(take().empty());
+    for (int i = 0; i < 10; ++i) serviceGpsConfiguration();
+    assert(take().empty());
     faultWorld(); configureGps(); // no NMEA at all: readiness give-up also reports
     while (gGpsConfig.state != GPS_CONFIG_DONE) { g_millis += 8000; serviceGpsConfiguration(); }
     one(3004, "notice");

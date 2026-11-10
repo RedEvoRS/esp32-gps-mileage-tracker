@@ -169,7 +169,7 @@ class ViewerRecords(unittest.TestCase):
             self.assertNotIn("<script>alert(1)</script>", page)
             workbook = load_workbook(io.BytesIO(self.client.get("/export.xlsx").data))
             try:
-                cells = dict(zip((c.value for c in workbook.active[1]), workbook.active[2]))
+                cells = dict(zip((c.value for c in workbook.active[1]), workbook.active[2], strict=True))
                 self.assertEqual(cells["destination"].value, destination)
                 self.assertEqual(cells["destination"].data_type, "s")
             finally:
@@ -189,7 +189,7 @@ class ViewerRecords(unittest.TestCase):
         self.assertEqual([float(row[c]) for c in ("start_latitude", "start_longitude", "end_latitude", "end_longitude")], [0, -122.5, 2, -121])
         workbook = load_workbook(io.BytesIO(self.client.get("/export.xlsx").data))
         try:
-            cells = dict(zip((c.value for c in workbook.active[1]), workbook.active[2]))
+            cells = dict(zip((c.value for c in workbook.active[1]), workbook.active[2], strict=True))
             self.assertEqual(cells["start_longitude"].value, -122.5)
             self.assertEqual(cells["start_longitude"].data_type, "n")
         finally:

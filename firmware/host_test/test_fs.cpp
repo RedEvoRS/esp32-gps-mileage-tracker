@@ -30,6 +30,9 @@ static std::string g_outDir;
 static double gLat = 37.0, gLon = -122.0;
 
 static void resetWorld() {
+    g_watchdog = WatchdogStub(); loopTaskWDTEnabled = false; gLoopWatchdogArmed = false;
+    gLoopWatchdogTimeoutMs = 0; gStartupWatchdog = startup_watchdog::Policy(); gStartupWatchdogRecord.magic = 0;
+    g_resetReason = ESP_RST_POWERON;
     gDebugMode.store(hostDebugMode());
     gProductionDisplayReady = gProductionDisplayFailed = gProductionDisplayBegun = false;
     gProductionHaveOutput = gProductionWireReady = false;
@@ -62,7 +65,10 @@ static void resetWorld() {
     gPmuIrqRetry = false; gPmuIrqReadMs = 0; gBatteryThresholds = -1;
     g_httpCode = 200; g_httpRequests = 0; g_httpLastBody.clear(); g_httpHook = nullptr;
     g_httpBodies.clear();
+    g_httpConnectMs = g_httpWriteMs = g_httpHeaderMs = g_httpByteMs = 0;
+    g_httpConnectTimeouts.clear(); g_httpReadTimeouts.clear();
     gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0; gChargeCheckT0 = 0;
+    gChargeFirstResolved = false; gChargeFirstMs = 0;
     gNetBusy = false; gNetHold = false; gNetAbort = false;
     gNetLastAttemptMs = 0; gNetRetryMs = 0; gNetRetryNow = false; WiFi = WiFiStub();
     g_failMutexCreate = false; g_taskCreates = 0; g_restarts = 0;
@@ -134,7 +140,8 @@ static std::vector<std::string> times(const std::string& d) {
 }
 static std::string iso(uint64_t ms) { char b[25]; isoFromEpochMs(ms, b, sizeof b); return b; }
 static bool logHas(const char* frag) {
-    for (auto& l : Serial.log) if (l.find(frag) != std::string::npos) return true; return false;
+    for (auto& l : Serial.log) if (l.find(frag) != std::string::npos) return true;
+    return false;
 }
 static bool wellFormedShape(const std::string& d) {
     // prologue at start, epilogue at end, every trkpt line complete
@@ -152,7 +159,6 @@ static void padTripTo(size_t bytes) {
 }
 // setup()'s halt loops never return: a delay() hook throws this to stop one.
 struct Halted {};
-static int  g_haltSecs = 0;
 static bool g_chargeAtMount = false, g_chargeWhileHot = false, g_chargeWhenCool = false;
 
 static void dump(const char* test) {
@@ -901,7 +907,9 @@ int main(int argc, char** argv) {
         g_disk.failMount = true;
         PMU.chargeEnabled = true;                    // left on by the last boot
         PMU.dieC = 60;                               // parked in the sun
-        g_disk.onMount = [] { g_chargeAtMount = PMU.chargeEnabled; };
+        // Capture startup only; nonblocking first-read retries also move the
+        // degraded recovery schedule, whose later mounts must not overwrite it.
+        g_disk.onMount = [] { if (g_disk.mountAttempts == 1) g_chargeAtMount = PMU.chargeEnabled; };
         g_delayHook = [](uint32_t ms) { g_millis += ms; };
         setup();
         CHECK(gDegraded.mode() == startup::Mode::NoStorage, "storage failure enters degraded loop");
@@ -1783,10 +1791,10 @@ int main(int argc, char** argv) {
         CHECK(times(g_sdDisk.files.at(first)).back() == times(g_sdDisk.files.at(second)).front() &&
               count(g_sdDisk.files.at(second), "<trkpt ") == 1,
               "boundary point belongs to both pieces without an arming gap");
-        CHECK(gTripMeters == 0 && gMaxSpeedMps == 5 && gTripT0 == gLastFix.monoMs &&
+        CHECK(gTripMeters == 0 && gTripT0 == gLastFix.monoMs &&
               gLastMoveMs == gTripT0 && gPendCount == 0 && gArmCount == 0 &&
               gTripBytes == g_sdDisk.files.at(second).size(),
-              "new piece starts with fresh distance, speed, time and byte count");
+              "new piece starts with fresh distance, time and byte count");
         drive(5, 1);
         CHECK(gTripMeters > 4 && gTripMeters < 6 && count(g_sdDisk.files.at(second), "<trkpt ") == 2,
               "next fix adds one step from the shared boundary point");
@@ -1824,7 +1832,7 @@ int main(int argc, char** argv) {
         padTripTo(TRIP_SPLIT_BYTES - (TRKPT_LINE_BYTES - 1) - strlen(GPX_EPILOGUE) - 1);
         drive(0, 1);
         CHECK(gState == COOLDOWN && first != gTripPath && gCoolT0 == coolT0 &&
-              gTripMeters == 0 && gMaxSpeedMps == 0 && gTripT0 == gLastFix.monoMs,
+              gTripMeters == 0 && gTripT0 == gLastFix.monoMs,
               "stationary split keeps the original cooldown deadline and resets per-piece stats");
         drive(0, kCooldownSeconds - 101);
         CHECK(gState == IDLE && gTripPath[0] == 0,
@@ -1958,6 +1966,34 @@ int main(int argc, char** argv) {
         }
     }
 
+    printf("T66 explicit trip HTTP budgets and separate send/reply timing\n");
+    for (int status : {200, 503, 400}) {
+        resetWorld(); drive(15, 40); endTrip(false);
+        std::string path = tripFiles()[0];
+        size_t bytes = g_disk.files.at(path).size();
+        g_httpCode = status;
+        g_httpConnectMs = 200; g_httpWriteMs = 300; g_httpHeaderMs = 1200;
+        g_millis = UINT32_MAX - 500; // both timings must survive millis wrap
+        CHECK(uploadFile(LittleFS, path.c_str()) == (status == 200), "HTTP result policy is preserved");
+        CHECK(g_httpConnectTimeouts.back() == TRIP_CONNECT_TIMEOUT_MS &&
+              g_httpReadTimeouts.back() == TRIP_REPLY_TIMEOUT_MS, "trip request sets both named timeouts");
+        char timing[80];
+        float sent = (200 + ((bytes + 1435) / 1436) * 300) / 1000.0f;
+        snprintf(timing, sizeof timing, "; send %.1f s, reply 1.2 s", sent);
+        CHECK(logHas(timing), "send includes connect and final socket write; reply is separate");
+    }
+    resetWorld(); drive(15, 40); endTrip(false);
+    std::string timeoutPath = tripFiles()[0];
+    g_httpHeaderMs = TRIP_REPLY_TIMEOUT_MS + 500;
+    uint32_t requestStart = millis();
+    CHECK(!uploadFile(LittleFS, timeoutPath.c_str()) && g_disk.files.count(timeoutPath) &&
+          uint32_t(millis() - requestStart) == TRIP_REPLY_TIMEOUT_MS &&
+          logHas("HTTP -11 (will retry); send 0.0 s, reply 10.0 s"), "reply timeout keeps the trip and fits NET_ABORT_MS");
+    resetWorld(); drive(15, 40); endTrip(false);
+    std::string connectPath = tripFiles()[0];
+    g_httpConnectMs = TRIP_CONNECT_TIMEOUT_MS + 1;
+    CHECK(!uploadFile(LittleFS, connectPath.c_str()) && g_disk.files.count(connectPath) &&
+          logHas("send 5.0 s, reply 0.0 s"), "failed connect has no reply wait");
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
     return g_fail ? 1 : 0;
 }

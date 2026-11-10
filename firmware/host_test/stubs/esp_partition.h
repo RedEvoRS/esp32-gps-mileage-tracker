@@ -1,9 +1,7 @@
 // Raw partition reads are separate from the simulated mounted filesystem.
 #pragma once
 #include "arduino_stub.h"
-
-using esp_err_t = int;
-static constexpr esp_err_t ESP_OK = 0;
+#include "esp_err.h"
 static constexpr int ESP_PARTITION_TYPE_DATA = 1;
 static constexpr int ESP_PARTITION_SUBTYPE_ANY = 0xFF;
 struct esp_partition_t { uint32_t size = 8192; };

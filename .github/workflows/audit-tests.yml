@@ -50,8 +50,12 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
+      - name: Lint Python
+        run: |
+          python -m pip install -r tools/lint/requirements.txt
+          ruff check
       - name: Install service dependencies
-        run: python -m pip install -r server/mileage-ingest/requirements.txt -r server/mileage-viewer/requirements.txt
+        run: python -m pip install --require-hashes -r server/mileage-ingest/requirements.txt -r server/mileage-viewer/requirements.txt
       - name: Install backup test tools
         # test_backup skips without these; make sure CI never skips it.
         run: command -v rsync || (sudo apt-get update && sudo apt-get install -y rsync)
@@ -73,7 +77,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install local diagnostics ingest bridge dependencies
-        run: python -m pip install -r server/mileage-ingest/requirements.txt
+        run: python -m pip install --require-hashes -r server/mileage-ingest/requirements.txt
       - name: Check out TinyGPSPlus 1.0.3
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -304,6 +308,9 @@ jobs:
             INSTALL_OUTPUTS=none \
             bash "$INSTALLER" < /dev/null
           test "$(docker exec mileage-viewer printenv DISPLAY_TZ)" = America/Chicago
+          for container in mileage-ingest mileage-viewer; do
+            test "$(docker inspect -f '{{.HostConfig.LogConfig.Type}}:{{index .HostConfig.LogConfig.Config "max-size"}}:{{index .HostConfig.LogConfig.Config "max-file"}}' "$container")" = json-file:10m:3
+          done
           # Backups are private to the backup user (umask 077).
           test -n "$(sudo ls /srv/offhost/snapshots)"
           systemctl is-enabled "mileage-backup@$TEST_USER.timer"

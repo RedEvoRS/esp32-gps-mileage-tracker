@@ -2,6 +2,8 @@
 # This excludes .env, viewer.env, monitor.env, data/, backup/, backups/, tests/,
 # __pycache__/, bytecode, editor files and future unlisted files.
 # VERSION, COMMIT and stamp_version.py stay on the build host; use SERVER_VERSION.
+# requirements.in and update_python_dependencies.sh are maintainer inputs;
+# images install only the compiled requirements.txt locks.
 # Re-deny contents after opening each directory: Docker otherwise includes
 # unlisted descendants through the directory exception.
 **

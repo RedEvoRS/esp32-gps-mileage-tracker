@@ -9,7 +9,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo

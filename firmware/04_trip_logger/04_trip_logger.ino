@@ -11,12 +11,12 @@
 //   2. GPX logging to microSD (LittleFS fallback) -- one line per timed fix,
 //      file.close() after every write to limit power-cut data loss.
 //      The latest 90 untimed points are buffered in RAM; older ones spill
-//      to flash without times. Boot-time "fsck" attempts
+//      to the selected trip store without times. Boot-time "fsck" attempts
 //      repair; a maximum loss bound still needs hardware validation.
 //   3. A FreeRTOS networking task pinned to core 0 that, when parked on
 //      home WiFi, uploads finished .gpx files to the ingest server and
 //      deletes them locally on success. GPS parsing stays on core 1 and
-//      is never blocked by networking.
+//      shares storage only for individual reads/writes.
 //   4. AXP2101 VBUS-loss handling: when the car turns off (USB power
 //      goes away), finalize the current trip cleanly and keep the file
 //      for the next time we're home.
@@ -35,11 +35,10 @@
 // New trips use SD when it mounts at boot. Both mounted stores are repaired
 // and drained, SD first, so flash trips from a previous boot are not stranded.
 //
-// NOTE: compiles on ESP32 Arduino core 3.3.11 (XPowersLib 0.3.3,
-// TinyGPSPlus 1.0.3) but has not yet had its on-hardware shakedown --
-// do that pass before trusting it in the car (see the README).
+// NOTE: targets ESP32 Arduino core 3.3.11 (XPowersLib 0.3.3,
+// TinyGPSPlus 1.0.3). Recorded hardware checks are in the README.
 // 2026-06-09 review fixes: per-chunk FS locking during upload, battery
-// idle deep-sleep, ARMING-phase point capture, stationary-jitter distance
+// idle power-off, ARMING-phase point capture, stationary-jitter distance
 // gate, fix-loss trip finalization. See ../../docs/history/CODE_REVIEW_2026-06-09.md.
 // =================================================================
 
@@ -57,6 +56,8 @@
 #include <vector>
 #include <esp_sntp.h>
 #include <esp_partition.h>
+#include <esp_task_wdt.h>
+#include <esp_attr.h>
 #include <atomic>
 #include <new>
 #include <cmath>
@@ -64,10 +65,12 @@
 #include "secrets.h"
 #include "pmu_startup_event.h"
 #include "pmu_read_state.h"
+#include "charge_temperature.h"
 #include "journal_fs.h"
 #include "journal_boot.h"
 #include "revision_nvs.h"
 #include "degraded_policy.h"
+#include "startup_watchdog.h"
 #include "journal_sd_geometry.h"
 #include "diag_upload.h"
 #include "journal_platform.h"
@@ -92,6 +95,7 @@ static constexpr uint32_t DEBUG_FEEDBACK_MS = 2000;
 #endif
 #include "build_version.h"
 #include "debug_display.h"
+static uint32_t gDebugDrawMs = 0; // loop-owned redraw cadence, not renderer state
 #include "debug_temperature.h"
 static float gDebugTempDie = NAN;
 static uint32_t gDebugTempDieMs = 0, gDebugTempLogMs = 0;
@@ -117,7 +121,7 @@ static bool gDisplayUsbPowerRequest = false; // core-1 power handler -> renderer
 #define GPS_BAUD     9600
 #define PMU_IRQ_PIN  40   // active-low; not an RTC GPIO on the S3
 // LilyGO utilities.h / LoRaBoards.cpp at 1991b1ed70915d4f246b841f99f6027166ea7330.
-// SD wiring still needs Stage 2 d on the bench. Board uses QSPI, not octal PSRAM.
+// SD wiring checked by Stage 2 d, 2026-10-18. Board uses QSPI, not octal PSRAM.
 static constexpr int SD_MOSI = 35, SD_SCK = 36, SD_MISO = 37, SD_CS = 47, IMU_CS = 34;
 static constexpr uint32_t SD_SPI_HZ = 4000000; // core default; ample for ~119 B/s GPX
 static constexpr uint32_t SD_SETTLE_MS = 250;
@@ -138,6 +142,13 @@ static constexpr unsigned RESUME_FIXES    = 3; // consecutive trusted moving fix
 // Arrival-time association, allowing either UBX/NMEA ordering at 1 Hz.
 static constexpr uint32_t NAV_PVT_FRESH_MS = 1500;
 static constexpr uint32_t NAV_PVT_FALLBACK_MS = 10000;
+// Let core 1 idle between bursts. At 9600 baud, 5 ms is about five bytes,
+// far below the 2048-byte RX buffer; check the UART again just before resting.
+static constexpr uint32_t LOOP_IDLE_MS = 5;
+// Normal passes take milliseconds; shutdown has two bounded 15 s handoffs.
+// Allow 60 s for slow card/driver calls without masking a stuck loop task.
+// Large boot scans run before enrollment; runtime repair feeds on byte progress.
+static constexpr uint32_t LOOP_WDT_TIMEOUT_MS = 60000;
 static constexpr float    MIN_TRIP_METERS = 160.0f;          // ~0.1 mi
 static constexpr uint32_t MIN_TRIP_MS     = 30UL  * 1000;
 static constexpr size_t   TRIP_SPLIT_BYTES = 8 * 1024 * 1024; // half the server cap
@@ -170,6 +181,12 @@ static constexpr uint32_t IDLE_BATT_SLEEP_MS = 10UL * 60 * 1000;
 // to close the file and switch WiFi off. A cut-off trip stays queued.
 static constexpr uint32_t NET_DRAIN_MS = 16UL * 60 * 1000;
 static constexpr uint32_t NET_ABORT_MS = 15UL * 1000;
+static constexpr uint32_t TRIP_CONNECT_TIMEOUT_MS = 5000;
+// An 8 MiB trip parses in about 0.4 s on a desktop. Allow slower CPUs and
+// durable disk writes 10 s to reply, while leaving margin in the 15 s
+// shutdown handshake: gNetAbort cannot interrupt HTTPClient's reply wait.
+static constexpr uint16_t TRIP_REPLY_TIMEOUT_MS = 10000;
+static_assert(TRIP_REPLY_TIMEOUT_MS < NET_ABORT_MS, "trip reply must fit the shutdown abort window");
 
 // How often the networking task wakes to look for pending uploads.
 static constexpr uint32_t NET_TICK_MS     = 30000;
@@ -444,6 +461,83 @@ static uint64_t contactUptime() {
 }
 static bool debugMode() { return gDebugMode.load(); }
 
+static bool gLoopWatchdogArmed = false; // loop task only, never core 0
+static uint32_t gLoopWatchdogTimeoutMs = 0;
+static RTC_NOINIT_ATTR volatile startup_watchdog::Record gStartupWatchdogRecord;
+static startup_watchdog::Policy gStartupWatchdog;
+static void saveStartupWatchdog() {
+    auto r = gStartupWatchdog.record();
+    // Invalidate first, publish magic last. A reset during these stores
+    // leaves either a complete record or invalid history, never a false latch.
+    gStartupWatchdogRecord.magic = 0;
+    gStartupWatchdogRecord.stage = r.stage;
+    gStartupWatchdogRecord.hangs = r.hangs;
+    gStartupWatchdogRecord.fallback = r.fallback;
+    gStartupWatchdogRecord.checksum = r.checksum;
+    gStartupWatchdogRecord.magic = r.magic;
+}
+static void armLoopWatchdog(uint32_t timeoutMs = LOOP_WDT_TIMEOUT_MS, bool reportError = true) {
+    if (gLoopWatchdogArmed && gLoopWatchdogTimeoutMs == timeoutMs) return;
+    uint32_t idleMask = 0;
+#if CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0
+    idleMask |= 1U;
+#endif
+#if CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1
+    idleMask |= 2U;
+#endif
+    // Keep the core's idle-task subscriptions. The installed S3 core starts
+    // TWDT at 5 s with panic enabled; explicitly retain panic (reset), not
+    // just a warning, with the longer startup/runtime limits.
+    // IDF 5.5.5 reconfigure stops/restarts the timer under its spinlock and
+    // retains task subscriptions. Never unenroll at the startup hand-over.
+    if (gLoopWatchdogArmed) feedLoopWDT(); // previous stage has returned
+    const esp_task_wdt_config_t config = {timeoutMs, idleMask, true};
+    esp_err_t error = esp_task_wdt_reconfigure(&config);
+    if (error == ESP_ERR_INVALID_STATE) error = esp_task_wdt_init(&config);
+    if (error == ESP_OK) {
+        if (!gLoopWatchdogArmed) enableLoopWDT(); // core feeds before loop()
+        if (esp_task_wdt_status(nullptr) == ESP_OK) {
+            gLoopWatchdogArmed = true;
+            gLoopWatchdogTimeoutMs = timeoutMs;
+            feedLoopWDT();
+            return;
+        }
+    }
+    // Carry on without it. Recording trips matters more than the safety net,
+    // and restarting here would loop forever if arming can never succeed.
+    if (reportError) Serial.println("ERROR: loop watchdog could not be armed/configured; carrying on.");
+}
+
+static void feedLoopWatchdogProgress() {
+    // Some file helpers are shared. Never feed or enroll the core-0 network
+    // task, and never feed while waiting to acquire FS_LOCK or for another task.
+    if (xPortGetCoreID() == 1 && gLoopWatchdogArmed) feedLoopWDT();
+}
+
+static void startupStage(startup_watchdog::Stage stage) {
+    if (!gStartupWatchdog.active()) return; // runtime mounts are not startup
+    feedLoopWatchdogProgress(); // only after the previous stage returned
+    gStartupWatchdog.stage(stage);
+    saveStartupWatchdog();
+}
+static void finishStartupWatchdog() {
+    // Switch to the loop limit. If the early arm failed, this is one more
+    // try; a second failure prints an error and logging carries on unwatched.
+    armLoopWatchdog();
+    gStartupWatchdog.complete();
+    saveStartupWatchdog();
+}
+static void printStartupWatchdog() {
+    using startup_watchdog::Stage;
+    if (!gLoopWatchdogArmed) Serial.println("ERROR: startup watchdog could not be armed; startup is not watched.");
+    if (gStartupWatchdog.hungStage() != Stage::None)
+        Serial.printf("STARTUP WATCHDOG: previous hang in %s; consecutive startup hangs %lu.\n",
+            startup_watchdog::stageText(gStartupWatchdog.hungStage()), (unsigned long)gStartupWatchdog.hangs());
+    if (gStartupWatchdog.skipCard()) Serial.println(gStartupWatchdog.noStorage() ?
+        "STARTUP WATCHDOG: skipping all storage and recovery probes until next power-on; no trip recording." :
+        "STARTUP WATCHDOG: skipping card until next power-on; using internal flash for trips.");
+}
+
 static void serverContact() { gLastContact = contactUptime(); gContactKnown = true; }
 static bool heartbeatDue() {
     return !gContactKnown || contactUptime() - gLastContact >= diagnostics::kHeartbeatMs;
@@ -577,7 +671,6 @@ static void armBufPush(const Fix& fx) {
     if (gArmCount < 16) gArmCount++;
     else gArmHead = (gArmHead + 1) % 16;
 }
-static float     gMaxSpeedMps = 0;
 static char      gTripPath[48] = {0};   // active file, "" when none
 static bool      gTripWriteFailed = false;  // a write to gTripPath didn't land
 static bool      gHaveLastFix = false;
@@ -701,7 +794,7 @@ static void setClockFromGps(uint64_t* rmcUtcMs = nullptr) {
     bool rawGP = validRmcClockFields(gRmcTimeGP, gRmcDateGP);
     bool fresh = (rawGN || rawGP) && gps.date.isValid() && gps.time.isValid() &&
                  gps.time.isUpdated() && gps.date.age() < 2000 && gps.time.age() < 2000;
-    struct tm tmv = {0};
+    struct tm tmv = {};
     tmv.tm_year = gps.date.year() - 1900;
     tmv.tm_mon  = gps.date.month() - 1;
     tmv.tm_mday = gps.date.day();
@@ -899,7 +992,6 @@ static bool beginTrip(const Fix& fx, bool continuation = false) {
     gTripContinuation = false;
     fs::FS& storage = *gTripFS;
     gTripMeters = 0;
-    gMaxSpeedMps = fx.speedMps;
     gTripBytes = 0;
     gTripWriteFailed = false;
     gTripT0 = gArmCount ? gArmBuf[gArmHead].monoMs : fx.monoMs;
@@ -954,7 +1046,6 @@ static bool beginTrip(const Fix& fx, bool continuation = false) {
             const Fix& a = gArmBuf[(gArmHead + i - 1) % 16];
             gTripMeters += haversineM(a.lat, a.lon, b.lat, b.lon);
         }
-        if (b.speedMps > gMaxSpeedMps) gMaxSpeedMps = b.speedMps;
     }
     armBufReset();
     gCoolT0 = fx.monoMs;
@@ -1098,7 +1189,6 @@ static void tripFsmOnFix(const Fix& fx) {
             gTripMeters += haversineM(gLastFix.lat, gLastFix.lon, fx.lat, fx.lon);
         gLastMoveMs = now;
     }
-    if (speed > gMaxSpeedMps) gMaxSpeedMps = speed;
 
     switch (gState) {
     case IDLE:
@@ -1218,6 +1308,7 @@ static long findLastTrkptEnd(File& f, uint32_t* points = nullptr) {
         carryLen = min(tl - 1, rl);
         memmove(region, region + rl - carryLen, carryLen);
         pos += n;
+        feedLoopWatchdogProgress(); // another verified scan block
     }
     return last;
 }
@@ -1234,6 +1325,7 @@ static bool sameFilePrefix(File& a, File& b, size_t bytes, bool* readFailed = nu
         }
         if (memcmp(ab, bb, n) != 0) return false;
         bytes -= n;
+        feedLoopWatchdogProgress(); // another verified matching block
     }
     return true;
 }
@@ -1246,6 +1338,7 @@ static bool fileMatchesText(File& f, const char* text, size_t bytes, bool* readF
         if (memcmp(buf, text, n) != 0) return false;
         text += n;
         bytes -= n;
+        feedLoopWatchdogProgress();
     }
     return true;
 }
@@ -1371,7 +1464,9 @@ static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result) 
         int n = f.read(b, want);
         if (n <= 0) break;
         w.put((const char*)b, n);
+        if (!w.ok) break;
         remaining -= n;
+        feedLoopWatchdogProgress(); // copied bytes, never a stalled read/write
     }
     w.put("\n");
     w.put(GPX_EPILOGUE);
@@ -1381,7 +1476,9 @@ static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result) 
     out.close();
     f.close();
     if (!ok) {
-        result.reason = remaining ? "read" : "write";
+        // The copy loop stops at the first failed write, with bytes still
+        // unread, so check the writer before blaming the read.
+        result.reason = (!w.ok || !remaining) ? "write" : "read";
         storage.remove(tmp.c_str());
         Serial.printf("fsck: could not repair %s (write failed)\n", path);
         return false;
@@ -1439,13 +1536,17 @@ static void fsckAllTrips(fs::FS& storage) {
                 if (!seen) paths.push_back(name);
             }
             e.close();
+            feedLoopWatchdogProgress(); // another directory entry completed
             e = dir.openNextFile();
         }
     }
     // LittleFS directory cursors can change when repair creates, removes or
     // renames entries. Finish enumeration and close every handle first.
     dir.close();
-    for (const String& path : paths) repairIfNeeded(storage, path.c_str());
+    for (const String& path : paths) {
+        repairIfNeeded(storage, path.c_str());
+        feedLoopWatchdogProgress(); // another file checked, even if no repair
+    }
     FS_UNLOCK();
 }
 
@@ -1569,6 +1670,7 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
     Serial.println("Preparing PMU power-off (battery critical / idle).");
     if (gTripPath[0]) endTrip(/*discardIfMicro=*/false);
     stopNetworkTask();
+    feedLoopWatchdogProgress(); // bounded abort handoff completed, <=15 s
     // The core-0 consumer closes each append itself; ask it to drain and seal
     // before unmount. A stuck network task cannot delay power safety forever.
     if (gJournalReady) {
@@ -1591,6 +1693,7 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
         if (!gJournalSealDone.load() || !gJournalSealOk.load())
             Serial.println("Journal: shutdown drain/seal incomplete; RAM records may be lost.");
     }
+    feedLoopWatchdogProgress(); // bounded journal handoff completed, <=15 s
     // pollPmu() and both idle paths run on loop/core 1, the OLED owner.
     // Draw synchronously: no wait for another task or display acknowledgment.
     // The adapter latches the first bus failure (10 ms Wire timeout); a failed
@@ -1613,6 +1716,7 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
     FS_LOCK();
     if (gSdMounted) SD.end();
     if (gFlashMounted) LittleFS.end();
+    feedLoopWatchdogProgress(); // unmount returned; no feed while acquiring lock
     // Only the current owner sleeps the shared panel, before the final VBUS
     // read. A latched failure must not retry via the other adapter.
     display::DisplayModel::Input displayOff; displayOff.shutdown = true;
@@ -1639,6 +1743,7 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
         // before treating a returning call as failure; don't spin or leave
         // the logger alive with storage unmounted if power stays on.
         vTaskDelay(pdMS_TO_TICKS(1000));
+        feedLoopWatchdogProgress(); // shutdown returned after the bounded hold
         Serial.println(gDegraded.mode() == startup::Mode::Normal ?
             "ERROR: PMU.shutdown() did not power off -- resuming logging." :
             "ERROR: PMU.shutdown() did not power off -- resuming degraded service.");
@@ -1667,6 +1772,7 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
         ESP.restart();
         return;
     }
+    feedLoopWatchdogProgress(); // completed remount, before journal recovery
     gJournal.invalidateStorage(); // same boot/queue, reload metadata after remount
     gJournalStarted = false; // recheck FAT allocation geometry on core 0
     gPowerOffEventPending.store(false); // consumer excluded by FS_LOCK
@@ -1769,10 +1875,14 @@ static constexpr float    CHG_HOT_RESUME_C  = 38.0f + DIE_OFFSET_C;   // battery
 static constexpr float    CHG_COLD_PAUSE_C  =  0.0f + DIE_OFFSET_C;   // battery ~0 C
 static constexpr float    CHG_COLD_RESUME_C =  5.0f + DIE_OFFSET_C;   // battery ~5 C
 static constexpr uint32_t CHG_CHECK_MS      = 30UL * 1000;
+static constexpr uint32_t CHG_FIRST_RETRY_MS = 1000;
+static constexpr uint32_t CHG_FIRST_GRACE_MS = 10000;
 // The first temperature check must command/verify explicitly: the charger
 // keeps its state across ESP32 resets. Only matching read-back confirms it.
 static pmu_read::ChargeState gChargeState = pmu_read::ChargeState::Unconfirmed;
 static bool     gChargeChecked = false;
+static bool     gChargeFirstResolved = false; // plausible read OR grace exhausted; never reopens on rollover
+static uint32_t gChargeFirstMs = 0;
 static bool     gChargePauseRequested = false; // hysteresis follows intent, even on failure
 static uint8_t  gChargeFailures = 0;
 static constexpr uint8_t CHG_FAILURE_LIMIT = 3;
@@ -1780,12 +1890,21 @@ static uint32_t gChargeCheckT0 = 0;
 
 static void serviceChargeTemp() {
     uint32_t now = millis();
-    if (gChargeChecked && uint32_t(now - gChargeCheckT0) < CHG_CHECK_MS) return;
+    if (gChargeChecked && uint32_t(now - gChargeCheckT0) <
+        (gChargeFirstResolved ? CHG_CHECK_MS : CHG_FIRST_RETRY_MS)) return;
     gChargeCheckT0 = now;
-    bool first = !gChargeChecked;
+    if (!gChargeChecked) gChargeFirstMs = now;
     gChargeChecked = true;
+    bool first = !gChargeFirstResolved; // no decision made yet this boot
 
     float die = PMU.getTemperature();
+    // XPowersLib AXP2101: 22 + (7274 - raw) / 20. Raw zero is 385.7 C,
+    // consistent with the cold-start ADC not having completed a conversion.
+    // Treat implausible values exactly like a failed read, including debug.
+    if (!charge_temperature::plausible(die)) die = NAN;
+    if (std::isfinite(die) || uint32_t(now - gChargeFirstMs) >= CHG_FIRST_GRACE_MS)
+        gChargeFirstResolved = true;
+    bool firstGrace = !gChargeFirstResolved;
     // Reuse this exact sample, including NAN on failure. No second PMU read.
     gDebugTempDie = die;
     gDebugTempDieMs = now;
@@ -1801,7 +1920,7 @@ static void serviceChargeTemp() {
         pause = die >= CHG_HOT_PAUSE_C || die <= CHG_COLD_PAUSE_C;
         why = die >= CHG_HOT_PAUSE_C ? "too hot" : "too cold";
     }
-    gChargePauseRequested = pause;
+    if (!firstGrace) gChargePauseRequested = pause;
 
     const auto intended = pause ? pmu_read::ChargeState::Paused : pmu_read::ChargeState::Charging;
     if (gChargeState != intended) {
@@ -1813,13 +1932,14 @@ static void serviceChargeTemp() {
         gChargeState = actual == intended ? intended : pmu_read::ChargeState::Unconfirmed;
         if (gChargeState == pmu_read::ChargeState::Unconfirmed) {
             if (gChargeFailures < CHG_FAILURE_LIMIT) ++gChargeFailures;
-            Serial.println("Charge control unconfirmed; retrying in 30 s.");
+            Serial.printf("Charge control unconfirmed; retrying in %lu s.\n",
+                (unsigned long)((firstGrace ? CHG_FIRST_RETRY_MS : CHG_CHECK_MS) / 1000));
         } else {
             gChargeFailures = 0;
-            if (pause) {
+            if (pause && !firstGrace) {
                 Serial.printf("Charging paused: %s (die %.1f C, battery ~%.0f C)\n",
                               why, die, die - DIE_OFFSET_C);
-            } else {
+            } else if (!pause) {
                 Serial.printf(first ? "Charge guard: die %.1f C (battery ~%.0f C), charging on.\n"
                                     : "Charging resumed (die %.1f C, battery ~%.0f C)\n",
                               die, die - DIE_OFFSET_C);
@@ -1840,10 +1960,15 @@ static void serviceChargeTemp() {
                 gLoopFaults.condition(pause && (code == 2004 ? die > CHG_HOT_RESUME_C : die < CHG_COLD_RESUME_C));
             }
         }
-        gLoopFaults.event(2006, now).condition(unreadable);
+        if (!firstGrace) gLoopFaults.event(2006, now).condition(unreadable);
         if (gChargeState != pmu_read::ChargeState::Unconfirmed || gChargeFailures >= CHG_FAILURE_LIMIT)
             gLoopFaults.event(2008, now).condition(gChargeFailures >= CHG_FAILURE_LIMIT);
     }
+    // Charging was already commanded off during the retries, so the state
+    // block above prints nothing when the window ends without a reading.
+    if (first && !firstGrace && !std::isfinite(die))
+        Serial.printf("Charge guard: no plausible temperature in the first %lu s; charging stays off.\n",
+                      (unsigned long)(CHG_FIRST_GRACE_MS / 1000));
 }
 
 // Once USB power has been off for VBUS_OFF_CONFIRM_MS, the car is off:
@@ -2008,22 +2133,35 @@ static bool isComplete(fs::FS& storage, const char* path) {
 // sending and fails the request, so a cut-off upload ends within a chunk.
 class LockedFileStream : public Stream {
     File& _f;
+    size_t _remaining;
+    bool _replyStarted = false;
+    uint32_t _replyStartMs = 0;
 public:
-    explicit LockedFileStream(File& f) : _f(f) {}
+    LockedFileStream(File& f, size_t size) : _f(f), _remaining(size) {}
     int available() override {
+        // Core 3.3.11's HTTPClient checks available() again AFTER the final
+        // socket write, before testing its remaining length and reading the
+        // response. Recording EOF here includes the last socket write in
+        // send time, unlike timing the final filesystem read.
+        if (!_remaining && !_replyStarted) { _replyStarted = true; _replyStartMs = millis(); }
         if (gNetAbort.load()) return -1;
         FS_LOCK(); int n = _f.available(); FS_UNLOCK(); return n;
     }
     int read() override {
-        FS_LOCK(); int c = _f.read(); FS_UNLOCK(); return c;
+        FS_LOCK(); int c = _f.read(); FS_UNLOCK();
+        if (c >= 0 && _remaining) --_remaining;
+        return c;
     }
     size_t readBytes(char* buf, size_t len) override {
-        FS_LOCK(); size_t n = _f.read((uint8_t*)buf, len); FS_UNLOCK(); return n;
+        FS_LOCK(); size_t n = _f.read((uint8_t*)buf, len); FS_UNLOCK();
+        _remaining -= min(n, _remaining);
+        return n;
     }
     int peek() override {
         FS_LOCK(); int c = _f.peek(); FS_UNLOCK(); return c;
     }
     size_t write(uint8_t) override { return 0; }   // read-only proxy
+    uint32_t replyWaitMs(uint32_t ended) const { return _replyStarted ? uint32_t(ended - _replyStartMs) : 0; }
 };
 
 static bool uploadFile(fs::FS& storage, const char* path) {
@@ -2042,8 +2180,10 @@ static bool uploadFile(fs::FS& storage, const char* path) {
     size_t sz = f.size();
     FS_UNLOCK();
 
-    LockedFileStream body(f);
+    LockedFileStream body(f, sz);
     http.begin(client, url);
+    http.setConnectTimeout(TRIP_CONNECT_TIMEOUT_MS);
+    http.setTimeout(TRIP_REPLY_TIMEOUT_MS);
     http.addHeader("Content-Type", "application/gpx+xml");
     http.addHeader("Authorization", String("Bearer ") + AUTH_TOKEN);
     http.addHeader("X-Device-Id", DEVICE_ID);
@@ -2056,10 +2196,15 @@ static bool uploadFile(fs::FS& storage, const char* path) {
     // the server's worker timeout (900 s) bounds how slow it can be.
     uint32_t t0 = millis();
     int code = http.sendRequest("POST", &body, sz);
+    uint32_t ended = millis();
+    uint32_t elapsed = ended - t0;
+    uint32_t replyMs = body.replyWaitMs(ended);
+    float sendSecs = (elapsed - replyMs) / 1000.0f;
+    float replySecs = replyMs / 1000.0f;
     http.end();
     if (code == 200) serverContact();
     uploadDiagnostics(code);
-    float secs = (millis() - t0) / 1000.0f;
+    float secs = elapsed / 1000.0f;
     reportNetworkStack("after HTTP upload");
 
     FS_LOCK();
@@ -2087,18 +2232,18 @@ static bool uploadFile(fs::FS& storage, const char* path) {
     if (ok && !deleted) {
         // HTTP success still clears upload backoff; the queued copy may retry.
         Serial.printf("Upload %s (%u B, %.1f s) -> HTTP 200, but deleting the local file failed "
-                      "(will re-upload; the server ignores identical copies)\n",
-                      path, (unsigned)sz, secs);
+                      "(will re-upload; the server ignores identical copies); send %.1f s, reply %.1f s\n",
+                      path, (unsigned)sz, secs, sendSecs, replySecs);
     } else if (ok) {
-        Serial.printf("Upload %s (%u B, %.1f s) -> HTTP 200 (deleted)\n",
-                      path, (unsigned)sz, secs);
+        Serial.printf("Upload %s (%u B, %.1f s) -> HTTP 200 (deleted); send %.1f s, reply %.1f s\n",
+                      path, (unsigned)sz, secs, sendSecs, replySecs);
     } else if (rejected) {
-        Serial.printf("ERROR: upload %s (%u B, %.1f s) -> HTTP %d: server rejected the file -- %s\n",
+        Serial.printf("ERROR: upload %s (%u B, %.1f s) -> HTTP %d: server rejected the file -- %s; send %.1f s, reply %.1f s\n",
                       path, (unsigned)sz, secs, code,
-                      setAside ? "kept as .bad, not retried" : "rename failed, will retry");
+                      setAside ? "kept as .bad, not retried" : "rename failed, will retry", sendSecs, replySecs);
     } else {
-        Serial.printf("Upload %s (%u B, %.1f s) -> HTTP %d (will retry)\n",
-                      path, (unsigned)sz, secs, code);
+        Serial.printf("Upload %s (%u B, %.1f s) -> HTTP %d (will retry); send %.1f s, reply %.1f s\n",
+                      path, (unsigned)sz, secs, code, sendSecs, replySecs);
     }
     return ok;
 }
@@ -2595,7 +2740,7 @@ static void receiveGpsByte(uint8_t c) {
         }
         if (rx.checksumA && c == rx.b && rx.cls == 0x01 && rx.id == 0x07 && rx.len == 92) {
             // Explicit little-endian reads avoid alignment and host-endian assumptions.
-            const auto u4 = [&rx](size_t off) -> uint32_t {
+            const auto u4 = [](size_t off) -> uint32_t {
                 return uint32_t(rx.payload[off]) | uint32_t(rx.payload[off + 1]) << 8 |
                        uint32_t(rx.payload[off + 2]) << 16 | uint32_t(rx.payload[off + 3]) << 24;
             };
@@ -2641,6 +2786,7 @@ static bool tripPartitionIsErased() {
             }
         }
         offset += n;
+        feedLoopWatchdogProgress(); // verified another erased block, not a wait
         delay(1);  // yield during the full-partition scan on a new board
     }
     return true;
@@ -2664,6 +2810,7 @@ static bool mountFlashStorage(bool allowProvision = true) {
 }
 
 static bool mountSdStorage() {
+    if (gStartupWatchdog.skipCard()) return false;
     // Also used for cancelled/failed shutdown recovery, under FS_LOCK and
     // gNetHold, with no live handles. Never provision or format the card.
     if (!PMU.disableBLDO1() || !PMU.setBLDO1Voltage(3300) || !PMU.enableBLDO1()) {
@@ -2696,22 +2843,37 @@ static bool mountSdStorage() {
     return false;
 }
 
-static bool mountTripStorage(bool allowProvision = true) {
+static bool mountTripStorage(bool allowProvision = true, bool reportFreeSpace = true) {
+    if (gStartupWatchdog.noStorage()) return false;
+    startupStage(startup_watchdog::Stage::CardMount);
+#ifdef WATCHDOG_BENCH_STARTUP_HANG
+    if (gStartupWatchdog.active() && !gStartupWatchdog.skipCard()) {
+        Serial.println("WATCHDOG BENCH: blocking card mount until startup watchdog reset.");
+        for (;;) vTaskDelay(pdMS_TO_TICKS(1000)); // deliberately never feed
+    }
+#endif
     gSdMounted = mountSdStorage();
     // Keep the existing preservation-first provisioning rule for flash.
     // If flash is damaged but SD works, record to SD and preserve flash
     // for recovery; degraded service handles both stores being unavailable.
+    startupStage(startup_watchdog::Stage::FlashMount);
     gFlashMounted = mountFlashStorage(allowProvision);
     if (gFlashMounted && !LittleFS.exists(TRIP_DIR)) {
         gFlashMounted = LittleFS.mkdir(TRIP_DIR);
         if (!gFlashMounted) LittleFS.end();
     }
     gTripFS = gSdMounted ? static_cast<fs::FS*>(&SD) : static_cast<fs::FS*>(&LittleFS);
+    // Degraded retry only probes mounts, then restarts through full setup.
+    // Leave the potentially slow first FAT free-cluster scan to that startup,
+    // under the longer startup limit, rather than repeat it on the loop.
+    if (!reportFreeSpace) return gSdMounted || gFlashMounted;
     if (gSdMounted) {
+        startupStage(startup_watchdog::Stage::CardSpace);
         Serial.printf("Trip storage: microSD (%.2f GiB free); internal flash queue %s.\n",
                       storageFreeBytes(SD) / (1024.0 * 1024 * 1024),
                       gFlashMounted ? "mounted" : "unavailable -- preserved for recovery");
     } else if (gFlashMounted) {
+        startupStage(startup_watchdog::Stage::FlashSpace);
         Serial.printf("WARNING: microSD unavailable -- using internal flash (%.2f MiB free).\n",
                       storageFreeBytes(LittleFS) / (1024.0 * 1024));
     } else {
@@ -2766,7 +2928,7 @@ static void beginDebugTemperature() {
     // batches) all run serially on core 1; the ISR only sets a flag. There is
     // no PMU access from the networking task and no PMU mutex to acquire.
     gDebugTempTs = debug_temperature::setupTs(PMU);
-    char control[8] = "--", adc[8] = "--";
+    char control[11] = "--", adc[11] = "--"; // room for the API's full int range
     if (gDebugTempTs.control >= 0) snprintf(control, sizeof control, "0x%02X", gDebugTempTs.control);
     if (gDebugTempTs.adc >= 0) snprintf(adc, sizeof adc, "0x%02X", gDebugTempTs.adc);
     Serial.printf("Temp setup: TS %s, REG50 %s, REG30 %s (target external input, 50 uA).\n",
@@ -2801,7 +2963,7 @@ static void serviceDebugTemperature() {
     }
     const auto p = debug_temperature::samplePower(PMU, now);
     char die[40] = "-- C", estimate[16] = "--", ts[16] = "--", tsRaw[8] = "--";
-    char bme[16] = "--", volts[16] = "--", percent[8] = "--";
+    char bme[16] = "--", volts[16] = "--", percent[12] = "--";
     // Independent 30 s schedules can drift. Reuse the latest guard sample
     // through one guard interval plus 5 s, and report its age explicitly.
     uint32_t dieAgeMs = uint32_t(now - gDebugTempDieMs);
@@ -2961,10 +3123,13 @@ static void serviceDisplay() {
 
 // Shared boot producers, including failed startup's retained E2007 notice.
 static void beginJournal() {
+    // EventLog::begin is RAM-only. Disk journal loading is deferred to the
+    // service task; this shared startup stage includes the NVS boot counter.
+    startupStage(startup_watchdog::Stage::Journal);
     gJournal.~EventLog();
     new (&gJournal) diagnostics::EventLog(gSdMounted ? &gSdJournalFs : nullptr,
                                          gFlashMounted ? &gFlashJournalFs : nullptr, diagnostics::uploadJournalConfig(&gRevisionState));
-    gJournalBoot = diagnostics::newJournalBoot();
+    gJournalBoot = diagnostics::newJournalBoot(!gStartupWatchdog.noStorage());
     gJournalReady = gJournal.begin(gJournalBoot.id, gJournalBoot.counter, firmware::kVersion);
     gJournal.setTimeProvider(stampDiagnosticTime);
     if (gJournalReady) diagnostics::submitJournalBoot(gJournal, esp_reset_reason(), gPmuStartup, millis(), gBootBattery);
@@ -2990,9 +3155,10 @@ static void enterDegraded(startup::Mode mode) {
         gLoopFaults.event(4001, millis()).condition(true);
         gLoopFaults.event(4002, millis()).condition(true);
         gLoopFaults.event(4003, millis()).condition(true);
-        Serial.println("DEGRADED: no usable trip storage -- not recording trips. Power management and charge guard active. Retrying storage in 60 s.");
-        // Measurements have been enabled; allow the ADC its first conversion.
-        delay(1000);
+        Serial.println(gStartupWatchdog.noStorage() ?
+            "DEGRADED: no trip storage; power management and charge guard active. Storage recovery disabled until next power-on." :
+            "DEGRADED: no usable trip storage -- not recording trips. Power management and charge guard active. Retrying storage in 60 s.");
+        // The loop retries an implausible first conversion without blocking.
         serviceChargeTemp();
     } else {
         if (mode == startup::Mode::PmuUntrusted) {
@@ -3008,13 +3174,15 @@ static void enterDegraded(startup::Mode mode) {
         }
         if (!createFsMutex()) return;
         // Internal flash only, journal only. Never provision/format or use SD.
-        gFlashMounted = LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL);
+        startupStage(startup_watchdog::Stage::FlashMount);
+        gFlashMounted = !gStartupWatchdog.noStorage() && LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL);
         beginJournal();
         gLoopFaults.event(2001, millis()).condition(true);
         Serial.println(mode == startup::Mode::PmuMissing ?
             "DEGRADED: power chip not responding -- not recording; no charge or rail control. Retrying in 60 s." :
             "DEGRADED: power chip state untrusted -- not recording; no further charge or rail control. Retrying in 60 s.");
     }
+    finishStartupWatchdog(); // degraded boots have a loop task too
 }
 
 static void degradedLoop() {
@@ -3036,11 +3204,11 @@ static void degradedLoop() {
     }
     gLoopFaults.event(6001, millis()).condition(gProductionDisplayFailed);
     serviceJournal(); // single consumer; no network task in any degraded mode
-    if (gDegraded.retryDue(millis())) {
+    if (!(mode == Mode::NoStorage && gStartupWatchdog.noStorage()) && gDegraded.retryDue(millis())) {
         bool recovered = false;
         if (mode == Mode::NoStorage) {
             // No format, fsck, trip activity or journal migration on this probe.
-            recovered = mountTripStorage(false);
+            recovered = mountTripStorage(false, false);
             if (gSdMounted) { SD.end(); gSdSpi.end(); }
             if (gFlashMounted) LittleFS.end();
             gSdMounted = gFlashMounted = false;
@@ -3070,6 +3238,15 @@ void setup() {
     // and initialization, BEFORE Serial, storage or GPS setup can block.
     bool pmuReady = beginPmuWithRecovery(Wire1, PMU, I2C_SDA, I2C_SCL, gPmuStartup);
     bool radioOff = pmuReady && PMU.disableALDO3() && aldo3State() == Aldo3State::Off;
+    // Bounded PMU/bus recovery and the radio-off safety command come first.
+    // Enroll before display, USB waits, filesystems, NVS or any storage call.
+    startup_watchdog::Record saved{gStartupWatchdogRecord.magic, gStartupWatchdogRecord.stage,
+        gStartupWatchdogRecord.hangs, gStartupWatchdogRecord.fallback, gStartupWatchdogRecord.checksum};
+    auto reason = esp_reset_reason();
+    gStartupWatchdog.boot(saved, reason == ESP_RST_POWERON,
+        reason == ESP_RST_TASK_WDT || reason == ESP_RST_INT_WDT || reason == ESP_RST_WDT);
+    saveStartupWatchdog();
+    armLoopWatchdog(startup_watchdog::STARTUP_WDT_TIMEOUT_MS, false);
     bool aldo1Warning = false;
     gBootBattery = diagnostics::BatterySample();
     if (radioOff) {
@@ -3095,7 +3272,7 @@ void setup() {
     }
     // SH1106 can retain its state across an ESP32 reset. Put it to sleep
     // before either degraded startup branch; never touch the PMU's Wire1.
-    beginProductionDisplay();
+    if (!gStartupWatchdog.noStorage()) beginProductionDisplay();
     gDebugMode.store(false); // boot-local, never restored from NVS
     pinMode(DEBUG_BOOT_PIN, INPUT_PULLUP); // ROM has already sampled the strap
     gBootButton = runtime_debug::BootButton();
@@ -3106,6 +3283,7 @@ void setup() {
         delay(1000); // Allow native USB to become ready before boot messages.
         Serial.println("\n=== Stage 4: Trip Logger ===");
         Serial.printf("Firmware: %s\n", firmware::kVersion);
+        printStartupWatchdog();
         printPmuStartup(gPmuStartup);
         enterDegraded(powerMode);
         return;
@@ -3122,13 +3300,14 @@ void setup() {
     // Never touch DCDC1 (ESP32).
 
     Serial.begin(115200);
-    gRtc.begin(Wire1, gDiagnosticClock);
+    if (!gStartupWatchdog.noStorage()) gRtc.begin(Wire1, gDiagnosticClock);
     delay(1000);
     // ADC has had a conversion interval, charger still disabled. Retain this
     // early sample across storage startup; never re-read it after charge guard.
     gBootBattery = diagnostics::readBatterySample(PMU);
     Serial.println("\n=== Stage 4: Trip Logger ===");
     Serial.printf("Firmware: %s\n", firmware::kVersion);
+    printStartupWatchdog();
     printPmuStartup(gPmuStartup);
     if (aldo1Warning)
         Serial.println("WARNING: ALDO1 3.3 V/on setup unconfirmed; OLED/BME280/magnetometer may be unavailable.");
@@ -3167,10 +3346,13 @@ void setup() {
                   gVbusLost ? "absent (on battery)" : "present");
 
     // --- Storage + boot-time repair ---
+    // A latched no-storage fallback returns false here before any mount, so
+    // it takes the same degraded path, with the same PMU setup, as a failure.
     if (!mountTripStorage()) {
         enterDegraded(startup::Mode::NoStorage);
         return;
     }
+    startupStage(startup_watchdog::Stage::Services);
     // --- GPS UART. setRxBufferSize MUST precede begin(). ---
     GPSSerial.setRxBufferSize(2048);
     GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
@@ -3183,19 +3365,20 @@ void setup() {
         gLoopFaults.event(2001, millis()).condition(false);
         gLoopFaults.event(4003, millis()).condition(false);
         gLoopFaults.event(4001, millis()).condition(!gSdMounted);
+        startupStage(gSdMounted ? startup_watchdog::Stage::CardSpace : startup_watchdog::Stage::FlashSpace);
         storageConditions(storageFreeBytes(*gTripFS), millis());
     }
-    if (gSdMounted) fsckAllTrips(SD);
-    if (gFlashMounted) fsckAllTrips(LittleFS);
+    if (gSdMounted) { startupStage(startup_watchdog::Stage::CardRepair); fsckAllTrips(SD); }
+    if (gFlashMounted) { startupStage(startup_watchdog::Stage::FlashRepair); fsckAllTrips(LittleFS); }
+    startupStage(startup_watchdog::Stage::Services);
 
     // Start a bounded readiness wait; loop() receives NMEA and configures
     // the receiver without blocking trip logging or power/charge checks.
     configureGps();
 
     // First charge-temperature check now, not 30 s in: charging has been off
-    // since the PMU setup, and this turns it back on if it's safe. (The
-    // temperature ADC was enabled well over a conversion time ago, with the
-    // PMU.)
+    // since PMU setup. A cold-start ADC can still be unready: the loop retries
+    // once a second for ten seconds, keeping charging off until a valid read.
     serviceChargeTemp();
 
     initEventUpload();
@@ -3206,9 +3389,18 @@ void setup() {
     }
 
     Serial.println("Setup complete. Logging trips.");
+    finishStartupWatchdog();
 }
 
 void loop() {
+#ifdef WATCHDOG_BENCH_HANG
+    // Deliberately no feed: the next watchdog-reset boot skips this hook,
+    // runs ordinary fsck, records E1003 and continues instead of reset-looping.
+    if (std::strcmp(diagnostics::journalResetReason(esp_reset_reason()), "watchdog") != 0) {
+        Serial.println("WATCHDOG BENCH: blocking loop until watchdog reset.");
+        for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+#endif
     if (gDegraded.mode() != startup::Mode::Normal) {
         degradedLoop();
         return;
@@ -3265,4 +3457,5 @@ void loop() {
     }
     serviceDisplay();
     if (debugMode()) serviceDebugTemperature();
+    if (GPSSerial.available() == 0) vTaskDelay(pdMS_TO_TICKS(LOOP_IDLE_MS));
 }

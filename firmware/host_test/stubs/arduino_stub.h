@@ -362,6 +362,7 @@ struct SDStub : fs::FS {
     bool cardPresent = false;
     int begins = 0, ends = 0;
     int capacityQueries = 0;
+    std::function<void()> onCapacity;
     int cs = -1, maxFiles = 0;
     uint32_t hz = 0;
     SPIClass* spi = nullptr;
@@ -380,7 +381,11 @@ struct SDStub : fs::FS {
     }
     uint8_t cardType() { return g_disk.mounted ? CARD_SDHC : CARD_NONE; }
     // Core 3.3.x keeps cardType cached but returns zero on f_getfree error.
-    uint64_t totalBytes() { ++capacityQueries; return cardPresent && !g_disk.readsFail ? g_disk.capacity : 0; }
+    uint64_t totalBytes() {
+        ++capacityQueries;
+        if (onCapacity) onCapacity();
+        return cardPresent && !g_disk.readsFail ? g_disk.capacity : 0;
+    }
     uint64_t usedBytes() { return cardPresent && !g_disk.readsFail ? g_disk.used() : 0; }
     bool readRAW(uint8_t* data, uint32_t sector) {
         if (sector || !g_disk.mounted) return false;
@@ -394,7 +399,8 @@ inline SDStub SD;
 // ---- Preferences ----------------------------------------------------------
 struct Preferences {
     std::map<std::string, uint32_t> kv;
-    bool begin(const char*, bool) { return !failBegin; }
+    inline static unsigned begins = 0;
+    bool begin(const char*, bool) { ++begins; return !failBegin; }
     uint32_t getUInt(const char* k, uint32_t d) { auto it = kv.find(k); return it == kv.end() ? d : it->second; }
     void putUInt(const char* k, uint32_t v) { kv[k] = v; }
     inline static std::map<std::string, uint64_t> durable64;
@@ -419,7 +425,9 @@ inline void portEXIT_CRITICAL(portMUX_TYPE*) {}
 inline bool g_failMutexCreate = false;
 inline SemaphoreHandle_t xSemaphoreCreateMutex() { return g_failMutexCreate ? nullptr : (void*)1; }
 extern int g_lockDepth;
+inline std::function<void(uint32_t)> g_semaphoreTakeHook;
 inline int xSemaphoreTake(SemaphoreHandle_t, uint32_t wait) {
+    if (g_semaphoreTakeHook) g_semaphoreTakeHook(wait);
     if (!wait && g_lockDepth) return 0;
     if (g_lockDepth != 0) { fprintf(stderr, "FATAL: re-entrant FS_LOCK (would deadlock)\n"); exit(3); }
     g_lockDepth++; return 1;
@@ -629,8 +637,8 @@ struct XPowersAXP2101 {
     }
 };
 // GPS UART: tests append NMEA/UBX bytes to rx and inspect what the sketch
-// sends in tx. Polling an empty port advances the clock 1 ms, so timeout
-// loops in the sketch terminate instead of spinning.
+// sends in tx. loop() advances time through its explicit vTaskDelay, like
+// the scheduler; checking an empty UART itself takes no simulated time.
 struct HardwareSerial {
     std::string rx, tx;
     size_t rxPos = 0;
@@ -640,7 +648,7 @@ struct HardwareSerial {
     void setRxBufferSize(int) {}
     void begin(int b, int, int rx, int tx) { baud = b; rxPin = rx; txPin = tx; }
     int available() {
-        if (rxPos >= rx.size()) { g_millis += 1; return 0; }
+        if (rxPos >= rx.size()) return 0;
         return (int)(rx.size() - rxPos);
     }
     int read() { return rxPos < rx.size() ? (uint8_t)rx[rxPos++] : -1; }
@@ -713,7 +721,9 @@ struct WiFiClient : Stream {
         nextByte = g_millis + g_httpByteMs; return uint8_t(response[position++]);
     }
     virtual int read(uint8_t* out, size_t size) {
-        if (!size || !available()) return 0; *out = read(); return 1;
+        if (!size || !available()) return 0;
+        *out = read();
+        return 1;
     }
     int peek() override { return available() ? uint8_t(response[position]) : -1; }
     size_t write(uint8_t) override { return 1; }
@@ -753,18 +763,27 @@ struct HTTPClient {
         g_httpRequests++;
         g_httpLastBody.clear();
         bool events = url.find("/v1/device-events") != std::string::npos;
-        if (events && !client->connect("test.invalid", 8090, connectTimeout)) return -1;
+        if (!client->connect("test.invalid", 8090, connectTimeout)) return -1;
+        if (!events) client->setTimeout(readTimeout);
         if (g_httpHook) g_httpHook();
         char buf[1436];
-        while (g_httpLastBody.size() < size && s->available() > 0) {
+        // Match core 3.3.11: the final available() follows the last socket
+        // write even when the specified body length has been consumed.
+        while (s->available() > -1 && g_httpLastBody.size() < size) {
+            if (s->available() <= 0) break;
             size_t want = std::min(sizeof buf, size - g_httpLastBody.size());
             size_t n = s->readBytes(buf, want);
             if (n == 0) break;
             g_httpLastBody.append(buf, n);
+            if (!events && client->write(reinterpret_cast<const uint8_t*>(buf), n) != n) return -3;
         }
         g_httpBodies.push_back(g_httpLastBody);
         g_httpUrls.push_back(url); g_httpHeaders.push_back(headers);
         if (g_httpLastBody.size() != size) return -3;   // HTTPC_ERROR_SEND_PAYLOAD_FAILED
+        if (!events) {
+            g_millis += std::min(g_httpHeaderMs, readTimeout);
+            return g_httpHeaderMs > readTimeout ? -11 : g_httpCode;
+        }
         if (events) {
             if (client->write(reinterpret_cast<const uint8_t*>(g_httpLastBody.data()), size) != size) return -3;
             uint32_t headerStart = g_millis;

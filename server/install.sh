@@ -478,10 +478,10 @@ preflight() {
 
     # COMMIT is optional: archives supply it, but hand copies can use VERSION alone.
     local f missing=()
-    for f in VERSION stamp_version.py common/version.py common/settings.py docker-compose.yml .dockerignore .env.example viewer.env.example monitor.env.example sample.gpx \
+    for f in VERSION stamp_version.py common/version.py common/settings.py common/trip_summary.py docker-compose.yml .dockerignore .env.example viewer.env.example monitor.env.example sample.gpx \
         common/__init__.py common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json} \
         mileage-ingest/{Dockerfile,app.py,diag_store.py,reset_high_water.py,requirements.txt} \
-        mileage-viewer/{Dockerfile,app.py,geocoding.py,requirements.txt} \
+        mileage-viewer/{Dockerfile,app.py,geocoding.py,trip_merges.py,trip_log.py,users.py,manage_users.py,requirements.txt} \
         mileage-viewer/static/{leaflet.js,leaflet.css,gpx.js,endpoint-places.js} \
         mileage-monitor/{Dockerfile,monitor.py,gelf.py,prometheus.py,loki.py} ntfy/server.yml \
         backup/{backup.sh,restore.sh,lib.sh,backup.conf.example} \
@@ -1534,6 +1534,33 @@ verify_services() {
         problem "The viewer's password hash lost its \$ signs on the way into the container" \
             "Single-quote VIEWER_PASSWORD_HASH in viewer.env, then: docker compose up -d"
     fi
+}
+
+# Inspect the containers, not just the Compose file: older containers retain
+# their original log settings until Compose recreates them. Optional services
+# have project-derived names, so discover their IDs through their profiles.
+verify_log_limits() {
+    local svc id config
+    for svc in mileage-ingest mileage-viewer mileage-monitor ntfy; do
+        id=$svc
+        case $svc in
+            mileage-monitor|ntfy)
+                id=$({ compose --profile monitor --profile ntfy ps -a -q "$svc" < /dev/null 2> /dev/null || true; } | head -n 1)
+                [[ -n $id ]] || continue ;;
+        esac
+        [[ $(container_state "$id") == running ]] || continue
+        if ! config=$("${DOCKER[@]}" inspect -f '{{json .HostConfig.LogConfig}}' "$id" 2> /dev/null); then
+            warn "Couldn't check $svc's container log limit" \
+                "Check Docker access, then run install.sh --check again."
+        elif jq -e '.Type == "json-file" and .Config["max-size"] == "10m" and .Config["max-file"] == "3"' \
+                <<< "$config" > /dev/null 2>&1; then
+            ok "$svc container logs are limited to three 10 MB files"
+        else
+            warn "$svc isn't using the three-file, 10 MB container log limit" \
+                "Update the server files, then recreate containers: docker compose --profile monitor --profile ntfy up -d --force-recreate --no-deps $svc" \
+                "This discards that container's old logs; save any you need first. Existing logs aren't trimmed in place."
+        fi
+    done
 }
 
 # --- End to end --------------------------------------------------------
@@ -3857,6 +3884,7 @@ main() {
     verify_reboots
     setup_backups
     setup_outputs
+    verify_log_limits
     summary
 }
 

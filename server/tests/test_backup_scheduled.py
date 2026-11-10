@@ -161,7 +161,7 @@ class ScheduledBackup(unittest.TestCase):
         sleeps = [int(line.split()[1]) for line in (self.tmp / "calls").read_text().splitlines()
                   if line.startswith("sleep ")]
         self.assertEqual(len(sleeps), 2)
-        for delay, limit in zip(sleeps, (1, 900)):
+        for delay, limit in zip(sleeps, (1, 900), strict=True):
             self.assertGreaterEqual(delay, 0)
             self.assertLessEqual(delay, limit)
 

@@ -48,7 +48,7 @@ struct Epoch { int t; double lat, lon; float mps; bool fix; };
 
 // One second of default M8N output. ggaFirst swaps the RMC/GGA order.
 static std::vector<std::string> sentences(const Epoch& e, bool ggaFirst = false) {
-    char hms[16], b[200];
+    char hms[20], b[200]; // allow the full int-derived minute field in fixtures
     int s = 30 * 60 + e.t;   // epoch 0 = 14:30:00
     snprintf(hms, sizeof hms, "14%02d%02d.00", s / 60, s % 60);
     std::string ll = coord(e.lat, true) + "," + coord(e.lon, false);
@@ -105,6 +105,9 @@ static void run(float mps, int seconds, bool fix = true, bool ggaFirst = false,
 }
 
 static void resetWorld() {
+    g_watchdog = WatchdogStub(); loopTaskWDTEnabled = false; gLoopWatchdogArmed = false;
+    gLoopWatchdogTimeoutMs = 0; gStartupWatchdog = startup_watchdog::Policy(); gStartupWatchdogRecord.magic = 0;
+    g_resetReason = ESP_RST_POWERON;
     gDebugMode.store(hostDebugMode());
     gBootButton = runtime_debug::BootButton();
     gModeFeedback = false; gDisplayOwner = DisplayOwner::Production;
@@ -284,7 +287,7 @@ int main(int argc, char** argv) {
         want += frame(0x0A, 0x38, {});
         CHECK(GPSSerial.tx == want && valset().size() == 52,
               "exact VALSET frame: RAM layer, eight correctly sized keys, GSV rate 5 in all builds and checksum");
-        CHECK(g_millis <= 8 && logCount("GPS configured on attempt 1 (") == 1 &&
+        CHECK(g_millis <= 8 * LOOP_IDLE_MS && logCount("GPS configured on attempt 1 (") == 1 &&
               logCount("ms after config start") == 1 && logCount("GSV every 5 epochs") == 1,
               "loop does not wait for ACKs and success is logged once");
     }
@@ -466,7 +469,7 @@ int main(int argc, char** argv) {
         CHECK(g_sntpStopCalls == 2, "stops background SNTP after timeout");
         GPSSerial.rx = sentences({0, 37, -122, 0, true})[0];
         loop();
-        CHECK(gClockSet && nowEpochMs() == 1776177000001ULL,
+        CHECK(gClockSet && nowEpochMs() == 1776177000000ULL + LOOP_IDLE_MS,
               "fresh GPS corrects retained RTC even after unsuccessful NTP");
     }
 
@@ -481,7 +484,7 @@ int main(int argc, char** argv) {
         CHECK(g_sntpStopCalls == 2, "stops SNTP after successful attempt");
         GPSSerial.rx = sentences({0, 37, -122, 0, true})[0];
         loop();
-        CHECK(gGpsClockSet && nowEpochMs() == 1776177000001ULL,
+        CHECK(gGpsClockSet && nowEpochMs() == 1776177000000ULL + LOOP_IDLE_MS,
               "first fresh GPS corrects time even when SNTP already set it");
         uint32_t lastSync = gLastGpsSyncMs;
         g_epochBaseMs += 20000; // inject RTC drift
@@ -490,7 +493,7 @@ int main(int argc, char** argv) {
         CHECK(gLastGpsSyncMs == lastSync, "does not step the clock for every fix");
         g_millis = lastSync + GPS_CLOCK_SYNC_MS;
         GPSSerial.rx += sentences({60, 37, -122, 0, true})[0]; loop();
-        CHECK(nowEpochMs() == 1776177060001ULL, "fresh GPS removes drift at the next minute");
+        CHECK(nowEpochMs() == 1776177060000ULL + LOOP_IDLE_MS, "fresh GPS removes drift at the next minute");
     }
 
     printf("G9 stale GPS and midnight sentence ordering\n");
@@ -506,7 +509,7 @@ int main(int argc, char** argv) {
         CHECK(!gClockSet, "fresh GGA time cannot reuse yesterday's RMC date");
         GPSSerial.rx += nmea("GNRMC,000000.25,A,3700.0,N,12200.0,W,0.0,0.0,150426,,,A");
         loop();
-        CHECK(gClockSet && nowEpochMs() == 1776211200251ULL,
+        CHECK(gClockSet && nowEpochMs() == 1776211200250ULL + LOOP_IDLE_MS,
               "new RMC sets the matching next-day date and fractional seconds");
     }
 
@@ -526,7 +529,7 @@ int main(int argc, char** argv) {
         CHECK(gLastGpsSyncMs == lastSync, "empty time cannot refresh a cached time");
         GPSSerial.rx += nmea(std::string(talker) + ",000100.25,A,3700.0,N,12200.0,W,0.0,0.0,150426,,,A");
         loop();
-        CHECK(nowEpochMs() == 1776211260251ULL, "next complete RMC corrects the clock");
+        CHECK(nowEpochMs() == 1776211260250ULL + LOOP_IDLE_MS, "next complete RMC corrects the clock");
     }
 
     printf("G11 GPS arrives during an SNTP wait\n");
@@ -538,7 +541,7 @@ int main(int argc, char** argv) {
             g_sntpPollHook = nullptr;
         };
         trySntp();
-        CHECK(gGpsClockSet && gClockSet && nowEpochMs() == 1776177000101ULL,
+        CHECK(gGpsClockSet && gClockSet && nowEpochMs() == 1776177000100ULL + LOOP_IDLE_MS,
               "GPS source wins without waiting for an NTP timeout");
         CHECK(g_sntpStopCalls == 2 && g_sntpPolls == 1, "network task stops its SNTP attempt after GPS success");
     }
@@ -915,11 +918,13 @@ int main(int argc, char** argv) {
         resetWorld(); run(15, 60, true, false, 100);
         if (stopped) run(4.65f, 1, true, false, 2500);
         const uint32_t last = gLastFixMonoMs;
-        // The serial stub advances millis once on the final available().
+        // Services run before the idle pause advances the simulated clock.
         g_millis = last + FIX_LOSS_END_MS - 1; loop();
         CHECK(gState == (stopped ? COOLDOWN : ACTIVE),
               "neither trip state ends before the watchdog exceeds five minutes since the last RMC");
-        ++g_millis; loop();
+        g_millis = last + FIX_LOSS_END_MS; loop();
+        CHECK(gState == (stopped ? COOLDOWN : ACTIVE), "fix-loss boundary itself remains inclusive");
+        g_millis = last + FIX_LOSS_END_MS + 1; loop();
         CHECK(gState == IDLE && logCount("No GPS fix for 5 min") == 1,
               "complete fix loss still finalizes with no further GPS bytes");
     }

@@ -2238,6 +2238,13 @@ docker compose logs mileage-ingest --tail 50
 docker compose logs mileage-viewer --tail 50
 ```
 
+Each service keeps at most three 10 MB Docker log files per container, including
+optional monitor and ntfy. The limit applies after the containers are recreated;
+the installer update does this when their Compose settings change. Old logs
+are not trimmed in place. Recreating a container discards its old logs, so save
+any you need first. `bash install.sh --check` warns about older log settings
+and shows the command to apply the limit.
+
 **Upload returns 500, logs show a permission error** — the `./data` ownership
 problem from Step 3. Fix: `sudo chown -R 1000:1000 ~/mileage-tracker/data`
 then `docker compose restart mileage-ingest`.

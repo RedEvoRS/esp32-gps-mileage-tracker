@@ -166,12 +166,14 @@ concerns handled by `mileage-viewer`, which reads these files independently.
     ├── tests/                 # The server test suite (not needed to run it)
     ├── mileage-ingest/
     │   ├── Dockerfile         # Container definition
-    │   ├── requirements.txt   # Python dependencies
+    │   ├── requirements.in    # Direct Python dependencies (maintainer input)
+    │   ├── requirements.txt   # Complete dependency lock with hashes
     │   ├── app.py             # GPX uploads + device-event endpoint (Flask)
     │   ├── diag_store.py      # Diagnostics transactions and ordered health
     │   └── reset_high_water.py # Admin recovery for a device's snapshot high-water (see DIAGNOSTICS.md)
     └── mileage-viewer/
         ├── Dockerfile
+        ├── requirements.in
         ├── requirements.txt
         ├── app.py             # The web UI (Flask)
         ├── manage_users.py    # Command-line management of everyday logins
@@ -322,6 +324,52 @@ For an advanced source deployment, use the
 It preserves the archive commit stamp and includes the required dotfiles.
 Release users keep the supplied version; the bump/tag instructions above
 are for maintainers deploying source changes.
+
+## Updating Python dependencies
+
+Each service's `requirements.in` is the short list of packages we use directly.
+Its generated `requirements.txt` locks the complete dependency tree to exact
+versions and SHA-256 hashes. Image builds and CI install that lock with hash
+checking, so rebuilding does not silently pick up new Python packages. The
+Python base image and operating-system packages are updated separately.
+
+Edit direct pins in the `.in` files when needed, keeping shared pins in step.
+From the repository root, regenerate **both** locks in the runtime's Linux
+Python 3.12 environment (never resolve them with Windows Python):
+
+```bash
+docker run --rm --mount "type=bind,src=$(pwd),dst=/work" -w /work \
+  python:3.12-slim sh server/update_python_dependencies.sh
+```
+
+In Git Bash on Windows, prefix the command with `MSYS_NO_PATHCONV=1`.
+In PowerShell, use `src=${PWD}` instead of `src=$(pwd)` in the mount argument.
+The helper installs `pip==25.2` and `pip-tools==7.5.3` in the throwaway container,
+then runs `pip-compile --upgrade --generate-hashes --resolver=backtracking
+--strip-extras --no-emit-index-url --no-emit-trusted-host
+--output-file=requirements.txt requirements.in` in ingest first, then viewer.
+The viewer command also adds `--constraint ../mileage-ingest/requirements.txt`
+to keep shared packages at the ingest lock's versions. This constraint stays
+in the helper, leaving Dependabot free to update each input/lock pair. Hashes include
+all published wheels and source archives, including Linux amd64 and arm64 wheels.
+The inputs and helper ship in releases for maintainers; only the compiled locks
+are needed in image build contexts or by `install.sh`.
+
+Review both lock diffs, build both images on amd64 and arm64, and run the server
+suite using the locks together:
+
+```bash
+python -m pip install --require-hashes -r server/mileage-ingest/requirements.txt -r server/mileage-viewer/requirements.txt
+python -m unittest discover -s server/tests
+```
+
+CI checks pins, hashes, direct versions and agreement between locks without
+running the resolver. Dependabot's monthly grouped updates cover direct and
+indirect packages in both services, with a seven-day version-update cooldown.
+Keep the standard pip-compile Python 3.12 header: Dependabot uses it to select
+Python and regenerates the hashes. If the shared-version test fails on an
+update, regenerate both locks together
+with the command above and review the resulting changes.
 
 ## First-Time Setup
 
@@ -497,6 +545,14 @@ for storage, Python fallback and service setup.
 Check the logs when you want to see what's happening:
 
     docker compose logs -f mileage-ingest
+
+Every service, including optional monitor and ntfy, keeps at most three 10 MB
+Docker log files per container. This protects the server's Docker storage from
+growing logs. The limit applies after containers are recreated: the installer
+update does this when the Compose settings change, including enabled optional
+services. Existing logs are not trimmed in place; recreating a container
+discards its old logs, so save any you need first. `install.sh --check` warns
+when a running container still has older log settings.
 
 After changing `.env` or `viewer.env`, recreate the containers so they
 pick up the new values (Compose only recreates the ones that changed):

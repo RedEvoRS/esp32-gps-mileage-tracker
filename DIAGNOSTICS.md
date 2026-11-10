@@ -1203,6 +1203,29 @@ the active backend and physical unacknowledged valid-frame/segment counts;
 uncertain inventory is labeled incomplete. Ambiguous writes can retain duplicate
 IDs, so physical frame counts can exceed distinct event counts.
 
+Firmware v1.04 enrolls the loop task after bounded PMU recovery and the radio-off
+safety command. Startup uses 120 seconds per stage, then normal and degraded
+loops use 60 seconds. Verified scan/repair progress feeds it; waits do not.
+Two startup watchdog hangs skip a failing card for LittleFS (E4001), or use
+no-storage degraded mode for other stages (E4001/E4002/E4003). Another startup
+hang with the card skipped also selects no-storage mode. That mode disables
+storage recovery probes and uses a RAM journal without NVS boot counting.
+The checksummed RTC-memory fallback lasts until a real power-on. Corrupt
+history is ignored; running-loop watchdog resets do not add startup hangs.
+Serial names the stage and count; each watchdog-reset boot enqueues E1003.
+Repairs run on the stores still in use. The core-0 network task is unenrolled.
+The card skip was bench-checked on 2026-11-10 (UTC) with the startup-hang
+bench build: two resets 120 seconds apart, then a boot that used LittleFS.
+The server received E1003 and E4001 from that boot. The boot after the first
+reset hung again before its events were saved, so one E1003 arrived for the
+pair. No-storage mode, a real power-on clearing the latch and
+full-card/large-repair startup timing remain unverified.
+The watchdog and its intentional-hang bench hook were bench-checked on
+2026-11-10 (UTC): the reset arrived after 60 seconds and the server received
+E1003 from the following boot. See
+[the firmware guide](firmware/README.md#watchdog-bench-check). No catalog or
+diagnostics-protocol change is needed.
+
 After trusted PMU/LoRa startup, charging is disabled and battery detection/ADC
 are enabled before display/USB waits. After the existing one-second USB wait,
 the raw battery registers are sampled once, before storage, GPS startup and the
@@ -1366,9 +1389,9 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E2001 | PMU initialization failed or LoRa ALDO3 could not be verified off at startup | Only a normal boot after successful PMU initialization and rail verification observes healthy; retry success restarts, never clears in degraded mode | none |
 | E2002 | Verified AXP2101 level-1 IRQ or battery percentage <= successfully read configured low warning | Valid connected battery percentage above that threshold; failed threshold reads neither raise nor clear | `battery_mv`, if in catalog range |
 | E2003 | Verified AXP2101 level-2 IRQ (before existing shutdown), or percentage <= successfully read configured critical level | Valid connected battery percentage above critical; failed threshold reads neither raise nor clear | `battery_mv`, if in range |
-| E2004 | Guard requires a hot pause (die >=54 C); keeps requesting it above 47 C | Finite die sample <=47 C or another measured pause reason; describes required pause even if control is unconfirmed | `temperature_mc` = measured PMU die, if in range |
-| E2005 | Guard requires a cold pause (die <=9 C); keeps requesting it below 14 C | Finite die sample >=14 C or another measured pause reason; describes required pause even if control is unconfirmed | `temperature_mc` = measured PMU die, if in range |
-| E2006 | Non-finite charge-temperature sample | Finite sample; hot/cold conditions are not cleared by an unreadable sample | none |
+| E2004 | Plausible die requires a hot pause (die >=54 C); keeps requesting it above 47 C | Plausible die <=47 C or another measured pause reason; describes required pause even if control is unconfirmed | `temperature_mc` = measured PMU die |
+| E2005 | Plausible die requires a cold pause (die <=9 C); keeps requesting it below 14 C | Plausible die >=14 C or another measured pause reason; describes required pause even if control is unconfirmed | `temperature_mc` = measured PMU die |
+| E2006 | Non-finite or implausible die sample; first ten seconds of first-reading retries are silent | Plausible sample; hot/cold conditions are not cleared by an unreadable sample | none |
 | E2008 | Three consecutive charger command/read-back failures, 30 s apart | Checked 0x18 bit 1 read matches the intended charger state | none |
 | E3001 | No checksum-valid NMEA for 10 s, starting at GPS configuration start | Next checksum-valid NMEA; noise/UBX/bad checksum do not recover it | `elapsed_ms` |
 | E3002 | No trusted fix (one meeting the NAV-PVT start accuracy limits, or any valid fix in RMC-only fallback) for 120 s while idle | Trusted fix; acquisition grace starts again after leaving a trip | `elapsed_ms`, `satellites` when measured |
@@ -1417,12 +1440,23 @@ including if more edges arrive while reads fail. Successful batches use the
 XPowersLib bit positions and the same enabled mask as IRQ setup, then clear as
 before. The production short-press display hook uses this verified batch too.
 
+Plausible means finite and within -40 to 125 C. Before the first usable reading
+each boot, the guard commands/verifies charging off and retries once a second
+for ten seconds. There is no E2006 during that grace window. Expiry pauses
+charging with E2006 and returns to 30-second checks. A plausible hot reading
+still raises E2004 immediately. Invalid readings never drive or clear hot/cold
+conditions, carry temperature context or appear as real debug temperatures.
+The first-reading retry has host tests only. Bench boots on 2026-11-10 (UTC)
+were USB resets whose first reading was already usable, so a start from fully
+off remains unchecked.
+
 The charge guard uses its existing die proxy and hysteresis; diagnostic context
 never presents that die reading as a measured cell temperature. Each enable/disable
 command in the normal temperature guard is followed by a checked CHARGE_GAUGE_WDT_CTRL (0x18)
 bit-1 read. State is confirmed paused, confirmed charging or unconfirmed. A
 mismatch or read failure leaves it unconfirmed, retains pause-request hysteresis
-and retries at the 30 s temperature cadence. Only a matching read-back logs a
+and retries at the temperature cadence (one second during first-reading grace,
+otherwise 30 seconds). Only a matching read-back logs a
 confirmed pause/resume. E2008 stays active until confirmation; the first two
 unconfirmed attempts cannot manufacture recovery. The degraded PMU-untrusted
 mode retains its separate one-time best-effort disable/read-back policy.

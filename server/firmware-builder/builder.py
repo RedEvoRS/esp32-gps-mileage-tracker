@@ -83,7 +83,7 @@ def validate_settings(settings):
     except ipaddress.AddressValueError:
         if len(host) > 253 or not all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
                                       for label in host.split(".")):
-            raise ValueError("Server host must be an IPv4 address or hostname, without URL or port")
+            raise ValueError("Server host must be an IPv4 address or hostname, without URL or port") from None
     else:
         if address.is_unspecified or address.is_multicast:
             raise ValueError("Server host must be a reachable LAN address")

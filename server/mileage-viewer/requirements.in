@@ -1,0 +1,6 @@
+# Direct dependencies only; regenerate both locks with update_python_dependencies.sh.
+flask==3.1.3
+gunicorn==26.2.0
+openpyxl==3.1.5
+# IANA timezone data: refresh when timezone rules change.
+tzdata==2026.5

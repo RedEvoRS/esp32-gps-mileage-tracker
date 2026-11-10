@@ -109,7 +109,7 @@ class TripRoundTrip(unittest.TestCase):
             self.assertEqual(float(total["distance_miles"]), record["distance_miles"])
             workbook = load_workbook(io.BytesIO(client.get("/export.xlsx?year=2026").data))
             try:
-                cells = dict(zip((c.value for c in workbook.active[1]), workbook.active[2]))
+                cells = dict(zip((c.value for c in workbook.active[1]), workbook.active[2], strict=True))
                 self.assertEqual(cells["timing_status"].value, "partial")
                 for field in ("start_time", "end_time", "duration_minutes", "avg_speed_mph"):
                     self.assertIsNone(cells[field].value, field)
@@ -191,7 +191,7 @@ class TripRoundTrip(unittest.TestCase):
             workbook = load_workbook(io.BytesIO(xlsx_response.data))
             try:
                 self.assertEqual(workbook.active.max_row, 2)  # header and one trip
-                cells = dict(zip((c.value for c in workbook.active[1]), workbook.active[2]))
+                cells = dict(zip((c.value for c in workbook.active[1]), workbook.active[2], strict=True))
                 self.assertEqual(cells["distance_miles"].value, record["distance_miles"])
                 self.assertEqual(cells["category"].value, "business")
                 self.assertEqual(cells["purpose_note"].value, "Test visit")
@@ -263,7 +263,7 @@ class TripRoundTrip(unittest.TestCase):
             self.assertEqual(xlsx_response.status_code, 200)
             workbook = load_workbook(io.BytesIO(xlsx_response.data))
             try:
-                cells = dict(zip((c.value for c in workbook.active[1]), workbook.active[2]))
+                cells = dict(zip((c.value for c in workbook.active[1]), workbook.active[2], strict=True))
                 self.assertEqual(cells["purpose_note"].value, "=1+2")
                 self.assertEqual(cells["purpose_note"].data_type, "s")
                 self.assertEqual(cells["distance_miles"].value, record["distance_miles"])
