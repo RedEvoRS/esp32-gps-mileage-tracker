@@ -62,7 +62,7 @@ import unicodedata
 from threading import Lock
 from urllib.parse import unquote, urlsplit
 from xml.parsers import expat
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -797,17 +797,72 @@ def read_summary(json_path):
     return kept, None
 
 
+# Per worker, shared by its gthread requests. Values contain only the validated
+# scalar fields above; callers always get a new dictionary. Never cache DB data.
+_summary_cache = {}
+_summary_cache_lock = Lock()
+
+
+def _summary_stamp(path):
+    st = path.stat()
+    return st.st_ino, st.st_size, st.st_mtime_ns
+
+
+def _cached_summary(path):
+    with _summary_cache_lock:
+        try:
+            stamp = _summary_stamp(path)
+        except OSError:
+            _summary_cache.pop(path, None)
+            return read_summary(path)
+        cached = _summary_cache.get(path)
+        if cached is not None and cached[0] == stamp:
+            summary, problem = cached[1:]
+            if problem:
+                app.logger.warning("Unreadable trip summary %s: %s", path, problem)
+            return dict(summary) if summary is not None else None, problem
+        summary, problem = read_summary(path)
+        # Do not pin a read raced by an atomic ingest rewrite (or hand edit).
+        # This request can show either complete file, as before; the next read
+        # must not mistake the older parsed content for the newer file.
+        try:
+            unchanged = _summary_stamp(path) == stamp
+        except OSError:
+            unchanged = False
+        if unchanged and problem not in ("the file could not be read", "the file is missing"):
+            _summary_cache[path] = (stamp, dict(summary) if summary is not None else None, problem)
+        else:
+            _summary_cache.pop(path, None)
+        return summary, problem
+
+
+@contextmanager
+def _trip_read(include_removed=False, trip_key=None):
+    """Yield a consistent DB snapshot, reserving a writer only for refresh."""
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        # A single read snapshot keeps membership, annotations and removals
+        # consistent without reserving the DB's writer. Never promote a stale
+        # SQLite read snapshot: restart, then recheck everything under the lock.
+        conn.execute("BEGIN")
+        try:
+            trips, unreadable = _load_trips(conn, include_removed, refresh_merges=False,
+                                            trip_key=trip_key)
+        except trip_merges.MergeRefreshNeeded:
+            conn.rollback()
+            conn.execute("BEGIN IMMEDIATE")
+            trips, unreadable = _load_trips(conn, include_removed, trip_key=trip_key)
+        yield conn, trips, unreadable
+
+
 def load_trips(conn=None, include_removed=False):
     if conn is not None:
         return _load_trips(conn, include_removed)
-    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
-        conn.row_factory = sqlite3.Row
-        # Serialize cache refreshes with edits/merges across gunicorn workers.
-        conn.execute("BEGIN IMMEDIATE")
-        return _load_trips(conn, include_removed)
+    with _trip_read(include_removed) as (_, trips, unreadable):
+        return trips, unreadable
 
 
-def _load_trips(conn, include_removed=False):
+def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None):
     """Scan DATA_ROOT for trips and join annotations.
 
     Returns (trips, unreadable). trips is sorted by its date anchor descending,
@@ -828,16 +883,39 @@ def _load_trips(conn, include_removed=False):
     # A GPX with no summary next to it is a trip too. Ingest writes the GPX
     # first, so a failed or lost summary write leaves one behind. (A page
     # load in the middle of an upload can catch one for a moment, too.)
-    json_paths = [*DATA_ROOT.glob("*/*.json"), *(
-        gpx.with_suffix(".json") for gpx in DATA_ROOT.glob("*/*.gpx")
-        if not gpx.with_suffix(".json").exists()
-    )]
+    if trip_key is None:
+        json_paths = [*DATA_ROOT.glob("*/*.json"), *(
+            gpx.with_suffix(".json") for gpx in DATA_ROOT.glob("*/*.gpx")
+            if not gpx.with_suffix(".json").exists()
+        )]
+        with _summary_cache_lock:
+            live = set(json_paths)
+            for path in _summary_cache.keys() - live:
+                del _summary_cache[path]
+    else:
+        trip_key = trip_merges.canonical_key(conn, trip_key)
+        keys = trip_merges.parts(conn, trip_key) or [trip_key]
+        try:
+            json_paths = [p.with_suffix(".json") for p in trip_merges.source_paths(DATA_ROOT, keys)]
+        except ValueError:
+            # Invalid persisted membership must never become a filesystem path.
+            # apply_merges will report the missing sources as a broken merge.
+            json_paths = []
+        with _summary_cache_lock:
+            # Targeted pages do not enumerate the data tree. Still evict any
+            # vanished cached files, so repeated one-trip reads cannot retain
+            # an ever-growing history of files that have since been removed.
+            for path in list(_summary_cache):
+                if not path.exists():
+                    del _summary_cache[path]
+        json_paths = [p for p in json_paths if p.exists() or p.with_suffix(".gpx").exists()]
+    only_merge_key = trip_key
     for json_path in json_paths:
         ym = json_path.parent.name
         trip_id = json_path.stem
         trip_key = f"{ym}/{trip_id}"
         ann = annotations.get(trip_key, {})
-        summary, problem = read_summary(json_path)
+        summary, problem = _cached_summary(json_path)
         trip = {
             **(summary or {}),
             "id": trip_id,
@@ -853,7 +931,8 @@ def _load_trips(conn, include_removed=False):
         else:
             trips.append(trip)
 
-    trips, unreadable = trip_merges.apply_merges(conn, DATA_ROOT, trips, unreadable)
+    trips, unreadable = trip_merges.apply_merges(
+        conn, DATA_ROOT, trips, unreadable, refresh=refresh_merges, only_key=only_merge_key)
     # Removal is keyed by the canonical key the list shows (a merged trip's
     # merge key, a part never), so filtering here, after the merges, hides a
     # merged trip as a whole. This is the only place that filters: the list,
@@ -1472,7 +1551,7 @@ def _recording_years(key):
     """
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}/[A-Za-z0-9_-]+", key or ""):
         return set()
-    summary, problem = read_summary(DATA_ROOT / f"{key}.json")
+    summary, problem = _cached_summary(DATA_ROOT / f"{key}.json")
     if problem:
         return _folder_years(key.split("/")[0])
     year = _trip_local_year(summary)
@@ -2845,11 +2924,7 @@ def _late_edit_rows(conn, year, trips):
 @app.route("/admin/year/<year>")
 def admin_year(year):
     year = valid_year(year)
-    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
-        conn.row_factory = sqlite3.Row
-        # Serialize the merge-cache refresh in _load_trips, like load_trips().
-        conn.execute("BEGIN IMMEDIATE")
-        trips, unreadable = _load_trips(conn, include_removed=True)
+    with _trip_read(include_removed=True) as (conn, trips, unreadable):
         closed = trip_log.closed_years(conn).get(year)
         # Totals and the problem lists come from the same selection the list
         # and exports use, applied to the log without its removed trips.
@@ -3063,12 +3138,13 @@ def trip_view(ym, trip_id):
     year = selected_year()
     _safe_trip_paths(ym, trip_id)
     key = f"{ym}/{trip_id}"
-    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+    # Resolve the requested recording/alias and read only its own sources.
+    # Removed trips, redirects and unknown-device trips need no global merge
+    # suggestions; the normal known-device page still needs the full chronology.
+    with _trip_read(include_removed=True, trip_key=key) as (conn, trips, unreadable):
         key = trip_merges.canonical_key(conn, key)
         removed = trip_log.removal(conn, key)
-    # Merge suggestions get the standard lists plus the removed readable
-    # trips; only the admin may open a removed trip itself.
-    trips, unreadable, removed_trips, removed_unreadable = split_removed(*load_trips(include_removed=True))
+    trips, unreadable, removed_trips, removed_unreadable = split_removed(trips, unreadable)
     t = next((t for t in trips if t["trip_key"] == key or key in t.get("parts", [])), None)
     if t is None and g.role == "admin" and removed is not None:
         t = next((t for t in removed_trips + removed_unreadable if t["trip_key"] == key), None)
@@ -3081,6 +3157,14 @@ def trip_view(ym, trip_id):
         ))
     if t["trip_key"] != f"{ym}/{trip_id}":
         return redirect(url_for("trip_view", ym=t["ym"], trip_id=t["id"], year=year or ""))
+    if not t.get("removal") and trip_merges._known_device(t.get("device_id")):
+        trips, unreadable, removed_trips, _ = split_removed(*load_trips(include_removed=True))
+        # A concurrent edit can remove or split the trip between snapshots.
+        # Use the latest complete snapshot for suggestions, as before.
+        current = next((trip for trip in trips if trip["trip_key"] == t["trip_key"]), None)
+        if current is None:
+            return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
+        t = current
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         conn.row_factory = sqlite3.Row
         last_edited = _last_edited(conn, t)

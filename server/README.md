@@ -747,6 +747,23 @@ and puts year, display timezone, and totals on a separate `Totals` sheet.
 Totals are summed before rounding to three decimal places, matching stored
 distance precision. Unclassified totals include trips without a category.
 
+Each viewer worker keeps parsed summaries in memory, shared safely by its
+threads. It checks file identity, size and nanosecond modification time on
+each scan, rereads changed files and drops vanished entries. A restart clears
+the cache. Annotations, removals and year locks always come from the database.
+Ordinary reads use a consistent read transaction; only a changed merged
+summary (or an older fingerprint needing file identities) reserves the database
+writer and rechecks the log before saving. SQLite can still briefly delay a
+writer's commit until a read transaction finishes.
+
+File discovery still covers the log: the year menu needs years from other
+folders, every year review lists all undated trips, and a changed display
+timezone or rebuilt summary can move a trip across New Year. A known-device
+trip page also needs the full chronology for safe merge suggestions. Removed
+trip pages, unknown-device pages and redirects read only the requested trip's
+sources. The data mount remains read-only; none of these caches writes GPX
+or JSON files.
+
 A trip whose summary file can't be read (damaged on disk, edited by hand,
 or missing next to its GPX) has no miles the viewer can count. The trip list shows a warning
 naming it and why, the CSV lists it with `row_type=unreadable` and blank
@@ -920,8 +937,11 @@ in a serialized SQLite transaction so concurrent workers preserve existing
 annotations. The original annotation rows remain intact. Back up this database
 alongside the trip files: losing it also loses merges.
 
-The cached summary is refreshed only when a part's GPX/JSON size or modification
-time changes. A change to the shared summary rules (`SUMMARY_VERSION`) does not
+The cached summary is refreshed only when a part's GPX/JSON inode (file identity),
+size or nanosecond modification time changes. An atomic file replacement is
+therefore noticed even if its size and timestamp stay the same. Older merge
+fingerprints gain file identities on first use without recalculating their
+stored mileage. A change to the shared summary rules (`SUMMARY_VERSION`) does not
 rebuild it by itself, the same as the plain trips' stored summaries, which keep the
 rules of the day they were written; otherwise one release would total merged
 trips under new rules and everything else under old ones. Ordinary list views
