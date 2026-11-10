@@ -262,9 +262,14 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   after >10s without NAV-PVT from config end or the last NAV-PVT, warn once
   and fall back to RMC-only speed
 - FreeRTOS: networking on core 0, GPS on core 1; normal loop pauses 5 ms
-  only with an empty UART. Firmware v1.04 arms a 60 s loop watchdog after
-  normal/degraded setup; progressing runtime repairs feed it, lock waits do not.
-  Startup and the network task are outside that coverage. Bench-checked
+  only with an empty UART. Firmware v1.04 watches startup at 120 s per stage
+  after bounded PMU recovery and radio-off safety setup, then switches to 60 s
+  for the loop. Verified scan/repair progress feeds it; waits and locks do not.
+  Two startup hangs skip a failing card for LittleFS, or use no-storage mode
+  after other hangs. The latch lasts until a real power-on; no-storage mode
+  suppresses storage probes. The startup limits and fallback have host tests
+  only and are unverified on the board. The network task remains unenrolled.
+  The existing loop watchdog and pause were bench-checked
   2026-11-10 (UTC) on USB with no battery: a deliberately blocked loop was
   reset after 60 s, rebooted, carried on and reported E1003; the loop pause
   ran 22 minutes with normal GPS and sampling. Battery savings, power-off
@@ -282,6 +287,11 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   15-minute repeats; WiFi access point (AP) absence is a boot-local counter,
   never a scan event. Per-core static producer builders keep event buffers
   off task stacks. Bounded degraded startup retries restart on recovery.
+  The charge guard accepts finite die readings only from -40 to 125 C.
+  An unreadable first sample keeps charging off and retries each second for
+  ten seconds before E2006; plausible hot/cold samples act immediately.
+  Invalid samples never create hot/cold history or real debug temperatures.
+  The first-reading retry has host tests only and is unverified on the board.
 - Diagnostic journal: the network task services one queued record at a time
   using a zero-wait filesystem lock and yields maintenance to trip/upload
   demand. Mounted SD has a 16 MiB journal quota; LittleFS has a 64 KiB reserve

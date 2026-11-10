@@ -1014,17 +1014,26 @@ How it behaves once flashed:
   a new burst is read on the next pass without an added pause. This gives
   core 1 time to idle; battery and temperature improvements have not been
   measured. The existing degraded loop keeps its 20 ms pause.
-  A 60-second task watchdog is armed after normal or degraded startup ends.
+  A task watchdog starts after bounded PMU recovery and the radio-off safety
+  command, before display or storage work. Startup has a generous 120-second
+  limit per stage; normal and degraded loops use 60 seconds afterward.
   The Arduino core feeds it before each loop pass. A stuck filesystem lock
   or driver call then requests a panic and board restart. Slow runtime trip
   repair feeds it only as bytes are successfully scanned or copied; bounded
   shutdown stages feed it between stages, never inside their polling waits.
-  Startup is deliberately outside this protection: mounting storage, the
-  first card free-space scan, journal setup and boot repair can take a long
-  time. A hang there is not covered by the loop watchdog. The network task
+  Boot scans and repairs feed only on verified progress. Stage boundaries feed
+  after a call returns. The first card free-space query has no progress hook
+  and must return within 120 seconds. Two startup hangs in card-only work skip
+  the card and use internal flash with E4001. Other repeated startup hangs,
+  or another hang with the card skipped, select no-storage degraded mode and
+  disable storage recovery probes. The fallback lasts until a real power-on.
+  Each watchdog-reset boot records E1003; serial names the hung stage/count.
+  These startup limits and fallbacks have host tests only and are unverified
+  on the board. Slow full-card scans and large repairs have not been timed.
+  The network task
   on core 0 is not enrolled: a trip upload may legitimately take 15 minutes.
-  After a watchdog reset, boot records E1003 and runs the usual trip repair
-  before logging resumes. The untimed points still in RAM can be lost.
+  Boot repairs the stores still in use before logging resumes. Untimed points
+  still in RAM can be lost.
   The watchdog reset and the loop pause were bench-checked on USB power on
   2026-11-10 (UTC). Battery savings, the power-off paths and recovery of a
   trip cut off mid-recording have not been checked on the board.
@@ -1116,8 +1125,17 @@ How it behaves once flashed:
   logs the readings it needs (the `Temp:` line under [The screen](#the-screen)).
   This is not a measurement of the battery cell or a guarantee of safe charging in a
   hot car. Logging continues while charging is paused.
+  A die reading must be finite and between -40 and 125 C to be usable.
+  An unreadable first sample keeps charging off and retries each second for
+  ten seconds, without blocking startup or raising E2004/E2005/E2006.
+  A plausible hot/cold reading acts immediately. If no usable reading arrives,
+  E2006 is raised and retries return to 30 seconds. Runtime garbage after a
+  good reading pauses charging and raises E2006 at once. Invalid readings
+  never clear hot/cold faults or appear as real debug temperatures.
+  This first-reading retry is covered by host tests only and is unverified
+  on the board.
   The guard verifies every charger on/off command with a checked register read
-  and retries unconfirmed commands every 30 s; E2008 means three attempts failed
+  and retries unconfirmed commands at the sampling cadence; E2008 means three attempts failed
   to confirm the requested state, so charging may still be on or remain off.
 - **Storage full:** the selected trip store (microSD or internal flash)
   must have at least 64 KiB free to start a trip; below 24 KiB it ends
@@ -1241,6 +1259,29 @@ with this bench build will hang again; rebuild without the flag afterward.
 The hook runs before a new trip starts. To check boot repair as well, prepare
 an incomplete test GPX on the spare card while the board is off; the hook
 alone does not prove recovery of a trip interrupted during recording.
+
+The separate `WATCHDOG_BENCH_STARTUP_HANG` flag is also off by default.
+Build it with
+`--build-property compiler.cpp.extra_flags=-DWATCHDOG_BENCH_STARTUP_HANG`.
+It prints `WATCHDOG BENCH: blocking card mount until startup watchdog reset.`
+on each boot where the card is not skipped, then yields without feeding.
+The expected sequence is two startup timeouts of about 120 seconds each,
+then a boot that skips SD, selects LittleFS, raises E4001 and records trips.
+A checksummed record in retained RTC memory counts only watchdog resets
+while a startup stage is active. A loop reset does not count. The card stays
+skipped across resets and completed boots until a real power-on, when this
+bench build will hang again. Rebuild without the flag afterward. Use each
+bench flag separately.
+
+This startup hook and fallback have host tests only; they have not been run
+on the board. The timeout is unmeasured for a full 32 GB card, an 8 MiB repair
+or the full 2.375 MB erased-partition scan. Successful block/copy progress
+feeds the watchdog, so a healthy repair may take longer overall. With a card
+that always hangs, each power-on waits about four minutes (two 120-second
+timeouts), plus reboot and healthy internal-flash startup, before trips can
+be recorded to flash. There is no fixed total bound for progressing repairs.
+If internal flash also hangs, the next startup hang latches no-storage mode;
+trips cannot be recorded, but charge and battery power management continue.
 
 #### Startup failures
 

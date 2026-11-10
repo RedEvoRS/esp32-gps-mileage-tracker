@@ -78,9 +78,9 @@ Real TinyGPSPlus headers and implementation are system includes; project
 sources and stubs remain warning-checked. U8g2's real font source is read by
 Python for the glyph check, while renderer tests use project-owned stubs.
 
-`run.sh` builds **30 C++ test sources in 35 build variants**, plus six Python
+`run.sh` builds **31 C++ test sources in 37 build variants**, plus six Python
 checks. Extra builds cover stamped/fallback versions, a second display-card
-duration, the watchdog bench hook and three sketch copies of bus recovery.
+duration, both watchdog bench hooks and three sketch copies of bus recovery.
 Many integration binaries also run with runtime debug off and on.
 **[TinyGPSPlus]** marks the ten sources that require that optional library.
 
@@ -95,7 +95,8 @@ Many integration binaries also run with runtime debug off and on.
 
 - `test_gps` **[TinyGPSPlus]**: real GPS sentence parsing through the sketch's loop, one point per second, receiver configuration/replies, fix-quality gates, gaps, UTC (universal time) timestamps/clock corrections and debug-mode GPX parity.
 - `test_loop_runtime` **[TinyGPSPlus]**: real 5 ms idle cadence, UART drain and late arrivals, latched IRQs, BOOT debounce, ACK deadlines, NAV-PVT freshness and one-second debug redraw. RTC and temperature runtime suites also exercise alignment/conversion through the pause.
-- `test_watchdog` **[TinyGPSPlus]**: late one-time enrollment, slow boot scans and fsck outside coverage, E1003 plus repair on watchdog boot, degraded modes, runtime repair progress, bounded shutdown stages, blocked lock without feeds, core-0 exclusion and enrollment failures. A second build tests the intentional bench hang and watchdog-reset skip; neither build proves real timer expiry or board reset.
+- `test_watchdog` **[TinyGPSPlus]**: early startup enrollment, slow progressing boot scans/repairs, the 120-to-60-second hand-over without re-enrollment, retained card/non-card hang sequences, LittleFS recording with E1003/E4001, no-storage mode without recovery probes, degraded startups, runtime repair progress, shutdown bounds, blocked locks, core-0 exclusion and enrollment failures. Two extra builds exercise the loop and startup bench flags. Fake-time expiry does not prove real timer expiry, RTC retention or board reset.
+- `test_startup_watchdog`: pure retained-record policy, every stage classification, consecutive hangs, escalation after card fallback, completed/loop/software resets, power-on clearing and corrupt records.
 - `test_gps_antenna`: antenna-warning evidence, hold times, missing/stale observations, recovery and timer wraparound.
 - `test_debug_status` **[TinyGPSPlus]**: real satellite-message parsing, satellite deduplication/freshness and bounded screen/serial formatting, including release-version fit/omit cases in the top row.
 
@@ -144,11 +145,11 @@ enrollment never reuses a loaded epoch after NVS reset.
 
 - `test_i2c`: I2C (two-wire peripheral bus) recovery and PMU (power-management chip) startup failures, built against `02_pmu_test`, `03_gps_test` and `04_trip_logger` (three builds).
 - `test_pmu_startup_event`: diagnostic boot-history policy from saved PMU startup/recovery results.
-- `test_pmu_verification` **[TinyGPSPlus]**: checked PMU register reads, interrupt decoding, charging thresholds/control read-back, hysteresis and retry timing.
+- `test_pmu_verification` **[TinyGPSPlus]**: checked PMU register reads, interrupt decoding, charging thresholds/control read-back, hysteresis and retry timing; plausible-reading boundaries, garbage-first recovery on normal/no-storage startup, grace expiry/recovery, hot first readings, runtime garbage and timer rollover.
 - `test_degraded_policy`: mode selection and bounded retry delays when power control or storage is unavailable/untrusted.
 - `test_degraded` **[TinyGPSPlus]**: real startup/loop behavior with PMU/storage failures, verified supply settings, retry/restart recovery and preserved trips.
 - `test_temperature`: BME280 temperature-sensor compensation, bounded bus operations and checked PMU temperature-input/battery probes.
-- `test_temperature_runtime` **[TinyGPSPlus]**: debug temperature sampling/logging, failed/stale samples, charge-guard freshness and debug-off behavior.
+- `test_temperature_runtime` **[TinyGPSPlus]**: debug temperature sampling/logging, failed/stale/implausible samples, charge-guard freshness and debug-off behavior.
 
 **RTC (real-time clock) and diagnostic time**
 
@@ -226,3 +227,8 @@ the real drivers, radio, allocator or reset mechanism. Network time transport
 is simulated, and sequential host calls do not prove real multicore timing.
 This does not replace the on-hardware shakedown: it checks logic, not the flash
 driver, GPS reception or power behavior.
+
+The startup watchdog, its unmeasured 120-second stage limit, retained fallback
+and first charge-temperature retry are covered by host tests only and remain
+unverified on the board. Full 32 GB card scans, 8 MiB repairs, erased-flash scan
+timings and actual watchdog-reset retention still need hardware measurement.

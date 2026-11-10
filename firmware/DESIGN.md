@@ -83,28 +83,65 @@ inactivity limit, so trickling response headers can extend the total wait
 beyond ten seconds. The assertion bounds the configured timeout, not the
 entire HTTP request.
 
-## Main-loop watchdog
+## Startup and main-loop watchdog
 
 The installed ESP32-S3 core 3.3.11 initializes the task watchdog at five
 seconds with panic enabled, watches the core-0 idle task, and leaves the
 Arduino loop task unenrolled. `armLoopWatchdog()` reconfigures that shared
-watchdog to `LOOP_WDT_TIMEOUT_MS` (60 seconds), explicitly enables panic,
+watchdog to `STARTUP_WDT_TIMEOUT_MS` (120 seconds), explicitly enables panic,
 preserves the configured idle-task subscriptions and enrolls the loop task
 with `enableLoopWDT()`. Enrollment is checked. If it fails, the firmware
 prints an error and carries on without the watchdog: restarting would loop
 forever when arming can never succeed, and recording trips matters more than
 the safety net. When the watchdog does expire, the installed panic
 configuration prints and reboots. This also extends
-the existing core-0 idle-task watchdog timeout to 60 seconds.
+the existing core-0 idle-task watchdog timeout too.
 
-Enrollment occurs at the end of normal setup and after every degraded
-startup. All initial PMU/display work, SD/LittleFS mounting, first free-space
-query, full erased-partition scan, journal initialization and boot fsck run
-before enrollment. This avoids false resets on a slow but progressing boot;
-it also leaves a boot-time hang outside the loop watchdog's coverage.
-Degraded storage retry only probes mounts, then restarts into full setup
-for the first free-space scan and recovery. No boot repair decision depends
-on reset reason: watchdog boots still run fsck and emit existing E1003 history.
+Enrollment follows bounded PMU bus recovery and the LoRa-off safety command,
+before display setup, USB waits or storage. Degraded startups use it too.
+The initial PMU recovery itself is not watched by this helper. Stage boundaries
+feed only after the previous stage returned. Erased-partition reads, trip scans,
+directory entries and repair copies also feed on verified progress. Waits,
+mount retries and lock acquisition do not feed. A progressing operation can
+take longer than 120 seconds in total. Driver calls without visible progress,
+including the first FAT free-space query, must return within that limit.
+
+At the end of normal or degraded startup, the limit becomes
+`LOOP_WDT_TIMEOUT_MS` (60 seconds). ESP-IDF 5.5.5's
+`esp_task_wdt_reconfigure()` retains subscriptions and restarts its timer under
+a spinlock. The sketch feeds around this change and never removes the loop
+task. It preserves the idle-task mask. A failed arm or reconfiguration prints
+an error and carries on; it never deliberately restarts the board.
+
+`startup_watchdog.h` decides how to handle repeated startup hangs. A small
+`RTC_NOINIT_ATTR` record holds the active stage, hang count, fallback, magic
+and checksum. This section is separate from cleared RTC BSS. The S3 task-watchdog
+panic path restarts the CPUs without clearing it. This is source-supported;
+retention through a real panic reset has not been checked on this board.
+A corrupt record means no history. Only a watchdog reset with an active
+startup stage increments the streak. Loop watchdog resets do not count.
+Other resets break the streak, while preserving a fallback already latched.
+
+After `STARTUP_HANG_LIMIT` (two) hangs, a card mount, free-space query or trip
+repair failure skips the card and records to LittleFS with existing E4001.
+The startup journal stage is shared RAM/NVS work, not a card-only operation:
+disk journal loading is deferred to the service task. Two hangs in another
+stage, or another startup hang with the card already skipped, select
+`NoStorage`. That mode skips all mounts, provisioning, NVS boot counting and
+storage recovery probes. Diagnostics remain in RAM; power management and the
+charge guard keep running. The fallback stays latched through completed boots
+and resets until a real power-on. That power-on clears the history and tries
+normal storage again. Serial output identifies the previous stage/count and
+the applied fallback. Watchdog boots still enqueue E1003.
+
+The startup limit is generous and **unmeasured**. Only nearly empty-card boots
+without repair have been observed at 1–2 seconds from banner to completion.
+Full 32 GB card scans, 8 MiB repairs and the 2.375 MB erased-flash scan have
+not been timed. A card that hangs at every mount costs two 120-second waits
+per power-on, about four minutes plus reboot and healthy flash startup, before
+trips can use internal flash. Progressing flash repair has no fixed total limit.
+The startup watchdog, limits and fallback are covered by host tests only and
+remain unverified on the board.
 
 Arduino's `main.cpp` feeds before each `loop()` call, covering normal and
 degraded modes. Runtime scan, prefix comparison and repair-copy loops feed
@@ -119,12 +156,34 @@ disk recovery is deferred to core 0; degraded service processes one queued
 record per pass. The core-0 network task is not enrolled or fed by these
 helpers, since a healthy upload may run for 15 minutes.
 
-`WATCHDOG_BENCH_HANG`, off by default, deliberately blocks the loop without
+`WATCHDOG_BENCH_STARTUP_HANG`, off by default, blocks each unskipped card-mount
+stage without feeds. After two simulated resets, host tests verify a LittleFS
+trip and E1003/E4001. The real reset sequence still needs a supervised bench run.
+`WATCHDOG_BENCH_HANG`, also off by default, deliberately blocks the loop without
 feeding; watchdog-reset boots skip the hook and continue through ordinary
 recovery. See the [bench instructions](README.md#watchdog-bench-check).
 The watchdog reset was bench-checked on 2026-11-10 (UTC); the results and
 what remains unchecked are in the same README section. Host control-flow
 tests and real board builds do not prove SD durability.
+
+## First charge-temperature reading
+
+`charge_temperature.h` accepts only finite die readings from -40 to 125 C.
+These are plausibility bounds, not battery charging limits. XPowersLib 0.3.3
+uses `22 + (7274 - raw) / 20`; raw zero gives the observed 385.7 C cold-start
+sample. It is consistent with an ADC conversion not being ready.
+
+The first normal or no-storage check commands and verifies charging off if
+the reading is implausible. The loop retries every `CHG_FIRST_RETRY_MS`
+(one second) for `CHG_FIRST_GRACE_MS` (ten seconds), without a setup wait.
+During this grace period there is no hot/cold event or E2006. A plausible
+reading immediately uses the existing thresholds and charger read-back rules;
+a plausible hot reading still raises E2004 at once. Grace expiry raises
+E2006 and returns to 30-second sampling. Later plausible recovery clears it.
+Any implausible sample after the first good one immediately follows the normal
+unreadable path. Invalid readings never clear hot/cold episodes, supply event
+temperature context or appear as real debug temperatures. The retry is covered
+by host tests only and is unverified on the board.
 
 ## Firmware identity on the debug screen
 
