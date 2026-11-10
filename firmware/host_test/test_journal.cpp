@@ -44,6 +44,16 @@ static uint64_t allocation(FakeDisk& disk, uint32_t unit) {
     return bytes;
 }
 int main() {
+    // The existing debug journal line exposes invalid input locally, without
+    // adding an uploaded field or a loss event.
+    world(true, true);
+    EventInput invalid; invalid.code = 7001;
+    assert(gJournal.submit(invalid) == EventLog::Submit::Invalid);
+    serviceJournal();
+    size_t invalidLines = 0;
+    for (const auto& line : Serial.log)
+        if (line.rfind("Journal: ", 0) == 0 && line.find("invalid submits 1") != std::string::npos) ++invalidLines;
+    assert(invalidLines == (debugMode() ? 1u : 0u));
     Preferences::durable64.clear();
     auto first = newJournalBoot(), second = newJournalBoot();
     assert(first.counterPersisted && first.counter == 1 && second.counter == 2);

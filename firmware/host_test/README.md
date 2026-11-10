@@ -78,7 +78,7 @@ Real TinyGPSPlus headers and implementation are system includes; project
 sources and stubs remain warning-checked. U8g2's real font source is read by
 Python for the glyph check, while renderer tests use project-owned stubs.
 
-`run.sh` builds **31 C++ test sources in 37 build variants**, plus six Python
+`run.sh` builds **32 C++ test sources in 42 build variants**, plus six Python
 checks. Extra builds cover stamped/fallback versions, a second display-card
 duration, both watchdog bench hooks and three sketch copies of bus recovery.
 Many integration binaries also run with runtime debug off and on.
@@ -104,11 +104,11 @@ Many integration binaries also run with runtime debug off and on.
 
 - `test_build_version`: fallback and stamped firmware-version strings (two builds).
 - `test_diag_catalog`: diagnostic codes, severity, display strings and event-storage policy.
-- `test_event_log`: event identity, damaged/torn records, acknowledgment recovery, quotas, fallback, concurrency and bounded rejected-record/loss recovery.
+- `test_event_log`: event identity, damaged/torn records, acknowledgment recovery, quotas, fallback, concurrency, local invalid-submit counts and bounded rejected-record/loss recovery.
 - `test_journal_faults`: E4008 open/write/close/rename/ack observations, same-store append/ack recovery, aggregate faults, 15-minute repeats, cooperative cancellation and bounded event growth through 10,000 all-store failure service calls.
 - `test_battery_events`: checked boot/shutdown battery samples, failed reads and shutdown journal ordering with a full queue.
 - `test_event_upload`: production delivery, PSRAM (external RAM) buffer allocation/reuse/failure with continued local journaling/GPX delivery, 64-record/32 KiB limits, consistent status snapshots, old-boot history, trip priority, deadlines, HTTP/acknowledgment failures, retries, heartbeat and rejected-record recovery.
-- `test_fault_hooks` **[TinyGPSPlus]**: real sketch paths raising, repeating and clearing power/GPS/storage/network/display faults, plus a normal drive/upload without spurious faults.
+- `test_fault_hooks` **[TinyGPSPlus]**: real sketch paths raising, repeating and clearing power/GPS/storage/network/display faults, plus a normal drive/upload without spurious faults. Also checks debug-only missing-condition warnings and their once-per-code boot limit.
 
 Delivery tests exercise the **core-0 worker** (background networking task
 assigned to ESP32 CPU core 0) and `netCycle` (one pass deciding whether to
@@ -155,6 +155,7 @@ enrollment never reuses a loaded epoch after NVS reset.
 
 - `test_rtc`: calendar encoding/validation, clock confidence, timestamp sources and timer wraparound.
 - `test_rtc_runtime` **[TinyGPSPlus]**: real sketch clock reads, missing/invalid clocks, verified correction, retry limits and diagnostic timestamps.
+- `test_ntp_settings`: network-time defaults, independent overrides, unused first/second/both server slots and static pointer lifetime (five builds).
 
 **Python checks**
 
@@ -163,7 +164,7 @@ enrollment never reuses a loaded epoch after NVS reset.
 - `check_battery_events_protocol.py`: validate actual boot/shutdown battery-event exports.
 - `check_event_upload_protocol.py`: validate requests and post/replay them through the real ingest app's disposable Flask test client/SQLite databases; no sockets or live server.
 - `check_rtc_protocol.py` **[TinyGPSPlus]**: validate diagnostic events with unknown, RTC, GPS and network-synchronized time sources.
-- `check_fault_hooks_protocol.py` **[TinyGPSPlus]**: validate actual fault transitions, measured context and catalog policy.
+- `check_fault_hooks_protocol.py` **[TinyGPSPlus]**: validate actual fault transitions, measured context and catalog policy; run a missing-condition probe and require its assertion to fail with the expected message.
 
 ## Optional libraries and skips
 

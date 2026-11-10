@@ -69,6 +69,7 @@ python_step() {
             # Preserve the existing automation interface; values are never argv.
             for name in TRACKER_ACCEPT_DOWNLOAD TRACKER_WIFI_SSID TRACKER_WIFI_PASSWORD \
                 TRACKER_WIFI_BSSID TRACKER_DEVICE_ID TRACKER_SERVER_HOST TRACKER_SERVER_PORT \
+                TRACKER_NTP_SERVER_1 TRACKER_NTP_SERVER_2 \
                 TRACKER_FRESH_SD TRACKER_NEW_BOARD; do
                 if [[ -v $name ]]; then options+=(--env "$name"); fi
             done
@@ -130,6 +131,8 @@ Uses host Python 3 when available, otherwise a throwaway Python container.
 Non-interactive settings: TRACKER_WIFI_SSID, TRACKER_WIFI_PASSWORD,
 TRACKER_WIFI_BSSID (optional), TRACKER_DEVICE_ID, TRACKER_SERVER_HOST,
 TRACKER_SERVER_PORT (default 8090). Token is read only from .env.
+Advanced optional settings (both modes): TRACKER_NTP_SERVER_1, TRACKER_NTP_SERVER_2.
+Empty/unset uses the firmware's default time servers; see firmware-builder/README.md.
 TRACKER_ACCEPT_DOWNLOAD=yes accepts the first download (about 1.8 GB; image about 2.7 GB).
 TRACKER_FRESH_SD=yes AND TRACKER_NEW_BOARD=yes explicitly authorize ID 1;
 otherwise builds normal firmware. Never infer fresh state from a failed read.

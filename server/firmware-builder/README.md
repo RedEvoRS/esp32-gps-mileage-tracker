@@ -92,10 +92,24 @@ For automation, use `--non-interactive` and these environment variables:
 | `TRACKER_DEVICE_ID` | Required; `[a-z0-9][a-z0-9_-]{0,31}` |
 | `TRACKER_SERVER_HOST` | Required IPv4 address or hostname, without URL/port |
 | `TRACKER_SERVER_PORT` | Optional; defaults to 8090 |
+| `TRACKER_NTP_SERVER_1` | Optional time-server hostname or IPv4; empty/unset uses `pool.ntp.org` |
+| `TRACKER_NTP_SERVER_2` | Optional time-server hostname or IPv4; empty/unset uses `time.nist.gov` |
 | `TRACKER_ACCEPT_DOWNLOAD=yes` | Explicitly accepts the first toolchain download |
 | `TRACKER_FRESH_SD=yes` | Confirms fresh/unused SD state for this tracker |
 | `TRACKER_NEW_BOARD=yes` | Confirms ID 1 has never been consumed on the board |
 | `TRACKER_BUILDER_IMAGE` | Optional local image tag; default `mileage-firmware-builder:local` |
+
+The two NTP settings are advanced, optional environment variables in both
+interactive and non-interactive builds; there are no extra prompts. They set
+the servers used to get network time while already on home WiFi, only if GPS
+has not set the clock. Use a hostname or IPv4 address without a URL, port or
+path. To keep time requests on your LAN, set **both** to your router or local
+time server (the same address is fine). Setting only one leaves the other
+public default in use. Empty/unset writes no define, so it keeps that default;
+this builder interface does not disable either server. If neither answers,
+the clock waits for GPS. Time requests contain no trip data. For a manually
+edited `secrets.h`, an explicit empty string instead leaves that server slot
+unused; see [firmware settings](../../firmware/secrets.h.example).
 
 Only a verified absent/null server revision, a fresh SD card, and an unused
 enrollment ID 1 produce `current` kind `enroll` plus `cleanup` kind `normal`.

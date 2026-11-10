@@ -248,6 +248,16 @@ else:
         self.assertEqual(result.returncode, 7)
         self.assertEqual(list(self.install.glob(".firmware-build.*")), [])
 
+    def test_optional_ntp_settings_reach_fallback_container(self):
+        self.env.update(TRACKER_NTP_SERVER_1="clock.example", TRACKER_NTP_SERVER_2="192.0.2.123")
+        result = self.run_builder()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        configure = next(call for call in self.calls() if call[0] == "run" and "configure" in call)
+        for name in ("TRACKER_NTP_SERVER_1", "TRACKER_NTP_SERVER_2"):
+            index = configure.index(name)
+            self.assertEqual(configure[index - 1], "--env")
+            self.assertNotIn(self.env[name], configure)  # values never become argv
+
     def test_fallback_publication_rolls_back_after_failed_rename(self):
         current = self.install / "firmware-out/current"
         current.mkdir(parents=True)
@@ -476,6 +486,49 @@ class FirmwareBuilderTests(unittest.TestCase):
         self.assertIn("DIAGNOSTICS_STATUS_HIGH_WATER 0ULL", header)
         with self.assertRaises(ValueError):
             builder.secrets_header(self.settings, True, None)
+
+    def test_optional_ntp_validation_and_header(self):
+        for values in ({}, {"ntp_server_1": "", "ntp_server_2": ""}):
+            self.assertNotIn("#define NTP_SERVER_", builder.secrets_header(dict(self.settings, **values)))
+        for key in ("ntp_server_1", "ntp_server_2"):
+            for value in ("clock", "clock.example", "192.0.2.123", "a" * 63 + ".example"):
+                with self.subTest(key=key, value=value):
+                    header = builder.secrets_header(dict(self.settings, **{key: value}))
+                    self.assertIn(f"#define {key.upper()} {builder.c_string(value)}\n", header)
+                    other = "NTP_SERVER_2" if key.endswith("1") else "NTP_SERVER_1"
+                    self.assertNotIn(f"#define {other}", header)
+            for value in ("http://clock.example", "clock:123", "clock/path", "clock name", " clock",
+                          "a" * 64 + ".example", ".clock", "clock..example", "-clock", "clock-",
+                          "a." * 127, "::1", "0.0.0.0", "224.0.0.1", 'clock"', "clock\\",
+                          "clock\n#define INJECTED 1", "clock\r", "clock\x00", "clöck.example"):
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    builder.secrets_header(dict(self.settings, **{key: value}))
+
+    def test_configure_reads_optional_ntp_in_both_modes_without_prompts(self):
+        install, private = self.root / "install", self.root / "private"
+        sketch = install / "firmware-src/firmware/04_trip_logger/04_trip_logger.ino"
+        sketch.parent.mkdir(parents=True)
+        sketch.write_text("// fake sketch\n")
+        private.mkdir()
+        (install / ".env").write_text("BIND_ADDR=tracker.example\nINGEST_AUTH_TOKEN=" + "a" * 64 + "\n")
+        env = dict(TRACKER_ACCEPT_DOWNLOAD="yes", TRACKER_WIFI_SSID=self.settings["ssid"],
+                   TRACKER_WIFI_PASSWORD=self.settings["password"], TRACKER_DEVICE_ID="test-01",
+                   TRACKER_SERVER_HOST="tracker.example", TRACKER_NTP_SERVER_1="clock.example",
+                   TRACKER_NTP_SERVER_2="192.0.2.123")
+        answers = ["yes", self.settings["ssid"], self.settings["password"], "", "test-01", "tracker.example", "8090"]
+        for noninteractive in (False, True):
+            for optional in ({}, {"TRACKER_NTP_SERVER_1": "", "TRACKER_NTP_SERVER_2": ""},
+                             {key: env[key] for key in ("TRACKER_NTP_SERVER_1", "TRACKER_NTP_SERVER_2")}):
+                variables = {key: value for key, value in env.items() if not key.startswith("TRACKER_NTP_")}
+                variables.update(optional)
+                with self.subTest(noninteractive=noninteractive, optional=optional), \
+                        patch.dict(os.environ, variables, clear=True), \
+                        patch.object(builder, "ask", side_effect=answers) as ask:
+                    builder.configure(install, private, noninteractive)
+                    self.assertEqual(ask.call_count, 0 if noninteractive else 7)
+                    expected = dict(self.settings, ntp_server_1=optional.get("TRACKER_NTP_SERVER_1", ""),
+                                    ntp_server_2=optional.get("TRACKER_NTP_SERVER_2", ""))
+                    self.assertEqual((private / "normal.h").read_text(), builder.secrets_header(expected))
 
     def test_env_is_data_never_shell(self):
         path = self.root / ".env"

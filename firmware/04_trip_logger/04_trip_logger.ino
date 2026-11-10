@@ -63,6 +63,7 @@
 #include <cmath>
 
 #include "secrets.h"
+#include "ntp_settings.h"
 #include "pmu_startup_event.h"
 #include "pmu_read_state.h"
 #include "charge_temperature.h"
@@ -81,6 +82,7 @@
 // Core 1 is the only writer. Core 0 reads the mode, never the button or OLED.
 static std::atomic<bool> gDebugMode{false};
 static bool debugMode();
+static void reportMissingCondition(diagnostics::Code code);
 static constexpr int DEBUG_BOOT_PIN = 0;
 static runtime_debug::BootButton gBootButton;
 static void toggleRuntimeDebug();
@@ -359,18 +361,54 @@ static bool gJournalStarted = false; // under FS_LOCK; core-0 consumer only
 static bool gJournalBootReported = false;
 // Single writer per array/builder. Only EventLog's try-lock crosses cores.
 static diagnostics::RuntimeFaults::Condition gLoopConditions[] = {
-    {2001}, {2002}, {2003}, {2004}, {2005}, {2006}, {2008}, {3001}, {3002}, {3005}, {3006}, {3007}, {3008}, {3009},
-    {4001}, {4002}, {4003}, {4004}, {4005}, {4006}, {4008}, {6001}
+    {diagnostics::Code::PMU_INIT_FAILED},
+    {diagnostics::Code::BATTERY_LOW},
+    {diagnostics::Code::BATTERY_CRITICAL},
+    {diagnostics::Code::CHARGE_HOT},
+    {diagnostics::Code::CHARGE_COLD},
+    {diagnostics::Code::CHARGE_TEMP_UNREADABLE},
+    {diagnostics::Code::CHARGE_CONTROL_FAILED},
+    {diagnostics::Code::GPS_NO_DATA},
+    {diagnostics::Code::GPS_NO_FIX},
+    {diagnostics::Code::GPS_TRIP_FIX_LOST},
+    {diagnostics::Code::UTC_UNAVAILABLE},
+    {diagnostics::Code::RTC_UNAVAILABLE},
+    {diagnostics::Code::RTC_TIME_INVALID},
+    {diagnostics::Code::GPS_ANTENNA_SUSPECT},
+    {diagnostics::Code::SD_UNAVAILABLE},
+    {diagnostics::Code::LITTLEFS_UNAVAILABLE},
+    {diagnostics::Code::NO_RECORDING_STORAGE},
+    {diagnostics::Code::STORAGE_LOW},
+    {diagnostics::Code::STORAGE_FULL},
+    {diagnostics::Code::TRIP_WRITE_FAILED},
+    {diagnostics::Code::EVENT_WRITE_FAILED},
+    {diagnostics::Code::DISPLAY_UNAVAILABLE}
 };
 static diagnostics::RuntimeFaults::Condition gNetConditions[] = {
-    {1007}, {5002}, {5003}, {5004}, {5005}, {5006}, {5007}, {5008}, {5009}
+    {diagnostics::Code::NET_STACK_LOW},
+    {diagnostics::Code::WIFI_JOIN_FAILED},
+    {diagnostics::Code::UPLOAD_TRANSPORT_FAILED},
+    {diagnostics::Code::UPLOAD_AUTH_FAILED},
+    {diagnostics::Code::UPLOAD_TOO_LARGE},
+    {diagnostics::Code::UPLOAD_INVALID},
+    {diagnostics::Code::UPLOAD_CONFLICT},
+    {diagnostics::Code::UPLOAD_SERVER_FAILED},
+    {diagnostics::Code::UPLOAD_HTTP_OTHER}
 };
-static diagnostics::RuntimeFaults gLoopFaults(gJournal, gLoopConditions, sizeof(gLoopConditions) / sizeof(gLoopConditions[0]));
-static diagnostics::RuntimeFaults gNetFaults(gJournal, gNetConditions, sizeof(gNetConditions) / sizeof(gNetConditions[0]));
+static diagnostics::RuntimeFaults gLoopFaults(gJournal, gLoopConditions, sizeof(gLoopConditions) / sizeof(gLoopConditions[0]), reportMissingCondition);
+static diagnostics::RuntimeFaults gNetFaults(gJournal, gNetConditions, sizeof(gNetConditions) / sizeof(gNetConditions[0]), reportMissingCondition);
 static diagnostics::RuntimeFaults::Condition gEventConditions[] = {
-    {4008}, {5003}, {5004}, {5005}, {5006}, {5007}, {5008}, {5009}, {5010}
+    {diagnostics::Code::EVENT_WRITE_FAILED},
+    {diagnostics::Code::UPLOAD_TRANSPORT_FAILED},
+    {diagnostics::Code::UPLOAD_AUTH_FAILED},
+    {diagnostics::Code::UPLOAD_TOO_LARGE},
+    {diagnostics::Code::UPLOAD_INVALID},
+    {diagnostics::Code::UPLOAD_CONFLICT},
+    {diagnostics::Code::UPLOAD_SERVER_FAILED},
+    {diagnostics::Code::UPLOAD_HTTP_OTHER},
+    {diagnostics::Code::EVENT_ACK_INVALID}
 };
-static diagnostics::RuntimeFaults gEventFaults(gJournal, gEventConditions, sizeof(gEventConditions) / sizeof(gEventConditions[0]));
+static diagnostics::RuntimeFaults gEventFaults(gJournal, gEventConditions, sizeof(gEventConditions) / sizeof(gEventConditions[0]), reportMissingCondition);
 static uint32_t gContactTick = 0;
 static uint64_t gContactUptime = 0, gLastContact = 0;
 static bool gContactKnown = false;
@@ -460,6 +498,21 @@ static uint64_t contactUptime() {
     return gContactUptime;
 }
 static bool debugMode() { return gDebugMode.load(); }
+static void reportMissingCondition(diagnostics::Code code) {
+    if (!debugMode()) return; // do not consume the warning before debug is on
+    // Sparse boot-local set, large enough for every named catalog code. Both
+    // cores share it, including E4008's two owners; each code prints at most once.
+    static std::atomic<uint32_t> reported[diagnostics::kCatalogSize]{};
+    uint32_t value = uint32_t(code) + 1; // zero means unused
+    for (auto& entry : reported) {
+        uint32_t previous = 0;
+        if (entry.compare_exchange_strong(previous, value, std::memory_order_relaxed)) {
+            Serial.printf("Diagnostics: E%u condition missing from task table.\n", unsigned(code));
+            return;
+        }
+        if (previous == value) return;
+    }
+}
 
 static bool gLoopWatchdogArmed = false; // loop task only, never core 0
 static uint32_t gLoopWatchdogTimeoutMs = 0;
@@ -550,11 +603,11 @@ static bool tripStoreAvailable(fs::FS& storage) {
 }
 
 static void tripWriteResult(fs::FS& storage, bool ok, const char* operation) {
-    if (gJournalReady) gLoopFaults.event(4006, millis()).enumeration("backend", tripBackend(storage))
+    if (gJournalReady) gLoopFaults.event(diagnostics::Code::TRIP_WRITE_FAILED, millis()).enumeration("backend", tripBackend(storage))
         .enumeration("operation", operation).condition(!ok);
 }
 
-static void batteryCondition(uint16_t code, bool active, uint32_t now) {
+static void batteryCondition(diagnostics::Code code, bool active, uint32_t now) {
     gLoopFaults.event(code, now);
     unsigned mv = PMU.getBattVoltage();
     if (mv <= 6000) gLoopFaults.integer("battery_mv", mv);
@@ -563,12 +616,12 @@ static void batteryCondition(uint16_t code, bool active, uint32_t now) {
 
 static void storageConditions(uint64_t freeB, uint32_t now) {
     if (!gJournalReady) return;
-    gLoopFaults.event(4001, now).condition(!gSdMounted || gSdUnavailable.load());
+    gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, now).condition(!gSdMounted || gSdUnavailable.load());
     bool available = tripStoreAvailable(*gTripFS);
-    gLoopFaults.event(4004, now).enumeration("backend", tripBackend(*gTripFS));
+    gLoopFaults.event(diagnostics::Code::STORAGE_LOW, now).enumeration("backend", tripBackend(*gTripFS));
     if (available) gLoopFaults.integer("free_bytes", freeB);
     gLoopFaults.condition(available && freeB < FS_START_FREE);
-    gLoopFaults.event(4005, now).enumeration("backend", tripBackend(*gTripFS));
+    gLoopFaults.event(diagnostics::Code::STORAGE_FULL, now).enumeration("backend", tripBackend(*gTripFS));
     if (available) gLoopFaults.integer("free_bytes", freeB);
     gLoopFaults.condition(available && freeB < FS_STOP_FREE);
 }
@@ -588,7 +641,7 @@ static void journalStorageFaults() {
     auto fault = gJournal.storageFault();
     if (!fault.observed) return;
     auto& faults = gDegraded.mode() == startup::Mode::Normal ? gEventFaults : gLoopFaults;
-    faults.event(4008, millis()).enumeration("operation", fault.operation)
+    faults.event(diagnostics::Code::EVENT_WRITE_FAILED, millis()).enumeration("operation", fault.operation)
         .enumeration("backend", fault.backend == diagnostics::EventLog::Backend::Sd ? "sd" : "littlefs")
         .condition(fault.active);
 }
@@ -616,10 +669,11 @@ static void serviceJournal() {
         auto stats = gJournal.stats();
         const char* backend = stats.backend == diagnostics::EventLog::Backend::Sd ? "sd" :
                               stats.backend == diagnostics::EventLog::Backend::LittleFs ? "littlefs" : "ram";
-        Serial.printf("Journal: %s, %llu unacknowledged records, %u segments%s; boot counter %s.\n",
+        Serial.printf("Journal: %s, %llu unacknowledged records, %u segments%s; boot counter %s; invalid submits %lu.\n",
                       backend, (unsigned long long)backlog.records, (unsigned)backlog.segments,
                       backlog.complete ? "" : " (inventory incomplete)",
-                      gJournalBoot.counterPersisted ? "persisted" : "unavailable");
+                      gJournalBoot.counterPersisted ? "persisted" : "unavailable",
+                      (unsigned long)stats.invalidSubmits);
         gJournalBootReported = true;
     }
     if (sealing && gPowerOffEventPending.load()) {
@@ -714,9 +768,9 @@ static void stampDiagnosticTime(diagnostics::EventInput& event) {
 // Core 1 only. Both cores' event builders read atomic publications, with no I2C.
 static void rtcConditions() {
     if (!gJournalReady || !gRtc.begun()) return;
-    gLoopFaults.event(3007, millis()).condition(gRtc.unavailable());
+    gLoopFaults.event(diagnostics::Code::RTC_UNAVAILABLE, millis()).condition(gRtc.unavailable());
     bool invalid = gRtc.invalid();
-    gLoopFaults.event(3008, millis());
+    gLoopFaults.event(diagnostics::Code::RTC_TIME_INVALID, millis());
     if (invalid) gLoopFaults.enumeration("reason", diagnostics::rtc::reason(gRtc.invalidReason()));
     gLoopFaults.condition(invalid);
 }
@@ -1499,7 +1553,7 @@ static bool repairIfNeeded(fs::FS& storage, const char* path) {
     TripRecovery result;
     bool ok = repairTrip(storage, path, result);
     if (gJournalReady && (!ok || result.repaired)) {
-        gLoopFaults.event(ok ? 4010 : 4007, millis()).enumeration("backend", tripBackend(storage));
+        gLoopFaults.event(ok ? diagnostics::Code::TRIP_RECOVERED : diagnostics::Code::TRIP_RECOVERY_FAILED, millis()).enumeration("backend", tripBackend(storage));
         if (!ok) gLoopFaults.enumeration("reason", result.reason);
         else if (result.pointsKnown) gLoopFaults.integer("points", result.points);
         gLoopFaults.notice();
@@ -1519,7 +1573,7 @@ static void fsckAllTrips(fs::FS& storage) {
     std::vector<String> paths;
     File dir = storage.open(TRIP_DIR);
     if (!dir || !dir.isDirectory()) {
-        if (gJournalReady) gLoopFaults.event(4007, millis()).enumeration("backend", tripBackend(storage))
+        if (gJournalReady) gLoopFaults.event(diagnostics::Code::TRIP_RECOVERY_FAILED, millis()).enumeration("backend", tripBackend(storage))
             .enumeration("reason", "read").notice();
         if (dir) dir.close();
         FS_UNLOCK();
@@ -1827,9 +1881,9 @@ static void pollPmu() {
     // submit from the ISR (it only latches gPmuIrqFlag).
     if (gJournalReady) {
         if (irq.has(XPOWERS_AXP2101_WARNING_LEVEL1_IRQ))
-            batteryCondition(2002, true, millis());
+            batteryCondition(diagnostics::Code::BATTERY_LOW, true, millis());
         if (irq.has(XPOWERS_AXP2101_WARNING_LEVEL2_IRQ))
-            batteryCondition(2003, true, millis());
+            batteryCondition(diagnostics::Code::BATTERY_CRITICAL, true, millis());
     }
     if (irq.has(XPOWERS_AXP2101_WARNING_LEVEL2_IRQ)) powerOffForVbus("battery_critical");
 
@@ -1852,8 +1906,8 @@ static void serviceBatteryDiagnostics() {
     if (gBatteryThresholds < 0) return; // unmeasured: neither raise nor clear
     unsigned low = ((gBatteryThresholds >> 4) & 0x0F) + 5;
     unsigned critical = gBatteryThresholds & 0x0F;
-    batteryCondition(2002, unsigned(percent) <= low, now);
-    batteryCondition(2003, unsigned(percent) <= critical, now);
+    batteryCondition(diagnostics::Code::BATTERY_LOW, unsigned(percent) <= low, now);
+    batteryCondition(diagnostics::Code::BATTERY_CRITICAL, unsigned(percent) <= critical, now);
 }
 
 // -----------------------------------------------------------------
@@ -1954,15 +2008,15 @@ static void serviceChargeTemp() {
         // Unreadable samples carry no temperature.
         bool unreadable = !std::isfinite(die);
         if (!unreadable) {
-            for (uint16_t code : {2004, 2005}) {
+            for (auto code : {diagnostics::Code::CHARGE_HOT, diagnostics::Code::CHARGE_COLD}) {
                 gLoopFaults.event(code, now);
                 if (die >= -50 && die <= 150) gLoopFaults.integer("temperature_mc", int(die * 1000));
-                gLoopFaults.condition(pause && (code == 2004 ? die > CHG_HOT_RESUME_C : die < CHG_COLD_RESUME_C));
+                gLoopFaults.condition(pause && (code == diagnostics::Code::CHARGE_HOT ? die > CHG_HOT_RESUME_C : die < CHG_COLD_RESUME_C));
             }
         }
-        if (!firstGrace) gLoopFaults.event(2006, now).condition(unreadable);
+        if (!firstGrace) gLoopFaults.event(diagnostics::Code::CHARGE_TEMP_UNREADABLE, now).condition(unreadable);
         if (gChargeState != pmu_read::ChargeState::Unconfirmed || gChargeFailures >= CHG_FAILURE_LIMIT)
-            gLoopFaults.event(2008, now).condition(gChargeFailures >= CHG_FAILURE_LIMIT);
+            gLoopFaults.event(diagnostics::Code::CHARGE_CONTROL_FAILED, now).condition(gChargeFailures >= CHG_FAILURE_LIMIT);
     }
     // Charging was already commanded off during the retries, so the state
     // block above prints nothing when the window ends without a reading.
@@ -1998,7 +2052,7 @@ static void confirmVbusOff() {
 // Networking task (core 0): upload finished trips when parked at home
 // =================================================================
 static void observeNetworkStack(unsigned remaining) {
-    if (gJournalReady) gNetFaults.event(1007, millis()).integer("free_bytes", min(remaining, 1048576u))
+    if (gJournalReady) gNetFaults.event(diagnostics::Code::NET_STACK_LOW, millis()).integer("free_bytes", min(remaining, 1048576u))
         .condition(remaining < NET_STACK_WARN_BYTES);
 }
 
@@ -2046,24 +2100,24 @@ static bool connectWifi() {
     bool joined = WiFi.status() == WL_CONNECTED;
     if (gJournalReady && !gNetAbort.load()) {
         gJoinFailures = joined ? 0 : min(unsigned(gJoinFailures) + 1, 255u);
-        gNetFaults.event(5002, millis()).integer("attempts", gJoinFailures).condition(!joined);
+        gNetFaults.event(diagnostics::Code::WIFI_JOIN_FAILED, millis()).integer("attempts", gJoinFailures).condition(!joined);
     }
     return joined;
 }
 
 static void uploadDiagnostics(int status) {
     if (!gJournalReady || gNetAbort.load()) return; // planned shutdown is not a transport fault
-    uint16_t code = status <= 0 ? 5003 : status == 401 ? 5004 : status == 413 ? 5005 :
-                    status == 400 ? 5006 : status == 409 ? 5007 :
-                    status >= 500 && status <= 599 ? 5008 : 5009;
+    diagnostics::Code code = status <= 0 ? diagnostics::Code::UPLOAD_TRANSPORT_FAILED : status == 401 ? diagnostics::Code::UPLOAD_AUTH_FAILED : status == 413 ? diagnostics::Code::UPLOAD_TOO_LARGE :
+                    status == 400 ? diagnostics::Code::UPLOAD_INVALID : status == 409 ? diagnostics::Code::UPLOAD_CONFLICT :
+                    status >= 500 && status <= 599 ? diagnostics::Code::UPLOAD_SERVER_FAILED : diagnostics::Code::UPLOAD_HTTP_OTHER;
     if (status <= 0) gTransportFailures = min(unsigned(gTransportFailures) + 1, 255u);
     if (status == 200) gTransportFailures = 0;
-    for (uint16_t c = 5003; c <= 5009; ++c) {
+    for (auto c : diagnostics::kHttpFaultCodes) {
         // A different error class is not evidence of recovery. Keep each
         // episode until an actual HTTP 200, with context from that observation.
         if (status != 200 && c != code) continue;
         gNetFaults.event(c, millis()).enumeration("target", "trip");
-        if (c == 5003) gNetFaults.integer("attempts", gTransportFailures);
+        if (c == diagnostics::Code::UPLOAD_TRANSPORT_FAILED) gNetFaults.integer("attempts", gTransportFailures);
         else if (status >= 100 && status <= 599) gNetFaults.integer("http_status", status);
         // A non-HTTP positive library result has no valid status measurement.
         gNetFaults.condition(status != 200);
@@ -2075,10 +2129,11 @@ static void uploadDiagnostics(int status) {
 // Only an actual completion from this attempt makes its timestamps trusted.
 static void trySntp() {
     if (gClockSet.load()) return;
+    if (!network_time::kUseServer1 && !network_time::kUseServer2) return;
     esp_sntp_stop();
     esp_sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
     esp_sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    configTime(0, 0, network_time::server1(), network_time::server2());
     uint32_t start = millis();
     while (!gClockSet.load() && !gNetAbort.load() && millis() - start < 5000) {
         if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
@@ -2507,7 +2562,7 @@ static void gpsConfigAttemptFailed() {
         // One give-up notice, not one per send/deadline. NAKs are separately
         // per-occurrence E3003; a final NAK is not also a timeout.
         if (gJournalReady && gGpsConfig.ack != 0)
-            gLoopFaults.event(3004, millis()).integer("message_class", 0x06).integer("message_id", 0x8A).notice();
+            gLoopFaults.event(diagnostics::Code::GPS_CONFIG_TIMEOUT, millis()).integer("message_class", 0x06).integer("message_id", 0x8A).notice();
         gGpsConfig.state = GPS_CONFIG_DONE;
         gNavPvtWaitMs = millis();
         Serial.printf("WARNING: GPS not configured after %u attempts -- continuing with current receiver settings.\n",
@@ -2563,7 +2618,7 @@ static void serviceGpsConfiguration() {
                       (unsigned long)(millis() - gGpsConfig.started));
     } else if (gGpsConfig.ack == 0) {
         if (gJournalReady)
-            gLoopFaults.event(3003, millis()).integer("message_class", 0x06).integer("message_id", 0x8A).notice();
+            gLoopFaults.event(diagnostics::Code::GPS_CONFIG_NACK, millis()).integer("message_class", 0x06).integer("message_id", 0x8A).notice();
         gpsConfigAttemptFailed();  // NAK: retry the same VALSET later
     } else if (millis() - gGpsConfig.since >= GPS_ACK_MS) {
         if (gGpsConfig.sends < GPS_COMMAND_SENDS) sendGpsConfigCommand();
@@ -2622,7 +2677,7 @@ static void receiveGpsNmea(uint8_t c) {
         Fix fx;
         if (buildFix(fx, rmcUtcMs)) {
             if (gJournalReady) {
-                gLoopFaults.event(3005, fx.monoMs).integer("elapsed_ms", 0).condition(false);
+                gLoopFaults.event(diagnostics::Code::GPS_TRIP_FIX_LOST, fx.monoMs).integer("elapsed_ms", 0).condition(false);
             }
             if (gHaveLastFix && (fx.monoMs - gLastFix.monoMs) > SEG_GAP_MS) {
                 if (gState == ACTIVE || gState == COOLDOWN) {
@@ -2642,14 +2697,14 @@ static void serviceRuntimeDiagnostics() {
     uint32_t now = millis();
     // Ten seconds of silence is well beyond normal 1 Hz output.
     uint32_t nmeaGap = now - gLastNmeaMs;
-    gLoopFaults.event(3001, now).integer("elapsed_ms", nmeaGap).condition(nmeaGap >= 10000);
+    gLoopFaults.event(diagnostics::Code::GPS_NO_DATA, now).integer("elapsed_ms", nmeaGap).condition(nmeaGap >= 10000);
     bool recording = gState == ACTIVE || gState == COOLDOWN;
     // E3002 means no fix accurate enough to start a trip: count from the last
     // trusted fix, or GPS config start, with a fresh idle acquisition grace.
     uint32_t trustedFixGap = now - (gHaveLastFix ? gLastFix.monoMs : gGpsDiagStartMs);
     if (gState != IDLE) gIdleFixWaitMs = now;
     uint32_t idleGap = min(trustedFixGap, uint32_t(now - gIdleFixWaitMs));
-    gLoopFaults.event(3002, now).integer("elapsed_ms", idleGap);
+    gLoopFaults.event(diagnostics::Code::GPS_NO_FIX, now).integer("elapsed_ms", idleGap);
     if (gps.satellites.isValid()) gLoopFaults.integer("satellites", min(gps.satellites.value(), uint32_t(255)));
     gLoopFaults.condition(gState == IDLE && idleGap >= 120000);
     // E3005 means positions stopped: any valid RMC counts, trusted or not,
@@ -2658,20 +2713,20 @@ static void serviceRuntimeDiagnostics() {
     // on a valid RMC, including after the five-minute watchdog.
     uint32_t rmcFixGap = now - gLastFixMonoMs;
     if (recording && rmcFixGap >= 30000)
-        gLoopFaults.event(3005, now).integer("elapsed_ms", rmcFixGap).condition(true);
+        gLoopFaults.event(diagnostics::Code::GPS_TRIP_FIX_LOST, now).integer("elapsed_ms", rmcFixGap).condition(true);
     // UTC_UNAVAILABLE describes the existing trusted system-clock state, with
     // a two-minute boot allowance for GPS/SNTP. Untimed GPX points are separate.
-    gLoopFaults.event(3006, now).condition(!gClockSet.load() && uint32_t(now - gGpsDiagStartMs) >= 120000);
+    gLoopFaults.event(diagnostics::Code::UTC_UNAVAILABLE, now).condition(!gClockSet.load() && uint32_t(now - gGpsDiagStartMs) >= 120000);
     // Never manufacture a healthy observation at boot or during the hold.
     // No-evidence samples retain the last measured verdict; RuntimeFaults
     // supplies bounded retries/repeats and the original episode identity.
     if (gGpsAntenna.observed()) {
-        gLoopFaults.event(3009, now);
+        gLoopFaults.event(diagnostics::Code::GPS_ANTENNA_SUSPECT, now);
         if (gAntennaRf.valid) gLoopFaults.integer("agc_pct", gAntennaRf.agcPct);
         if (gAntennaSignal.heard >= 0) gLoopFaults.integer("max_cno", gAntennaSignal.maxCno);
         gLoopFaults.condition(gGpsAntenna.active());
     }
-    gLoopFaults.event(4001, now).condition(!gSdMounted || gSdUnavailable.load());
+    gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, now).condition(!gSdMounted || gSdUnavailable.load());
     // Check idle storage too, so a successful core-0 upload can be observed as
     // recovery on core 1 without sharing producer state across tasks.
     if (uint32_t(now - gStorageDiagMs) >= FS_CHECK_MS) {
@@ -2679,7 +2734,7 @@ static void serviceRuntimeDiagnostics() {
         storageConditions(fsFreeBytes(), now);
     }
     serviceBatteryDiagnostics();
-    gLoopFaults.event(6001, now).condition(gDebugDisplayFailed || gProductionDisplayFailed);
+    gLoopFaults.event(diagnostics::Code::DISPLAY_UNAVAILABLE, now).condition(gDebugDisplayFailed || gProductionDisplayFailed);
 }
 
 static void receiveGpsByte(uint8_t c) {
@@ -3152,9 +3207,9 @@ static void enterDegraded(startup::Mode mode) {
     if (mode == startup::Mode::NoStorage) {
         // No mounted store: boot and faults stay in the bounded RAM queue.
         beginJournal();
-        gLoopFaults.event(4001, millis()).condition(true);
-        gLoopFaults.event(4002, millis()).condition(true);
-        gLoopFaults.event(4003, millis()).condition(true);
+        gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, millis()).condition(true);
+        gLoopFaults.event(diagnostics::Code::LITTLEFS_UNAVAILABLE, millis()).condition(true);
+        gLoopFaults.event(diagnostics::Code::NO_RECORDING_STORAGE, millis()).condition(true);
         Serial.println(gStartupWatchdog.noStorage() ?
             "DEGRADED: no trip storage; power management and charge guard active. Storage recovery disabled until next power-on." :
             "DEGRADED: no usable trip storage -- not recording trips. Power management and charge guard active. Retrying storage in 60 s.");
@@ -3177,7 +3232,7 @@ static void enterDegraded(startup::Mode mode) {
         startupStage(startup_watchdog::Stage::FlashMount);
         gFlashMounted = !gStartupWatchdog.noStorage() && LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL);
         beginJournal();
-        gLoopFaults.event(2001, millis()).condition(true);
+        gLoopFaults.event(diagnostics::Code::PMU_INIT_FAILED, millis()).condition(true);
         Serial.println(mode == startup::Mode::PmuMissing ?
             "DEGRADED: power chip not responding -- not recording; no charge or rail control. Retrying in 60 s." :
             "DEGRADED: power chip state untrusted -- not recording; no further charge or rail control. Retrying in 60 s.");
@@ -3196,13 +3251,13 @@ static void degradedLoop() {
         serviceBatteryDiagnostics();
         if (!gVbusLost) gIdleSince = millis();
         else if (uint32_t(millis() - gIdleSince) >= IDLE_BATT_SLEEP_MS) powerOffForVbus();
-        gLoopFaults.event(4001, millis()).condition(true);
-        gLoopFaults.event(4002, millis()).condition(true);
-        gLoopFaults.event(4003, millis()).condition(true);
+        gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, millis()).condition(true);
+        gLoopFaults.event(diagnostics::Code::LITTLEFS_UNAVAILABLE, millis()).condition(true);
+        gLoopFaults.event(diagnostics::Code::NO_RECORDING_STORAGE, millis()).condition(true);
     } else {
-        gLoopFaults.event(2001, millis()).condition(true);
+        gLoopFaults.event(diagnostics::Code::PMU_INIT_FAILED, millis()).condition(true);
     }
-    gLoopFaults.event(6001, millis()).condition(gProductionDisplayFailed);
+    gLoopFaults.event(diagnostics::Code::DISPLAY_UNAVAILABLE, millis()).condition(gProductionDisplayFailed);
     serviceJournal(); // single consumer; no network task in any degraded mode
     if (!(mode == Mode::NoStorage && gStartupWatchdog.noStorage()) && gDegraded.retryDue(millis())) {
         bool recovered = false;
@@ -3362,9 +3417,9 @@ void setup() {
     rtcConditions();
     if (gJournalReady) {
         // Explicit healthy observations resolve prior degraded-boot alerts.
-        gLoopFaults.event(2001, millis()).condition(false);
-        gLoopFaults.event(4003, millis()).condition(false);
-        gLoopFaults.event(4001, millis()).condition(!gSdMounted);
+        gLoopFaults.event(diagnostics::Code::PMU_INIT_FAILED, millis()).condition(false);
+        gLoopFaults.event(diagnostics::Code::NO_RECORDING_STORAGE, millis()).condition(false);
+        gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, millis()).condition(!gSdMounted);
         startupStage(gSdMounted ? startup_watchdog::Stage::CardSpace : startup_watchdog::Stage::FlashSpace);
         storageConditions(storageFreeBytes(*gTripFS), millis());
     }

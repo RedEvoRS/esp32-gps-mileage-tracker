@@ -30,68 +30,15 @@ bool versionToken(const char* value) {
     }
     return true;
 }
-// Context schemas are deliberately local to the journal, not changes to the
-// catalog generator. The host fixture exercises every field against Python's
-// authoritative catalog, so a future schema change needs an explicit review.
-struct Field {
-    uint16_t code; const char* key; EventContext::Type type;
-    int64_t min, max; const char* values;
-};
 using Type = EventContext::Type;
-#define NUMBER(code, key, lo, hi) {code, key, Type::Integer, lo, hi, ""}
-#define ENUM(code, key, values) {code, key, Type::Enum, 0, 0, values}
-#define BOOL(code, key) {code, key, Type::Boolean, 0, 1, ""}
-#define BACKEND(code) ENUM(code, "backend", "sd|littlefs|ram|none")
-#define HTTP(code) NUMBER(code, "http_status", 100, 599), ENUM(code, "target", "trip|events")
-const Field fields[] = {
-    ENUM(1000, "reset_reason", "power_on|deep_sleep|software|watchdog|brownout|panic|other"),
-    NUMBER(1000, "battery_mv", 1, 6000), NUMBER(1000, "battery_pct", 0, 100),
-    NUMBER(1007, "free_bytes", 0, 1048576),
-    NUMBER(2002, "battery_mv", 0, 6000), NUMBER(2003, "battery_mv", 0, 6000),
-    NUMBER(2004, "temperature_mc", -50000, 150000), NUMBER(2005, "temperature_mc", -50000, 150000),
-    NUMBER(2007, "clock_count", 0, 27), NUMBER(2007, "attempt_count", 1, 3),
-    ENUM(2007, "recovery_state", "not_needed|recovered|sda_stuck|scl_stuck"),
-    BOOL(2007, "pmu_ready"), BOOL(2007, "wire_end_failed"),
-    NUMBER(2009, "battery_mv", 1, 6000), NUMBER(2009, "battery_pct", 0, 100),
-    ENUM(2009, "reason", "idle_battery|battery_critical|user_long_press"),
-    NUMBER(3001, "elapsed_ms", 0, INT64_MAX), NUMBER(3002, "elapsed_ms", 0, INT64_MAX),
-    NUMBER(3002, "satellites", 0, 255),
-    NUMBER(3003, "message_class", 0, 255), NUMBER(3003, "message_id", 0, 255),
-    NUMBER(3004, "message_class", 0, 255), NUMBER(3004, "message_id", 0, 255),
-    NUMBER(3005, "elapsed_ms", 0, INT64_MAX),
-    ENUM(3008, "reason", "stopped|invalid_date|out_of_range|read_failed"),
-    NUMBER(3009, "agc_pct", 0, 100), NUMBER(3009, "max_cno", 0, 99),
-    BACKEND(4004), NUMBER(4004, "free_bytes", 0, INT64_MAX),
-    BACKEND(4005), NUMBER(4005, "free_bytes", 0, INT64_MAX),
-    BACKEND(4006), ENUM(4006, "operation", "open|write|close|rename"),
-    BACKEND(4007), ENUM(4007, "reason", "read|parse|write|rename"),
-    BACKEND(4008), ENUM(4008, "operation", "open|write|close|rename|ack"),
-    NUMBER(4009, "count", 0, INT32_MAX), BACKEND(4009),
-    BACKEND(4010), NUMBER(4010, "points", 0, INT32_MAX),
-    NUMBER(5002, "attempts", 0, 255), NUMBER(5003, "attempts", 0, 255),
-    ENUM(5003, "target", "trip|events"),
-    HTTP(5004), HTTP(5005), HTTP(5006), HTTP(5007), HTTP(5008), HTTP(5009),
-    ENUM(5010, "reason", "parse|missing_ids|unexpected_ids|duplicate_ids")
-};
-#undef NUMBER
-#undef ENUM
-#undef BOOL
-#undef BACKEND
-#undef HTTP
 bool validContext(uint16_t code, const EventContext& context) {
     if (!terminated(context.key, sizeof(context.key)) || !terminated(context.value, sizeof(context.value))) return false;
-    for (const auto& field : fields) {
-        if (code != field.code || std::strcmp(context.key, field.key)) continue;
+    for (const auto& field : kContextFields) {
+        if (code != static_cast<uint16_t>(field.code) || std::strcmp(context.key, field.key)) continue;
         if (context.type != field.type) return false;
         if (field.type != Type::Enum) return context.number >= field.min && context.number <= field.max;
-        const char* at = field.values;
-        size_t length = std::strlen(context.value);
-        while (*at) {
-            const char* end = std::strchr(at, '|');
-            size_t n = end ? static_cast<size_t>(end - at) : std::strlen(at);
-            if (length == n && !std::strncmp(at, context.value, n)) return true;
-            at += n + (end ? 1 : 0);
-        }
+        for (size_t i = 0; i < field.valueCount; ++i)
+            if (!std::strcmp(context.value, field.values[i])) return true;
         return false;
     }
     return false;
@@ -235,6 +182,10 @@ EventLog::Submit EventLog::submit(const EventInput& input, EventIdentity* id) {
         if (id) { std::strcpy(id->bootId, bootId_); id->sequence = sequence_; }
         result = Submit::Accepted;
     }
+    // Producers on both cores share this counter with stats(). The queue lock
+    // serializes increments; the atomic load also permits an unlocked reader.
+    if (result == Submit::Invalid && invalidSubmits_.load(std::memory_order_relaxed) != UINT32_MAX)
+        invalidSubmits_.fetch_add(1, std::memory_order_relaxed);
     queueLock_.clear(std::memory_order_release); return result;
 }
 void EventLog::fail() { if (failures_ != UINT32_MAX) ++failures_; } // no sink callback/recursive event
@@ -720,6 +671,7 @@ bool EventLog::isolateRejected(const Batch& batch) {
 }
 EventLog::Stats EventLog::stats() {
     Stats result; result.backend = backend_; result.storageFailures = failures_;
+    result.invalidSubmits = invalidSubmits_.load(std::memory_order_relaxed);
     result.dropped = ramPending_; result.pendingLoss = ramPending_;
     for (const auto& store : stores_) {
         result.dropped = sum(result.dropped, store.meta.dropped);
