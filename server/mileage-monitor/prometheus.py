@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from common.diagnostics import validate_device_id
+from shared import condition_states
 
 
 PORT = 8093
@@ -92,7 +93,6 @@ class MetricsSnapshot:
             lines.extend(samples)
 
         contacts, snapshots, pending, dropped, counters = [], [], [], [], []
-        conditions = {}
         known_conditions = {}
         decisions = {}
         for device, code, state, alerted_at, resolved_at in episodes:
@@ -148,36 +148,8 @@ class MetricsSnapshot:
                                                  ("symbol", definition["symbol"]),
                                                  ("severity", definition["severity"])), str(value)))
 
-                active = {item["code"] for item in snapshot.get("active", []) if isinstance(item, dict)
-                          and type(item.get("code")) is int}
-                observed = snapshot.get("observed")
-                observed = ({code for code in observed if type(code) is int}
-                            if isinstance(observed, list) else set(active))
-            else:
-                active, observed = set(), set()
-            persisted = device.get("conditions")
-            persisted = (persisted if isinstance(persisted, dict) else {})
-            persisted_codes = {code for code in persisted if type(code) is int}
-            known = observed | active | persisted_codes | known_conditions.get(device_id, set())
-            fresh = (isinstance(snapshot, dict) and isinstance(snapshot_at, (int, float))
-                     and 0 <= now - snapshot_at <= 86400)
-            for code in known:
-                definition = self.codes.get(code)
-                if not definition:
-                    continue
-                if not fresh or code not in observed:
-                    state = "unknown"
-                elif persisted.get(code) in ("active", "clear", "unknown"):
-                    state = persisted[code]
-                else:
-                    state = "active" if code in active else "clear"
-                conditions[(device_id, code)] = state
-
-        for device_id, codes in known_conditions.items():
-            # A known condition whose device disappeared from events.db has no
-            # current evidence. Preserve its label and publish unknown.
-            for code in codes:
-                conditions.setdefault((device_id, code), "unknown")
+        known = {(device, code) for device, codes in known_conditions.items() for code in codes}
+        conditions = condition_states(devices, known, now, self.stale_seconds)
 
         family("mileage_tracker_last_contact_age_seconds", "Seconds since the last accepted server contact.",
                "gauge", contacts)
@@ -188,7 +160,7 @@ class MetricsSnapshot:
                                  (("device_id", device), ("code", code),
                                   ("symbol", self.codes[code]["symbol"]),
                                   ("severity", self.codes[code]["severity"]), ("state", state)), "1")
-                         for (device, code), state in sorted(conditions.items())])
+                         for (device, code), (state, _, _) in sorted(conditions.items()) if code in self.codes])
         family("mileage_tracker_pending_events", "Pending diagnostic events reported by the latest check-in.",
                "gauge", pending)
         family("mileage_tracker_dropped_events", "Dropped diagnostic events reported by the latest check-in.",

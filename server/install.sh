@@ -483,7 +483,7 @@ preflight() {
         mileage-ingest/{Dockerfile,app.py,diag_store.py,reset_high_water.py,requirements.txt} \
         mileage-viewer/{Dockerfile,app.py,geocoding.py,trip_merges.py,trip_log.py,users.py,manage_users.py,requirements.txt} \
         mileage-viewer/static/{leaflet.js,leaflet.css,gpx.js,endpoint-places.js} \
-        mileage-monitor/{Dockerfile,monitor.py,gelf.py,prometheus.py,loki.py} ntfy/server.yml \
+        mileage-monitor/{Dockerfile,monitor.py,gelf.py,prometheus.py,loki.py,shared.py} ntfy/server.yml \
         backup/{backup.sh,restore.sh,lib.sh,backup.conf.example} \
         backup/mileage-backup@.{service,timer}; do
         if [[ ! -e $f ]]; then missing+=("$f"); fi

@@ -2054,7 +2054,14 @@ MONITOR_STALE_DAYS=7
 Enabled settings are validated at startup; keep tokens in private environment
 files, never event context or public examples. Snapshot freshness is **24 hours
 inclusive**, aligned with the opportunistic heartbeat, measured from accepted snapshot receipt time.
-GPX-only contact does not make an old health snapshot fresh.
+GPX-only contact does not make an old health snapshot fresh. All outputs use
+`server/mileage-monitor/shared.py` for this state rule: active snapshot entries
+are active, observed entries absent from active are clear, and missing, future
+or stale snapshot evidence is unknown. Stored condition rows retain known
+codes but do not override the accepted snapshot. E7001 comes only from valid
+server contact age, even without a snapshot. Catalog severity and `notify`
+filter phone delivery, not state. Prometheus and Loki condition lines retain
+only current catalog codes; GELF also describes unknown codes.
 
 Alert only for catalog-eligible current faults in a fresh snapshot. Hold a new
 fault for 300 seconds by default; critical faults bypass that hold, while

@@ -1919,8 +1919,12 @@ or away from WiFi, so a parked tracker can still trigger this notification.
 The monitor does not wake the tracker. Retiring an obsolete identity needs a
 future explicit policy; all devices remain watched.
 
-Faults need a snapshot at most **24 hours** old; GPX contact alone does not
-refresh it. Old events, unknown conditions and a reboot do not imply recovery.
+All monitor outputs use the same current-condition rule. Faults need a
+snapshot at most **24 hours** old (including exactly 24 hours); GPX contact
+alone does not refresh it. The accepted snapshot takes precedence over stored
+condition rows; a missing or future snapshot means unknown. Severity and
+`notify` filter phone alerts only; Prometheus and Loki condition lines show
+current catalog codes, while Graylog also describes unknown codes. Old events, unknown conditions and a reboot do not imply recovery.
 A resolution needs a successfully sent alert and a newer snapshot explicitly
 observing that code clear. Overflow coalesces into digests of at most 3500
 UTF-8 bytes; unsent work persists and is rechecked before delivery. Failed

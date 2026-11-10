@@ -41,6 +41,7 @@ mileage-monitor/**
 !mileage-monitor/gelf.py
 !mileage-monitor/prometheus.py
 !mileage-monitor/loki.py
+!mileage-monitor/shared.py
 !common/
 common/**
 !common/__init__.py

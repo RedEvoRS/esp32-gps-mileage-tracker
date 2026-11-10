@@ -437,7 +437,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   suspends sends until a successful read. Own `/state/monitor.db` schema v1 in
   `monitor-state` stores episodes, pending work/outbox, successful delivery
   window and retry state. Every 60 s, all devices are watched, with no watchlist.
-  Freshness is 24 h of accepted snapshot receipt, independent of GPX contact.
+  One shared rule supplies current condition state to every output: freshness
+  is 24 h inclusive from accepted snapshot receipt, independent of GPX contact.
+  Stored condition rows retain known codes but do not override the snapshot.
   Catalog severity/notify control faults; 300 s hold (critical bypass), 24 h
   reminders, six successful posts per rolling hour including bounded digests
   and resolutions. Unknown/reboot is not recovery; explicit newer clear and

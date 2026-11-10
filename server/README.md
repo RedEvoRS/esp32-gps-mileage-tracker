@@ -203,7 +203,12 @@ episodes, delivery intent, digest overflow, reminders, rolling-hour cap and
 retry backoff. Use one replica and preserve the volume to retain deduplication.
 
 Fault notifications require eligible severity from the current catalog and
-a snapshot at most 24 hours old. Hold defaults to 300 seconds (critical skips
+a snapshot at most 24 hours old (including exactly 24 hours). Every output
+uses the same state rule: an accepted snapshot determines faults, and server
+contact age determines E7001 silence, independently of snapshot age. Stored
+condition rows do not override a fresh snapshot. Catalog severity and `notify`
+filter phone delivery only; Prometheus and Loki condition lines retain current
+catalog codes, while Graylog also describes unknown codes. Hold defaults to 300 seconds (critical skips
 it), reminders to 24 hours, and the cap to six successful posts per rolling
 hour. Overflow becomes bounded digests. Recovery needs an actually sent alert
 and an ordered explicit clear; unknown, reboot or historical events do not

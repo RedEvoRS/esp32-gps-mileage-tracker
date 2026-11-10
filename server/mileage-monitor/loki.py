@@ -1,10 +1,8 @@
 """Optional, durable JSON-line push to an external Loki (#136)."""
 
 import base64
-import ipaddress
 import json
 import math
-import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -12,7 +10,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 
-import gelf
+from shared import NoRedirect, event_fields, valid_host as _valid_host
 from common.diagnostics import validate_device_id, validate_request
 
 
@@ -50,16 +48,6 @@ CREATE TABLE IF NOT EXISTS loki_conditions (
 """
 SEED = ("INSERT OR IGNORE INTO loki_cursor VALUES (1,0,0)",
         "INSERT OR IGNORE INTO loki_retry VALUES (1,0,0)")
-
-
-def _valid_host(host):
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except ValueError:
-        return bool(host and len(host) <= 253 and all(
-            re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", label)
-            for label in host.rstrip(".").split(".")))
 
 
 def _ascii_header(value, maximum=1024):
@@ -120,11 +108,6 @@ class LokiConfig:
         if self.tenant:
             result["X-Scope-OrgID"] = self.tenant
         return result
-
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None  # Loki credentials and tenant headers never follow redirects.
 
 
 class HttpTransport:
@@ -192,19 +175,13 @@ def event_log(catalog, row):
                           "events": [safe_event]}, catalog=catalog)
         safe_row = (*row[:6], json.dumps(safe_event, separators=(",", ":"),
                                          ensure_ascii=True, allow_nan=False))
-        payload = gelf.event_message(codes, safe_row)
-        if payload is None:
+        fields = event_fields(codes, safe_row)
+        if fields is None:
             return None
-        message = json.loads(payload.decode("ascii"))
-        severity = message["_severity"]
+        severity = fields["severity"]
         if severity not in SEVERITIES:
             return None
-        timestamp = _iso_timestamp_ns(message["_received_at"])
-        # gelf.event_message supplies catalog titles and bounded field shapes.
-        fields = {key[1:] if key.startswith("_") else key: value
-                  for key, value in message.items()
-                  if key not in ("version", "host", "timestamp", "short_message", "level")
-                  }
+        timestamp = _iso_timestamp_ns(fields["received_at"])
         line = json.dumps(fields, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
         return (device, severity), timestamp, line
     except (KeyError, ValueError, TypeError, OverflowError, RecursionError):
