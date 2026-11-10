@@ -232,6 +232,25 @@ class SummaryCacheTests(unittest.TestCase):
             self.assertEqual(self.signed_in("admin").get("/trip/2026-01/drive").status_code, 200)
         self.assertEqual(set(self.viewer._summary_cache), {self.path})
 
+    def test_trip_missing_from_full_load_retries_once_then_returns_not_found(self):
+        with patch.object(self.viewer, "load_trips", return_value=([], [])) as load, patch.object(
+                self.viewer.app.logger, "warning") as warning:
+            response = self.signed_in("admin").get("/trip/2026-01/drive?year=2026")
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn("Location", response.headers)
+        self.assertEqual(load.call_count, 2)
+        warning.assert_called_once_with("Trip missing from full log after retry: %s", "2026-01/drive")
+
+    def test_trip_missing_from_first_full_load_can_recover_on_one_retry(self):
+        full = self.viewer.load_trips(include_removed=True)
+        with patch.object(self.viewer, "load_trips", side_effect=[([], []), full]) as load, patch.object(
+                self.viewer.app.logger, "warning") as warning:
+            response = self.signed_in("admin").get("/trip/2026-01/drive?year=2026")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("Location", response.headers)
+        self.assertEqual(load.call_count, 2)
+        warning.assert_not_called()
+
 
 class MergeCacheTransactionTests(unittest.TestCase):
     setUp = merges.ViewerMerges.setUp

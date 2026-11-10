@@ -3158,12 +3158,17 @@ def trip_view(ym, trip_id):
     if t["trip_key"] != f"{ym}/{trip_id}":
         return redirect(url_for("trip_view", ym=t["ym"], trip_id=t["id"], year=year or ""))
     if not t.get("removal") and trip_merges._known_device(t.get("device_id")):
-        trips, unreadable, removed_trips, _ = split_removed(*load_trips(include_removed=True))
         # A concurrent edit can remove or split the trip between snapshots.
-        # Use the latest complete snapshot for suggestions, as before.
-        current = next((trip for trip in trips if trip["trip_key"] == t["trip_key"]), None)
+        # Retry the full snapshot once, then fail closed if it still disagrees
+        # with the targeted lookup. A self-redirect could loop indefinitely.
+        for _ in range(2):
+            trips, unreadable, removed_trips, _ = split_removed(*load_trips(include_removed=True))
+            current = next((trip for trip in trips if trip["trip_key"] == t["trip_key"]), None)
+            if current is not None:
+                break
         if current is None:
-            return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
+            app.logger.warning("Trip missing from full log after retry: %s", t["trip_key"])
+            abort(404, description="This trip is no longer available. Return to the trip list and reopen it.")
         t = current
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         conn.row_factory = sqlite3.Row
