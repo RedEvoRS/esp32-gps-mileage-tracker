@@ -119,6 +119,9 @@ services:
       - VIEWER_DB_PATH=/db/annotations.db
       - VIEWER_TRUSTED_PROXIES=${VIEWER_TRUSTED_PROXIES:-}
       - VIEWER_COOKIE_SECURE=${VIEWER_COOKIE_SECURE:-false}
+      # Empty/unset keeps OSM; use none to draw the track without base tiles.
+      - MAP_TILE_URL=${MAP_TILE_URL:-}
+      - MAP_TILE_ATTRIBUTION=${MAP_TILE_ATTRIBUTION:-}
       # Timezone all trip times are displayed and exported in, from .env
       # (see the note on the ingest service).
       - DISPLAY_TZ=${DISPLAY_TZ:-}

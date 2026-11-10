@@ -49,7 +49,9 @@ class InstallerProxyTests(unittest.TestCase):
 
     def test_loopback_override_only_changes_viewer_and_preserves_settings(self):
         output = self.run_check(VIEWER_BIND_ADDR="127.0.0.1", VIEWER_COOKIE_SECURE="true",
-                                VIEWER_TRUSTED_PROXIES=" 192.0.2.1,2001:db8::/64 ")
+                                VIEWER_TRUSTED_PROXIES=" 192.0.2.1,2001:db8::/64 ",
+                                MAP_TILE_URL="http://tiles.example.test/{z}/{x}/{y}.png",
+                                MAP_TILE_ATTRIBUTION="'Local tiles & credit'")
         self.assertIn("INGEST=http://192.0.2.1:8090", output)
         self.assertIn("VIEWER=http://127.0.0.1:8091", output)
         self.assertIn("FAILURES=0", output)

@@ -423,7 +423,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   `trip_removals`, `trip_history` and `tax_years`. Optional `geocoding.py`
   sends a selected endpoint to an explicitly configured provider only on an
   authenticated, CSRF-protected click and caches suggestions in that database.
-  Configurable interval, default 1.1 s.
+  Configurable interval, default 1.1 s. Viewer-only `MAP_TILE_URL` selects
+  base tiles (default OSM; `none` disables); attribution is plain text.
   No lookup on page views, exports or uploads; never use public OSMF Nominatim.
   `/device-health` reads
   diagnostics schema v1 via `mode=ro` with a 2 s busy timeout, shows contact and

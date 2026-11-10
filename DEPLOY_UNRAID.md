@@ -156,7 +156,19 @@ Binding is the LAN-only control here. It does not replace router rules between
 networks. Do not forward these ports from the internet.
 
 For HTTPS, follow [Debian Step 7's reverse-proxy section](DEPLOY_DEBIAN.md#behind-a-reverse-proxy-caddy-or-nginx-proxy-manager).
-The viewer proxy settings are the same. If the proxy takes host ports
+The viewer proxy settings are the same. Optional viewer map settings also
+go in `.env`: `MAP_TILE_URL=http://<host>/{z}/{x}/{y}.png` selects your own
+HTTP/HTTPS tile server; `MAP_TILE_ATTRIBUTION` supplies plain text credit
+(HTML is escaped). The URL requires `{z}`, `{x}`, `{y}` (optional `{s}`, `{r}`),
+at most 2048 characters, with no quotes, backslashes, angle brackets,
+whitespace or controls. Attribution allows up to 2000 characters without
+controls. Wrong values stop the viewer at startup and name the setting in
+its log. Unset/empty keeps the OSM URL and credit. Your browser sends the
+tile host its IP and viewed areas/zoom levels, which can reveal parking
+locations over time. `MAP_TILE_URL=none` makes no tile requests and draws
+the track and endpoints on a plain light/dark background. Run
+`docker compose up -d` after edits; only the viewer receives these settings,
+and reruns/updates preserve them without prompts. If the proxy takes host ports
 80/443, move the Unraid web UI to other ports in Management Access first.
 Keep the tracker's ingest address reachable; a viewer proxy does not change
 the firmware's plain HTTP upload connection.

@@ -363,7 +363,8 @@ You should see `docker-compose.yml`, `.env.example`, `viewer.env.example`,
 `backup/`, `mileage-ingest/` (including `diag_store.py`), and `mileage-viewer/`
 (with `static/` holding
 `leaflet.js`, `leaflet.css`, `gpx.js` — those are vendored, so the viewer
-works with no internet except OSM map tiles).
+works with no internet except the default OSM map tiles; see the optional
+tile settings below).
 
 > **Watch for:** `scp -r` on Windows can silently skip dotfiles in some
 > OpenSSH builds. Confirm `.env.example` and `.dockerignore` made it:
@@ -913,6 +914,19 @@ an existing install keeps its current HTTP behavior:
   when the proxy is installed on the host or runs with host networking:
   it can reach `127.0.0.1:8091`, and plain HTTP is closed on the LAN.
   An IPv6 loopback bind (`::1`) is also supported if your Docker host has IPv6.
+- `MAP_TILE_URL` optionally selects a viewer base map, for example
+  `http://<host>/{z}/{x}/{y}.png`. HTTP/HTTPS and `{z}`, `{x}`, `{y}` are
+  required; `{s}` and `{r}` are optional. No quotes, backslashes, angle
+  brackets, whitespace or controls; maximum 2048 characters. The browser
+  sends the tile host its IP and the areas and zoom levels you view, which
+  can reveal parking locations over time. Use a household server to keep
+  this traffic local, or `MAP_TILE_URL=none` for tracks and endpoints on a
+  plain light/dark background with no tile requests. Unset/empty keeps OSM.
+  `MAP_TILE_ATTRIBUTION` is plain text credit (HTML is escaped), maximum
+  2000 characters without controls; unset/empty keeps the OSM credit.
+  Invalid settings stop the viewer at startup and name the setting in its
+  log. Set these in `.env`, then run `docker compose up -d`. Only the viewer
+  receives them; installer reruns and release updates preserve them.
 - `VIEWER_TRUSTED_PROXIES` is a comma-separated list of proxy peer IPs or
   CIDR network ranges (an address followed by a prefix length), IPv4 or
   IPv6, with optional spaces. Empty trusts no forwarded
@@ -2453,8 +2467,10 @@ changing or differs between workers. It must be a fixed value in
 `viewer.env`.
 
 **Viewer loads but the map is blank** — Leaflet/GPX are vendored locally, so
-the page frame works offline; only OSM *tiles* need internet. Blank tiles =
-the server (or your browser) can't reach `tile.openstreetmap.org`.
+the page frame works offline; the default OSM *tiles* need internet.
+Unexpected blank tiles mean your browser can't reach the configured tile
+host (default `tile.openstreetmap.org`). With `MAP_TILE_URL=none`, a plain
+background with the track and endpoints is expected.
 
 **The trip list says a trip summary file can't be read** — the `.json` next
 to that trip's GPX is damaged or missing (disk trouble, a hand edit, or a

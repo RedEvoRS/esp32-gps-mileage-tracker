@@ -684,7 +684,21 @@ What it does:
   OpenStreetMap map (Leaflet). This is how you eyeball a trip for GPS
   errors before trusting its mileage. Your trip coordinates are served
   from the LAN and drawn in your browser; only the base map tiles come
-  from OpenStreetMap.
+  from OpenStreetMap by default. The browser sends the tile host its IP
+  address and the viewed areas and zoom levels, which over time can reveal
+  where the car parks. To use your own tile server, set
+  `MAP_TILE_URL=http://<host>/{z}/{x}/{y}.png` in `.env` and set
+  `MAP_TILE_ATTRIBUTION` to its plain text credit. The URL must use HTTP or
+  HTTPS, include `{z}`, `{x}`, `{y}` (optional `{s}`, `{r}`), be at most
+  2048 characters and contain no quotes, backslashes, angle brackets,
+  whitespace or control characters. Attribution is escaped as text, limited
+  to 2000 characters without controls. Invalid settings stop the viewer
+  at startup with the setting's name in the log. Unset or empty values keep
+  today's OSM URL and credit. `MAP_TILE_URL=none` makes no tile requests:
+  the track and endpoints still draw on a plain background that follows
+  light/dark mode. Run `docker compose up -d` after changes. These settings
+  go only to the viewer; installer reruns and release updates preserve them
+  in `.env` without asking new questions.
 - **Annotate** — tag each trip business / personal / other and add a
   note (e.g. "Client visit — Acme Corp") and destination / place. Annotations are stored in a
   SQLite database in a separate `viewer-db` volume, kept apart from the

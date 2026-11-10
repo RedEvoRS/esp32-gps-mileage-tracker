@@ -90,7 +90,7 @@ for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resol
         sys.path.insert(0, str(import_root))
 
 from common.version import server_version
-from common.settings import trusted_proxies, viewer_cookie_secure
+from common.settings import map_tiles, trusted_proxies, viewer_cookie_secure
 
 from common.diagnostics import CatalogError, load_catalog
 from geocoding import Geocoder, GeocodeError
@@ -153,6 +153,8 @@ VIEWER_SECRET_KEY = os.environ.get("VIEWER_SECRET_KEY", "").strip()
 try:
     VIEWER_TRUSTED_PROXIES = trusted_proxies(os.environ.get("VIEWER_TRUSTED_PROXIES", ""))
     VIEWER_COOKIE_SECURE = viewer_cookie_secure(os.environ.get("VIEWER_COOKIE_SECURE", ""))
+    MAP_TILE_URL, MAP_TILE_ATTRIBUTION = map_tiles(
+        os.environ.get("MAP_TILE_URL", ""), os.environ.get("MAP_TILE_ATTRIBUTION", ""))
 except ValueError as exc:
     raise RuntimeError("mileage-viewer refusing to start: " + str(exc)) from exc
 
@@ -1702,6 +1704,11 @@ def version_context():
     return {"server_version": server_version()}
 
 
+@app.context_processor
+def map_context():
+    return {"map_tile_url": MAP_TILE_URL, "map_tile_attribution": MAP_TILE_ATTRIBUTION}
+
+
 VERSION_FOOTER = '<footer class="server-version">Server {{ server_version }}</footer>'
 VERSION_HEADER = '<div class="header-version">Server {{ server_version }}</div>'
 
@@ -2101,9 +2108,10 @@ TRIP_HTML = """
 <script src="{{ url_for('static', filename='gpx.js') }}"></script>
 <script>
   var map = L.map('map');
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  var tileUrl = {{ map_tile_url|tojson }};
+  if (tileUrl) L.tileLayer(tileUrl, {
     maxZoom: 19,
-    attribution: '&copy; OpenStreetMap contributors'
+    attribution: {{ map_tile_attribution|tojson }}
   }).addTo(map);
   new L.GPX("{{ url_for('trip_gpx', ym=t.ym, trip_id=t.id) }}", {
     async: true,
