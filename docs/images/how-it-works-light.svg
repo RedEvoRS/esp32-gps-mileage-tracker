@@ -1,0 +1,201 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 786" width="960" height="786" role="img" aria-labelledby="t d">
+<title id="t">How the GPS mileage tracker works</title>
+<desc id="d">Flowchart. In the car: ignition on powers the board; trip detection starts a trip above 5 mph for 10 seconds and ends it below 2 mph for 5 minutes; each GPS point is saved as GPX on the microSD card, or internal flash without a card; at ignition off the board closes the trip, uploads over home WiFi on battery for about 10 minutes, then powers off until the next ignition. Trips go to POST /upload and the health journal to POST /v1/device-events on the ingest service, which writes trip files and an events database; HTTP 200 lets the board delete its copy. The viewer reads both and gives you a trip map, business purpose notes, CSV or XLSX export and device health. An optional monitor reads the events database and sends phone alerts through self-hosted ntfy.</desc>
+<style>
+.lane-car{fill:#f8ecdc} .lane-srv{fill:#e2f1ee} .lane-you{fill:#e9e8f8}
+.node{fill:#ffffff;stroke:#cdd5de;stroke-width:1}
+.store{fill:#f3faf8;stroke:#cdd5de;stroke-width:1}
+.opt{stroke-dasharray:5 4;stroke:#7a8696}
+text{font-family:'Segoe UI', 'Helvetica Neue', Helvetica, Arial, 'Liberation Sans', sans-serif}
+.t-lane{font-weight:700;font-size:12px;letter-spacing:.14em}
+.t-lanedesc{font-size:12.5px;fill:#586474}
+.t-title{font-weight:600;font-size:15px;fill:#16202c}
+.t-item{font-weight:600;font-size:13.5px;fill:#16202c}
+.t-em{font-weight:600;font-size:13px;fill:#16202c}
+.t-key{font-family:Consolas, Menlo, 'SF Mono', 'Liberation Mono', 'DejaVu Sans Mono', monospace;font-weight:500;font-size:13px;fill:#16202c}
+.t-keylab{font-family:Consolas, Menlo, 'SF Mono', 'Liberation Mono', 'DejaVu Sans Mono', monospace;font-size:12px;fill:#586474}
+.t-port{font-family:Consolas, Menlo, 'SF Mono', 'Liberation Mono', 'DejaVu Sans Mono', monospace;font-size:12px;fill:#586474}
+.t-mono{font-family:Consolas, Menlo, 'SF Mono', 'Liberation Mono', 'DejaVu Sans Mono', monospace;font-size:11.5px;fill:#586474}
+.t-d{font-size:12.5px;fill:#586474}
+.t-tag{font-weight:600;font-size:10.5px;letter-spacing:.08em;fill:#586474}
+.t-edge{font-weight:500;font-size:11.5px;fill:#586474}
+.t-flowhead{font-weight:600;font-size:13px;fill:#0a73b8}
+.t-flowlab{font-size:12.5px;fill:#16202c}
+.t-flowcode{font-family:Consolas, Menlo, 'SF Mono', 'Liberation Mono', 'DejaVu Sans Mono', monospace;font-weight:500;font-size:12px;fill:#0a73b8}
+.c-car{fill:#b25e09;color:#b25e09} .c-srv{fill:#0d7468;color:#0d7468}
+.c-you{fill:#4b45b8;color:#4b45b8} .c-flow{color:#0a73b8}
+.ic{fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.edge{fill:none;stroke:#7a8696;stroke-width:1.6}
+.edge-flow{fill:none;stroke:#0a73b8;stroke-width:2.6}
+.edge-ack{fill:none;stroke:#7a8696;stroke-width:1.4}
+.ah-muted{fill:#7a8696} .ah-flow{fill:#0a73b8}
+</style>
+<defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="9" markerHeight="9" orient="auto">
+    <path class="ah-muted" d="M0 1 L9 5 L0 9 Z"/>
+  </marker>
+  <marker id="ahf" viewBox="0 0 10 10" refX="9" refY="5" markerUnits="userSpaceOnUse" markerWidth="13" markerHeight="13" orient="auto">
+    <path class="ah-flow" d="M0 1 L9 5 L0 9 Z"/>
+  </marker>
+  <symbol id="i-power" viewBox="0 0 20 20"><path d="M10 2.8v6.4"/><path d="M5.7 5.6a6.2 6.2 0 1 0 8.6 0"/></symbol>
+  <symbol id="i-gauge" viewBox="0 0 20 20"><path d="M3.2 14.5a7.2 7.2 0 1 1 13.6 0"/><path d="M10 12.6l3.6-4.4"/><circle cx="10" cy="12.8" r="1.2"/></symbol>
+  <symbol id="i-sd" viewBox="0 0 20 20"><path d="M6 2.8h6.2l3 3v11.4H6z"/><path d="M8.6 5v2.4M11 5v2.4"/></symbol>
+  <symbol id="i-park" viewBox="0 0 20 20"><rect x="3" y="3" width="14" height="14" rx="3.2"/><path d="M8 14.2V5.8h2.9a2.4 2.4 0 0 1 0 4.8H8"/></symbol>
+  <symbol id="i-wifi" viewBox="0 0 20 20"><path d="M2.8 8.2a10.2 10.2 0 0 1 14.4 0"/><path d="M5.4 11a6.4 6.4 0 0 1 9.2 0"/><path d="M8 13.7a2.8 2.8 0 0 1 4 0"/><circle cx="10" cy="16.2" r=".6"/></symbol>
+  <symbol id="i-server" viewBox="0 0 20 20"><rect x="3" y="3.5" width="14" height="5.5" rx="1.4"/><rect x="3" y="11" width="14" height="5.5" rx="1.4"/><path d="M6.2 6.25h.01M6.2 13.75h.01"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 20 20"><path d="M2.8 6.2A1.2 1.2 0 0 1 4 5h3.8l1.7 1.8H16a1.2 1.2 0 0 1 1.2 1.2v7.4a1.2 1.2 0 0 1-1.2 1.2H4a1.2 1.2 0 0 1-1.2-1.2z"/></symbol>
+  <symbol id="i-db" viewBox="0 0 20 20"><ellipse cx="10" cy="5" rx="6" ry="2.3"/><path d="M4 5v10c0 1.27 2.69 2.3 6 2.3s6-1.03 6-2.3V5"/><path d="M4 10c0 1.27 2.69 2.3 6 2.3s6-1.03 6-2.3"/></symbol>
+  <symbol id="i-browser" viewBox="0 0 20 20"><rect x="2.6" y="3.6" width="14.8" height="12.8" rx="1.8"/><path d="M2.6 7.4h14.8"/><path d="M5 5.5h.01M7 5.5h.01"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 20 20"><path d="M5.8 13.6V9.2a4.2 4.2 0 0 1 8.4 0v4.4l1.4 1.6H4.4z"/><path d="M8.6 17.4h2.8"/></symbol>
+  <symbol id="i-pin" viewBox="0 0 20 20"><path d="M10 17.4s5.2-4.6 5.2-8.8a5.2 5.2 0 0 0-10.4 0c0 4.2 5.2 8.8 5.2 8.8z"/><circle cx="10" cy="8.6" r="1.9"/></symbol>
+  <symbol id="i-pencil" viewBox="0 0 20 20"><path d="M4 16l.9-3.6 8.4-8.4 2.7 2.7-8.4 8.4z"/><path d="M11.8 5.5l2.7 2.7"/></symbol>
+  <symbol id="i-table" viewBox="0 0 20 20"><rect x="3" y="3.6" width="14" height="12.8" rx="1.5"/><path d="M3 7.9h14M3 12.2h14M8 3.6v12.8"/></symbol>
+  <symbol id="i-pulse" viewBox="0 0 20 20"><path d="M2.4 10.4h3.4l2-4.6 3.2 9 2.1-4.4h4.5"/></symbol>
+  <symbol id="i-phone" viewBox="0 0 20 20"><rect x="5.8" y="2.4" width="8.4" height="15.2" rx="2"/><path d="M9 14.8h2"/></symbol>
+</defs>
+
+<!-- ============ Lane 1: in the car ============ -->
+<rect class="lane-car" x="8" y="8" width="944" height="244" rx="14"/>
+<text class="t-lane c-car" x="28" y="34">IN THE CAR</text>
+<text class="t-lanedesc" x="152" y="34">LilyGO T-Beam Supreme · ESP32-S3 + u-blox MAX-M10S GPS · car USB power, 18650 backup</text>
+
+<!-- 1 Ignition on -->
+<rect class="node" x="24" y="56" width="207" height="124" rx="10"/>
+<use href="#i-power" class="ic c-car" x="40" y="71" width="22" height="22"/>
+<text class="t-title" x="72" y="88">Ignition on</text>
+<text class="t-key" x="40" y="118">USB power in</text>
+<text class="t-d" x="40" y="140">Board switches on and</text>
+<text class="t-d" x="40" y="159">the GPS gets a fix</text>
+
+<!-- 2 Trip detection -->
+<rect class="node" x="259" y="56" width="207" height="124" rx="10"/>
+<use href="#i-gauge" class="ic c-car" x="275" y="71" width="22" height="22"/>
+<text class="t-title" x="307" y="88">Trip detection</text>
+<text x="275" y="118"><tspan class="t-keylab">start</tspan><tspan class="t-key" x="318">&gt;5 mph for 10 s</tspan></text>
+<text x="275" y="139"><tspan class="t-keylab">end</tspan><tspan class="t-key" x="318">&lt;2 mph for 5 min</tspan></text>
+<text class="t-d" x="275" y="161">Red lights don't split a trip</text>
+
+<!-- 3 Recording -->
+<rect class="node" x="494" y="56" width="207" height="124" rx="10"/>
+<use href="#i-sd" class="ic c-car" x="510" y="71" width="22" height="22"/>
+<text class="t-title" x="542" y="88">Recording</text>
+<text class="t-key" x="510" y="118">GPX → microSD</text>
+<text class="t-d" x="510" y="140">Each point saved at once</text>
+<text class="t-d" x="510" y="159">No card? Internal flash</text>
+
+<!-- 4 Ignition off -->
+<rect class="node" x="729" y="56" width="207" height="124" rx="10"/>
+<use href="#i-park" class="ic c-car" x="745" y="71" width="22" height="22"/>
+<text class="t-title" x="777" y="88">Ignition off</text>
+<text class="t-key" x="745" y="118">~10 min on battery</text>
+<text class="t-d" x="745" y="140">Closes the trip, uploads</text>
+<text class="t-d" x="745" y="159">over WiFi, then powers off</text>
+
+<!-- sequence arrows -->
+<path class="edge" d="M231 118 H257" marker-end="url(#ah)"/>
+<path class="edge" d="M466 118 H492" marker-end="url(#ah)"/>
+<path class="edge" d="M701 118 H727" marker-end="url(#ah)"/>
+
+<!-- loop back to ignition on -->
+<path class="edge" d="M760 180 V198 Q760 206 752 206 H135.5 Q127.5 206 127.5 198 V182" marker-end="url(#ah)"/>
+<text class="t-edge" x="444" y="228" text-anchor="middle">Next ignition: USB power switches the board back on</text>
+
+<!-- ============ WiFi hop ============ -->
+<text class="t-edge" x="908" y="284">reply</text>
+<text class="t-edge" x="908" y="300">200 OK</text>
+<use href="#i-wifi" class="ic c-flow" x="562" y="252" width="20" height="20"/>
+<text class="t-flowhead" x="588" y="267">Home WiFi, bearer token</text>
+<text class="t-flowlab" x="564" y="286">Trips (GPX)</text>
+<text class="t-flowcode" x="676" y="286">POST /upload</text>
+<text class="t-flowlab" x="564" y="304">Health journal</text>
+<text class="t-flowcode" x="676" y="304">POST /v1/device-events</text>
+<text class="t-edge" x="564" y="322">Board deletes a trip only after 200 OK</text>
+
+<!-- ============ Lane 2: home server ============ -->
+<rect class="lane-srv" x="8" y="332" width="944" height="280" rx="14"/>
+<!-- WiFi hop arrows drawn after the server band so they sit on top of it -->
+<path class="edge-flow" d="M850 180 V378" marker-end="url(#ahf)"/>
+<path class="edge-ack" d="M900 380 V182" marker-end="url(#ah)"/>
+<text class="t-lane c-srv" x="28" y="358">HOME SERVER</text>
+<text class="t-lanedesc" x="152" y="358">Docker on Debian or Unraid · stays on your LAN</text>
+
+<!-- Ingest -->
+<rect class="node" x="729" y="380" width="207" height="124" rx="10"/>
+<use href="#i-server" class="ic c-srv" x="745" y="395" width="22" height="22"/>
+<text class="t-title" x="777" y="412">Ingest</text>
+<text class="t-port" x="920" y="412" text-anchor="end">:8090</text>
+<text class="t-em" x="745" y="442">Adds up the miles</text>
+<text class="t-d" x="745" y="464">Counts steps above 2 mph,</text>
+<text class="t-d" x="745" y="483">skips bad fixes and jumps</text>
+
+<!-- Stores -->
+<rect class="store" x="430" y="380" width="213" height="54" rx="8"/>
+<use href="#i-folder" class="ic c-srv" x="446" y="388" width="20" height="20"/>
+<text class="t-em" x="474" y="403">Trip files</text>
+<text class="t-mono" x="474" y="423">YYYY-MM/*.gpx, *.json</text>
+
+<rect class="store" x="430" y="450" width="213" height="54" rx="8"/>
+<use href="#i-db" class="ic c-srv" x="446" y="458" width="20" height="20"/>
+<text class="t-em" x="474" y="473">Health journal</text>
+<text class="t-mono" x="474" y="493">events.db</text>
+
+<path class="edge" d="M729 407 H645" marker-end="url(#ah)"/>
+<text class="t-edge" x="686" y="400" text-anchor="middle">writes</text>
+<path class="edge" d="M729 477 H645" marker-end="url(#ah)"/>
+<text class="t-edge" x="686" y="470" text-anchor="middle">writes</text>
+
+<!-- Viewer -->
+<rect class="node" x="24" y="380" width="320" height="124" rx="10"/>
+<use href="#i-browser" class="ic c-srv" x="40" y="395" width="22" height="22"/>
+<text class="t-title" x="72" y="412">Viewer</text>
+<text class="t-port" x="328" y="412" text-anchor="end">:8091</text>
+<text class="t-em" x="40" y="442">Map · business purpose · export</text>
+<text class="t-d" x="40" y="464">Web app on your LAN, behind a login</text>
+<text class="t-d" x="40" y="483">Reads trips only; notes in its own DB</text>
+
+<path class="edge" d="M430 407 H346" marker-end="url(#ah)"/>
+<text class="t-edge" x="387" y="400" text-anchor="middle">reads</text>
+<path class="edge" d="M430 477 H346" marker-end="url(#ah)"/>
+<text class="t-edge" x="387" y="470" text-anchor="middle">reads</text>
+
+<!-- Monitor (optional) -->
+<rect class="node opt" x="729" y="530" width="207" height="60" rx="10"/>
+<use href="#i-bell" class="ic c-srv" x="745" y="540" width="20" height="20"/>
+<text class="t-em" x="773" y="555">Monitor</text>
+<text class="t-tag" x="922" y="548" text-anchor="end">OPTIONAL</text>
+<text class="t-d" x="773" y="576">Faults, long silences</text>
+
+<path class="edge" d="M610 504 V552 Q610 560 618 560 H727" marker-end="url(#ah)"/>
+<text class="t-edge" x="672" y="553" text-anchor="middle">reads</text>
+
+<!-- ============ Lane 3: you ============ -->
+<rect class="lane-you" x="8" y="640" width="944" height="138" rx="14"/>
+<text class="t-lane c-you" x="28" y="666">YOU</text>
+<text class="t-lanedesc" x="152" y="666">Your browser and phone</text>
+
+<path class="edge" d="M320 504 V682" marker-end="url(#ah)"/>
+<text class="t-edge" x="330" y="570">pages + exports</text>
+
+<rect class="node" x="24" y="684" width="660" height="78" rx="10"/>
+<use href="#i-pin" class="ic c-you" x="40" y="702" width="20" height="20"/>
+<text class="t-item" x="68" y="717">Trip map</text>
+<text class="t-d" x="68" y="738">Each route drawn</text>
+<use href="#i-pencil" class="ic c-you" x="200" y="702" width="20" height="20"/>
+<text class="t-item" x="228" y="717">Business purpose</text>
+<text class="t-d" x="228" y="738">Notes per trip</text>
+<use href="#i-table" class="ic c-you" x="360" y="702" width="20" height="20"/>
+<text class="t-item" x="388" y="717">Mileage log</text>
+<text class="t-d" x="388" y="738">CSV or XLSX export</text>
+<use href="#i-pulse" class="ic c-you" x="520" y="702" width="20" height="20"/>
+<text class="t-item" x="548" y="717">Device health</text>
+<text class="t-d" x="548" y="738">Errors and contact</text>
+
+<path class="edge" d="M832 590 V682" marker-end="url(#ah)"/>
+<text class="t-edge" x="842" y="630">ntfy push</text>
+
+<rect class="node opt" x="729" y="684" width="207" height="78" rx="10"/>
+<use href="#i-phone" class="ic c-you" x="745" y="702" width="20" height="20"/>
+<text class="t-item" x="773" y="717">Phone alerts</text>
+<text class="t-tag" x="922" y="702" text-anchor="end">OPTIONAL</text>
+<text class="t-d" x="773" y="738">via self-hosted ntfy</text>
+      </svg>
