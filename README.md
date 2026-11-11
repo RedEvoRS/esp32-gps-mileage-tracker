@@ -60,18 +60,10 @@ nothing on `main` applies to it.
 
 ## How it works
 
-```
-Target device: LilyGO T-Beam Supreme (ESP32-S3 + MAX-M10S GPS)
-       | records GPX to
-       v
-SanDisk 32 GB Max Endurance microSD
-       | uploads over home WiFi
-       v
-POST /upload (GPX) --> mileage-ingest --> GPX + JSON summary
-                                      |
-                                      v
-                         read-only viewer and exports
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
+  <img src="docs/images/how-it-works-light.svg" alt="Flowchart in three lanes. In the car: ignition on switches the board on from car USB power; trip detection starts a trip above 5 mph for 10 s and ends it below 2 mph for 5 min; recording saves every GPS point as GPX on the microSD card, or internal flash without a card; at ignition off the board closes the trip, runs about 10 minutes on battery to upload over home WiFi, then powers off until the next ignition. Over home WiFi with a bearer token, trips go to POST /upload and the health journal to POST /v1/device-events; the board deletes a trip only after the server replies 200 OK. On the home server, ingest (port 8090) adds up the miles and writes the trip files and the health journal (events.db); the viewer (port 8091) reads both; an optional monitor reads events.db. For you: a trip map, business purpose notes, a CSV or XLSX mileage log, Device health, and optional phone alerts through self-hosted ntfy.">
+</picture>
 
 The board decides on its own when a trip starts and stops. Going faster than
 5 mph for 10 seconds starts one. Staying under 2 mph for 5 minutes ends it,
