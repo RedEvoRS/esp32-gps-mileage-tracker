@@ -727,8 +727,10 @@ What it does:
 - **Diagnostics retention** — on **Admin** (`/admin`), set how many days of
   events to keep: **365** by default, whole numbers **30–3650**. Only an admin
   can save it; the page shows who last saved it and when. Ingest deletes older
-  events on the next diagnostics upload, at most once per hour per worker,
-  in batches of 250. Current device health and the newest event are kept.
+  events on the next diagnostics upload in batches of 250, with a two-second
+  budget checked between batches. Unfinished cleanup continues on the next
+  upload; completed or failed attempts wait an hour. Current device health
+  and the newest event are kept.
   Deleted pages are reused; cleanup does not shrink the database file.
   The viewer saves the setting in `annotations.db`, then publishes a tiny
   `diagnostics.json` in `ingest-settings`, mounted at `/settings` writable in

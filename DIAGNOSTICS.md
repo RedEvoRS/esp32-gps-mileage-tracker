@@ -1996,12 +1996,16 @@ events to keep**. The first value is **365**; only whole numbers from **30 to
 last admin who saved it and the time. This affects event history only: device
 contact, boots, current snapshots and conditions remain available.
 
-The setting takes effect the next time the tracker uploads diagnostics, subject
-to a cleanup limit of once per hour in each ingest worker. After the upload has
-committed, ingest deletes events whose server `received_at` is older than the
-chosen number of days, in separate transactions of at most 250 rows, yielding
-between batches. The highest rowid is always kept, even if old: the event table
-has no `AUTOINCREMENT`, and export cursors require rowids not to be reused.
+The setting takes effect the next time the tracker uploads diagnostics. After
+the upload has committed, ingest deletes events whose server `received_at` is
+older than the chosen number of days, in separate transactions of at most 250
+rows, yielding between batches. Each call has a two-second budget, checked
+between batches; a batch already running can finish. Unfinished cleanup
+continues on the next upload without waiting an hour. Completed or failed
+attempts wait an hour in each ingest worker. Logs report how many rows were
+removed and whether more remain. The highest rowid is always kept, even if
+old: the event table has no `AUTOINCREMENT`, and export cursors require rowids
+not to be reused.
 Cleanup errors are logged and never change an accepted upload's response.
 The diagnostics schema stays at version 1, DELETE journal and synchronous=FULL.
 There is no `VACUUM`: deleted pages are reused, so the database stops growing

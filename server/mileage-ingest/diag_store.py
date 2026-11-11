@@ -10,7 +10,7 @@ import logging
 import os
 import sqlite3
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
@@ -24,6 +24,7 @@ SCHEMA_VERSION = 1
 MAX_STATUS_STEP = 1_000_000
 PRUNE_INTERVAL_SECONDS = 3600
 PRUNE_BATCH_SIZE = 250
+PRUNE_BUDGET_SECONDS = 2.0
 SCHEMA = (
     "CREATE TABLE IF NOT EXISTS schema_version ("
     "singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL)",
@@ -66,6 +67,7 @@ class DiagnosticsStore:
         self.settings_path = SETTINGS_PATH
         self._settings_problems = set()
         self._last_prune = float("-inf")
+        self._prune_pending = False
         self._prune_lock = Lock()
 
     def retention_days(self):
@@ -92,22 +94,25 @@ class DiagnosticsStore:
         return DEFAULT_DAYS
 
     def prune_if_due(self):
-        """Best effort after upload commit; one attempt/hour per worker, no signals."""
+        """Best effort; unfinished cleanup resumes next upload, failures wait an hour."""
         if not self._prune_lock.acquire(blocking=False):
             return
         try:
             now = time.monotonic()
-            if now - self._last_prune < PRUNE_INTERVAL_SECONDS:
+            if not self._prune_pending and now - self._last_prune < PRUNE_INTERVAL_SECONDS:
                 return
             self._last_prune = now  # Failed attempts are throttled too.
+            self._prune_pending = False  # Only a successful budget pause bypasses the throttle.
             self.prune(self.retention_days())
         finally:
             self._prune_lock.release()
 
     def prune(self, days):
+        deadline = time.monotonic() + PRUNE_BUDGET_SECONDS
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         removed = 0
-        while True:
+        more = False
+        while time.monotonic() < deadline:
             with self._transaction() as db:
                 # Receipt times are datetime.isoformat() UTC (+00:00), with
                 # either six fractional digits or no fraction at exact seconds.
@@ -122,7 +127,16 @@ class DiagnosticsStore:
             if count < PRUNE_BATCH_SIZE:
                 break
             time.sleep(0.01)  # Yield between committed batches to waiting readers/writers.
-        logging.getLogger(__name__).info("Diagnostics retention removed %s event row(s)", removed)
+        else:
+            # A full last batch may have finished cleanup exactly at the budget.
+            # Check before bypassing the hourly throttle on the next upload.
+            with closing(self._connect()) as db:
+                more = bool(db.execute(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE received_at<? "
+                    "AND rowid<(SELECT MAX(rowid) FROM events))", (cutoff,)).fetchone()[0])
+        self._prune_pending = more
+        logging.getLogger(__name__).info(
+            "Diagnostics retention removed %s event row(s); more remain: %s", removed, more)
         return removed
 
     def _connect(self):

@@ -1825,7 +1825,7 @@ ACCOUNT_HTML = """
 <p><a class="btn secondary" href="{{ url_for('admin_history') }}">Change history</a></p>
 <h2>Diagnostics history</h2>
 <p>Events older than the number of days below are deleted. Current device health is kept.
-This takes effect the next time the tracker uploads diagnostics; cleanup runs at most once per hour in each ingest worker.</p>
+Older events are deleted the next time the tracker uploads diagnostics.</p>
 {% if retention_warning %}<p role="alert">{{ retention_warning }}</p>{% endif %}
 <form method="post" class="login-form">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

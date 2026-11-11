@@ -415,8 +415,10 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   viewer mirrors JSON atomically to `ingest-settings:/settings`, read-only in
   ingest. Both images prepare app-owned `/settings`. Viewer startup tolerates
   mirror failure and Admin warns; ingest defaults to 365 for missing/invalid
-  settings. After diagnostics commit, ingest prunes at most hourly per worker,
-  250 rows per transaction, preserving highest rowid and all current health.
+  settings. After diagnostics commit, ingest prunes 250 rows per transaction
+  with a two-second budget checked between batches. Unfinished cleanup resumes
+  on the next upload; completed or failed attempts wait an hour. Highest rowid
+  and all current health are preserved.
   No VACUUM or schema change; errors never change upload responses. GELF/Loki
   continue past a pruned cursor only if no rows at/below it remain and highest
   rowid is at least the cursor; other restore rules still reset. Backups include

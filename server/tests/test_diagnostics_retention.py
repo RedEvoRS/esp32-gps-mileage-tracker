@@ -38,6 +38,7 @@ class RetentionAdminTests(unittest.TestCase):
         self.assertIn(b'name="events_retention_days"', response.data)
         self.assertIn(b'value="365"', response.data)
         self.assertIn(b'next time the tracker uploads diagnostics', response.data)
+        self.assertNotIn(b'ingest worker', response.data)
         for days in (30, 3650, 400):
             self.assertEqual(self.save(str(days)).status_code, 302)
             self.assertEqual(settings.current()['days'], days)
@@ -165,6 +166,93 @@ class RetentionIngestTests(unittest.TestCase):
     setUp = ingest_tests.DiagnosticsIngest.setUp
     post = ingest_tests.DiagnosticsIngest.post
     rows = ingest_tests.DiagnosticsIngest.rows
+
+    def seed_old_events(self, count):
+        body = batch()
+        body['events'] = [dict(body['events'][0], sequence=n) for n in range(1, count + 1)]
+        store = self.ing.DIAGNOSTICS_STORE
+        store.accept('tracker-1', body)
+        old = (datetime.now(timezone.utc) - timedelta(days=366)).isoformat()
+        with closing(sqlite3.connect(store.path)) as db, db:
+            db.execute('UPDATE events SET received_at=?', (old,))
+
+    def test_budget_preserves_ack_and_next_upload_finishes_before_hourly_throttle(self):
+        store = self.ing.DIAGNOSTICS_STORE
+        self.seed_old_events(350)
+        store.settings_path = self.root / 'diagnostics.json'
+        store.settings_path.write_text('{"events_retention_days":30}')
+        with patch('diag_store.time.monotonic', return_value=0) as clock, \
+                patch('diag_store.time.sleep') as pause, patch.object(store, 'prune', wraps=store.prune) as prune:
+            def yield_between_batches(seconds):
+                self.assertEqual(seconds, 0.01)
+                clock.return_value += 2  # Exhaust the budget without a real sleep.
+            pause.side_effect = yield_between_batches
+            with self.assertLogs('diag_store', level='INFO') as logs:
+                response = self.post(batch(2, 351))
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json(), {'accepted': [{'boot_id': ingest_tests.BOOT, 'sequence': 351}]})
+            self.assertEqual(self.rows('SELECT MIN(rowid),MAX(rowid),COUNT(*) FROM events'), [(251, 351, 101)])
+            self.assertIn('250 event row(s); more remain: True', logs.output[-1])
+
+            with self.assertLogs('diag_store', level='INFO') as logs:
+                response = self.post(batch(3, 352))
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json(), {'accepted': [{'boot_id': ingest_tests.BOOT, 'sequence': 352}]})
+            self.assertEqual(self.rows('SELECT rowid FROM events ORDER BY rowid'), [(351,), (352,)])
+            self.assertIn('100 event row(s); more remain: False', logs.output[-1])
+            self.assertEqual(prune.call_count, 2)
+            pause.assert_called_once_with(0.01)
+
+            with closing(sqlite3.connect(store.path)) as db, db:
+                db.execute("UPDATE events SET received_at='2000-01-01T00:00:00+00:00' WHERE rowid=351")
+            for stamp in (2, 3601):
+                clock.return_value = stamp
+                self.assertEqual(self.post(batch(3, 352)).status_code, 200)
+                self.assertEqual(prune.call_count, 2)
+                self.assertEqual(self.rows('SELECT rowid FROM events ORDER BY rowid'), [(351,), (352,)])
+            clock.return_value = 3602
+            self.assertEqual(self.post(batch(4, 353)).status_code, 200)
+            self.assertEqual(prune.call_count, 3)
+            self.assertEqual(self.rows('SELECT rowid FROM events ORDER BY rowid'), [(352,), (353,)])
+
+    def test_budget_expiry_after_exact_batch_keeps_newest_and_restores_throttle(self):
+        store = self.ing.DIAGNOSTICS_STORE
+        self.seed_old_events(251)
+        with patch('diag_store.time.monotonic', return_value=0) as clock, \
+                patch('diag_store.time.sleep') as pause, patch.object(store, 'prune', wraps=store.prune) as prune:
+            def yield_between_batches(_):
+                clock.return_value = 2
+            pause.side_effect = yield_between_batches
+            with self.assertLogs('diag_store', level='INFO') as logs:
+                self.assertEqual(self.post().status_code, 200)
+            self.assertEqual(self.rows('SELECT rowid FROM events'), [(251,)])
+            self.assertIn('250 event row(s); more remain: False', logs.output[-1])
+            self.assertEqual(self.post(batch(2, 252)).status_code, 200)
+            self.assertEqual(prune.call_count, 1)
+            self.assertEqual(self.rows('SELECT rowid FROM events ORDER BY rowid'), [(251,), (252,)])
+
+    def test_failed_continuation_preserves_ack_and_is_throttled(self):
+        store = self.ing.DIAGNOSTICS_STORE
+        self.seed_old_events(350)
+        with patch('diag_store.time.monotonic', return_value=0) as clock, patch('diag_store.time.sleep') as pause:
+            def yield_between_batches(_):
+                clock.return_value = 2
+            pause.side_effect = yield_between_batches
+            self.assertEqual(self.post(batch(2, 351)).status_code, 200)
+            self.assertEqual(self.rows('SELECT COUNT(*) FROM events'), [(101,)])
+            with patch.object(store, 'prune', side_effect=sqlite3.OperationalError('synthetic')) as prune:
+                with self.assertLogs(self.ing.app.logger, level='WARNING'):
+                    response = self.post(batch(3, 352))
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.get_json(), {'accepted': [{'boot_id': ingest_tests.BOOT, 'sequence': 352}]})
+                self.assertEqual(prune.call_count, 1)
+                for stamp in (2, 3601):
+                    clock.return_value = stamp
+                    self.assertEqual(self.post(batch(3, 352)).status_code, 200)
+                    self.assertEqual(prune.call_count, 1)
+            clock.return_value = 3602
+            self.assertEqual(self.post(batch(4, 353)).status_code, 200)
+            self.assertEqual(self.rows('SELECT rowid FROM events ORDER BY rowid'), [(351,), (352,), (353,)])
 
     def test_missing_valid_invalid_and_unreadable_settings(self):
         store = self.ing.DIAGNOSTICS_STORE
