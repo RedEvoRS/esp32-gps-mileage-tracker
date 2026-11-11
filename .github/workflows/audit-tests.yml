@@ -19,9 +19,8 @@ jobs:
     # The repo is meant to go public, so files, commit messages and author
     # emails must carry nothing personal. PII_DENYLIST is a repo secret
     # (one term per line: real name, personal email, street, SSID, ...).
-    # Skipped on runs Dependabot starts: its PRs only bump versions, and
-    # it can't read the secret anyway. Every push to main still scans.
-    if: github.actor != 'dependabot[bot]'
+    # Dependabot cannot read the secret; only its scan is skipped. The
+    # tools and firmware release checks still run on every PR.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -34,7 +33,14 @@ jobs:
         run: command -v jq || (sudo apt-get update && sudo apt-get install -y jq)
       - name: Test the scanner
         run: python -m unittest discover -s tools -v
+      - name: Check firmware version increase and reviewed release notes
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python tools/firmware_release.py check --base "$BASE_SHA" --ref "$HEAD_SHA"
       - name: Scan files, and on a PR its commits, for personal info
+        if: github.actor != 'dependabot[bot]'
         env:
           PII_DENYLIST: ${{ secrets.PII_DENYLIST }}
           COMMITS: ${{ github.event_name == 'pull_request' && format('{0}..{1}', github.event.pull_request.base.sha, github.event.pull_request.head.sha) || '' }}
@@ -284,7 +290,8 @@ jobs:
             exit 0
           fi
           echo "$TEST_USER ALL=(ALL) ALL" | sudo tee /etc/sudoers.d/zz-installer-test
-          if sudo -u "$TEST_USER" -H bash "$INSTALLER" < /dev/null > nosudo.log 2>&1; then
+          # The runner owns these logs; only the installer changes user.
+          if { sudo -u "$TEST_USER" -H bash "$INSTALLER" < /dev/null; } > nosudo.log 2>&1; then
             cat nosudo.log
             echo "install.sh carried on without sudo"
             exit 1
@@ -330,8 +337,8 @@ jobs:
           fi
           echo "$TEST_USER ALL=(ALL) ALL" | sudo tee /etc/sudoers.d/zz-installer-test
           status=0
-          sudo -u "$TEST_USER" -H env INSTALL_KEEP_LOGIN=y INSTALL_KEEP_OUTPUTS=y INSTALL_VIEWER_PASSWORD="$PASSWORD" \
-            bash "$INSTALLER" < /dev/null > rerun.log 2>&1 || status=$?
+          { sudo -u "$TEST_USER" -H env INSTALL_KEEP_LOGIN=y INSTALL_KEEP_OUTPUTS=y INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+            bash "$INSTALLER" < /dev/null; } > rerun.log 2>&1 || status=$?
           echo "$TEST_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/zz-installer-test
           cat rerun.log
           test "$status" = 0
@@ -374,8 +381,8 @@ jobs:
           before=$(sudo sha256sum "$old.gpx" "$old.json")
           pids=()
           for n in 1 2; do
-            sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
-              bash "$INSTALLER" --check < /dev/null > "check$n.log" 2>&1 &
+            { sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+              bash "$INSTALLER" --check < /dev/null; } > "check$n.log" 2>&1 &
             pids+=($!)
           done
           failed=0
@@ -393,8 +400,8 @@ jobs:
         run: |
           dir=$(dirname "$INSTALLER")
           sudo -u "$TEST_USER" sed -i 's/$/\r/' "$dir/.env"
-          if sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
-              bash "$INSTALLER" --check < /dev/null > crlf.log 2>&1; then
+          if { sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+              bash "$INSTALLER" --check < /dev/null; } > crlf.log 2>&1; then
             cat crlf.log
             echo "--check passed with a CRLF .env"
             exit 1
@@ -409,9 +416,9 @@ jobs:
         run: |
           dir=$(dirname "$INSTALLER")
           before=$(docker inspect -f '{{.State.StartedAt}}' mileage-ingest mileage-viewer)
-          sudo -u "$TEST_USER" -H env INSTALL_KEEP_LOGIN=y INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+          { sudo -u "$TEST_USER" -H env INSTALL_KEEP_LOGIN=y INSTALL_VIEWER_PASSWORD="$PASSWORD" \
             INSTALL_KEEP_OUTPUTS=n INSTALL_OUTPUTS=metrics INSTALL_STALE_DAYS=7 \
-            bash "$INSTALLER" < /dev/null > metrics.log 2>&1 || status=$?
+            bash "$INSTALLER" < /dev/null; } > metrics.log 2>&1 || status=$?
           cat metrics.log
           test "${status:-0}" = 0
           grep -q 'Monitor enabled; ntfy disabled, Graylog disabled, Prometheus enabled, Loki disabled' metrics.log \
@@ -420,8 +427,8 @@ jobs:
           test "$before" = "$(docker inspect -f '{{.State.StartedAt}}' mileage-ingest mileage-viewer)"
           test "$(curl -s -o /dev/null -w '%{http_code}' "http://$LAN_ADDR:8093/metrics")" = 401
           test "$(sudo grep -c METRICS_TOKEN "$dir/.env" || true)" = 0
-          sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
-            bash "$INSTALLER" --check < /dev/null > metrics-check.log 2>&1
+          { sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+            bash "$INSTALLER" --check < /dev/null; } > metrics-check.log 2>&1
           cat metrics-check.log
           test "$(grep -c '  FAIL  ' metrics-check.log)" = 0
           grep -q 'Metrics answer with the token (200)' metrics-check.log
@@ -433,8 +440,8 @@ jobs:
           case $pointer in /*) monitor_file=$pointer ;; *) monitor_file=$dir/${pointer#./} ;; esac
           sudo grep -q '^MONITOR_STALE_DAYS=7$' "$monitor_file"
           sudo -u "$TEST_USER" sed -i 's/^MONITOR_STALE_DAYS=7$/MONITOR_STALE_DAYS=8/' "$monitor_file"
-          if sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
-              bash "$INSTALLER" --check < /dev/null > stale-monitor.log 2>&1; then
+          if { sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+              bash "$INSTALLER" --check < /dev/null; } > stale-monitor.log 2>&1; then
             cat stale-monitor.log
             echo "--check passed with an unapplied monitor.env edit"
             exit 1
@@ -443,13 +450,13 @@ jobs:
           grep -q 'The monitor is running with older settings than monitor.env' stale-monitor.log
           test "$(grep -c '  FAIL  ' stale-monitor.log)" = 1
           sudo -u "$TEST_USER" sed -i 's/^MONITOR_STALE_DAYS=8$/MONITOR_STALE_DAYS=7/' "$monitor_file"
-          sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
-            bash "$INSTALLER" --check < /dev/null > metrics-check2.log 2>&1
+          { sudo -u "$TEST_USER" -H env INSTALL_VIEWER_PASSWORD="$PASSWORD" \
+            bash "$INSTALLER" --check < /dev/null; } > metrics-check2.log 2>&1
           grep -q 'running with the settings in monitor.env and its Compose configuration' metrics-check2.log
       - name: --check reports a stopped viewer without blaming its config
         run: |
           docker stop mileage-viewer
-          if sudo -u "$TEST_USER" -H bash "$INSTALLER" --check < /dev/null > stopped.log 2>&1; then
+          if { sudo -u "$TEST_USER" -H bash "$INSTALLER" --check < /dev/null; } > stopped.log 2>&1; then
             cat stopped.log
             echo "--check passed with the viewer stopped"
             exit 1

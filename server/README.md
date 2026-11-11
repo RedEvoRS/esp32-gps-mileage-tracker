@@ -350,6 +350,15 @@ uses `srv-v0.01`. These server tags are separate from firmware tags. Do not
 tag a dirty build as a release: its uncommitted changes cannot be recovered
 from a Git tag.
 
+Server `srv-` tagging stays manual after the verified deploy. Merging a
+`firmware/VERSION` bump automatically publishes the firmware release as
+Latest immediately, before the server is deployed or the board is flashed,
+and then uploads its assets. That release can include a new server version.
+If it fails, re-run all Firmware release jobs, or manually run Release assets
+(`release.yml`) with the published tag if only assets failed. See
+[Firmware versions and releases](../firmware/README.md#firmware-versions-and-releases)
+for the reviewed release notes and recovery steps.
+
 From this folder, `python3 stamp_version.py` prints the release plus the first
 ten Git commit characters, for example `v0.01+abcdef1234`. Any uncommitted
 tracked change anywhere in the repository appends `-dirty`; untracked and

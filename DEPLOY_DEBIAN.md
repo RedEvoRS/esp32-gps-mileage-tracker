@@ -595,6 +595,13 @@ do not open a separate version-only PR. Use `v<major>.<two-digit minor>`
 tag that exact merged commit `srv-v0.NN`, for example `srv-v0.02` for release
 `v0.02` (`srv-v0.01` for the initial release). These tags identify server
 releases separately from firmware.
+Server tagging stays manual after a verified deploy. Merging a
+`firmware/VERSION` bump publishes its firmware release as Latest immediately,
+before this deployment or a board flash; the release may include the new
+server version. If that release run fails, re-run all Firmware release jobs,
+or manually run Release assets (`release.yml`) with its published tag if
+only assets failed. The reviewed notes and full recovery steps are in
+[Firmware versions and releases](firmware/README.md#firmware-versions-and-releases).
 Do not tag dirty builds as releases: a tag cannot preserve uncommitted code.
 
 `python3 stamp_version.py`, run in the server folder, prints the release plus

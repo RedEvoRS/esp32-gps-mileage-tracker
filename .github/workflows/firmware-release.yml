@@ -1,0 +1,88 @@
+name: Firmware release
+
+on:
+  push:
+    branches: [main]
+    paths: [firmware/VERSION]
+
+permissions:
+  contents: read
+
+# Hold the lock through asset upload, including retries of an older run.
+concurrency:
+  group: firmware-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'RedEvoRS/esp32-gps-mileage-tracker'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.notes.outputs.tag }}
+    env:
+      TZ: UTC
+      RELEASE_SHA: ${{ github.sha }}
+      BASE_SHA: ${{ github.event.before }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Validate version increase and assemble reviewed notes
+        id: notes
+        run: |
+          python tools/firmware_release.py render --base "$BASE_SHA" --ref "$RELEASE_SHA" \
+            --body-file "$RUNNER_TEMP/firmware-release.md" --github-output "$GITHUB_OUTPUT"
+      - name: Create annotated tag without moving an existing tag
+        env:
+          RELEASE_TAG: ${{ steps.notes.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.notes.outputs.version }}
+        shell: bash
+        run: |
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            tagged_commit=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
+            if [[ "$tagged_commit" != "$RELEASE_SHA" ]]; then
+              echo "::error::Tag $RELEASE_TAG already points to $tagged_commit, expected $RELEASE_SHA; refusing to move it"
+              exit 1
+            fi
+            echo "Tag $RELEASE_TAG already points to the release commit"
+          else
+            git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              tag -a "$RELEASE_TAG" "$RELEASE_SHA" -m "Supreme firmware $RELEASE_VERSION"
+            git push origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          fi
+      - name: Publish release before uploading assets
+        env:
+          RELEASE_TAG: ${{ steps.notes.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.notes.outputs.version }}
+        shell: bash
+        run: |
+          if unfinished=$(gh release view "$RELEASE_TAG" --json isDraft,isPrerelease --jq '.isDraft or .isPrerelease'); then
+            if [[ "$unfinished" != false ]]; then
+              echo '::error::Existing release must be published and not a prerelease; finish it by hand, then re-run'
+              exit 1
+            fi
+            echo "Release $RELEASE_TAG already exists; continuing with its assets"
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --latest \
+              --title "Supreme firmware $RELEASE_VERSION" --notes-file "$RUNNER_TEMP/firmware-release.md"
+          fi
+
+  # GITHUB_TOKEN-created tags/releases do not trigger another workflow run.
+  assets:
+    if: github.repository == 'RedEvoRS/esp32-gps-mileage-tracker'
+    needs: publish
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.publish.outputs.tag }}

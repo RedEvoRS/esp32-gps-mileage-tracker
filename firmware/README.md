@@ -614,24 +614,47 @@ trips and settings. Reflashing does not erase trips on the card.
 Versions `v0.xx` were beta; `v1.00` is the first public release. Builds
 between bumps show the last number plus their own commit.
 
-For maintainers preparing a new release, such as `v1.01` (these steps are
+For maintainers preparing a new release, such as `v1.06` (these steps are
 not needed to install or update a tracker):
 
-1. Change `firmware/VERSION` to the new version in its own commit, titled
-   `Firmware v1.01`, and merge it.
-2. On that merged commit, create and push an annotated tag:
-   `git tag -a fw-v1.01 -m "Firmware v1.01"`, then `git push origin fw-v1.01`.
-3. Run `python tools/stamp_firmware_version.py`, build from that commit, then flash.
-4. Publish a GitHub release from the tag, titled `Supreme firmware v1.01`,
-   as a full release marked **Latest**:
-   `gh release create fw-v1.01 --verify-tag --latest --title "..." --notes-file notes.md`.
-   Publishing triggers the source bundle and checksum asset upload; `srv-v*` releases get the same bundle.
-   Don't mark it pre-release: a pre-release can't be Latest, and the frozen
-   "T-Beam V1.2 final" release would then look like the current firmware.
-   Copy the previous release's notes and update them: what's new, what works
-   and what's still unproven (the open `Shakedown:` issues), the build steps,
-   and whether the server must be updated first. Attach no binary, because
-   each owner's WiFi password and upload token are compiled in.
+1. Increase `firmware/VERSION` in the PR that ships the change. Add
+   `release-notes/fw-v1.06.md` with only that version's summary paragraph,
+   and review it with the code. The shared Install section lives once in
+   `release-notes/install.md`; the workflow appends it without inventing notes.
+2. Run `python tools/firmware_release.py check --base origin/main` and preview
+   the full body with `python tools/firmware_release.py render`. CI checks
+   that the version increases and its notes exist and are non-empty.
+3. Merge the PR to main. **This publishes the release immediately, before the
+   server is deployed or the board is flashed.** Firmware release creates an
+   annotated `fw-v1.06` tag on the merge commit, with the UTC bot tagger and
+   message `Supreme firmware v1.06`, and publishes a full release of that name
+   marked **Latest**. It then calls Release assets (`release.yml`) to upload
+   `setup.sh`, `flash.ps1`, `flash.sh`, `mileage-tracker-fw-v1.06.tar.gz` and
+   `SHA256SUMS`. There is a short interval where the release is public but its
+   assets are not ready; wait for both jobs to pass before using it.
+4. Update and verify the server first, then build and flash the tracker as
+   described above. Publication is not deployment or hardware acceptance.
+   No firmware binary is attached: each owner's WiFi password and upload
+   token are compiled in. For a source build, run
+   `python tools/stamp_firmware_version.py` before compiling.
+
+Server `srv-<VERSION>` tags stay manual, made only after a verified deploy
+of the clean merged commit; a firmware release can include a server version
+that has not yet been deployed. See [the server version runbook](../DEPLOY_DEBIAN.md#server-version-for-each-deployment).
+
+If Firmware release fails, inspect the failed job and **re-run all jobs** for
+that push after fixing any transient access or service problem. A tag on the
+same commit and an existing published release are reused; the workflow does
+not change existing notes or mark an older release Latest again. A tag on a
+different commit fails loudly: never move or delete it to force a retry;
+investigate and prepare a new version if needed. An existing draft or
+prerelease must be finished as a full published release by hand before retrying.
+If the release is published and only assets failed, run **Release assets**
+manually from Actions with `tag` set to `fw-v1.06`, or use
+`gh workflow run release.yml -f tag=fw-v1.06`. This rebuilds and replaces the
+assets on that release. A release published by hand still triggers the same
+asset workflow; the automatic path calls it directly because token-created
+releases do not trigger other workflows.
 
 Keep `firmware/VERSION` to one line in the form `v<major>.<two-digit minor>`:
 major 0–99 without leading zeros, such as `v0.05` or `v1.00`. The stamp script
