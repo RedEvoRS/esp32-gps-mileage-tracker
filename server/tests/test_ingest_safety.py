@@ -62,6 +62,87 @@ class UploadSafety(unittest.TestCase):
         gpx = self.root / response.get_json()["stored_as"]
         return gpx, gpx.with_suffix(".json")
 
+    def symlink(self, link, target, directory=False):
+        try:
+            link.symlink_to(target, target_is_directory=directory)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlink creation unavailable: {type(exc).__name__}")
+
+    def assert_storage_error(self, target):
+        with self.assertLogs(self.ing.app.logger, "WARNING"):
+            response = self.upload()
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.get_json(), {"error": "server error writing trip"})
+        self.assertNotIn(str(target), response.get_data(as_text=True))
+
+    def test_symlinked_target_month_cannot_write_outside_data_root(self):
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside)
+            self.symlink(self.root / "2026-04", target, directory=True)
+            real_stat = Path.stat
+            outside_stats = []
+
+            def stat(path, *args, **kwargs):
+                if target in path.parents or path.parent == self.root / "2026-04":
+                    outside_stats.append(path)
+                    raise AssertionError("outside trip stat")
+                return real_stat(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "stat", stat):
+                self.assert_storage_error(target)
+            self.assertEqual(outside_stats, [])
+            self.assertEqual(list(target.iterdir()), [])
+
+    def test_symlinked_other_month_is_skipped_without_trip_stat(self):
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside)
+            (target / "2026-04-14T14-30-00Z.gpx").write_bytes(b"outside-trip-sentinel")
+            self.symlink(self.root / "2026-03", target, directory=True)
+            real_stat = Path.stat
+            outside_stats = []
+
+            def stat(path, *args, **kwargs):
+                if target in path.parents or path.parent == self.root / "2026-03":
+                    outside_stats.append(path)
+                    raise AssertionError("outside trip stat")
+                return real_stat(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "stat", stat), self.assertLogs(self.ing.app.logger, "WARNING"):
+                response = self.upload()
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(outside_stats, [])
+            self.assertEqual(response.json["stored_as"], "2026-04/2026-04-14T14-30-00Z.gpx")
+            self.assertEqual([p.read_bytes() for p in target.iterdir()], [b"outside-trip-sentinel"])
+
+    def test_final_trip_symlinks_cannot_escape_data_root(self):
+        month = self.root / "2026-04"
+        month.mkdir()
+        with tempfile.TemporaryDirectory() as outside:
+            for suffix in (".gpx", ".json"):
+                for present in (False, True):
+                    with self.subTest(suffix=suffix, present=present):
+                        target = Path(outside) / ("private" + suffix)
+                        if present:
+                            target.write_bytes(b"outside-trip-sentinel")
+                        link = month / ("2026-04-14T14-30-00Z" + suffix)
+                        self.symlink(link, target)
+                        try:
+                            with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("outside read")) as read, \
+                                    mock.patch.object(self.ing, "_atomic_write_bytes",
+                                                      side_effect=AssertionError("trip written")) as write:
+                                self.assert_storage_error(target)
+                            read.assert_not_called()
+                            write.assert_not_called()
+                            self.assertTrue(link.is_symlink())
+                            self.assertEqual(list(month.iterdir()), [link])
+                            if present:
+                                self.assertEqual(target.read_bytes(), b"outside-trip-sentinel")
+                                target.unlink()
+                            else:
+                                self.assertFalse(target.exists())
+                        finally:
+                            link.unlink()
+
     def test_rmc_whole_and_fractional_epochs_across_midnight(self):
         # Invented stationary coordinates; only the timestamp format matters.
         epochs = ["2026-04-14T23:59:59.990Z", "2026-04-15T00:00:00Z",

@@ -100,6 +100,8 @@ so they can never be left partially written:
   speeds, bounding box) so other tools can list and total trips without
   re-parsing every track
 
+Ingest refuses trip folders or files that resolve outside its data folder.
+
 Distance is the great-circle (haversine) sum over consecutive fixes, with
 three rules, all in `summarize()`:
 

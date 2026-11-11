@@ -273,7 +273,21 @@ def _stored_summary(json_file):
     return summary
 
 
-def _stored_trip_directories(safe_id):
+def _checked_trip_path(root, path):
+    """Resolve a trip folder or final file inside the resolved data root."""
+    resolved = path.resolve()
+    if root not in resolved.parents:
+        raise ValueError(f"Trip path escapes data root: {path}")
+    return resolved
+
+
+def _trip_paths(root, directory, safe_id):
+    directory = _checked_trip_path(root, directory)
+    return (directory, *(_checked_trip_path(root, directory / f"{safe_id}{suffix}")
+                         for suffix in (".gpx", ".json")))
+
+
+def _stored_trip_directories(root, safe_id):
     """Find either half of a stored pair; caller must hold _upload_lock.
 
     Timezone changes and undated receipt times can change the month. Look
@@ -282,14 +296,21 @@ def _stored_trip_directories(safe_id):
     Check known filenames in each month instead of reading every trip.
     """
     matches = []
-    for directory in DATA_ROOT.iterdir():
+    for directory in root.iterdir():
         if not re.fullmatch(r"[0-9]{4}-[0-9]{2}", directory.name):
             continue
-        for suffix in (".gpx", ".json"):
+        try:
+            directory = _checked_trip_path(root, directory)
+        except ValueError:
+            app.logger.warning("Skipping month folder outside data root: %s", directory)
+            continue
+        # Check both files before any stat or read, even for a partial pair.
+        directory, gpx_file, json_file = _trip_paths(root, directory, safe_id)
+        for path in (gpx_file, json_file):
             try:
                 # stat() propagates permission/I/O errors: an unreadable
                 # original must not be mistaken for a missing record.
-                (directory / f"{safe_id}{suffix}").stat()
+                path.stat()
             except (FileNotFoundError, NotADirectoryError):
                 continue
             matches.append(directory)
@@ -585,18 +606,18 @@ def upload_trip():
         return jsonify(error="invalid GPX: summary cannot be serialized"), 400
 
     try:
+        root = DATA_ROOT.resolve()
         with _upload_lock():
             # Lookup and creation share the lock, including timed trips whose
             # local month changes after DISPLAY_TZ is corrected.
-            existing_dirs = _stored_trip_directories(safe_id)
+            existing_dirs = _stored_trip_directories(root, safe_id)
             if len(existing_dirs) > 1:
                 return jsonify({"error": "trip ID exists in multiple month directories"}), 409
             if existing_dirs:
                 target_dir = existing_dirs[0]
-            gpx_file = target_dir / f"{safe_id}.gpx"
-            json_file = target_dir / f"{safe_id}.json"
+            target_dir, gpx_file, json_file = _trip_paths(root, target_dir, safe_id)
             target_dir.mkdir(parents=True, exist_ok=True)
-            _sync_directory(DATA_ROOT)
+            _sync_directory(root)
             # An ID can be retried, but must never replace another trip's
             # immutable source (including sanitized-ID/device collisions).
             if gpx_file.exists() and gpx_file.read_bytes() != raw:
@@ -654,7 +675,7 @@ def upload_trip():
             {
                 "status": "accepted",
                 "trip_id": trip_id,
-                "stored_as": str(gpx_file.relative_to(DATA_ROOT)),
+                "stored_as": str(gpx_file.relative_to(root)),
                 "distance_miles": record["distance_miles"],
             }
         ),
