@@ -214,8 +214,7 @@ def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=N
                 t["received_at"] = received
             merged.append(t)
         except (OSError, ValueError):
-            broken.append({**t, "has_gpx": False,
-                           "problem": "A merge part is missing or unreadable; restore it or undo the merge."})
+            broken.append({**t, "problem": "A merge part is missing or unreadable; restore it or undo the merge."})
     return ([t for t in trips if t["trip_key"] not in hidden] + merged,
             [t for t in unreadable if t["trip_key"] not in hidden] + broken)
 

@@ -105,15 +105,31 @@ class ViewerMerges(unittest.TestCase):
                         self.assertEqual(trips, [])
                         self.assertEqual([t["trip_key"] for t in unreadable], [key])
                         self.assertIn("A merge part is missing or unreadable", unreadable[0]["problem"])
-                        self.assertFalse(unreadable[0]["has_gpx"])
+                        self.assertTrue(unreadable[0]["has_gpx"])
                         for route, status in (("/", 200), (f"/trip/{key}", 404),
                                               ("/export.csv", 200), ("/export.xlsx", 200)):
                             response = self.client.get(route)
                             self.assertEqual(response.status_code, status)
+                            if route == "/":
+                                self.assertNotIn("(no GPX either)", response.get_data(as_text=True))
                             response.close()
                 finally:
                     source.unlink()
                     source.write_bytes(raw)
+
+    def test_missing_merge_summary_does_not_claim_gpx_is_missing(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        (self.month / "b.json").unlink()
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual(trips, [])
+        self.assertEqual([t["trip_key"] for t in unreadable], [key])
+        self.assertTrue(unreadable[0]["has_gpx"])
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("A merge part is missing or unreadable", response.get_data(as_text=True))
+        self.assertNotIn("(no GPX either)", response.get_data(as_text=True))
+        response.close()
 
     def test_trip_uploaded_after_its_neighbours_were_merged_is_flagged_not_silent(self):
         first, last = self.trip("a", 0), self.trip("c", 200)

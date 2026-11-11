@@ -67,6 +67,7 @@ class ViewerHardeningTests(unittest.TestCase):
 
     def assert_unreadable_link(self, key, target):
         self.signed_in("admin")
+        not_found = self.client.get("/no/such/page").get_data(as_text=True)
         # Catch application summary stats/opens, including a cache hit after
         # replacing a regular summary with a symlink.
         with patch.object(self.viewer, "read_summary", side_effect=AssertionError("outside summary opened")), \
@@ -75,6 +76,12 @@ class ViewerHardeningTests(unittest.TestCase):
             self.assertEqual(trips, [])
             self.assertEqual([t["trip_key"] for t in unreadable], [key])
             self.assertEqual(unreadable[0]["problem"], "the file could not be read")
+            # A containment failure must reach the unreadable result without
+            # probing presence through an escaping month or final-file link.
+            with patch.object(self.viewer.os.path, "lexists", side_effect=AssertionError("unsafe presence probe")):
+                with self.viewer._trip_read(trip_key=key) as (_, trips, targeted_unreadable):
+                    self.assertEqual(trips, [])
+                    self.assertEqual(targeted_unreadable, unreadable)
             self.assertEqual(self.viewer._recording_years(key), {2025, 2026})
             for route, status in (("/", 200), (f"/trip/{key}", 404), ("/export.csv", 200),
                                   ("/export.xlsx", 200), ("/admin/year/2026", 200)):
@@ -94,6 +101,8 @@ class ViewerHardeningTests(unittest.TestCase):
                     self.assertNotIn(str(target), text)
                     if route == "/export.csv":
                         self.assertIn("unreadable", text)
+                    elif route == f"/trip/{key}":
+                        self.assertEqual(text, not_found)
                     elif not route.endswith(".xlsx"):
                         self.assertIn("the file could not be read", text)
                     response.close()
@@ -125,6 +134,33 @@ class ViewerHardeningTests(unittest.TestCase):
         self.assert_unreadable_link("2026-01/drive", target)
         self.assertFalse(self.viewer.load_trips()[1][0]["has_gpx"])
         self.assertEqual(self.client.get("/gpx/2026-01/drive").status_code, 404)
+
+    def test_dangling_escaping_summary_symlink_is_unreadable_without_gpx(self):
+        summary = self.viewer.DATA_ROOT / "2026-01/drive.json"
+        target = self.db.parent / "missing-summary.json"
+        summary.unlink()
+        summary.with_suffix(".gpx").unlink()
+        self.symlink(summary, target)
+        self.assert_unreadable_link("2026-01/drive", target)
+
+    def test_dangling_escaping_month_symlink_is_unreadable_on_targeted_read(self):
+        target = self.db.parent / "missing-month"
+        self.symlink(self.viewer.DATA_ROOT / "2026-02", target, directory=True)
+        with patch.object(self.viewer.os.path, "lexists", side_effect=AssertionError("unsafe presence probe")), \
+                patch.object(self.viewer, "read_summary", side_effect=AssertionError("outside summary opened")), \
+                patch.object(self.viewer, "_summary_stamp", side_effect=AssertionError("outside summary stat")):
+            with self.viewer._trip_read(trip_key="2026-02/missing") as (_, trips, unreadable):
+                self.assertEqual(trips, [])
+                self.assertEqual([t["trip_key"] for t in unreadable], ["2026-02/missing"])
+                self.assertEqual(unreadable[0]["problem"], "the file could not be read")
+
+    def test_missing_trip_page_does_not_log_unreadable_summary(self):
+        self.signed_in("admin")
+        for key in ("2026-01/missing", "2026-02/missing"):
+            with self.subTest(key=key), self.assertNoLogs(self.viewer.app.logger, "WARNING"):
+                response = self.client.get(f"/trip/{key}")
+                self.assertEqual(response.status_code, 404)
+                response.close()
 
     def test_escaping_gpx_is_not_available_to_pages_or_exports(self):
         self.signed_in("admin")
@@ -191,6 +227,8 @@ class ViewerHardeningTests(unittest.TestCase):
                         response = self.client.get(f"/{route}/2026-01/linked")
                         self.assertEqual(response.status_code, 404)
                         self.assertNotIn(b"private-file-sentinel", response.data)
+                        self.assertIn(b"The requested URL was not found on the server", response.data)
+                        self.assertNotIn(b"the file could not be read", response.data)
                         response.close()
             finally:
                 link.unlink()
