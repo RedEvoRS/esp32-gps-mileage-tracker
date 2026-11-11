@@ -16,16 +16,21 @@
 #      file, so an unmounted share can't pass for the off-host copy),
 #      re-reads the newest copy there to confirm it matches byte for byte,
 #      and, with REMOTE_PRUNE=yes, applies the same retention to REMOTE.
+#   5. When due, deep-checks older local and off-host snapshots. A failure
+#      fails the run only after today's backup has completed and been copied.
 #
 # Layout under BACKUP_DIR (the same under REMOTE, minus `latest`):
 #   snapshots/2026-10-06T033012Z/{annotations.db,events.db?,monitor.db?,data/,SHA256SUMS,INFO}
 #   latest -> snapshots/<newest>
 #   last-success
+#   verify-state (local only: last deep check, result, cursor, retry names)
 # REMOTE also holds .mileage-backup-target.
 #
 # `backup.sh --mark-target` writes the marker file (.mileage-backup-target)
 # the destination needs before a backup will copy to it, and
 # `backup.sh --check-target` says whether it is there (exit 0 or 1).
+# `backup.sh --verify` makes a normal backup, then forces a deep check,
+# including when periodic verification is disabled.
 #
 # Restore and restore tests: restore.sh.
 
@@ -39,9 +44,11 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 [[ -n $REMOTE ]] || die "REMOTE is not set in $CONF. A backup that stays on this box isn't one."
 [[ $KEEP_RECENT =~ ^[1-9][0-9]*$ ]] || die "KEEP_RECENT must be a positive number"
 [[ $KEEP_MONTHLY =~ ^[0-9]+$ ]] || die "KEEP_MONTHLY must be a number"
+validate_verify_settings
 require_commands rsync flock sha256sum cmp
 guard_backup_mounts
 
+force_verify=no
 case ${1:-} in
     --mark-target)
         mark_target || die "couldn't write $TARGET_MARKER to $REMOTE"
@@ -49,8 +56,9 @@ case ${1:-} in
         exit 0 ;;
     --check-target)
         if target_marked; then exit 0; else exit 1; fi ;;
+    --verify) force_verify=yes ;;
     '') ;;
-    *) die "unknown option $1 (backup.sh takes --mark-target or --check-target)" ;;
+    *) die "unknown option $1 (backup.sh takes --mark-target, --check-target or --verify)" ;;
 esac
 
 [[ -d $COMPOSE_DIR/data ]] || die "no trip data directory at $COMPOSE_DIR/data"
@@ -59,6 +67,14 @@ mkdir -p "$SNAPSHOTS"
 exec 9> "$BACKUP_DIR/.lock"
 # 75 lets the scheduled catch-up distinguish contention from a failed backup.
 flock -n 9 || { log "another backup is already running"; exit 75; }
+read_verify_state
+
+# A failed/interrupted deep check retries the same snapshots before retention
+# can discard them. No pins apply when verification is explicitly disabled.
+verify_pinned() {
+    [[ $force_verify == yes ]] || (( BACKUP_VERIFY_DAYS != 0 )) || return 1
+    [[ " $VERIFY_PENDING $VERIFY_REMOTE_PENDING " == *" $1 "* ]]
+}
 
 name=$(date -u +%Y-%m-%dT%H%M%SZ)
 work=$SNAPSHOTS/.partial-$name
@@ -150,6 +166,7 @@ ln -sfn "snapshots/$current" "$BACKUP_DIR/latest"
 # newest KEEP_MONTHLY months. The current snapshot is always among the
 # newest, so it's never pruned.
 list_snapshots | retention_drops | while read -r old; do
+    if verify_pinned "$old"; then continue; fi
     log "Pruning local snapshot $old"
     rm -rf "${SNAPSHOTS:?}/$old"
 done
@@ -212,6 +229,7 @@ prune_remote() {
     empty=$(mktemp -d "$BACKUP_DIR/.empty.XXXXXX")
     while read -r old; do
         [[ $old < $current ]] || continue            # never the snapshot just made
+        if verify_pinned "$old"; then continue; fi
         log "Pruning off-host snapshot $old"
         # rsync deletes the one named folder because the empty source lacks
         # it; every other name is excluded, so it stays. Works the same
@@ -226,9 +244,114 @@ if [[ $REMOTE_PRUNE == yes ]]; then
     prune_remote
 fi
 
-date -u +%Y-%m-%dT%H:%M:%SZ > "$BACKUP_DIR/last-success"
 log "Backup complete: $current is on $REMOTE"
 
+# --- 5. Periodic deep verification -------------------------------------
+
+# Subshell keeps cleanup/traps local. Every fallible operation is explicitly
+# checked: the caller captures failure so today's copied backup is preserved.
+deep_verify() (
+    local now epoch names oldest old next_cursor failed=0 remote_names remote_oldest
+    local scratch='' selected='' failed_names='' failed_remote='' remote_checks='' checks
+    [[ $force_verify == yes ]] || (( BACKUP_VERIFY_DAYS != 0 )) || return 0
+    now=$(date -u +%s) || return 1
+    epoch=$(date -u -d "$VERIFY_TIME" +%s 2>/dev/null) || epoch=0
+    if [[ $force_verify != yes && $VERIFY_RESULT == passed && -n $VERIFY_TIME ]] \
+            && (( epoch > 0 && now >= epoch && now - epoch < BACKUP_VERIFY_DAYS * 86400 )); then
+        log "Deep check not due (last passed: $VERIFY_TIME)"
+        return 0
+    fi
+
+    names=$(list_snapshots | grep -Fxv "$current" || true)
+    oldest=$(head -n 1 <<< "$names")
+    next_cursor=$VERIFY_CURSOR
+    if [[ -n $oldest ]]; then selected=$oldest; fi
+    checks=$(( ${#selected} > 0 ? 1 : 0 ))
+    # Retry failures first, then advance by UTC name and wrap once. The
+    # cursor need not still exist, unlike an array index after pruning.
+    while read -r old; do
+        [[ -n $old && $old != "$oldest" && $old != "$current" && -d $SNAPSHOTS/$old ]] || continue
+        [[ " $selected " != *" $old "* ]] || continue
+        (( checks < BACKUP_VERIFY_COUNT )) || break
+        selected+=" $old"
+        checks=$((checks + 1))
+        next_cursor=$old
+    done < <(tr ' ' '\n' <<< "$VERIFY_PENDING"
+        awk -v cursor="$VERIFY_CURSOR" '$0 > cursor' <<< "$names"
+        awk -v cursor="$VERIFY_CURSOR" 'NF && $0 <= cursor' <<< "$names")
+
+    # List REMOTE with rsync, never ssh shell commands. Retry a previously
+    # failing remote-only snapshot even if another name is now oldest.
+    remote_checks=$VERIFY_REMOTE_PENDING
+    if remote_names=$(list_remote_snapshots); then
+        remote_oldest=$(head -n 1 <<< "$remote_names")
+        if [[ -n $remote_oldest && $remote_oldest != "$current" && ! -d $SNAPSHOTS/$remote_oldest \
+                && " $remote_checks " != *" $remote_oldest "* ]]; then
+            remote_checks+="$remote_oldest "
+        fi
+    else
+        log "Deep check FAILED remote: cannot list snapshots"
+        failed=1
+    fi
+    VERIFY_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ) || return 1
+    VERIFY_RESULT=running
+    VERIFY_PENDING=$selected
+    VERIFY_REMOTE_PENDING=$remote_checks
+    write_verify_state || { log "Deep check FAILED: cannot write verify-state"; return 1; }
+    # Run even with no older local snapshots: REMOTE may retain older history.
+    # Scratch stays on the backup disk, outside snapshots and the copied tree.
+    trap '[[ -z $scratch ]] || rm -rf -- "$scratch"' EXIT
+    trap 'exit 1' HUP INT TERM
+    # Only this backup lock owns verification scratch. Even leftover cleanup
+    # errors are deferred until after today's backup has been copied.
+    rm -rf "$BACKUP_DIR"/.verify-scratch-* || return 1
+    for old in $selected; do
+        log "Deep check local $old"
+        if ! verify_snapshot "$SNAPSHOTS/$old"; then
+            log "Deep check FAILED local $old"
+            failed=1
+            failed_names+="$old "
+            continue
+        fi
+        log "Deep check remote $old against verified local copy"
+        if diffs=$(rsync_remote -anc --numeric-ids --delete --itemize-changes \
+                "$SNAPSHOTS/$old/" "$REMOTE/snapshots/$old/") && [[ -z $diffs ]]; then
+            :
+        else
+            log "Deep check FAILED remote $old (differences/paths below)"
+            [[ -z $diffs ]] || printf '%s\n' "$diffs" >&2
+            failed=1
+            failed_names+="$old "
+        fi
+    done
+    for old in $remote_checks; do
+        log "Deep check remote-only $old (fetching into scratch)"
+        scratch=$(mktemp -d "$BACKUP_DIR/.verify-scratch-XXXXXX") || return 1
+        if rsync_remote -a --numeric-ids "$REMOTE/snapshots/$old/" "$scratch/snapshot/" < /dev/null \
+                && verify_snapshot "$scratch/snapshot"; then
+            :
+        else
+            log "Deep check FAILED remote-only $old"
+            failed=1
+            failed_remote+="$old "
+        fi
+        rm -rf -- "$scratch" || return 1
+        scratch=
+    done
+    VERIFY_RESULT=failed
+    if (( failed == 0 )); then VERIFY_RESULT=passed; VERIFY_CURSOR=$next_cursor; fi
+    VERIFY_PENDING=$failed_names
+    VERIFY_REMOTE_PENDING=$failed_remote
+    write_verify_state || { log "Deep check FAILED: cannot write verify-state"; return 1; }
+    log "Deep check $VERIFY_RESULT"
+    return "$failed"
+)
+
+deep_verify || die "Deep check failed; today's backup was copied. Check the failed snapshots and rerun backup.sh."
+
+# A deep failure must also withhold the success timestamp and heartbeat, so
+# both existing reporting paths treat this as a failed run.
+date -u +%Y-%m-%dT%H:%M:%SZ > "$BACKUP_DIR/last-success"
 if [[ -n $PING_URL ]]; then
     curl -fsS -m 10 --retry 3 -o /dev/null "$PING_URL" \
         || log "Warning: backup succeeded but the ping to PING_URL failed"

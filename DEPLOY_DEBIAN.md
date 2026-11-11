@@ -1450,8 +1450,72 @@ REMOTE=<backup-user>@<backup-host>:/<backup-path>
 RSYNC_SSH="ssh -i /home/<user>/.ssh/mileage_backup"
 ```
 
-The rest of the file explains the retention settings and an optional
+The rest of the file explains retention, periodic verification and an optional
 `PING_URL`.
+
+**Periodic deep checks.** After the normal backup has finished and been copied
+off-host, `BACKUP_VERIFY_DAYS=7` re-reads older snapshots once a week. Set it to
+`0` to turn periodic checks off; allowed values are whole days from 0 to 36500.
+`BACKUP_VERIFY_COUNT=3` checks up to three local snapshots other than the current
+one: always the oldest, plus a rotating selection. The count must be 2 to 1000,
+so there is room for both the oldest and rotation. The rotation uses UTC snapshot
+names, so pruning a snapshot does not reset the walk through the remaining ones.
+
+Each selected local snapshot is checked against `SHA256SUMS`, including missing
+and unlisted files (only the root `SHA256SUMS` and human-readable `INFO` are
+exempt). After it passes, a checksum rsync dry run compares its REMOTE copy,
+including extra files. If REMOTE's oldest snapshot no longer exists locally, it
+is also fetched to private scratch under `BACKUP_DIR`, checked against its own
+manifest and removed. This works for a mounted REMOTE and rsync over SSH; it
+needs no additional shell commands on the other machine. Allow enough free space
+for that extra snapshot. Normal exits, errors and termination clean scratch;
+the next run removes scratch left by a forced kill or power loss.
+
+These checks read whole files at both ends and can take minutes or hours on a
+large history or slow disk/share. Rsync still stops after 600 seconds without
+I/O, and the systemd service's six-hour limit covers the backup and deep check
+together. A direct manual run has no six-hour limit. State is atomically written
+to `BACKUP_DIR/verify-state`: UTC `last_check`, `result` (`running`, `passed` or
+`failed`), rotation `cursor`, and pending local/remote retry names. Status is
+shown by `backup/scheduled.sh --status`, `install.sh --check` and `restore.sh check`.
+
+A deep-check failure exits non-zero **after today's backup has been copied**.
+The systemd unit fails, `last-success` does not advance, and `PING_URL` is not
+called. The log identifies local or remote, the snapshot and failed file paths;
+it does not print file contents. A failed or interrupted check retries on the
+next backup run, without waiting another week. Failed selections are retained
+through pruning until a retry passes (or periodic checking is disabled), so
+pruning cannot erase the evidence before retry. Rotation advances only after
+the whole check passes.
+
+**If a deep check fails:** snapshots share unchanged files as hard links. One
+damaged file can therefore fail in every snapshot sharing it. A failed checksum
+means that copy cannot be trusted; it does not establish that another snapshot
+or the off-host copy is good. Inspect other dated copies with:
+
+```bash
+bash ~/mileage-tracker/backup/restore.sh check <snapshot-name>
+```
+
+This checks the named snapshot on REMOTE. To check a local one, give its full
+snapshot path instead. Keep the damaged copies while investigating the disk or
+share. If a REMOTE snapshot passes and holds the file you need, copy that good
+file back to the affected **local snapshot**, for example:
+
+```bash
+rsync -ac -- '<REMOTE>/snapshots/<good-snapshot>/data/<month>/<trip>.gpx' '<BACKUP_DIR>/snapshots/<damaged-snapshot>/data/<month>/<trip>.gpx'
+bash ~/mileage-tracker/backup/restore.sh check '<BACKUP_DIR>/snapshots/<damaged-snapshot>'
+bash ~/mileage-tracker/backup/backup.sh --verify
+```
+
+Replace the placeholders and use the SSH options from `RSYNC_SSH` (`-e`) if
+configured. Choose a good file that matches the damaged snapshot's manifest;
+do not regenerate the manifest to hide a mismatch. Rsync replaces that snapshot's
+directory entry without overwriting shared hard links in place; other affected
+snapshots may still need repair. `--verify` always makes/copies today's backup
+first, then forces a deep check, even if not due or periodic checks are off.
+Repeat named checks for other affected snapshots; the rotating check samples
+history rather than checking every retained snapshot in one run.
 
 **Mark the destination.** A backup copies there only if the folder holds a
 file named `.mileage-backup-target`. `install.sh` writes it when it sets up
@@ -1477,8 +1541,9 @@ mount before each run (`RequiresMountsFor=`).
 bash ~/mileage-tracker/backup/backup.sh
 ```
 
-It should finish with `Backup complete: <snapshot> is on <REMOTE>`. Running
-it a second time straight away should say `Nothing changed`. If it stops with
+It should report `Backup complete: <snapshot> is on <REMOTE>`, followed by the
+deep-check result when due. Running it a second time straight away should say
+`Nothing changed`. If it stops with
 `has no .mileage-backup-target file`, the destination isn't marked or isn't
 there: see the end of 10b.
 

@@ -337,12 +337,53 @@ The private persistent log is `backup/logs/backup.log` (mode 600). It rotates
 after exceeding 1 MiB and keeps `.1` through `.3`. State lives in
 `backup/state/last-attempt`, with UTC start, end and exit status. These
 directories are mode 700. `--status` prints `last_attempt_start`,
-`last_attempt_end`, `last_attempt_status`, `last_success` and the absolute
-log path. Empty values can mean it has never run. Status 0 means success;
+`last_attempt_end`, `last_attempt_status`, `last_success`, the absolute
+log path, `last_deep_check` and `last_deep_check_result`. Empty values can mean
+it has never run. Status 0 means success;
 `running` has no final result yet. Reading status itself exits 0, so inspect
 the fields. `last_success` comes from `BACKUP_DIR/last-success` and may be
 empty when its disk is absent. A direct `backup.sh` run does not update
 the wrapper's last-attempt record or persistent log.
+
+After today's backup has completed and been copied, the same run periodically
+checks older snapshots. In `backup/backup.conf`, `BACKUP_VERIFY_DAYS=7` means
+weekly; `0` disables periodic checks (allowed: whole days 0 to 36500).
+`BACKUP_VERIFY_COUNT=3` checks up to three older local snapshots, always the
+oldest plus a rotating selection; allowed counts are 2 to 1000 so rotation has
+room. The current snapshot is excluded. The rotation follows UTC names and
+survives pruning. Each local copy must pass `SHA256SUMS` before a checksum rsync
+dry run compares REMOTE. Unlisted files also fail, except root `INFO` and
+`SHA256SUMS`. REMOTE can be a guarded mounted share or rsync over SSH, without
+extra shell commands there. If REMOTE's oldest snapshot exists only there, it
+is fetched into private scratch under `BACKUP_DIR`, verified and removed; allow
+space for that snapshot. Scratch is cleaned on exit or termination; a later run
+also clears leftovers from a forced kill or power loss.
+
+Whole-file reads on both disks can take minutes or hours. The existing 600-second
+rsync I/O timeout and wrapper's six-hour limit still apply. The atomic
+`BACKUP_DIR/verify-state` holds the last check's UTC time, result, rotation cursor
+and pending retries. `--status` adds `last_deep_check` and
+`last_deep_check_result` (`running`, `passed`, `failed`, or empty before a check).
+`install.sh --check` and `restore.sh check` show the same last result.
+
+A deep failure leaves today's copied backup in place, but exits non-zero so
+`scheduled.sh` records failure; `last_success` and the heartbeat do not advance.
+The log names the snapshot, local or remote, and failed file paths. Failed or
+interrupted checks retry on the next backup run rather than waiting a week.
+Failed selections remain protected from pruning until a retry passes or
+periodic verification is disabled; rotation advances only on success.
+
+Hard links mean one damaged file can affect every snapshot sharing it. Check
+other dated copies with `bash backup/restore.sh check <snapshot-name>` (REMOTE)
+or give a local snapshot's full path. Verify a good REMOTE snapshot before using
+`rsync -ac` to copy its good file back into an affected local snapshot; do not
+overwrite shared files in place or regenerate a manifest to conceal damage.
+[Debian Step 10b](DEPLOY_DEBIAN.md#10b--configure-it) has the placeholder
+recovery command and explains rechecking each affected snapshot. To force a new
+deep check now, run `bash backup/backup.sh --verify`; it first completes the normal
+backup, and also works with periodic checks off. On Unraid this direct run does
+not update the wrapper attempt/log, so inspect its output and `--status` deep
+result, then use `bash backup/scheduled.sh` for the normal recorded run.
 
 ## Step 5 — Build on Unraid, flash from the PC
 

@@ -1314,6 +1314,42 @@ on, are in `DEPLOY_DEBIAN.md` Step 10.
 Each SQLite snapshot is consistent individually; the databases and trip files
 are captured in sequence, rather than in one shared transaction.
 
+After today's backup is copied, a periodic deep check reads older snapshots in
+full. `BACKUP_VERIFY_DAYS=7` defaults to weekly; whole days 0 to 36500 are allowed,
+and `0` disables periodic checking. `BACKUP_VERIFY_COUNT=3` selects up to three
+older local snapshots, always the oldest plus rotation through the rest. Counts
+must be 2 to 1000 to leave room for rotation. UTC snapshot names keep the rotation
+working after pruning. Each selected copy must pass `SHA256SUMS` (unlisted files
+also fail, except root `INFO` and `SHA256SUMS`), then a checksum rsync dry run
+checks REMOTE against that verified local copy. If REMOTE's oldest snapshot is
+no longer local, it is fetched into private scratch under `BACKUP_DIR`, checked
+against its manifest and removed. This supports both mounted paths and SSH
+REMOTE, with no extra remote shell commands. Allow space for that extra snapshot.
+
+Whole-file reads can take minutes or hours; the existing 600-second rsync I/O
+timeout and six-hour systemd/Unraid wrapper limit still apply. Scratch is cleaned
+on exit or termination, or by the next backup after a forced kill. An atomic
+`BACKUP_DIR/verify-state` records UTC check time, result, rotation cursor and
+pending retries. `scheduled.sh --status` exposes `last_deep_check` and
+`last_deep_check_result`; `install.sh --check` and `restore.sh check` also show it.
+A failed check exits non-zero after today's backup is copied, fails the Debian
+unit or Unraid wrapper attempt, and withholds `last-success` and the heartbeat.
+Failed or interrupted checks retry on the next backup run, keeping the rotation
+position and protecting failed snapshots from pruning until success (or checking
+is disabled).
+
+One damaged file can affect every snapshot sharing its hard link. A failure
+names the local or remote snapshot and file paths; check other copies with
+`bash backup/restore.sh check <snapshot-name>` (REMOTE), or give a full local
+snapshot path. After verifying a good REMOTE snapshot, use `rsync -ac` to copy
+the matching good file back into the affected local snapshot and recheck it;
+avoid writing through shared hard links in place or changing the manifest to
+hide damage. The [recovery example in Debian Step 10b](../DEPLOY_DEBIAN.md#10b--configure-it)
+shows the command and cautions. Run `bash backup/backup.sh --verify` to complete
+a normal backup and force a deep check now, even if not due or periodic checks
+are off. Check other affected snapshots by name too: one rotating run samples
+history and does not verify every snapshot.
+
 `backup/restore.sh check` fetches the newest off-host snapshot, verifies every
 file and database, and reports annotation/event counts and monitor state tables
 without changing live data. `backup/restore.sh restore` runs those checks,

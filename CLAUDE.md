@@ -510,6 +510,7 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   snapshots of viewer annotations, ingest diagnostics (`events.db`), and optional
   monitor delivery/export state (`monitor.db`, when its volume exists). Viewer
   helpers read annotations and diagnostics; the monitor helper reads its volume.
+  Weekly deep checks rotate older local/REMOTE copies, record `BACKUP_DIR/verify-state`, and fail after today's copy on damage.
   Missing diagnostics/monitor databases are normal and recorded in `INFO`.
   Monitor discovery uses Compose config's project name and Docker's Compose
   project/volume labels, without recent config flags or logging credentials.
