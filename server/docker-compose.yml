@@ -56,6 +56,7 @@ services:
     # container rebuilds, restarts, and even docker compose down -v.
     volumes:
       - ./data:/data
+      - ingest-settings:/settings:ro
 
     environment:
       # The auth token is read from the .env file (never commit .env!)
@@ -106,6 +107,8 @@ services:
       # Annotations (trip purpose + notes) live here, separate from the
       # immutable trip data so losing them never risks the trips.
       - viewer-db:/db
+      # Only the derived retention JSON crosses the service boundary.
+      - ingest-settings:/settings
 
     # Login credentials + session key come from their own env file, passed
     # through verbatim. Two reasons this is separate from .env:
@@ -189,6 +192,7 @@ services:
 
 # Separate named volumes; none of these lives in the ingest data directory.
 volumes:
+  ingest-settings:
   viewer-db:
   monitor-state:
   ntfy-state:

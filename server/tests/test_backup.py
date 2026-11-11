@@ -142,6 +142,7 @@ class BackupScripts(unittest.TestCase):
             COMPOSE_DIR={self.compose_dir}
             KEEP_RECENT=3
             KEEP_MONTHLY=2
+            BACKUP_VERIFY_DAYS=0
             """))
         self.env = dict(os.environ,
                         MILEAGE_BACKUP_CONF=str(conf),
@@ -231,6 +232,313 @@ class BackupScripts(unittest.TestCase):
     def snapshots(self, root=None):
         root = (root or self.backups) / "snapshots"
         return sorted(p.name for p in root.iterdir() if not p.name.startswith("."))
+
+    # --- periodic deep verification ---
+
+    def seed_verification(self, count=6):
+        """Real manifest/database fixture; old snapshots are independent copies."""
+        self.run_script("backup.sh")
+        newest = self.backups / "snapshots" / self.snapshots()[-1]
+        names = [f"2026-01-{day:02}T030000Z" for day in range(1, count + 1)]
+        for name in names:
+            shutil.copytree(newest, newest.parent / name)
+        self.conf_append("KEEP_RECENT=100\nBACKUP_VERIFY_DAYS=7\n")
+        return names
+
+    def verify_state(self):
+        return dict(line.split("=", 1) for line in
+                    (self.backups / "verify-state").read_text().splitlines())
+
+    def make_verify_due(self):
+        path = self.backups / "verify-state"
+        state = self.verify_state()
+        state["last_check"] = "2020-01-01T00:00:00Z"
+        path.write_text("".join(f"{key}={value}\n" for key, value in state.items()))
+
+    def selected_verification(self, result):
+        return [line.split("Deep check local ", 1)[1]
+                for line in result.stderr.splitlines() if "Deep check local " in line]
+
+    def silently_corrupt(self, path):
+        stat = path.stat()
+        original = path.read_bytes()
+        path.write_bytes(b"X" + original[1:])
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+    def test_deep_check_due_selects_oldest_and_rotation_then_not_due(self):
+        names = self.seed_verification()
+        ping_log = self.tmp / "curl.log"
+        self.env["CURL_LOG"] = str(ping_log)
+        self.shim("curl", 'echo "$@" >> "$CURL_LOG"\n')
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        result = self.run_script("backup.sh")
+        self.assertEqual(len(ping_log.read_text().splitlines()), 1)
+        self.assertEqual(self.selected_verification(result), names[:3])
+        self.assertLess(result.stderr.index("Backup complete:"),
+                        result.stderr.index("Deep check local"))
+        state = self.verify_state()
+        self.assertEqual(state["result"], "passed")
+        self.assertEqual(state["cursor"], names[2])
+        self.assertEqual((self.backups / "verify-state").stat().st_mode & 0o777, 0o600)
+        result = self.run_script("backup.sh")
+        self.assertEqual(len(ping_log.read_text().splitlines()), 2)
+        self.assertEqual(self.selected_verification(result), [])
+        self.assertIn("Deep check not due", result.stderr)
+        self.assertEqual(self.verify_state(), state)
+        # An absent/invalid time must be due: GNU date treats an empty -d
+        # argument as today's midnight, which would otherwise defer forever.
+        for stamp in ("", "invalid"):
+            state["last_check"] = stamp
+            (self.backups / "verify-state").write_text(
+                "".join(f"{key}={value}\n" for key, value in state.items()))
+            result = self.run_script("backup.sh")
+            self.assertEqual(len(self.selected_verification(result)), 3)
+            self.assertEqual(self.verify_state()["result"], "passed")
+
+    def test_deep_check_rotation_wraps_and_survives_pruned_cursor(self):
+        names = self.seed_verification()
+        self.run_script("backup.sh")
+        shutil.rmtree(self.backups / "snapshots" / names[2])
+        for expected in ([names[0], names[3], names[4]],
+                         [names[0], names[5], names[1]]):
+            self.make_verify_due()
+            result = self.run_script("backup.sh")
+            self.assertEqual(self.selected_verification(result), expected)
+            self.assertEqual(self.verify_state()["cursor"], expected[-1])
+
+    def test_deep_check_local_corruption_fails_after_new_backup_and_retries(self):
+        names = self.seed_verification()
+        self.run_script("backup.sh")
+        self.make_verify_due()
+        # A rotating snapshot, rather than the always-selected oldest.
+        path = self.backups / "snapshots" / names[3] / "data/2026-10/2026-10-01T15-00-00.gpx"
+        self.silently_corrupt(path)
+        last_success = "2020-01-01T00:00:00Z\n"
+        (self.backups / "last-success").write_text(last_success)
+        self.add_trip("2026-10/new-trip", "new")
+        result = self.run_script("backup.sh", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"FAILED local {names[3]}", result.stderr)
+        self.assertIn("./data/2026-10/2026-10-01T15-00-00.gpx", result.stderr)
+        self.assertNotIn("Xirst.gpx", result.stderr)
+        self.assertTrue((self.remote / "snapshots" / self.snapshots()[-1] / "data/2026-10/new-trip.gpx").exists())
+        self.assertNotEqual((self.backups / "last-success").read_text(), last_success)
+        state = self.verify_state()
+        self.assertEqual(state["result"], "failed")
+        self.assertEqual(state["cursor"], names[2])
+        # Retention must not erase a failed snapshot before retrying it.
+        self.conf_append("KEEP_RECENT=1\nKEEP_MONTHLY=0\n")
+        retry = self.run_script("backup.sh", check=False)
+        self.assertNotEqual(retry.returncode, 0)
+        self.assertIn(names[3], self.selected_verification(retry))
+        self.assertTrue(path.exists())
+
+    def test_deep_check_remote_corruption_with_mounted_and_ssh_remote(self):
+        names = self.seed_verification(3)
+        self.run_script("backup.sh")
+        path = self.remote / "snapshots" / names[0] / "data/2026-10/2026-10-01T15-00-00.gpx"
+        self.silently_corrupt(path)
+        self.make_verify_due()
+        for ssh in (False, True):
+            if ssh:
+                self.use_ssh_remote()
+            result = self.run_script("backup.sh", check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f"FAILED remote {names[0]}", result.stderr)
+            self.assertIn("data/2026-10/2026-10-01T15-00-00.gpx", result.stderr)
+            self.assertEqual(self.verify_state()["result"], "failed")
+
+    def test_deep_check_remote_only_oldest_fetches_checks_and_cleans_scratch(self):
+        names = self.seed_verification(3)
+        self.run_script("backup.sh")
+        shutil.rmtree(self.backups / "snapshots" / names[0])
+        self.make_verify_due()
+        log = self.watch_rsync()
+        for ssh in (False, True):
+            if ssh:
+                self.use_ssh_remote()
+            result = self.run_script("backup.sh")
+            self.assertIn(f"Deep check remote-only {names[0]}", result.stderr)
+            self.assertEqual(self.verify_state()["result"], "passed")
+            self.assertEqual(list(self.backups.glob(".verify-scratch-*")), [])
+            self.make_verify_due()
+        self.assertIn(".verify-scratch-", log.read_text())
+        path = self.remote / "snapshots" / names[0] / "annotations.db"
+        self.silently_corrupt(path)
+        result = self.run_script("backup.sh", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"FAILED remote-only {names[0]}", result.stderr)
+        self.assertEqual(list(self.backups.glob(".verify-scratch-*")), [])
+        self.assertEqual(self.verify_state()["remote_pending"].strip(), names[0])
+        self.assertEqual(list(self.backups.glob(".verify-state.*")), [])
+        retry = self.run_script("backup.sh", check=False)
+        self.assertIn(f"FAILED remote-only {names[0]}", retry.stderr)
+
+    def test_deep_check_rejects_unlisted_files_and_reports_status_everywhere(self):
+        names = self.seed_verification(2)
+        (self.backups / "snapshots" / names[0] / "data/extra.gpx").write_text("private-content")
+        result = self.run_script("backup.sh", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("./data/extra.gpx", result.stderr)
+        self.assertNotIn("private-content", result.stderr)
+        state = self.verify_state()
+        result = self.run_script("scheduled.sh", "--status")
+        self.assertIn(f"last_deep_check={state['last_check']}", result.stdout)
+        self.assertIn("last_deep_check_result=failed", result.stdout)
+        result = self.run_script("restore.sh", "check", self.snapshots()[-1])
+        self.assertIn(f"Last deep check: {state['last_check']} (result: failed)", result.stderr)
+        # Source the real installer status function without running setup.
+        command = ('install_file=$1; backup_server=$2; shift 2; '
+                   'source <(sed \'$d\' "$install_file"); AS_ME=(); '
+                   'SCRIPT_DIR="$backup_server"; show_backup_deep_check')
+        result = subprocess.run(["bash", "-c", command, "bash", str(SERVER / "install.sh"),
+                                 str(SERVER)], env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"Last deep check: {state['last_check']} (result: failed)", result.stdout)
+
+    def test_deep_check_force_runs_when_not_due_or_disabled(self):
+        names = self.seed_verification(3)
+        self.run_script("backup.sh")
+        result = self.run_script("backup.sh", "--verify")
+        self.assertEqual(self.selected_verification(result), [names[0], names[1], names[2]])
+        self.conf_append("BACKUP_VERIFY_DAYS=0\n")
+        result = self.run_script("backup.sh", "--verify")
+        self.assertEqual(len(self.selected_verification(result)), 3)
+
+    def test_deep_check_disabled_and_invalid_settings(self):
+        self.run_script("backup.sh")
+        self.assertFalse((self.backups / "verify-state").exists())
+        self.conf_append("BACKUP_VERIFY_DAYS=7\nBACKUP_VERIFY_COUNT=3\n")
+        for setting in ("BACKUP_VERIFY_DAYS=-1", "BACKUP_VERIFY_DAYS=", "BACKUP_VERIFY_DAYS=1.5",
+                        "BACKUP_VERIFY_DAYS=08", "BACKUP_VERIFY_DAYS=36501",
+                        "BACKUP_VERIFY_COUNT=0", "BACKUP_VERIFY_COUNT=1", "BACKUP_VERIFY_COUNT=1001",
+                        "BACKUP_VERIFY_COUNT=", "BACKUP_VERIFY_COUNT=no"):
+            with self.subTest(setting=setting):
+                conf = Path(self.env["MILEAGE_BACKUP_CONF"])
+                original = conf.read_text()
+                self.conf_append(setting + "\n")
+                result = self.run_script("backup.sh", check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(setting.split("=")[0] + " must be", result.stderr)
+                conf.write_text(original)
+
+    def test_deep_check_defaults_are_enabled_and_count_three(self):
+        names = self.seed_verification()
+        conf = Path(self.env["MILEAGE_BACKUP_CONF"])
+        conf.write_text("\n".join(line for line in conf.read_text().splitlines()
+                                  if not line.startswith("BACKUP_VERIFY_")) + "\n")
+        result = self.run_script("backup.sh")
+        self.assertEqual(self.selected_verification(result), names[:3])
+        self.assertEqual(self.verify_state()["result"], "passed")
+
+    def test_deep_check_failure_is_recorded_by_real_scheduler(self):
+        names = self.seed_verification(2)
+        self.silently_corrupt(self.backups / "snapshots" / names[0] / "annotations.db")
+        scripts = self.tmp / "scheduled-scripts"
+        scripts.mkdir()
+        for name in ("scheduled.sh", "backup.sh", "lib.sh"):
+            shutil.copyfile(BACKUP / name, scripts / name)
+        result = subprocess.run(["bash", str(scripts / "scheduled.sh")], env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("status=1", (scripts / "state/last-attempt").read_text())
+        self.assertIn(f"FAILED local {names[0]}", (scripts / "logs/backup.log").read_text())
+        self.assertTrue((self.remote / "snapshots" / self.snapshots()[-1]).is_dir())
+
+    def test_deep_check_failure_skips_overdue_catchup_but_retries_nightly(self):
+        names = self.seed_verification(2)
+        self.run_script("backup.sh")
+        shutil.rmtree(self.backups / "snapshots" / names[0])
+        self.silently_corrupt(self.remote / "snapshots" / names[0] / "annotations.db")
+        self.make_verify_due()
+        stale_success = "2020-01-01T00:00:00Z\n"
+        (self.backups / "last-success").write_text(stale_success)
+        self.env["MILEAGE_PLATFORM"] = "unraid"
+        ping_log = self.tmp / "curl.log"
+        self.env["CURL_LOG"] = str(ping_log)
+        self.shim("curl", 'echo "$@" >> "$CURL_LOG"\n')
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        rsync_log = self.watch_rsync()
+        scripts = self.tmp / "scheduled-scripts"
+        scripts.mkdir()
+        for name in ("scheduled.sh", "backup.sh", "lib.sh"):
+            shutil.copyfile(BACKUP / name, scripts / name)
+
+        def run_wrapper(*args):
+            return subprocess.run(["bash", str(scripts / "scheduled.sh"), *args],
+                                  env=self.env, capture_output=True, text=True, timeout=30)
+
+        result = run_wrapper()
+        self.assertNotEqual(result.returncode, 0)
+        status = dict(line.split("=", 1) for line in run_wrapper("--status").stdout.splitlines())
+        self.assertEqual(status["last_attempt_status"], "1")
+        self.assertEqual(status["last_deep_check_result"], "failed")
+        self.assertNotEqual(status["last_success"] + "\n", stale_success)
+        self.assertIn(f"FAILED remote-only {names[0]}", (scripts / "logs/backup.log").read_text())
+        self.assertEqual(self.verify_state()["remote_pending"].strip(), names[0])
+        self.assertFalse(ping_log.exists())
+
+        # New uploads must not cause hourly backups or remote-only fetches.
+        self.add_trip("2026-10/new-trip", "new")
+        watched = [scripts / "state/last-attempt", scripts / "logs/backup.log",
+                   self.backups / "last-success", self.backups / "verify-state",
+                   self.compose_log, rsync_log]
+        before = [path.read_bytes() for path in watched]
+        snapshots = [self.snapshots(root) for root in (self.backups, self.remote)]
+        for _ in range(2):
+            result = run_wrapper("--if-overdue", "26")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout + result.stderr, "")
+            self.assertEqual([path.read_bytes() for path in watched], before)
+            self.assertEqual([self.snapshots(root) for root in (self.backups, self.remote)], snapshots)
+
+        # The normal nightly invocation still retries without waiting a week.
+        result = run_wrapper()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((scripts / "logs/backup.log").read_text().count(
+            f"Deep check remote-only {names[0]}"), 2)
+        self.assertEqual(self.verify_state()["remote_pending"].strip(), names[0])
+        self.assertTrue((self.remote / "snapshots" / self.snapshots()[-1] / "data/2026-10/new-trip.gpx").exists())
+        self.assertFalse(ping_log.exists())
+
+    def test_deep_check_no_older_local_but_remote_only_history_and_running_retry(self):
+        names = self.seed_verification(1)
+        self.run_script("backup.sh")
+        shutil.rmtree(self.backups / "snapshots" / names[0])
+        state = self.verify_state()
+        state["result"] = "running"
+        (self.backups / "verify-state").write_text(
+            "".join(f"{key}={value}\n" for key, value in state.items()))
+        result = self.run_script("backup.sh")
+        self.assertEqual(self.selected_verification(result), [])
+        self.assertIn(f"Deep check remote-only {names[0]}", result.stderr)
+        self.assertEqual(self.verify_state()["result"], "passed")
+
+    def test_deep_check_termination_cleans_scratch_and_retries(self):
+        names = self.seed_verification(1)
+        self.run_script("backup.sh")
+        shutil.rmtree(self.backups / "snapshots" / names[0])
+        self.make_verify_due()
+        real_rsync = shutil.which("rsync")
+        shim = self.shim("rsync", 'for arg; do\n'
+                         '  if [[ $arg == *".verify-scratch-"* ]]; then\n'
+                         '    kill -TERM "$PPID"; exit 20\n'
+                         '  fi\n'
+                         f'done\nexec {real_rsync} "$@"\n')
+        result = self.run_script("backup.sh", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Backup complete:", result.stderr)
+        self.assertEqual(self.verify_state()["result"], "running")
+        self.assertEqual(list(self.backups.glob(".verify-scratch-*")), [])
+        shim.unlink()
+        # Simulate debris that SIGKILL or a power loss could leave.
+        debris = self.backups / ".verify-scratch-abandoned"
+        debris.mkdir()
+        (debris / "incomplete").touch()
+        result = self.run_script("backup.sh")
+        self.assertIn(f"Deep check remote-only {names[0]}", result.stderr)
+        self.assertEqual(self.verify_state()["result"], "passed")
+        self.assertEqual(list(self.backups.glob(".verify-scratch-*")), [])
 
     # --- Unraid mount, config and root ownership safeguards ---
 
@@ -587,6 +895,28 @@ fi
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--yes", result.stderr)
         self.assertNotIn("stop", self.compose_log.read_text())
+
+    def test_retention_setting_round_trips_in_annotations_without_settings_volume(self):
+        path = self.db_dir / 'annotations.db'
+        with sqlite3.connect(path) as conn:
+            conn.execute('CREATE TABLE viewer_settings (key TEXT PRIMARY KEY, value INTEGER NOT NULL, '
+                         'updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)')
+            conn.execute('INSERT INTO viewer_settings VALUES (?,?,?,?)',
+                         ('events_retention_days', 500, 'example-admin', '2026-01-01T00:00:00+00:00'))
+        conn.close()
+        self.run_script('backup.sh')
+        with sqlite3.connect(path) as conn:
+            conn.execute('UPDATE viewer_settings SET value=30')
+        conn.close()
+        self.run_script('restore.sh', 'restore', 'latest', '--yes')
+        with sqlite3.connect(path) as conn:
+            self.assertEqual(conn.execute('SELECT * FROM viewer_settings').fetchall(),
+                             [('events_retention_days', 500, 'example-admin', '2026-01-01T00:00:00+00:00')])
+        conn.close()
+        # Restart runs the viewer startup mirror; the derived volume needs no snapshot.
+        calls = self.compose_log.read_text()
+        self.assertTrue(calls.rstrip().endswith('up -d'))
+        self.assertNotIn('ingest-settings', calls)
 
     def test_events_snapshot_while_writer_has_uncommitted_transaction(self):
         path = self.add_events()

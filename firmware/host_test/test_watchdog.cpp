@@ -69,8 +69,8 @@ static std::string largeOpenTrip() {
 }
 static void startupAndRecovery() {
     watchdogWorld();
-    // Each operation exceeds the startup limit in total, but successful
-    // block/copy progress feeds it. Individual waits never feed it.
+    // The erased scan exceeds the startup limit in total; verified block
+    // progress feeds it. Tail repair no longer scans/copies the whole trip.
     g_disk.failMount = true;
     g_partition.partition.size = 0x260000;
     g_partition.bytes.assign(g_partition.partition.size, 0xff);
@@ -195,13 +195,14 @@ static void repairProgress() {
     uint32_t lastFeed = millis();
     g_watchdog.onFeed = [&]() { assert(uint32_t(millis() - lastFeed) <= 200); lastFeed = millis(); };
     uint32_t started = millis(); endTrip(false);
-    assert(uint32_t(millis() - started) > LOOP_WDT_TIMEOUT_MS && g_watchdog.feeds > 10000);
+    assert(uint32_t(millis() - started) <= 200);
     assert(g_sdDisk.files.at("/trips/runtime.gpx").ends_with(GPX_EPILOGUE));
     // Verify .fix prefix/suffix scan loops feed only after successful matches.
     g_sdDisk.files["/trips/original.gpx"] = g_sdDisk.files.at("/trips/runtime.gpx");
     g_sdDisk.files["/trips/original.gpx.fix"] = g_sdDisk.files["/trips/original.gpx"];
     FS_LOCK(); assert(repairIfNeeded(SD, "/trips/original.gpx")); FS_UNLOCK();
     assert(!g_sdDisk.files.count("/trips/original.gpx.fix"));
+    assert(g_watchdog.feeds > 10000); // legacy verified-prefix comparisons
     g_watchdog.onFeed = nullptr; g_sdDisk.onRead = nullptr;
     unsigned before = g_watchdog.feeds;
     g_sdDisk.failReadPath = "/trips/runtime.gpx";

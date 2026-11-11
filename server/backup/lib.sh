@@ -52,6 +52,8 @@ KEEP_RECENT=${KEEP_RECENT:-14}
 KEEP_MONTHLY=${KEEP_MONTHLY:-84}
 REMOTE_PRUNE=${REMOTE_PRUNE:-no}
 PING_URL=${PING_URL:-}
+BACKUP_VERIFY_DAYS=${BACKUP_VERIFY_DAYS-7}
+BACKUP_VERIFY_COUNT=${BACKUP_VERIFY_COUNT-3}
 
 SNAPSHOTS=$BACKUP_DIR/snapshots
 # Snapshot directories are named by UTC creation time, so they sort
@@ -273,6 +275,84 @@ list_remote_snapshots() {
         return 1
     fi
     awk '{ print $NF }' <<< "$listing" | grep -E "$SNAPSHOT_RE" | LC_ALL=C sort || true
+}
+
+# Shared with restore: files not covered by the manifest are not verified.
+# INFO and SHA256SUMS itself are the only exceptions, at the snapshot root.
+# sha256sum reports failed paths, never file contents or expected hashes.
+verify_snapshot() {
+    local snap=$1 listed actual
+    [[ -f $snap/SHA256SUMS && -f $snap/annotations.db && -d $snap/data ]] || {
+        log "snapshot doesn't look like a backup (SHA256SUMS, annotations.db or data missing)"
+        return 1
+    }
+    (cd "$snap" && sha256sum --quiet --strict -c SHA256SUMS) >&2 || {
+        log "checksums don't match; this snapshot is damaged"
+        return 1
+    }
+    listed=$(sed -E 's/^[0-9a-f]{64} [ *]//' "$snap/SHA256SUMS" | LC_ALL=C sort) || return 1
+    actual=$(cd "$snap" && find . -type f ! -path ./SHA256SUMS ! -path ./INFO | LC_ALL=C sort) || return 1
+    if [[ $listed != "$actual" ]]; then
+        log "snapshot has files missing from or not in SHA256SUMS (paths below)"
+        LC_ALL=C comm -3 <(printf '%s\n' "$listed") <(printf '%s\n' "$actual") >&2
+        return 1
+    fi
+}
+
+validate_verify_settings() {
+    if [[ ! $BACKUP_VERIFY_DAYS =~ ^(0|[1-9][0-9]{0,4})$ ]] \
+            || (( BACKUP_VERIFY_DAYS > 36500 )); then
+        die "BACKUP_VERIFY_DAYS must be 0 (off) or 1..36500 days"
+    fi
+    if [[ ! $BACKUP_VERIFY_COUNT =~ ^[1-9][0-9]{0,3}$ ]] \
+            || (( BACKUP_VERIFY_COUNT < 2 || BACKUP_VERIFY_COUNT > 1000 )); then
+        die "BACKUP_VERIFY_COUNT must be 2..1000 (oldest plus rotation)"
+    fi
+}
+
+# Data, never sourced shell code. The timestamp cursor remains meaningful
+# even when pruning removes the snapshot it named. Pending names pin failed
+# snapshots until retry; 'running' also retries after interruption/timeout.
+read_verify_state() {
+    VERIFY_TIME='' VERIFY_RESULT='' VERIFY_CURSOR='' VERIFY_PENDING='' VERIFY_REMOTE_PENDING=''
+    local key value name
+    [[ -r $BACKUP_DIR/verify-state ]] || return 0
+    while IFS='=' read -r key value; do
+        case $key in
+            last_check) [[ $value =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] && VERIFY_TIME=$value ;;
+            result) [[ $value == passed || $value == failed || $value == running ]] && VERIFY_RESULT=$value ;;
+            cursor) [[ $value =~ $SNAPSHOT_RE ]] && VERIFY_CURSOR=$value ;;
+            pending|remote_pending)
+                for name in $value; do
+                    [[ $name =~ $SNAPSHOT_RE ]] || continue
+                    if [[ $key == pending ]]; then VERIFY_PENDING+="$name "; else VERIFY_REMOTE_PENDING+="$name "; fi
+                done ;;
+        esac
+    done < "$BACKUP_DIR/verify-state"
+    # Successful runs need no retry pins.
+    if [[ $VERIFY_RESULT == passed ]]; then VERIFY_PENDING='' VERIFY_REMOTE_PENDING=''; fi
+    return 0
+}
+
+print_verify_status() {
+    read_verify_state
+    printf 'last_deep_check=%s\nlast_deep_check_result=%s\n' "$VERIFY_TIME" "$VERIFY_RESULT"
+}
+
+show_verify_status() {
+    read_verify_state
+    log "Last deep check: ${VERIFY_TIME:-never} (result: ${VERIFY_RESULT:-not run})"
+}
+
+write_verify_state() {
+    local tmp
+    tmp=$(mktemp "$BACKUP_DIR/.verify-state.XXXXXX") || return 1
+    if ! printf 'last_check=%s\nresult=%s\ncursor=%s\npending=%s\nremote_pending=%s\n' \
+            "$VERIFY_TIME" "$VERIFY_RESULT" "$VERIFY_CURSOR" "$VERIFY_PENDING" "$VERIFY_REMOTE_PENDING" > "$tmp" \
+            || ! mv -f "$tmp" "$BACKUP_DIR/verify-state"; then
+        rm -f "$tmp"
+        return 1
+    fi
 }
 
 # Retention for both the local and the off-host snapshots: reads names

@@ -39,6 +39,15 @@ which every trip was recorded, uploaded and exported correctly. Later fixes
 are listed on the
 [releases page](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases).
 
+For maintainers, merging a `firmware/VERSION` bump publishes its firmware
+release as **Latest** immediately, before the server is deployed or the board
+is flashed. The PR includes the reviewed summary in `release-notes/`; the
+workflow then uploads the install/flash scripts, source bundle and checksums.
+Server `srv-` tags stay manual after a verified deploy. To finish a failed
+run, re-run all Firmware release jobs, or manually run Release assets with
+the published tag if only assets failed. See
+[Firmware versions and releases](firmware/README.md#firmware-versions-and-releases).
+
 Still unproven on the Supreme: trips that end in a parking garage, and
 distance accuracy against the car's odometer. Open work is tracked in
 [GitHub issues](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/issues).

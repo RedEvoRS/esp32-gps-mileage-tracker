@@ -527,10 +527,10 @@ preflight() {
 
     # COMMIT is optional: archives supply it, but hand copies can use VERSION alone.
     local f missing=()
-    for f in VERSION stamp_version.py common/version.py common/settings.py common/trip_summary.py docker-compose.yml .dockerignore .env.example viewer.env.example monitor.env.example sample.gpx \
+    for f in VERSION stamp_version.py common/version.py common/settings.py common/retention.py common/trip_summary.py docker-compose.yml .dockerignore .env.example viewer.env.example monitor.env.example sample.gpx \
         common/__init__.py common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json} \
         mileage-ingest/{Dockerfile,app.py,diag_store.py,reset_high_water.py,requirements.txt} \
-        mileage-viewer/{Dockerfile,app.py,geocoding.py,trip_merges.py,trip_log.py,users.py,manage_users.py,requirements.txt} \
+        mileage-viewer/{Dockerfile,app.py,geocoding.py,trip_merges.py,trip_log.py,users.py,manage_users.py,diagnostics_settings.py,requirements.txt} \
         mileage-viewer/static/{leaflet.js,leaflet.css,gpx.js,endpoint-places.js} \
         mileage-monitor/{Dockerfile,monitor.py,gelf.py,prometheus.py,loki.py,shared.py,settings_rules.py} ntfy/server.yml \
         backup/{backup.sh,restore.sh,lib.sh,backup.conf.example} \
@@ -2273,6 +2273,7 @@ verify_unraid_backups() {
             problem "$key destination mount is missing or differs from backup.conf" "Mount the recorded disk, or rerun install.sh to configure the destination."
         fi
     done
+    show_backup_deep_check
     if ! status=$(bash "$SCRIPT_DIR/backup/scheduled.sh" --status); then
         unraid_backup_log
         problem "Couldn't read scheduled backup status" "See the backup log above."
@@ -2600,8 +2601,24 @@ install_backup_timer() {
     ok "The backup works when systemd runs it"
 }
 
+show_backup_deep_check() {
+    local status key value when='' result=''
+    [[ -f $SCRIPT_DIR/backup/scheduled.sh ]] || return 0
+    status=$("${AS_ME[@]}" bash "$SCRIPT_DIR/backup/scheduled.sh" --status 2>/dev/null) || return 0
+    while IFS='=' read -r key value; do
+        case $key in last_deep_check) when=$value ;; last_deep_check_result) result=$value ;; esac
+    done <<< "$status"
+    note "Last deep check: ${when:-never} (result: ${result:-not run})"
+    if [[ $result == failed ]]; then
+        warn "The last deep check failed; inspect the backup log and rerun the backup"
+    elif [[ $result == running ]]; then
+        warn "The last deep check has no final result yet; it may still be running or have been interrupted"
+    fi
+}
+
 verify_backups() {
     local unit backup_dir last age next
+    show_backup_deep_check
     unit=$(backup_unit)
     if ! timer_ok; then
         problem "The daily backup timer isn't running" "sudo systemctl enable --now $unit.timer"

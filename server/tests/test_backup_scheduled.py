@@ -7,7 +7,10 @@ import tempfile
 import time
 import unittest
 
-from test_backup import BACKUP, tools_missing
+try:
+    from .test_backup import BACKUP, tools_missing
+except ImportError:  # unittest discovery imports this file as a top-level module.
+    from test_backup import BACKUP, tools_missing
 
 
 @unittest.skipIf(tools_missing(), tools_missing())
@@ -66,7 +69,8 @@ class ScheduledBackup(unittest.TestCase):
     def test_status_before_first_run_has_exact_fields_and_creates_nothing(self):
         self.assertEqual(self.status(), {
             "last_attempt_start": "", "last_attempt_end": "", "last_attempt_status": "",
-            "last_success": "", "log": str(self.log)})
+            "last_success": "", "log": str(self.log),
+            "last_deep_check": "", "last_deep_check_result": ""})
         self.assertFalse(self.state.parent.exists())
         self.assertFalse(self.log.parent.exists())
 
@@ -77,6 +81,17 @@ class ScheduledBackup(unittest.TestCase):
             else:
                 self.conf.write_text("BACKUP_DIR=\n")
             self.assertEqual(self.status()["last_success"], "")
+
+    def test_status_reads_deep_check_state_without_sourcing_it(self):
+        stamp = "2026-01-01T00:00:00Z"
+        for result in ("passed", "failed", "running"):
+            (self.backups / "verify-state").write_text(
+                f"last_check={stamp}\nresult={result}\ncursor=\n"
+                'ignored=$(touch "' + str(self.tmp / "injected") + '")\n')
+            status = self.status()
+            self.assertEqual(status["last_deep_check"], stamp)
+            self.assertEqual(status["last_deep_check_result"], result)
+            self.assertFalse((self.tmp / "injected").exists())
 
     def test_success_records_utc_state_and_private_log_in_install_folder(self):
         result = self.run_wrapper()

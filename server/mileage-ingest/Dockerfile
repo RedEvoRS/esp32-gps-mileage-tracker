@@ -11,7 +11,7 @@ COPY mileage-ingest/app.py mileage-ingest/diag_store.py mileage-ingest/reset_hig
 COPY common/ /app/common/
 ENV PYTHONPATH=/app
 
-RUN mkdir -p /data && chown -R app:app /data /app
+RUN mkdir -p /data /settings && chown -R app:app /data /settings /app
 
 ARG SERVER_VERSION=unversioned
 ENV SERVER_VERSION=${SERVER_VERSION}

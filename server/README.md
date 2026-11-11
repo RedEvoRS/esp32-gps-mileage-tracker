@@ -178,6 +178,7 @@ concerns handled by `mileage-viewer`, which reads these files independently.
         ├── app.py             # The web UI (Flask)
         ├── manage_users.py    # Command-line management of everyday logins
         ├── users.py           # Login accounts and password hashing
+        ├── diagnostics_settings.py # Retention setting and atomic ingest mirror
         ├── trip_log.py        # Trip removal, change history and tax-year records
         ├── trip_merges.py     # Merging recordings from one drive
         ├── geocoding.py       # Optional place lookup
@@ -321,6 +322,10 @@ Importable panel and LogQL alert examples are in `grafana/`; see
 DEPLOY_DEBIAN.md Step 11f.
 
 Backups include consistent diagnostics and monitor-state database snapshots.
+The diagnostics retention setting is included in the annotations snapshot.
+The `ingest-settings` volume holds only a derived JSON copy and is not backed
+up; restore restarts the default services and viewer startup recreates that
+copy from the restored annotations database.
 The optional ntfy volume (users, tokens and cached messages) needs a separate
 backup. Full policy and schema details are in [DIAGNOSTICS.md](../DIAGNOSTICS.md).
 
@@ -344,6 +349,15 @@ merges and you verify the deployment, tag that exact merged commit `srv-v0.NN`
 uses `srv-v0.01`. These server tags are separate from firmware tags. Do not
 tag a dirty build as a release: its uncommitted changes cannot be recovered
 from a Git tag.
+
+Server `srv-` tagging stays manual after the verified deploy. Merging a
+`firmware/VERSION` bump automatically publishes the firmware release as
+Latest immediately, before the server is deployed or the board is flashed,
+and then uploads its assets. That release can include a new server version.
+If it fails, re-run all Firmware release jobs, or manually run Release assets
+(`release.yml`) with the published tag if only assets failed. See
+[Firmware versions and releases](../firmware/README.md#firmware-versions-and-releases)
+for the reviewed release notes and recovery steps.
 
 From this folder, `python3 stamp_version.py` prints the release plus the first
 ten Git commit characters, for example `v0.01+abcdef1234`. Any uncommitted
@@ -719,6 +733,20 @@ What it does:
   The diagnostics DB is opened read-only with a two-second lock timeout.
   Before it exists the page says "No diagnostics yet"; read/schema/lock errors
   say "Diagnostics unavailable" (503) and log a warning. Neither means healthy.
+- **Diagnostics retention** — on **Admin** (`/admin`), set how many days of
+  events to keep: **365** by default, whole numbers **30–3650**. Only an admin
+  can save it; the page shows who last saved it and when. Ingest deletes older
+  events on the next diagnostics upload in batches of 250, with a two-second
+  budget checked between batches. Unfinished cleanup continues on the next
+  upload; completed or failed attempts wait an hour. Current device health
+  and the newest event are kept.
+  Deleted pages are reused; cleanup does not shrink the database file.
+  The viewer saves the setting in `annotations.db`, then publishes a tiny
+  `diagnostics.json` in `ingest-settings`, mounted at `/settings` writable in
+  viewer and read-only in ingest. Ingest cannot read the viewer database, and
+  viewer still reads diagnostics only. A failed hand-off warns on Admin;
+  fix the volume and save again or restart the viewer. A missing or invalid
+  mirror makes ingest use 365 days. [Retention details](../DIAGNOSTICS.md#diagnostics-event-retention).
 
 Years are based on **trip start in `DISPLAY_TZ`**, including at the New Year
 boundary. A trip crossing midnight belongs entirely to its start year; it
@@ -1294,6 +1322,46 @@ marker for you, and `backup/backup.sh --mark-target` writes it if you set
 on, are in `DEPLOY_DEBIAN.md` Step 10.
 Each SQLite snapshot is consistent individually; the databases and trip files
 are captured in sequence, rather than in one shared transaction.
+
+After today's backup is copied, a periodic deep check reads older snapshots in
+full. `BACKUP_VERIFY_DAYS=7` defaults to weekly; whole days 0 to 36500 are allowed,
+and `0` disables periodic checking. `BACKUP_VERIFY_COUNT=3` selects up to three
+older local snapshots, always the oldest plus rotation through the rest. Counts
+must be 2 to 1000 to leave room for rotation. UTC snapshot names keep the rotation
+working after pruning. Each selected copy must pass `SHA256SUMS` (unlisted files
+also fail, except root `INFO` and `SHA256SUMS`), then a checksum rsync dry run
+checks REMOTE against that verified local copy. If REMOTE's oldest snapshot is
+no longer local, it is fetched into private scratch under `BACKUP_DIR`, checked
+against its manifest and removed. This supports both mounted paths and SSH
+REMOTE, with no extra remote shell commands. Allow space for that extra snapshot.
+
+Whole-file reads can take minutes or hours; the existing 600-second rsync I/O
+timeout and six-hour systemd/Unraid wrapper limit still apply. Scratch is cleaned
+on exit or termination, or by the next backup after a forced kill. An atomic
+`BACKUP_DIR/verify-state` records UTC check time, result, rotation cursor and
+pending retries. `scheduled.sh --status` exposes `last_deep_check` and
+`last_deep_check_result`; `install.sh --check` and `restore.sh check` also show it.
+`BACKUP_DIR/last-success` advances once today's backup has completed and been
+copied off-host, before the deep check. A failed check still exits non-zero:
+the Debian unit fails or Unraid records a failed `last_attempt_status`, and
+`install.sh --check` reports the failure as a problem. The `PING_URL` heartbeat
+is withheld, so an external monitor can alert. Failed or interrupted checks
+retry on the next nightly backup run. Unraid's hourly overdue catch-up does
+nothing while `last-success` is fresh. Retries keep the rotation
+position and protect failed snapshots from pruning until success (or checking
+is disabled).
+
+One damaged file can affect every snapshot sharing its hard link. A failure
+names the local or remote snapshot and file paths; check other copies with
+`bash backup/restore.sh check <snapshot-name>` (REMOTE), or give a full local
+snapshot path. After verifying a good REMOTE snapshot, use `rsync -ac` to copy
+the matching good file back into the affected local snapshot and recheck it;
+avoid writing through shared hard links in place or changing the manifest to
+hide damage. The [recovery example in Debian Step 10b](../DEPLOY_DEBIAN.md#10b--configure-it)
+shows the command and cautions. Run `bash backup/backup.sh --verify` to complete
+a normal backup and force a deep check now, even if not due or periodic checks
+are off. Check other affected snapshots by name too: one rotating run samples
+history and does not verify every snapshot.
 
 `backup/restore.sh check` fetches the newest off-host snapshot, verifies every
 file and database, and reports annotation/event counts and monitor state tables

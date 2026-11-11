@@ -28,6 +28,7 @@ mileage-viewer/**
 !mileage-viewer/trip_log.py
 !mileage-viewer/users.py
 !mileage-viewer/manage_users.py
+!mileage-viewer/diagnostics_settings.py
 !mileage-viewer/static/
 mileage-viewer/static/**
 !mileage-viewer/static/leaflet.js
@@ -48,6 +49,7 @@ common/**
 !common/__init__.py
 !common/version.py
 !common/settings.py
+!common/retention.py
 !common/trip_summary.py
 !common/diagnostics/
 common/diagnostics/**

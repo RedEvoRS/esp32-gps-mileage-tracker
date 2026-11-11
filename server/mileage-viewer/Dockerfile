@@ -9,13 +9,14 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 COPY mileage-viewer/app.py /app/
 COPY mileage-viewer/geocoding.py mileage-viewer/trip_merges.py mileage-viewer/trip_log.py mileage-viewer/users.py mileage-viewer/manage_users.py /app/
+COPY mileage-viewer/diagnostics_settings.py /app/
 COPY mileage-viewer/static/ /app/static/
 COPY common/ /app/common/
 ENV PYTHONPATH=/app
 
 # /data is the read-only mount of the ingest data; /db holds the
 # annotations SQLite database (its own writable volume).
-RUN mkdir -p /data /db && chown -R app:app /data /db /app
+RUN mkdir -p /data /db /settings && chown -R app:app /data /db /settings /app
 
 ARG SERVER_VERSION=unversioned
 ENV SERVER_VERSION=${SERVER_VERSION}

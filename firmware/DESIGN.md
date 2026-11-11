@@ -101,7 +101,7 @@ Enrollment follows bounded PMU bus recovery and the LoRa-off safety command,
 before display setup, USB waits or storage. Degraded startups use it too.
 The initial PMU recovery itself is not watched by this helper. Stage boundaries
 feed only after the previous stage returned. Erased-partition reads, trip scans,
-directory entries and repair copies also feed on verified progress. Waits,
+directory entries and legacy repair comparisons also feed on verified progress. Waits,
 mount retries and lock acquisition do not feed. A progressing operation can
 take longer than 120 seconds in total. Driver calls without visible progress,
 including the first FAT free-space query, must return within that limit.
@@ -150,7 +150,7 @@ real power-on clearing the latch and the stage timings above remain unchecked
 on the board.
 
 Arduino's `main.cpp` feeds before each `loop()` call, covering normal and
-degraded modes. Runtime scan, prefix comparison and repair-copy loops feed
+degraded modes. Runtime tail scans and legacy prefix comparisons feed
 only after successful byte progress. Power-off feeds after its two bounded
 15-second network/journal handoffs, returned unmount, returned shutdown hold
 and completed remount. Its display hold and post-shutdown hold are one second
@@ -315,13 +315,51 @@ full, the oldest point is committed without a time before accepting more.
 at trip end. The in-memory tail can be lost on reset.
 
 At boot, `setup()` calls `fsckAllTrips()` on both mounted stores before
-networking starts. `repairTrip()` copies through the last complete
-`</trkpt>` and adds closing tags; files with no complete points are removed.
-`recoverRepairCopy()` handles interrupted `.gpx.fix` repairs, retaining
-ambiguous copies. `publishRepair()` replaces the original only after the
-repair is verified and closed. On SD it must remove the old destination
-before renaming; File Allocation Table (FAT) metadata is not power-loss
-atomic. Incomplete files are excluded from uploads (`isCompleteFile()`).
+networking starts. `repairTrip()` looks backwards in 256-byte blocks for the
+last complete `</trkpt>`, retaining seven bytes between blocks so a split tag
+is recognized. Zero-filled or garbage tails are skipped the same way. Every
+verified block feeds the watchdog. Files with no complete points are removed;
+read errors never authorize removal. The existing `</gpx>` tail check leaves
+already-complete files alone.
+
+New repairs shorten the original file immediately after that point, then add
+a newline and the closing tags. The bytes match the former copy-based repair,
+without needing space for a second trip or creating a `.fix` file. Arduino's
+file interface has no truncate and hides sync/close errors, so
+`trip_repair_vfs.h` uses the already-mounted virtual filesystem (VFS) directly:
+`/sd` for SD and `/littlefs` for internal flash, matching the mount calls.
+It opens the existing file without creating it, calls `ftruncate()`, syncs
+the cut, seeks explicitly to the cut, appends, syncs again and checks close.
+Syncing before the append commits the shortened File Allocation Table (FAT)
+chain before more clusters can be allocated. Any failed operation reports a write failure, including
+when the closing bytes were written but sync or close failed.
+
+A reset after the cut leaves every complete point in an incomplete document;
+the next boot adds the same closing tags. A partial append can be cut back
+and retried too. Only a full closing marker passes the existing completeness
+check (`isCompleteFile()`). FAT metadata itself is not power-loss atomic;
+these checked calls cannot repair a damaged filesystem or guarantee what a
+card has physically persisted. A failed sync/close may leave the complete
+document on disk; it is still reported as failure on that attempt.
+
+`endTrip()` runs on the GPS-reading core with the filesystem lock held. Its
+repair reads at most the 16-byte completeness tail plus 4 KiB backwards.
+Normally only one 256-byte block is needed, regardless of trip length. If
+the damage is longer, it leaves the file untouched for boot recovery rather
+than blocking GPS on a whole-file pass. Driver truncate/sync/close latency
+still needs measurement on hardware. New repairs omit the diagnostic point
+count (`pointsKnown=false`); boot recovery also avoids counting the retained
+prefix because that adds a full-file read without helping recovery.
+
+`recoverRepairCopy()` still handles `.gpx.fix` files left by older firmware,
+retaining ambiguous copies and quarantine-name collisions. That legacy path
+may compare/count the whole file and use `publishRepair()`; it is deferred
+to boot if encountered during `endTrip()`. On SD, publishing a verified,
+closed legacy copy removes the old destination before renaming. An orphan
+copy remains discoverable after an interrupted replacement. Rename failure
+reasons remain specific to this legacy path; new repairs use existing read,
+write and parse reasons. E4006 write-condition and E4007 recovery-failure
+reporting still go through the existing helpers.
 
 `mountTripStorage()` selects SD first and LittleFS fallback for new trips;
 the destination does not change mid-trip. Both mounted stores can upload

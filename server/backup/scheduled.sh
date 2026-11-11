@@ -55,6 +55,11 @@ if [[ $status_only == yes ]]; then
     fi
     printf 'last_attempt_start=%s\nlast_attempt_end=%s\nlast_attempt_status=%s\nlast_success=%s\nlog=%s\n' \
         "$start" "$end" "$result" "$last_success" "$LOG"
+    (
+        # shellcheck source=lib.sh
+        . "$SCRIPT_DIR/lib.sh" > /dev/null 2>&1
+        print_verify_status
+    ) || printf 'last_deep_check=\nlast_deep_check_result=\n'
     exit 0
 fi
 

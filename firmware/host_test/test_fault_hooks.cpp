@@ -423,21 +423,25 @@ int main(int argc, char** argv) {
     while (gGpsConfig.state != GPS_CONFIG_DONE) { g_millis += 8000; serviceGpsConfiguration(); }
     one(3004, "notice");
 
-    // Boot fsck: no event on complete files; actual repair counts points;
+    // Boot fsck: no event on complete files; new repair omits unknown points;
     // read/open, write and rename failures preserve recoverable trip data.
     for (const char* reason : {"read", "write", "rename"}) {
         faultWorld(); g_sdDisk.files["/trips/broken.gpx"] = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\npartial";
         if (!std::strcmp(reason, "read")) g_sdDisk.failNextOpens = 1;
-        if (!std::strcmp(reason, "write")) g_sdDisk.failFlushes = 1;
-        if (!std::strcmp(reason, "rename")) g_sdDisk.failRenames = 1;
+        if (!std::strcmp(reason, "write")) g_sdDisk.repairFailOperation = "truncate";
+        if (!std::strcmp(reason, "rename")) {
+            g_sdDisk.files["/trips/broken.gpx.fix"] = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n" + GPX_EPILOGUE;
+            g_sdDisk.failRenames = 1;
+        }
         fsckAllTrips(SD); auto failed = one(4007, "notice");
         has(failed, std::string("\"reason\":\"") + reason + "\"");
         g_sdDisk.failNextOpens = g_sdDisk.failFlushes = g_sdDisk.failRenames = 0;
+        g_sdDisk.repairFailOperation.clear();
         fsckAllTrips(SD); one(4010, "notice");
         fsckAllTrips(SD); assert(take().empty());
     }
     faultWorld(); g_sdDisk.files["/trips/broken.gpx"] = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n<trkpt></trkpt>\npartial";
-    fsckAllTrips(SD); auto repaired = one(4010, "notice"); has(repaired, "\"points\":2");
+    fsckAllTrips(SD); auto repaired = one(4010, "notice"); assert(repaired.find("\"points\"") == std::string::npos);
     faultWorld(); g_sdDisk.files["/trips/orphan.gpx.fix"] = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n" + GPX_EPILOGUE;
     fsckAllTrips(SD); one(4010, "notice"); fsckAllTrips(SD); assert(take().empty());
     faultWorld(); g_sdDisk.files["/trips/ambiguous.gpx.fix"] = "unrecognized repair";

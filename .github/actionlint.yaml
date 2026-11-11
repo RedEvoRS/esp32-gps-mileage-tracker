@@ -1,0 +1,4 @@
+# GitHub supports this hosted image; actionlint v1.7.12 does not list it yet.
+# This setting allows the label without changing the installer's runner.
+self-hosted-runner:
+  labels: [ubuntu-26.04]

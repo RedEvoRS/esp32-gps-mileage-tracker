@@ -9,6 +9,12 @@ on:
         description: Existing release tag to rebuild assets for
         required: true
         type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: Existing release tag to build assets for
+        required: true
+        type: string
 
 permissions:
   contents: read

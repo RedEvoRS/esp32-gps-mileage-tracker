@@ -109,12 +109,15 @@ server/
 
 tools/check_pii.py                  Personal-info scan (CI runs it; see Do Not)
 tools/generate_error_catalog.py     Generates sketch-local diag_catalog.h
+tools/firmware_release.py           Validates firmware bumps and assembles release notes
 tools/lint/requirements.txt         Pinned ruff for the CI lint step
 ruff.toml                           Lint rules (F, E9, B) for server, tools and install
 DEPLOY_UNRAID.md                   Unraid install, cron backups and Debian migration
 DIAGNOSTICS.md                     Framework reference and issue delivery map
 .github/workflows/release.yml       Published-release bundle, scripts and checksums
+.github/workflows/firmware-release.yml  Firmware VERSION push: tag, publish, then release assets
 .github/workflows/audit-tests.yml   CI: PII scan + server tests + firmware host tests
+release-notes/                    Reviewed firmware summaries and shared Install section
 .github/dependabot.yml              Dependabot: monthly pip, Docker and Actions bumps
 docs/history/                     Reviews and original V1.2 design brief (see Where Status Lives)
 ```
@@ -148,14 +151,24 @@ names no issue numbers on purpose, because they go stale; keep it that way.
 
 ## Tests
 
-CI runs all checks on PRs and manual runs; pushes to main run only the PII
-scan. Strict up-to-date required checks mean main receives exactly the files
+CI runs all checks on PRs and manual runs; pushes to main run the PII/tools
+job, plus the firmware release workflow when `firmware/VERSION` changes.
+That workflow publishes immediately, before server deployment or board flashing.
+Strict up-to-date required checks mean main receives exactly the files
 tested on the PR. A new push to a PR cancels its older run; main runs are not
-cancelled. The PII/tools job is skipped for Dependabot PRs:
+cancelled. Only the secret-backed PII scan is skipped for Dependabot; tools
+tests and the firmware release check still run:
 - PII: `python tools/check_pii.py` (add `--commits origin/main..HEAD`
   before pushing; it also checks every file version and path the range adds,
   even ones later removed) and `python -m unittest discover -s tools`.
   The scanner checks positions and new commit dates; commit with TZ=UTC.
+- Firmware release: the PII/tools job runs
+  `python tools/firmware_release.py check --base <base-commit> --ref <head-commit>`
+  on every PR. VERSION unchanged from the PR's merge base needs no notes;
+  a changed `firmware/VERSION` must exceed both the merge base and base tip
+  versions and have a non-empty summary in `release-notes/fw-<VERSION>.md`.
+  The same script compares the before and after push commits directly for
+  releases and assembles the published body with `release-notes/install.md`.
 - Python lint: `python -m pip install -r tools/lint/requirements.txt`, then
   `ruff check` (server, tools and install; rules F, E9 and B).
 - Server: `python -m unittest discover -s server/tests`,
@@ -334,6 +347,16 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   No generated `firmware_version.h` means `unversioned`; an existing header
   keeps its old stamp. Run `python tools/stamp_firmware_version.py` before
   every build. Boards flashed before version reporting show `Not reported`.
+  Bump `firmware/VERSION` and review `release-notes/fw-<VERSION>.md` in the PR
+  that ships the change. Merging the bump to main creates an annotated
+  `fw-<VERSION>` tag on that commit and publishes `Supreme firmware <VERSION>`
+  as Latest, then builds and uploads the source bundle, install/flash scripts
+  and checksums through the reusable release workflow. Publication happens
+  before the server is deployed or the board is flashed; it proves neither.
+  Re-run all jobs after a failed release; if only assets need finishing,
+  manually run Release assets (`release.yml`) with the existing tag. A tag
+  on a different commit fails and is never moved. Runbook:
+  `firmware/README.md` "Firmware versions and releases".
 - Display/debug: one Stage 4 firmware starts with debug off at every power-on,
   never saved. While running, hold BOOT then tap POWER to toggle the live
   page and debug serial output. POWER alone shows a production status card
@@ -372,7 +395,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   and unauthenticated `/health` expose it on the LAN; `install.sh --check`
   warns on service mismatches.
   Bump VERSION in the PR that ships the change (no separate PR); after
-  deployment is verified, tag the merged commit `srv-v0.NN` (see DEPLOY_DEBIAN.md).
+  deployment is verified, manually tag the merged commit `srv-<VERSION>`
+  (see DEPLOY_DEBIAN.md). Server tags stay manual; a firmware release may
+  already be published before that deploy is verified.
 - Ingest port: 8090, bearer token auth, GPX body in → raw `.gpx` + derived
   `.json` summary out (atomic writes); distance = haversine over moving
   steps only (speed > 2 mph at either end), HDOP > 5 and > 60 m/s jumps
@@ -410,6 +435,19 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   compare-and-set admin recovery (DIAGNOSTICS.md); ack only after commit. GPX successes refresh contact only for a valid device header;
   diagnostics failure never changes their response. See `DIAGNOSTICS.md` for
   schema/unknown-condition semantics.
+- Diagnostics retention: admin-only `/admin` form, whole days 30–3650, default
+  365. `viewer_settings` in annotations is the source (last admin/time recorded);
+  viewer mirrors JSON atomically to `ingest-settings:/settings`, read-only in
+  ingest. Both images prepare app-owned `/settings`. Viewer startup tolerates
+  mirror failure and Admin warns; ingest defaults to 365 for missing/invalid
+  settings. After diagnostics commit, ingest prunes 250 rows per transaction
+  with a two-second budget checked between batches. Unfinished cleanup resumes
+  on the next upload; completed or failed attempts wait an hour. Highest rowid
+  and all current health are preserved.
+  No VACUUM or schema change; errors never change upload responses. GELF/Loki
+  continue past a pruned cursor only if no rows at/below it remain and highest
+  rowid is at least the cursor; other restore rules still reset. Backups include
+  the source setting; restore restarts viewer and rebuilds the unbacked-up mirror.
 - Viewer port: 8091, admin/everyday session logins (LAN-only), reads `./data`
   read-only, owns `annotations.db` (SQLite) in `viewer-db`. Removal only marks
   a trip in that DB; it never touches `./data`. Closing a year saves its totals
@@ -497,6 +535,13 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   snapshots of viewer annotations, ingest diagnostics (`events.db`), and optional
   monitor delivery/export state (`monitor.db`, when its volume exists). Viewer
   helpers read annotations and diagnostics; the monitor helper reads its volume.
+  Weekly deep checks rotate older local/REMOTE copies and record
+  `BACKUP_DIR/verify-state`. `last-success` advances once today's backup has
+  completed and been copied off-host, before the deep check. A deep failure
+  still exits non-zero (failed Debian unit / Unraid `last_attempt_status`,
+  reported as a problem by `install.sh --check`) and withholds the `PING_URL`
+  heartbeat. The next nightly run retries; Unraid's hourly overdue catch-up
+  does nothing while `last-success` is fresh.
   Missing diagnostics/monitor databases are normal and recorded in `INFO`.
   Monitor discovery uses Compose config's project name and Docker's Compose
   project/volume labels, without recent config flags or logging credentials.

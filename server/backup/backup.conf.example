@@ -41,6 +41,15 @@ REMOTE=backup@nas.lan:/volume1/backups/mileage-tracker
 KEEP_RECENT=14
 KEEP_MONTHLY=84
 
+# After copying today's backup, re-read older snapshots every this many days.
+# Default 7; 0 disables deep checks. Allowed: 0..36500, whole days.
+BACKUP_VERIFY_DAYS=7
+# Check up to this many older local snapshots, always the oldest plus a
+# rotating selection. At least 2 leaves room for rotation (maximum 1000).
+# Also check the oldest REMOTE snapshot if it no longer exists locally.
+# Failures retry on the next backup run, without waiting for the interval.
+BACKUP_VERIFY_COUNT=3
+
 # yes = after each copy, apply the same retention rule (KEEP_RECENT newest,
 # plus the first of each of the newest KEEP_MONTHLY months) to the snapshot
 # names on the off-host copy, and delete the names it drops. It never makes

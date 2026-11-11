@@ -83,17 +83,8 @@ fetch_and_check() {
     log "Fetching $source"
     rsync_remote -a --numeric-ids "$source/" "$scratch/snapshot/"
     local snap=$scratch/snapshot
-    [[ -f $snap/SHA256SUMS && -f $snap/annotations.db && -d $snap/data ]] \
-        || die "$source doesn't look like a backup snapshot"
-
     log "Verifying checksums"
-    (cd "$snap" && sha256sum --quiet --strict -c SHA256SUMS) \
-        || die "checksums don't match; this snapshot is damaged"
-    # Every file must be listed, so nothing can be slipped in unverified.
-    local listed actual
-    listed=$(sed -E 's/^[0-9a-f]{64} [ *]//' "$snap/SHA256SUMS" | LC_ALL=C sort)
-    actual=$(cd "$snap" && find . -type f ! -name SHA256SUMS ! -name INFO | LC_ALL=C sort)
-    [[ $listed == "$actual" ]] || die "snapshot has files missing from or not in SHA256SUMS"
+    verify_snapshot "$snap" || die "$source failed snapshot verification"
 
     log "Checking the database"
     viewer_python "$PY_CHECK_RESTORE" annotations < "$snap/annotations.db" >&2 \
@@ -166,6 +157,7 @@ else
 fi
 trap cleanup EXIT
 
+show_verify_status
 fetch_and_check "$snapshot_arg"
 
 if [[ $command == check ]]; then

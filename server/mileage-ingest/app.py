@@ -430,6 +430,10 @@ def device_events():
     except Exception:
         app.logger.exception("Failed to commit device diagnostics")
         return jsonify(error="server error storing diagnostics"), 500
+    try:
+        DIAGNOSTICS_STORE.prune_if_due()
+    except Exception as exc:
+        app.logger.warning("Diagnostics retention prune failed (%s); upload remains accepted", type(exc).__name__)
     return jsonify(accepted=accepted), 200
 
 

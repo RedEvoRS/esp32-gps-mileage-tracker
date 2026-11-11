@@ -80,6 +80,63 @@ class CursorIdentityTests(unittest.TestCase):
             self.assertEqual({name: sql for name, sql in db.execute("SELECT name,sql FROM sqlite_master WHERE type='table'")
                               if name != "event_cursor_markers"}, old_tables)
 
+    def event_sequences(self):
+        return ([row['_sequence'] for row in self.gelf_seen if row['_kind'] == 'event'],
+                [row['sequence'] for row in self.loki_seen if row['kind'] == 'event'])
+
+    def test_pruned_delivered_prefix_continues_both_sinks_without_replay(self):
+        for sequence in range(1, 4):
+            self.post(sequence)
+        self.worker.tick()
+        for sequence in (4, 5):
+            self.post(sequence)
+        with closing(sqlite3.connect(self.store.path)) as db, db:
+            db.execute('DELETE FROM events WHERE rowid<=3')
+        for _ in range(3):
+            self.assertTrue(self.worker.tick())
+        self.assertEqual(self.event_sequences(), ([1, 2, 3, 4, 5], [1, 2, 3, 4, 5]))
+        with closing(sqlite3.connect(self.worker.state_path)) as db:
+            markers = db.execute('SELECT sink,event_rowid,fingerprint FROM event_cursor_markers ORDER BY sink').fetchall()
+        self.assertEqual([row[:2] for row in markers], [('gelf', 5), ('loki', 5)])
+        self.assertTrue(all(row[2] for row in markers))
+
+    def test_pruned_anchor_refreshes_marker_before_delivery_progress(self):
+        from unittest.mock import patch
+        for sequence in (1, 2):
+            self.post(sequence)
+        self.worker.tick()
+        self.post(3)
+        with closing(sqlite3.connect(self.store.path)) as db, db:
+            db.execute('DELETE FROM events WHERE rowid<=2')
+        with patch.object(self.worker, 'gelf_sender', side_effect=OSError('synthetic')), \
+                patch.object(self.worker, 'loki_sender', side_effect=OSError('synthetic')):
+            self.worker.tick()
+        with closing(sqlite3.connect(self.worker.state_path)) as db:
+            self.assertEqual(db.execute('SELECT sink,event_rowid,fingerprint FROM event_cursor_markers ORDER BY sink').fetchall(),
+                             [('gelf', 2, ''), ('loki', 2, '')])
+        self.assertEqual(self.event_sequences(), ([1, 2], [1, 2]))
+
+    def test_missing_anchor_inside_retained_history_still_resets_both_sinks(self):
+        for sequence in (1, 2, 3):
+            self.post(sequence)
+        self.worker.tick()
+        self.post(4)
+        with closing(sqlite3.connect(self.store.path)) as db, db:
+            db.execute('DELETE FROM events WHERE rowid=3')
+        self.worker.tick()  # Reset: earlier rows remain, so this is not a pruned prefix.
+        self.worker.tick()
+        self.assertEqual(self.event_sequences(), ([1, 2, 3, 1, 2, 4], [1, 2, 3, 1, 2, 4]))
+
+    def test_lower_maximum_still_resets_both_sinks(self):
+        for sequence in (1, 2, 3):
+            self.post(sequence)
+        self.worker.tick()
+        with closing(sqlite3.connect(self.store.path)) as db, db:
+            db.execute('DELETE FROM events WHERE rowid>=3')
+        self.worker.tick()
+        self.worker.tick()
+        self.assertEqual(self.event_sequences(), ([1, 2, 3, 1, 2], [1, 2, 3, 1, 2]))
+
 
 if __name__ == "__main__":
     unittest.main()
