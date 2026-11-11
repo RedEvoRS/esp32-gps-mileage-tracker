@@ -3,6 +3,7 @@
 import copy
 import importlib.util
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -256,6 +257,76 @@ class MonitorTests(unittest.TestCase):
         self.sql("UPDATE schema_version SET version=1")
         self.assertTrue(self.tick())
         self.assertEqual(len(self.messages), 1)
+
+    def symlink(self, link, target, directory=False):
+        try:
+            link.symlink_to(target, target_is_directory=directory)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlink creation unavailable: {type(exc).__name__}")
+
+    def assert_events_link_suspends_and_recovers(self, folder):
+        # Queue an alert whose first delivery fails: unsafe reads must also
+        # suspend already-pending sends, rather than just ignore new rows.
+        self.snapshot(active=(4003,))
+        with mock.patch.object(self.worker, "sender", side_effect=OSError), \
+                self.assertLogs("mileage-monitor", "WARNING"):
+            self.assertTrue(self.tick())
+        pending = self.sql("SELECT * FROM work", state=True)
+        self.assertTrue(pending)
+        self.now += 60
+        self.worker = self.make_monitor(
+            graylog=monitor.gelf.GelfConfig(enabled=True, url="http://graylog.invalid/gelf"),
+            loki=monitor.loki_module.LokiConfig(enabled=True, url="http://loki.invalid/push"),
+            metrics=monitor.prometheus.MetricsConfig(enabled=True, token="x" * 32))
+        ntfy, graylog, loki = mock.Mock(), mock.Mock(side_effect=len), mock.Mock()
+        self.worker.sender, self.worker.gelf_sender, self.worker.loki_sender = ntfy, graylog, loki
+        os.utime(self.worker.heartbeat_path, (1, 1))
+        path = self.store.path
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / ("diagnostics" if folder else "events.db")
+            link = path.parent if folder else path
+            link.rename(target)
+            outside_db = target / "events.db" if folder else target
+            before = outside_db.read_bytes(), outside_db.stat().st_mtime_ns
+            self.symlink(link, target, directory=folder)
+            try:
+                # Both readers must reject before stat/connect, independently
+                # of the tick's early return and enabled export settings.
+                with mock.patch.object(sqlite3, "connect", side_effect=AssertionError("outside DB opened")) as connect:
+                    for reader in (lambda: monitor.read_devices(path, self.catalog),
+                                   lambda: monitor.shared.read_events(path, 0, 10)):
+                        with self.assertRaisesRegex(ValueError, "escapes data root"):
+                            reader()
+                connect.assert_not_called()
+                for _ in range(2):
+                    with self.assertLogs("mileage-monitor", "WARNING") as logs:
+                        self.assertFalse(self.tick())
+                    self.assertIn("Diagnostics unavailable", " ".join(logs.output))
+                    self.assertNotIn(str(target), " ".join(logs.output))
+                ntfy.assert_not_called()
+                graylog.assert_not_called()
+                loki.assert_not_called()
+                self.assertNotIn('device_id="tracker-1"', self.worker.metrics_snapshot.render(self.now))
+                self.assertEqual(self.sql("SELECT * FROM work", state=True), pending)
+                self.assertEqual(self.worker.heartbeat_path.stat().st_mtime, 1)
+                self.assertEqual((outside_db.read_bytes(), outside_db.stat().st_mtime_ns), before)
+            finally:
+                link.unlink()
+                target.rename(link)
+        self.assertTrue(self.tick())
+        self.assertEqual(ntfy.call_count, 1)
+        self.assertTrue(graylog.called)
+        self.assertTrue(loki.called)
+        self.assertIn('device_id="tracker-1"', self.worker.metrics_snapshot.render(self.now))
+        self.assertGreater(self.worker.heartbeat_path.stat().st_mtime, 1)
+
+    @unittest.skipIf(os.name == "nt", "symlink containment runs on POSIX")
+    def test_events_database_symlink_suspends_all_outputs_until_recovery(self):
+        self.assert_events_link_suspends_and_recovers(folder=False)
+
+    @unittest.skipIf(os.name == "nt", "symlink containment runs on POSIX")
+    def test_diagnostics_folder_symlink_suspends_all_outputs_until_recovery(self):
+        self.assert_events_link_suspends_and_recovers(folder=True)
 
     def test_fresh_snapshot_boundary_and_gpx_does_not_refresh_it(self):
         self.snapshot(active=(4003,), at=self.now - 86401)
