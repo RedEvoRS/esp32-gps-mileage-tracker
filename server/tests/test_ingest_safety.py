@@ -93,6 +93,29 @@ class UploadSafety(unittest.TestCase):
             self.assertEqual(outside_stats, [])
             self.assertEqual(list(target.iterdir()), [])
 
+    @unittest.skipUnless(os.name == "posix", "POSIX no-follow upload lock")
+    def test_upload_lock_symlink_never_creates_or_changes_its_target(self):
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / "private-lock"
+            for present in (False, True):
+                with self.subTest(present=present):
+                    if present:
+                        target.write_bytes(b"outside-lock-sentinel")
+                        before = target.stat()
+                    link = self.root / ".upload.lock"
+                    self.symlink(link, target)
+                    try:
+                        self.assert_storage_error(target)
+                        self.assertEqual(list(self.root.iterdir()), [link])
+                        self.assertTrue(link.is_symlink())
+                        if present:
+                            self.assertEqual(target.read_bytes(), b"outside-lock-sentinel")
+                            self.assertEqual(target.stat().st_mtime_ns, before.st_mtime_ns)
+                        else:
+                            self.assertFalse(target.exists())
+                    finally:
+                        link.unlink()
+
     def test_symlinked_other_month_is_skipped_without_trip_stat(self):
         with tempfile.TemporaryDirectory() as outside:
             target = Path(outside)

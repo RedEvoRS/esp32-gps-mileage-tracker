@@ -205,7 +205,17 @@ def _upload_lock():
     Lock the whole GPX/JSON transaction, not just individual renames. Kernel
     locks are released if a worker exits; no stale lock cleanup is needed.
     """
-    with open(DATA_ROOT / ".upload.lock", "a+b") as lock:
+    path = DATA_ROOT / ".upload.lock"
+    if os.name == "posix":
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        except OSError:
+            app.logger.warning("Could not open upload lock without following links: %s", path)
+            raise
+        lock_file = os.fdopen(fd, "r+b")
+    else:
+        lock_file = open(path, "a+b")
+    with lock_file as lock:
         if os.name == "nt":
             import msvcrt
             if lock.seek(0, os.SEEK_END) == 0:
