@@ -62,17 +62,31 @@ def body(root, value, ref=None):
     return summary + "\n\n" + install
 
 
-def validate(root, base=None, ref=None):
-    """An unchanged VERSION needs no notes; every changed VERSION must increase."""
+def validate(root, base=None, ref=None, *, pull_request=False):
+    """Compare pushes with base; PR changes must exceed merge base and base tip."""
     ref = resolve(root, ref) if ref else None
     raw = read(root, VERSION_PATH, ref)
     value = version(raw)
     if base:
-        previous_raw = read(root, VERSION_PATH, resolve(root, base))
+        base = resolve(root, base)
+        comparison_base = base
+        if pull_request:
+            head = ref or resolve(root, "HEAD")
+            try:
+                comparison_base = git(root, "merge-base", base, head).decode("ascii").strip()
+            except ValueError:
+                raise ValueError("cannot compute PR merge base; fetch complete base and head history") from None
+        previous_raw = read(root, VERSION_PATH, comparison_base)
         previous = version(previous_raw)
         if raw == previous_raw:
             return value, False
-        if number(value) <= number(previous):
+        if pull_request:
+            base_tip = version(read(root, VERSION_PATH, base))
+            if number(value) <= number(previous) or number(value) <= number(base_tip):
+                raise ValueError(
+                    f"firmware/VERSION must increase above both merge base {previous} "
+                    f"and base tip {base_tip}; proposed {value}")
+        elif number(value) <= number(previous):
             raise ValueError(f"firmware/VERSION must increase: base {previous}, proposed {value}")
     body(root, value, ref)
     return value, True
@@ -90,7 +104,7 @@ def main(argv=None):
     if args.command == "check" and not args.base:
         parser.error("check requires --base")
     try:
-        value, changed = validate(args.root, args.base, args.ref)
+        value, changed = validate(args.root, args.base, args.ref, pull_request=args.command == "check")
         if args.command == "render":
             if args.base and not changed:
                 raise ValueError("firmware/VERSION did not change; there is no release to publish")

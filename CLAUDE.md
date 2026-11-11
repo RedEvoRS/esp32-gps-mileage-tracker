@@ -164,9 +164,11 @@ tests and the firmware release check still run:
   The scanner checks positions and new commit dates; commit with TZ=UTC.
 - Firmware release: the PII/tools job runs
   `python tools/firmware_release.py check --base <base-commit> --ref <head-commit>`
-  on every PR. A changed `firmware/VERSION` must increase and have a non-empty
-  summary in `release-notes/fw-<VERSION>.md`; the same script validates and
-  assembles the published body with `release-notes/install.md`.
+  on every PR. VERSION unchanged from the PR's merge base needs no notes;
+  a changed `firmware/VERSION` must exceed both the merge base and base tip
+  versions and have a non-empty summary in `release-notes/fw-<VERSION>.md`.
+  The same script compares the before and after push commits directly for
+  releases and assembles the published body with `release-notes/install.md`.
 - Python lint: `python -m pip install -r tools/lint/requirements.txt`, then
   `ruff check` (server, tools and install; rules F, E9 and B).
 - Server: `python -m unittest discover -s server/tests`,

@@ -13,10 +13,14 @@ python tools/firmware_release.py check --base origin/main
 python tools/firmware_release.py render
 ```
 
-CI uses `--ref <head-commit>` to read committed files, and compares VERSION
-with `--base <base-commit>`. A change must increase the numeric version and
-include non-empty notes. The release workflow uses the same script and reads
-all release inputs from the exact push commit.
+CI uses `--ref <head-commit>` to read committed files. The PR check compares
+VERSION with the merge base of `--base <base-commit>` and the head commit
+(or HEAD when `--ref` is omitted). An unchanged VERSION needs no notes, even
+when the base tip has a newer version. A changed VERSION must be greater than
+both the merge base's version and the base tip's version and include non-empty
+notes. The check requires complete base and head history to find their merge
+base. The release workflow still compares the before and after push commits
+directly and reads all release inputs from the exact push commit.
 
 Merging the bump to main publishes a Latest firmware release immediately,
 before the server is deployed or the board is flashed, then uploads assets.

@@ -45,6 +45,12 @@ class FirmwareRelease(unittest.TestCase):
         self.git("add", ".")
         self.git("commit", "-qm", "Synthetic release fixture")
 
+    def advance_base(self, value="v1.06"):
+        self.git("checkout", "-qb", "base-tip", self.base)
+        self.write(release.VERSION_PATH, value + "\n")
+        self.commit()
+        return self.git("rev-parse", "HEAD")
+
     def test_increase_with_notes(self):
         self.assertEqual(release.validate(self.root, self.base), ("v1.06", True))
 
@@ -161,6 +167,93 @@ class FirmwareRelease(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as stdout:
             release.main(["render", *args])
         self.assertEqual(stdout.getvalue(), body.read_text())
+
+    def test_cli_stale_pr_without_version_change_needs_no_notes(self):
+        self.write(release.VERSION_PATH, "v1.05\n")
+        (self.root / self.notes).unlink()
+        (self.root / release.INSTALL_PATH).unlink()
+        self.write("unrelated.txt", "Synthetic dependency update.\n")
+        self.commit()
+        head = self.git("rev-parse", "HEAD")
+        base_tip = self.advance_base()
+        self.git("checkout", "-q", head)
+        for ref_args in (["--ref", head], []):
+            with self.subTest(ref_args=ref_args):
+                with redirect_stdout(io.StringIO()) as stdout:
+                    release.main(["check", "--root", str(self.root), "--base", base_tip, *ref_args])
+                self.assertIn("v1.05 (unchanged)", stdout.getvalue())
+
+    def test_cli_pr_bump_colliding_with_base_tip_fails(self):
+        self.commit()
+        head = self.git("rev-parse", "HEAD")
+        base_tip = self.advance_base()
+        with self.assertRaisesRegex(
+                SystemExit, "must increase.*merge base v1.05.*base tip v1.06.*proposed v1.06"):
+            release.main(["check", "--root", str(self.root), "--base", base_tip, "--ref", head])
+
+    def test_cli_pr_bump_above_both_versions_passes(self):
+        self.write(release.VERSION_PATH, "v1.07\n")
+        self.write("release-notes/fw-v1.07.md", "Synthetic newer firmware.\n")
+        self.commit()
+        head = self.git("rev-parse", "HEAD")
+        base_tip = self.advance_base()
+        with redirect_stdout(io.StringIO()) as stdout:
+            release.main(["check", "--root", str(self.root), "--base", base_tip, "--ref", head])
+        self.assertIn("v1.07 (increase with reviewed notes)", stdout.getvalue())
+
+    def test_cli_pr_version_must_also_exceed_merge_base(self):
+        self.write(release.VERSION_PATH, "v1.04\n")
+        self.commit()
+        head = self.git("rev-parse", "HEAD")
+        base_tip = self.advance_base("v1.03")
+        with self.assertRaisesRegex(
+                SystemExit, "must increase.*merge base v1.05.*base tip v1.03.*proposed v1.04"):
+            release.main(["check", "--root", str(self.root), "--base", base_tip, "--ref", head])
+
+    def test_cli_pr_bump_without_committed_notes_fails(self):
+        (self.root / self.notes).unlink()
+        self.commit()
+        head = self.git("rev-parse", "HEAD")
+        self.write(self.notes, "Only in the working tree.\n")
+        with self.assertRaisesRegex(SystemExit, "cannot read release-notes/fw-v1.06.md"):
+            release.main(["check", "--root", str(self.root), "--base", self.base, "--ref", head])
+
+    def test_cli_pr_missing_merge_base_fails_closed(self):
+        self.commit()
+        self.git("checkout", "-q", "--orphan", "unrelated")
+        self.commit()
+        head = self.git("rev-parse", "HEAD")
+        output = self.root / "outputs"
+        with self.assertRaisesRegex(SystemExit, "cannot compute PR merge base; fetch complete base and head history"):
+            release.main(["check", "--root", str(self.root), "--base", self.base,
+                          "--ref", head, "--github-output", str(output)])
+        self.assertFalse(output.exists())
+
+    def test_cli_pr_shallow_history_fails_closed(self):
+        self.commit()
+        head = self.git("rev-parse", "HEAD")
+        base_tip = self.advance_base()
+        self.write(".git/shallow", head + "\n" + base_tip + "\n")
+        with self.assertRaisesRegex(SystemExit, "cannot compute PR merge base; fetch complete base and head history"):
+            release.main(["check", "--root", str(self.root), "--base", base_tip, "--ref", head])
+
+    def test_cli_render_still_compares_with_base_tip(self):
+        self.commit()
+        head = self.git("rev-parse", "HEAD")
+        base_tip = self.advance_base()
+        with self.assertRaisesRegex(SystemExit, "no release to publish"):
+            release.main(["render", "--root", str(self.root), "--base", base_tip, "--ref", head])
+
+    def test_cli_render_does_not_require_merge_base(self):
+        self.commit()
+        head = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "--orphan", "unrelated")
+        self.write(release.VERSION_PATH, "v1.05\n")
+        self.commit()
+        before = self.git("rev-parse", "HEAD")
+        with redirect_stdout(io.StringIO()) as stdout:
+            release.main(["render", "--root", str(self.root), "--base", before, "--ref", head])
+        self.assertEqual(stdout.getvalue(), "Synthetic firmware improvements.\n\n" + self.install)
 
     def test_cli_missing_notes_fails_without_outputs(self):
         (self.root / self.notes).unlink()
