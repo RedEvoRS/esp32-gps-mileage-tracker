@@ -276,6 +276,96 @@ class BackupScripts(unittest.TestCase):
         self.assertFalse(ping.exists())
         self.assertEqual(self.snapshots(), [])
 
+    def assert_restore_helpers_refuse(self, path):
+        for helper in ("PY_CHECK_RESTORE", "PY_REMOVE_DB", "PY_CHECK_DB_TARGET"):
+            script = self.python_helper(helper)
+            args = ["events", str(path), str(self.data)] if helper == "PY_CHECK_RESTORE" else [str(path), str(self.data)]
+            errors = io.StringIO()
+            with mock.patch.object(sys, "argv", ["helper", *args]), \
+                    mock.patch.object(Path, "mkdir", side_effect=AssertionError("target directory created")) as mkdir, \
+                    mock.patch.object(sqlite3, "connect", side_effect=AssertionError("database opened")) as connect, \
+                    mock.patch.object(os, "unlink", side_effect=AssertionError("database deleted")) as unlink, \
+                    redirect_stderr(errors), self.assertRaises(SystemExit) as caught:
+                exec(script, {})
+            self.assertEqual(caught.exception.code, 5)
+            self.assertIn("unsafe database path", errors.getvalue())
+            mkdir.assert_not_called()
+            connect.assert_not_called()
+            unlink.assert_not_called()
+
+    def assert_restore_link_rejected(self, folder):
+        path = self.add_events()
+        self.run_script("backup.sh")
+        saved = self.tmp / "saved-diagnostics"
+        path.parent.rename(saved)
+        if not folder:
+            path.parent.mkdir()
+        # A refusal must happen before annotations or trip data are restored.
+        with sqlite3.connect(self.db_dir / "annotations.db") as db:
+            db.execute("UPDATE annotations SET purpose_note='keep current live value'")
+        db.close()
+        annotations = (self.db_dir / "annotations.db").read_bytes()
+        for present in (False, True):
+            with self.subTest(present=present):
+                outside = self.tmp / ("existing-target" if present else "missing-target")
+                target = outside if folder else outside / "events.db"
+                outside_db = outside / "events.db" if folder else target
+                if present:
+                    outside.mkdir()
+                    for suffix in ("", "-wal", "-journal", "-shm"):
+                        Path(str(outside_db) + suffix).write_bytes(b"outside-database-sentinel" + suffix.encode())
+                before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in outside.iterdir()} if present else {}
+                link = path.parent if folder else path
+                self.symlink(link, target, directory=folder)
+                try:
+                    self.assert_restore_helpers_refuse(path)
+                    self.compose_log.write_text("")
+                    result = self.run_script("restore.sh", "restore", "latest", "--yes", check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("refused unsafe restore target /data/diagnostics/events.db", result.stderr)
+                    self.assertNotIn(str(target), result.stdout + result.stderr)
+                    self.assertNotIn("stop mileage-", self.compose_log.read_text())
+                    self.assertFalse(list(self.backups.glob("pre-restore-*")))
+                    self.assertEqual((self.db_dir / "annotations.db").read_bytes(), annotations)
+                    self.assertTrue(link.is_symlink())
+                    if present:
+                        self.assertEqual({p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in outside.iterdir()}, before)
+                    else:
+                        self.assertFalse(outside.exists())
+                finally:
+                    link.unlink()
+
+    def test_restore_events_database_symlink_never_creates_writes_or_deletes_target(self):
+        self.assert_restore_link_rejected(folder=False)
+
+    def test_restore_diagnostics_folder_symlink_never_creates_writes_or_deletes_target(self):
+        self.assert_restore_link_rejected(folder=True)
+
+    def test_restore_final_symlink_inside_data_root_is_also_refused(self):
+        path = self.add_events()
+        self.run_script("backup.sh")
+        target = self.data / "other-events.db"
+        path.rename(target)
+        self.symlink(path, target)
+        before = target.read_bytes(), target.stat().st_mtime_ns
+        self.assert_restore_helpers_refuse(path)
+        result = self.run_script("restore.sh", "restore", "latest", "--yes", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symbolic link write target", result.stderr)
+        self.assertFalse(list(self.backups.glob("pre-restore-*")))
+        self.assertEqual((target.read_bytes(), target.stat().st_mtime_ns), before)
+
+    def test_restore_sidecar_symlink_is_refused_before_any_database_deletion(self):
+        path = self.add_events()
+        outside = self.tmp / "outside-sidecar"
+        outside.write_bytes(b"outside-sidecar-sentinel")
+        before = path.read_bytes(), outside.read_bytes()
+        sidecar = Path(str(path) + "-shm")
+        self.symlink(sidecar, outside)
+        self.assert_restore_helpers_refuse(path)
+        self.assertEqual((path.read_bytes(), outside.read_bytes()), before)
+        self.assertTrue(sidecar.is_symlink())
+
     def add_monitor(self):
         self.env["FAKE_MONITOR"] = "yes"
         path = self.monitor_dir / "monitor.db"
