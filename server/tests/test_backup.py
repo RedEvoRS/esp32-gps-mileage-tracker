@@ -267,7 +267,12 @@ class BackupScripts(unittest.TestCase):
 
     def test_deep_check_due_selects_oldest_and_rotation_then_not_due(self):
         names = self.seed_verification()
+        ping_log = self.tmp / "curl.log"
+        self.env["CURL_LOG"] = str(ping_log)
+        self.shim("curl", 'echo "$@" >> "$CURL_LOG"\n')
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
         result = self.run_script("backup.sh")
+        self.assertEqual(len(ping_log.read_text().splitlines()), 1)
         self.assertEqual(self.selected_verification(result), names[:3])
         self.assertLess(result.stderr.index("Backup complete:"),
                         result.stderr.index("Deep check local"))
@@ -276,6 +281,7 @@ class BackupScripts(unittest.TestCase):
         self.assertEqual(state["cursor"], names[2])
         self.assertEqual((self.backups / "verify-state").stat().st_mode & 0o777, 0o600)
         result = self.run_script("backup.sh")
+        self.assertEqual(len(ping_log.read_text().splitlines()), 2)
         self.assertEqual(self.selected_verification(result), [])
         self.assertIn("Deep check not due", result.stderr)
         self.assertEqual(self.verify_state(), state)
@@ -307,7 +313,8 @@ class BackupScripts(unittest.TestCase):
         # A rotating snapshot, rather than the always-selected oldest.
         path = self.backups / "snapshots" / names[3] / "data/2026-10/2026-10-01T15-00-00.gpx"
         self.silently_corrupt(path)
-        last_success = (self.backups / "last-success").read_text()
+        last_success = "2020-01-01T00:00:00Z\n"
+        (self.backups / "last-success").write_text(last_success)
         self.add_trip("2026-10/new-trip", "new")
         result = self.run_script("backup.sh", check=False)
         self.assertNotEqual(result.returncode, 0)
@@ -315,7 +322,7 @@ class BackupScripts(unittest.TestCase):
         self.assertIn("./data/2026-10/2026-10-01T15-00-00.gpx", result.stderr)
         self.assertNotIn("Xirst.gpx", result.stderr)
         self.assertTrue((self.remote / "snapshots" / self.snapshots()[-1] / "data/2026-10/new-trip.gpx").exists())
-        self.assertEqual((self.backups / "last-success").read_text(), last_success)
+        self.assertNotEqual((self.backups / "last-success").read_text(), last_success)
         state = self.verify_state()
         self.assertEqual(state["result"], "failed")
         self.assertEqual(state["cursor"], names[2])
@@ -437,6 +444,62 @@ class BackupScripts(unittest.TestCase):
         self.assertIn("status=1", (scripts / "state/last-attempt").read_text())
         self.assertIn(f"FAILED local {names[0]}", (scripts / "logs/backup.log").read_text())
         self.assertTrue((self.remote / "snapshots" / self.snapshots()[-1]).is_dir())
+
+    def test_deep_check_failure_skips_overdue_catchup_but_retries_nightly(self):
+        names = self.seed_verification(2)
+        self.run_script("backup.sh")
+        shutil.rmtree(self.backups / "snapshots" / names[0])
+        self.silently_corrupt(self.remote / "snapshots" / names[0] / "annotations.db")
+        self.make_verify_due()
+        stale_success = "2020-01-01T00:00:00Z\n"
+        (self.backups / "last-success").write_text(stale_success)
+        self.env["MILEAGE_PLATFORM"] = "unraid"
+        ping_log = self.tmp / "curl.log"
+        self.env["CURL_LOG"] = str(ping_log)
+        self.shim("curl", 'echo "$@" >> "$CURL_LOG"\n')
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        rsync_log = self.watch_rsync()
+        scripts = self.tmp / "scheduled-scripts"
+        scripts.mkdir()
+        for name in ("scheduled.sh", "backup.sh", "lib.sh"):
+            shutil.copyfile(BACKUP / name, scripts / name)
+
+        def run_wrapper(*args):
+            return subprocess.run(["bash", str(scripts / "scheduled.sh"), *args],
+                                  env=self.env, capture_output=True, text=True, timeout=30)
+
+        result = run_wrapper()
+        self.assertNotEqual(result.returncode, 0)
+        status = dict(line.split("=", 1) for line in run_wrapper("--status").stdout.splitlines())
+        self.assertEqual(status["last_attempt_status"], "1")
+        self.assertEqual(status["last_deep_check_result"], "failed")
+        self.assertNotEqual(status["last_success"] + "\n", stale_success)
+        self.assertIn(f"FAILED remote-only {names[0]}", (scripts / "logs/backup.log").read_text())
+        self.assertEqual(self.verify_state()["remote_pending"].strip(), names[0])
+        self.assertFalse(ping_log.exists())
+
+        # New uploads must not cause hourly backups or remote-only fetches.
+        self.add_trip("2026-10/new-trip", "new")
+        watched = [scripts / "state/last-attempt", scripts / "logs/backup.log",
+                   self.backups / "last-success", self.backups / "verify-state",
+                   self.compose_log, rsync_log]
+        before = [path.read_bytes() for path in watched]
+        snapshots = [self.snapshots(root) for root in (self.backups, self.remote)]
+        for _ in range(2):
+            result = run_wrapper("--if-overdue", "26")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout + result.stderr, "")
+            self.assertEqual([path.read_bytes() for path in watched], before)
+            self.assertEqual([self.snapshots(root) for root in (self.backups, self.remote)], snapshots)
+
+        # The normal nightly invocation still retries without waiting a week.
+        result = run_wrapper()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((scripts / "logs/backup.log").read_text().count(
+            f"Deep check remote-only {names[0]}"), 2)
+        self.assertEqual(self.verify_state()["remote_pending"].strip(), names[0])
+        self.assertTrue((self.remote / "snapshots" / self.snapshots()[-1] / "data/2026-10/new-trip.gpx").exists())
+        self.assertFalse(ping_log.exists())
 
     def test_deep_check_no_older_local_but_remote_only_history_and_running_retry(self):
         names = self.seed_verification(1)

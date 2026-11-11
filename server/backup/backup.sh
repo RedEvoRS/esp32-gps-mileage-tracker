@@ -16,8 +16,12 @@
 #      file, so an unmounted share can't pass for the off-host copy),
 #      re-reads the newest copy there to confirm it matches byte for byte,
 #      and, with REMOTE_PRUNE=yes, applies the same retention to REMOTE.
+#      Writes last-success now to record today's completed off-host backup.
 #   5. When due, deep-checks older local and off-host snapshots. A failure
-#      fails the run only after today's backup has completed and been copied.
+#      still exits non-zero (failed Debian unit / Unraid attempt status,
+#      reported as a problem by install.sh --check) and withholds PING_URL.
+#      last-success still advances, so Unraid's hourly catch-up skips it;
+#      the next nightly run retries the failed snapshots.
 #
 # Layout under BACKUP_DIR (the same under REMOTE, minus `latest`):
 #   snapshots/2026-10-06T033012Z/{annotations.db,events.db?,monitor.db?,data/,SHA256SUMS,INFO}
@@ -244,6 +248,9 @@ if [[ $REMOTE_PRUNE == yes ]]; then
     prune_remote
 fi
 
+# This records today's completed copy, so an old snapshot's deep-check
+# failure does not make the scheduler start another overdue catch-up.
+date -u +%Y-%m-%dT%H:%M:%SZ > "$BACKUP_DIR/last-success"
 log "Backup complete: $current is on $REMOTE"
 
 # --- 5. Periodic deep verification -------------------------------------
@@ -349,9 +356,7 @@ deep_verify() (
 
 deep_verify || die "Deep check failed; today's backup was copied. Check the failed snapshots and rerun backup.sh."
 
-# A deep failure must also withhold the success timestamp and heartbeat, so
-# both existing reporting paths treat this as a failed run.
-date -u +%Y-%m-%dT%H:%M:%SZ > "$BACKUP_DIR/last-success"
+# Only ping after the deep check passes or is not due.
 if [[ -n $PING_URL ]]; then
     curl -fsS -m 10 --retry 3 -o /dev/null "$PING_URL" \
         || log "Warning: backup succeeded but the ping to PING_URL failed"

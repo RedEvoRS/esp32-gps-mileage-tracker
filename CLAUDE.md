@@ -510,7 +510,13 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   snapshots of viewer annotations, ingest diagnostics (`events.db`), and optional
   monitor delivery/export state (`monitor.db`, when its volume exists). Viewer
   helpers read annotations and diagnostics; the monitor helper reads its volume.
-  Weekly deep checks rotate older local/REMOTE copies, record `BACKUP_DIR/verify-state`, and fail after today's copy on damage.
+  Weekly deep checks rotate older local/REMOTE copies and record
+  `BACKUP_DIR/verify-state`. `last-success` advances once today's backup has
+  completed and been copied off-host, before the deep check. A deep failure
+  still exits non-zero (failed Debian unit / Unraid `last_attempt_status`,
+  reported as a problem by `install.sh --check`) and withholds the `PING_URL`
+  heartbeat. The next nightly run retries; Unraid's hourly overdue catch-up
+  does nothing while `last-success` is fresh.
   Missing diagnostics/monitor databases are normal and recorded in `INFO`.
   Monitor discovery uses Compose config's project name and Docker's Compose
   project/volume labels, without recent config flags or logging credentials.

@@ -366,10 +366,15 @@ and pending retries. `--status` adds `last_deep_check` and
 `last_deep_check_result` (`running`, `passed`, `failed`, or empty before a check).
 `install.sh --check` and `restore.sh check` show the same last result.
 
-A deep failure leaves today's copied backup in place, but exits non-zero so
-`scheduled.sh` records failure; `last_success` and the heartbeat do not advance.
+`BACKUP_DIR/last-success` (shown as `last_success`) advances once today's backup
+has completed and been copied off-host, before the deep check. A deep failure
+still exits non-zero, so `scheduled.sh` records a failed `last_attempt_status`
+and `install.sh --check` reports the failed scheduled backup as a problem.
+The `PING_URL` heartbeat is withheld, so an external monitor can alert.
 The log names the snapshot, local or remote, and failed file paths. Failed or
-interrupted checks retry on the next backup run rather than waiting a week.
+interrupted checks retry on the next nightly backup run rather than waiting a
+week. The hourly overdue catch-up does nothing while `last-success` is fresh;
+a deep-check failure alone does not start another backup every hour.
 Failed selections remain protected from pruning until a retry passes or
 periodic verification is disabled; rotation advances only on success.
 

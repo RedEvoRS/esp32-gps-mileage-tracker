@@ -1332,10 +1332,14 @@ on exit or termination, or by the next backup after a forced kill. An atomic
 `BACKUP_DIR/verify-state` records UTC check time, result, rotation cursor and
 pending retries. `scheduled.sh --status` exposes `last_deep_check` and
 `last_deep_check_result`; `install.sh --check` and `restore.sh check` also show it.
-A failed check exits non-zero after today's backup is copied, fails the Debian
-unit or Unraid wrapper attempt, and withholds `last-success` and the heartbeat.
-Failed or interrupted checks retry on the next backup run, keeping the rotation
-position and protecting failed snapshots from pruning until success (or checking
+`BACKUP_DIR/last-success` advances once today's backup has completed and been
+copied off-host, before the deep check. A failed check still exits non-zero:
+the Debian unit fails or Unraid records a failed `last_attempt_status`, and
+`install.sh --check` reports the failure as a problem. The `PING_URL` heartbeat
+is withheld, so an external monitor can alert. Failed or interrupted checks
+retry on the next nightly backup run. Unraid's hourly overdue catch-up does
+nothing while `last-success` is fresh. Retries keep the rotation
+position and protect failed snapshots from pruning until success (or checking
 is disabled).
 
 One damaged file can affect every snapshot sharing its hard link. A failure

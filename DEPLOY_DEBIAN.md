@@ -1479,12 +1479,14 @@ to `BACKUP_DIR/verify-state`: UTC `last_check`, `result` (`running`, `passed` or
 `failed`), rotation `cursor`, and pending local/remote retry names. Status is
 shown by `backup/scheduled.sh --status`, `install.sh --check` and `restore.sh check`.
 
-A deep-check failure exits non-zero **after today's backup has been copied**.
-The systemd unit fails, `last-success` does not advance, and `PING_URL` is not
-called. The log identifies local or remote, the snapshot and failed file paths;
+`BACKUP_DIR/last-success` advances once today's backup has completed and been
+copied off-host, before the deep check. A deep-check failure still exits non-zero:
+the systemd unit fails and `install.sh --check` reports "The last backup failed"
+as a problem. The `PING_URL` heartbeat is withheld, so an external monitor can
+alert. The log identifies local or remote, the snapshot and failed file paths;
 it does not print file contents. A failed or interrupted check retries on the
-next backup run, without waiting another week. Failed selections are retained
-through pruning until a retry passes (or periodic checking is disabled), so
+next nightly backup run, without waiting another week. Failed selections are
+retained through pruning until a retry passes (or periodic checking is disabled), so
 pruning cannot erase the evidence before retry. Rotation advances only after
 the whole check passes.
 
@@ -1645,9 +1647,13 @@ A failed run shows up as a failed unit (`systemctl --failed`) and in the
 journal, but nobody looks there. Two options:
 
 - Set `PING_URL` in `backup.conf` to a push monitor (Uptime Kuma, or
-  healthchecks.io). The script calls it only after a verified off-host copy,
-  so if the pings stop, the backups have stopped.
-- Or check by hand now and then: `cat ~/mileage-backups/last-success`.
+  healthchecks.io). The script calls it only after the off-host copy is verified
+  and any due deep check has passed. Missing pings mean the backup or
+  a deep check needs attention.
+- Or run `bash ~/mileage-tracker/install.sh --check` by hand now and then.
+  It reports a failed backup unit as a problem. `last-success` records today's
+  copied backup and still advances if the deep check fails; it alone cannot
+  tell you whether older snapshots passed.
 
 ### Backups set up before the destination marker existed
 
