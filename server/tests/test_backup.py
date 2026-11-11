@@ -8,6 +8,8 @@ directory. Needs bash, rsync and GNU coreutils, so it skips on Windows.
 
 import os
 import hashlib
+import io
+from contextlib import redirect_stderr
 from pathlib import Path
 import shutil
 import sqlite3
@@ -16,6 +18,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 
 SERVER = Path(__file__).resolve().parents[1]
@@ -56,7 +59,8 @@ FAKE_COMPOSE = textwrap.dedent("""\
     if args[0] == "run":
         service = args[args.index("python") - 1]
         args = args[args.index("python"):]
-        if len(args) > 4:  # A restore must run only after its writer is stopped.
+        restoring = len(args) > 4 and args[3] in ("annotations", "events", "monitor")
+        if restoring:  # A restore must run only after its writer is stopped.
             writer = {"annotations": "mileage-viewer", "events": "mileage-ingest",
                       "monitor": "mileage-monitor"}[args[3]]
             if writer != "mileage-monitor" or os.environ.get("FAKE_MONITOR") == "yes":
@@ -65,8 +69,8 @@ FAKE_COMPOSE = textwrap.dedent("""\
         for arg in args:
             for prefix, key in (("/db/", "FAKE_DB_DIR"), ("/data/", "FAKE_DATA_DIR"),
                                 ("/state/", "FAKE_MONITOR_DIR")):
-                if arg.startswith(prefix):
-                    if prefix == "/data/" and len(args) > 4:
+                if arg == prefix.rstrip("/") or arg.startswith(prefix):
+                    if prefix == "/data/" and restoring:
                         assert service == "mileage-ingest", "viewer data mount is read-only"
                     arg = os.environ[key] + "/" + arg[len(prefix):]
                     break
@@ -194,6 +198,83 @@ class BackupScripts(unittest.TestCase):
                                "INSERT INTO events VALUES (1);")
         conn.close()
         return path
+
+    def symlink(self, link, target, directory=False):
+        try:
+            link.symlink_to(target, target_is_directory=directory)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlink creation unavailable: {type(exc).__name__}")
+
+    def python_helper(self, name):
+        result = subprocess.run(["bash", "-c", 'source "$LIB"; printf "%s" "${!HELPER}"'],
+                                env=dict(self.env, LIB=str(BACKUP / "lib.sh"), HELPER=name),
+                                capture_output=True, text=True, timeout=10, check=True)
+        return result.stdout
+
+    def assert_snapshot_link_rejected(self, folder):
+        path = self.add_events()
+        target = self.tmp / "outside" / ("diagnostics" if folder else "events.db")
+        target.parent.mkdir()
+        link = path.parent if folder else path
+        link.rename(target)
+        outside_db = target / "events.db" if folder else target
+        before = outside_db.read_bytes(), outside_db.stat().st_mtime_ns
+        self.symlink(link, target, directory=folder)
+        for helper in ("PY_SNAPSHOT", "PY_RAW_COPY"):
+            script = self.python_helper(helper)
+            errors = io.StringIO()
+            with mock.patch.object(sys, "argv", ["helper", str(path), str(self.data)]), \
+                    mock.patch.object(sqlite3, "connect", side_effect=AssertionError("outside DB opened")) as connect, \
+                    mock.patch("tarfile.open", side_effect=AssertionError("raw archive opened")) as archive, \
+                    redirect_stderr(errors), self.assertRaises(SystemExit) as caught:
+                exec(script, {})
+            self.assertEqual(caught.exception.code, 5)
+            self.assertIn("unsafe database path", errors.getvalue())
+            self.assertNotIn(str(target), errors.getvalue())
+            connect.assert_not_called()
+            archive.assert_not_called()
+        result = self.run_script("backup.sh", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("refused unsafe database path /data/diagnostics/events.db", result.stderr)
+        self.assertEqual(self.snapshots(), [])
+        self.assertFalse((self.backups / "last-success").exists())
+        self.assertFalse((self.remote / "snapshots").exists())
+        self.assertEqual((outside_db.read_bytes(), outside_db.stat().st_mtime_ns), before)
+        self.assertTrue(link.is_symlink())
+
+    def test_snapshot_events_database_symlink_never_reads_target(self):
+        self.assert_snapshot_link_rejected(folder=False)
+
+    def test_snapshot_diagnostics_folder_symlink_never_reads_target(self):
+        self.assert_snapshot_link_rejected(folder=True)
+
+    def test_escaping_events_fails_nightly_backup_and_reports_failed_status(self):
+        self.assert_snapshot_link_rejected(folder=False)
+        scripts = self.tmp / "scheduled-scripts"
+        scripts.mkdir()
+        for name in ("scheduled.sh", "backup.sh", "lib.sh"):
+            shutil.copyfile(BACKUP / name, scripts / name)
+        ping = self.tmp / "ping.log"
+        self.env["CURL_LOG"] = str(ping)
+        self.shim("curl", 'echo called >> "$CURL_LOG"\n')
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        stale = "2020-01-01T00:00:00Z"
+        (self.backups / "last-success").write_text(stale + "\n")
+        result = subprocess.run(["bash", str(scripts / "scheduled.sh")], env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout + result.stderr, "")
+        status = subprocess.run(["bash", str(scripts / "scheduled.sh"), "--status"],
+                                env=self.env, capture_output=True, text=True, timeout=10, check=True)
+        fields = dict(line.split("=", 1) for line in status.stdout.splitlines())
+        self.assertEqual(fields["last_attempt_status"], "1")
+        self.assertEqual(fields["last_success"], stale)
+        self.assertNotIn("/data/diagnostics/events.db", status.stdout)
+        self.assertIn("refused unsafe database path /data/diagnostics/events.db",
+                      (scripts / "logs/backup.log").read_text())
+        self.assertFalse(ping.exists())
+        self.assertEqual(self.snapshots(), [])
 
     def add_monitor(self):
         self.env["FAKE_MONITOR"] = "yes"
