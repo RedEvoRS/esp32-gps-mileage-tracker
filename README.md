@@ -33,9 +33,7 @@ contact services outside it:
 
 ## Where it's at
 
-The tracker and server are in daily use. **v1.00**, the first public
-release, came out on 2026-11-01 (UTC) after a week of everyday driving in
-which every trip was recorded, uploaded and exported correctly. Later fixes
+The tracker and server have been in daily use since **v1.00**. Later fixes
 are listed on the
 [releases page](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases).
 
