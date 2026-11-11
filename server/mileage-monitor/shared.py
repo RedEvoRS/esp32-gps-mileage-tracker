@@ -122,9 +122,28 @@ def event_fields(codes, row):
         return None
 
 
+def checked_events_path(path):
+    """Keep the configured <data root>/diagnostics/events.db inside its root.
+
+    Derive the root before resolving the folder or file, so neither symlink
+    can redefine the boundary. Custom paths used by tests follow the same rule.
+    """
+    path = Path(path)
+    try:
+        root = path.parent.parent.resolve()
+        directory = path.parent.resolve()
+        resolved = path.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("Unreadable diagnostics database path") from exc
+    if any(root not in candidate.parents for candidate in (directory, resolved)):
+        raise ValueError("Diagnostics database path escapes data root")
+    return resolved
+
+
 def read_events(path, after_rowid, limit):
     """Read rows and cursor identity from the same SQLite snapshot."""
-    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
+    path = checked_events_path(path)
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
         db.execute("BEGIN")
         highest = db.execute("SELECT COALESCE(MAX(rowid),0) FROM events").fetchone()[0]
         rows = db.execute("SELECT rowid,device_id,boot_id,sequence,code,received_at,canonical_json "

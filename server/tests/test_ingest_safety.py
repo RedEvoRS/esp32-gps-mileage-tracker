@@ -62,6 +62,110 @@ class UploadSafety(unittest.TestCase):
         gpx = self.root / response.get_json()["stored_as"]
         return gpx, gpx.with_suffix(".json")
 
+    def symlink(self, link, target, directory=False):
+        try:
+            link.symlink_to(target, target_is_directory=directory)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlink creation unavailable: {type(exc).__name__}")
+
+    def assert_storage_error(self, target):
+        with self.assertLogs(self.ing.app.logger, "WARNING"):
+            response = self.upload()
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.get_json(), {"error": "server error writing trip"})
+        self.assertNotIn(str(target), response.get_data(as_text=True))
+
+    def test_symlinked_target_month_cannot_write_outside_data_root(self):
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside)
+            self.symlink(self.root / "2026-04", target, directory=True)
+            real_stat = Path.stat
+            outside_stats = []
+
+            def stat(path, *args, **kwargs):
+                if target in path.parents or path.parent == self.root / "2026-04":
+                    outside_stats.append(path)
+                    raise AssertionError("outside trip stat")
+                return real_stat(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "stat", stat):
+                self.assert_storage_error(target)
+            self.assertEqual(outside_stats, [])
+            self.assertEqual(list(target.iterdir()), [])
+
+    @unittest.skipUnless(os.name == "posix", "POSIX no-follow upload lock")
+    def test_upload_lock_symlink_never_creates_or_changes_its_target(self):
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / "private-lock"
+            for present in (False, True):
+                with self.subTest(present=present):
+                    if present:
+                        target.write_bytes(b"outside-lock-sentinel")
+                        before = target.stat()
+                    link = self.root / ".upload.lock"
+                    self.symlink(link, target)
+                    try:
+                        self.assert_storage_error(target)
+                        self.assertEqual(list(self.root.iterdir()), [link])
+                        self.assertTrue(link.is_symlink())
+                        if present:
+                            self.assertEqual(target.read_bytes(), b"outside-lock-sentinel")
+                            self.assertEqual(target.stat().st_mtime_ns, before.st_mtime_ns)
+                        else:
+                            self.assertFalse(target.exists())
+                    finally:
+                        link.unlink()
+
+    def test_symlinked_other_month_is_skipped_without_trip_stat(self):
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside)
+            (target / "2026-04-14T14-30-00Z.gpx").write_bytes(b"outside-trip-sentinel")
+            self.symlink(self.root / "2026-03", target, directory=True)
+            real_stat = Path.stat
+            outside_stats = []
+
+            def stat(path, *args, **kwargs):
+                if target in path.parents or path.parent == self.root / "2026-03":
+                    outside_stats.append(path)
+                    raise AssertionError("outside trip stat")
+                return real_stat(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "stat", stat), self.assertLogs(self.ing.app.logger, "WARNING"):
+                response = self.upload()
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(outside_stats, [])
+            self.assertEqual(response.json["stored_as"], "2026-04/2026-04-14T14-30-00Z.gpx")
+            self.assertEqual([p.read_bytes() for p in target.iterdir()], [b"outside-trip-sentinel"])
+
+    def test_final_trip_symlinks_cannot_escape_data_root(self):
+        month = self.root / "2026-04"
+        month.mkdir()
+        with tempfile.TemporaryDirectory() as outside:
+            for suffix in (".gpx", ".json"):
+                for present in (False, True):
+                    with self.subTest(suffix=suffix, present=present):
+                        target = Path(outside) / ("private" + suffix)
+                        if present:
+                            target.write_bytes(b"outside-trip-sentinel")
+                        link = month / ("2026-04-14T14-30-00Z" + suffix)
+                        self.symlink(link, target)
+                        try:
+                            with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("outside read")) as read, \
+                                    mock.patch.object(self.ing, "_atomic_write_bytes",
+                                                      side_effect=AssertionError("trip written")) as write:
+                                self.assert_storage_error(target)
+                            read.assert_not_called()
+                            write.assert_not_called()
+                            self.assertTrue(link.is_symlink())
+                            self.assertEqual(list(month.iterdir()), [link])
+                            if present:
+                                self.assertEqual(target.read_bytes(), b"outside-trip-sentinel")
+                                target.unlink()
+                            else:
+                                self.assertFalse(target.exists())
+                        finally:
+                            link.unlink()
+
     def test_rmc_whole_and_fractional_epochs_across_midnight(self):
         # Invented stationary coordinates; only the timestamp format matters.
         epochs = ["2026-04-14T23:59:59.990Z", "2026-04-15T00:00:00Z",
@@ -182,6 +286,40 @@ class UploadSafety(unittest.TestCase):
         response = self.upload(body(timed=False), **{"X-Trip-Id": "caf\u00e9-trip"})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(Path(response.get_json()["stored_as"]).stem, "caf_-trip")
+
+    def test_custom_trip_ids_keep_the_same_filename_sanitizing(self):
+        for trip_id, filename in (("AZaz09_-", "AZaz09_-"), ("../private", "___private"),
+                                  ("C:\\private\\trip", "C__private_trip"),
+                                  ("\\\\host\\share", "__host_share"),
+                                  ("caf\u00e9-trip", "caf_-trip")):
+            with self.subTest(trip_id=trip_id):
+                response = self.upload(body(timed=False), **{"X-Trip-Id": trip_id})
+                self.assertEqual(response.status_code, 200)
+                gpx, summary = self.saved_pair(response)
+                self.assertEqual(gpx.stem, filename)
+                self.assertEqual(gpx.parent.parent, self.root)
+                self.assertEqual(json.loads(summary.read_bytes())["trip_id"], trip_id)
+
+    def test_trip_path_checks_reject_root_and_sibling_prefix(self):
+        root = self.root.resolve()
+        for path in (root, root.parent / (root.name + "-other") / "drive.gpx",
+                     root / ".." / "private.gpx"):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                self.ing._checked_trip_path(root, path)
+
+    def test_linked_data_root_and_internal_trip_links_still_work(self):
+        with tempfile.TemporaryDirectory() as aliases:
+            alias = Path(aliases) / "linked-data"
+            self.symlink(alias, self.root, directory=True)
+            with mock.patch.object(self.ing, "DATA_ROOT", alias):
+                response = self.upload()
+            self.assertEqual(response.status_code, 200)
+            gpx, summary = self.saved_pair(response)
+            link = gpx.parent / "linked.gpx"
+            self.symlink(link, gpx)
+            self.assertEqual(self.ing._checked_trip_path(self.root.resolve(), alias / link.relative_to(self.root)),
+                             gpx.resolve())
+            self.assertTrue(summary.exists())
 
     def test_fallback_trip_id_is_utc_start_time_and_file_name(self):
         # No X-Trip-Id (the firmware's case), with times given at an offset.

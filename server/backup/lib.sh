@@ -173,6 +173,12 @@ print(name)
     return 0
 }
 
+db_containment_root() {
+    # Only the shared trip-data mount has this boundary; the independent
+    # annotations and monitor volumes keep their existing paths.
+    if [[ $1 == /data/* ]]; then printf '/data'; fi
+}
+
 # Sets SNAPSHOT_REPORT to the checked container report, or 'missing'.
 # Missing is only allowed for optional DBs (and pre-restore safety copies).
 # With salvage=yes (restore's safety copies), a live file that can't be
@@ -180,8 +186,9 @@ print(name)
 # restore: SNAPSHOT_REPORT is 'unreadable' and the raw files are in
 # DEST-unreadable/.
 snapshot_db() {
-    local runner=$1 path=$2 dest=$3 optional=$4 salvage=${5:-no} status expected actual
-    if "$runner" "$PY_SNAPSHOT" "$path" > "$dest" 2> "$dest.log"; then
+    local runner=$1 path=$2 dest=$3 optional=$4 salvage=${5:-no} status expected actual root
+    root=$(db_containment_root "$path")
+    if "$runner" "$PY_SNAPSHOT" "$path" "$root" > "$dest" 2> "$dest.log"; then
         SNAPSHOT_REPORT=$(grep -E '^sha256=' "$dest.log" | tail -n 1 || true)
         expected=$(sed -E 's/^sha256=([0-9a-f]+) .*/\1/' <<< "$SNAPSHOT_REPORT")
         actual=$(sha256sum "$dest" | cut -d ' ' -f 1)
@@ -191,7 +198,9 @@ snapshot_db() {
     else
         status=$?
         cat "$dest.log" >&2
-        if [[ $status -eq 3 && $optional == yes ]]; then
+        if [[ $status -eq 5 ]]; then
+            die "refused unsafe database path $path; nothing more was restored or backed up"
+        elif [[ $status -eq 3 && $optional == yes ]]; then
             rm "$dest" "$dest.log"
             SNAPSHOT_REPORT=missing
             log "$path: no database yet; skipped"
@@ -209,9 +218,10 @@ snapshot_db() {
 # sidecars, byte for byte into a new folder. Nothing else can safely hold
 # what the damaged file still has in it.
 salvage_raw_db() {
-    local runner=$1 path=$2 dir=$3 count
+    local runner=$1 path=$2 dir=$3 count root
+    root=$(db_containment_root "$path")
     mkdir -p "$dir"
-    "$runner" "$PY_RAW_COPY" "$path" | tar -x -f - -C "$dir" --no-same-owner \
+    "$runner" "$PY_RAW_COPY" "$path" "$root" | tar -x -f - -C "$dir" --no-same-owner \
         || die "$path can't be read as a database, and its raw files couldn't be saved either; nothing more was restored"
     count=$(find "$dir" -type f | wc -l)
     [[ $count -gt 0 ]] || die "$path can't be read as a database, and no raw file was found to save; nothing more was restored"
@@ -225,7 +235,14 @@ salvage_raw_db() {
 # for a file that salvage_raw_db has already saved.
 remove_raw_db() {
     local runner=$1 path=$2
-    "$runner" "$PY_REMOVE_DB" "$path" || die "could not clear the damaged $path"
+    "$runner" "$PY_REMOVE_DB" "$path" "$(db_containment_root "$path")" \
+        || die "could not clear the damaged $path"
+}
+
+check_restore_target() {
+    local runner=$1 path=$2
+    "$runner" "$PY_CHECK_DB_TARGET" "$path" "$(db_containment_root "$path")" >&2 \
+        || die "refused unsafe restore target $path; no live databases were changed"
 }
 
 # An unattended backup must not wait forever on a destination that
@@ -377,15 +394,45 @@ require_commands() {
     done
 }
 
+# Shared preflight for the Python helpers. Callers explicitly pass /data for
+# data-mount paths, or an empty root for the separate database volumes.
+# Exit 5 is unsafe, never missing (3) or corrupt and eligible for salvage (4).
+PY_DB_CONTAINMENT=$(cat <<'PY'
+import sys
+from pathlib import Path
+
+def checked_db_paths(path, root, suffixes=("",), *, writing=False):
+    paths = [Path(str(path) + suffix) for suffix in suffixes]
+    if not root:
+        return paths
+    try:
+        root = Path(root).resolve()
+        directory = Path(path).parent.resolve()
+        resolved = [candidate.resolve() for candidate in paths]
+        if any(root not in candidate.parents for candidate in [directory, *resolved]):
+            raise ValueError("outside data root")
+        # Refuse final links even when they stay inside the data root. Check
+        # every sidecar before making any change, including unlinking the DB.
+        if writing and any(candidate.is_symlink() for candidate in paths):
+            print(f"unsafe database path {path}: symbolic link write target", file=sys.stderr)
+            sys.exit(5)
+    except (OSError, RuntimeError, ValueError):
+        print(f"unsafe database path {path}: outside data root or unresolvable", file=sys.stderr)
+        sys.exit(5)
+    return resolved
+PY
+)
+
 # Snapshot the database at argv[1] to stdout using SQLite's online backup
 # API, which is consistent even while the viewer is writing. Checks the
 # copy before sending it and reports its hash on stderr so the caller can
 # confirm nothing was lost on the way out. Exit 3 means no database yet;
 # exit 4 means the file exists but isn't a readable database (damaged).
-PY_SNAPSHOT=$(cat <<'PY'
+# argv[2] is the explicit containment root, or empty for other volumes.
+PY_SNAPSHOT=$PY_DB_CONTAINMENT$'\n'$(cat <<'PY'
 import hashlib, os, sqlite3, sys, tempfile
 from pathlib import Path
-src_path = sys.argv[1]
+src_path = checked_db_paths(sys.argv[1], sys.argv[2])[0]
 try:
     os.stat(src_path)
 except FileNotFoundError:
@@ -435,35 +482,47 @@ PY
 
 # Write the database file at argv[1] and any -wal/-journal/-shm sidecars
 # to stdout as a tar stream, without opening them as a database.
-PY_RAW_COPY=$(cat <<'PY'
+PY_RAW_COPY=$PY_DB_CONTAINMENT$'\n'$(cat <<'PY'
 import os, sys, tarfile
 path = sys.argv[1]
+suffixes = ("", "-wal", "-journal", "-shm")
+paths = checked_db_paths(path, sys.argv[2], suffixes)
 with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as tar:
-    for suffix in ("", "-wal", "-journal", "-shm"):
-        if os.path.exists(path + suffix):
-            tar.add(path + suffix, arcname=os.path.basename(path) + suffix, recursive=False)
+    for suffix, candidate in zip(suffixes, paths):
+        if candidate.exists():
+            tar.add(candidate, arcname=os.path.basename(path) + suffix, recursive=False)
 PY
 )
 
 # Delete the database file at argv[1] and its -wal/-journal/-shm sidecars.
-PY_REMOVE_DB=$(cat <<'PY'
+PY_REMOVE_DB=$PY_DB_CONTAINMENT$'\n'$(cat <<'PY'
 import os, sys
-for suffix in ("", "-wal", "-journal", "-shm"):
+paths = checked_db_paths(sys.argv[1], sys.argv[2], ("", "-wal", "-journal", "-shm"), writing=True)
+for path in paths:
     try:
-        os.unlink(sys.argv[1] + suffix)
+        os.unlink(path)
     except FileNotFoundError:
         pass
 PY
 )
 
+# Preflight the diagnostics target before restore changes any live database.
+PY_CHECK_DB_TARGET=$PY_DB_CONTAINMENT$'\n'$(cat <<'PY'
+checked_db_paths(sys.argv[1], sys.argv[2], ("", "-wal", "-journal", "-shm"), writing=True)
+PY
+)
+
 # Read a database from stdin, check it, and report what it holds.
 # argv[1] selects annotations/events/monitor. With argv[2], also copy it
-# over that path (the live database) using the backup API, then check it.
-PY_CHECK_RESTORE=$(cat <<'PY'
+# over that path (the live database) using the backup API, then check it;
+# argv[3] is its containment root (empty for non-data volumes).
+PY_CHECK_RESTORE=$PY_DB_CONTAINMENT$'\n'$(cat <<'PY'
 import os, sqlite3, sys, tempfile
 from pathlib import Path
 
 kind = sys.argv[1] if len(sys.argv) > 1 else "annotations"
+path = (checked_db_paths(sys.argv[2], sys.argv[3], ("", "-wal", "-journal", "-shm"), writing=True)[0]
+        if len(sys.argv) > 2 else None)
 def describe(conn, label):
     check = conn.execute("PRAGMA integrity_check").fetchall()
     if check != [("ok",)]:
@@ -509,9 +568,11 @@ try:
         f.write(data)
     src = sqlite3.connect(tmp)
     describe(src, "snapshot")
-    if len(sys.argv) > 2:
-        path = Path(sys.argv[2])
+    if path is not None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        # sqlite3 has no SQLITE_OPEN_NOFOLLOW binding. The lstat preflight
+        # above rejects final links; it does not protect against a local
+        # writer replacing paths concurrently before SQLite reopens them.
         dst = sqlite3.connect(path)
         src.backup(dst)
         describe(dst, "restored database")

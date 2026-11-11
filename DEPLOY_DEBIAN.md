@@ -1386,6 +1386,7 @@ off-host destination. Each run:
   trips, annotations and diagnostics still back up. No monitor helper is run
   unless its volume is known to exist. Snapshots are taken in sequence, so
   they do not share one transaction across databases.
+  An escaping diagnostics path stops backup or restore before access (restore also refuses final-file symlinks), and a failed nightly backup leaves `last-success` unchanged and is reported by `install.sh --check` or Unraid's `backup/scheduled.sh --status`.
 - copies `data/` while holding ingest's upload lock, so it never catches
   a trip with its GPX written and its summary not. The live
   `diagnostics/events.db` and its SQLite sidecars are excluded from rsync.

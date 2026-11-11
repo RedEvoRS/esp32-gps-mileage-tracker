@@ -109,8 +109,8 @@ class SummaryCacheTests(unittest.TestCase):
     def test_replacement_during_parse_is_not_pinned_under_old_stamp(self):
         original_read = self.viewer.read_summary
 
-        def replace_after_read(path):
-            result = original_read(path)
+        def replace_after_read(path, **kwargs):
+            result = original_read(path, **kwargs)
             path.write_text(path.read_text().replace('"distance_miles": 1', '"distance_miles": 4'))
             stamp = path.stat()
             os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1_000_000))
@@ -150,7 +150,7 @@ class SummaryCacheTests(unittest.TestCase):
     def test_reader_does_not_reserve_writer_during_summary_io(self):
         original = self.viewer.read_summary
 
-        def read(path):
+        def read(path, **kwargs):
             # A second connection can reserve the writer while this reader
             # holds its snapshot. In rollback journal mode its COMMIT can
             # still wait for the read snapshot; no WAL migration is required.
@@ -158,7 +158,7 @@ class SummaryCacheTests(unittest.TestCase):
                 writer.execute("BEGIN IMMEDIATE")
                 writer.execute("UPDATE annotations SET category='other'")
                 writer.rollback()
-            return original(path)
+            return original(path, **kwargs)
 
         with patch.object(self.viewer, "read_summary", side_effect=read):
             self.assertEqual(len(self.viewer.load_trips()[0]), 1)

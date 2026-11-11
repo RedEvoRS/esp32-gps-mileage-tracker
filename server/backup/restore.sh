@@ -172,6 +172,10 @@ if [[ $yes != yes ]]; then
     [[ $answer == RESTORE ]] || die "cancelled"
 fi
 
+# Reject unsafe diagnostics targets before changing any live DB or data
+# directory. Each writing/deleting helper also repeats its own preflight.
+check_restore_target ingest_python /data/diagnostics/events.db
+
 pre=$BACKUP_DIR/pre-restore-$(date -u +%Y-%m-%dT%H%M%SZ)
 [[ ! -L $COMPOSE_DIR/data ]] || die "trip data directory must not be a symlink"
 data_owner=1000:1000
@@ -221,7 +225,7 @@ restore_db() {
     for damaged in ${unreadable[@]+"${unreadable[@]}"}; do
         if [[ $damaged == "$path" ]]; then remove_raw_db "$runner" "$path"; fi
     done
-    "$runner" "$PY_CHECK_RESTORE" "$kind" "$path" < "$file" >&2
+    "$runner" "$PY_CHECK_RESTORE" "$kind" "$path" "$(db_containment_root "$path")" < "$file" >&2
 }
 save_current_db viewer_python /db/annotations.db "$pre/annotations.db"
 save_current_db ingest_python /data/diagnostics/events.db "$pre/events.db"

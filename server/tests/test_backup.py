@@ -8,6 +8,8 @@ directory. Needs bash, rsync and GNU coreutils, so it skips on Windows.
 
 import os
 import hashlib
+import io
+from contextlib import redirect_stderr
 from pathlib import Path
 import shutil
 import sqlite3
@@ -16,6 +18,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 
 SERVER = Path(__file__).resolve().parents[1]
@@ -56,7 +59,8 @@ FAKE_COMPOSE = textwrap.dedent("""\
     if args[0] == "run":
         service = args[args.index("python") - 1]
         args = args[args.index("python"):]
-        if len(args) > 4:  # A restore must run only after its writer is stopped.
+        restoring = len(args) > 4 and args[3] in ("annotations", "events", "monitor")
+        if restoring:  # A restore must run only after its writer is stopped.
             writer = {"annotations": "mileage-viewer", "events": "mileage-ingest",
                       "monitor": "mileage-monitor"}[args[3]]
             if writer != "mileage-monitor" or os.environ.get("FAKE_MONITOR") == "yes":
@@ -65,8 +69,8 @@ FAKE_COMPOSE = textwrap.dedent("""\
         for arg in args:
             for prefix, key in (("/db/", "FAKE_DB_DIR"), ("/data/", "FAKE_DATA_DIR"),
                                 ("/state/", "FAKE_MONITOR_DIR")):
-                if arg.startswith(prefix):
-                    if prefix == "/data/" and len(args) > 4:
+                if arg == prefix.rstrip("/") or arg.startswith(prefix):
+                    if prefix == "/data/" and restoring:
                         assert service == "mileage-ingest", "viewer data mount is read-only"
                     arg = os.environ[key] + "/" + arg[len(prefix):]
                     break
@@ -194,6 +198,173 @@ class BackupScripts(unittest.TestCase):
                                "INSERT INTO events VALUES (1);")
         conn.close()
         return path
+
+    def symlink(self, link, target, directory=False):
+        try:
+            link.symlink_to(target, target_is_directory=directory)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlink creation unavailable: {type(exc).__name__}")
+
+    def python_helper(self, name):
+        result = subprocess.run(["bash", "-c", 'source "$LIB"; printf "%s" "${!HELPER}"'],
+                                env=dict(self.env, LIB=str(BACKUP / "lib.sh"), HELPER=name),
+                                capture_output=True, text=True, timeout=10, check=True)
+        return result.stdout
+
+    def assert_snapshot_link_rejected(self, folder):
+        path = self.add_events()
+        target = self.tmp / "outside" / ("diagnostics" if folder else "events.db")
+        target.parent.mkdir()
+        link = path.parent if folder else path
+        link.rename(target)
+        outside_db = target / "events.db" if folder else target
+        before = outside_db.read_bytes(), outside_db.stat().st_mtime_ns
+        self.symlink(link, target, directory=folder)
+        for helper in ("PY_SNAPSHOT", "PY_RAW_COPY"):
+            script = self.python_helper(helper)
+            errors = io.StringIO()
+            with mock.patch.object(sys, "argv", ["helper", str(path), str(self.data)]), \
+                    mock.patch.object(sqlite3, "connect", side_effect=AssertionError("outside DB opened")) as connect, \
+                    mock.patch("tarfile.open", side_effect=AssertionError("raw archive opened")) as archive, \
+                    redirect_stderr(errors), self.assertRaises(SystemExit) as caught:
+                exec(script, {})
+            self.assertEqual(caught.exception.code, 5)
+            self.assertIn("unsafe database path", errors.getvalue())
+            self.assertNotIn(str(target), errors.getvalue())
+            connect.assert_not_called()
+            archive.assert_not_called()
+        result = self.run_script("backup.sh", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("refused unsafe database path /data/diagnostics/events.db", result.stderr)
+        self.assertEqual(self.snapshots(), [])
+        self.assertFalse((self.backups / "last-success").exists())
+        self.assertFalse((self.remote / "snapshots").exists())
+        self.assertEqual((outside_db.read_bytes(), outside_db.stat().st_mtime_ns), before)
+        self.assertTrue(link.is_symlink())
+
+    def test_snapshot_events_database_symlink_never_reads_target(self):
+        self.assert_snapshot_link_rejected(folder=False)
+
+    def test_snapshot_diagnostics_folder_symlink_never_reads_target(self):
+        self.assert_snapshot_link_rejected(folder=True)
+
+    def test_escaping_events_fails_nightly_backup_and_reports_failed_status(self):
+        self.assert_snapshot_link_rejected(folder=False)
+        scripts = self.tmp / "scheduled-scripts"
+        scripts.mkdir()
+        for name in ("scheduled.sh", "backup.sh", "lib.sh"):
+            shutil.copyfile(BACKUP / name, scripts / name)
+        ping = self.tmp / "ping.log"
+        self.env["CURL_LOG"] = str(ping)
+        self.shim("curl", 'echo called >> "$CURL_LOG"\n')
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        stale = "2020-01-01T00:00:00Z"
+        (self.backups / "last-success").write_text(stale + "\n")
+        result = subprocess.run(["bash", str(scripts / "scheduled.sh")], env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout + result.stderr, "")
+        status = subprocess.run(["bash", str(scripts / "scheduled.sh"), "--status"],
+                                env=self.env, capture_output=True, text=True, timeout=10, check=True)
+        fields = dict(line.split("=", 1) for line in status.stdout.splitlines())
+        self.assertEqual(fields["last_attempt_status"], "1")
+        self.assertEqual(fields["last_success"], stale)
+        self.assertNotIn("/data/diagnostics/events.db", status.stdout)
+        self.assertIn("refused unsafe database path /data/diagnostics/events.db",
+                      (scripts / "logs/backup.log").read_text())
+        self.assertFalse(ping.exists())
+        self.assertEqual(self.snapshots(), [])
+
+    def assert_restore_helpers_refuse(self, path):
+        for helper in ("PY_CHECK_RESTORE", "PY_REMOVE_DB", "PY_CHECK_DB_TARGET"):
+            script = self.python_helper(helper)
+            args = ["events", str(path), str(self.data)] if helper == "PY_CHECK_RESTORE" else [str(path), str(self.data)]
+            errors = io.StringIO()
+            with mock.patch.object(sys, "argv", ["helper", *args]), \
+                    mock.patch.object(Path, "mkdir", side_effect=AssertionError("target directory created")) as mkdir, \
+                    mock.patch.object(sqlite3, "connect", side_effect=AssertionError("database opened")) as connect, \
+                    mock.patch.object(os, "unlink", side_effect=AssertionError("database deleted")) as unlink, \
+                    redirect_stderr(errors), self.assertRaises(SystemExit) as caught:
+                exec(script, {})
+            self.assertEqual(caught.exception.code, 5)
+            self.assertIn("unsafe database path", errors.getvalue())
+            mkdir.assert_not_called()
+            connect.assert_not_called()
+            unlink.assert_not_called()
+
+    def assert_restore_link_rejected(self, folder):
+        path = self.add_events()
+        self.run_script("backup.sh")
+        saved = self.tmp / "saved-diagnostics"
+        path.parent.rename(saved)
+        if not folder:
+            path.parent.mkdir()
+        # A refusal must happen before annotations or trip data are restored.
+        with sqlite3.connect(self.db_dir / "annotations.db") as db:
+            db.execute("UPDATE annotations SET purpose_note='keep current live value'")
+        db.close()
+        annotations = (self.db_dir / "annotations.db").read_bytes()
+        for present in (False, True):
+            with self.subTest(present=present):
+                outside = self.tmp / ("existing-target" if present else "missing-target")
+                target = outside if folder else outside / "events.db"
+                outside_db = outside / "events.db" if folder else target
+                if present:
+                    outside.mkdir()
+                    for suffix in ("", "-wal", "-journal", "-shm"):
+                        Path(str(outside_db) + suffix).write_bytes(b"outside-database-sentinel" + suffix.encode())
+                before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in outside.iterdir()} if present else {}
+                link = path.parent if folder else path
+                self.symlink(link, target, directory=folder)
+                try:
+                    self.assert_restore_helpers_refuse(path)
+                    self.compose_log.write_text("")
+                    result = self.run_script("restore.sh", "restore", "latest", "--yes", check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("refused unsafe restore target /data/diagnostics/events.db", result.stderr)
+                    self.assertNotIn(str(target), result.stdout + result.stderr)
+                    self.assertNotIn("stop mileage-", self.compose_log.read_text())
+                    self.assertFalse(list(self.backups.glob("pre-restore-*")))
+                    self.assertEqual((self.db_dir / "annotations.db").read_bytes(), annotations)
+                    self.assertTrue(link.is_symlink())
+                    if present:
+                        self.assertEqual({p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in outside.iterdir()}, before)
+                    else:
+                        self.assertFalse(outside.exists())
+                finally:
+                    link.unlink()
+
+    def test_restore_events_database_symlink_never_creates_writes_or_deletes_target(self):
+        self.assert_restore_link_rejected(folder=False)
+
+    def test_restore_diagnostics_folder_symlink_never_creates_writes_or_deletes_target(self):
+        self.assert_restore_link_rejected(folder=True)
+
+    def test_restore_final_symlink_inside_data_root_is_also_refused(self):
+        path = self.add_events()
+        self.run_script("backup.sh")
+        target = self.data / "other-events.db"
+        path.rename(target)
+        self.symlink(path, target)
+        before = target.read_bytes(), target.stat().st_mtime_ns
+        self.assert_restore_helpers_refuse(path)
+        result = self.run_script("restore.sh", "restore", "latest", "--yes", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symbolic link write target", result.stderr)
+        self.assertFalse(list(self.backups.glob("pre-restore-*")))
+        self.assertEqual((target.read_bytes(), target.stat().st_mtime_ns), before)
+
+    def test_restore_sidecar_symlink_is_refused_before_any_database_deletion(self):
+        path = self.add_events()
+        outside = self.tmp / "outside-sidecar"
+        outside.write_bytes(b"outside-sidecar-sentinel")
+        before = path.read_bytes(), outside.read_bytes()
+        sidecar = Path(str(path) + "-shm")
+        self.symlink(sidecar, outside)
+        self.assert_restore_helpers_refuse(path)
+        self.assertEqual((path.read_bytes(), outside.read_bytes()), before)
+        self.assertTrue(sidecar.is_symlink())
 
     def add_monitor(self):
         self.env["FAKE_MONITOR"] = "yes"

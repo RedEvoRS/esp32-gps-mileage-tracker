@@ -62,7 +62,8 @@ def canonical(value):
 
 class DiagnosticsStore:
     def __init__(self, data_root, catalog):
-        self.path = Path(data_root) / "diagnostics" / "events.db"
+        self.data_root = Path(data_root)
+        self.path = self.data_root / "diagnostics" / "events.db"
         self.definitions = {row["code"]: row for row in catalog["codes"]}
         self.settings_path = SETTINGS_PATH
         self._settings_problems = set()
@@ -140,13 +141,25 @@ class DiagnosticsStore:
         return removed
 
     def _connect(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Resolve lazily: an unusable diagnostics path must not stop GPX startup.
+        root = self._resolved_path(self.data_root)
+        directory = self._resolved_path(self.path.parent)
+        path = self._resolved_path(self.path)
+        if any(root not in candidate.parents for candidate in (directory, path)):
+            raise ValueError("Diagnostics database path escapes data root")
+        directory.mkdir(parents=True, exist_ok=True)
         # Explicit creation mode also protects callers that import this store
         # independently of app.py's private umask. Existing files are tightened.
-        fd = os.open(self.path, os.O_CREAT | os.O_WRONLY, 0o600)
-        os.close(fd)
-        os.chmod(self.path, 0o600)
-        db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
+        fd = os.open(directory / self.path.name,
+                     os.O_CREAT | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+        # Python's sqlite3 does not expose SQLITE_OPEN_NOFOLLOW. Use the checked
+        # path; this preflight does not defend against a concurrent local writer
+        # replacing paths before SQLite reopens the file.
+        db = sqlite3.connect(path, timeout=5, isolation_level=None)
         try:
             db.execute("PRAGMA busy_timeout=5000")
             db.execute("PRAGMA foreign_keys=ON")
@@ -156,6 +169,16 @@ class DiagnosticsStore:
             db.close()
             raise
         return db
+
+    @staticmethod
+    def _resolved_path(path):
+        resolved = path.resolve()
+        # Windows can retain the extended prefix when another worker has the
+        # file open. Compare all resolved paths in the same namespace.
+        if os.name == "nt" and str(resolved).startswith("\\\\?\\"):
+            text = str(resolved)[4:]
+            resolved = Path("\\\\" + text[4:] if text.startswith("UNC\\") else text)
+        return resolved
 
     @contextmanager
     def _transaction(self):

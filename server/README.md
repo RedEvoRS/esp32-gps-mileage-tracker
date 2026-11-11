@@ -100,6 +100,8 @@ so they can never be left partially written:
   speeds, bounding box) so other tools can list and total trips without
   re-parsing every track
 
+Ingest refuses trip and diagnostics folders or files that resolve outside its data folder.
+
 Distance is the great-circle (haversine) sum over consecutive fixes, with
 three rules, all in `summarize()`:
 
@@ -199,6 +201,7 @@ The monitor reads every known device from `/data/diagnostics/events.db` using
 SQLite `mode=ro`, schema v1 and a two-second busy timeout. A missing file means
 nothing to monitor; unreadable/schema/lock errors are logged and retried next
 minute, never treated as healthy. It cannot write trip data or annotations.
+The monitor checks the resolved diagnostics folder and file against the configured events path's data root (its grandparent); escaping paths suspend sends and leave the heartbeat unchanged until a successful read.
 Its versioned state DB, `/state/monitor.db` in `monitor-state`, persists
 episodes, delivery intent, digest overflow, reminders, rolling-hour cap and
 retry backoff. Use one replica and preserve the volume to retain deduplication.

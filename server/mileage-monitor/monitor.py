@@ -121,13 +121,13 @@ def receipt(value):
 
 
 def read_devices(path, catalog):
-    path = Path(path)
+    path = shared.checked_events_path(path)
     catalog_codes = {row["code"] for row in catalog["codes"]}
     try:
         path.stat()
     except FileNotFoundError:
         return None
-    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro",
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro",
                                  uri=True, timeout=2)) as db:
         db.row_factory = sqlite3.Row
         db.execute("BEGIN")
