@@ -1052,13 +1052,20 @@ def read_diagnostics(page, code, severity):
     immutable=1 would skip those checks and could show inconsistent health.
     Closing is explicit: sqlite3's context manager does not close handles.
     """
-    path = DATA_ROOT / "diagnostics" / "events.db"
+    try:
+        root = DATA_ROOT.resolve()
+        directory = (root / "diagnostics").resolve()
+        path = (directory / "events.db").resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("Unreadable diagnostics database path") from exc
+    if any(root not in candidate.parents for candidate in (directory, path)):
+        raise ValueError("Diagnostics database path escapes data root")
     try:
         path.stat()
     except FileNotFoundError:
         return {"state": "absent"}
     now = datetime.now(timezone.utc)
-    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro",
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro",
                                  uri=True, timeout=2)) as db:
         db.row_factory = sqlite3.Row
         db.execute("BEGIN")

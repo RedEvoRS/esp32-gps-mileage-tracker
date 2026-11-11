@@ -128,6 +128,65 @@ class ViewerDiagnostics(unittest.TestCase):
         self.assertFalse(self.store.path.exists())
         self.assertFalse(self.store.path.parent.exists() and list(self.store.path.parent.iterdir()))
 
+    def symlink(self, link, target, directory=False):
+        try:
+            link.symlink_to(target, target_is_directory=directory)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlink creation unavailable: {type(exc).__name__}")
+
+    def assert_escaping_diagnostics_unavailable(self, target):
+        with patch.object(sqlite3, "connect", side_effect=AssertionError("outside DB opened")) as connect:
+            with self.assertRaises((OSError, ValueError)):
+                self.viewer.read_diagnostics(1, None, "")
+        connect.assert_not_called()
+        with self.assertLogs(self.viewer.app.logger, "WARNING") as logs:
+            response = self.client.get("/device-health")
+        self.assertEqual(response.status_code, 503)
+        page = response.get_data(as_text=True)
+        self.assertIn("Diagnostics unavailable", page)
+        self.assertNotIn("No diagnostics yet", page)
+        self.assertNotIn("tracker-1", page)
+        self.assertNotIn(str(target), page)
+        self.assertIn("Diagnostics unavailable", " ".join(logs.output))
+
+    def test_events_database_symlink_cannot_escape_data_root(self):
+        with tempfile.TemporaryDirectory() as outside:
+            for present in (False, True):
+                with self.subTest(present=present):
+                    target = Path(outside) / "private.db"
+                    self.store.path.parent.mkdir(parents=True, exist_ok=True)
+                    if present:
+                        self.fixture()
+                        self.store.path.rename(target)
+                        before = target.read_bytes(), target.stat().st_mtime_ns, target.stat().st_mode
+                    self.symlink(self.store.path, target)
+                    try:
+                        self.assert_escaping_diagnostics_unavailable(target)
+                        self.assertTrue(self.store.path.is_symlink())
+                        if present:
+                            self.assertEqual((target.read_bytes(), target.stat().st_mtime_ns, target.stat().st_mode),
+                                             before)
+                            self.assertEqual(list(target.parent.iterdir()), [target])
+                        else:
+                            self.assertFalse(target.exists())
+                    finally:
+                        self.store.path.unlink()
+
+    def test_diagnostics_folder_symlink_cannot_escape_data_root(self):
+        self.fixture()
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / "private-diagnostics"
+            self.store.path.parent.rename(target)
+            path = target / "events.db"
+            before = path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_mode
+            self.symlink(self.store.path.parent, target, directory=True)
+            try:
+                self.assert_escaping_diagnostics_unavailable(target)
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_mode), before)
+                self.assertEqual(list(target.iterdir()), [path])
+            finally:
+                self.store.path.parent.unlink()
+
     def test_corrupt_database(self):
         self.store.path.parent.mkdir(parents=True, exist_ok=True)
         self.store.path.write_bytes(b"not a sqlite database")
