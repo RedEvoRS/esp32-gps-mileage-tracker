@@ -1241,7 +1241,15 @@ at once. See the
 [troubleshooting steps](#check-recording-and-uploads)
 for what to check and preserve in each case.
 
-Boot repair also examines `.gpx.fix` files left by interrupted repairs.
+Firmware v1.06 repairs torn trip tails in place: it keeps every complete
+trackpoint, cuts off the damaged tail and adds closing tags. It needs room
+only for those tags rather than a second copy of the trip. A failed final
+write scans at most 4 KiB backwards on the GPS-reading core; longer damage
+waits for boot recovery. Checked sync and close errors report failure; a
+reset after the cut leaves the complete points available for the next boot.
+Real card/flash timing and power-loss durability still need bench tests.
+
+Boot repair also examines `.gpx.fix` files left by older firmware's interrupted repairs.
 It reclaims a temporary copy only when its bytes match the original or its
 expected repaired contents. A finished repair can replace its original
 without allocating another copy. Orphans with the logger's GPX header and
@@ -1334,7 +1342,7 @@ bench flag separately.
 This startup hook and the card skip were run on the board on 2026-11-10
 (UTC), as above; no-storage mode was not. The timeout is unmeasured for a
 full 32 GB card, an 8 MiB repair
-or the full 2.375 MB erased-partition scan. Successful block/copy progress
+or the full 2.375 MB erased-partition scan. Successful scan/comparison progress
 feeds the watchdog, so a healthy repair may take longer overall. With a card
 that always hangs, each power-on waits about four minutes (two 120-second
 timeouts), plus reboot and healthy internal-flash startup, before trips can

@@ -269,10 +269,10 @@ int main(int argc, char** argv) {
         CHECK(gTripPath[0] == 0 && gState != ACTIVE && gState != COOLDOWN, "trip ended when the filesystem filled");
         auto v = tripFiles();
         const std::string& d = g_disk.files[v[0]];
-        CHECK(v.size() == 1 && d.find("</gpx>") == std::string::npos, "left incomplete (no room to repair)");
-        CHECK(count(d, "<trkpt ") > count(d, "</trkpt>"), "a partial point sits at the tail (as on real flash)");
-        CHECK(!isComplete(LittleFS, v[0].c_str()), "incomplete file is not offered for upload");
-        CHECK(logHas("left for boot-time repair"), "logged loudly");
+        CHECK(v.size() == 1 && wellFormedShape(d), "space from the torn point suffices for in-place repair");
+        CHECK(count(d, "<trkpt ") == count(d, "</trkpt>"), "partial point removed without copying the trip");
+        CHECK(isComplete(LittleFS, v[0].c_str()), "repaired full-store trip can upload");
+        CHECK(logHas("Trip finalized"), "successful repair is reported");
         drive(15, 20);
         CHECK(tripFiles().size() == 1 && gTripPath[0] == 0, "no new trip while full, nothing left behind");
         g_disk.capacity = 1 << 22;                // uploads freed space
@@ -312,15 +312,15 @@ int main(int argc, char** argv) {
         CHECK(tripFiles().empty() && logHas("Discarding micro-trip"), "discarded");
     }
 
-    printf("T9 repair copy fails -> original kept\n");
+    printf("T9 truncate fails -> original kept\n");
     {
         resetWorld();
         std::string partial = std::string(GPX_PROLOGUE) + "<trkpt lat=\"1\" lon=\"2\"></trkpt>\n<trkpt lat=";
         g_disk.files["/trips/t000009.gpx"] = partial;
-        g_disk.failFlushes = 1;
+        g_disk.repairFailOperation = "truncate";
         CHECK(!repairIfNeeded(LittleFS, "/trips/t000009.gpx"), "reports failure");
         CHECK(g_disk.files["/trips/t000009.gpx"] == partial, "original untouched");
-        CHECK(!g_disk.files.count("/trips/t000009.gpx.fix"), "bad copy removed");
+        CHECK(!g_disk.files.count("/trips/t000009.gpx.fix"), "no repair copy created");
     }
 
     printf("T10 free-space guard ends a trip before the partition fills (F1)\n");
@@ -497,13 +497,14 @@ int main(int argc, char** argv) {
         CHECK(!PMU.chargeEnabled, "acted on at the next check");
     }
 
-    printf("T21 repair rename failure preserves the original for a later boot\n");
+    printf("T21 legacy repair rename failure preserves the original for a later boot\n");
     {
         resetWorld();
         const std::string path = "/trips/t000021.gpx";
         const std::string partial = std::string(GPX_PROLOGUE) +
             "<trkpt lat=\"1\" lon=\"2\"></trkpt>\n<trkpt lat=";
         g_disk.files[path] = partial;
+        g_disk.files[path + ".fix"] = partial.substr(0, partial.rfind("</trkpt>") + 8) + "\n" + GPX_EPILOGUE;
         g_disk.failRenames = 1;
         CHECK(!repairIfNeeded(LittleFS, path.c_str()), "rename failure is reported");
         CHECK(g_disk.files.count(path) && g_disk.files[path] == partial,
@@ -740,11 +741,12 @@ int main(int argc, char** argv) {
             const std::string partial = points + "\n<trkpt lat=";
             g_disk.files[path + ".fix"] = partial;
             if (full) g_disk.capacity = g_disk.used();
-            else g_disk.failFlushes = 2;
+            else g_disk.repairFailOperation = "sync";
             fsckAllTrips(LittleFS);
-            CHECK(g_disk.files[path] == partial, "failed orphan repair preserves renamed original");
+            CHECK(g_disk.files[path].starts_with(points), "failed orphan repair preserves every complete point");
             CHECK(!isComplete(LittleFS, path.c_str()), "failed repair is not uploaded");
             g_disk.capacity = 1 << 22;
+            g_disk.repairFailOperation.clear();
             fsckAllTrips(LittleFS);
             CHECK(g_disk.files[path] == complete, "repair retries after storage recovers");
         }
@@ -1747,8 +1749,9 @@ int main(int argc, char** argv) {
         setup();
         CHECK(wellFormedShape(g_sdDisk.files.at(path)) && wellFormedShape(g_disk.files.at(path)) &&
               !g_sdDisk.files.count(path + ".fix"),
-              "boot repairs SD and flash, including FAT rename over an existing destination");
+              "boot repairs SD and flash in place without a temporary copy");
         g_sdDisk.files[path] = partial; g_sdDisk.failRenames = 1;
+        g_sdDisk.files[path + ".fix"] = partial.substr(0, partial.rfind("</trkpt>") + 8) + "\n" + GPX_EPILOGUE;
         fsckAllTrips(SD);
         CHECK(!g_sdDisk.files.count(path) && g_sdDisk.files.count(path + ".fix") &&
               wellFormedShape(g_sdDisk.files.at(path + ".fix")),
@@ -1757,6 +1760,7 @@ int main(int argc, char** argv) {
         CHECK(wellFormedShape(g_sdDisk.files.at(path)) && !g_sdDisk.files.count(path + ".fix"),
               "the next boot recovers an orphan FAT repair without losing trackpoints");
         g_sdDisk.files[path] = partial; g_sdDisk.failRemoves = 1;
+        g_sdDisk.files[path + ".fix"] = partial.substr(0, partial.rfind("</trkpt>") + 8) + "\n" + GPX_EPILOGUE;
         fsckAllTrips(SD);
         CHECK(g_sdDisk.files.at(path) == partial && g_sdDisk.files.count(path + ".fix"),
               "failed FAT removal keeps the original and the verified repair");
@@ -1994,6 +1998,149 @@ int main(int argc, char** argv) {
     g_httpConnectMs = TRIP_CONNECT_TIMEOUT_MS + 1;
     CHECK(!uploadFile(LittleFS, connectPath.c_str()) && g_disk.files.count(connectPath) &&
           logHas("send 5.0 s, reply 0.0 s"), "failed connect has no reply wait");
+    printf("T67 in-place bytes, mount isolation and low free space\n");
+    for (bool sd : {false, true}) {
+        resetWorld(); g_sdDisk.mounted = gSdMounted = true; gSdUnavailable = false;
+        fs::FS& storage = sd ? static_cast<fs::FS&>(SD) : static_cast<fs::FS&>(LittleFS);
+        FakeDisk& disk = sd ? g_sdDisk : g_disk;
+        FakeDisk& other = sd ? g_disk : g_sdDisk;
+        const std::string path = "/trips/in-place.gpx";
+        const std::string prefix = std::string(GPX_PROLOGUE) + std::string(8192, ' ') +
+                                   "<trkpt></trkpt>\n<trkpt></trkpt>";
+        const std::string expected = prefix + "\n" + GPX_EPILOGUE;
+        disk.files[path] = prefix + "\n<trkpt";
+        other.files[path] = "other store evidence";
+        disk.capacity = disk.used() + 32; // epilogue fits, a second copy cannot
+        TripRecovery result;
+        CHECK(disk.capacity - disk.used() < disk.files[path].size(), "copy could not fit");
+        CHECK(repairTrip(storage, path.c_str(), result) && result.repaired && !result.pointsKnown,
+              "in-place repair succeeds without counting the whole file");
+        CHECK(disk.files[path] == expected, "bytes equal the historical prefix plus newline and epilogue");
+        CHECK(other.files[path] == "other store evidence", "mounted VFS path selects only the intended store");
+        CHECK(disk.repairOperations == std::vector<std::string>({"open", "truncate", "sync", "seek", "write", "sync", "close"}),
+              "cut is synced before append, then suffix synced and descriptor closed");
+        CHECK(disk.files.size() == 1 && disk.openHandles == 0, "no .fix or open handle remains");
+    }
+
+    printf("T68 checked repair IO failures preserve all complete points\n");
+    for (bool sd : {false, true}) for (const char* fault : {"open", "truncate", "seek", "write", "sync", "final-sync", "close", "short-write"}) {
+        resetWorld(); g_sdDisk.mounted = gSdMounted = true; gSdUnavailable = false;
+        fs::FS& storage = sd ? static_cast<fs::FS&>(SD) : static_cast<fs::FS&>(LittleFS);
+        FakeDisk& disk = sd ? g_sdDisk : g_disk;
+        const std::string path = "/trips/fault.gpx";
+        const std::string prefix = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n<trkpt></trkpt>";
+        const std::string original = prefix + std::string(100, '?');
+        disk.files[path] = original;
+        disk.repairFailOperation = fault;
+        if (disk.repairFailOperation == "final-sync") { disk.repairFailOperation = "sync"; disk.repairFailuresToSkip = 1; }
+        if (disk.repairFailOperation == "short-write") disk.repairWriteLimit = 12;
+        TripRecovery result;
+        CHECK(!repairTrip(storage, path.c_str(), result) && !result.repaired && !std::strcmp(result.reason, "write"),
+              "open/truncate/seek/append/both syncs/close/short write report failure");
+        CHECK(disk.files[path].starts_with(prefix) && disk.files.size() == 1 && disk.openHandles == 0,
+              "every complete point survives, with no temporary copy or leaked descriptor");
+        if (!std::strcmp(fault, "open") || !std::strcmp(fault, "truncate"))
+            CHECK(disk.files[path] == original, "failure before cutting preserves original bytes");
+        if (!std::strcmp(fault, "sync"))
+            CHECK(disk.files[path] == prefix, "failed cut sync prevents any append");
+        if (!std::strcmp(fault, "short-write"))
+            CHECK(!isComplete(storage, path.c_str()), "partial epilogue is never a complete trip");
+        disk.repairFailOperation.clear(); disk.repairWriteLimit = SIZE_MAX;
+        fsckAllTrips(storage);
+        CHECK(disk.files[path] == prefix + "\n" + GPX_EPILOGUE, "next boot recovers after any repair IO fault");
+    }
+
+    printf("T69 reset after cut and after every partial epilogue\n");
+    for (bool sd : {false, true}) {
+        const std::string path = "/trips/power-cut.gpx";
+        const std::string prefix = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>";
+        const std::string suffix = std::string("\n") + GPX_EPILOGUE;
+        for (size_t written = 0; written < suffix.size(); ++written) {
+            resetWorld(); g_sdDisk.mounted = gSdMounted = true; gSdUnavailable = false;
+            fs::FS& storage = sd ? static_cast<fs::FS&>(SD) : static_cast<fs::FS&>(LittleFS);
+            FakeDisk& disk = sd ? g_sdDisk : g_disk;
+            disk.files[path] = prefix + "torn point";
+            std::string full = std::string(sd ? "/sd" : "/littlefs") + path;
+            int fd = trip_repair_io::open(full.c_str(), O_WRONLY);
+            CHECK(fd >= 0 && trip_repair_io::ftruncate(fd, prefix.size()) == 0 && trip_repair_io::fsync(fd) == 0,
+                  "simulate durable cut before power loss");
+            CHECK(trip_repair_io::lseek(fd, prefix.size(), SEEK_SET) == static_cast<off_t>(prefix.size()) &&
+                  trip_repair_io::write(fd, suffix.data(), written) == static_cast<ssize_t>(written) && trip_repair_io::close(fd) == 0,
+                  "simulate any persisted prefix of the closing tags");
+            // Power can fail after the complete closing marker but before its
+            // final newline. Those bytes already contain the full document.
+            bool closed = suffix.substr(0, written).find("</gpx>") != std::string::npos;
+            CHECK(isComplete(storage, path.c_str()) == closed, "only a fully closed document is considered complete");
+            fsckAllTrips(storage);
+            CHECK(disk.files[path] == (closed ? prefix + suffix.substr(0, written) : prefix + suffix),
+                  "next boot preserves all points and completes an interrupted append");
+        }
+    }
+
+    printf("T70 backwards token boundaries, zero tails and garbage removal\n");
+    for (size_t tail = 249; tail <= 255; ++tail) for (char fill : {'?', '\0'}) {
+        resetWorld();
+        const std::string path = "/trips/boundary.gpx";
+        const std::string prefix = std::string(GPX_PROLOGUE) + std::string(600, ' ') + "<trkpt></trkpt>";
+        g_disk.files[path] = prefix + std::string(tail, fill);
+        TripRecovery result;
+        CHECK(repairTrip(LittleFS, path.c_str(), result) && g_disk.files[path] == prefix + "\n" + GPX_EPILOGUE,
+              "last closing token survives every block split and zero-filled/garbage tail");
+    }
+    for (const std::string& garbage : {std::string(), std::string(900, '\0'), std::string(GPX_PROLOGUE) + "<trkpt>torn</trkpt"}) {
+        resetWorld(); g_disk.files["/trips/garbage.gpx"] = garbage;
+        CHECK(repairIfNeeded(LittleFS, "/trips/garbage.gpx") && g_disk.files.empty(), "no complete point still means garbage removal");
+    }
+    for (bool seek : {false, true}) {
+        resetWorld(); const std::string path = "/trips/unreadable.gpx";
+        const std::string original = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>" + std::string(800, '?');
+        g_disk.files[path] = original;
+        g_disk.failSeek = seek;
+        if (!seek) { g_disk.failReadPath = path; g_disk.failReadAfter = 0; }
+        TripRecovery result;
+        CHECK(!repairTrip(LittleFS, path.c_str(), result) && !std::strcmp(result.reason, "read") && g_disk.files[path] == original,
+              "failed seek or read never authorizes cutting or garbage removal");
+    }
+    resetWorld();
+    const std::string unreadablePath = "/trips/scan-read-error.gpx";
+    const std::string unreadableTrip = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>" + std::string(800, '?');
+    g_disk.files[unreadablePath] = unreadableTrip;
+    g_disk.onRead = []() {
+        if (g_disk.readCalls == 3) { g_disk.failReadPath = "/trips/scan-read-error.gpx"; g_disk.failReadAfter = 0; }
+    };
+    TripRecovery unreadableResult;
+    CHECK(!repairTrip(LittleFS, unreadablePath.c_str(), unreadableResult) &&
+          !std::strcmp(unreadableResult.reason, "read") && g_disk.files[unreadablePath] == unreadableTrip && g_disk.repairOperations.empty(),
+          "a short read after verified backwards progress cannot authorize cutting");
+
+    printf("T71 endTrip repair cost follows the tail with a fixed scan ceiling\n");
+    for (size_t padding : {size_t(2048), TRIP_SPLIT_BYTES - 1024}) {
+        resetWorld();
+        const std::string path = "/trips/runtime.gpx";
+        const std::string prefix = std::string(GPX_PROLOGUE) + std::string(padding, ' ') + "<trkpt></trkpt>";
+        g_disk.capacity = 16 * 1024 * 1024;
+        g_disk.files[path] = prefix + "<trkpt";
+        strcpy(gTripPath, path.c_str()); gTripWriteFailed = true; gState = ACTIVE;
+        endTrip(false);
+        CHECK(g_disk.readCalls == 2 && g_disk.readBytes == 272 && g_disk.files[path] == prefix + "\n" + GPX_EPILOGUE,
+              "small and near-8-MiB endTrip repairs each read only 16 plus 256 bytes");
+        g_disk.files[path] = prefix + std::string(TRIP_REPAIR_SCAN_BYTES * 2, '\0');
+        const std::string damaged = g_disk.files[path];
+        g_disk.readBytes = g_disk.readCalls = 0; g_disk.repairOperations.clear();
+        strcpy(gTripPath, path.c_str()); gTripWriteFailed = true; gState = ACTIVE;
+        endTrip(false);
+        CHECK(g_disk.readBytes == TRIP_REPAIR_SCAN_BYTES + 16 && g_disk.files[path] == damaged && g_disk.repairOperations.empty(),
+              "excess damage stops at 4 KiB without cutting or removing complete points");
+        fsckAllTrips(LittleFS);
+        CHECK(g_disk.files[path] == prefix + "\n" + GPX_EPILOGUE, "boot repairs a tail longer than the runtime budget");
+    }
+    resetWorld();
+    g_disk.files["/trips/legacy.gpx.fix"] = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n" + GPX_EPILOGUE;
+    CHECK(!repairIfNeeded(LittleFS, "/trips/legacy.gpx", true) && g_disk.readBytes == 0,
+          "runtime defers legacy full-prefix recovery without reading it");
+    fsckAllTrips(LittleFS);
+    CHECK(g_disk.files.count("/trips/legacy.gpx") && !g_disk.files.count("/trips/legacy.gpx.fix"), "boot still recovers deferred legacy copies");
+
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
     return g_fail ? 1 : 0;
 }

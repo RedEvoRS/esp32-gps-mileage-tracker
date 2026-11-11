@@ -75,6 +75,7 @@
 #include "journal_sd_geometry.h"
 #include "diag_upload.h"
 #include "journal_platform.h"
+#include "trip_repair_vfs.h"
 #include "runtime_faults.h"
 #include "rtc_runtime.h"
 
@@ -1157,7 +1158,7 @@ static bool writeOrBufferTrkpt(const Fix& fx) {
     return ok;
 }
 
-static bool repairIfNeeded(fs::FS& storage, const char* path);
+static bool repairIfNeeded(fs::FS& storage, const char* path, bool bounded = false);
 
 // Close out the active trip. If it's too short/slow it's discarded --
 // unless this is a power-loss finalize, where a genuine short drive that
@@ -1202,11 +1203,10 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
         }
         // A failed write may have left a partial line at the tail. Don't
         // append after it: trim back to the last complete point and close
-        // the document there. If even that fails (e.g. no room for the
-        // repair copy) the file stays incomplete -- never uploaded -- and
-        // the boot-time fsck retries it.
+        // the document there. Bound the tail scan on this GPS-reading core;
+        // a longer damaged tail or a storage error waits for boot-time fsck.
         if (!ok && tripStoreAvailable(storage)) {
-            ok = repairIfNeeded(storage, gTripPath);
+            ok = repairIfNeeded(storage, gTripPath, /*bounded=*/true);
             tripWriteResult(storage, ok, "close");
         }
         if (!tripStoreAvailable(storage)) tripWriteResult(storage, false, "close");
@@ -1332,6 +1332,32 @@ static void tripFsmOnFix(const Fix& fx) {
 // Boot-time fsck: repair any trip file left unclosed by a power cut,
 // then leave it in place for the network task to upload.
 // =================================================================
+static constexpr size_t TRIP_REPAIR_SCAN_BYTES = 4096;
+
+// New repairs search from the tail, without counting the whole trip. Carry
+// seven bytes from the next block so a split closing token is still found.
+// -2 = IO failure; -3 = runtime budget exhausted (never authorize removal).
+static long findLastTrkptEndBackwards(File& f, size_t limit = SIZE_MAX) {
+    static const char token[] = "</trkpt>";
+    constexpr size_t tokenLen = sizeof(token) - 1;
+    char region[256 + tokenLen - 1];
+    size_t cursor = f.size(), carry = 0;
+    while (cursor && limit) {
+        size_t n = min(size_t(256), min(cursor, limit));
+        memmove(region + n, region, carry);
+        cursor -= n;
+        if (!f.seek(cursor) || f.read(reinterpret_cast<uint8_t*>(region), n) != (int)n) return -2;
+        feedLoopWatchdogProgress(); // another verified backwards-scan block
+        for (int i = (int)(n + carry) - (int)tokenLen; i >= 0; --i) {
+            if (memcmp(region + i, token, tokenLen) == 0) return cursor + i + tokenLen;
+        }
+        carry = min(tokenLen - 1, n + carry);
+        limit -= n;
+    }
+    return cursor ? -3 : -1;
+}
+
+// Legacy .fix validation still needs the point count and verified prefix.
 static long findLastTrkptEnd(File& f, uint32_t* points = nullptr) {
     if (points) *points = 0;
     const char* tok = "</trkpt>";
@@ -1407,7 +1433,7 @@ static bool publishRepair(fs::FS& storage, const char* tmp, const char* path) {
     return storage.rename(tmp, path);
 }
 
-// Deal with previous repair attempts before FILE_WRITE can truncate them.
+// Deal with older firmware's repair copies before changing the original.
 // Called under the same FS lock as repairIfNeeded. Ambiguous copies are
 // retained for inspection; only proven redundant bytes may be discarded.
 static bool recoverRepairCopy(fs::FS& storage, const char* path, TripRecovery& result) {
@@ -1475,8 +1501,11 @@ static bool recoverRepairCopy(fs::FS& storage, const char* path, TripRecovery& r
 }
 
 // Returns true if the file is complete afterwards (or was removed as empty),
-// false if it had to be left as it was.
-static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result) {
+// false on any IO error or if bounded runtime work must wait for boot. A
+// failed in-place write can leave a shortened/partially closed recoverable trip.
+static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result, bool bounded = false) {
+    // Legacy comparisons may read megabytes. Do them only during boot fsck.
+    if (bounded && storage.exists((String(path) + ".fix").c_str())) return false;
     if (!recoverRepairCopy(storage, path, result)) return false;
     result.reason = "read";
     File f = storage.open(path, FILE_READ);
@@ -1487,7 +1516,7 @@ static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result) 
     bool complete = false;
     if (sz >= 6) {
         size_t back = sz > 16 ? 16 : sz;
-        f.seek(sz - back);
+        if (!f.seek(sz - back)) { f.close(); return false; }
         char tail[17];
         int n = f.read((uint8_t*)tail, back);
         if (n != (int)back) { f.close(); return false; }
@@ -1496,8 +1525,9 @@ static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result) 
     }
     if (complete) { f.close(); return true; }
 
-    long end = findLastTrkptEnd(f, &result.points);
+    long end = findLastTrkptEndBackwards(f, bounded ? TRIP_REPAIR_SCAN_BYTES : SIZE_MAX);
     if (end == -2) { f.close(); return false; }
+    if (end == -3) { f.close(); result.reason = "parse"; return false; }
     if (end <= 0) {
         f.close();
         result.reason = "write";
@@ -1506,52 +1536,24 @@ static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result) 
         return true;
     }
 
-    String tmp = String(path) + ".fix";
-    File out = storage.open(tmp.c_str(), FILE_WRITE);
-    if (!out) { f.close(); result.reason = "write"; return false; }
-    FileWriter w(out);
-    f.seek(0);
-    long remaining = end;
-    uint8_t b[256];
-    while (remaining > 0) {
-        int want = remaining > 256 ? 256 : (int)remaining;
-        int n = f.read(b, want);
-        if (n <= 0) break;
-        w.put((const char*)b, n);
-        if (!w.ok) break;
-        remaining -= n;
-        feedLoopWatchdogProgress(); // copied bytes, never a stalled read/write
-    }
-    w.put("\n");
-    w.put(GPX_EPILOGUE);
-    // A short read or a write that didn't land means the copy is not a
-    // faithful repair -- keep the original rather than replace it.
-    bool ok = w.commit() && remaining == 0;
-    out.close();
     f.close();
-    if (!ok) {
-        // The copy loop stops at the first failed write, with bytes still
-        // unread, so check the writer before blaming the read.
-        result.reason = (!w.ok || !remaining) ? "write" : "read";
-        storage.remove(tmp.c_str());
+    result.reason = "write";
+    const String suffix = String("\n") + GPX_EPILOGUE;
+    if (!repairTripInPlace(&storage == &SD ? "/sd" : "/littlefs", path,
+                           static_cast<size_t>(end), suffix.c_str())) {
         Serial.printf("fsck: could not repair %s (write failed)\n", path);
         return false;
     }
-    // Publish only after both handles are closed and the repair is verified.
-    // A surviving .fix is discovered on the next boot, including on FAT.
-    if (!publishRepair(storage, tmp.c_str(), path)) {
-        result.reason = "rename";
-        Serial.printf("fsck: could not replace %s (rename failed)\n", path);
-        return false;
-    }
     Serial.printf("fsck: repaired %s\n", path);
-    result.repaired = result.pointsKnown = true;
+    result.repaired = true;
+    // Do not scan the retained prefix just to enrich a recovery event, even
+    // at boot. Only legacy .fix recovery may already know the point count.
     return true;
 }
 
-static bool repairIfNeeded(fs::FS& storage, const char* path) {
+static bool repairIfNeeded(fs::FS& storage, const char* path, bool bounded) {
     TripRecovery result;
-    bool ok = repairTrip(storage, path, result);
+    bool ok = repairTrip(storage, path, result, bounded);
     if (gJournalReady && (!ok || result.repaired)) {
         gLoopFaults.event(ok ? diagnostics::Code::TRIP_RECOVERED : diagnostics::Code::TRIP_RECOVERY_FAILED, millis()).enumeration("backend", tripBackend(storage));
         if (!ok) gLoopFaults.enumeration("reason", result.reason);

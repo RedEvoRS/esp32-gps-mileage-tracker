@@ -168,6 +168,13 @@ struct FakeDisk {
     std::string failOpenPath;
     std::string failReadPath;
     size_t failReadAfter = 0;
+    size_t readBytes = 0, readCalls = 0;
+    bool failSeek = false;
+    // Direct VFS repair faults are separate from Arduino buffered flushes.
+    std::string repairFailOperation;
+    unsigned repairFailuresToSkip = 0;
+    size_t repairWriteLimit = SIZE_MAX;
+    std::vector<std::string> repairOperations;
     void (*onRead)() = nullptr;  // simulate the other core interrupting a queue scan
     int removeCount = 0;
     bool invalidateDirectoryOnMutation = false;
@@ -257,13 +264,15 @@ public:
     }
     void flush() { if (p && p->writable) p->commitPending(); }
     void close() { if (p && p->writable) p->commitPending(); p.reset(); }
-    bool seek(uint32_t pos) { p->pos = pos; return true; }
+    bool seek(uint32_t pos) { if (p->disk->failSeek) return false; p->pos = pos; return true; }
     int available() override { return (int)(size() - p->pos); }
     int read() override { return p->pos < size() ? (uint8_t)data()[p->pos++] : -1; }
     int read(uint8_t* b, size_t n) {
+        p->disk->readCalls++;
         if (p->disk->onRead) p->disk->onRead();
         if (p->path == p->disk->failReadPath && p->pos >= p->disk->failReadAfter) return 0;
         size_t k = std::min(n, size() - std::min(size(), p->pos));
+        p->disk->readBytes += k;
         memcpy(b, data().data() + p->pos, k); p->pos += k; return (int)k;
     }
     size_t readBytes(char* b, size_t n) override { return read((uint8_t*)b, n); }
