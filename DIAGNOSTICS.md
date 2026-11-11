@@ -1956,6 +1956,10 @@ startup; missing/invalid `catalog.json` fails startup clearly. Each connection
 uses a 5000 ms busy timeout. Schema creation/versioning shares the same
 `BEGIN IMMEDIATE` writer lock as updates, safe across Gunicorn workers.
 
+Ingest checks that the resolved diagnostics folder and database stay inside the
+data root before opening them and sets database permissions through a file
+descriptor opened without following a final symlink on POSIX.
+
 Schema version 1 (all receipt timestamps are UTC ISO 8601 with `+00:00`):
 
 - `schema_version`: singleton row `(singleton=1, version=1)`. Unsupported versions

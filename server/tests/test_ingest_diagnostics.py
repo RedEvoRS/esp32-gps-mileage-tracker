@@ -72,6 +72,156 @@ class DiagnosticsIngest(unittest.TestCase):
         finally:
             db.close()
 
+    def symlink(self, link, target, directory=False):
+        try:
+            link.symlink_to(target, target_is_directory=directory)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlink creation unavailable: {type(exc).__name__}")
+
+    def assert_diagnostics_path_rejected(self, target):
+        # Startup stays lazy even when a database path is unusable.
+        self.ing = load_ingest(self.root)
+        self.client = self.ing.app.test_client()
+        with mock.patch.object(sqlite3, "connect", side_effect=AssertionError("outside DB opened")) as connect, \
+                self.assertLogs(self.ing.app.logger, "ERROR"):
+            response = self.post()
+        connect.assert_not_called()
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.get_json(), {"error": "server error storing diagnostics"})
+        self.assertNotIn(str(target), response.get_data(as_text=True))
+        raw = b'<gpx><trk><trkseg><trkpt lat="0" lon="0"/></trkseg></trk></gpx>'
+        with self.assertLogs(self.ing.app.logger, "ERROR"):
+            response = self.client.post("/upload", data=raw, headers=HEADERS | {"X-Trip-Id": "safe-trip"})
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(str(target), response.get_data(as_text=True))
+        self.assertEqual((self.root / response.json["stored_as"]).read_bytes(), raw)
+
+    def test_events_database_symlink_cannot_escape_data_root(self):
+        folder = self.root / "diagnostics"
+        folder.mkdir()
+        with tempfile.TemporaryDirectory() as outside:
+            for present in (False, True):
+                with self.subTest(present=present):
+                    target = Path(outside) / "private.db"
+                    if present:
+                        target.write_bytes(b"outside-diagnostics-sentinel")
+                        target.chmod(0o644)
+                        before = target.stat()
+                    link = folder / "events.db"
+                    self.symlink(link, target)
+                    try:
+                        self.assert_diagnostics_path_rejected(target)
+                        self.assertTrue(link.is_symlink())
+                        self.assertEqual(list(folder.iterdir()), [link])
+                        if present:
+                            self.assertEqual(target.read_bytes(), b"outside-diagnostics-sentinel")
+                            self.assertEqual((target.stat().st_mode, target.stat().st_mtime_ns),
+                                             (before.st_mode, before.st_mtime_ns))
+                        else:
+                            self.assertFalse(target.exists())
+                    finally:
+                        link.unlink()
+
+    @unittest.skipUnless(os.name == "nt", "Windows extended path namespace")
+    def test_extended_database_path_has_the_same_containment_as_its_root(self):
+        path = self.ing.DIAGNOSTICS_STORE.path
+        resolve = Path.resolve
+
+        def extended(candidate, *args, **kwargs):
+            result = resolve(candidate, *args, **kwargs)
+            return Path("\\\\?\\" + str(result)) if candidate == path else result
+
+        with mock.patch.object(Path, "resolve", extended):
+            self.assertEqual(self.post().status_code, 200)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX descriptor permissions")
+    def test_existing_database_permissions_are_tightened_through_descriptor(self):
+        self.assertEqual(self.post().status_code, 200)
+        path = self.ing.DIAGNOSTICS_STORE.path
+        path.chmod(0o644)
+        with mock.patch.object(os, "chmod", side_effect=AssertionError("path chmod")), \
+                mock.patch.object(os, "fchmod", wraps=os.fchmod) as fchmod:
+            self.assertEqual(self.post(batch(revision=2, sequence=2)).status_code, 200)
+        self.assertTrue(fchmod.called)
+        self.assertTrue(all(isinstance(call.args[0], int) and call.args[1] == 0o600
+                            for call in fchmod.call_args_list))
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX no-follow database open")
+    def test_database_link_added_before_descriptor_open_is_refused(self):
+        path = self.ing.DIAGNOSTICS_STORE.path
+        original_open = os.open
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / "private.db"
+
+            def plant_link(candidate, *args, **kwargs):
+                if candidate == path:
+                    self.symlink(path, target)
+                return original_open(candidate, *args, **kwargs)
+
+            with mock.patch.object(os, "open", side_effect=plant_link), \
+                    mock.patch.object(os, "fchmod", wraps=os.fchmod) as fchmod, \
+                    self.assertLogs(self.ing.app.logger, "ERROR"):
+                response = self.post()
+            self.assertEqual(response.status_code, 500)
+            self.assertEqual(response.get_json(), {"error": "server error storing diagnostics"})
+            fchmod.assert_not_called()
+            self.assertFalse(target.exists())
+            self.assertTrue(path.is_symlink())
+
+    def test_diagnostics_folder_symlink_cannot_escape_data_root(self):
+        with tempfile.TemporaryDirectory() as outside:
+            for present in (False, True):
+                with self.subTest(present=present):
+                    target = Path(outside) / ("existing" if present else "missing")
+                    if present:
+                        target.mkdir()
+                        sentinel = target / "private.txt"
+                        sentinel.write_bytes(b"outside-diagnostics-sentinel")
+                    link = self.root / "diagnostics"
+                    self.symlink(link, target, directory=True)
+                    try:
+                        self.assert_diagnostics_path_rejected(target)
+                        if present:
+                            self.assertEqual(list(target.iterdir()), [sentinel])
+                            self.assertEqual(sentinel.read_bytes(), b"outside-diagnostics-sentinel")
+                        else:
+                            self.assertFalse(target.exists())
+                    finally:
+                        link.unlink()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX SQLite no-follow journal")
+    def test_journal_symlink_fails_without_ack_or_changes_to_target(self):
+        self.assertEqual(self.post().status_code, 200)
+        path = self.ing.DIAGNOSTICS_STORE.path
+        before_db = path.read_bytes()
+        with tempfile.TemporaryDirectory() as outside:
+            for present in (False, True):
+                with self.subTest(present=present):
+                    target = Path(outside) / ("existing" if present else "missing")
+                    if present:
+                        target.write_bytes(b"outside-journal-sentinel")
+                        before = target.stat()
+                    link = path.with_name("events.db-journal")
+                    self.symlink(link, target)
+                    try:
+                        with self.assertLogs(self.ing.app.logger, "ERROR"):
+                            response = self.post(batch(revision=2, sequence=2))
+                        self.assertEqual(response.status_code, 500)
+                        self.assertEqual(response.get_json(), {"error": "server error storing diagnostics"})
+                        self.assertNotIn(str(target), response.get_data(as_text=True))
+                        self.assertEqual(path.read_bytes(), before_db)
+                        self.assertTrue(link.is_symlink())
+                        if present:
+                            self.assertEqual(target.read_bytes(), b"outside-journal-sentinel")
+                            self.assertEqual((target.stat().st_mode, target.stat().st_mtime_ns),
+                                             (before.st_mode, before.st_mtime_ns))
+                        else:
+                            self.assertFalse(target.exists())
+                    finally:
+                        link.unlink()
+        self.assertEqual(self.rows("SELECT sequence FROM events"), [(1,)])
+
     def test_battery_boot_and_power_off_context(self):
         for sequence, code in enumerate((1000, 2009), 1):
             body = batch(revision=sequence, sequence=sequence)
