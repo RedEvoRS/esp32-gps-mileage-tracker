@@ -9,15 +9,21 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Lock
+
+from common.retention import DEFAULT_DAYS, SETTINGS_PATH, valid_days
 
 
 SCHEMA_VERSION = 1
 # The firmware saves +1 per drain opportunity (normally at most every 30 s).
 # This permits about 347 days of continuous awake allocations without contact.
 MAX_STATUS_STEP = 1_000_000
+PRUNE_INTERVAL_SECONDS = 3600
+PRUNE_BATCH_SIZE = 250
 SCHEMA = (
     "CREATE TABLE IF NOT EXISTS schema_version ("
     "singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL)",
@@ -57,6 +63,67 @@ class DiagnosticsStore:
     def __init__(self, data_root, catalog):
         self.path = Path(data_root) / "diagnostics" / "events.db"
         self.definitions = {row["code"]: row for row in catalog["codes"]}
+        self.settings_path = SETTINGS_PATH
+        self._settings_problems = set()
+        self._last_prune = float("-inf")
+        self._prune_lock = Lock()
+
+    def retention_days(self):
+        problem = None
+        try:
+            with self.settings_path.open("rb") as stream:
+                raw = stream.read(4097)
+            if len(raw) > 4096:
+                problem = "oversized file"
+            else:
+                value = json.loads(raw)
+                if isinstance(value, dict) and valid_days(value.get("events_retention_days")):
+                    return value["events_retention_days"]
+                problem = "invalid days"
+        except FileNotFoundError:
+            return DEFAULT_DAYS
+        except (ValueError, RecursionError):
+            problem = "malformed JSON"
+        except OSError as exc:
+            problem = "unreadable file (" + type(exc).__name__ + ")"
+        if problem not in self._settings_problems:
+            self._settings_problems.add(problem)
+            logging.getLogger(__name__).warning("Diagnostics retention: %s; using 365 days", problem)
+        return DEFAULT_DAYS
+
+    def prune_if_due(self):
+        """Best effort after upload commit; one attempt/hour per worker, no signals."""
+        if not self._prune_lock.acquire(blocking=False):
+            return
+        try:
+            now = time.monotonic()
+            if now - self._last_prune < PRUNE_INTERVAL_SECONDS:
+                return
+            self._last_prune = now  # Failed attempts are throttled too.
+            self.prune(self.retention_days())
+        finally:
+            self._prune_lock.release()
+
+    def prune(self, days):
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        removed = 0
+        while True:
+            with self._transaction() as db:
+                # Receipt times are datetime.isoformat() UTC (+00:00), with
+                # either six fractional digits or no fraction at exact seconds.
+                # Preserve MAX(rowid): events has no AUTOINCREMENT, and sinks
+                # rely on future inserts never reusing an exported rowid.
+                result = db.execute(
+                    "DELETE FROM events WHERE rowid IN (SELECT rowid FROM events "
+                    "WHERE received_at<? AND rowid<(SELECT MAX(rowid) FROM events) "
+                    "ORDER BY rowid LIMIT ?)", (cutoff, PRUNE_BATCH_SIZE))
+                count = result.rowcount
+            removed += count
+            if count < PRUNE_BATCH_SIZE:
+                break
+            time.sleep(0.01)  # Yield between committed batches to waiting readers/writers.
+        logging.getLogger(__name__).info("Diagnostics retention removed %s event row(s)", removed)
+        return removed
 
     def _connect(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)

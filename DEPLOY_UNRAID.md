@@ -58,6 +58,17 @@ setup on this route. Ingest, viewer and monitor run as the non-root application
 user, with user/group IDs (UID/GID) **1000:1000**. The optional bundled ntfy
 runs as root inside its container and keeps its state in the `ntfy-state`
 volume. Root on the host can maintain their private files.
+The `ingest-settings` named volume carries only the diagnostics retention JSON:
+viewer mounts `/settings` writable, ingest read-only. Both images prepare it
+for UID 1000, including when ingest starts first. On **Admin** (`/admin`), an
+admin sets days of diagnostics history to keep (default **365**, whole days
+**30–3650**). It takes effect on the next diagnostics upload, at most hourly
+per ingest worker; current health and the newest event remain. Cleanup reuses
+deleted space rather than shrinking the file. If Admin warns of a failed
+hand-off, fix the volume and save again or restart viewer. The source setting
+is in the backed-up annotations database. The derived volume is not backed up;
+restore restarts the default services and viewer startup recreates its mirror.
+See [diagnostics retention](DIAGNOSTICS.md#diagnostics-event-retention).
 The installer creates `data/` with that ownership and mode 700. On an existing
 folder, it checks the owner UID and permissions.
 

@@ -410,6 +410,17 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   compare-and-set admin recovery (DIAGNOSTICS.md); ack only after commit. GPX successes refresh contact only for a valid device header;
   diagnostics failure never changes their response. See `DIAGNOSTICS.md` for
   schema/unknown-condition semantics.
+- Diagnostics retention: admin-only `/admin` form, whole days 30–3650, default
+  365. `viewer_settings` in annotations is the source (last admin/time recorded);
+  viewer mirrors JSON atomically to `ingest-settings:/settings`, read-only in
+  ingest. Both images prepare app-owned `/settings`. Viewer startup tolerates
+  mirror failure and Admin warns; ingest defaults to 365 for missing/invalid
+  settings. After diagnostics commit, ingest prunes at most hourly per worker,
+  250 rows per transaction, preserving highest rowid and all current health.
+  No VACUUM or schema change; errors never change upload responses. GELF/Loki
+  continue past a pruned cursor only if no rows at/below it remain and highest
+  rowid is at least the cursor; other restore rules still reset. Backups include
+  the source setting; restore restarts viewer and rebuilds the unbacked-up mirror.
 - Viewer port: 8091, admin/everyday session logins (LAN-only), reads `./data`
   read-only, owns `annotations.db` (SQLite) in `viewer-db`. Removal only marks
   a trip in that DB; it never touches `./data`. Closing a year saves its totals

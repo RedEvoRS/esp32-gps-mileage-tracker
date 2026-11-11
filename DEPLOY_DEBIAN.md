@@ -452,6 +452,18 @@ also enables backups.
 
 The viewer's annotations DB lives in a named Docker volume (`viewer-db`), not
 here — nothing to prepare for it.
+The small `ingest-settings` named volume is also created automatically. The
+viewer writes `/settings/diagnostics.json`; ingest mounts it read-only and
+cannot read `viewer-db`. Both images prepare its application-user ownership.
+On **Admin** (`/admin`), **Days of diagnostics events to keep** defaults to
+365 and accepts whole numbers from 30 to 3650. It takes effect on the next
+diagnostics upload, with cleanup at most hourly per ingest worker. Current
+health and the newest event stay; deleted space is reused without shrinking
+the file. A hand-off warning on Admin means fix the settings volume and save
+again or restart the viewer. The source setting is backed up in annotations;
+the derived volume is not backed up. Restore restarts the default services,
+so viewer startup recreates the mirror from the restored database. See
+[diagnostics retention](DIAGNOSTICS.md#diagnostics-event-retention).
 
 ---
 

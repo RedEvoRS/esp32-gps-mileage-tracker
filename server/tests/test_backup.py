@@ -588,6 +588,28 @@ fi
         self.assertIn("--yes", result.stderr)
         self.assertNotIn("stop", self.compose_log.read_text())
 
+    def test_retention_setting_round_trips_in_annotations_without_settings_volume(self):
+        path = self.db_dir / 'annotations.db'
+        with sqlite3.connect(path) as conn:
+            conn.execute('CREATE TABLE viewer_settings (key TEXT PRIMARY KEY, value INTEGER NOT NULL, '
+                         'updated_by TEXT NOT NULL, updated_at TEXT NOT NULL)')
+            conn.execute('INSERT INTO viewer_settings VALUES (?,?,?,?)',
+                         ('events_retention_days', 500, 'example-admin', '2026-01-01T00:00:00+00:00'))
+        conn.close()
+        self.run_script('backup.sh')
+        with sqlite3.connect(path) as conn:
+            conn.execute('UPDATE viewer_settings SET value=30')
+        conn.close()
+        self.run_script('restore.sh', 'restore', 'latest', '--yes')
+        with sqlite3.connect(path) as conn:
+            self.assertEqual(conn.execute('SELECT * FROM viewer_settings').fetchall(),
+                             [('events_retention_days', 500, 'example-admin', '2026-01-01T00:00:00+00:00')])
+        conn.close()
+        # Restart runs the viewer startup mirror; the derived volume needs no snapshot.
+        calls = self.compose_log.read_text()
+        self.assertTrue(calls.rstrip().endswith('up -d'))
+        self.assertNotIn('ingest-settings', calls)
+
     def test_events_snapshot_while_writer_has_uncommitted_transaction(self):
         path = self.add_events()
         writer = sqlite3.connect(path)

@@ -131,15 +131,24 @@ def read_events(path, after_rowid, limit):
                           "FROM events WHERE rowid>? ORDER BY rowid LIMIT ?", (after_rowid, limit)).fetchall()
         anchor = db.execute("SELECT rowid,device_id,boot_id,sequence,code,received_at,canonical_json "
                             "FROM events WHERE rowid=?", (after_rowid,)).fetchone()
-        return highest, rows, event_fingerprint(anchor) if anchor else None
+        at_or_below = db.execute("SELECT 1 FROM events WHERE rowid<=? LIMIT 1", (after_rowid,)).fetchone()
+        pruned = anchor is None and highest >= after_rowid and at_or_below is None
+        return highest, rows, event_fingerprint(anchor) if anchor else None, pruned
 
 
 def event_fingerprint(row):
     return hashlib.sha256(json.dumps(row, ensure_ascii=True).encode("ascii")).hexdigest()
 
 
-def cursor_changed(db, sink, cursor, fingerprint):
+def cursor_changed(db, sink, cursor, fingerprint, pruned=False):
     if not cursor:
+        return False
+    if pruned:
+        # A stalled sink's whole delivered prefix aged out. Rows above its
+        # cursor are exactly the unsent rows. Refresh the now-missing marker;
+        # lower/refilled restores and holes inside retained history still reset.
+        with db:
+            save_cursor_marker(db, sink, cursor, "")
         return False
     stored = db.execute("SELECT event_rowid,fingerprint FROM event_cursor_markers WHERE sink=?",
                         (sink,)).fetchone()

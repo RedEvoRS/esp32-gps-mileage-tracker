@@ -418,6 +418,21 @@ class DiagnosticsIngest(unittest.TestCase):
 
 
 class DiagnosticsPackaging(unittest.TestCase):
+    def test_settings_volume_preserves_service_boundaries_and_initial_ownership(self):
+        compose = (SERVER / 'docker-compose.yml').read_text(encoding='utf-8')
+        ingest = compose.split('  mileage-ingest:\n', 1)[1].split('  mileage-viewer:\n', 1)[0]
+        viewer = compose.split('  mileage-viewer:\n', 1)[1].split('  mileage-monitor:\n', 1)[0]
+        self.assertIn('ingest-settings:/settings:ro', ingest)
+        self.assertNotIn('viewer-db:', ingest)
+        self.assertNotIn('viewer.env', ingest)
+        self.assertIn('ingest-settings:/settings\n', viewer)
+        self.assertIn('./data:/data:ro', viewer)
+        # Comments explain the token boundary; it must not be an environment entry.
+        self.assertNotIn('- INGEST_AUTH_TOKEN', viewer)
+        for service in ('mileage-ingest', 'mileage-viewer'):
+            dockerfile = (SERVER / service / 'Dockerfile').read_text()
+            self.assertRegex(dockerfile, r'RUN mkdir -p [^\n]*/settings[^\n]*&& chown -R app:app [^\n]*/settings')
+
     def test_build_contexts_copy_shared_code_and_allowlist_excludes_secrets(self):
         compose = (SERVER / "docker-compose.yml").read_text(encoding="utf-8")
         ignore = (SERVER / ".dockerignore").read_text(encoding="utf-8").splitlines()

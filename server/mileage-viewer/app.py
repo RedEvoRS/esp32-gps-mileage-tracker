@@ -94,6 +94,7 @@ from common.settings import map_tiles, trusted_proxies, viewer_cookie_secure
 
 from common.diagnostics import CatalogError, load_catalog
 from geocoding import Geocoder, GeocodeError
+from diagnostics_settings import DiagnosticsSettings, WARNING as SETTINGS_WARNING
 import trip_log
 import trip_merges
 import users
@@ -113,6 +114,7 @@ TRIP_HISTORY_PAGE_SIZE = 50
 # ---------------------------------------------------------------------
 DATA_ROOT = Path(os.environ.get("INGEST_DATA_ROOT", "/data"))
 DB_PATH = Path(os.environ.get("VIEWER_DB_PATH", "/db/annotations.db"))
+DIAGNOSTICS_SETTINGS = DiagnosticsSettings(DB_PATH)
 GEOCODER = Geocoder(DB_PATH)
 
 # --- Display timezone -----------------------------------------------
@@ -313,6 +315,7 @@ def init_db():
         if "destination" not in columns:
             conn.execute("ALTER TABLE annotations ADD COLUMN destination TEXT NOT NULL DEFAULT ''")
         users.init_schema(conn)
+        DiagnosticsSettings.init_schema(conn)
         Geocoder.init_schema(conn)
         trip_merges.init_schema(conn)
         trip_log.init_schema(conn)
@@ -1820,6 +1823,18 @@ ACCOUNT_HTML = """
 {% if title == 'Admin' %}<p>{{ admin_username }}: Admin (set in viewer.env)</p>
 <p><a class="btn secondary" href="{{ url_for('admin_removed') }}">Removed trips</a></p>
 <p><a class="btn secondary" href="{{ url_for('admin_history') }}">Change history</a></p>
+<h2>Diagnostics history</h2>
+<p>Events older than the number of days below are deleted. Current device health is kept.
+This takes effect the next time the tracker uploads diagnostics; cleanup runs at most once per hour in each ingest worker.</p>
+{% if retention_warning %}<p role="alert">{{ retention_warning }}</p>{% endif %}
+<form method="post" class="login-form">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<input type="hidden" name="action" value="diagnostics-retention">
+<label>Days of diagnostics events to keep
+<input type="number" name="events_retention_days" min="30" max="3650" step="1" value="{{ retention.days }}" required></label>
+<p class="muted">Whole days, 30 to 3650. Deleted events cannot be recovered except from a backup.</p>
+<button class="btn" type="submit">Save diagnostics retention</button></form>
+{% if retention.updated_at %}<p class="muted">Last changed by {{ retention.updated_by }} on {{ fmt_date(retention.updated_at) }} ({{ timezone }}).</p>{% endif %}
 <h2>Year review</h2>
 <p class="muted">Check a year's log before filing, then close it so nothing in it changes by accident.</p>
 <table class="year-table"><tr><th>Year</th><th>Status</th><th></th></tr>
@@ -2252,6 +2267,7 @@ DEVICE_HEALTH_HTML = """
     </form>
   </div>
 </header><main class="wrap"><h1>Device health</h1>
+{% if retention_days is not none %}<p class="muted">Events older than {{ retention_days }} days are deleted; the newest event and current device health are kept.</p>{% endif %}
 {% if state == 'absent' %}
   <p>No diagnostics yet. No device diagnostics or identified trip contact has arrived.</p>
 {% elif state == 'unavailable' %}
@@ -2363,9 +2379,17 @@ def device_health():
         # contain private text). Keep enough detail to diagnose schema/I/O faults.
         app.logger.warning("Diagnostics unavailable (%s)", type(exc).__name__)
         data = {"state": "unavailable"}
+    try:
+        retention_days = DIAGNOSTICS_SETTINGS.current()["days"]
+    except (OSError, sqlite3.Error) as exc:
+        # The optional policy label must not hide diagnostics or break their
+        # existing unavailable page when annotations cannot be read.
+        app.logger.warning("Diagnostics retention setting unavailable (%s)", type(exc).__name__)
+        retention_days = None
     return render_template_string(
         DEVICE_HEALTH_HTML, **data, page=page, code=code, severity=severity,
         severities=DIAGNOSTICS_SEVERITIES, timezone=DISPLAY_TZ_NAME,
+        retention_days=retention_days,
     ), 503 if data["state"] == "unavailable" else 200
 
 
@@ -2449,6 +2473,14 @@ def _confirmed_password():
 @app.route("/admin", methods=["GET", "POST"])
 def admin():
     if request.method == "POST":
+        if request.form.get("action") == "diagnostics-retention":
+            try:
+                mirrored = DIAGNOSTICS_SETTINGS.save(request.form.get("events_retention_days", ""), g.user)
+                session["account_message"] = ("Diagnostics retention saved." if mirrored else
+                                               "Diagnostics retention saved. " + SETTINGS_WARNING)
+            except ValueError as exc:
+                session["account_message"] = str(exc)
+            return redirect(url_for("admin"))
         try:
             action = request.form.get("action", "")
             username = request.form.get("username", "")
@@ -2460,7 +2492,9 @@ def admin():
         except users.UserError as exc:
             session["account_message"] = str(exc)
         return redirect(url_for("admin"))
+    retention = DIAGNOSTICS_SETTINGS.current()
     return render_template_string(ACCOUNT_HTML, title="Admin", admin_username=VIEWER_USERNAME,
+                                  retention=retention, retention_warning=DIAGNOSTICS_SETTINGS.warning(retention["days"]),
                                   logins=users.list_users(DB_PATH), timezone=DISPLAY_TZ_NAME,
                                   year_list=_year_list(),
                                   message=session.pop("account_message", None))
@@ -3620,6 +3654,7 @@ def export_xlsx():
 
 
 init_db()
+DIAGNOSTICS_SETTINGS.mirror()
 
 
 if __name__ == "__main__":

@@ -178,6 +178,7 @@ concerns handled by `mileage-viewer`, which reads these files independently.
         ├── app.py             # The web UI (Flask)
         ├── manage_users.py    # Command-line management of everyday logins
         ├── users.py           # Login accounts and password hashing
+        ├── diagnostics_settings.py # Retention setting and atomic ingest mirror
         ├── trip_log.py        # Trip removal, change history and tax-year records
         ├── trip_merges.py     # Merging recordings from one drive
         ├── geocoding.py       # Optional place lookup
@@ -321,6 +322,10 @@ Importable panel and LogQL alert examples are in `grafana/`; see
 DEPLOY_DEBIAN.md Step 11f.
 
 Backups include consistent diagnostics and monitor-state database snapshots.
+The diagnostics retention setting is included in the annotations snapshot.
+The `ingest-settings` volume holds only a derived JSON copy and is not backed
+up; restore restarts the default services and viewer startup recreates that
+copy from the restored annotations database.
 The optional ntfy volume (users, tokens and cached messages) needs a separate
 backup. Full policy and schema details are in [DIAGNOSTICS.md](../DIAGNOSTICS.md).
 
@@ -719,6 +724,18 @@ What it does:
   The diagnostics DB is opened read-only with a two-second lock timeout.
   Before it exists the page says "No diagnostics yet"; read/schema/lock errors
   say "Diagnostics unavailable" (503) and log a warning. Neither means healthy.
+- **Diagnostics retention** — on **Admin** (`/admin`), set how many days of
+  events to keep: **365** by default, whole numbers **30–3650**. Only an admin
+  can save it; the page shows who last saved it and when. Ingest deletes older
+  events on the next diagnostics upload, at most once per hour per worker,
+  in batches of 250. Current device health and the newest event are kept.
+  Deleted pages are reused; cleanup does not shrink the database file.
+  The viewer saves the setting in `annotations.db`, then publishes a tiny
+  `diagnostics.json` in `ingest-settings`, mounted at `/settings` writable in
+  viewer and read-only in ingest. Ingest cannot read the viewer database, and
+  viewer still reads diagnostics only. A failed hand-off warns on Admin;
+  fix the volume and save again or restart the viewer. A missing or invalid
+  mirror makes ingest use 365 days. [Retention details](../DIAGNOSTICS.md#diagnostics-event-retention).
 
 Years are based on **trip start in `DISPLAY_TZ`**, including at the New Year
 boundary. A trip crossing midnight belongs entirely to its start year; it

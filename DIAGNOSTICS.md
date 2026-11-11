@@ -1988,6 +1988,48 @@ only the required runtime files. Secrets, data and development artifacts stay
 outside the build context. All three services load the catalog once at startup and
 fail fast if it is missing or invalid.
 
+#### Diagnostics event retention
+
+On the viewer's **Admin** page (`/admin`), an admin can set **Days of diagnostics
+events to keep**. The first value is **365**; only whole numbers from **30 to
+3650** are accepted. Everyday logins cannot change it. The page records the
+last admin who saved it and the time. This affects event history only: device
+contact, boots, current snapshots and conditions remain available.
+
+The setting takes effect the next time the tracker uploads diagnostics, subject
+to a cleanup limit of once per hour in each ingest worker. After the upload has
+committed, ingest deletes events whose server `received_at` is older than the
+chosen number of days, in separate transactions of at most 250 rows, yielding
+between batches. The highest rowid is always kept, even if old: the event table
+has no `AUTOINCREMENT`, and export cursors require rowids not to be reused.
+Cleanup errors are logged and never change an accepted upload's response.
+The diagnostics schema stays at version 1, DELETE journal and synchronous=FULL.
+There is no `VACUUM`: deleted pages are reused, so the database stops growing
+with accumulated old event history rather than shrinking on disk. Other tables
+and the newest event can still use space as devices and boots accumulate.
+
+The source is the `viewer_settings` table in `annotations.db` (absent row means
+365). At startup and after a save, the viewer atomically publishes only
+`{"events_retention_days":365}` to `/settings/diagnostics.json` in the
+`ingest-settings` named volume. The viewer can write that volume; ingest mounts
+it read-only. Ingest never reads `annotations.db`; the viewer still has no ingest
+token and never writes or recovers `events.db`. Both images create `/settings`
+owned by the application user, including when ingest initializes the volume first.
+Concurrent viewer workers serialize publication using the annotations writer lock,
+re-read the latest setting, fsync a unique temporary file, replace the mirror,
+and fsync the directory on Linux.
+
+If publication fails, the viewer starts and the Admin page warns that the saved
+setting could not be handed to ingest. Fix the settings volume and save again,
+or restart the viewer. Ingest uses 365 when the file is missing; unreadable,
+malformed or out-of-range files also use 365 with one warning per distinct
+problem per worker. An older valid mirror remains in use until repaired.
+
+Backups already include this setting inside the annotations snapshot. The
+`ingest-settings` volume contains only the derived copy and is not backed up.
+Restore restarts the default services, so viewer startup replaces the mirror
+from the restored annotations, including the default for older backups.
+
 #### Device health page (#119, shipped)
 
 Open `/device-health` from the viewer navigation after logging in. It shows
@@ -2233,13 +2275,16 @@ independent of `NOTIFY_ENABLED` and `NOTIFY_*` settings (only
 
 - `event`: cursor-based, at-least-once forwarding of `events.db` rows in rowid
   order. An interrupted send before cursor commit can produce duplicates. The
-  cursor is the last delivered rowid (`gelf_cursor`). The ingest never deletes
-  events, so rowids only grow; if the table's highest rowid is ever below the
-  cursor, or the row at the cursor no longer has the stored fingerprint, the
-  cursor resets to 0 and history is resent. This also detects a restore whose
+  cursor is the last delivered rowid (`gelf_cursor`). Ingest keeps the highest
+  rowid when pruning, so new rowids keep growing. A missing anchor is treated
+  as pruned only when the highest rowid is at least the cursor and no rows at
+  or below the cursor remain; export continues above that cursor and refreshes
+  its marker. If the highest rowid is below the cursor, a retained anchor has a
+  different fingerprint, or the anchor is missing while earlier rows remain,
+  the cursor resets to 0 and history is resent. This also detects a restore whose
   rowids were refilled before the next tick. Graylog may see duplicates.
   Fingerprints live in the additive `event_cursor_markers` table; existing v1
-  cursor tables are unchanged. On upgrade, a nonzero cursor without a marker
+  cursor tables are unchanged. On upgrade, a nonzero cursor with a retained anchor but without a marker
   replays once because its old identity cannot be verified.
   A damaged stored row is skipped with a type-only warning and the cursor
   moves past it.
@@ -2330,9 +2375,13 @@ duplicated. If `events.db` has a lower maximum rowid or a different event
 fingerprint at Loki's cursor, only that sink's event cursor resets and history
 is sent again, even when new uploads refilled the old rowids between ticks.
 Its marker is independent of GELF in `event_cursor_markers`; upgrading an old
-nonzero cursor without a marker replays once. Loki runs
+nonzero cursor with a retained anchor but without a marker replays once. Loki runs
 after ntfy and GELF; its failures are caught separately and do not change
 either sink's progress or trip uploads.
+
+Loki uses the same pruned-prefix rule as GELF: a missing anchor with no retained
+row at or below the cursor and a highest rowid at least that cursor continues
+without replay. Other missing/changed anchors and lower restores still reset.
 
 ### Backups and acceptance (#129/#130)
 
