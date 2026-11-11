@@ -1,10 +1,12 @@
 """Viewer-owned merge records; original files and annotations stay untouched."""
 
 import json
+import os
 import re
 import xml.etree.ElementTree as ET
 from xml.parsers import expat
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from common.trip_summary import parse_gpx, summarize, _parse_iso
 import trip_log
@@ -49,15 +51,25 @@ def canonical_key(conn, key):
     return row[0] if row else key
 
 
-def checked_path(root, path):
-    """Resolve a final trip file inside an already resolved data root."""
+def checked_path(root, path, *, preserve_final=False):
+    """Check a trip path; optionally retain its final link for presence tests."""
     try:
-        resolved = path.resolve()
+        # Resolve the parent first so a linked DATA_ROOT still works. The
+        # normalized prefix check is also understood by static path analysis.
+        parent = os.path.realpath(path.parent)
+        normalized = os.path.abspath(os.path.join(parent, path.name))
+        prefix = os.path.join(str(root), "")
+        if not normalized.startswith(prefix):
+            raise ValueError("Invalid trip path")
+        candidate = Path(normalized)
+        resolved = candidate.resolve()
     except (OSError, RuntimeError) as exc:
         raise ValueError("Unreadable trip path") from exc
     if root not in resolved.parents:
         raise ValueError("Invalid trip path")
-    return resolved
+    # Keep the resolve/ancestor check: a lexical prefix cannot see final-file
+    # symlinks. lexists callers retain a safe dangling link's own identity.
+    return candidate if preserve_final else resolved
 
 
 def source_file_pairs(data_root, keys):

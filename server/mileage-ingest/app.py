@@ -285,7 +285,14 @@ def _stored_summary(json_file):
 
 def _checked_trip_path(root, path):
     """Resolve a trip folder or final file inside the resolved data root."""
-    resolved = path.resolve()
+    # Normalize and guard before pathlib accesses the candidate, including
+    # when DATA_ROOT itself is a link. Keep the final symlink check below.
+    parent = os.path.realpath(path.parent)
+    normalized = os.path.abspath(os.path.join(parent, path.name))
+    prefix = os.path.join(str(root), "")
+    if not normalized.startswith(prefix):
+        raise ValueError(f"Trip path escapes data root: {path}")
+    resolved = Path(normalized).resolve()
     if root not in resolved.parents:
         raise ValueError(f"Trip path escapes data root: {path}")
     return resolved

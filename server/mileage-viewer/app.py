@@ -924,13 +924,13 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
     for json_path in json_paths:
         if only_merge_key is not None:
             try:
-                trip_merges.checked_path(root, json_path)
+                presence_path = trip_merges.checked_path(root, json_path, preserve_final=True)
             except ValueError:
                 pass  # Keep unsafe paths so _cached_summary reports them.
             else:
                 # Check containment before lexists: it follows month links,
                 # but never the final file link (including a dangling link).
-                if not (os.path.lexists(json_path) or os.path.lexists(json_path.with_suffix(".gpx"))):
+                if not (os.path.lexists(presence_path) or os.path.lexists(presence_path.with_suffix(".gpx"))):
                     continue
         ym = json_path.parent.name
         trip_id = json_path.stem

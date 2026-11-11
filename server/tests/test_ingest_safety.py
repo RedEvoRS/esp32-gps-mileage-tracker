@@ -287,6 +287,40 @@ class UploadSafety(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(Path(response.get_json()["stored_as"]).stem, "caf_-trip")
 
+    def test_custom_trip_ids_keep_the_same_filename_sanitizing(self):
+        for trip_id, filename in (("AZaz09_-", "AZaz09_-"), ("../private", "___private"),
+                                  ("C:\\private\\trip", "C__private_trip"),
+                                  ("\\\\host\\share", "__host_share"),
+                                  ("caf\u00e9-trip", "caf_-trip")):
+            with self.subTest(trip_id=trip_id):
+                response = self.upload(body(timed=False), **{"X-Trip-Id": trip_id})
+                self.assertEqual(response.status_code, 200)
+                gpx, summary = self.saved_pair(response)
+                self.assertEqual(gpx.stem, filename)
+                self.assertEqual(gpx.parent.parent, self.root)
+                self.assertEqual(json.loads(summary.read_bytes())["trip_id"], trip_id)
+
+    def test_trip_path_checks_reject_root_and_sibling_prefix(self):
+        root = self.root.resolve()
+        for path in (root, root.parent / (root.name + "-other") / "drive.gpx",
+                     root / ".." / "private.gpx"):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                self.ing._checked_trip_path(root, path)
+
+    def test_linked_data_root_and_internal_trip_links_still_work(self):
+        with tempfile.TemporaryDirectory() as aliases:
+            alias = Path(aliases) / "linked-data"
+            self.symlink(alias, self.root, directory=True)
+            with mock.patch.object(self.ing, "DATA_ROOT", alias):
+                response = self.upload()
+            self.assertEqual(response.status_code, 200)
+            gpx, summary = self.saved_pair(response)
+            link = gpx.parent / "linked.gpx"
+            self.symlink(link, gpx)
+            self.assertEqual(self.ing._checked_trip_path(self.root.resolve(), alias / link.relative_to(self.root)),
+                             gpx.resolve())
+            self.assertTrue(summary.exists())
+
     def test_fallback_trip_id_is_utc_start_time_and_file_name(self):
         # No X-Trip-Id (the firmware's case), with times given at an offset.
         headers = {k: v for k, v in HEADERS.items() if k != "X-Trip-Id"}

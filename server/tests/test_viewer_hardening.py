@@ -40,7 +40,9 @@ class ViewerHardeningTests(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as conn:
             before = {table: conn.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
         files = {p: p.read_bytes() for p in self.viewer.DATA_ROOT.glob("*/*")}
-        for key in ("2026-01/drive%0A", f"{quote(month)}/drive", "2026-01%0A/drive"):
+        for key in ("2026-01/drive%0A", f"{quote(month)}/drive", "2026-01%0A/drive",
+                    "2026-01/..", "2026-01/C:%5Cprivate", "2026-01/%5C%5Chost%5Cshare",
+                    "2026-01/drive%2Fother", "2026-01/drive%5Cother"):
             for method, route in routes:
                 with self.subTest(key=key, route=route):
                     with patch.object(self.viewer, "read_summary", side_effect=AssertionError("invalid URL read")), \
@@ -239,6 +241,54 @@ class ViewerHardeningTests(unittest.TestCase):
         root = self.viewer.DATA_ROOT.resolve()
         self.assertEqual(paths, (root / "2026-02/missing.gpx", root / "2026-02/missing.json"))
         self.assertFalse(any(p.exists() for p in paths))
+
+    def test_trip_path_checks_preserve_ascii_allowlists(self):
+        merges = self.viewer.trip_merges
+        root = self.viewer.DATA_ROOT.resolve()
+        for trip_id in ("a", "AZaz09_-", "2026-01-02T12-00-00Z"):
+            with self.subTest(trip_id=trip_id), self.viewer.app.test_request_context():
+                paths = self.viewer._safe_trip_paths("2026-01", trip_id)
+                self.assertEqual(paths, tuple(root / f"2026-01/{trip_id}{ext}"
+                                              for ext in (".gpx", ".json")))
+        for key in ("2026-01/../private", "2026-01/drive\n", "2026-01/drive.other",
+                    "2026-01/C:" + BS + "private", "2026-01" + BS + "drive",
+                    "\u0662\u0660\u0662\u0666-01/drive"):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                list(merges.source_file_pairs(root, [key]))
+
+    def test_trip_path_checks_reject_root_and_sibling_prefix(self):
+        root = self.viewer.DATA_ROOT.resolve()
+        for path in (root, root.parent / (root.name + "-other") / "drive.json",
+                     root / ".." / "private.json"):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                self.viewer.trip_merges.checked_path(root, path)
+
+    def test_linked_data_root_and_internal_trip_links_still_work(self):
+        root = self.viewer.DATA_ROOT
+        alias = self.db.parent / "linked-data"
+        self.symlink(alias, root, directory=True)
+        link = root / "2026-01/linked.json"
+        self.symlink(link, root / "2026-01/drive.json")
+        with patch.object(self.viewer, "DATA_ROOT", alias), self.viewer.app.test_request_context():
+            self.assertEqual(self.viewer._safe_trip_paths("2026-01", "linked")[1],
+                             (root / "2026-01/drive.json").resolve())
+            self.assertTrue(self.viewer._trip_file_exists(root.resolve(), alias / "2026-01/linked.json"))
+
+    def test_targeted_presence_keeps_internal_dangling_summary_link(self):
+        root = self.viewer.DATA_ROOT.resolve()
+        summary = root / "2026-01/drive.json"
+        summary.unlink()
+        target = root / "2026-01/missing.json"
+        self.symlink(summary, target)
+        checked = self.viewer.trip_merges.checked_path(root, summary, preserve_final=True)
+        self.assertEqual(checked, summary)
+        self.assertTrue(self.viewer.os.path.lexists(checked))
+        self.assertEqual(self.viewer.trip_merges.checked_path(root, summary), target)
+        with self.assertLogs(self.viewer.app.logger, "WARNING"):
+            with self.viewer._trip_read(trip_key="2026-01/drive") as (_, trips, unreadable):
+                self.assertEqual(trips, [])
+                self.assertEqual([t["trip_key"] for t in unreadable], ["2026-01/drive"])
+                self.assertEqual(unreadable[0]["problem"], "the file is missing")
 
     # -- framing and sniffing headers -------------------------------------
 
