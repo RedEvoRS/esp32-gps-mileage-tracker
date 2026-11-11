@@ -263,11 +263,6 @@ def _annotation_text_problem(label, text):
                 "program) and save again.")
     return None
 
-# Strict patterns for the URL components, so a trip path can never escape
-# DATA_ROOT via "..", absolute paths, or odd characters.
-YM_RE = re.compile(r"^\d{4}-\d{2}$")
-ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-
 _startup_check()
 
 app = Flask(__name__)
@@ -702,17 +697,19 @@ def _safe_trip_paths(ym, trip_id):
     Aborts with 404 on anything that doesn't match the strict patterns or
     that would resolve outside DATA_ROOT.
     """
-    if not YM_RE.match(ym or "") or not ID_RE.match(trip_id or ""):
+    if not trip_merges.YM_RE.fullmatch(ym or "") or not trip_merges.ID_RE.fullmatch(trip_id or ""):
         abort(404)
-    base = (DATA_ROOT / ym).resolve()
-    root = DATA_ROOT.resolve()
-    if root != base and root not in base.parents:
-        abort(404)
-    gpx = (base / f"{trip_id}.gpx").resolve()
-    json_path = (base / f"{trip_id}.json").resolve()
-    if any(root not in path.parents for path in (gpx, json_path)):
-        abort(404)
-    return gpx, json_path
+    try:
+        return next(trip_merges.source_file_pairs(DATA_ROOT, [f"{ym}/{trip_id}"]))
+    except ValueError:
+        abort(404, description="the file could not be read")
+
+
+def _trip_file_exists(root, path):
+    try:
+        return trip_merges.checked_path(root, path).exists()
+    except (OSError, ValueError):
+        return False
 
 
 # The summary fields the pages and exports read. read_summary() keeps only
@@ -760,7 +757,7 @@ def _summary_problem(summary):
     return None
 
 
-def read_summary(json_path):
+def read_summary(json_path, *, root=None):
     """Load a summary: (summary, problem), retaining identity on rejected JSON.
 
     Ingest writes summaries atomically, so a bad one means disk damage or
@@ -768,6 +765,11 @@ def read_summary(json_path):
     so callers leave its miles out and report the trip as unreadable.
     """
     summary = None
+    try:
+        json_path = trip_merges.checked_path(DATA_ROOT.resolve() if root is None else root, json_path)
+    except ValueError:
+        app.logger.warning("Unreadable trip summary path %s", json_path)
+        return None, "the file could not be read"
     try:
         with open(json_path, "r", encoding="utf-8") as fh:
             summary = json.load(fh)
@@ -811,26 +813,36 @@ def _summary_stamp(path):
     return st.st_ino, st.st_size, st.st_mtime_ns
 
 
-def _cached_summary(path):
+def _cached_summary(path, *, root=None):
+    root = DATA_ROOT.resolve() if root is None else root
+    try:
+        checked = trip_merges.checked_path(root, path)
+    except ValueError:
+        # Always check before stamps or cache lookup: a cached regular file
+        # may since have been replaced by a symlink outside the data mount.
+        app.logger.warning("Unreadable trip summary path %s", path)
+        with _summary_cache_lock:
+            _summary_cache.pop(path, None)
+        return None, "the file could not be read"
     with _summary_cache_lock:
         try:
-            stamp = _summary_stamp(path)
+            stamp = _summary_stamp(checked)
         except OSError:
             _summary_cache.pop(path, None)
-            return read_summary(path)
+            return read_summary(path, root=root)
         cached = _summary_cache.get(path)
         if cached is not None and cached[0] == stamp:
             summary, problem = cached[1:]
             if problem:
                 app.logger.warning("Unreadable trip summary %s: %s", path, problem)
             return dict(summary) if summary is not None else None, problem
-        summary, problem = read_summary(path)
+        summary, problem = read_summary(path, root=root)
         # Do not pin a read raced by an atomic ingest rewrite (or hand edit).
         # This request can show either complete file, as before; the next read
         # must not mistake the older parsed content for the newer file.
         try:
-            unchanged = _summary_stamp(path) == stamp
-        except OSError:
+            unchanged = _summary_stamp(trip_merges.checked_path(root, path)) == stamp
+        except (OSError, ValueError):
             unchanged = False
         if unchanged and problem not in ("the file could not be read", "the file is missing"):
             _summary_cache[path] = (stamp, dict(summary) if summary is not None else None, problem)
@@ -882,15 +894,15 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
     """
     annotations = {r["trip_key"]: dict(r) for r in conn.execute("SELECT * FROM annotations")}
     trips, unreadable = [], []
+    root = DATA_ROOT.resolve()
 
     # A GPX with no summary next to it is a trip too. Ingest writes the GPX
     # first, so a failed or lost summary write leaves one behind. (A page
     # load in the middle of an upload can catch one for a moment, too.)
     if trip_key is None:
-        json_paths = [*DATA_ROOT.glob("*/*.json"), *(
+        json_paths = list(dict.fromkeys([*DATA_ROOT.glob("*/*.json"), *(
             gpx.with_suffix(".json") for gpx in DATA_ROOT.glob("*/*.gpx")
-            if not gpx.with_suffix(".json").exists()
-        )]
+        )]))
         with _summary_cache_lock:
             live = set(json_paths)
             for path in _summary_cache.keys() - live:
@@ -898,27 +910,26 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
     else:
         trip_key = trip_merges.canonical_key(conn, trip_key)
         keys = trip_merges.parts(conn, trip_key) or [trip_key]
-        try:
-            json_paths = [p.with_suffix(".json") for p in trip_merges.source_paths(DATA_ROOT, keys)]
-        except ValueError:
-            # Invalid persisted membership must never become a filesystem path.
-            # apply_merges will report the missing sources as a broken merge.
-            json_paths = []
+        # Keep the lexical identity even for escaping/unreadable sources so
+        # the trip can be reported. Never construct paths from invalid keys.
+        json_paths = [DATA_ROOT / f"{key}.json" for key in keys if trip_merges.TRIP_KEY_RE.fullmatch(key)]
         with _summary_cache_lock:
             # Targeted pages do not enumerate the data tree. Still evict any
             # vanished cached files, so repeated one-trip reads cannot retain
             # an ever-growing history of files that have since been removed.
             for path in list(_summary_cache):
-                if not path.exists():
+                if not _trip_file_exists(root, path):
                     del _summary_cache[path]
-        json_paths = [p for p in json_paths if p.exists() or p.with_suffix(".gpx").exists()]
     only_merge_key = trip_key
     for json_path in json_paths:
         ym = json_path.parent.name
         trip_id = json_path.stem
         trip_key = f"{ym}/{trip_id}"
         ann = annotations.get(trip_key, {})
-        summary, problem = _cached_summary(json_path)
+        summary, problem = _cached_summary(json_path, root=root)
+        has_gpx = _trip_file_exists(root, json_path.with_suffix(".gpx"))
+        if only_merge_key is not None and problem == "the file is missing" and not has_gpx:
+            continue
         trip = {
             **(summary or {}),
             "id": trip_id,
@@ -927,7 +938,7 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
             "category": ann.get("category", ""),
             "purpose_note": ann.get("purpose_note", ""),
             "destination": ann.get("destination", ""),
-            "has_gpx": (json_path.with_suffix(".gpx")).exists(),
+            "has_gpx": has_gpx,
         }
         if problem:
             unreadable.append({**trip, "problem": problem})
@@ -1405,7 +1416,7 @@ def history_filters():
     if not re.fullmatch(r"[1-9][0-9]{0,6}", raw_page):
         abort(400)
     trip = request.args.get("trip", "")
-    if trip and not re.fullmatch(r"[0-9]{4}-[0-9]{2}/[A-Za-z0-9_-]+", trip):
+    if trip and not trip_merges.TRIP_KEY_RE.fullmatch(trip):
         abort(400)
     return int(raw_page), trip or None
 
@@ -1434,7 +1445,7 @@ def _may_start_in(ym, year):
 
 def _folder_years(ym):
     """The years a trip with an unreadable summary may belong to, by folder."""
-    if not YM_RE.match(ym):
+    if not trip_merges.YM_RE.fullmatch(ym):
         return set()  # not an ingest folder: no evidence of a year
     folder_year = int(ym[:4])
     return {folder_year, folder_year - 1} if ym.endswith("-01") else {folder_year}
@@ -1552,7 +1563,7 @@ def _recording_years(key):
     A merged trip hides its parts from the loaded lists, so a part's year has
     to come from its own summary file, by the same rule as any other trip.
     """
-    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}/[A-Za-z0-9_-]+", key or ""):
+    if not trip_merges.TRIP_KEY_RE.fullmatch(key or ""):
         return set()
     summary, problem = _cached_summary(DATA_ROOT / f"{key}.json")
     if problem:
@@ -2658,7 +2669,7 @@ def _history_trip_link(conn, row):
                     old_parts = ()
                 if old_parts:
                     target = old_parts[0]
-    match = re.fullmatch(r"([0-9]{4}-[0-9]{2})/([A-Za-z0-9_-]+)", target)
+    match = trip_merges.TRIP_KEY_RE.fullmatch(target)
     if not match:
         return url_for("index"), key
     return url_for("trip_view", ym=match.group(1), trip_id=match.group(2)), key
@@ -3275,7 +3286,7 @@ def trip_gpx(ym, trip_id):
 @app.route("/trip/<ym>/<trip_id>/annotate", methods=["POST"])
 def annotate(ym, trip_id):
     year = selected_year()
-    _safe_trip_paths(ym, trip_id)
+    _, json_path = _safe_trip_paths(ym, trip_id)
     category = request.form.get("category", "").strip()
     if category not in CATEGORIES:
         category = ""
@@ -3299,7 +3310,7 @@ def annotate(ym, trip_id):
         if merged:
             before = {field: merged[field] or "" for field in trip_merges.ANNOTATION_FIELDS}
         else:
-            if not (DATA_ROOT / (key + ".json")).exists():
+            if not json_path.exists():
                 abort(404)
             annotation = conn.execute("SELECT * FROM annotations WHERE trip_key=?", (key,)).fetchone()
             before = ({field: annotation[field] or "" for field in trip_merges.ANNOTATION_FIELDS}
@@ -3482,7 +3493,10 @@ def track_endpoints(trip):
         last = track_endpoints({"ym": end_ym, "id": end_id})
         return {**{k: v for k, v in first.items() if k.startswith("start_")},
                 **{k: v for k, v in last.items() if k.startswith("end_")}}
-    path, _ = _safe_trip_paths(trip["ym"], trip["id"])
+    try:
+        path = next(trip_merges.source_paths(DATA_ROOT, [f"{trip['ym']}/{trip['id']}"]))
+    except ValueError:
+        return {}
     parser = expat.ParserCreate(namespace_separator="}")
     stack = []
     first = last = None

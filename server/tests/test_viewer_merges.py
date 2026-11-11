@@ -80,6 +80,41 @@ class ViewerMerges(unittest.TestCase):
     def split(self, key):
         return self.client.post(f"/trip/{key}/split", data={"csrf_token": "test-csrf", "confirm": "yes"})
 
+    def test_escaping_merge_source_symlinks_make_the_merge_unreadable(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        for extension in ("json", "gpx"):
+            with self.subTest(extension=extension):
+                source = self.month / f"b.{extension}"
+                raw = source.read_bytes()
+                target = self.root / f"private.{extension}"
+                target.write_bytes(raw)
+                source.unlink()
+                try:
+                    source.symlink_to(target)
+                except (OSError, NotImplementedError) as exc:
+                    self.skipTest(f"symlink creation unavailable: {type(exc).__name__}")
+                try:
+                    with self.assertRaises(ValueError):
+                        list(self.viewer.trip_merges.source_paths(self.data, [b]))
+                    with self.assertRaises(ValueError):
+                        self.viewer.trip_merges.fingerprint(self.data, [b])
+                    with patch.object(self.viewer.trip_merges, "combined_summary",
+                                      side_effect=AssertionError("unsafe merge rebuilt")):
+                        trips, unreadable = self.viewer.load_trips()
+                        self.assertEqual(trips, [])
+                        self.assertEqual([t["trip_key"] for t in unreadable], [key])
+                        self.assertIn("A merge part is missing or unreadable", unreadable[0]["problem"])
+                        self.assertFalse(unreadable[0]["has_gpx"])
+                        for route, status in (("/", 200), (f"/trip/{key}", 404),
+                                              ("/export.csv", 200), ("/export.xlsx", 200)):
+                            response = self.client.get(route)
+                            self.assertEqual(response.status_code, status)
+                            response.close()
+                finally:
+                    source.unlink()
+                    source.write_bytes(raw)
+
     def test_trip_uploaded_after_its_neighbours_were_merged_is_flagged_not_silent(self):
         first, last = self.trip("a", 0), self.trip("c", 200)
         merged = self.merged_key(self.merge(first, last))

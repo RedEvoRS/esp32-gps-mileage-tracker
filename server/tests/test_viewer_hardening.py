@@ -24,6 +24,122 @@ class ViewerHardeningTests(unittest.TestCase):
     signed_in = roles.ViewerRolesTests.signed_in
     login = roles.ViewerRolesTests.login
 
+    def test_invalid_trip_url_components_never_read_or_change_trips(self):
+        self.signed_in("admin")
+        # Hand-made folders expose the old disagreement with merge-key checks.
+        month = "\u0662\u0660\u0662\u0666-\u0660\u0661"
+        original = self.viewer.DATA_ROOT / "2026-01"
+        folder = self.viewer.DATA_ROOT / month
+        folder.mkdir()
+        for extension in ("json", "gpx"):
+            (folder / f"drive.{extension}").write_bytes((original / f"drive.{extension}").read_bytes())
+        routes = [("GET", "/trip/{key}"), ("GET", "/gpx/{key}")]
+        routes += [("POST", "/trip/{key}/" + action) for action in
+                   ("annotate", "remove", "restore", "lookup-place", "merge", "split")]
+        tables = ("annotations", "trip_removals", "trip_history", "trip_merges", "trip_merge_parts")
+        with closing(sqlite3.connect(self.db)) as conn:
+            before = {table: conn.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
+        files = {p: p.read_bytes() for p in self.viewer.DATA_ROOT.glob("*/*")}
+        for key in ("2026-01/drive%0A", f"{quote(month)}/drive", "2026-01%0A/drive"):
+            for method, route in routes:
+                with self.subTest(key=key, route=route):
+                    with patch.object(self.viewer, "read_summary", side_effect=AssertionError("invalid URL read")), \
+                            patch.object(self.viewer.GEOCODER, "lookup", side_effect=AssertionError("lookup")):
+                        response = self.client.open(route.format(key=key), method=method, data={
+                            "csrf_token": "known-token", "category": "business", "purpose_note": "changed",
+                            "reason": "test removal", "confirm": "yes", "endpoint": "start",
+                            "next_trip": "2026-01/drive",
+                        })
+                    self.assertEqual(response.status_code, 404)
+                    response.close()
+                    with closing(sqlite3.connect(self.db)) as conn:
+                        self.assertEqual(before, {table: conn.execute(f"SELECT * FROM {table}").fetchall()
+                                                  for table in tables})
+                    self.assertEqual(files, {p: p.read_bytes() for p in self.viewer.DATA_ROOT.glob("*/*")})
+        self.assertEqual(self.viewer._folder_years(month), set())
+        self.assertEqual(self.viewer._folder_years("2026-01\n"), set())
+
+    def symlink(self, link, target, directory=False):
+        try:
+            link.symlink_to(target, target_is_directory=directory)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"symlink creation unavailable: {type(exc).__name__}")
+
+    def assert_unreadable_link(self, key, target):
+        self.signed_in("admin")
+        # Catch application summary stats/opens, including a cache hit after
+        # replacing a regular summary with a symlink.
+        with patch.object(self.viewer, "read_summary", side_effect=AssertionError("outside summary opened")), \
+                patch.object(self.viewer, "_summary_stamp", side_effect=AssertionError("outside summary stat")):
+            trips, unreadable = self.viewer.load_trips()
+            self.assertEqual(trips, [])
+            self.assertEqual([t["trip_key"] for t in unreadable], [key])
+            self.assertEqual(unreadable[0]["problem"], "the file could not be read")
+            self.assertEqual(self.viewer._recording_years(key), {2025, 2026})
+            for route, status in (("/", 200), (f"/trip/{key}", 404), ("/export.csv", 200),
+                                  ("/export.xlsx", 200), ("/admin/year/2026", 200)):
+                with self.subTest(route=route):
+                    response = self.client.get(route)
+                    self.assertEqual(response.status_code, status)
+                    if route.endswith(".xlsx"):
+                        book = load_workbook(io.BytesIO(response.data))
+                        try:
+                            self.assertIn("Unreadable trips", book.sheetnames)
+                            text = str([list(sheet.values) for sheet in book])
+                        finally:
+                            book.close()
+                    else:
+                        text = response.get_data(as_text=True)
+                    self.assertNotIn("outside-summary-sentinel", text)
+                    self.assertNotIn(str(target), text)
+                    if route == "/export.csv":
+                        self.assertIn("unreadable", text)
+                    elif not route.endswith(".xlsx"):
+                        self.assertIn("the file could not be read", text)
+                    response.close()
+
+    def test_summary_symlink_is_unreadable_in_lists_pages_exports_and_year_review(self):
+        summary = self.viewer.DATA_ROOT / "2026-01/drive.json"
+        target = self.db.parent / "private-summary.json"
+        target.write_text(json.dumps({"start_time": "2026-01-02T12:00:00Z", "distance_miles": 999,
+                                      "device_id": "outside-summary-sentinel"}), encoding="utf-8")
+        summary.unlink()
+        self.symlink(summary, target)
+        self.assert_unreadable_link("2026-01/drive", target)
+
+    def test_cached_summary_cannot_bypass_replaced_symlink_check(self):
+        summary = self.viewer.DATA_ROOT / "2026-01/drive.json"
+        self.viewer.load_trips()
+        self.assertIn(summary, self.viewer._summary_cache)
+        target = self.db.parent / "private-summary.json"
+        target.write_bytes(summary.read_bytes())
+        summary.unlink()
+        self.symlink(summary, target)
+        self.assert_unreadable_link("2026-01/drive", target)
+
+    def test_symlinked_month_is_unreadable_and_has_no_downloadable_gpx(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        target = self.db.parent / "private-month"
+        month.rename(target)
+        self.symlink(month, target, directory=True)
+        self.assert_unreadable_link("2026-01/drive", target)
+        self.assertFalse(self.viewer.load_trips()[1][0]["has_gpx"])
+        self.assertEqual(self.client.get("/gpx/2026-01/drive").status_code, 404)
+
+    def test_escaping_gpx_is_not_available_to_pages_or_exports(self):
+        self.signed_in("admin")
+        gpx = self.viewer.DATA_ROOT / "2026-01/drive.gpx"
+        target = self.db.parent / "private-track.gpx"
+        gpx.rename(target)
+        self.symlink(gpx, target)
+        self.assertFalse(self.viewer.load_trips()[0][0]["has_gpx"])
+        for route in ("/", "/export.csv", "/export.xlsx"):
+            with self.subTest(route=route):
+                response = self.client.get(route)
+                self.assertEqual(response.status_code, 200)
+                response.close()
+        self.assertEqual(self.client.get("/gpx/2026-01/drive").status_code, 404)
+
     def test_unreadable_summary_hides_os_error_paths_but_logs_details(self):
         self.signed_in("admin")
         summary = self.viewer.DATA_ROOT / "2026-01/drive.json"

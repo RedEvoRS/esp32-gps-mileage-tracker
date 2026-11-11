@@ -11,6 +11,9 @@ import trip_log
 
 MERGE_MAX_GAP = timedelta(minutes=15)
 ANNOTATION_FIELDS = ("category", "purpose_note", "destination")
+YM_RE = re.compile(r"[0-9]{4}-[0-9]{2}")
+ID_RE = re.compile(r"[A-Za-z0-9_-]+")
+TRIP_KEY_RE = re.compile(rf"({YM_RE.pattern})/({ID_RE.pattern})")
 
 
 class MergeRefreshNeeded(Exception):
@@ -46,15 +49,30 @@ def canonical_key(conn, key):
     return row[0] if row else key
 
 
-def source_paths(data_root, keys):
+def checked_path(root, path):
+    """Resolve a final trip file inside an already resolved data root."""
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("Unreadable trip path") from exc
+    if root not in resolved.parents:
+        raise ValueError("Invalid trip path")
+    return resolved
+
+
+def source_file_pairs(data_root, keys):
+    """Yield both checked source paths, preserving the original file pairing."""
+    root = data_root.resolve()
     # Keys originate from validated trip paths, but validate persisted keys too.
     for key in keys:
-        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}/[A-Za-z0-9_-]+", key):
+        if not TRIP_KEY_RE.fullmatch(key):
             raise ValueError("Invalid merge part")
-        path = (data_root / (key + ".gpx")).resolve()
-        if data_root.resolve() not in path.parents:
-            raise ValueError("Invalid merge part path")
-        yield path
+        yield tuple(checked_path(root, data_root / (key + suffix)) for suffix in (".gpx", ".json"))
+
+
+def source_paths(data_root, keys):
+    for gpx, _ in source_file_pairs(data_root, keys):
+        yield gpx
 
 
 def fingerprint(data_root, keys):
@@ -66,8 +84,8 @@ def fingerprint(data_root, keys):
     file changes (or the merge is undone and redone), not on first view.
     """
     stamps = []
-    for path in source_paths(data_root, keys):
-        for source in (path, path.with_suffix(".json")):
+    for pair in source_file_pairs(data_root, keys):
+        for source in pair:
             st = source.stat()
             stamps.append((source.name, st.st_mtime_ns, st.st_size, st.st_ino))
     return json.dumps(stamps)
@@ -196,7 +214,8 @@ def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=N
                 t["received_at"] = received
             merged.append(t)
         except (OSError, ValueError):
-            broken.append({**t, "problem": "A merge part is missing or unreadable; restore it or undo the merge."})
+            broken.append({**t, "has_gpx": False,
+                           "problem": "A merge part is missing or unreadable; restore it or undo the merge."})
     return ([t for t in trips if t["trip_key"] not in hidden] + merged,
             [t for t in unreadable if t["trip_key"] not in hidden] + broken)
 
