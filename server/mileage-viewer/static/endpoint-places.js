@@ -69,5 +69,34 @@
     destination.value = endSuggestion;
     destination.focus();
   });
-  if (document.currentScript && document.currentScript.dataset.autoLookup === 'true') lookupMissing();
+  const autoAllowed = document.currentScript && document.currentScript.dataset.autoLookup === 'true';
+  const autoSwitch = document.getElementById('auto-lookup');
+  const autoStatus = document.querySelector('[data-auto-lookup-status]');
+  let autoLookup = true;
+  try { autoLookup = localStorage.getItem('viewer-auto-lookup') !== 'off'; } catch (_) {}
+  function updateAutoLookup() {
+    if (autoSwitch) {
+      autoSwitch.textContent = autoLookup ? 'Auto lookup: On' : 'Auto lookup: Off';
+      autoSwitch.setAttribute('aria-pressed', String(autoLookup));
+    }
+    if (autoStatus) autoStatus.textContent = autoLookup
+      ? 'Uncached endpoints are looked up when a trip opens.'
+      : 'Automatic lookup is off in this browser. Nothing is sent until you click.';
+  }
+  if (autoAllowed) {
+    updateAutoLookup();
+    if (autoSwitch) {
+      autoSwitch.addEventListener('click', () => {
+        autoLookup = !autoLookup;
+        try {
+          if (autoLookup) localStorage.removeItem('viewer-auto-lookup');
+          else localStorage.setItem('viewer-auto-lookup', 'off');
+        } catch (_) {}
+        updateAutoLookup();
+        if (autoLookup) lookupMissing();
+      });
+      autoSwitch.hidden = false;
+    }
+    if (autoLookup) lookupMissing();
+  }
 })();

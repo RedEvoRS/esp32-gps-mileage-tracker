@@ -1719,6 +1719,8 @@ DEVICE_HEALTH_BUTTON = """
 
 # Reuse the dark palette for OS preference and the explicit override.
 DARK_THEME_CSS = """
+    --auto-on-bg: #183d25; --auto-on-text: #b2f2bb;
+    --auto-off-bg: #252c34; --auto-off-text: #e9ecef;
     --nav-bg: #fb923c; --nav-text: #15191e; --nav-hover: #fdba74;
     --page-bg: #15191e; --text: #e9ecef; --header-bg: #123b60;
     --table-head-bg: #252c34; --border: #414b57; --row-hover-bg: #20262d;
@@ -1740,6 +1742,8 @@ DARK_THEME_CSS = """
 
 THEME_CSS = """
   :root {
+    --auto-on-bg: #d3f9d8; --auto-on-text: #145523;
+    --auto-off-bg: #f1f3f5; --auto-off-text: #343a40;
     --nav-bg: #c2410c; --nav-text: #fff; --nav-hover: #9a3412;
     color-scheme: light dark;
     --page-bg: #fff; --text: #1a1a1a; --header-bg: #1864ab; --header-text: #fff;
@@ -1814,6 +1818,11 @@ BASE_CSS = THEME_CSS + """
   .trip-nav a:hover { background: var(--nav-hover); }
   .trip-nav a:focus-visible { outline: 2px solid var(--text); outline-offset: 3px;
                              background: var(--nav-hover); }
+  .trip-nav .auto-lookup { background: var(--auto-off-bg); color: var(--auto-off-text);
+    border: 2px solid currentColor; border-radius: 24px; }
+  .trip-nav .auto-lookup[aria-pressed="true"] { background: var(--auto-on-bg); color: var(--auto-on-text); }
+  .trip-nav .auto-lookup[hidden] { display: none; }
+  .trip-nav button:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
   .trip-nav [aria-disabled="true"] { opacity: .65; cursor: default; }
   button.btn:disabled, button.btn[aria-disabled="true"] { opacity: .65; cursor: default; }
   .endpoint-place { margin: 16px 0; overflow-wrap: anywhere; }
@@ -2094,6 +2103,9 @@ TRIP_HTML = """
   <nav class="trip-nav" aria-label="Trip navigation">
     {% if previous_trip %}<a class="btn" href="{{ url_for('trip_view', ym=previous_trip.ym, trip_id=previous_trip.id, year=year or '') }}">← Previous</a>
     {% else %}<span class="btn" aria-disabled="true">← Previous</span>{% endif %}
+    {% if geocoder_enabled and geocoder_auto_lookup %}
+    <button id="auto-lookup" class="btn auto-lookup" type="button" aria-pressed="true" hidden>Auto lookup: On</button>
+    {% endif %}
     {% if next_trip %}<a class="btn" href="{{ url_for('trip_view', ym=next_trip.ym, trip_id=next_trip.id, year=year or '') }}">Next →</a>
     {% else %}<span class="btn" aria-disabled="true">Next →</span>{% endif %}
   </nav>
@@ -2149,7 +2161,7 @@ TRIP_HTML = """
       corrected parking locations. Check them before using them in a mileage record.</p>
     {% if geocoder_enabled %}
     <p>Each lookup sends only that endpoint's coordinates to the address provider configured
-      by your server administrator. Results are saved locally. {% if geocoder_auto_lookup %}Uncached endpoints are looked up when a trip opens.{% else %}Nothing is sent until you click.{% endif %}</p>
+      by your server administrator. Results are saved locally. <span data-auto-lookup-status>{% if geocoder_auto_lookup %}Uncached endpoints are looked up when a trip opens.{% else %}Nothing is sent until you click.{% endif %}</span></p>
     {% if 'start' in places and 'end' in places %}
     <button id="lookup-both-places" class="btn" type="button" disabled>Look up both places</button>
     {% endif %}
