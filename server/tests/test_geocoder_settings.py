@@ -31,8 +31,10 @@ class GeocoderSettingsTests(unittest.TestCase):
     def test_host_classification(self):
         for host in ("localhost", "provider", "provider.", "127.0.0.1", "10.0.0.1",
                      "172.16.0.1", "192.168.0.1", "100.64.0.1", "100.127.255.254",
-                     "[::1]", "[fd00::1]", "[fe80::1]", "[::ffff:10.0.0.1]"):
+                     "[::1]", "[fd00::1]", "[fe80::1]", "[::ffff:10.0.0.1]",
+                     "geo.local", "geo.lan", "geo.internal", "geo.localdomain",
+                     "geo.home.arpa", "geo.example.ts.net", "GEO.LAN."):
             with self.subTest(host=host):
                 self.assertFalse(geocoder_public_host(f"http://{host}/reverse"))
-        for host in ("example.com", "provider.example.com."):
+        for host in ("example.com", "provider.example.com.", "lan.example.com", "example.net"):
             self.assertTrue(geocoder_public_host(f"https://{host}/reverse"))

@@ -112,10 +112,14 @@ def geocoder_endpoint(url, user_agent):
             ) from None
 
 
+# Names that only resolve on a home network or a private tailnet.
+_LOCAL_SUFFIXES = (".local", ".lan", ".internal", ".localdomain", ".home.arpa", ".ts.net")
+
+
 def geocoder_public_host(url):
     """Whether the host looks public; advisory only, never resolves DNS."""
     host = (urlsplit(url).hostname or "").lower().rstrip(".")
-    if host == "localhost":
+    if host == "localhost" or host.endswith(_LOCAL_SUFFIXES):
         return False
     try:
         address = ipaddress.ip_address(host)

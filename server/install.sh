@@ -1235,13 +1235,11 @@ try:
     geocoder_endpoint(url, agent)
     geocoder_endpoint(url.strip(), agent.strip())
     interval = geocoder_interval(gap)
-    boolean({"auto": auto}, "auto", "false")
+    boolean({"VIEWER_GEOCODER_AUTO_LOOKUP": auto}, "VIEWER_GEOCODER_AUTO_LOOKUP", "false")
     if kind == "third-party" and interval < 1:
         raise ValueError("Third-party lookup gap must be from 1 to 60 seconds.")
     if kind == "third-party" and auto != "false":
         raise ValueError("Third-party automatic lookup must be false.")
-    if kind == "self-hosted" and interval != 0.1:
-        raise ValueError("Self-hosted lookup gap must be 0.1 seconds.")
     if url and interval < 1 and geocoder_public_host(url):
         print("public")
 except ValueError as exc:

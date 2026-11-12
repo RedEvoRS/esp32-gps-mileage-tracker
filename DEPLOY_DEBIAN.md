@@ -148,7 +148,8 @@ trip endpoints. Answer **no** to leave it off. If enabled, choose **self-hosted*
 the full Nominatim `/reverse` URL. The installer asks who runs it rather than
 guessing from the URL.
 
-Self-hosted service uses a 0.1 second gap. Automatic lookup when a trip opens
+Self-hosted service uses a 0.1 second gap (an unattended install can set a
+longer one, up to 60 seconds). Automatic lookup when a trip opens
 is optional, default no. Third-party providers limit how often one server may
 ask, commonly one request per second. Going faster breaks their usage policy
 and can get your server blocked. The installer asks for a gap of 1 to 60 seconds
@@ -165,8 +166,11 @@ Older installs with a URL but no gap relied on the old 1.1 second default:
 the installer asks which kind of provider it is. Without terminal input it
 writes 1.1 to keep the old pace and explains how to select self-hosted service.
 `install.sh --check` reports on/off and the gap. A gap under one second for a
-public host produces a warning, not a failed check. This warning cannot tell
-who runs the provider.
+public host produces a warning, not a failed check. A host counts as public
+when it is a dotted name or a public IP address; loopback, private-range
+addresses, single-word names such as a Docker container name, and local names
+ending in `.local`, `.lan`, `.internal`, `.localdomain`, `.home.arpa` or
+Tailscale's `.ts.net` don't. This warning cannot tell who runs the provider.
 
 Unattended answers (set these alongside the other `INSTALL_*` variables):
 
@@ -174,7 +178,7 @@ Unattended answers (set these alongside the other `INSTALL_*` variables):
   off or disables existing lookup. A provider preset skips the keep question.
 - `INSTALL_GEOCODER_URL`: full `/reverse` URL, required when enabling unless
   already configured.
-- `INSTALL_GEOCODER_INTERVAL`: optional; self-hosted accepts 0.1 only;
+- `INSTALL_GEOCODER_INTERVAL`: optional; self-hosted accepts 0.1 to 60, default 0.1;
   third-party accepts 1 to 60, default 1.1.
 - `INSTALL_GEOCODER_AUTO_LOOKUP=true|false`: optional, default false;
   third-party requires false.

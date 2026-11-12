@@ -78,6 +78,17 @@ class InstallerGeocoderTests(unittest.TestCase):
         self.assertIn("Turn on place suggestions?", result.stdout)
         self.assertIn("Look places up automatically when a trip opens?", result.stdout)
 
+    def test_self_hosted_accepts_a_longer_gap(self):
+        result, text, _ = self.run_step(INSTALL_GEOCODER="self-hosted",
+            INSTALL_GEOCODER_URL="http://provider/reverse", INSTALL_GEOCODER_INTERVAL="0.3")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("VIEWER_GEOCODER_INTERVAL=0.3", text)
+        result, text, _ = self.run_step(INSTALL_GEOCODER="self-hosted",
+            INSTALL_GEOCODER_URL="http://provider/reverse", INSTALL_GEOCODER_AUTO_LOOKUP="yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("VIEWER_GEOCODER_AUTO_LOOKUP must be true or false", result.stdout + result.stderr)
+        self.assertEqual(text, "KEEP=unchanged\n")
+
     def test_changed_settings_reach_service_start(self):
         result, _, _ = self.run_step(INSTALL_GEOCODER="self-hosted",
             INSTALL_GEOCODER_URL="http://provider/reverse", TEST_START="yes")
