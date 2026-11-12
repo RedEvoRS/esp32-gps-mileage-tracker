@@ -17,6 +17,14 @@ One accepts the uploads and computes trip distance. The other shows each
 trip on a map, records its business purpose, and exports the log as CSV
 (comma-separated values) or XLSX (Excel) files.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/viewer-trip-desktop-dark.png">
+  <img src="docs/images/viewer-trip-desktop-light.png" alt="A trip in the viewer: the route drawn on an OpenStreetMap map of Madison, Wisconsin, with the annotation form beside it. Business is selected, the Destination has been filled in from the trip's end place, and the Save button is in view. Previous, Auto lookup and Next buttons sit above the trip's date, distance, duration and speeds.">
+</picture>
+
+*Annotating a trip in the viewer. This trip and the business names in it are
+invented; see [The viewer](#the-viewer).*
+
 Tracks and annotations are stored on your own server. These features
 contact services outside it:
 
@@ -92,6 +100,50 @@ least one end is above 2 mph, so wobble while parked doesn't add miles. Bad
 fixes and impossible jumps are skipped, and a gap in coverage, like a tunnel
 or parking garage, is joined with a straight line. That line can miss road
 distance, and GPS noise can add some, so the total is an estimate.
+
+## The viewer
+
+The viewer is where the mileage log gets written. The board records where
+and when you drove; you add the business purpose. Sign in from a browser on
+your network, desktop or phone.
+
+The trip list shows your business, personal, other and unclassified miles for
+the year you pick, and exports the log as CSV or XLSX. Each trip page has its
+annotation form beside the map, with **Save** in view on a laptop screen,
+as in the screenshot at the top of this page.
+
+Going through a week of trips takes a few clicks per trip:
+
+1. **Open a trip.** If place lookup is set up with **Auto lookup** on, the
+   start and end places are looked up as the page opens, and an empty
+   Destination is filled with the end place. Nothing is saved until you
+   press Save.
+2. **Pick a purpose:** Business, Personal or Other, one click each.
+3. **Check the Destination, add a note if you want one, and Save.**
+4. **Next** goes to the next trip down the list, without going back to it.
+
+Place lookup is optional and off until you configure it; see
+[place suggestions](server/README.md#endpoint-place-suggestions). With your
+own Nominatim server on your network, lookups take a fraction of a second.
+A third-party provider usually allows only about one request per second, so
+expect a short wait on each trip.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/viewer-trip-phone-dark.png">
+  <img src="docs/images/viewer-trip-phone-light.png" width="300" alt="The same trip page on a phone: the Previous, Auto lookup and Next buttons, the date and stats, then the annotation form with Business selected, the Destination filled in and Save, and the map below.">
+</picture>
+
+On a phone, the form sits above the map.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/viewer-trip-list-dark.png">
+  <img src="docs/images/viewer-trip-list-light.png" alt="Trip list: year filter, Export CSV and Export XLSX buttons, totals of 21.235 business, 20.455 personal, 0.000 other and 10.084 unclassified miles, then a table of trips with date, distance, duration, average speed, purpose, destination, note and a Map / Edit button.">
+</picture>
+
+The screenshots use invented trips on public roads in Madison, Wisconsin, and
+the business names in them are made up. The full feature list, including
+merging split drives, removing trips and closing a tax year, is in
+[Viewer / export UI](server/README.md#viewer--export-ui).
 
 ## What you need
 
