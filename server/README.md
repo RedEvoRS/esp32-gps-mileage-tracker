@@ -1061,14 +1061,25 @@ suits self-hosted Nominatim. Set `VIEWER_GEOCODER_INTERVAL` in `viewer.env`
 will send lookups up to ten times faster after updating**; set the interval
 before updating.
 
-A request arriving during the normal gap waits when the remaining gap is no
-more than the configured interval and no more than two seconds. The total wait
-budget is two seconds; longer waits return the usual busy message. The database
-write lock is released while waiting, so annotation saves can continue. Cached
-results never wait. Active lookup reservations, even near expiry, and failure
-cooldowns return busy immediately. Completed successes are explicitly marked,
-so a nearly expired reservation cannot be mistaken for a normal gap. The
-reservation covers the lookup deadline and cleanup plus five seconds of margin.
+A lookup that arrives while the gate is closed waits instead of failing, within
+a total budget of two seconds:
+
+- **During the normal gap** after a successful lookup, it waits out the rest of
+  the gap, if that is no more than the configured interval and no more than two
+  seconds.
+- **While another lookup is running** (for example, you clicked Previous/Next
+  before the last page's automatic lookup finished), it checks again every
+  0.05 seconds until that lookup finishes, then waits out the normal gap. A
+  self-hosted provider normally answers well inside the budget.
+- **After a provider failure**, it returns the busy message at once: the
+  failure cooldown below applies.
+
+If the budget runs out, it returns the usual busy message. The database write
+lock is released while waiting, so annotation saves can continue, and a cached
+result never waits. The gate records whether it closed after a success, during a
+running lookup or after a failure, so the viewer never has to guess from the
+time left. A running lookup's reservation covers the lookup deadline and cleanup
+plus five seconds of margin.
 Provider failures trigger a five-minute cooldown (longer `Retry-After` values are
 honoured up to seven days). There are no automatic retries,
 redirects, or ambient HTTP proxies. Responses have a 64 KiB size limit and a

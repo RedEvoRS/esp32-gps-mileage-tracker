@@ -390,8 +390,11 @@ class EndpointPlaceTests(unittest.TestCase):
         waiting.assert_called_once()
         fetch.assert_called_once()
 
-    def test_lease_failure_and_long_gap_refused_without_waiting(self):
-        for delay, token in ((.05, "active"), (16, "active"), (300, "failed"), (3600, "failed"), (3, "")):
+    def test_failure_cooldown_and_long_gap_refused_without_waiting(self):
+        # A marked failure, a gap longer than the wait budget, and a closed gate
+        # further ahead than any reservation (older unmarked failure rows).
+        for delay, token in ((.05, "failed"), (300, "failed"), (3600, "failed"), (3, ""),
+                             (self.viewer.GEOCODER.LEASE + 1, "older-random-token")):
             self.set_gate(delay, token)
             with patch.object(self.viewer.GEOCODER, "interval", 60), \
                  patch("geocoding.time.time", return_value=10000), \
@@ -402,6 +405,66 @@ class EndpointPlaceTests(unittest.TestCase):
                 self.assertEqual(error.exception.status, 429)
                 waiting.assert_not_called()
                 fetch.assert_not_called()
+
+    def test_running_lookup_is_awaited_then_gap_respected(self):
+        # Another worker holds the reservation and finishes 0.3 s later.
+        self.set_gate(16, "active")
+        clock = [10000.0]
+        sleeps = []
+        def sleep(delay):
+            sleeps.append(delay)
+            clock[0] += delay
+            if clock[0] >= 10000.3:
+                with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn, conn:
+                    conn.execute("UPDATE geocode_gate SET next_allowed = ?, token = '' "
+                                 "WHERE token = 'active'", (10000.3 + self.viewer.GEOCODER.interval,))
+        with patch("geocoding.time.time", side_effect=lambda: clock[0]), \
+             patch("geocoding.time.monotonic", side_effect=lambda: clock[0]), \
+             patch("geocoding.time.sleep", side_effect=sleep), \
+             patch.object(self.viewer.GEOCODER, "_fetch", return_value="Example") as fetch:
+            self.assertEqual(self.viewer.GEOCODER.lookup(1, 3), "Example")
+        fetch.assert_called_once()
+        # Short polls while the other lookup runs, then at most one normal gap.
+        polls = [delay for delay in sleeps if delay <= self.viewer.GEOCODER.POLL + 1e-9]
+        self.assertGreaterEqual(len(polls), 5)
+        self.assertLessEqual(len(sleeps) - len(polls), 1)
+        self.assertTrue(all(delay <= self.viewer.GEOCODER.interval + 1e-9 for delay in sleeps))
+        # The provider is called only after the finished lookup's gap.
+        self.assertGreaterEqual(clock[0], 10000.3 + self.viewer.GEOCODER.interval - 1e-9)
+        self.assertLessEqual(clock[0] - 10000, self.viewer.GEOCODER.WAIT_CAP)
+
+    def test_running_lookup_that_never_finishes_is_refused_within_budget(self):
+        self.set_gate(16, "active")
+        clock = [10000.0]
+        def sleep(delay):
+            clock[0] += delay
+        with patch("geocoding.time.time", side_effect=lambda: clock[0]), \
+             patch("geocoding.time.monotonic", side_effect=lambda: clock[0]), \
+             patch("geocoding.time.sleep", side_effect=sleep), \
+             patch.object(self.viewer.GEOCODER, "_fetch") as fetch:
+            with self.assertRaises(self.viewer.GeocodeError) as error:
+                self.viewer.GEOCODER.lookup(1, 3)
+        self.assertEqual(error.exception.status, 429)
+        fetch.assert_not_called()
+        self.assertLessEqual(clock[0] - 10000, self.viewer.GEOCODER.WAIT_CAP)
+
+    def test_provider_failure_marks_gate_failed(self):
+        failure = self.viewer.GeocodeError("The address provider is unavailable. Try again later.")
+        with patch("geocoding.time.time", return_value=10000), \
+             patch.object(self.viewer.GEOCODER, "_fetch", side_effect=failure):
+            with self.assertRaises(self.viewer.GeocodeError):
+                self.viewer.GEOCODER.lookup(1, 3)
+        with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn:
+            self.assertEqual(conn.execute("SELECT token, next_allowed FROM geocode_gate").fetchone(),
+                             (self.viewer.GEOCODER.FAILED, 10300))
+        with patch("geocoding.time.time", return_value=10001), \
+             patch("geocoding.time.sleep") as waiting, \
+             patch.object(self.viewer.GEOCODER, "_fetch") as fetch:
+            with self.assertRaises(self.viewer.GeocodeError) as error:
+                self.viewer.GEOCODER.lookup(2, 4)
+        self.assertEqual(error.exception.status, 429)
+        waiting.assert_not_called()
+        fetch.assert_not_called()
 
     def test_wait_deadline_is_bounded_when_gate_keeps_moving(self):
         self.set_gate(.1)

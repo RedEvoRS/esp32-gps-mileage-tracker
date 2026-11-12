@@ -41,6 +41,10 @@ class Geocoder:
     MAX_LABEL = 1000
     INTERVAL = 0.1
     WAIT_CAP = 2.0
+    # How often a request rechecks while another lookup holds the gate.
+    POLL = 0.05
+    # Gate token after a provider failure. A completed success stores "".
+    FAILED = "failed"
     RESPONSE_BUDGET = 10
     CLEANUP_BUDGET = 1
     LEASE_MARGIN = 5
@@ -129,9 +133,14 @@ class Geocoder:
             raise GeocodeError("Address lookup is not configured.", 503)
         key = self.key(latitude, longitude)
         token = os.urandom(16).hex()
-        # Only a completed success clears its token. Active leases (even near
-        # expiry), failures and pre-upgrade rows are refused, never guessed from
-        # the remaining duration. Each waiter must reserve again under the lock.
+        # The gate token says why the gate is closed: "" after a completed
+        # success (wait out the short gap), FAILED after a provider failure
+        # (refuse at once), anything else while a lookup holds the reservation
+        # (poll briefly: a local provider answers well inside the budget). A
+        # reservation never extends more than LEASE ahead, so a longer wait is
+        # a cooldown, including rows written before tokens were marked. Every
+        # wait is bounded by WAIT_CAP, and each waiter must reserve again under
+        # the lock, so two waiters cannot both call inside one gap.
         deadline = time.monotonic() + self.WAIT_CAP
         while True:
             with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
@@ -152,12 +161,18 @@ class Geocoder:
                         (now + self.LEASE, token),
                     )
                     break
-                if (gate[1] != "" or remaining > self.interval
-                        or remaining > self.WAIT_CAP
-                        or remaining > deadline - time.monotonic()):
+                if gate[1] == "":
+                    wait = remaining
+                    refuse = remaining > min(self.interval, self.WAIT_CAP)
+                elif gate[1] != self.FAILED and remaining <= self.LEASE:
+                    wait = min(self.POLL, remaining)
+                    refuse = False
+                else:
+                    refuse = True
+                if refuse or wait > deadline - time.monotonic():
                     raise GeocodeError("Address lookup is busy or cooling down. Try again later.", 429)
             # The transaction and connection have ended before sleeping.
-            time.sleep(remaining)
+            time.sleep(wait)
         # Worker aborts (SystemExit/KeyboardInterrupt) still run finally. Treat
         # any incomplete provider call as failure, including those abort paths.
         cooldown = 300
@@ -182,7 +197,7 @@ class Geocoder:
                 conn.execute(
                     "UPDATE geocode_gate SET next_allowed = ?, token = ? "
                     "WHERE singleton = 1 AND token = ?",
-                    (time.time() + cooldown, "" if succeeded else token, token),
+                    (time.time() + cooldown, "" if succeeded else self.FAILED, token),
                 )
 
     def _fetch(self, latitude, longitude):
