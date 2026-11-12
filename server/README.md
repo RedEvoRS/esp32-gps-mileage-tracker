@@ -697,6 +697,9 @@ What it does:
 - **Trip list** — trips with date, distance, duration, destination, and the
   purpose tag you've assigned. Select a year or All years to see matching
   trips and totals for business, personal, other, and unclassified miles.
+  On a phone each trip shows as a card with its **Map / Edit** button next to
+  the date, so nothing is off the edge of the screen; wider windows show the
+  table.
 - **Map audit** — click "Map / Edit" to see the track drawn on an
   OpenStreetMap map (Leaflet). This is how you eyeball a trip for GPS
   errors before trusting its mileage. Your trip coordinates are served

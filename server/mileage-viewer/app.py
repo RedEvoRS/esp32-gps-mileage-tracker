@@ -1839,6 +1839,33 @@ BASE_CSS = THEME_CSS + """
   th { background: var(--table-head-bg); font-size: 13px; text-transform: uppercase; letter-spacing: .03em; }
   tr:hover td { background: var(--row-hover-bg); }
   .tag { background: var(--tag-bg); font-size: 12px; padding: 2px 8px; border-radius: 10px; }
+  /* Phones: each trip-list row becomes a card, so Map / Edit is on screen without a sideways swipe. */
+  @media (max-width: 599px) {
+    .trip-table { overflow-x: visible; }
+    .trip-table table, .trip-table tbody, .trip-table tr, .trip-table td { display: block; }
+    .trip-table .trip-head { display: none; }
+    .trip-table .trip-row { display: grid; grid-template-columns: auto auto auto 1fr auto;
+      grid-template-areas: "date date date date open" "dist dur avg avg avg"
+                           "purpose purpose purpose purpose purpose" "dest dest dest dest dest"
+                           "note note note note note";
+      gap: 4px 14px; align-items: baseline; padding: 10px 12px; margin: 0 0 10px;
+      border: 1px solid var(--border); border-radius: 8px; background: var(--card-bg); }
+    .trip-table .trip-row td { padding: 0; border: 0; background: none; min-width: 0; overflow-wrap: anywhere; }
+    .trip-table .c-date { grid-area: date; font-weight: 600; }
+    .trip-table .c-dist { grid-area: dist; }
+    .trip-table .c-dur { grid-area: dur; }
+    .trip-table .c-avg { grid-area: avg; }
+    .trip-table .c-avg::after { content: " avg mph"; color: var(--muted); }
+    .trip-table .c-purpose { grid-area: purpose; }
+    .trip-table .c-purpose::before { content: "Purpose: "; color: var(--muted); }
+    .trip-table .c-dest { grid-area: dest; }
+    .trip-table .c-dest::before { content: "Destination: "; color: var(--muted); }
+    .trip-table .c-note { grid-area: note; }
+    .trip-table .c-note::before { content: "Note: "; color: var(--muted); }
+    .trip-table .c-dest:empty, .trip-table .c-note:empty { display: none; }
+    .trip-table .c-dist, .trip-table .c-dur, .trip-table .c-avg, .trip-table .c-open .btn { white-space: nowrap; }
+    .trip-table .c-open { grid-area: open; align-self: center; }
+  }
   .business { background: var(--business-bg); color: var(--business-text); }
   .personal { background: var(--personal-bg); color: var(--personal-text); }
   .other    { background: var(--other-bg); color: var(--other-text); }
@@ -2132,18 +2159,18 @@ LIST_HTML = """
   <p class="muted">Totals cover recorded trips in this selection. Partly timed trips use their first recorded timestamp
     for year selection; their actual start can be in an earlier year. Trips with no usable date appear only under All years.</p>
   <div class="trip-table"><table>
-    <tr><th>Date</th><th>Distance</th><th>Duration</th><th>Avg mph</th>
+    <tr class="trip-head"><th>Date</th><th>Distance</th><th>Duration</th><th>Avg mph</th>
         <th>Purpose</th><th>Destination</th><th>Note</th><th></th></tr>
     {% for t in trips %}
-    <tr>
-      <td>{{ fmt_trip_date(t) }}{% if t.get('timing_status') == 'partial' %}<br><span class="muted">Partial timing</span>{% endif %}{% if t.get('inside_merge') %}<br><span class="tag other">Inside a merged trip</span> <a href="{{ url_for('trip_view', ym=t.inside_merge.ym, trip_id=t.inside_merge.id, year=year or '') }}">counted twice: undo that merge</a>{% endif %}{% if t.get('parts') %}<br><code>{{ t.gpx_file }}</code>{% endif %}</td>
-      <td>{{ "%.2f"|format(t.distance_miles or 0) }} mi</td>
-      <td>{{ fmt_duration(t.duration_seconds) }}</td>
-      <td>{{ fmt_speed(t.get('avg_speed_mph')) }}</td>
-      <td>{% if t.category %}<span class="tag {{ t.category }}">{{ t.category }}</span>
+    <tr class="trip-row">
+      <td class="c-date">{{ fmt_trip_date(t) }}{% if t.get('timing_status') == 'partial' %}<br><span class="muted">Partial timing</span>{% endif %}{% if t.get('inside_merge') %}<br><span class="tag other">Inside a merged trip</span> <a href="{{ url_for('trip_view', ym=t.inside_merge.ym, trip_id=t.inside_merge.id, year=year or '') }}">counted twice: undo that merge</a>{% endif %}{% if t.get('parts') %}<br><code>{{ t.gpx_file }}</code>{% endif %}</td>
+      <td class="c-dist">{{ "%.2f"|format(t.distance_miles or 0) }} mi</td>
+      <td class="c-dur">{{ fmt_duration(t.duration_seconds) }}</td>
+      <td class="c-avg">{{ fmt_speed(t.get('avg_speed_mph')) }}</td>
+      <td class="c-purpose">{% if t.category %}<span class="tag {{ t.category }}">{{ t.category }}</span>
           {% else %}<span class="muted">—</span>{% endif %}</td>
-      <td>{{ t.destination or "" }}</td><td>{{ t.purpose_note or "" }}</td>
-      <td><a class="btn" href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year or '') }}">Map / Edit</a></td>
+      <td class="c-dest">{{ t.destination or "" }}</td><td class="c-note">{{ t.purpose_note or "" }}</td>
+      <td class="c-open"><a class="btn" href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year or '') }}">Map / Edit</a></td>
     </tr>
     {% endfor %}
     {% if not trips %}

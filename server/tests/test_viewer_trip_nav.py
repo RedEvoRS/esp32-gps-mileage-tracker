@@ -49,6 +49,12 @@ class TripNavigationTests(YearTestBase):
         # The phone viewport would otherwise let the wide table widen the whole page.
         self.assertIn('<div class="trip-table"><table>', listing)
         self.assertIn(".trip-table { overflow-x: auto; }", listing)
+        # Phones: each row is a card, so Map / Edit stays on screen (#691).
+        self.assertIn('<tr class="trip-head">', listing)
+        self.assertIn('<tr class="trip-row">', listing)
+        self.assertIn('<td class="c-open"><a class="btn" href=', listing)
+        self.assertIn(".trip-table .trip-row { display: grid;", listing)
+        self.assertIn('"date date date date open"', listing)
         page = self.admin.get(f"/trip/{key}").get_data(as_text=True)
         self.assertEqual(page.count('name="viewport"'), 1)
         # .btn sets display:inline-block, which would override the hidden attribute.
