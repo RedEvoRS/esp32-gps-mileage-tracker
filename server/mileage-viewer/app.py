@@ -1671,6 +1671,7 @@ app.jinja_env.globals.update(
 # ---------------------------------------------------------------------
 
 THEME_HEAD = """
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <script id="theme-init">
   (function () {
     var root = document.documentElement;
@@ -1678,6 +1679,25 @@ THEME_HEAD = """
     try { mode = localStorage.getItem('viewer-theme'); } catch (e) {}
     if (mode === 'light' || mode === 'dark') root.dataset.theme = mode;
     document.addEventListener('DOMContentLoaded', function () {
+      var menu = document.querySelector('[data-header-menu]');
+      var actions = document.querySelector('.header-actions');
+      if (menu && actions) {
+        menu.hidden = false;
+        actions.id = 'header-actions';
+        menu.setAttribute('aria-controls', actions.id);
+        menu.addEventListener('click', function () {
+          var expanded = menu.getAttribute('aria-expanded') !== 'true';
+          menu.setAttribute('aria-expanded', String(expanded));
+          actions.classList.toggle('menu-open', expanded);
+        });
+        document.addEventListener('keydown', function (event) {
+          if (event.key === 'Escape' && menu.getAttribute('aria-expanded') === 'true') {
+            menu.setAttribute('aria-expanded', 'false');
+            actions.classList.remove('menu-open');
+            menu.focus();
+          }
+        });
+      }
       var button = document.querySelector('[data-theme-toggle]');
       function label() {
         var current = root.dataset.theme || 'auto';
@@ -1782,6 +1802,21 @@ BASE_CSS = THEME_CSS + """
   header { background: var(--header-bg); color: var(--header-text); padding: 14px 22px;
            display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
   header a { color: var(--header-text); text-decoration: none; font-weight: 600; }
+  .header-menu { display: none; background: var(--header-button-bg); color: var(--header-button-text);
+    border: 1px solid var(--header-button-border); border-radius: 5px; padding: 5px 12px; font: inherit; cursor: pointer; }
+  @media (max-width: 599px) {
+    header { padding: 10px 16px; gap: 8px; }
+    .header-menu:not([hidden]) { display: block; margin-left: auto; }
+    .header-menu:not([hidden]) + .header-actions { display: none; }
+    .header-menu:not([hidden]) + .header-actions.menu-open { display: flex; flex-basis: 100%; }
+    body .wrap { padding: 14px 16px; }
+    .trip-title h2 { font-size: 20px; margin: 12px 0 2px; }
+    .trip-title p { font-size: 13px; margin: 0 0 8px; }
+    .trip-info .stats { flex-wrap: nowrap; gap: 12px; margin: 8px 0; }
+    .trip-info .stat { min-width: 0; }
+    .trip-info .stat b { font-size: 16px; }
+    .trip-info .stat span { font-size: 11px; }
+  }
   .header-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
                     justify-content: flex-end; margin-left: auto; }
   .header-version { color: var(--header-text); opacity: .85; font-size: 12px; white-space: nowrap; }
@@ -1879,7 +1914,7 @@ VERSION_HEADER = '<div class="header-version">Server {{ server_version }}</div>'
 
 
 ACCOUNT_HEADER = """
-{% if g.role %}<header><a href="{{ url_for('index') }}">Trips</a><div class="header-actions">
+{% if g.role %}<header><a href="{{ url_for('index') }}">Trips</a><button type="button" class="header-menu" data-header-menu aria-expanded="false" hidden>Menu</button><div class="header-actions">
 """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + ACCOUNT_BUTTON + THEME_BUTTON + """
 <form class="logout" method="post" action="{{ url_for('logout') }}">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Log out</button>
@@ -2020,7 +2055,7 @@ LIST_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Mileage Trips</title>
 """ + THEME_HEAD + """<style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index') }}">🚗 Mileage Tracker</a>
-  <div class="header-actions">
+  <button type="button" class="header-menu" data-header-menu aria-expanded="false" hidden>Menu</button><div class="header-actions">
     """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + ACCOUNT_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -2109,7 +2144,7 @@ TRIP_HTML = """
 <link rel="stylesheet" href="{{ url_for('static', filename='leaflet.css') }}">
 <style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index', year=year or '') }}">← {{ year or 'All' }} trips</a>
-  <div class="header-actions">
+  <button type="button" class="header-menu" data-header-menu aria-expanded="false" hidden>Menu</button><div class="header-actions">
     """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + ACCOUNT_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -2365,7 +2400,7 @@ DEVICE_HEALTH_HTML = """
   .snapshot-group .count { font-weight: 600; white-space: nowrap; }
 </style></head><body>
 <header><a href="{{ url_for('index') }}">← Trips</a>
-  <div class="header-actions">
+  <button type="button" class="header-menu" data-header-menu aria-expanded="false" hidden>Menu</button><div class="header-actions">
     """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + ACCOUNT_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
