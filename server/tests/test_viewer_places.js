@@ -51,6 +51,7 @@ async function run() {
   const hostile = '<img src=x onerror=alert(1)>';
   await s.respond(0, {label: hostile});
   assert.equal(s.labels.end.textContent, hostile);
+  assert.equal(s.suggestion.textContent, 'End: ' + hostile);
   assert.equal(s.destination.value, 'Unsaved edit');
   s.useEnd.click(); assert.equal(s.destination.value, hostile);
   assert.equal(s.calls.length, 2);
@@ -60,8 +61,10 @@ async function run() {
   s.both.click(); assert.equal(s.calls.length, 2, 'both skips fetched and no-match results');
   s.submit(1); await s.respond(2, {error: 'Provider unavailable.'}, false);
   assert.equal(s.labels.end.textContent, 'Provider unavailable.');
+  assert.equal(s.suggestion.textContent, 'End: Provider unavailable.');
   assert.equal(s.useEnd.disabled, true, 'failed lookup disables stale suggestion');
   s.submit(1); await s.respond(3, {label: ''}); assert.equal(s.useEnd.disabled, true);
+  assert.equal(s.suggestion.textContent, 'End: no mapped address found');
   s.submit(1); await s.respond(4, null); assert.match(s.labels.end.textContent, /Check your session/);
   assert.ok(s.forms.every(f => !('aria-disabled' in f.querySelector().attributes)));
   for (const auto of [false, true]) {

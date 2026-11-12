@@ -2155,7 +2155,7 @@ LIST_HTML = """
 TRIP_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Trip {{ t.get('trip_id') or t.id }}</title>
 """ + THEME_HEAD + """
-{% if geocoder_enabled and geocoder_auto_lookup %}
+{% if geocoder_enabled and geocoder_auto_lookup and places and not removal %}
 <script>
   try {
     if (localStorage.getItem('viewer-auto-lookup') !== 'off')
