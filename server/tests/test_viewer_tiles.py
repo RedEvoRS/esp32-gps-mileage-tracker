@@ -4,12 +4,17 @@ import html
 import json
 import os
 import re
+import sys
 import unittest
 from unittest.mock import patch
 
 import test_viewer_roles as roles
-from common.settings import DEFAULT_MAP_TILE_URL, map_tiles
-from test_round_trip import load_service
+
+# Put server/ on the path so this file also runs on its own (#680).
+sys.path.insert(0, str(roles.SERVER))
+
+from common.settings import DEFAULT_MAP_TILE_URL, map_tiles  # noqa: E402
+from test_round_trip import load_service  # noqa: E402
 
 
 class TileSettingsTests(unittest.TestCase):

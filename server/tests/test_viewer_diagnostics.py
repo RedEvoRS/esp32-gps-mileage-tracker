@@ -18,7 +18,11 @@ from unittest.mock import patch
 from werkzeug.security import generate_password_hash
 
 from test_round_trip import SERVER, load_service
-from common.diagnostics import validate_request
+
+# Put server/ on the path so this file also runs on its own (#680).
+sys.path.insert(0, str(SERVER))
+
+from common.diagnostics import validate_request  # noqa: E402
 
 
 BOOT = "00000000000000000000000000000001"
