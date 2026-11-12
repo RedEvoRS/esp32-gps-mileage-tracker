@@ -472,6 +472,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   `VIEWER_GEOCODER_AUTO_LOOKUP=true`; Auto lookup beside Next defaults On,
   with an Off choice saved per browser. On hides manual lookup buttons except
   endpoint retries after errors; End suggestion and Use sit beneath Destination.
+  On also fills an empty, untouched Destination with the end suggestion
+  (shown with a note, unsaved until Save).
   Trip annotations use clearable purpose radios and a panel beside the map
   (above it on narrow windows); shared phone headers use Menu with a no-JS row.
   No lookup on exports or uploads; never
