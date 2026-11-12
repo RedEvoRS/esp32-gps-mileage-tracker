@@ -1484,7 +1484,7 @@ def year_members(trips, unreadable, year):
 
 
 def trip_neighbours(trip_key, trips, year=None):
-    """Return (older, newer) in the list's newest-first, openable row order.
+    """Return (older, newer): Next goes down the list, Previous goes up.
 
     load_trips has already combined merged parts and separated unreadable
     summaries. Inside-merge recordings still have their own Map / Edit link.
@@ -3295,7 +3295,7 @@ def trip_view(ym, trip_id):
                                       year=year, geocoder_enabled=False, last_edited=last_edited,
                                       year_lock=year_lock)
     merge_next, merge_block_reason = trip_merges.next_trip(t, trips, unreadable, removed_trips)
-    previous_trip, next_trip = trip_neighbours(t["trip_key"], trips, year)
+    older_trip, newer_trip = trip_neighbours(t["trip_key"], trips, year)
     places = {}
     if GEOCODER.enabled:
         endpoints = track_endpoints(t)
@@ -3305,7 +3305,7 @@ def trip_view(ym, trip_id):
                     endpoints[f"{endpoint}_latitude"], endpoints[f"{endpoint}_longitude"]
                 )
     return render_template_string(TRIP_HTML, t=t, categories=CATEGORIES, year=year,
-                                  previous_trip=previous_trip, next_trip=next_trip,
+                                  previous_trip=newer_trip, next_trip=older_trip,
                                   geocoder_enabled=GEOCODER.enabled, geocoder_auto_lookup=GEOCODER_AUTO_LOOKUP, places=places, merge_next=merge_next,
                                   merge_block_reason=merge_block_reason,
                                   last_edited=last_edited, year_lock=year_lock,
