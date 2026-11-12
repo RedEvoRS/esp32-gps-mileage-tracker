@@ -462,10 +462,13 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   source file changes. The DB includes `users`,
   `trip_removals`, `trip_history` and `tax_years`. Optional `geocoding.py`
   sends a selected endpoint to an explicitly configured provider only on an
-  authenticated, CSRF-protected click and caches suggestions in that database.
-  Configurable interval, default 1.1 s. Viewer-only `MAP_TILE_URL` selects
-  base tiles (default OSM; `none` disables); attribution is plain text.
-  No lookup on page views, exports or uploads; never use public OSMF Nominatim.
+  authenticated, CSRF-protected browser request, caching suggestions locally.
+  Configurable interval, default 0.1 s for self-hosted providers; third-party
+  providers need an interval matching their rate policy. Viewer-only
+  `MAP_TILE_URL` selects base tiles (default OSM; `none` disables); attribution is plain text.
+  Page views look up uncached endpoints only with opt-in
+  `VIEWER_GEOCODER_AUTO_LOOKUP=true`. No lookup on exports or uploads; never
+  use public OSMF Nominatim.
   `/device-health` reads
   diagnostics schema v1 via `mode=ro` with a 2 s busy timeout, shows contact and
   snapshot ages, active/unknown/clear conditions and 50-event history pages with

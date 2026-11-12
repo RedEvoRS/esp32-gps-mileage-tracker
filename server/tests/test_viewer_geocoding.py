@@ -135,7 +135,7 @@ class EndpointPlaceTests(unittest.TestCase):
         cls.entered.clear()
         cls.release.set()
         with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn, conn:
-            for table in ("geocode_cache", "geocode_gate", "annotations"):
+            for table in ("geocode_cache", "geocode_gate", "annotations", "trip_removals"):
                 conn.execute(f"DELETE FROM {table}")
         self.viewer.upsert_annotation("2026-10/sample", "business", "Keep note", "Keep destination")
         # Entirely invented coordinates, generated to avoid real location data.
@@ -351,7 +351,7 @@ class EndpointPlaceTests(unittest.TestCase):
                 with patch("geocoding.time.time", return_value=10000):
                     self.assertTrue(geocoder.lookup(i, i + 2))
                 with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn:
-                    self.assertEqual(conn.execute("SELECT next_allowed FROM geocode_gate").fetchone()[0], 10001.1)
+                    self.assertEqual(conn.execute("SELECT next_allowed FROM geocode_gate").fetchone()[0], 10000.1)
 
     def test_custom_interval_is_enforced_across_workers(self):
         with patch.dict(os.environ, {"VIEWER_GEOCODER_URL": self.provider_url, "VIEWER_GEOCODER_INTERVAL": "0.5"}):
@@ -361,14 +361,160 @@ class EndpointPlaceTests(unittest.TestCase):
             self.assertTrue(geocoder.lookup(1, 3))
         with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn:
             self.assertEqual(conn.execute("SELECT next_allowed FROM geocode_gate").fetchone()[0], 10000.5)
-        with patch("geocoding.time.time", return_value=10000.49):
-            with self.assertRaises(self.viewer.GeocodeError) as error:
-                other_worker.lookup(2, 4)
-            self.assertEqual(error.exception.status, 429)
-        self.assertEqual(len(self.received), 1)
-        with patch("geocoding.time.time", return_value=10000.5):
+        clock = [10000.49]
+        def sleep(delay):
+            clock[0] += delay
+        with patch("geocoding.time.time", side_effect=lambda: clock[0]), \
+             patch("geocoding.time.sleep", side_effect=sleep) as waiting:
             self.assertTrue(other_worker.lookup(2, 4))
+        self.assertAlmostEqual(waiting.call_args.args[0], .01)
         self.assertEqual(len(self.received), 2)
+
+    def set_gate(self, delay, token=""):
+        with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn, conn:
+            conn.execute("INSERT OR REPLACE INTO geocode_gate VALUES (1, ?, ?)", (10000 + delay, token))
+
+    def test_short_gap_wait_releases_lock_and_checks_cache_first(self):
+        self.set_gate(.05)
+        clock = [10000.0]
+        def sleep(delay):
+            self.assertLessEqual(delay, 2)
+            # A separate connection can write while this request waits.
+            self.viewer.upsert_annotation("2026-10/sample", "personal", "While waiting", "Manual")
+            clock[0] += delay
+        with patch("geocoding.time.time", side_effect=lambda: clock[0]), \
+             patch("geocoding.time.sleep", side_effect=sleep) as waiting, \
+             patch.object(self.viewer.GEOCODER, "_fetch", return_value="Example") as fetch:
+            self.assertEqual(self.viewer.GEOCODER.lookup(1, 3), "Example")
+            self.assertEqual(self.viewer.GEOCODER.lookup(1, 3), "Example")
+        waiting.assert_called_once()
+        fetch.assert_called_once()
+
+    def test_lease_failure_and_long_gap_refused_without_waiting(self):
+        for delay, token in ((.05, "active"), (16, "active"), (300, "failed"), (3600, "failed"), (3, "")):
+            self.set_gate(delay, token)
+            with patch.object(self.viewer.GEOCODER, "interval", 60), \
+                 patch("geocoding.time.time", return_value=10000), \
+                 patch("geocoding.time.sleep") as waiting, \
+                 patch.object(self.viewer.GEOCODER, "_fetch") as fetch:
+                with self.assertRaises(self.viewer.GeocodeError) as error:
+                    self.viewer.GEOCODER.lookup(1, 3)
+                self.assertEqual(error.exception.status, 429)
+                waiting.assert_not_called()
+                fetch.assert_not_called()
+
+    def test_wait_deadline_is_bounded_when_gate_keeps_moving(self):
+        self.set_gate(.1)
+        clock = [10000.0]
+        def sleep(delay):
+            clock[0] += delay
+            with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn, conn:
+                conn.execute("UPDATE geocode_gate SET next_allowed = ?", (clock[0] + .1,))
+        with patch("geocoding.time.time", side_effect=lambda: clock[0]), \
+             patch("geocoding.time.monotonic", side_effect=lambda: clock[0]), \
+             patch("geocoding.time.sleep", side_effect=sleep), \
+             patch.object(self.viewer.GEOCODER, "_fetch") as fetch:
+            with self.assertRaises(self.viewer.GeocodeError):
+                self.viewer.GEOCODER.lookup(1, 3)
+        self.assertLessEqual(clock[0] - 10000, 2)
+        fetch.assert_not_called()
+
+    def test_two_waiters_share_cache_after_atomic_reservation(self):
+        self.set_gate(.05)
+        barrier = threading.Barrier(2)
+        clock = [10000.0]
+        def sleep(delay):
+            barrier.wait(timeout=3)
+            clock[0] = 10000.05
+        with patch("geocoding.time.time", side_effect=lambda: clock[0]), \
+             patch("geocoding.time.sleep", side_effect=sleep), \
+             patch.object(self.viewer.GEOCODER, "_fetch", return_value="Example") as fetch:
+            def lookup():
+                try:
+                    return self.viewer.GEOCODER.lookup(1, 3)
+                except self.viewer.GeocodeError as exc:
+                    return exc.status
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(lambda _: lookup(), range(2)))
+        self.assertIn("Example", results)
+        self.assertTrue(all(result in ("Example", 429) for result in results))
+        fetch.assert_called_once()
+
+    def test_two_distinct_waiters_cannot_call_inside_success_gap(self):
+        geocoder = self.viewer.GEOCODER
+        with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn, conn:
+            conn.execute("INSERT INTO geocode_gate VALUES (1, ?, '')", (time.time() + .05,))
+        barrier = threading.Barrier(2)
+        called = []
+        def fetch(*args):
+            called.append(time.monotonic())
+            return "Example"
+        def lookup(value):
+            barrier.wait(timeout=3)
+            try:
+                return geocoder.lookup(value, value + 2)
+            except self.viewer.GeocodeError as exc:
+                return exc.status
+        with patch.object(geocoder, "_fetch", side_effect=fetch):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(lookup, (1, 2)))
+        self.assertTrue(all(result in ("Example", 429) for result in results))
+        self.assertGreaterEqual(len(called), 1)
+        if len(called) == 2:
+            self.assertGreaterEqual(called[1] - called[0], geocoder.interval)
+
+    def test_auto_removed_and_invalid_pages_have_no_lookup_hook_or_both_button(self):
+        with patch.object(self.viewer, "GEOCODER_AUTO_LOOKUP", True):
+            self.gpx_path.write_text("<gpx/>")
+            html = self.client.get("/trip/2026-10/sample").get_data(as_text=True)
+            self.assertNotIn('id="lookup-both-places"', html)
+            self.assertNotIn("data-place-lookup", html)
+            self.gpx_path.write_text(self.good_gpx)
+            response = self.client.post("/trip/2026-10/sample/remove", data={
+                "csrf_token": "test-csrf", "reason": "Duplicate test recording"})
+            self.assertEqual(response.status_code, 302)
+            html = self.client.get("/trip/2026-10/sample").get_data(as_text=True)
+            self.assertNotIn("data-auto-lookup", html)
+            self.assertNotIn("data-place-lookup", html)
+            self.assertNotIn('id="lookup-both-places"', html)
+            self.assertEqual(self.post().status_code, 409)
+        self.assertEqual(self.received, [])
+
+    def test_auto_setting_parsing_and_startup_failure(self):
+        env = {
+            "DISPLAY_TZ": "UTC", "VIEWER_DB_PATH": str(self.viewer.DB_PATH),
+            "INGEST_DATA_ROOT": str(self.viewer.DATA_ROOT),
+            "VIEWER_USERNAME": "driver", "VIEWER_SECRET_KEY": "test-key-" * 8,
+            "VIEWER_PASSWORD_HASH": generate_password_hash("pw", "pbkdf2:sha256:1000"),
+        }
+        for value, expected in (("", False), ("false", False), ("FALSE", False), ("true", True), ("TRUE", True)):
+            with patch.dict(os.environ, {**env, "VIEWER_GEOCODER_AUTO_LOOKUP": value}):
+                self.assertEqual(load_service("mileage-viewer").GEOCODER_AUTO_LOOKUP, expected)
+        with patch.dict(os.environ, env):
+            os.environ.pop("VIEWER_GEOCODER_AUTO_LOOKUP", None)
+            self.assertFalse(load_service("mileage-viewer").GEOCODER_AUTO_LOOKUP)
+        for value in ("1", "yes", " true ", "invalid"):
+            with patch.dict(os.environ, {**env, "VIEWER_GEOCODER_AUTO_LOOKUP": value}):
+                with self.assertRaisesRegex(RuntimeError, "refusing to start: VIEWER_GEOCODER_AUTO_LOOKUP must be true or false"):
+                    load_service("mileage-viewer")
+
+    def test_auto_page_text_hook_and_both_button(self):
+        for enabled in (False, True):
+            with patch.object(self.viewer, "GEOCODER_AUTO_LOOKUP", enabled):
+                html = self.client.get("/trip/2026-10/sample").get_data(as_text=True)
+            self.assertEqual('data-auto-lookup="true"' in html, enabled)
+            self.assertEqual("Nothing is sent until you click." in html, not enabled)
+            self.assertEqual("Uncached endpoints are looked up when a trip opens." in html, enabled)
+            self.assertIn('id="lookup-both-places"', html)
+            self.assertIn('data-place-cached="false"', html)
+        self.assertEqual(self.received, [])
+        self.post()
+        html = self.client.get("/trip/2026-10/sample").get_data(as_text=True)
+        self.assertIn('data-place-cached="true"', html)
+        with patch.object(self.viewer.GEOCODER, "url", ""), patch.object(self.viewer, "GEOCODER_AUTO_LOOKUP", True):
+            html = self.client.get("/trip/2026-10/sample").get_data(as_text=True)
+            self.assertNotIn("data-auto-lookup", html)
+            self.assertNotIn('id="lookup-both-places"', html)
 
     def test_interval_range_includes_both_limits(self):
         for value in ("0.1", "60"):
@@ -421,7 +567,7 @@ class EndpointPlaceTests(unittest.TestCase):
                 type(self).release.set()
             self.assertTrue(task.result(timeout=5))
         self.assertEqual(len(self.received), 1)
-        self.assertEqual(self.post().status_code, 429)
+        self.assertEqual(self.post().status_code, 200)
 
     def test_default_disabled_provider_changes_and_public_service_rejected(self):
         with patch.dict(os.environ, {"VIEWER_GEOCODER_URL": ""}):

@@ -1023,8 +1023,15 @@ The viewer rejects `openstreetmap.org` hosts. Map tiles remain independent of
 address lookup. Google Maps/Places is not a provider in this implementation.
 
 Click **Look up start place** or **Look up end place** to send only the selected
-recorded endpoint to your configured provider. No lookup runs when viewing a
-page, exporting, uploading, or in the background. The page explains this before
+recorded endpoint to your configured provider. **Look up both places** looks up
+start then end, skipping results already shown (including no-match results).
+Clicks made during a lookup wait in order; a waiting label confirms the click.
+No lookup runs when viewing a page unless you opt in with
+`VIEWER_GEOCODER_AUTO_LOOKUP=true` in `viewer.env` (empty/unset or `false` is off;
+other values prevent startup). This is intended for a self-hosted provider:
+with a third-party provider every trip opened sends its uncached endpoints.
+Cached endpoints send nothing, and removed trips never look up. Exports, uploads
+and background work never look anything up. The page explains this before
 the action. No full track, trip/device ID, note, category or destination is sent.
 Your provider can see the coordinate and server IP and may log the query; choose
 a provider and retention policy appropriate for your location data.
@@ -1046,13 +1053,22 @@ without deleting the cache or changing saved destinations. To refresh all result
 stop the viewer, back up the database, delete rows from `geocode_cache` using
 SQLite, then restart. A future lookup will query the configured provider again.
 
-A shared gate serializes requests across workers, with at least 1.1
-seconds after each successful call by default. Its reservation covers the
-entire lookup deadline and cleanup period, plus a five-second safety margin.
-Set `VIEWER_GEOCODER_INTERVAL` in `viewer.env` to change the normal gap
-(0.1 to 60 seconds); leaving it unset or empty keeps the default, which suits
-providers with a one-request-per-second policy. Use values below 1 second only
-with self-hosted Nominatim or a provider that explicitly permits them.
+A shared gate serializes requests across workers, with at least 0.1 seconds
+between a successful call finishing and the next call by default. This default
+suits self-hosted Nominatim. Set `VIEWER_GEOCODER_INTERVAL` in `viewer.env`
+(0.1 to 60 seconds) to match a third-party provider's rate policy, for example
+`1.1` for one request per second. **Existing third-party installs with no setting
+will send lookups up to ten times faster after updating**; set the interval
+before updating.
+
+A request arriving during the normal gap waits when the remaining gap is no
+more than the configured interval and no more than two seconds. The total wait
+budget is two seconds; longer waits return the usual busy message. The database
+write lock is released while waiting, so annotation saves can continue. Cached
+results never wait. Active lookup reservations, even near expiry, and failure
+cooldowns return busy immediately. Completed successes are explicitly marked,
+so a nearly expired reservation cannot be mistaken for a normal gap. The
+reservation covers the lookup deadline and cleanup plus five seconds of margin.
 Provider failures trigger a five-minute cooldown (longer `Retry-After` values are
 honoured up to seven days). There are no automatic retries,
 redirects, or ambient HTTP proxies. Responses have a 64 KiB size limit and a

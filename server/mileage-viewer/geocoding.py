@@ -39,7 +39,8 @@ class NoRedirect(HTTPRedirectHandler):
 class Geocoder:
     MAX_RESPONSE = 65536
     MAX_LABEL = 1000
-    INTERVAL = 1.1
+    INTERVAL = 0.1
+    WAIT_CAP = 2.0
     RESPONSE_BUDGET = 10
     CLEANUP_BUDGET = 1
     LEASE_MARGIN = 5
@@ -128,27 +129,42 @@ class Geocoder:
             raise GeocodeError("Address lookup is not configured.", 503)
         key = self.key(latitude, longitude)
         token = os.urandom(16).hex()
-        # A short transaction reserves the provider across all workers. Never
-        # hold a SQLite write lock during HTTP or block manual annotation saves.
-        with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT label FROM geocode_cache WHERE cache_key = ?", (key,)
-            ).fetchone()
-            if row is not None:
-                return row[0]
-            gate = conn.execute("SELECT next_allowed FROM geocode_gate WHERE singleton = 1").fetchone()
-            now = time.time()
-            if gate and now < gate[0]:
-                raise GeocodeError("Address lookup is busy or cooling down. Try again later.", 429)
-            conn.execute(
-                "INSERT OR REPLACE INTO geocode_gate VALUES (1, ?, ?)", (now + self.LEASE, token)
-            )
+        # Only a completed success clears its token. Active leases (even near
+        # expiry), failures and pre-upgrade rows are refused, never guessed from
+        # the remaining duration. Each waiter must reserve again under the lock.
+        deadline = time.monotonic() + self.WAIT_CAP
+        while True:
+            with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT label FROM geocode_cache WHERE cache_key = ?", (key,)
+                ).fetchone()
+                if row is not None:
+                    return row[0]
+                gate = conn.execute(
+                    "SELECT next_allowed, token FROM geocode_gate WHERE singleton = 1"
+                ).fetchone()
+                now = time.time()
+                remaining = gate[0] - now if gate else 0
+                if remaining <= 0:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO geocode_gate VALUES (1, ?, ?)",
+                        (now + self.LEASE, token),
+                    )
+                    break
+                if (gate[1] != "" or remaining > self.interval
+                        or remaining > self.WAIT_CAP
+                        or remaining > deadline - time.monotonic()):
+                    raise GeocodeError("Address lookup is busy or cooling down. Try again later.", 429)
+            # The transaction and connection have ended before sleeping.
+            time.sleep(remaining)
         # Worker aborts (SystemExit/KeyboardInterrupt) still run finally. Treat
         # any incomplete provider call as failure, including those abort paths.
         cooldown = 300
+        succeeded = False
         try:
             label = self._fetch(latitude, longitude)
+            succeeded = True
             cooldown = self.interval
             with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
                 conn.execute(
@@ -164,8 +180,9 @@ class Geocoder:
         finally:
             with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
                 conn.execute(
-                    "UPDATE geocode_gate SET next_allowed = ? WHERE singleton = 1 AND token = ?",
-                    (time.time() + cooldown, token),
+                    "UPDATE geocode_gate SET next_allowed = ?, token = ? "
+                    "WHERE singleton = 1 AND token = ?",
+                    (time.time() + cooldown, "" if succeeded else token, token),
                 )
 
     def _fetch(self, latitude, longitude):

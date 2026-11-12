@@ -79,7 +79,7 @@ class ViewerWorkerIntegrationTests(unittest.TestCase):
                 'VIEWER_PASSWORD_HASH': generate_password_hash('example-password'),
                 'VIEWER_SECRET_KEY': 'example-session-key-' * 4,
                 'DISPLAY_TZ': 'UTC', 'VIEWER_GEOCODER_URL': '',
-                'VIEWER_GEOCODER_INTERVAL': '',
+                'VIEWER_GEOCODER_INTERVAL': '', 'VIEWER_GEOCODER_AUTO_LOOKUP': '',
             })
             idle = []
             with (root / 'gunicorn.log').open('w+') as log:
