@@ -38,6 +38,10 @@ class TripNavigationTests(YearTestBase):
             self.assertIn(f'type="radio" name="category" value="{value}"', page)
         self.assertIn('data-header-menu aria-expanded="false" hidden', page)
         self.assertIn('name="viewport"', page)
+        # Wide windows: the panel is the left column, the map the right (#696).
+        self.assertIn(".trip-layout { grid-template-columns: 360px minmax(0, 1fr); }", page)
+        self.assertIn(".annotation-panel { grid-column: 1; grid-row: 1; }", page)
+        self.assertIn(".trip-map { grid-column: 2; grid-row: 1; }", page)
 
     def test_shared_head_viewport_hidden_buttons_and_list_scroll(self):
         for name in ("ACCOUNT_HTML", "ERROR_HTML", "LOGIN_HTML", "LIST_HTML", "TRIP_HTML",

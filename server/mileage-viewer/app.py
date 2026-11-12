@@ -1932,9 +1932,9 @@ BASE_CSS = THEME_CSS + """
   .annotation-panel form.annotate { margin-top: 0; max-width: none; }
   .trip-map { min-width: 0; }
   @media (min-width: 900px) {
-    .trip-layout { grid-template-columns: minmax(0, 1fr) 360px; }
-    .trip-map { grid-column: 1; grid-row: 1; }
-    .annotation-panel { grid-column: 2; grid-row: 1; }
+    .trip-layout { grid-template-columns: 360px minmax(0, 1fr); }
+    .annotation-panel { grid-column: 1; grid-row: 1; }
+    .trip-map { grid-column: 2; grid-row: 1; }
   }
   form.annotate { margin-top: 18px; max-width: 520px; }
   label { display: block; margin: 10px 0 4px; font-weight: 600; font-size: 14px; }
