@@ -348,7 +348,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   keeps its old stamp. Run `python tools/stamp_firmware_version.py` before
   every build. Boards flashed before version reporting show `Not reported`.
   Bump `firmware/VERSION` and review `release-notes/fw-<VERSION>.md` in the PR
-  that ships the change. Merging the bump to main creates an annotated
+  that ships the change. Update README's "Current versions" line in the same PR;
+  `tools/test_readme_versions.py` fails CI until it matches both VERSION files.
+  Merging the bump to main creates an annotated
   `fw-<VERSION>` tag on that commit and publishes `Supreme firmware <VERSION>`
   as Latest, then builds and uploads the source bundle, install/flash scripts
   and checksums through the reusable release workflow. Publication happens
@@ -394,7 +396,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   `unversioned`. Viewer header (footer on login/error pages), Device health
   and unauthenticated `/health` expose it on the LAN; `install.sh --check`
   warns on service mismatches.
-  Bump VERSION in the PR that ships the change (no separate PR); after
+  Bump VERSION and README's "Current versions" line in the PR that ships
+  the change (no separate PR); after
   deployment is verified, manually tag the merged commit `srv-<VERSION>`
   (see DEPLOY_DEBIAN.md). Server tags stay manual; a firmware release may
   already be published before that deploy is verified.
