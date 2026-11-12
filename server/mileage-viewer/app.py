@@ -1882,6 +1882,18 @@ BASE_CSS = THEME_CSS + """
     .trip-top.has-nav .trip-title p { margin: 0; font-size: 14px; }
     .trip-top.has-nav .stats { margin: 6px 0 0; }
   }
+  .purpose-choices { border: 0; padding: 0; margin: 10px 0 0; display: flex; gap: 6px; flex-wrap: wrap; }
+  .purpose-choices legend { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+  .purpose-choice { position: relative; margin: 0; cursor: pointer; }
+  .purpose-choice input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .purpose-choice span { display: block; padding: 7px 10px; border: 1px solid var(--input-border);
+    border-radius: 6px; background: var(--input-bg); color: var(--input-text); font-weight: normal; }
+  .purpose-choice input:checked + span { outline: 2px solid currentColor; outline-offset: -2px; font-weight: 700; }
+  .purpose-choice input:checked + .business { background: var(--business-bg); color: var(--business-text); }
+  .purpose-choice input:checked + .personal { background: var(--personal-bg); color: var(--personal-text); }
+  .purpose-choice input:checked + .other { background: var(--other-bg); color: var(--other-text); }
+  .purpose-choice input:focus-visible + span { outline: 3px solid var(--text); outline-offset: 3px; }
+  .purpose-none span { font-size: 12px; }
   .trip-layout { display: grid; gap: 18px; margin-top: 14px; }
   .annotation-panel { background: var(--card-bg); border: 1px solid var(--border);
     border-radius: 8px; padding: 4px 16px 12px; min-width: 0; }
@@ -2221,13 +2233,12 @@ TRIP_HTML = """
   <form class="annotate" method="post"
         action="{{ url_for('annotate', ym=t.ym, trip_id=t.id, year=year or '') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <label for="category">Purpose</label>
-    <select name="category" id="category">
-      <option value="">— unset —</option>
+    <fieldset class="purpose-choices"><legend>Purpose</legend>
       {% for c in categories %}
-      <option value="{{ c }}" {% if t.category == c %}selected{% endif %}>{{ c }}</option>
+      <label class="purpose-choice"><input type="radio" name="category" value="{{ c }}" {% if t.category == c %}checked{% endif %}><span class="{{ c }}">{{ c|capitalize }}</span></label>
       {% endfor %}
-    </select>
+      <label class="purpose-choice purpose-none"><input type="radio" name="category" value="" {% if not t.category %}checked{% endif %}><span>None</span></label>
+    </fieldset>
     <label for="destination">Destination / place</label>
     <input type="text" name="destination" id="destination" maxlength="{{ annotation_max }}" value="{{ t.destination or '' }}">
     {% if geocoder_enabled and 'end' in places %}
@@ -2344,6 +2355,7 @@ TRIP_HTML = """
   {% endif %}
 </div>
 
+<script src="{{ url_for('static', filename='trip-annotation.js') }}"></script>
 {% if geocoder_enabled %}
 <script src="{{ url_for('static', filename='endpoint-places.js') }}"{% if geocoder_auto_lookup %} data-auto-lookup="true"{% endif %}></script>
 {% endif %}
