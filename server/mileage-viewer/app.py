@@ -1838,6 +1838,15 @@ BASE_CSS = THEME_CSS + """
   .leaflet-bar a.leaflet-disabled { background: var(--map-control-hover); color: var(--map-control-disabled); }
   .leaflet-container .leaflet-control-attribution { background: var(--attribution-bg); color: var(--attribution-text); }
   .leaflet-control-attribution a { color: var(--map-link); }
+  @media (min-width: 900px) {
+    .trip-top.has-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 16px 24px; }
+    .trip-top.has-nav .trip-nav { flex: none; }
+    .trip-top.has-nav .trip-info { border-left: 1px solid var(--border); padding-left: 24px; min-width: 0; }
+    .trip-top.has-nav .trip-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 16px; }
+    .trip-top.has-nav h2 { margin: 0; }
+    .trip-top.has-nav .trip-title p { margin: 0; font-size: 14px; }
+    .trip-top.has-nav .stats { margin: 6px 0 0; }
+  }
   .trip-layout { display: grid; gap: 18px; margin-top: 14px; }
   .annotation-panel { background: var(--card-bg); border: 1px solid var(--border);
     border-radius: 8px; padding: 4px 16px 12px; min-width: 0; }
@@ -2109,6 +2118,7 @@ TRIP_HTML = """
   </div>
 </header>
 <div class="wrap">
+  <div class="trip-top{% if not removal %} has-nav{% endif %}">
   {% if not removal %}
   <nav class="trip-nav" aria-label="Trip navigation">
     {% if previous_trip %}<a class="btn" href="{{ url_for('trip_view', ym=previous_trip.ym, trip_id=previous_trip.id, year=year or '') }}">← Previous</a>
@@ -2120,11 +2130,22 @@ TRIP_HTML = """
     {% else %}<span class="btn" aria-disabled="true">Next →</span>{% endif %}
   </nav>
   {% endif %}
+  <div class="trip-info"><div class="trip-title">
   <h2>{{ fmt_trip_date(t) }}</h2>
   {% if last_edited %}
   <p class="muted">{% if last_edited.pre_history %}Edited before the change history began ({{ fmt_date(last_edited.at) }})
     {% else %}Last edited by {{ last_edited.actor }} on {{ fmt_date(last_edited.at) }}{% endif %}</p>
   {% endif %}
+  </div>
+  <div class="stats">
+    <div class="stat"><b>{{ "%.2f"|format(t.distance_miles or 0) }}</b><span>miles</span></div>
+    <div class="stat"><b>{{ fmt_duration(t.duration_seconds) }}</b><span>duration</span></div>
+    <div class="stat"><b>{{ fmt_speed(t.get('avg_speed_mph')) }}</b><span>avg mph</span></div>
+    <div class="stat"><b>{{ "%.1f"|format(t.max_speed_mph or 0) }}</b><span>max mph</span></div>
+    <div class="stat"><b>{{ t.num_points or 0 }}</b><span>points</span></div>
+  </div>
+
+  </div></div>
   {% if year_lock %}
   <div class="warn" role="status">{{ year_lock.year }} is closed for edits (closed by {{ year_lock.closed_by }} on {{ fmt_day(year_lock.closed_at) }}).
     Nobody can change, merge, remove or restore this trip until the admin reopens {{ year_lock.year }} on the year review page.</div>
@@ -2146,14 +2167,6 @@ TRIP_HTML = """
     {{ fmt_date(t.timed_from) }} to {{ fmt_date(t.recorded_until) }}. Recorded distance is retained.
     Year selection uses the first recorded timestamp; the actual start can be in an earlier year.</p>
   {% endif %}
-  <div class="stats">
-    <div class="stat"><b>{{ "%.2f"|format(t.distance_miles or 0) }}</b><span>miles</span></div>
-    <div class="stat"><b>{{ fmt_duration(t.duration_seconds) }}</b><span>duration</span></div>
-    <div class="stat"><b>{{ fmt_speed(t.get('avg_speed_mph')) }}</b><span>avg mph</span></div>
-    <div class="stat"><b>{{ "%.1f"|format(t.max_speed_mph or 0) }}</b><span>max mph</span></div>
-    <div class="stat"><b>{{ t.num_points or 0 }}</b><span>points</span></div>
-  </div>
-
   {% if not removal %}<div class="trip-layout"><div class="annotation-panel">
   {% if year_lock %}
   <section aria-labelledby="annotation-heading">
