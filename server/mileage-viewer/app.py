@@ -1838,6 +1838,16 @@ BASE_CSS = THEME_CSS + """
   .leaflet-bar a.leaflet-disabled { background: var(--map-control-hover); color: var(--map-control-disabled); }
   .leaflet-container .leaflet-control-attribution { background: var(--attribution-bg); color: var(--attribution-text); }
   .leaflet-control-attribution a { color: var(--map-link); }
+  .trip-layout { display: grid; gap: 18px; margin-top: 14px; }
+  .annotation-panel { background: var(--card-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 4px 16px 12px; min-width: 0; }
+  .annotation-panel form.annotate { margin-top: 0; max-width: none; }
+  .trip-map { min-width: 0; }
+  @media (min-width: 900px) {
+    .trip-layout { grid-template-columns: minmax(0, 1fr) 360px; }
+    .trip-map { grid-column: 1; grid-row: 1; }
+    .annotation-panel { grid-column: 2; grid-row: 1; }
+  }
   form.annotate { margin-top: 18px; max-width: 520px; }
   label { display: block; margin: 10px 0 4px; font-weight: 600; font-size: 14px; }
   select, textarea, input[type=text], input[type=password] { width: 100%; padding: 8px; font-size: 14px; box-sizing: border-box;
@@ -2144,11 +2154,44 @@ TRIP_HTML = """
     <div class="stat"><b>{{ t.num_points or 0 }}</b><span>points</span></div>
   </div>
 
+  {% if not removal %}<div class="trip-layout"><div class="annotation-panel">
+  {% if year_lock %}
+  <section aria-labelledby="annotation-heading">
+    <h3 id="annotation-heading">Purpose, destination and note</h3>
+    <p>{{ t.category or '—' }}, {{ t.destination or '—' }}, {{ t.purpose_note or '—' }}</p>
+  </section>
+  {% else %}
+  <form class="annotate" method="post"
+        action="{{ url_for('annotate', ym=t.ym, trip_id=t.id, year=year or '') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label for="category">Purpose</label>
+    <select name="category" id="category">
+      <option value="">— unset —</option>
+      {% for c in categories %}
+      <option value="{{ c }}" {% if t.category == c %}selected{% endif %}>{{ c }}</option>
+      {% endfor %}
+    </select>
+    <label for="destination">Destination / place</label>
+    <input type="text" name="destination" id="destination" maxlength="{{ annotation_max }}" value="{{ t.destination or '' }}">
+    {% if geocoder_enabled and 'end' in places %}
+    <button type="button" class="btn secondary" id="use-end-place"
+      {% if not places.get('end') %}disabled{% endif %}>Use end suggestion as destination</button>
+    <p class="muted">Using a suggestion replaces the destination field above. Click Save to keep it.</p>
+    {% endif %}
+    <label for="purpose_note">Note (e.g. "Client visit — Acme Corp")</label>
+    <textarea name="purpose_note" id="purpose_note" rows="3" maxlength="{{ annotation_max }}">{{ t.purpose_note or "" }}</textarea>
+    <p><button class="btn" type="submit">Save</button></p>
+  </form>
+  {% endif %}
+  </div><div class="trip-map">
+  {% endif %}
   {% if t.has_gpx %}
   <div id="map"></div>
   {% else %}
   <p class="muted">GPX file missing — cannot draw the track.</p>
   {% endif %}
+
+  {% if not removal %}</div></div>{% endif %}
 
   {% if removal %}
   <p class="muted">This trip is out of the trip list, totals and exports, and can't be edited
@@ -2180,10 +2223,10 @@ TRIP_HTML = """
     {% endfor %}
     <p class="muted">Address data: <a href="https://www.openstreetmap.org/copyright"
       target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors (ODbL)</a>.</p>
-    <noscript>Enable JavaScript to look up places. You can still enter a destination below.</noscript>
+    <noscript>Enable JavaScript to look up places. You can still enter a destination in the form.</noscript>
     {% else %}
     <p class="muted">Address lookup is not configured. Ask your server administrator to set up
-      a supported address provider, or enter a destination below.</p>
+      a supported address provider, or enter a destination in the form.</p>
     {% endif %}
   </section>
 
@@ -2228,34 +2271,6 @@ TRIP_HTML = """
   </section>
   {% endif %}
 
-  {% if year_lock %}
-  <section aria-labelledby="annotation-heading">
-    <h3 id="annotation-heading">Purpose, destination and note</h3>
-    <p>{{ t.category or '—' }}, {{ t.destination or '—' }}, {{ t.purpose_note or '—' }}</p>
-  </section>
-  {% else %}
-  <form class="annotate" method="post"
-        action="{{ url_for('annotate', ym=t.ym, trip_id=t.id, year=year or '') }}">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <label for="category">Purpose</label>
-    <select name="category" id="category">
-      <option value="">— unset —</option>
-      {% for c in categories %}
-      <option value="{{ c }}" {% if t.category == c %}selected{% endif %}>{{ c }}</option>
-      {% endfor %}
-    </select>
-    <label for="destination">Destination / place</label>
-    <input type="text" name="destination" id="destination" maxlength="{{ annotation_max }}" value="{{ t.destination or '' }}">
-    {% if geocoder_enabled and 'end' in places %}
-    <button type="button" class="btn secondary" id="use-end-place"
-      {% if not places.get('end') %}disabled{% endif %}>Use end suggestion as destination</button>
-    <p class="muted">Using a suggestion replaces the destination field above. Click Save to keep it.</p>
-    {% endif %}
-    <label for="purpose_note">Note (e.g. "Client visit — Acme Corp")</label>
-    <textarea name="purpose_note" id="purpose_note" rows="3" maxlength="{{ annotation_max }}">{{ t.purpose_note or "" }}</textarea>
-    <p><button class="btn" type="submit">Save</button></p>
-  </form>
-  {% endif %}
   {% if g.role == 'admin' and not year_lock %}
   <section aria-labelledby="remove-heading">
     <h3 id="remove-heading">Remove from log</h3>
