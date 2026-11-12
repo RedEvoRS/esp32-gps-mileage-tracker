@@ -469,7 +469,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   providers need an interval matching their rate policy. Viewer-only
   `MAP_TILE_URL` selects base tiles (default OSM; `none` disables); attribution is plain text.
   Page views look up uncached endpoints only with opt-in
-  `VIEWER_GEOCODER_AUTO_LOOKUP=true`. No lookup on exports or uploads; never
+  `VIEWER_GEOCODER_AUTO_LOOKUP=true`; Auto lookup beside Next defaults On,
+  with an Off choice saved per browser. No lookup on exports or uploads; never
   use public OSMF Nominatim.
   `/device-health` reads
   diagnostics schema v1 via `mode=ro` with a 2 s busy timeout, shows contact and

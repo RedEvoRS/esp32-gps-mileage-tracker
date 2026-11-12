@@ -1032,7 +1032,15 @@ Clicks made during a lookup wait in order; a waiting label confirms the click.
 No lookup runs when viewing a page unless you opt in with
 `VIEWER_GEOCODER_AUTO_LOOKUP=true` in `viewer.env` (empty/unset or `false` is off;
 other values prevent startup). This is intended for a self-hosted provider:
-with a third-party provider every trip opened sends its uncached endpoints.
+with a third-party provider every trip opened sends its uncached endpoints
+unless you turn automatic lookup off. When this setting is enabled and address
+lookup is configured, an **Auto lookup: On/Off** switch appears between
+**Previous** and **Next**, immediately left of **Next**. It starts **On** and
+remembers your choice in this browser. Turning it **Off** stops new automatic
+lookups; requests already running or waiting may finish. The manual lookup
+buttons still work. Turning it **On** looks up the open trip's uncached endpoints
+straight away. The switch appears only when the administrator allows automatic
+lookup, and needs JavaScript.
 Cached endpoints send nothing, and removed trips never look up. Exports, uploads
 and background work never look anything up. The page explains this before
 the action. No full track, trip/device ID, note, category or destination is sent.

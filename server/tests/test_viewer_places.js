@@ -4,7 +4,15 @@ const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../mileage-viewer/static/endpoint-places.js'), 'utf8');
 const tick = () => new Promise(resolve => setImmediate(resolve));
-function setup({auto = false, cached = [], endpoints = ['start', 'end']} = {}) {
+function setup({auto = false, cached = [], endpoints = ['start', 'end'], storage = new Map(), throws = []} = {}) {
+  const autoSwitch = {hidden: true, attributes: {}, textContent: '',
+    setAttribute(k, v) { this.attributes[k] = v; }, addEventListener(_, fn) { this.click = fn; }};
+  const autoStatus = {textContent: ''};
+  const localStorage = {
+    getItem(k) { if (throws.includes('get')) throw Error('blocked'); return storage.get(k); },
+    setItem(k, v) { if (throws.includes('set')) throw Error('blocked'); storage.set(k, v); },
+    removeItem(k) { if (throws.includes('remove')) throw Error('blocked'); storage.delete(k); },
+  };
   const destination = {value: 'Unsaved edit', focus() { this.focused = true; }};
   const useEnd = {disabled: !cached.includes('end'), addEventListener(_, fn) { this.click = fn; }};
   const both = {disabled: true, addEventListener(_, fn) { this.click = fn; }};
@@ -16,17 +24,17 @@ function setup({auto = false, cached = [], endpoints = ['start', 'end']} = {}) {
       closest() { return {dataset: {endpoint}, querySelector() { return labels[endpoint]; }}; }};
   });
   const calls = [];
-  vm.runInNewContext(source, {document: {
+  vm.runInNewContext(source, {localStorage, document: {
     currentScript: {dataset: auto ? {autoLookup: 'true'} : {}},
-    getElementById(id) { return {'use-end-place': useEnd, 'lookup-both-places': endpoints.length === 2 ? both : null, destination}[id]; },
-    querySelector() { return labels.end; }, querySelectorAll() { return forms; }},
+    getElementById(id) { return {'auto-lookup': auto ? autoSwitch : null, 'use-end-place': useEnd, 'lookup-both-places': endpoints.length === 2 ? both : null, destination}[id]; },
+    querySelector(selector) { return selector === '[data-auto-lookup-status]' ? autoStatus : labels.end; }, querySelectorAll() { return forms; }},
     FormData: class {constructor(form) { this.form = form; }},
     fetch(url, options) { return new Promise(resolve => calls.push({url, options, resolve})); }});
   async function respond(index, data, ok = true) {
     calls[index].resolve({ok, async json() { if (data === null) throw Error('not JSON'); return data; }});
     await tick();
   }
-  return {forms, labels, both, calls, destination, useEnd, respond,
+  return {autoSwitch, autoStatus, storage, forms, labels, both, calls, destination, useEnd, respond,
     submit(index) { return forms[index].submit({preventDefault() {}}); }};
 }
 async function run() {
@@ -80,6 +88,49 @@ async function run() {
     assert.equal(single.calls.length, 1);
     await single.respond(0, {label: 'Example'});
   }
-  console.log('Endpoint lookup controller: 1 suite passed (queue order/deduplication, both, auto, cache, inert text, edits, failures).');
+  const key = 'viewer-auto-lookup';
+  const onText = 'Uncached endpoints are looked up when a trip opens.';
+  const offText = 'Automatic lookup is off in this browser. Nothing is sent until you click.';
+  function state(t, on) {
+    assert.equal(t.autoSwitch.hidden, false);
+    assert.equal(t.autoSwitch.textContent, on ? 'Auto lookup: On' : 'Auto lookup: Off');
+    assert.equal(t.autoSwitch.attributes['aria-pressed'], String(on));
+    assert.equal(t.autoStatus.textContent, on ? onText : offText);
+  }
+  const defaultOn = setup({auto: true}); state(defaultOn, true);
+  assert.equal(defaultOn.calls.length, 1);
+  defaultOn.autoSwitch.click(); state(defaultOn, false);
+  assert.equal(defaultOn.storage.get(key), 'off');
+  await defaultOn.respond(0, {label: 'Example'});
+  assert.equal(defaultOn.calls.length, 2, 'queued lookup may finish after Off');
+  await defaultOn.respond(1, {label: ''});
+  const next = setup({auto: true, storage: defaultOn.storage}); state(next, false);
+  assert.equal(next.calls.length, 0, 'Off persists on the next trip page');
+  next.submit(1); assert.equal(next.calls.length, 1, 'single manual lookup works while Off');
+  await next.respond(0, {label: 'Example'});
+  next.both.click(); assert.equal(next.calls.length, 2, 'both works while Off');
+  await next.respond(1, {label: ''});
+  const off = setup({auto: true, cached: ['start'], storage: new Map([[key, 'off']])});
+  state(off, false); assert.equal(off.calls.length, 0);
+  off.autoSwitch.click(); state(off, true);
+  assert.equal(off.storage.has(key), false, 'On removes preference');
+  assert.equal(off.calls.length, 1);
+  assert.equal(off.calls[0].options.body.form.endpoint, 'end');
+  await off.respond(0, {label: ''});
+  off.autoSwitch.click(); state(off, false);
+  off.autoSwitch.click(); state(off, true);
+  assert.equal(off.calls.length, 1, 'completed no-match is not looked up again');
+  for (const throws of [['get'], ['set'], ['remove'], ['get', 'set', 'remove']]) {
+    const blocked = setup({auto: true, throws}); state(blocked, true);
+    blocked.autoSwitch.click(); state(blocked, false);
+    blocked.autoSwitch.click(); state(blocked, true);
+    assert.equal(blocked.calls.length, 1, 'storage errors preserve queue deduplication');
+    await blocked.respond(0, {label: ''});
+    await blocked.respond(1, {label: ''});
+  }
+  const denied = setup({storage: new Map([[key, 'off']])});
+  assert.equal(denied.autoSwitch.hidden, true);
+  assert.equal(denied.calls.length, 0);
+  console.log('Endpoint lookup controller: 1 suite passed (queue order/deduplication, both, auto preference/toggles/storage errors, cache, inert text, edits, failures).');
 }
 run().catch(error => {console.error(error); process.exitCode = 1;});

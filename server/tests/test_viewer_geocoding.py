@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -537,6 +538,7 @@ class EndpointPlaceTests(unittest.TestCase):
                 "csrf_token": "test-csrf", "reason": "Duplicate test recording"})
             self.assertEqual(response.status_code, 302)
             html = self.client.get("/trip/2026-10/sample").get_data(as_text=True)
+            self.assertNotIn('id="auto-lookup"', html)
             self.assertNotIn("data-auto-lookup", html)
             self.assertNotIn("data-place-lookup", html)
             self.assertNotIn('id="lookup-both-places"', html)
@@ -565,6 +567,14 @@ class EndpointPlaceTests(unittest.TestCase):
         for enabled in (False, True):
             with patch.object(self.viewer, "GEOCODER_AUTO_LOOKUP", enabled):
                 html = self.client.get("/trip/2026-10/sample").get_data(as_text=True)
+            self.assertIn('<span data-auto-lookup-status>', html)
+            self.assertEqual('id="auto-lookup"' in html, enabled)
+            if enabled:
+                nav = re.search(r'<nav class="trip-nav".*?</nav>', html, re.S).group()
+                self.assertRegex(nav.replace('\n', ''),
+                                 r'Previous</span>.*?<button[^>]*id="auto-lookup"'
+                                 r'[^>]*type="button"[^>]*aria-pressed="true" hidden>'
+                                 r'Auto lookup: On</button>.*?Next')
             self.assertEqual('data-auto-lookup="true"' in html, enabled)
             self.assertEqual("Nothing is sent until you click." in html, not enabled)
             self.assertEqual("Uncached endpoints are looked up when a trip opens." in html, enabled)
@@ -576,6 +586,7 @@ class EndpointPlaceTests(unittest.TestCase):
         self.assertIn('data-place-cached="true"', html)
         with patch.object(self.viewer.GEOCODER, "url", ""), patch.object(self.viewer, "GEOCODER_AUTO_LOOKUP", True):
             html = self.client.get("/trip/2026-10/sample").get_data(as_text=True)
+            self.assertNotIn('id="auto-lookup"', html)
             self.assertNotIn("data-auto-lookup", html)
             self.assertNotIn('id="lookup-both-places"', html)
 
