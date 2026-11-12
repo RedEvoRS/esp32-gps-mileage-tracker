@@ -15,6 +15,7 @@ function setup({auto = false, cached = [], endpoints = ['start', 'end'], storage
   };
   const destination = {value: 'Unsaved edit', focus() { this.focused = true; }};
   const useEnd = {disabled: !cached.includes('end'), addEventListener(_, fn) { this.click = fn; }};
+  const suggestion = {textContent: ''};
   const both = {disabled: true, addEventListener(_, fn) { this.click = fn; }};
   const labels = {start: {textContent: 'Cached start'}, end: {textContent: 'Cached end'}};
   const forms = endpoints.map(endpoint => {
@@ -26,7 +27,7 @@ function setup({auto = false, cached = [], endpoints = ['start', 'end'], storage
   const calls = [];
   vm.runInNewContext(source, {localStorage, document: {
     currentScript: {dataset: auto ? {autoLookup: 'true'} : {}},
-    getElementById(id) { return {'auto-lookup': auto ? autoSwitch : null, 'use-end-place': useEnd, 'lookup-both-places': endpoints.length === 2 ? both : null, destination}[id]; },
+    getElementById(id) { return {'end-suggestion': suggestion, 'auto-lookup': auto ? autoSwitch : null, 'use-end-place': useEnd, 'lookup-both-places': endpoints.length === 2 ? both : null, destination}[id]; },
     querySelector(selector) { return selector === '[data-auto-lookup-status]' ? autoStatus : labels.end; }, querySelectorAll() { return forms; }},
     FormData: class {constructor(form) { this.form = form; }},
     fetch(url, options) { return new Promise(resolve => calls.push({url, options, resolve})); }});
@@ -34,7 +35,7 @@ function setup({auto = false, cached = [], endpoints = ['start', 'end'], storage
     calls[index].resolve({ok, async json() { if (data === null) throw Error('not JSON'); return data; }});
     await tick();
   }
-  return {autoSwitch, autoStatus, storage, forms, labels, both, calls, destination, useEnd, respond,
+  return {suggestion, autoSwitch, autoStatus, storage, forms, labels, both, calls, destination, useEnd, respond,
     submit(index) { return forms[index].submit({preventDefault() {}}); }};
 }
 async function run() {
@@ -97,6 +98,22 @@ async function run() {
     assert.equal(t.autoSwitch.attributes['aria-pressed'], String(on));
     assert.equal(t.autoStatus.textContent, on ? onText : offText);
   }
+  const retry = setup({auto: true});
+  assert.equal(retry.both.hidden, true);
+  assert.ok(retry.forms.every(form => form.querySelector().hidden));
+  await retry.respond(0, {error: 'Provider unavailable.'}, false);
+  assert.equal(retry.forms[0].querySelector().hidden, false);
+  assert.equal(retry.forms[0].querySelector().textContent, 'Try again');
+  assert.equal(retry.suggestion.textContent, 'End: looking up\u2026');
+  await retry.respond(1, {label: '100 Example Ave'});
+  assert.equal(retry.suggestion.textContent, 'End: 100 Example Ave');
+  assert.equal(retry.forms[1].querySelector().hidden, true);
+  retry.submit(0);
+  assert.equal(retry.forms[0].querySelector().hidden, true);
+  await retry.respond(2, {label: ''});
+  retry.autoSwitch.click();
+  assert.equal(retry.both.hidden, false);
+  assert.ok(retry.forms.every(form => !form.querySelector().hidden));
   const defaultOn = setup({auto: true}); state(defaultOn, true);
   assert.equal(defaultOn.calls.length, 1);
   defaultOn.autoSwitch.click(); state(defaultOn, false);

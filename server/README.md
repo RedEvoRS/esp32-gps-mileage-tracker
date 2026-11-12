@@ -1025,6 +1025,18 @@ vehicle-tracking applications and says not to submit confidential material.
 The viewer rejects `openstreetmap.org` hosts. Map tiles remain independent of
 address lookup. Google Maps/Places is not a provider in this implementation.
 
+On wide windows, the annotation panel sits beside the map; on narrower windows
+it comes first, above the map. Choose **Business**, **Personal** or **Other** for
+the purpose. Click the selected purpose again to clear it, or choose **None**
+(which also works without JavaScript). Tab reaches the radio group; arrow keys
+and Space select a choice. Destination and Note are saved with **Save**.
+The endpoint places, split-drive controls and removal controls follow the map.
+Closed years show a read-only summary in the panel; removed trips stay read-only.
+On wide windows the date and stats sit beside Previous/Next, wrapping below when
+space is limited. Phones use compact stats and a **Menu** button in the shared
+header for version, device health, account, theme and logout controls. Without
+JavaScript those header controls remain in a wrapped row.
+
 Click **Look up start place** or **Look up end place** to send only the selected
 recorded endpoint to your configured provider. **Look up both places** looks up
 start then end, skipping results already shown (including no-match results).
@@ -1038,7 +1050,8 @@ lookup is configured, an **Auto lookup: On/Off** switch appears between
 **Previous** and **Next**, immediately left of **Next**. It starts **On** and
 remembers your choice in this browser. Turning it **Off** stops new automatic
 lookups; requests already running or waiting may finish. The manual lookup
-buttons still work. Turning it **On** looks up the open trip's uncached endpoints
+buttons appear immediately when Off. While On they are hidden; a failed
+endpoint shows **Try again**. Turning it **On** looks up the open trip's uncached endpoints
 straight away. The switch appears only when the administrator allows automatic
 lookup, and needs JavaScript.
 Cached endpoints send nothing, and removed trips never look up. Exports, uploads
@@ -1049,8 +1062,9 @@ a provider and retention policy appropriate for your location data.
 
 Results are suggestions for the nearest mapped object, which may be on another
 street or may omit the business name. They do not verify a visit or correct GPS
-drift. Missing or invalid recordings cannot be looked up. Use **Use end suggestion
-as destination** to fill the editable Destination field, check it, then **Save**.
+drift. Missing or invalid recordings cannot be looked up. The **End:** line beneath Destination shows the lookup status or suggestion.
+Click its **Use** button to replace the editable Destination field, check it,
+then **Save**. Use stays disabled until a suggestion is available.
 Lookup never changes a saved annotation. The saved destination appears in the
 trip list and CSV/XLSX exports through the existing annotation flow. Exports do
 not perform lookup or add unreviewed address suggestions.
