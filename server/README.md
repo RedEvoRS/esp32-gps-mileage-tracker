@@ -1028,7 +1028,7 @@ vehicle-tracking applications and says not to submit confidential material.
 The viewer rejects `openstreetmap.org` hosts. Map tiles remain independent of
 address lookup. Google Maps/Places is not a provider in this implementation.
 
-On wide windows, the annotation panel sits beside the map; on narrower windows
+On wide windows, the annotation panel sits left of the map; on narrower windows
 it comes first, above the map. Choose **Business**, **Personal** or **Other** for
 the purpose. Click the selected purpose again to clear it, or choose **None**
 (which also works without JavaScript). Tab reaches the radio group; arrow keys
