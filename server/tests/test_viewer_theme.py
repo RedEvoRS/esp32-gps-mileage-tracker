@@ -211,6 +211,7 @@ class ViewerThemeTests(unittest.TestCase):
             ] + [
                 ("header-text", "header-bg"),
                 ("button-text", "button-bg"), ("button-text", "secondary-bg"),
+                ("nav-text", "nav-bg"), ("nav-text", "nav-hover"),
                 ("business-text", "business-bg"), ("personal-text", "personal-bg"),
                 ("other-text", "other-bg"), ("warn-text", "warn-bg"),
                 ("input-text", "input-bg"), ("input-text", "card-bg"), ("heading", "card-bg"),

@@ -1480,6 +1480,22 @@ def year_members(trips, unreadable, year):
             [t for t in unreadable if _may_start_in(t["ym"], year)])
 
 
+def trip_neighbours(trip_key, trips, year=None):
+    """Return (older, newer) in the list's newest-first, openable row order.
+
+    load_trips has already combined merged parts and separated unreadable
+    summaries. Inside-merge recordings still have their own Map / Edit link.
+    """
+    live = [t for t in trips if not t.get("removal")]
+    if year:
+        live, _ = year_members(live, [], year)
+    for index, trip in enumerate(live):
+        if trip["trip_key"] == trip_key:
+            return (live[index + 1] if index + 1 < len(live) else None,
+                    live[index - 1] if index else None)
+    return None, None
+
+
 def _flag_trips_inside_merges(trips):
     """Give each trip a live merged trip already covers an "inside_merge" entry.
 
@@ -1700,6 +1716,7 @@ DEVICE_HEALTH_BUTTON = """
 
 # Reuse the dark palette for OS preference and the explicit override.
 DARK_THEME_CSS = """
+    --nav-bg: #fb923c; --nav-text: #15191e; --nav-hover: #fdba74;
     --page-bg: #15191e; --text: #e9ecef; --header-bg: #123b60;
     --table-head-bg: #252c34; --border: #414b57; --row-hover-bg: #20262d;
     --tag-bg: #343e49; --business-bg: #183d25; --business-text: #b2f2bb;
@@ -1720,6 +1737,7 @@ DARK_THEME_CSS = """
 
 THEME_CSS = """
   :root {
+    --nav-bg: #c2410c; --nav-text: #fff; --nav-hover: #9a3412;
     color-scheme: light dark;
     --page-bg: #fff; --text: #1a1a1a; --header-bg: #1864ab; --header-text: #fff;
     --header-button-bg: rgba(0,0,0,.18); --header-button-text: #fff;
@@ -1788,6 +1806,12 @@ BASE_CSS = THEME_CSS + """
   .btn { display: inline-block; background: var(--button-bg); color: var(--button-text); padding: 8px 14px;
          border-radius: 6px; text-decoration: none; border: none; cursor: pointer; font-size: 14px; }
   .btn.secondary { background: var(--secondary-bg); }
+  .trip-nav { display: flex; flex-wrap: wrap; gap: 10px; }
+  .trip-nav .btn { background: var(--nav-bg); color: var(--nav-text); }
+  .trip-nav a:hover { background: var(--nav-hover); }
+  .trip-nav a:focus-visible { outline: 2px solid var(--text); outline-offset: 3px;
+                             background: var(--nav-hover); }
+  .trip-nav [aria-disabled="true"] { opacity: .65; cursor: default; }
   button.btn:disabled, button.btn[aria-disabled="true"] { opacity: .65; cursor: default; }
   .endpoint-place { margin: 16px 0; overflow-wrap: anywhere; }
   .toolbar { margin-bottom: 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
@@ -2063,6 +2087,14 @@ TRIP_HTML = """
   </div>
 </header>
 <div class="wrap">
+  {% if not removal %}
+  <nav class="trip-nav" aria-label="Trip navigation">
+    {% if previous_trip %}<a class="btn" href="{{ url_for('trip_view', ym=previous_trip.ym, trip_id=previous_trip.id, year=year or '') }}">← Previous</a>
+    {% else %}<span class="btn" aria-disabled="true">← Previous</span>{% endif %}
+    {% if next_trip %}<a class="btn" href="{{ url_for('trip_view', ym=next_trip.ym, trip_id=next_trip.id, year=year or '') }}">Next →</a>
+    {% else %}<span class="btn" aria-disabled="true">Next →</span>{% endif %}
+  </nav>
+  {% endif %}
   <h2>{{ fmt_trip_date(t) }}</h2>
   {% if last_edited %}
   <p class="muted">{% if last_edited.pre_history %}Edited before the change history began ({{ fmt_date(last_edited.at) }})
@@ -3201,8 +3233,8 @@ def trip_view(ym, trip_id):
     _safe_trip_paths(ym, trip_id)
     key = f"{ym}/{trip_id}"
     # Resolve the requested recording/alias and read only its own sources.
-    # Removed trips, redirects and unknown-device trips need no global merge
-    # suggestions; the normal known-device page still needs the full chronology.
+    # Removed trips and redirects need no full chronology. Live pages use it
+    # for navigation, and known-device pages also use it for merge suggestions.
     with _trip_read(include_removed=True, trip_key=key) as (conn, trips, unreadable):
         key = trip_merges.canonical_key(conn, key)
         removed = trip_log.removal(conn, key)
@@ -3232,6 +3264,8 @@ def trip_view(ym, trip_id):
             app.logger.warning("Trip missing from full log after retry: %s", t["trip_key"])
             abort(404, description="This trip is no longer available. Return to the trip list and reopen it.")
         t = current
+    elif not t.get("removal"):
+        trips, unreadable, removed_trips, _ = split_removed(*load_trips(include_removed=True))
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         conn.row_factory = sqlite3.Row
         last_edited = _last_edited(conn, t)
@@ -3243,6 +3277,7 @@ def trip_view(ym, trip_id):
                                       year=year, geocoder_enabled=False, last_edited=last_edited,
                                       year_lock=year_lock)
     merge_next, merge_block_reason = trip_merges.next_trip(t, trips, unreadable, removed_trips)
+    previous_trip, next_trip = trip_neighbours(t["trip_key"], trips, year)
     places = {}
     if GEOCODER.enabled:
         endpoints = track_endpoints(t)
@@ -3252,6 +3287,7 @@ def trip_view(ym, trip_id):
                     endpoints[f"{endpoint}_latitude"], endpoints[f"{endpoint}_longitude"]
                 )
     return render_template_string(TRIP_HTML, t=t, categories=CATEGORIES, year=year,
+                                  previous_trip=previous_trip, next_trip=next_trip,
                                   geocoder_enabled=GEOCODER.enabled, places=places, merge_next=merge_next,
                                   merge_block_reason=merge_block_reason,
                                   last_edited=last_edited, year_lock=year_lock,
