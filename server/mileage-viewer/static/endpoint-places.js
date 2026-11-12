@@ -3,6 +3,7 @@
   'use strict';
   const useEnd = document.getElementById('use-end-place');
   const endLabel = document.querySelector('[data-endpoint="end"] [data-place-label]');
+  const suggestionLabel = document.getElementById('end-suggestion');
   let endSuggestion = useEnd && !useEnd.disabled ? endLabel.textContent : '';
   const forms = Array.from(document.querySelectorAll('form[data-place-lookup]'));
   const completed = new Set(forms.filter(form => form.dataset.placeCached === 'true'));
@@ -11,6 +12,12 @@
   const queue = [];
   let busy = false;
   forms.forEach(form => { form.querySelector('button').disabled = false; });
+  function syncSuggestion(form, text) {
+    if (form.closest('[data-endpoint]').dataset.endpoint !== 'end') return;
+    if (suggestionLabel) suggestionLabel.textContent = 'End: ' +
+      (text === 'No mapped address found.' ? 'no mapped address found' : text);
+    if (useEnd) useEnd.disabled = true;
+  }
   async function drain() {
     if (busy) return;
     busy = true;
@@ -40,6 +47,10 @@
         failed.add(form);
         label.textContent = 'Address lookup failed. Check your session and try again.';
       } finally {
+        if (container.dataset.endpoint === 'end') {
+          syncSuggestion(form, label.textContent);
+          if (useEnd) useEnd.disabled = failed.has(form) || !endSuggestion;
+        }
         queued.delete(form);
         updateAutoLookup();
         form.querySelector('button').removeAttribute('aria-disabled');
@@ -53,6 +64,7 @@
     queued.add(form);
     updateAutoLookup();
     queue.push(form);
+    syncSuggestion(form, 'looking up\u2026');
     form.querySelector('button').setAttribute('aria-disabled', 'true');
     form.closest('[data-endpoint]').querySelector('[data-place-label]').textContent =
       'Waiting for the other lookup…';
@@ -71,7 +83,7 @@
     both.addEventListener('click', lookupMissing);
   }
   if (useEnd) useEnd.addEventListener('click', () => {
-    if (!endSuggestion) return;
+    if (useEnd.disabled || !endSuggestion) return;
     const destination = document.getElementById('destination');
     destination.value = endSuggestion;
     destination.focus();

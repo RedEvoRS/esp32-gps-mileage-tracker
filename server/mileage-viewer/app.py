@@ -1882,6 +1882,8 @@ BASE_CSS = THEME_CSS + """
     .trip-top.has-nav .trip-title p { margin: 0; font-size: 14px; }
     .trip-top.has-nav .stats { margin: 6px 0 0; }
   }
+  .end-suggestion { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 13px; overflow-wrap: anywhere; }
+  .end-suggestion .btn { padding: 4px 10px; }
   .purpose-choices { border: 0; padding: 0; margin: 10px 0 0; display: flex; gap: 6px; flex-wrap: wrap; }
   .purpose-choices legend { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
   .purpose-choice { position: relative; margin: 0; cursor: pointer; }
@@ -2242,9 +2244,9 @@ TRIP_HTML = """
     <label for="destination">Destination / place</label>
     <input type="text" name="destination" id="destination" maxlength="{{ annotation_max }}" value="{{ t.destination or '' }}">
     {% if geocoder_enabled and 'end' in places %}
+    <div class="end-suggestion"><span role="status" id="end-suggestion">End: {% if places['end'] is none %}not looked up yet{% elif places['end'] %}{{ places['end'] }}{% else %}no mapped address found{% endif %}</span>
     <button type="button" class="btn secondary" id="use-end-place"
-      {% if not places.get('end') %}disabled{% endif %}>Use end suggestion as destination</button>
-    <p class="muted">Using a suggestion replaces the destination field above. Click Save to keep it.</p>
+      {% if not places.get('end') %}disabled{% endif %}>Use</button></div>
     {% endif %}
     <label for="purpose_note">Note (e.g. "Client visit — Acme Corp")</label>
     <textarea name="purpose_note" id="purpose_note" rows="3" maxlength="{{ annotation_max }}">{{ t.purpose_note or "" }}</textarea>

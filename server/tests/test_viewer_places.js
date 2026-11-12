@@ -59,7 +59,7 @@ async function run() {
   s.both.click(); assert.equal(s.calls.length, 2, 'both skips fetched and no-match results');
   s.submit(1); await s.respond(2, {error: 'Provider unavailable.'}, false);
   assert.equal(s.labels.end.textContent, 'Provider unavailable.');
-  s.destination.value = 'Another edit'; s.useEnd.click(); assert.equal(s.destination.value, hostile);
+  assert.equal(s.useEnd.disabled, true, 'failed lookup disables stale suggestion');
   s.submit(1); await s.respond(3, {label: ''}); assert.equal(s.useEnd.disabled, true);
   s.submit(1); await s.respond(4, null); assert.match(s.labels.end.textContent, /Check your session/);
   assert.ok(s.forms.every(f => !('aria-disabled' in f.querySelector().attributes)));
