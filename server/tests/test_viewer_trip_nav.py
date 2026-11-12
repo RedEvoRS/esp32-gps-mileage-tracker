@@ -39,6 +39,21 @@ class TripNavigationTests(YearTestBase):
         self.assertIn('data-header-menu aria-expanded="false" hidden', page)
         self.assertIn('name="viewport"', page)
 
+    def test_shared_head_viewport_hidden_buttons_and_list_scroll(self):
+        for name in ("ACCOUNT_HTML", "ERROR_HTML", "LOGIN_HTML", "LIST_HTML", "TRIP_HTML",
+                     "DEVICE_HEALTH_HTML", "REMOVED_HTML", "HISTORY_HTML", "YEAR_HTML"):
+            self.assertEqual(getattr(self.viewer, name).count('name="viewport"'), 1, name)
+        key = self.add_trip("scroll", "2026-03-01T12:00:00Z")
+        listing = self.admin.get("/").get_data(as_text=True)
+        self.assertEqual(listing.count('name="viewport"'), 1)
+        # The phone viewport would otherwise let the wide table widen the whole page.
+        self.assertIn('<div class="trip-table"><table>', listing)
+        self.assertIn(".trip-table { overflow-x: auto; }", listing)
+        page = self.admin.get(f"/trip/{key}").get_data(as_text=True)
+        self.assertEqual(page.count('name="viewport"'), 1)
+        # .btn sets display:inline-block, which would override the hidden attribute.
+        self.assertIn(".btn[hidden] { display: none; }", page)
+
     def test_middle_and_ends_for_both_roles_reuse_full_snapshot(self):
         old = self.add_trip("old", "2026-03-01T12:00:00Z")
         middle = self.add_trip("middle", "2026-03-02T12:00:00Z")

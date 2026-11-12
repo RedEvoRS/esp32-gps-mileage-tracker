@@ -1834,6 +1834,7 @@ BASE_CSS = THEME_CSS + """
            background: var(--header-text); color: var(--header-bg); }
   .wrap { padding: 22px; }
   table { border-collapse: collapse; width: 100%; }
+  .trip-table { overflow-x: auto; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
   th { background: var(--table-head-bg); font-size: 13px; text-transform: uppercase; letter-spacing: .03em; }
   tr:hover td { background: var(--row-hover-bg); }
@@ -1847,6 +1848,7 @@ BASE_CSS = THEME_CSS + """
   .warn ul { margin: 6px 0 0; padding-left: 20px; }
   .btn { display: inline-block; background: var(--button-bg); color: var(--button-text); padding: 8px 14px;
          border-radius: 6px; text-decoration: none; border: none; cursor: pointer; font-size: 14px; }
+  .btn[hidden] { display: none; }
   .btn.secondary { background: var(--secondary-bg); }
   .trip-nav { display: flex; flex-wrap: wrap; gap: 10px; }
   .trip-nav .btn { background: var(--nav-bg); color: var(--nav-text); }
@@ -1883,7 +1885,7 @@ BASE_CSS = THEME_CSS + """
     .trip-top.has-nav .stats { margin: 6px 0 0; }
   }
   .end-suggestion { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 13px; overflow-wrap: anywhere; }
-  .end-suggestion .btn { padding: 4px 10px; }
+  .end-suggestion .btn { padding: 4px 10px; flex: none; white-space: nowrap; }
   .purpose-choices { border: 0; padding: 0; margin: 10px 0 0; display: flex; gap: 6px; flex-wrap: wrap; }
   .purpose-choices legend { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
   .purpose-choice { position: relative; margin: 0; cursor: pointer; }
@@ -1941,7 +1943,7 @@ PASSWORD_FIELDS = """
 """
 
 ACCOUNT_HTML = """
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<!doctype html><html><head><meta charset="utf-8">
 <title>{{ title }}</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """
 .login-form { max-width: 420px; margin-bottom: 20px; }
 .login-table { overflow-x: auto; }
@@ -2028,7 +2030,6 @@ def http_error(error):
 
 LOGIN_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Sign in · Mileage Tracker</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
 """ + THEME_HEAD + """<style>""" + THEME_CSS + """
   body { font-family: system-ui, sans-serif; background: var(--login-bg); color: var(--input-text); margin: 0;
          display: flex; min-height: 100vh; align-items: center; justify-content: center; }
@@ -2130,7 +2131,7 @@ LIST_HTML = """
   </div>
   <p class="muted">Totals cover recorded trips in this selection. Partly timed trips use their first recorded timestamp
     for year selection; their actual start can be in an earlier year. Trips with no usable date appear only under All years.</p>
-  <table>
+  <div class="trip-table"><table>
     <tr><th>Date</th><th>Distance</th><th>Duration</th><th>Avg mph</th>
         <th>Purpose</th><th>Destination</th><th>Note</th><th></th></tr>
     {% for t in trips %}
@@ -2148,7 +2149,7 @@ LIST_HTML = """
     {% if not trips %}
     <tr><td colspan="8" class="muted">No trips in this selection.</td></tr>
     {% endif %}
-  </table>
+  </table></div>
 </div></body></html>
 """
 
@@ -2401,7 +2402,6 @@ TRIP_HTML = """
 
 DEVICE_HEALTH_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Device health</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
 """ + THEME_HEAD + """<style>""" + BASE_CSS + """
   .health-table { overflow-x: auto; }
   .health-table td { vertical-align: top; overflow-wrap: anywhere; }
@@ -2665,7 +2665,7 @@ def admin():
 
 
 REMOVED_HTML = """
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<!doctype html><html><head><meta charset="utf-8">
 <title>Removed trips</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """
 .removed-table { overflow-x: auto; }
 .removed-table td { vertical-align: top; }
@@ -2706,7 +2706,7 @@ def admin_removed():
 
 
 HISTORY_HTML = """
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<!doctype html><html><head><meta charset="utf-8">
 <title>Change history</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """
 .history-table { overflow-x: auto; }
 .history-table td { vertical-align: top; overflow-wrap: anywhere; }
@@ -2874,7 +2874,7 @@ def _year_list():
 
 
 YEAR_HTML = """
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<!doctype html><html><head><meta charset="utf-8">
 <title>{{ year }} year review</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """
 .review-table { overflow-x: auto; }
 .review-table td { vertical-align: top; overflow-wrap: anywhere; }
