@@ -463,6 +463,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   `trip_removals`, `trip_history` and `tax_years`. Optional `geocoding.py`
   sends a selected endpoint to an explicitly configured provider only on an
   authenticated, CSRF-protected browser request, caching suggestions locally.
+  Installer Address lookup uses common/settings.py validators through host_python;
+  env_set updates viewer.env before compose up applies it on both platforms.
   Configurable interval, default 0.1 s for self-hosted providers; third-party
   providers need an interval matching their rate policy. Viewer-only
   `MAP_TILE_URL` selects base tiles (default OSM; `none` disables); attribution is plain text.

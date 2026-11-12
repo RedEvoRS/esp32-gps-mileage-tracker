@@ -986,6 +986,9 @@ against cross-site request forgery (CSRF).
 
 ### Endpoint place suggestions
 
+The installer's **Address lookup** step configures this optional feature; see
+[the installer choices and by-hand setup](../DEPLOY_DEBIAN.md#address-lookup).
+
 The trip's **Map / Edit** page can suggest readable start/end places using a
 Nominatim-compatible reverse-geocoding service. It is **disabled by default**.
 Set `VIEWER_GEOCODER_URL` in the private `viewer.env` to the full reverse endpoint

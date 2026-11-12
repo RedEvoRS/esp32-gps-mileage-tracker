@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
@@ -58,42 +58,21 @@ class Geocoder:
         return self.RESPONSE_BUDGET + self.CLEANUP_BUDGET + self.LEASE_MARGIN
 
     def __init__(self, db_path):
+        # The isolated HTTP child loads only stdlib and this file, and never
+        # constructs a Geocoder. Keep shared application imports out of it.
+        from common.settings import geocoder_endpoint, geocoder_interval
+
         self.db_path = db_path
         self.url = os.environ.get("VIEWER_GEOCODER_URL", "").strip()
         self.user_agent = os.environ.get(
             "VIEWER_GEOCODER_USER_AGENT", "GPSMileageTracker/1.0"
         ).strip()
         try:
-            self.interval = float(os.environ.get("VIEWER_GEOCODER_INTERVAL", "").strip() or self.INTERVAL)
-            if not math.isfinite(self.interval) or not 0.1 <= self.interval <= 60:
-                raise ValueError
-        except ValueError:
-            raise RuntimeError(
-                "Invalid VIEWER_GEOCODER_INTERVAL. Use a finite number from 0.1 to 60 seconds."
-            ) from None
-        if self.url:
-            try:
-                parts = urlsplit(self.url)
-                host = (parts.hostname or "").lower().rstrip(".")
-                valid = (parts.scheme in {"http", "https"} and host
-                         and parts.username is None and parts.password is None
-                         and not parts.query and not parts.fragment
-                         and self.url.isascii() and len(self.url) <= 2048
-                         and not any(ord(c) <= 32 or ord(c) == 127 for c in self.url)
-                         and parts.port != 0
-                         and host != "openstreetmap.org"
-                         and not host.endswith(".openstreetmap.org")
-                         and self.user_agent and self.user_agent.isascii() and len(self.user_agent) <= 256
-                         and not any(ord(c) < 32 or ord(c) == 127 for c in self.user_agent))
-            except ValueError:
-                valid = False
-            if not valid:
-                raise RuntimeError(
-                    "Invalid VIEWER_GEOCODER_URL or VIEWER_GEOCODER_USER_AGENT. "
-                    "Use a self-hosted or approved Nominatim reverse endpoint, "
-                    "without URL credentials, query or fragment. The public "
-                    "OpenStreetMap service does not permit vehicle tracking."
-                ) from None
+            self.interval = geocoder_interval(
+                os.environ.get("VIEWER_GEOCODER_INTERVAL", ""), self.INTERVAL)
+            geocoder_endpoint(self.url, self.user_agent)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from None
 
     @property
     def enabled(self):
