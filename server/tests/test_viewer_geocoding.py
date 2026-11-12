@@ -186,6 +186,8 @@ class EndpointPlaceTests(unittest.TestCase):
         self.assertEqual(parse_qs(urlsplit(self.received[-1][0]).query)["lat"], ["1.0"])
         html = self.client.get("/trip/2026-10/sample").get_data(as_text=True)
         self.assertIn('id="end-suggestion"', html)
+        # Auto lookup's Destination fill note starts hidden (#694).
+        self.assertIn('id="destination-autofill" role="status" hidden>', html)
         self.assertIn('>Use</button>', html)
         self.assertIn("sends only that endpoint", html)
         self.assertNotIn(self.provider_url, html)

@@ -5,6 +5,24 @@
   const endLabel = document.querySelector('[data-endpoint="end"] [data-place-label]');
   const suggestionLabel = document.getElementById('end-suggestion');
   let endSuggestion = useEnd && !useEnd.disabled ? endLabel.textContent : '';
+  const destination = document.getElementById('destination');
+  const autofillNote = document.getElementById('destination-autofill');
+  // Auto lookup may fill an empty Destination with the end suggestion. It never
+  // replaces a saved or typed destination, and nothing is saved until Save.
+  let autofilled = null;
+  let destinationTouched = false;
+  if (destination) destination.addEventListener('input', () => {
+    destinationTouched = true;
+    if (autofillNote) autofillNote.hidden = true;
+  });
+  function autofill() {
+    if (!(autoAllowed && autoLookup) || !destination || !endSuggestion || destinationTouched) return;
+    const untouchedFill = autofilled !== null && destination.value === autofilled;
+    if (destination.value.trim() !== '' && !untouchedFill) return;
+    destination.value = endSuggestion;
+    autofilled = endSuggestion;
+    if (autofillNote) autofillNote.hidden = false;
+  }
   const forms = Array.from(document.querySelectorAll('form[data-place-lookup]'));
   const completed = new Set(forms.filter(form => form.dataset.placeCached === 'true'));
   const failed = new Set();
@@ -41,6 +59,7 @@
           if (container.dataset.endpoint === 'end' && useEnd) {
             endSuggestion = data.label;
             useEnd.disabled = !endSuggestion;
+            autofill();
           }
         }
       } catch (_) {
@@ -83,9 +102,11 @@
     both.addEventListener('click', lookupMissing);
   }
   if (useEnd) useEnd.addEventListener('click', () => {
-    if (useEnd.disabled || !endSuggestion) return;
-    const destination = document.getElementById('destination');
+    if (useEnd.disabled || !endSuggestion || !destination) return;
     destination.value = endSuggestion;
+    // Use is an explicit choice: later lookups must not replace it.
+    destinationTouched = true;
+    if (autofillNote) autofillNote.hidden = true;
     destination.focus();
   });
   const autoAllowed = document.currentScript && document.currentScript.dataset.autoLookup === 'true';
@@ -121,10 +142,16 @@
           else localStorage.setItem('viewer-auto-lookup', 'off');
         } catch (_) {}
         updateAutoLookup();
-        if (autoLookup) lookupMissing();
+        if (autoLookup) {
+          autofill();
+          lookupMissing();
+        }
       });
       autoSwitch.hidden = false;
     }
-    if (autoLookup) lookupMissing();
+    if (autoLookup) {
+      autofill();
+      lookupMissing();
+    }
   }
 })();

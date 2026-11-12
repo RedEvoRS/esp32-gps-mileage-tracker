@@ -1913,6 +1913,7 @@ BASE_CSS = THEME_CSS + """
   }
   .end-suggestion { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 13px; overflow-wrap: anywhere; }
   .end-suggestion .btn { padding: 4px 10px; flex: none; white-space: nowrap; }
+  .autofill-note { margin: 4px 0 0; font-size: 13px; font-weight: 600; color: var(--auto-on-text); }
   .purpose-choices { border: 0; padding: 0; margin: 10px 0 0; display: flex; gap: 6px; flex-wrap: wrap; }
   .purpose-choices legend { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
   .purpose-choice { position: relative; margin: 0; cursor: pointer; }
@@ -2275,6 +2276,7 @@ TRIP_HTML = """
     <div class="end-suggestion"><span role="status" id="end-suggestion">End: {% if places['end'] is none %}not looked up yet{% elif places['end'] %}{{ places['end'] }}{% else %}no mapped address found{% endif %}</span>
     <button type="button" class="btn secondary" id="use-end-place"
       {% if not places.get('end') %}disabled{% endif %}>Use</button></div>
+    <p class="autofill-note" id="destination-autofill" role="status" hidden>Filled from the end suggestion. Check it, then Save.</p>
     {% endif %}
     <label for="purpose_note">Note (e.g. "Client visit — Acme Corp")</label>
     <textarea name="purpose_note" id="purpose_note" rows="3" maxlength="{{ annotation_max }}">{{ t.purpose_note or "" }}</textarea>

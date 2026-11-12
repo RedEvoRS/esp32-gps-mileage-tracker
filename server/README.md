@@ -1068,6 +1068,10 @@ street or may omit the business name. They do not verify a visit or correct GPS
 drift. Missing or invalid recordings cannot be looked up. The **End:** line beneath Destination shows the lookup status or suggestion.
 Click its **Use** button to replace the editable Destination field, check it,
 then **Save**. Use stays disabled until a suggestion is available.
+With **Auto lookup: On**, an empty Destination is filled with the end
+suggestion as soon as it is known, and a note under it says so. A destination
+that was saved, typed or chosen with **Use** is never replaced. The filled
+text is not saved until you click **Save**, so check it first.
 Lookup never changes a saved annotation. The saved destination appears in the
 trip list and CSV/XLSX exports through the existing annotation flow. Exports do
 not perform lookup or add unreviewed address suggestions.

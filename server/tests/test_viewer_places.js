@@ -4,7 +4,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../mileage-viewer/static/endpoint-places.js'), 'utf8');
 const tick = () => new Promise(resolve => setImmediate(resolve));
-function setup({auto = false, cached = [], endpoints = ['start', 'end'], storage = new Map(), throws = []} = {}) {
+function setup({auto = false, cached = [], endpoints = ['start', 'end'], storage = new Map(), throws = [], value = 'Unsaved edit'} = {}) {
   const autoSwitch = {hidden: true, attributes: {}, textContent: '',
     setAttribute(k, v) { this.attributes[k] = v; }, addEventListener(_, fn) { this.click = fn; }};
   const autoStatus = {textContent: ''};
@@ -13,7 +13,9 @@ function setup({auto = false, cached = [], endpoints = ['start', 'end'], storage
     setItem(k, v) { if (throws.includes('set')) throw Error('blocked'); storage.set(k, v); },
     removeItem(k) { if (throws.includes('remove')) throw Error('blocked'); storage.delete(k); },
   };
-  const destination = {value: 'Unsaved edit', focus() { this.focused = true; }};
+  const destination = {value, focus() { this.focused = true; }, addEventListener(_, fn) { this.input = fn; },
+    type(text) { this.value = text; this.input(); }};
+  const note = {hidden: true};
   const useEnd = {disabled: !cached.includes('end'), addEventListener(_, fn) { this.click = fn; }};
   const suggestion = {textContent: ''};
   const both = {disabled: true, addEventListener(_, fn) { this.click = fn; }};
@@ -27,7 +29,7 @@ function setup({auto = false, cached = [], endpoints = ['start', 'end'], storage
   const calls = [];
   vm.runInNewContext(source, {localStorage, document: {
     currentScript: {dataset: auto ? {autoLookup: 'true'} : {}},
-    getElementById(id) { return {'end-suggestion': suggestion, 'auto-lookup': auto ? autoSwitch : null, 'use-end-place': useEnd, 'lookup-both-places': endpoints.length === 2 ? both : null, destination}[id]; },
+    getElementById(id) { return {'end-suggestion': suggestion, 'auto-lookup': auto ? autoSwitch : null, 'use-end-place': useEnd, 'lookup-both-places': endpoints.length === 2 ? both : null, destination, 'destination-autofill': note}[id]; },
     querySelector(selector) { return selector === '[data-auto-lookup-status]' ? autoStatus : labels.end; }, querySelectorAll() { return forms; }},
     FormData: class {constructor(form) { this.form = form; }},
     fetch(url, options) { return new Promise(resolve => calls.push({url, options, resolve})); }});
@@ -35,7 +37,7 @@ function setup({auto = false, cached = [], endpoints = ['start', 'end'], storage
     calls[index].resolve({ok, async json() { if (data === null) throw Error('not JSON'); return data; }});
     await tick();
   }
-  return {suggestion, autoSwitch, autoStatus, storage, forms, labels, both, calls, destination, useEnd, respond,
+  return {note, suggestion, autoSwitch, autoStatus, storage, forms, labels, both, calls, destination, useEnd, respond,
     submit(index) { return forms[index].submit({preventDefault() {}}); }};
 }
 async function run() {
@@ -148,9 +150,55 @@ async function run() {
     await blocked.respond(0, {label: ''});
     await blocked.respond(1, {label: ''});
   }
+  // Auto lookup fills an empty Destination with the end suggestion (#694).
+  const cachedFill = setup({auto: true, cached: ['start', 'end'], value: ''});
+  assert.equal(cachedFill.destination.value, 'Cached end', 'cached suggestion fills an empty field');
+  assert.equal(cachedFill.note.hidden, false);
+  assert.equal(cachedFill.calls.length, 0, 'filling sends nothing');
+  const blank = setup({auto: true, cached: ['start', 'end'], value: '   '});
+  assert.equal(blank.destination.value, 'Cached end', 'whitespace counts as empty');
+  const saved = setup({auto: true, cached: ['start', 'end'], value: 'Saved place'});
+  assert.equal(saved.destination.value, 'Saved place', 'a saved destination is never replaced');
+  assert.equal(saved.note.hidden, true);
+  const manual = setup({cached: ['start', 'end'], value: ''});
+  assert.equal(manual.destination.value, '', 'no fill without server auto lookup');
+  const offFill = setup({auto: true, cached: ['start', 'end'], value: '', storage: new Map([[key, 'off']])});
+  assert.equal(offFill.destination.value, '', 'no fill while Off');
+  offFill.autoSwitch.click();
+  assert.equal(offFill.destination.value, 'Cached end', 'switching On fills');
+  const lookedUp = setup({auto: true, value: ''});
+  assert.equal(lookedUp.destination.value, '');
+  await lookedUp.respond(0, {label: 'Example start'});
+  assert.equal(lookedUp.destination.value, '', 'the start place never fills Destination');
+  await lookedUp.respond(1, {label: '200 Sample Rd'});
+  assert.equal(lookedUp.destination.value, '200 Sample Rd', 'a finished end lookup fills');
+  lookedUp.submit(1); await lookedUp.respond(2, {label: '300 Sample Rd'});
+  assert.equal(lookedUp.destination.value, '300 Sample Rd', 'a retry updates an untouched fill');
+  lookedUp.submit(1); await lookedUp.respond(3, {error: 'Provider unavailable.'}, false);
+  assert.equal(lookedUp.destination.value, '300 Sample Rd', 'a failed retry keeps the fill');
+  lookedUp.destination.type('Client office');
+  assert.equal(lookedUp.note.hidden, true, 'typing hides the note');
+  lookedUp.submit(1); await lookedUp.respond(4, {label: '400 Sample Rd'});
+  assert.equal(lookedUp.destination.value, 'Client office', 'typed text is never replaced');
+  const typedFirst = setup({auto: true, value: ''});
+  typedFirst.destination.type('Typed before lookup');
+  await typedFirst.respond(0, {label: ''});
+  await typedFirst.respond(1, {label: '200 Sample Rd'});
+  assert.equal(typedFirst.destination.value, 'Typed before lookup');
+  const cleared = setup({auto: true, value: ''});
+  await cleared.respond(0, {label: ''});
+  await cleared.respond(1, {label: '200 Sample Rd'});
+  cleared.destination.type('');
+  cleared.submit(1); await cleared.respond(2, {label: '300 Sample Rd'});
+  assert.equal(cleared.destination.value, '', 'a field the user cleared stays empty');
+  const used = setup({auto: true, cached: ['start', 'end'], value: ''});
+  used.useEnd.click();
+  assert.equal(used.note.hidden, true, 'Use is an explicit choice');
+  used.submit(1); await used.respond(0, {label: 'Other place'});
+  assert.equal(used.destination.value, 'Cached end', 'a later lookup never replaces a used suggestion');
   const denied = setup({storage: new Map([[key, 'off']])});
   assert.equal(denied.autoSwitch.hidden, true);
   assert.equal(denied.calls.length, 0);
-  console.log('Endpoint lookup controller: 1 suite passed (queue order/deduplication, both, auto preference/toggles/storage errors, cache, inert text, edits, failures).');
+  console.log('Endpoint lookup controller: 1 suite passed (queue order/deduplication, both, auto preference/toggles/storage errors, cache, inert text, edits, failures, destination autofill).');
 }
 run().catch(error => {console.error(error); process.exitCode = 1;});
