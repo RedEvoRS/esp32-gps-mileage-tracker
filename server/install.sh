@@ -1220,6 +1220,140 @@ configure() {
     setup_data_dir
     setup_env
     setup_viewer_env
+    setup_geocoder
+}
+
+# Shared viewer checks run on the host or in host_python's isolated container.
+geocoder_validate() {
+    host_python proxy - "$@" <<'PY'
+import sys
+from common.settings import boolean, geocoder_endpoint, geocoder_interval, geocoder_public_host
+try:
+    url, agent, gap, auto, kind = sys.argv[1:]
+    # Reject controls before writing a one-line env value; the viewer also
+    # strips surrounding spaces before checking its effective configuration.
+    geocoder_endpoint(url, agent)
+    geocoder_endpoint(url.strip(), agent.strip())
+    interval = geocoder_interval(gap)
+    boolean({"VIEWER_GEOCODER_AUTO_LOOKUP": auto}, "VIEWER_GEOCODER_AUTO_LOOKUP", "false")
+    if kind == "third-party" and interval < 1:
+        raise ValueError("Third-party lookup gap must be from 1 to 60 seconds.")
+    if kind == "third-party" and auto != "false":
+        raise ValueError("Third-party automatic lookup must be false.")
+    if url and interval < 1 and geocoder_public_host(url):
+        print("public")
+except ValueError as exc:
+    print(exc)
+    sys.exit(1)
+PY
+}
+
+setup_geocoder() {
+    section "Address lookup"
+    local url agent gap auto kind='' answer error key
+    local -a values=()
+    for key in URL USER_AGENT INTERVAL AUTO_LOOKUP; do
+        settings_request value "$(env_raw viewer.env "VIEWER_GEOCODER_$key")"
+        values+=("$SETTINGS_REPLY")
+    done
+    url=${values[0]} agent=${values[1]:-GPSMileageTracker/1.0}
+    gap=${values[2]} auto=${values[3]:-false}
+    if [[ -n $url ]]; then
+        note "Address lookup is on: $url" "Lookup gap: ${gap:-0.1} seconds; automatic lookup: $auto; User-Agent: $agent"
+    else
+        note "Address lookup is off; lookup gap: ${gap:-0.1} seconds."
+    fi
+    if [[ $MODE == check ]]; then
+        if ! error=$(geocoder_validate "$url" "$agent" "$gap" "$auto" ''); then
+            problem "Invalid address lookup settings: $error"
+        elif [[ $error == public ]]; then
+            warn "Address lookup gap is under 1 second for a public host." \
+                "Check the provider's usage policy; third-party providers commonly require at least one second."
+        fi
+        return 0
+    fi
+    # Presets are deliberate changes; reject orphan answers rather than ignore them.
+    for key in URL INTERVAL AUTO_LOOKUP USER_AGENT; do
+        answer="INSTALL_GEOCODER_$key"
+        if [[ -n ${!answer+set} && -z ${INSTALL_GEOCODER+set} ]]; then
+            die "$answer requires INSTALL_GEOCODER=none, self-hosted or third-party."
+        fi
+    done
+    for key in URL INTERVAL AUTO_LOOKUP USER_AGENT; do
+        answer="INSTALL_GEOCODER_$key"
+        if [[ -n ${!answer+set} && -z ${!answer} ]]; then
+            die "$answer must not be empty; omit it to keep the default."
+        fi
+    done
+    if [[ -n $url && -z $gap ]]; then
+        note "Older address lookup settings have no gap. The old default was 1.1 seconds."
+        if [[ ! -t 0 && -z ${INSTALL_GEOCODER+set} ]]; then
+            env_set viewer.env VIEWER_GEOCODER_INTERVAL 1.1
+            note "Kept the old 1.1 second pace. For your own provider, rerun with INSTALL_GEOCODER=self-hosted and INSTALL_GEOCODER_URL set to its full /reverse URL to use 0.1 seconds."
+            return 0
+        fi
+        kind=choose
+    elif [[ -z ${INSTALL_GEOCODER+set} ]]; then
+        if [[ ! -t 0 ]]; then return 0; fi
+        if [[ -n $url || -n $gap ]]; then
+            if ! confirm CHANGE_GEOCODER "Change the current address lookup settings?" n; then return 0; fi
+        fi
+    fi
+    if [[ -n ${INSTALL_GEOCODER+set} ]]; then
+        kind=$INSTALL_GEOCODER
+    elif [[ $kind != choose ]]; then
+        if ! confirm ENABLE_GEOCODER "Turn on place suggestions?" n; then return 0; fi
+        kind=choose
+    fi
+    if [[ $kind == choose ]]; then
+        ask kind GEOCODER "Provider kind (self-hosted or third-party)"
+    fi
+    case $kind in
+        none)
+            for key in URL INTERVAL AUTO_LOOKUP USER_AGENT; do
+                answer="INSTALL_GEOCODER_$key"
+                [[ -z ${!answer+set} ]] || die "$answer cannot be used with INSTALL_GEOCODER=none."
+            done
+            if [[ -n $url ]]; then
+                env_set viewer.env VIEWER_GEOCODER_URL "''"
+                env_set viewer.env VIEWER_GEOCODER_AUTO_LOOKUP false
+            fi
+            return 0 ;;
+        self-hosted|third-party) ;;
+        *) die "INSTALL_GEOCODER must be none, self-hosted or third-party." ;;
+    esac
+    ask url GEOCODER_URL "Full Nominatim /reverse URL" "$url"
+    [[ -n $url ]] || die "INSTALL_GEOCODER_URL must not be empty."
+    if [[ $kind == self-hosted ]]; then
+        gap=${INSTALL_GEOCODER_INTERVAL-0.1}
+        auto=${INSTALL_GEOCODER_AUTO_LOOKUP-false}
+        if [[ -z ${INSTALL_GEOCODER_AUTO_LOOKUP+set} && -t 0 ]]; then
+            if confirm GEOCODER_AUTO_LOOKUP "Look places up automatically when a trip opens?" n; then auto=true; fi
+        fi
+        agent=${INSTALL_GEOCODER_USER_AGENT:-$agent}
+    else
+        note "The provider's usage policy limits how often one server may ask, commonly one request per second." \
+            "Going faster breaks the policy and can get your server blocked. Use a higher gap if your provider requires it." \
+            "Automatic lookup stays off: every trip opened would send its endpoints to them."
+        gap=${INSTALL_GEOCODER_INTERVAL-1.1}
+        if [[ -t 0 || -n ${INSTALL_GEOCODER_INTERVAL+set} ]]; then
+            ask gap GEOCODER_INTERVAL "Gap between lookups in seconds (1 to 60)" 1.1
+        fi
+        if [[ -t 0 || -n ${INSTALL_GEOCODER_USER_AGENT+set} ]]; then
+            ask agent GEOCODER_USER_AGENT "Provider's required identifying User-Agent (optional)" "$agent"
+        fi
+        auto=${INSTALL_GEOCODER_AUTO_LOOKUP-false}
+    fi
+    if ! error=$(geocoder_validate "$url" "$agent" "$gap" "$auto" "$kind"); then
+        die "Invalid address lookup settings: $error"
+    fi
+    settings_request quote "$url"
+    env_set viewer.env VIEWER_GEOCODER_URL "$SETTINGS_REPLY"
+    env_set viewer.env VIEWER_GEOCODER_INTERVAL "$gap"
+    env_set viewer.env VIEWER_GEOCODER_AUTO_LOOKUP "$auto"
+    settings_request quote "$agent"
+    env_set viewer.env VIEWER_GEOCODER_USER_AGENT "$SETTINGS_REPLY"
+    ok "Address lookup configured; the viewer loads these settings when services start below."
 }
 
 # --- Build and start ---------------------------------------------------

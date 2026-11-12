@@ -78,6 +78,66 @@ Allow space on both the install pool and Docker's storage. Setup checks
 them separately: a Docker image disk can fill while the pool still has
 space. Allow at least 10 GiB free for the first firmware build.
 
+
+### Address lookup
+
+The installer's optional **Address lookup** step offers place suggestions for
+trip endpoints. Answer **no** to leave it off. If enabled, choose **self-hosted**
+(a provider you run) or **third-party** (someone else's provider), then enter
+the full Nominatim `/reverse` URL. The installer asks who runs it rather than
+guessing from the URL.
+
+Self-hosted service uses a 0.1 second gap (an unattended install can set a
+longer one, up to 60 seconds). Automatic lookup when a trip opens
+is optional, default no. Third-party providers limit how often one server may
+ask, commonly one request per second. Going faster breaks their usage policy
+and can get your server blocked. The installer asks for a gap of 1 to 60 seconds
+(default 1.1) and their required identifying User-Agent (optional, default
+`GPSMileageTracker/1.0`). Follow their policy; choose another provider if it
+requires a gap beyond this supported range. Automatic lookup stays off because
+every trip opened would send its endpoints to them. Manual lookup also sends
+the selected endpoint's coordinates and reveals your server's network address.
+Use a provider you trust with this information. Public OpenStreetMap Nominatim
+does not permit vehicle tracking and is refused.
+
+Reruns show current settings and keep them unless you choose to change them.
+Older installs with a URL but no gap relied on the old 1.1 second default:
+the installer asks which kind of provider it is. Without terminal input it
+writes 1.1 to keep the old pace and explains how to select self-hosted service.
+`install.sh --check` reports on/off and the gap. A gap under one second for a
+public host produces a warning, not a failed check. A host counts as public
+when it is a dotted name or a public IP address; loopback, private-range
+addresses, single-word names such as a Docker container name, and local names
+ending in `.local`, `.lan`, `.internal`, `.localdomain`, `.home.arpa` or
+Tailscale's `.ts.net` don't. This warning cannot tell who runs the provider.
+
+Unattended answers (set these alongside the other `INSTALL_*` variables):
+
+- `INSTALL_GEOCODER=none|self-hosted|third-party`: `none` leaves a new install
+  off or disables existing lookup. A provider preset skips the keep question.
+- `INSTALL_GEOCODER_URL`: full `/reverse` URL, required when enabling unless
+  already configured.
+- `INSTALL_GEOCODER_INTERVAL`: optional; self-hosted accepts 0.1 to 60, default 0.1;
+  third-party accepts 1 to 60, default 1.1.
+- `INSTALL_GEOCODER_AUTO_LOOKUP=true|false`: optional, default false;
+  third-party requires false.
+- `INSTALL_GEOCODER_USER_AGENT`: optional, keeps the current value or
+  `GPSMileageTracker/1.0`.
+
+Do not supply lookup answers with `none`. Without presets or terminal input,
+new installs stay off and reruns keep existing settings, except for the older
+install migration above.
+
+For setup by hand, edit `viewer.env`. Set `VIEWER_GEOCODER_URL` to the reverse
+URL and `VIEWER_GEOCODER_INTERVAL=0.1` for your own provider or `1.1` (or the
+higher gap its policy requires) for third-party service. Set
+`VIEWER_GEOCODER_AUTO_LOOKUP=false`; choose `true` only if you want opened trips'
+uncached endpoints sent automatically. Set `VIEWER_GEOCODER_USER_AGENT` if
+required. Single-quote URL and User-Agent values, keep the file private with
+`chmod 600 viewer.env`, then run `docker compose up -d` from the server folder
+to load the changed values. The installer applies its edits on the same run.
+
+
 ## Step 1 — Install with `setup.sh`
 
 Read the [download and trust note](README.md#setting-it-up). In the root

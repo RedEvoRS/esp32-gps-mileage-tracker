@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
@@ -39,7 +39,12 @@ class NoRedirect(HTTPRedirectHandler):
 class Geocoder:
     MAX_RESPONSE = 65536
     MAX_LABEL = 1000
-    INTERVAL = 1.1
+    INTERVAL = 0.1
+    WAIT_CAP = 2.0
+    # How often a request rechecks while another lookup holds the gate.
+    POLL = 0.05
+    # Gate token after a provider failure. A completed success stores "".
+    FAILED = "failed"
     RESPONSE_BUDGET = 10
     CLEANUP_BUDGET = 1
     LEASE_MARGIN = 5
@@ -53,42 +58,21 @@ class Geocoder:
         return self.RESPONSE_BUDGET + self.CLEANUP_BUDGET + self.LEASE_MARGIN
 
     def __init__(self, db_path):
+        # The isolated HTTP child loads only stdlib and this file, and never
+        # constructs a Geocoder. Keep shared application imports out of it.
+        from common.settings import geocoder_endpoint, geocoder_interval
+
         self.db_path = db_path
         self.url = os.environ.get("VIEWER_GEOCODER_URL", "").strip()
         self.user_agent = os.environ.get(
             "VIEWER_GEOCODER_USER_AGENT", "GPSMileageTracker/1.0"
         ).strip()
         try:
-            self.interval = float(os.environ.get("VIEWER_GEOCODER_INTERVAL", "").strip() or self.INTERVAL)
-            if not math.isfinite(self.interval) or not 0.1 <= self.interval <= 60:
-                raise ValueError
-        except ValueError:
-            raise RuntimeError(
-                "Invalid VIEWER_GEOCODER_INTERVAL. Use a finite number from 0.1 to 60 seconds."
-            ) from None
-        if self.url:
-            try:
-                parts = urlsplit(self.url)
-                host = (parts.hostname or "").lower().rstrip(".")
-                valid = (parts.scheme in {"http", "https"} and host
-                         and parts.username is None and parts.password is None
-                         and not parts.query and not parts.fragment
-                         and self.url.isascii() and len(self.url) <= 2048
-                         and not any(ord(c) <= 32 or ord(c) == 127 for c in self.url)
-                         and parts.port != 0
-                         and host != "openstreetmap.org"
-                         and not host.endswith(".openstreetmap.org")
-                         and self.user_agent and self.user_agent.isascii() and len(self.user_agent) <= 256
-                         and not any(ord(c) < 32 or ord(c) == 127 for c in self.user_agent))
-            except ValueError:
-                valid = False
-            if not valid:
-                raise RuntimeError(
-                    "Invalid VIEWER_GEOCODER_URL or VIEWER_GEOCODER_USER_AGENT. "
-                    "Use a self-hosted or approved Nominatim reverse endpoint, "
-                    "without URL credentials, query or fragment. The public "
-                    "OpenStreetMap service does not permit vehicle tracking."
-                ) from None
+            self.interval = geocoder_interval(
+                os.environ.get("VIEWER_GEOCODER_INTERVAL", ""), self.INTERVAL)
+            geocoder_endpoint(self.url, self.user_agent)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from None
 
     @property
     def enabled(self):
@@ -128,27 +112,53 @@ class Geocoder:
             raise GeocodeError("Address lookup is not configured.", 503)
         key = self.key(latitude, longitude)
         token = os.urandom(16).hex()
-        # A short transaction reserves the provider across all workers. Never
-        # hold a SQLite write lock during HTTP or block manual annotation saves.
-        with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT label FROM geocode_cache WHERE cache_key = ?", (key,)
-            ).fetchone()
-            if row is not None:
-                return row[0]
-            gate = conn.execute("SELECT next_allowed FROM geocode_gate WHERE singleton = 1").fetchone()
-            now = time.time()
-            if gate and now < gate[0]:
-                raise GeocodeError("Address lookup is busy or cooling down. Try again later.", 429)
-            conn.execute(
-                "INSERT OR REPLACE INTO geocode_gate VALUES (1, ?, ?)", (now + self.LEASE, token)
-            )
+        # The gate token says why the gate is closed: "" after a completed
+        # success (wait out the short gap), FAILED after a provider failure
+        # (refuse at once), anything else while a lookup holds the reservation
+        # (poll briefly: a local provider answers well inside the budget). A
+        # reservation never extends more than LEASE ahead, so a longer wait is
+        # a cooldown, including rows written before tokens were marked. Every
+        # wait is bounded by WAIT_CAP, and each waiter must reserve again under
+        # the lock, so two waiters cannot both call inside one gap.
+        deadline = time.monotonic() + self.WAIT_CAP
+        while True:
+            with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT label FROM geocode_cache WHERE cache_key = ?", (key,)
+                ).fetchone()
+                if row is not None:
+                    return row[0]
+                gate = conn.execute(
+                    "SELECT next_allowed, token FROM geocode_gate WHERE singleton = 1"
+                ).fetchone()
+                now = time.time()
+                remaining = gate[0] - now if gate else 0
+                if remaining <= 0:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO geocode_gate VALUES (1, ?, ?)",
+                        (now + self.LEASE, token),
+                    )
+                    break
+                if gate[1] == "":
+                    wait = remaining
+                    refuse = remaining > min(self.interval, self.WAIT_CAP)
+                elif gate[1] != self.FAILED and remaining <= self.LEASE:
+                    wait = min(self.POLL, remaining)
+                    refuse = False
+                else:
+                    refuse = True
+                if refuse or wait > deadline - time.monotonic():
+                    raise GeocodeError("Address lookup is busy or cooling down. Try again later.", 429)
+            # The transaction and connection have ended before sleeping.
+            time.sleep(wait)
         # Worker aborts (SystemExit/KeyboardInterrupt) still run finally. Treat
         # any incomplete provider call as failure, including those abort paths.
         cooldown = 300
+        succeeded = False
         try:
             label = self._fetch(latitude, longitude)
+            succeeded = True
             cooldown = self.interval
             with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
                 conn.execute(
@@ -164,8 +174,9 @@ class Geocoder:
         finally:
             with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
                 conn.execute(
-                    "UPDATE geocode_gate SET next_allowed = ? WHERE singleton = 1 AND token = ?",
-                    (time.time() + cooldown, token),
+                    "UPDATE geocode_gate SET next_allowed = ?, token = ? "
+                    "WHERE singleton = 1 AND token = ?",
+                    (time.time() + cooldown, "" if succeeded else self.FAILED, token),
                 )
 
     def _fetch(self, latitude, longitude):

@@ -90,7 +90,7 @@ for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resol
         sys.path.insert(0, str(import_root))
 
 from common.version import server_version
-from common.settings import map_tiles, trusted_proxies, viewer_cookie_secure
+from common.settings import boolean, map_tiles, trusted_proxies, viewer_cookie_secure
 
 from common.diagnostics import CatalogError, load_catalog
 from geocoding import Geocoder, GeocodeError
@@ -154,6 +154,9 @@ VIEWER_PASSWORD_HASH = os.environ.get("VIEWER_PASSWORD_HASH", "").strip()
 VIEWER_SECRET_KEY = os.environ.get("VIEWER_SECRET_KEY", "").strip()
 try:
     VIEWER_TRUSTED_PROXIES = trusted_proxies(os.environ.get("VIEWER_TRUSTED_PROXIES", ""))
+    GEOCODER_AUTO_LOOKUP = boolean(
+        {"VIEWER_GEOCODER_AUTO_LOOKUP": os.environ.get("VIEWER_GEOCODER_AUTO_LOOKUP", "") or "false"},
+        "VIEWER_GEOCODER_AUTO_LOOKUP", "false")
     VIEWER_COOKIE_SECURE = viewer_cookie_secure(os.environ.get("VIEWER_COOKIE_SECURE", ""))
     MAP_TILE_URL, MAP_TILE_ATTRIBUTION = map_tiles(
         os.environ.get("MAP_TILE_URL", ""), os.environ.get("MAP_TILE_ATTRIBUTION", ""))
@@ -2146,13 +2149,16 @@ TRIP_HTML = """
       corrected parking locations. Check them before using them in a mileage record.</p>
     {% if geocoder_enabled %}
     <p>Each lookup sends only that endpoint's coordinates to the address provider configured
-      by your server administrator. Results are saved locally. Nothing is sent until you click.</p>
+      by your server administrator. Results are saved locally. {% if geocoder_auto_lookup %}Uncached endpoints are looked up when a trip opens.{% else %}Nothing is sent until you click.{% endif %}</p>
+    {% if 'start' in places and 'end' in places %}
+    <button id="lookup-both-places" class="btn" type="button" disabled>Look up both places</button>
+    {% endif %}
     {% for endpoint, title in [('start', 'Start'), ('end', 'End')] %}
     <div class="endpoint-place" data-endpoint="{{ endpoint }}">
       <b>{{ title }}</b>
       {% if endpoint in places %}
       <p data-place-label role="status">{% if places[endpoint] is none %}Not looked up yet.{% elif places[endpoint] %}{{ places[endpoint] }}{% else %}No mapped address found.{% endif %}</p>
-      <form data-place-lookup method="post" action="{{ url_for('lookup_place', ym=t.ym, trip_id=t.id) }}">
+      <form data-place-lookup data-place-cached="{{ 'true' if places[endpoint] is not none else 'false' }}" method="post" action="{{ url_for('lookup_place', ym=t.ym, trip_id=t.id) }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <input type="hidden" name="endpoint" value="{{ endpoint }}">
         <button class="btn" type="submit" disabled>Look up {{ endpoint }} place</button>
@@ -2255,7 +2261,7 @@ TRIP_HTML = """
 </div>
 
 {% if geocoder_enabled %}
-<script src="{{ url_for('static', filename='endpoint-places.js') }}"></script>
+<script src="{{ url_for('static', filename='endpoint-places.js') }}"{% if geocoder_auto_lookup %} data-auto-lookup="true"{% endif %}></script>
 {% endif %}
 {% if t.has_gpx %}
 <script src="{{ url_for('static', filename='leaflet.js') }}"></script>
@@ -3288,7 +3294,7 @@ def trip_view(ym, trip_id):
                 )
     return render_template_string(TRIP_HTML, t=t, categories=CATEGORIES, year=year,
                                   previous_trip=previous_trip, next_trip=next_trip,
-                                  geocoder_enabled=GEOCODER.enabled, places=places, merge_next=merge_next,
+                                  geocoder_enabled=GEOCODER.enabled, geocoder_auto_lookup=GEOCODER_AUTO_LOOKUP, places=places, merge_next=merge_next,
                                   merge_block_reason=merge_block_reason,
                                   last_edited=last_edited, year_lock=year_lock,
                                   merge_conflict=bool(merge_next and trip_merges.annotated(t) and trip_merges.annotated(merge_next)))

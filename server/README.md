@@ -986,6 +986,9 @@ against cross-site request forgery (CSRF).
 
 ### Endpoint place suggestions
 
+The installer's **Address lookup** step configures this optional feature; see
+[the installer choices and by-hand setup](../DEPLOY_DEBIAN.md#address-lookup).
+
 The trip's **Map / Edit** page can suggest readable start/end places using a
 Nominatim-compatible reverse-geocoding service. It is **disabled by default**.
 Set `VIEWER_GEOCODER_URL` in the private `viewer.env` to the full reverse endpoint
@@ -1023,8 +1026,15 @@ The viewer rejects `openstreetmap.org` hosts. Map tiles remain independent of
 address lookup. Google Maps/Places is not a provider in this implementation.
 
 Click **Look up start place** or **Look up end place** to send only the selected
-recorded endpoint to your configured provider. No lookup runs when viewing a
-page, exporting, uploading, or in the background. The page explains this before
+recorded endpoint to your configured provider. **Look up both places** looks up
+start then end, skipping results already shown (including no-match results).
+Clicks made during a lookup wait in order; a waiting label confirms the click.
+No lookup runs when viewing a page unless you opt in with
+`VIEWER_GEOCODER_AUTO_LOOKUP=true` in `viewer.env` (empty/unset or `false` is off;
+other values prevent startup). This is intended for a self-hosted provider:
+with a third-party provider every trip opened sends its uncached endpoints.
+Cached endpoints send nothing, and removed trips never look up. Exports, uploads
+and background work never look anything up. The page explains this before
 the action. No full track, trip/device ID, note, category or destination is sent.
 Your provider can see the coordinate and server IP and may log the query; choose
 a provider and retention policy appropriate for your location data.
@@ -1046,13 +1056,33 @@ without deleting the cache or changing saved destinations. To refresh all result
 stop the viewer, back up the database, delete rows from `geocode_cache` using
 SQLite, then restart. A future lookup will query the configured provider again.
 
-A shared gate serializes requests across workers, with at least 1.1
-seconds after each successful call by default. Its reservation covers the
-entire lookup deadline and cleanup period, plus a five-second safety margin.
-Set `VIEWER_GEOCODER_INTERVAL` in `viewer.env` to change the normal gap
-(0.1 to 60 seconds); leaving it unset or empty keeps the default, which suits
-providers with a one-request-per-second policy. Use values below 1 second only
-with self-hosted Nominatim or a provider that explicitly permits them.
+A shared gate serializes requests across workers, with at least 0.1 seconds
+between a successful call finishing and the next call by default. This default
+suits self-hosted Nominatim. Set `VIEWER_GEOCODER_INTERVAL` in `viewer.env`
+(0.1 to 60 seconds) to match a third-party provider's rate policy, for example
+`1.1` for one request per second. **Existing third-party installs with no setting
+will send lookups up to ten times faster after updating**; set the interval
+before updating.
+
+A lookup that arrives while the gate is closed waits instead of failing, within
+a total budget of two seconds:
+
+- **During the normal gap** after a successful lookup, it waits out the rest of
+  the gap, if that is no more than the configured interval and no more than two
+  seconds.
+- **While another lookup is running** (for example, you clicked Previous/Next
+  before the last page's automatic lookup finished), it checks again every
+  0.05 seconds until that lookup finishes, then waits out the normal gap. A
+  self-hosted provider normally answers well inside the budget.
+- **After a provider failure**, it returns the busy message at once: the
+  failure cooldown below applies.
+
+If the budget runs out, it returns the usual busy message. The database write
+lock is released while waiting, so annotation saves can continue, and a cached
+result never waits. The gate records whether it closed after a success, during a
+running lookup or after a failure, so the viewer never has to guess from the
+time left. A running lookup's reservation covers the lookup deadline and cleanup
+plus five seconds of margin.
 Provider failures trigger a five-minute cooldown (longer `Retry-After` values are
 honoured up to seven days). There are no automatic retries,
 redirects, or ambient HTTP proxies. Responses have a 64 KiB size limit and a

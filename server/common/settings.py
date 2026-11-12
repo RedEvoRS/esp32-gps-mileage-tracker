@@ -1,6 +1,7 @@
 """Strict, stdlib-only environment settings shared by services and installer."""
 
 import ipaddress
+import math
 import html
 import re
 import unicodedata
@@ -71,3 +72,61 @@ def trusted_proxies(value):
 def viewer_cookie_secure(value):
     # Compose passes an empty example setting through; it means default false.
     return boolean({"VIEWER_COOKIE_SECURE": value or "false"}, "VIEWER_COOKIE_SECURE", "false")
+
+
+def geocoder_interval(value, default=0.1):
+    try:
+        interval = float(value.strip() or default)
+        if not math.isfinite(interval) or not 0.1 <= interval <= 60:
+            raise ValueError
+    except ValueError:
+        raise ValueError(
+            "Invalid VIEWER_GEOCODER_INTERVAL. Use a finite number from 0.1 to 60 seconds."
+        ) from None
+    return interval
+
+
+def geocoder_endpoint(url, user_agent):
+    if url:
+        try:
+            parts = urlsplit(url)
+            host = (parts.hostname or "").lower().rstrip(".")
+            valid = (parts.scheme in {"http", "https"} and host
+                     and parts.username is None and parts.password is None
+                     and not parts.query and not parts.fragment
+                     and url.isascii() and len(url) <= 2048
+                     and not any(ord(c) <= 32 or ord(c) == 127 for c in url)
+                     and parts.port != 0
+                     and host != "openstreetmap.org"
+                     and not host.endswith(".openstreetmap.org")
+                     and user_agent and user_agent.isascii() and len(user_agent) <= 256
+                     and not any(ord(c) < 32 or ord(c) == 127 for c in user_agent))
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError(
+                "Invalid VIEWER_GEOCODER_URL or VIEWER_GEOCODER_USER_AGENT. "
+                "Use a self-hosted or approved Nominatim reverse endpoint, "
+                "without URL credentials, query or fragment. The public "
+                "OpenStreetMap service does not permit vehicle tracking."
+            ) from None
+
+
+# Names that only resolve on a home network or a private tailnet.
+_LOCAL_SUFFIXES = (".local", ".lan", ".internal", ".localdomain", ".home.arpa", ".ts.net")
+
+
+def geocoder_public_host(url):
+    """Whether the host looks public; advisory only, never resolves DNS."""
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    if host == "localhost" or host.endswith(_LOCAL_SUFFIXES):
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return "." in host
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped
+    shared = ipaddress.ip_network("100.64.0.0/10")
+    return not (address.is_private or address.is_loopback or address.is_link_local
+                or (address.version == 4 and address in shared))
