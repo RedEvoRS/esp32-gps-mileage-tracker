@@ -12,7 +12,8 @@ class TripNavigationTests(YearTestBase):
         self.assertEqual(response.status_code, 200)
         page = response.get_data(as_text=True)
         nav = re.search(r'<nav class="trip-nav" aria-label="Trip navigation">.*?</nav>', page, re.S).group()
-        self.assertRegex(page, r'<div class="wrap">\s*' + re.escape(nav) + r'\s*<h2>')
+        self.assertRegex(page, r'<div class="trip-top has-nav">\s*' + re.escape(nav) +
+                         r'\s*<div class="trip-info"><div class="trip-title">\s*<h2>')
         return nav
 
     def assert_neighbours(self, key, older=None, newer=None, query="", client=None):
@@ -24,6 +25,40 @@ class TripNavigationTests(YearTestBase):
                 self.assertIn(f'<span class="btn" aria-disabled="true">{label}</span>', nav)
         self.assertLess(nav.index("← Previous"), nav.index("Next →"))
         return nav
+
+    def test_annotation_panel_precedes_map_and_secondary_actions(self):
+        key = self.add_trip("layout", "2026-03-01T12:00:00Z")
+        page = self.admin.get(f"/trip/{key}").get_data(as_text=True)
+        markers = ['class="annotation-panel"', 'class="trip-map"',
+                   'id="places-heading"', 'id="merge-heading"', 'id="remove-heading"']
+        positions = [page.index(marker) for marker in markers]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn('<select name="category"', page)
+        for value in ('business', 'personal', 'other', ''):
+            self.assertIn(f'type="radio" name="category" value="{value}"', page)
+        self.assertIn('data-header-menu aria-expanded="false" hidden', page)
+        self.assertIn('name="viewport"', page)
+
+    def test_shared_head_viewport_hidden_buttons_and_list_scroll(self):
+        for name in ("ACCOUNT_HTML", "ERROR_HTML", "LOGIN_HTML", "LIST_HTML", "TRIP_HTML",
+                     "DEVICE_HEALTH_HTML", "REMOVED_HTML", "HISTORY_HTML", "YEAR_HTML"):
+            self.assertEqual(getattr(self.viewer, name).count('name="viewport"'), 1, name)
+        key = self.add_trip("scroll", "2026-03-01T12:00:00Z")
+        listing = self.admin.get("/").get_data(as_text=True)
+        self.assertEqual(listing.count('name="viewport"'), 1)
+        # The phone viewport would otherwise let the wide table widen the whole page.
+        self.assertIn('<div class="trip-table"><table>', listing)
+        self.assertIn(".trip-table { overflow-x: auto; }", listing)
+        # Phones: each row is a card, so Map / Edit stays on screen (#691).
+        self.assertIn('<tr class="trip-head">', listing)
+        self.assertIn('<tr class="trip-row">', listing)
+        self.assertIn('<td class="c-open"><a class="btn" href=', listing)
+        self.assertIn(".trip-table .trip-row { display: grid;", listing)
+        self.assertIn('"date date date date open"', listing)
+        page = self.admin.get(f"/trip/{key}").get_data(as_text=True)
+        self.assertEqual(page.count('name="viewport"'), 1)
+        # .btn sets display:inline-block, which would override the hidden attribute.
+        self.assertIn(".btn[hidden] { display: none; }", page)
 
     def test_middle_and_ends_for_both_roles_reuse_full_snapshot(self):
         old = self.add_trip("old", "2026-03-01T12:00:00Z")

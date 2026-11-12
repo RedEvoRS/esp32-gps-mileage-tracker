@@ -1671,6 +1671,7 @@ app.jinja_env.globals.update(
 # ---------------------------------------------------------------------
 
 THEME_HEAD = """
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <script id="theme-init">
   (function () {
     var root = document.documentElement;
@@ -1678,6 +1679,25 @@ THEME_HEAD = """
     try { mode = localStorage.getItem('viewer-theme'); } catch (e) {}
     if (mode === 'light' || mode === 'dark') root.dataset.theme = mode;
     document.addEventListener('DOMContentLoaded', function () {
+      var menu = document.querySelector('[data-header-menu]');
+      var actions = document.querySelector('.header-actions');
+      if (menu && actions) {
+        menu.hidden = false;
+        actions.id = 'header-actions';
+        menu.setAttribute('aria-controls', actions.id);
+        menu.addEventListener('click', function () {
+          var expanded = menu.getAttribute('aria-expanded') !== 'true';
+          menu.setAttribute('aria-expanded', String(expanded));
+          actions.classList.toggle('menu-open', expanded);
+        });
+        document.addEventListener('keydown', function (event) {
+          if (event.key === 'Escape' && menu.getAttribute('aria-expanded') === 'true') {
+            menu.setAttribute('aria-expanded', 'false');
+            actions.classList.remove('menu-open');
+            menu.focus();
+          }
+        });
+      }
       var button = document.querySelector('[data-theme-toggle]');
       function label() {
         var current = root.dataset.theme || 'auto';
@@ -1782,6 +1802,21 @@ BASE_CSS = THEME_CSS + """
   header { background: var(--header-bg); color: var(--header-text); padding: 14px 22px;
            display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
   header a { color: var(--header-text); text-decoration: none; font-weight: 600; }
+  .header-menu { display: none; background: var(--header-button-bg); color: var(--header-button-text);
+    border: 1px solid var(--header-button-border); border-radius: 5px; padding: 5px 12px; font: inherit; cursor: pointer; }
+  @media (max-width: 599px) {
+    header { padding: 10px 16px; gap: 8px; }
+    .header-menu:not([hidden]) { display: block; margin-left: auto; }
+    .header-menu:not([hidden]) + .header-actions { display: none; }
+    .header-menu:not([hidden]) + .header-actions.menu-open { display: flex; flex-basis: 100%; }
+    body .wrap { padding: 14px 16px; }
+    .trip-title h2 { font-size: 20px; margin: 12px 0 2px; }
+    .trip-title p { font-size: 13px; margin: 0 0 8px; }
+    .trip-info .stats { flex-wrap: nowrap; gap: 12px; margin: 8px 0; }
+    .trip-info .stat { min-width: 0; }
+    .trip-info .stat b { font-size: 16px; }
+    .trip-info .stat span { font-size: 11px; }
+  }
   .header-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
                     justify-content: flex-end; margin-left: auto; }
   .header-version { color: var(--header-text); opacity: .85; font-size: 12px; white-space: nowrap; }
@@ -1799,10 +1834,38 @@ BASE_CSS = THEME_CSS + """
            background: var(--header-text); color: var(--header-bg); }
   .wrap { padding: 22px; }
   table { border-collapse: collapse; width: 100%; }
+  .trip-table { overflow-x: auto; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
   th { background: var(--table-head-bg); font-size: 13px; text-transform: uppercase; letter-spacing: .03em; }
   tr:hover td { background: var(--row-hover-bg); }
   .tag { background: var(--tag-bg); font-size: 12px; padding: 2px 8px; border-radius: 10px; }
+  /* Phones: each trip-list row becomes a card, so Map / Edit is on screen without a sideways swipe. */
+  @media (max-width: 599px) {
+    .trip-table { overflow-x: visible; }
+    .trip-table table, .trip-table tbody, .trip-table tr, .trip-table td { display: block; }
+    .trip-table .trip-head { display: none; }
+    .trip-table .trip-row { display: grid; grid-template-columns: auto auto auto 1fr auto;
+      grid-template-areas: "date date date date open" "dist dur avg avg avg"
+                           "purpose purpose purpose purpose purpose" "dest dest dest dest dest"
+                           "note note note note note";
+      gap: 4px 14px; align-items: baseline; padding: 10px 12px; margin: 0 0 10px;
+      border: 1px solid var(--border); border-radius: 8px; background: var(--card-bg); }
+    .trip-table .trip-row td { padding: 0; border: 0; background: none; min-width: 0; overflow-wrap: anywhere; }
+    .trip-table .c-date { grid-area: date; font-weight: 600; }
+    .trip-table .c-dist { grid-area: dist; }
+    .trip-table .c-dur { grid-area: dur; }
+    .trip-table .c-avg { grid-area: avg; }
+    .trip-table .c-avg::after { content: " avg mph"; color: var(--muted); }
+    .trip-table .c-purpose { grid-area: purpose; }
+    .trip-table .c-purpose::before { content: "Purpose: "; color: var(--muted); }
+    .trip-table .c-dest { grid-area: dest; }
+    .trip-table .c-dest::before { content: "Destination: "; color: var(--muted); }
+    .trip-table .c-note { grid-area: note; }
+    .trip-table .c-note::before { content: "Note: "; color: var(--muted); }
+    .trip-table .c-dest:empty, .trip-table .c-note:empty { display: none; }
+    .trip-table .c-dist, .trip-table .c-dur, .trip-table .c-avg, .trip-table .c-open .btn { white-space: nowrap; }
+    .trip-table .c-open { grid-area: open; align-self: center; }
+  }
   .business { background: var(--business-bg); color: var(--business-text); }
   .personal { background: var(--personal-bg); color: var(--personal-text); }
   .other    { background: var(--other-bg); color: var(--other-text); }
@@ -1812,6 +1875,7 @@ BASE_CSS = THEME_CSS + """
   .warn ul { margin: 6px 0 0; padding-left: 20px; }
   .btn { display: inline-block; background: var(--button-bg); color: var(--button-text); padding: 8px 14px;
          border-radius: 6px; text-decoration: none; border: none; cursor: pointer; font-size: 14px; }
+  .btn[hidden] { display: none; }
   .btn.secondary { background: var(--secondary-bg); }
   .trip-nav { display: flex; flex-wrap: wrap; gap: 10px; }
   .trip-nav .btn { background: var(--nav-bg); color: var(--nav-text); }
@@ -1838,6 +1902,39 @@ BASE_CSS = THEME_CSS + """
   .leaflet-bar a.leaflet-disabled { background: var(--map-control-hover); color: var(--map-control-disabled); }
   .leaflet-container .leaflet-control-attribution { background: var(--attribution-bg); color: var(--attribution-text); }
   .leaflet-control-attribution a { color: var(--map-link); }
+  @media (min-width: 900px) {
+    .trip-top.has-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 16px 24px; }
+    .trip-top.has-nav .trip-nav { flex: none; }
+    .trip-top.has-nav .trip-info { border-left: 1px solid var(--border); padding-left: 24px; min-width: 0; }
+    .trip-top.has-nav .trip-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 16px; }
+    .trip-top.has-nav h2 { margin: 0; }
+    .trip-top.has-nav .trip-title p { margin: 0; font-size: 14px; }
+    .trip-top.has-nav .stats { margin: 6px 0 0; }
+  }
+  .end-suggestion { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 13px; overflow-wrap: anywhere; }
+  .end-suggestion .btn { padding: 4px 10px; flex: none; white-space: nowrap; }
+  .purpose-choices { border: 0; padding: 0; margin: 10px 0 0; display: flex; gap: 6px; flex-wrap: wrap; }
+  .purpose-choices legend { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+  .purpose-choice { position: relative; margin: 0; cursor: pointer; }
+  .purpose-choice input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .purpose-choice span { display: block; padding: 7px 10px; border: 1px solid var(--input-border);
+    border-radius: 6px; background: var(--input-bg); color: var(--input-text); font-weight: normal; }
+  .purpose-choice input:checked + span { outline: 2px solid currentColor; outline-offset: -2px; font-weight: 700; }
+  .purpose-choice input:checked + .business { background: var(--business-bg); color: var(--business-text); }
+  .purpose-choice input:checked + .personal { background: var(--personal-bg); color: var(--personal-text); }
+  .purpose-choice input:checked + .other { background: var(--other-bg); color: var(--other-text); }
+  .purpose-choice input:focus-visible + span { outline: 3px solid var(--text); outline-offset: 3px; }
+  .purpose-none span { font-size: 12px; }
+  .trip-layout { display: grid; gap: 18px; margin-top: 14px; }
+  .annotation-panel { background: var(--card-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 4px 16px 12px; min-width: 0; }
+  .annotation-panel form.annotate { margin-top: 0; max-width: none; }
+  .trip-map { min-width: 0; }
+  @media (min-width: 900px) {
+    .trip-layout { grid-template-columns: minmax(0, 1fr) 360px; }
+    .trip-map { grid-column: 1; grid-row: 1; }
+    .annotation-panel { grid-column: 2; grid-row: 1; }
+  }
   form.annotate { margin-top: 18px; max-width: 520px; }
   label { display: block; margin: 10px 0 4px; font-weight: 600; font-size: 14px; }
   select, textarea, input[type=text], input[type=password] { width: 100%; padding: 8px; font-size: 14px; box-sizing: border-box;
@@ -1860,7 +1957,7 @@ VERSION_HEADER = '<div class="header-version">Server {{ server_version }}</div>'
 
 
 ACCOUNT_HEADER = """
-{% if g.role %}<header><a href="{{ url_for('index') }}">Trips</a><div class="header-actions">
+{% if g.role %}<header><a href="{{ url_for('index') }}">Trips</a><button type="button" class="header-menu" data-header-menu aria-expanded="false" hidden>Menu</button><div class="header-actions">
 """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + ACCOUNT_BUTTON + THEME_BUTTON + """
 <form class="logout" method="post" action="{{ url_for('logout') }}">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><button type="submit">Log out</button>
@@ -1873,7 +1970,7 @@ PASSWORD_FIELDS = """
 """
 
 ACCOUNT_HTML = """
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<!doctype html><html><head><meta charset="utf-8">
 <title>{{ title }}</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """
 .login-form { max-width: 420px; margin-bottom: 20px; }
 .login-table { overflow-x: auto; }
@@ -1960,7 +2057,6 @@ def http_error(error):
 
 LOGIN_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Sign in · Mileage Tracker</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
 """ + THEME_HEAD + """<style>""" + THEME_CSS + """
   body { font-family: system-ui, sans-serif; background: var(--login-bg); color: var(--input-text); margin: 0;
          display: flex; min-height: 100vh; align-items: center; justify-content: center; }
@@ -2001,7 +2097,7 @@ LIST_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Mileage Trips</title>
 """ + THEME_HEAD + """<style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index') }}">🚗 Mileage Tracker</a>
-  <div class="header-actions">
+  <button type="button" class="header-menu" data-header-menu aria-expanded="false" hidden>Menu</button><div class="header-actions">
     """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + ACCOUNT_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -2062,35 +2158,44 @@ LIST_HTML = """
   </div>
   <p class="muted">Totals cover recorded trips in this selection. Partly timed trips use their first recorded timestamp
     for year selection; their actual start can be in an earlier year. Trips with no usable date appear only under All years.</p>
-  <table>
-    <tr><th>Date</th><th>Distance</th><th>Duration</th><th>Avg mph</th>
+  <div class="trip-table"><table>
+    <tr class="trip-head"><th>Date</th><th>Distance</th><th>Duration</th><th>Avg mph</th>
         <th>Purpose</th><th>Destination</th><th>Note</th><th></th></tr>
     {% for t in trips %}
-    <tr>
-      <td>{{ fmt_trip_date(t) }}{% if t.get('timing_status') == 'partial' %}<br><span class="muted">Partial timing</span>{% endif %}{% if t.get('inside_merge') %}<br><span class="tag other">Inside a merged trip</span> <a href="{{ url_for('trip_view', ym=t.inside_merge.ym, trip_id=t.inside_merge.id, year=year or '') }}">counted twice: undo that merge</a>{% endif %}{% if t.get('parts') %}<br><code>{{ t.gpx_file }}</code>{% endif %}</td>
-      <td>{{ "%.2f"|format(t.distance_miles or 0) }} mi</td>
-      <td>{{ fmt_duration(t.duration_seconds) }}</td>
-      <td>{{ fmt_speed(t.get('avg_speed_mph')) }}</td>
-      <td>{% if t.category %}<span class="tag {{ t.category }}">{{ t.category }}</span>
+    <tr class="trip-row">
+      <td class="c-date">{{ fmt_trip_date(t) }}{% if t.get('timing_status') == 'partial' %}<br><span class="muted">Partial timing</span>{% endif %}{% if t.get('inside_merge') %}<br><span class="tag other">Inside a merged trip</span> <a href="{{ url_for('trip_view', ym=t.inside_merge.ym, trip_id=t.inside_merge.id, year=year or '') }}">counted twice: undo that merge</a>{% endif %}{% if t.get('parts') %}<br><code>{{ t.gpx_file }}</code>{% endif %}</td>
+      <td class="c-dist">{{ "%.2f"|format(t.distance_miles or 0) }} mi</td>
+      <td class="c-dur">{{ fmt_duration(t.duration_seconds) }}</td>
+      <td class="c-avg">{{ fmt_speed(t.get('avg_speed_mph')) }}</td>
+      <td class="c-purpose">{% if t.category %}<span class="tag {{ t.category }}">{{ t.category }}</span>
           {% else %}<span class="muted">—</span>{% endif %}</td>
-      <td>{{ t.destination or "" }}</td><td>{{ t.purpose_note or "" }}</td>
-      <td><a class="btn" href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year or '') }}">Map / Edit</a></td>
+      <td class="c-dest">{{ t.destination or "" }}</td><td class="c-note">{{ t.purpose_note or "" }}</td>
+      <td class="c-open"><a class="btn" href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year or '') }}">Map / Edit</a></td>
     </tr>
     {% endfor %}
     {% if not trips %}
     <tr><td colspan="8" class="muted">No trips in this selection.</td></tr>
     {% endif %}
-  </table>
+  </table></div>
 </div></body></html>
 """
 
 TRIP_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Trip {{ t.get('trip_id') or t.id }}</title>
 """ + THEME_HEAD + """
+{% if geocoder_enabled and geocoder_auto_lookup and places and not removal %}
+<script>
+  try {
+    if (localStorage.getItem('viewer-auto-lookup') !== 'off')
+      document.documentElement.classList.add('auto-places');
+  } catch (_) { document.documentElement.classList.add('auto-places'); }
+</script>
+<style>.auto-places #lookup-both-places, .auto-places [data-place-lookup] button { visibility: hidden; }</style>
+{% endif %}
 <link rel="stylesheet" href="{{ url_for('static', filename='leaflet.css') }}">
 <style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index', year=year or '') }}">← {{ year or 'All' }} trips</a>
-  <div class="header-actions">
+  <button type="button" class="header-menu" data-header-menu aria-expanded="false" hidden>Menu</button><div class="header-actions">
     """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + ACCOUNT_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -2099,6 +2204,7 @@ TRIP_HTML = """
   </div>
 </header>
 <div class="wrap">
+  <div class="trip-top{% if not removal %} has-nav{% endif %}">
   {% if not removal %}
   <nav class="trip-nav" aria-label="Trip navigation">
     {% if previous_trip %}<a class="btn" href="{{ url_for('trip_view', ym=previous_trip.ym, trip_id=previous_trip.id, year=year or '') }}">← Previous</a>
@@ -2110,11 +2216,22 @@ TRIP_HTML = """
     {% else %}<span class="btn" aria-disabled="true">Next →</span>{% endif %}
   </nav>
   {% endif %}
+  <div class="trip-info"><div class="trip-title">
   <h2>{{ fmt_trip_date(t) }}</h2>
   {% if last_edited %}
   <p class="muted">{% if last_edited.pre_history %}Edited before the change history began ({{ fmt_date(last_edited.at) }})
     {% else %}Last edited by {{ last_edited.actor }} on {{ fmt_date(last_edited.at) }}{% endif %}</p>
   {% endif %}
+  </div>
+  <div class="stats">
+    <div class="stat"><b>{{ "%.2f"|format(t.distance_miles or 0) }}</b><span>miles</span></div>
+    <div class="stat"><b>{{ fmt_duration(t.duration_seconds) }}</b><span>duration</span></div>
+    <div class="stat"><b>{{ fmt_speed(t.get('avg_speed_mph')) }}</b><span>avg mph</span></div>
+    <div class="stat"><b>{{ "%.1f"|format(t.max_speed_mph or 0) }}</b><span>max mph</span></div>
+    <div class="stat"><b>{{ t.num_points or 0 }}</b><span>points</span></div>
+  </div>
+
+  </div></div>
   {% if year_lock %}
   <div class="warn" role="status">{{ year_lock.year }} is closed for edits (closed by {{ year_lock.closed_by }} on {{ fmt_day(year_lock.closed_at) }}).
     Nobody can change, merge, remove or restore this trip until the admin reopens {{ year_lock.year }} on the year review page.</div>
@@ -2136,19 +2253,43 @@ TRIP_HTML = """
     {{ fmt_date(t.timed_from) }} to {{ fmt_date(t.recorded_until) }}. Recorded distance is retained.
     Year selection uses the first recorded timestamp; the actual start can be in an earlier year.</p>
   {% endif %}
-  <div class="stats">
-    <div class="stat"><b>{{ "%.2f"|format(t.distance_miles or 0) }}</b><span>miles</span></div>
-    <div class="stat"><b>{{ fmt_duration(t.duration_seconds) }}</b><span>duration</span></div>
-    <div class="stat"><b>{{ fmt_speed(t.get('avg_speed_mph')) }}</b><span>avg mph</span></div>
-    <div class="stat"><b>{{ "%.1f"|format(t.max_speed_mph or 0) }}</b><span>max mph</span></div>
-    <div class="stat"><b>{{ t.num_points or 0 }}</b><span>points</span></div>
-  </div>
-
+  {% if not removal %}<div class="trip-layout"><div class="annotation-panel">
+  {% if year_lock %}
+  <section aria-labelledby="annotation-heading">
+    <h3 id="annotation-heading">Purpose, destination and note</h3>
+    <p>{{ t.category or '—' }}, {{ t.destination or '—' }}, {{ t.purpose_note or '—' }}</p>
+  </section>
+  {% else %}
+  <form class="annotate" method="post"
+        action="{{ url_for('annotate', ym=t.ym, trip_id=t.id, year=year or '') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <fieldset class="purpose-choices"><legend>Purpose</legend>
+      {% for c in categories %}
+      <label class="purpose-choice"><input type="radio" name="category" value="{{ c }}" {% if t.category == c %}checked{% endif %}><span class="{{ c }}">{{ c|capitalize }}</span></label>
+      {% endfor %}
+      <label class="purpose-choice purpose-none"><input type="radio" name="category" value="" {% if not t.category %}checked{% endif %}><span>None</span></label>
+    </fieldset>
+    <label for="destination">Destination / place</label>
+    <input type="text" name="destination" id="destination" maxlength="{{ annotation_max }}" value="{{ t.destination or '' }}">
+    {% if geocoder_enabled and 'end' in places %}
+    <div class="end-suggestion"><span role="status" id="end-suggestion">End: {% if places['end'] is none %}not looked up yet{% elif places['end'] %}{{ places['end'] }}{% else %}no mapped address found{% endif %}</span>
+    <button type="button" class="btn secondary" id="use-end-place"
+      {% if not places.get('end') %}disabled{% endif %}>Use</button></div>
+    {% endif %}
+    <label for="purpose_note">Note (e.g. "Client visit — Acme Corp")</label>
+    <textarea name="purpose_note" id="purpose_note" rows="3" maxlength="{{ annotation_max }}">{{ t.purpose_note or "" }}</textarea>
+    <p><button class="btn" type="submit">Save</button></p>
+  </form>
+  {% endif %}
+  </div><div class="trip-map">
+  {% endif %}
   {% if t.has_gpx %}
   <div id="map"></div>
   {% else %}
   <p class="muted">GPX file missing — cannot draw the track.</p>
   {% endif %}
+
+  {% if not removal %}</div></div>{% endif %}
 
   {% if removal %}
   <p class="muted">This trip is out of the trip list, totals and exports, and can't be edited
@@ -2180,10 +2321,10 @@ TRIP_HTML = """
     {% endfor %}
     <p class="muted">Address data: <a href="https://www.openstreetmap.org/copyright"
       target="_blank" rel="noopener noreferrer">© OpenStreetMap contributors (ODbL)</a>.</p>
-    <noscript>Enable JavaScript to look up places. You can still enter a destination below.</noscript>
+    <noscript>Enable JavaScript to look up places. You can still enter a destination in the form.</noscript>
     {% else %}
     <p class="muted">Address lookup is not configured. Ask your server administrator to set up
-      a supported address provider, or enter a destination below.</p>
+      a supported address provider, or enter a destination in the form.</p>
     {% endif %}
   </section>
 
@@ -2228,34 +2369,6 @@ TRIP_HTML = """
   </section>
   {% endif %}
 
-  {% if year_lock %}
-  <section aria-labelledby="annotation-heading">
-    <h3 id="annotation-heading">Purpose, destination and note</h3>
-    <p>{{ t.category or '—' }}, {{ t.destination or '—' }}, {{ t.purpose_note or '—' }}</p>
-  </section>
-  {% else %}
-  <form class="annotate" method="post"
-        action="{{ url_for('annotate', ym=t.ym, trip_id=t.id, year=year or '') }}">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-    <label for="category">Purpose</label>
-    <select name="category" id="category">
-      <option value="">— unset —</option>
-      {% for c in categories %}
-      <option value="{{ c }}" {% if t.category == c %}selected{% endif %}>{{ c }}</option>
-      {% endfor %}
-    </select>
-    <label for="destination">Destination / place</label>
-    <input type="text" name="destination" id="destination" maxlength="{{ annotation_max }}" value="{{ t.destination or '' }}">
-    {% if geocoder_enabled and 'end' in places %}
-    <button type="button" class="btn secondary" id="use-end-place"
-      {% if not places.get('end') %}disabled{% endif %}>Use end suggestion as destination</button>
-    <p class="muted">Using a suggestion replaces the destination field above. Click Save to keep it.</p>
-    {% endif %}
-    <label for="purpose_note">Note (e.g. "Client visit — Acme Corp")</label>
-    <textarea name="purpose_note" id="purpose_note" rows="3" maxlength="{{ annotation_max }}">{{ t.purpose_note or "" }}</textarea>
-    <p><button class="btn" type="submit">Save</button></p>
-  </form>
-  {% endif %}
   {% if g.role == 'admin' and not year_lock %}
   <section aria-labelledby="remove-heading">
     <h3 id="remove-heading">Remove from log</h3>
@@ -2272,6 +2385,7 @@ TRIP_HTML = """
   {% endif %}
 </div>
 
+<script src="{{ url_for('static', filename='trip-annotation.js') }}"></script>
 {% if geocoder_enabled %}
 <script src="{{ url_for('static', filename='endpoint-places.js') }}"{% if geocoder_auto_lookup %} data-auto-lookup="true"{% endif %}></script>
 {% endif %}
@@ -2315,7 +2429,6 @@ TRIP_HTML = """
 
 DEVICE_HEALTH_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Device health</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
 """ + THEME_HEAD + """<style>""" + BASE_CSS + """
   .health-table { overflow-x: auto; }
   .health-table td { vertical-align: top; overflow-wrap: anywhere; }
@@ -2337,7 +2450,7 @@ DEVICE_HEALTH_HTML = """
   .snapshot-group .count { font-weight: 600; white-space: nowrap; }
 </style></head><body>
 <header><a href="{{ url_for('index') }}">← Trips</a>
-  <div class="header-actions">
+  <button type="button" class="header-menu" data-header-menu aria-expanded="false" hidden>Menu</button><div class="header-actions">
     """ + VERSION_HEADER + DEVICE_HEALTH_BUTTON + ACCOUNT_BUTTON + THEME_BUTTON + """
     <form class="logout" method="post" action="{{ url_for('logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -2579,7 +2692,7 @@ def admin():
 
 
 REMOVED_HTML = """
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<!doctype html><html><head><meta charset="utf-8">
 <title>Removed trips</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """
 .removed-table { overflow-x: auto; }
 .removed-table td { vertical-align: top; }
@@ -2620,7 +2733,7 @@ def admin_removed():
 
 
 HISTORY_HTML = """
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<!doctype html><html><head><meta charset="utf-8">
 <title>Change history</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """
 .history-table { overflow-x: auto; }
 .history-table td { vertical-align: top; overflow-wrap: anywhere; }
@@ -2788,7 +2901,7 @@ def _year_list():
 
 
 YEAR_HTML = """
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<!doctype html><html><head><meta charset="utf-8">
 <title>{{ year }} year review</title>""" + THEME_HEAD + """<style>""" + BASE_CSS + """
 .review-table { overflow-x: auto; }
 .review-table td { vertical-align: top; overflow-wrap: anywhere; }

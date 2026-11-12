@@ -185,7 +185,8 @@ class EndpointPlaceTests(unittest.TestCase):
         self.assertEqual(self.post("start").status_code, 200)
         self.assertEqual(parse_qs(urlsplit(self.received[-1][0]).query)["lat"], ["1.0"])
         html = self.client.get("/trip/2026-10/sample").get_data(as_text=True)
-        self.assertIn("Use end suggestion as destination", html)
+        self.assertIn('id="end-suggestion"', html)
+        self.assertIn('>Use</button>', html)
         self.assertIn("sends only that endpoint", html)
         self.assertNotIn(self.provider_url, html)
 
@@ -487,12 +488,28 @@ class EndpointPlaceTests(unittest.TestCase):
         self.set_gate(.05)
         barrier = threading.Barrier(2)
         clock = [10000.0]
+        slept, guard = set(), threading.Lock()
         def sleep(delay):
-            barrier.wait(timeout=3)
-            clock[0] = 10000.05
+            # Both waiters wait out the success gap together. The one that then
+            # finds the other's reservation polls (sleeps again) until the label
+            # is cached; let real time pass there instead of meeting the barrier
+            # a second time, which nobody would join (#693).
+            with guard:
+                first = threading.get_ident() not in slept
+                slept.add(threading.get_ident())
+            if first:
+                barrier.wait(timeout=3)
+                clock[0] = 10000.05
+            else:
+                threading.Event().wait(.01)
+        def slow_fetch(*args):
+            # Hold the reservation long enough that the other waiter always
+            # takes the polling path, not just on a slow machine.
+            threading.Event().wait(.1)
+            return "Example"
         with patch("geocoding.time.time", side_effect=lambda: clock[0]), \
              patch("geocoding.time.sleep", side_effect=sleep), \
-             patch.object(self.viewer.GEOCODER, "_fetch", return_value="Example") as fetch:
+             patch.object(self.viewer.GEOCODER, "_fetch", side_effect=slow_fetch) as fetch:
             def lookup():
                 try:
                     return self.viewer.GEOCODER.lookup(1, 3)
@@ -500,8 +517,8 @@ class EndpointPlaceTests(unittest.TestCase):
                     return exc.status
             with ThreadPoolExecutor(max_workers=2) as executor:
                 results = list(executor.map(lambda _: lookup(), range(2)))
-        self.assertIn("Example", results)
-        self.assertTrue(all(result in ("Example", 429) for result in results))
+        # One reserves and fetches; the other polls and reads the cached label.
+        self.assertEqual(results, ["Example", "Example"])
         fetch.assert_called_once()
 
     def test_two_distinct_waiters_cannot_call_inside_success_gap(self):

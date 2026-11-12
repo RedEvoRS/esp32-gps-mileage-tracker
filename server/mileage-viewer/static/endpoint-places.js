@@ -3,13 +3,21 @@
   'use strict';
   const useEnd = document.getElementById('use-end-place');
   const endLabel = document.querySelector('[data-endpoint="end"] [data-place-label]');
+  const suggestionLabel = document.getElementById('end-suggestion');
   let endSuggestion = useEnd && !useEnd.disabled ? endLabel.textContent : '';
   const forms = Array.from(document.querySelectorAll('form[data-place-lookup]'));
   const completed = new Set(forms.filter(form => form.dataset.placeCached === 'true'));
+  const failed = new Set();
   const queued = new Set();
   const queue = [];
   let busy = false;
   forms.forEach(form => { form.querySelector('button').disabled = false; });
+  function syncSuggestion(form, text) {
+    if (form.closest('[data-endpoint]').dataset.endpoint !== 'end') return;
+    if (suggestionLabel) suggestionLabel.textContent = 'End: ' +
+      (text === 'No mapped address found.' ? 'no mapped address found' : text);
+    if (useEnd) useEnd.disabled = true;
+  }
   async function drain() {
     if (busy) return;
     busy = true;
@@ -24,8 +32,10 @@
         });
         const data = await response.json();
         if (!response.ok || typeof data.label !== 'string') {
+          failed.add(form);
           label.textContent = data.error || 'Address lookup failed. Try again later.';
         } else {
+          failed.delete(form);
           completed.add(form);
           label.textContent = data.label || 'No mapped address found.';
           if (container.dataset.endpoint === 'end' && useEnd) {
@@ -34,9 +44,15 @@
           }
         }
       } catch (_) {
+        failed.add(form);
         label.textContent = 'Address lookup failed. Check your session and try again.';
       } finally {
+        if (container.dataset.endpoint === 'end') {
+          syncSuggestion(form, label.textContent);
+          if (useEnd) useEnd.disabled = failed.has(form) || !endSuggestion;
+        }
         queued.delete(form);
+        updateAutoLookup();
         form.querySelector('button').removeAttribute('aria-disabled');
       }
     }
@@ -44,8 +60,11 @@
   }
   function enqueue(form) {
     if (queued.has(form)) return;
+    failed.delete(form);
     queued.add(form);
+    updateAutoLookup();
     queue.push(form);
+    syncSuggestion(form, 'looking up\u2026');
     form.querySelector('button').setAttribute('aria-disabled', 'true');
     form.closest('[data-endpoint]').querySelector('[data-place-label]').textContent =
       'Waiting for the other lookup…';
@@ -64,7 +83,7 @@
     both.addEventListener('click', lookupMissing);
   }
   if (useEnd) useEnd.addEventListener('click', () => {
-    if (!endSuggestion) return;
+    if (useEnd.disabled || !endSuggestion) return;
     const destination = document.getElementById('destination');
     destination.value = endSuggestion;
     destination.focus();
@@ -75,6 +94,14 @@
   let autoLookup = true;
   try { autoLookup = localStorage.getItem('viewer-auto-lookup') !== 'off'; } catch (_) {}
   function updateAutoLookup() {
+    const active = autoAllowed && autoLookup;
+    if (both) both.hidden = active;
+    forms.forEach(form => {
+      const button = form.querySelector('button');
+      button.hidden = active && !failed.has(form);
+      button.textContent = active && failed.has(form) ? 'Try again' :
+        'Look up ' + form.closest('[data-endpoint]').dataset.endpoint + ' place';
+    });
     if (autoSwitch) {
       autoSwitch.textContent = autoLookup ? 'Auto lookup: On' : 'Auto lookup: Off';
       autoSwitch.setAttribute('aria-pressed', String(autoLookup));
@@ -83,6 +110,7 @@
       ? 'Uncached endpoints are looked up when a trip opens.'
       : 'Automatic lookup is off in this browser. Nothing is sent until you click.';
   }
+  if (document.documentElement) document.documentElement.classList.remove('auto-places');
   if (autoAllowed) {
     updateAutoLookup();
     if (autoSwitch) {
