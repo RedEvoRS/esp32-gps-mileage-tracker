@@ -205,7 +205,7 @@ class SummaryCacheTests(unittest.TestCase):
         self.assertTrue(self.viewer._may_start_in("2025-07", 2025))
         self.assertFalse(self.viewer._may_start_in("2026-02", 2025))
 
-    def test_unknown_device_trip_and_removed_trip_use_only_requested_sources(self):
+    def test_unknown_device_navigation_loads_list_but_removed_trip_stays_targeted(self):
         data = json.loads(self.path.read_text())
         data["device_id"] = "unknown"
         self.path.write_text(json.dumps(data))
@@ -214,7 +214,7 @@ class SummaryCacheTests(unittest.TestCase):
         client = self.signed_in("admin")
         with patch.object(self.viewer, "read_summary", wraps=self.viewer.read_summary) as read:
             self.assertEqual(client.get("/trip/2026-01/drive").status_code, 200)
-            self.assertEqual([call.args[0] for call in read.call_args_list], [self.path])
+            self.assertEqual([call.args[0] for call in read.call_args_list], [self.path, other])
         with closing(sqlite3.connect(self.db)) as conn, conn:
             self.viewer.trip_log.add_removal(conn, "2026-01/drive", "test reason", "driver")
         with patch.object(self.viewer, "load_trips", side_effect=AssertionError("global scan")):
@@ -228,8 +228,9 @@ class SummaryCacheTests(unittest.TestCase):
         self.viewer.load_trips()
         self.assertIn(other, self.viewer._summary_cache)
         other.unlink()
-        with patch.object(self.viewer, "load_trips", side_effect=AssertionError("global scan")):
+        with patch.object(self.viewer, "load_trips", wraps=self.viewer.load_trips) as load:
             self.assertEqual(self.signed_in("admin").get("/trip/2026-01/drive").status_code, 200)
+            load.assert_called_once_with(include_removed=True)
         self.assertEqual(set(self.viewer._summary_cache), {self.path})
 
     def test_trip_missing_from_full_load_retries_once_then_returns_not_found(self):
