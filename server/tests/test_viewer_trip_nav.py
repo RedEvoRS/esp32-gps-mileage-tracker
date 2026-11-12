@@ -17,11 +17,12 @@ class TripNavigationTests(YearTestBase):
 
     def assert_neighbours(self, key, older=None, newer=None, query="", client=None):
         nav = self.nav(key, query, client)
-        for target, label in ((older, "← Previous"), (newer, "Next →")):
+        for target, label in ((newer, "← Previous"), (older, "Next →")):
             if target:
                 self.assertIn(f'<a class="btn" href="/trip/{target}{query or "?year="}">{label}</a>', nav)
             else:
                 self.assertIn(f'<span class="btn" aria-disabled="true">{label}</span>', nav)
+        self.assertLess(nav.index("← Previous"), nav.index("Next →"))
         return nav
 
     def test_middle_and_ends_for_both_roles_reuse_full_snapshot(self):
