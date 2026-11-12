@@ -6,6 +6,7 @@
   let endSuggestion = useEnd && !useEnd.disabled ? endLabel.textContent : '';
   const forms = Array.from(document.querySelectorAll('form[data-place-lookup]'));
   const completed = new Set(forms.filter(form => form.dataset.placeCached === 'true'));
+  const failed = new Set();
   const queued = new Set();
   const queue = [];
   let busy = false;
@@ -24,8 +25,10 @@
         });
         const data = await response.json();
         if (!response.ok || typeof data.label !== 'string') {
+          failed.add(form);
           label.textContent = data.error || 'Address lookup failed. Try again later.';
         } else {
+          failed.delete(form);
           completed.add(form);
           label.textContent = data.label || 'No mapped address found.';
           if (container.dataset.endpoint === 'end' && useEnd) {
@@ -34,9 +37,11 @@
           }
         }
       } catch (_) {
+        failed.add(form);
         label.textContent = 'Address lookup failed. Check your session and try again.';
       } finally {
         queued.delete(form);
+        updateAutoLookup();
         form.querySelector('button').removeAttribute('aria-disabled');
       }
     }
@@ -44,7 +49,9 @@
   }
   function enqueue(form) {
     if (queued.has(form)) return;
+    failed.delete(form);
     queued.add(form);
+    updateAutoLookup();
     queue.push(form);
     form.querySelector('button').setAttribute('aria-disabled', 'true');
     form.closest('[data-endpoint]').querySelector('[data-place-label]').textContent =
@@ -75,6 +82,14 @@
   let autoLookup = true;
   try { autoLookup = localStorage.getItem('viewer-auto-lookup') !== 'off'; } catch (_) {}
   function updateAutoLookup() {
+    const active = autoAllowed && autoLookup;
+    if (both) both.hidden = active;
+    forms.forEach(form => {
+      const button = form.querySelector('button');
+      button.hidden = active && !failed.has(form);
+      button.textContent = active && failed.has(form) ? 'Try again' :
+        'Look up ' + form.closest('[data-endpoint]').dataset.endpoint + ' place';
+    });
     if (autoSwitch) {
       autoSwitch.textContent = autoLookup ? 'Auto lookup: On' : 'Auto lookup: Off';
       autoSwitch.setAttribute('aria-pressed', String(autoLookup));
@@ -83,6 +98,7 @@
       ? 'Uncached endpoints are looked up when a trip opens.'
       : 'Automatic lookup is off in this browser. Nothing is sent until you click.';
   }
+  if (document.documentElement) document.documentElement.classList.remove('auto-places');
   if (autoAllowed) {
     updateAutoLookup();
     if (autoSwitch) {

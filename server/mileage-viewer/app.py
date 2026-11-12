@@ -2141,6 +2141,15 @@ LIST_HTML = """
 TRIP_HTML = """
 <!doctype html><html><head><meta charset="utf-8"><title>Trip {{ t.get('trip_id') or t.id }}</title>
 """ + THEME_HEAD + """
+{% if geocoder_enabled and geocoder_auto_lookup %}
+<script>
+  try {
+    if (localStorage.getItem('viewer-auto-lookup') !== 'off')
+      document.documentElement.classList.add('auto-places');
+  } catch (_) { document.documentElement.classList.add('auto-places'); }
+</script>
+<style>.auto-places #lookup-both-places, .auto-places [data-place-lookup] button { visibility: hidden; }</style>
+{% endif %}
 <link rel="stylesheet" href="{{ url_for('static', filename='leaflet.css') }}">
 <style>""" + BASE_CSS + """</style></head><body>
 <header><a href="{{ url_for('index', year=year or '') }}">← {{ year or 'All' }} trips</a>
