@@ -491,11 +491,7 @@ exec {real_rsync} "$@"
         folder.mkdir()
         self.symlink(folder / "alias", "../2026-10-01T15-00-00.gpx")
         folder.chmod(0o500)
-        # Test fixtures must also be removable before the general cleanup fix.
-        def writable_directories():
-            for root, _, _ in os.walk(self.tmp, followlinks=False):
-                os.chmod(root, 0o700)
-        self.addCleanup(writable_directories)
+        self.addCleanup(self.writable_fixture_directories)
         self.conf_append("PING_URL=https://ping.invalid/backup\n")
         ping = self.tmp / "ping"
         self.shim("curl", f'touch "{ping}"\n')
@@ -540,6 +536,106 @@ exec {real_rsync} "$@"
             self.assertIn("WARNING: couldn't check how data links will restore", result.stderr)
             self.assertIn("Restore test passed" if command == "check" else "Restore complete", result.stderr)
         self.assertEqual(os.readlink(self.data / "long-chain"), chain)
+
+    def writable_fixture_directories(self):
+        for root, _, _ in os.walk(self.tmp, followlinks=False):
+            os.chmod(root, 0o700)
+
+    def read_only_data_folder(self):
+        self.addCleanup(self.writable_fixture_directories)
+        folder = self.data / "2026-10/ro"
+        folder.mkdir()
+        (folder / "saved.gpx").write_text("saved read-only trip")
+        (folder / "saved.gpx").chmod(0o400)
+        self.symlink(folder / "alias", "saved.gpx")
+        folder.chmod(0o500)
+        return folder
+
+    def test_read_only_folder_dedupe_check_and_restore_clean_up_and_keep_modes(self):
+        folder = self.read_only_data_folder()
+        self.run_script("backup.sh")
+        result = self.run_script("backup.sh")
+        self.assertIn("Nothing changed", result.stderr)
+        self.assertEqual(list((self.backups / "snapshots").glob(".partial-*")), [])
+        self.assertIn("Restore test passed", self.run_script("restore.sh", "check").stderr)
+        folder.chmod(0o700)
+        shutil.rmtree(self.data)
+        self.data.mkdir()
+        self.assertIn("Restore complete", self.run_script("restore.sh", "restore", "latest", "--yes").stderr)
+        self.assertEqual((folder / "alias").read_text(), "saved read-only trip")
+        if os.geteuid() != 0:  # The existing root restore intentionally applies D700,F600.
+            self.assertEqual(folder.stat().st_mode & 0o777, 0o500)
+            self.assertEqual((folder / "saved.gpx").stat().st_mode & 0o777, 0o400)
+        for base in (self.backups / "latest", self.remote / "snapshots" / self.snapshots()[-1]):
+            self.assertEqual((base / "data/2026-10/ro").stat().st_mode & 0o777, 0o500)
+            self.assertEqual((base / "data/2026-10/ro/saved.gpx").stat().st_mode & 0o777, 0o400)
+        self.assertEqual(list(self.backups.glob(".restore-scratch-*")), [])
+        self.assertEqual(list(self.backups.glob(".link-scratch-*")), [])
+
+    def test_read_only_local_pruning_preserves_kept_hardlink_modes(self):
+        self.read_only_data_folder()
+        self.conf_append("KEEP_RECENT=2\nKEEP_MONTHLY=0\n")
+        names = []
+        for index in range(3):
+            self.add_trip("2026-10/new", "new" * (index + 1))
+            self.run_script("backup.sh")
+            names.append(self.snapshots()[-1])
+        for base in (self.backups, self.remote):
+            self.assertEqual((base / "snapshots" / names[0]).exists(), base == self.remote)
+            files = [base / "snapshots" / n / "data/2026-10/ro/saved.gpx" for n in names[1:]]
+            self.assertEqual(files[0].stat().st_ino, files[1].stat().st_ino)
+            for path in files:
+                self.assertEqual(path.stat().st_mode & 0o777, 0o400)
+                self.assertEqual(path.parent.stat().st_mode & 0o777, 0o500)
+
+    def test_tree_removal_never_chmods_hardlinked_files_or_outside_links(self):
+        self.addCleanup(self.writable_fixture_directories)
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "sentinel").write_text("unchanged")
+        (outside / "sentinel").chmod(0o400)
+        doomed = self.backups / "doomed"
+        nested = doomed / "nested"
+        nested.mkdir(parents=True)
+        os.link(outside / "sentinel", nested / "hardlink")
+        self.symlink(nested / "outside", outside, True)
+        outside.chmod(0o500)
+        nested.chmod(0o000)
+        doomed.chmod(0o000)
+        subprocess.run(["bash", "-c", 'source "$1"; remove_backup_tree "$2"', "bash",
+                        str(BACKUP / "lib.sh"), str(doomed)], env=self.env, check=True, timeout=10)
+        self.assertFalse(doomed.exists())
+        self.assertEqual(outside.stat().st_mode & 0o777, 0o500)
+        self.assertEqual((outside / "sentinel").stat().st_mode & 0o777, 0o400)
+        self.assertEqual((outside / "sentinel").read_text(), "unchanged")
+
+    def test_abandoned_read_only_work_and_scratch_folders_are_removed(self):
+        self.addCleanup(self.writable_fixture_directories)
+        debris = [self.backups / "snapshots/.partial-abandoned",
+                  self.backups / ".restore-scratch-abandoned",
+                  self.backups / ".verify-scratch-abandoned",
+                  self.backups / ".link-scratch-abandoned"]
+        for path in debris:
+            nested = path / "ro"
+            nested.mkdir(parents=True)
+            (nested / "file").write_text("debris")
+            nested.chmod(0o500)
+            old = path.stat().st_mtime - 3 * 86400
+            os.utime(path, (old, old))
+        self.run_script("backup.sh", "--verify")
+        self.assertTrue(all(not path.exists() for path in debris))
+
+    def test_read_only_remote_only_deep_check_and_pruning_cleanup(self):
+        self.read_only_data_folder()
+        self.run_script("backup.sh")
+        old = "2026-01-01T030000Z"
+        shutil.copytree(self.backups / "latest", self.remote / "snapshots" / old, symlinks=True)
+        self.run_script("backup.sh", "--verify")
+        self.assertEqual(list(self.backups.glob(".verify-scratch-*")), [])
+        self.conf_append("KEEP_RECENT=1\nKEEP_MONTHLY=0\nREMOTE_PRUNE=yes\n")
+        self.use_ssh_remote()
+        self.run_script("backup.sh")
+        self.assertFalse((self.remote / "snapshots" / old).exists())
 
     def test_unknown_coverage_readers_and_recovery_never_dedupes(self):
         self.conf_append("KEEP_RECENT=10\n")

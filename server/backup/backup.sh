@@ -85,14 +85,18 @@ verify_pinned() {
 
 name=$(date -u +%Y-%m-%dT%H%M%SZ)
 work=$SNAPSHOTS/.partial-$name
-rm -rf "$SNAPSHOTS"/.partial-*        # left behind by a run that died
+remove_backup_tree "$SNAPSHOTS"/.partial-*        # left behind by a run that died
 # restore.sh's scratch folders, left behind if a restore test was killed
 find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -name '.restore-scratch-*' -mmin +1440 \
-    -exec rm -rf {} + 2> /dev/null || true
+    -print0 | while IFS= read -r -d '' stale; do
+        remove_backup_tree "$stale"
+    done 2> /dev/null || true
 prev=$(list_snapshots | tail -n 1)
 # Coverage lists and restore advice must never enter a snapshot or its manifest.
+remove_backup_tree "$BACKUP_DIR"/.link-scratch-* \
+    || log "WARNING: could not remove abandoned link advice scratch"
 link_scratch=$(mktemp -d "$BACKUP_DIR/.link-scratch-XXXXXX")
-trap 'rm -rf -- "$link_scratch" || log "WARNING: could not remove link advice scratch: $link_scratch"' EXIT
+trap 'remove_backup_tree "$link_scratch" || log "WARNING: could not remove link advice scratch: $link_scratch"' EXIT
 mkdir "$work"
 
 # --- 1. Annotations database -------------------------------------------
@@ -176,7 +180,7 @@ if [[ -n $prev && $LINKS_NOT_BACKED_UP =~ ^[0-9]+$ && $link_manifest_error == 0 
         && grep -Fxq "monitor=$monitor" "$SNAPSHOTS/$prev/INFO" \
         && [[ $(read_coverage_count "$SNAPSHOTS/$prev/INFO") == "$LINKS_NOT_BACKED_UP" ]]; then
     log "Nothing changed since $prev; keeping that snapshot"
-    rm -rf "$work"
+    remove_backup_tree "$work"
     current=$prev
 else
     # Names have one-second resolution; a second run within the same
@@ -208,7 +212,7 @@ ln -sfn "snapshots/$current" "$BACKUP_DIR/latest"
 list_snapshots | retention_drops | while read -r old; do
     if verify_pinned "$old"; then continue; fi
     log "Pruning local snapshot $old"
-    rm -rf "${SNAPSHOTS:?}/$old"
+    remove_backup_tree "${SNAPSHOTS:?}/$old"
 done
 
 # --- 4. Off-host copy --------------------------------------------------
@@ -352,11 +356,11 @@ deep_verify() (
     write_verify_state || { log "Deep check FAILED: cannot write verify-state"; return 1; }
     # Run even with no older local snapshots: REMOTE may retain older history.
     # Scratch stays on the backup disk, outside snapshots and the copied tree.
-    trap '[[ -z $scratch ]] || rm -rf -- "$scratch"' EXIT
+    trap '[[ -z $scratch ]] || remove_backup_tree "$scratch"' EXIT
     trap 'exit 1' HUP INT TERM
     # Only this backup lock owns verification scratch. Even leftover cleanup
     # errors are deferred until after today's backup has been copied.
-    rm -rf "$BACKUP_DIR"/.verify-scratch-* || return 1
+    remove_backup_tree "$BACKUP_DIR"/.verify-scratch-* || return 1
     for old in $selected; do
         log "Deep check local $old"
         if ! verify_snapshot "$SNAPSHOTS/$old"; then
@@ -387,7 +391,7 @@ deep_verify() (
             failed=1
             failed_remote+="$old "
         fi
-        rm -rf -- "$scratch" || return 1
+        remove_backup_tree "$scratch" || return 1
         scratch=
     done
     VERIFY_RESULT=failed

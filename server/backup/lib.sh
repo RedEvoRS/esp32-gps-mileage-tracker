@@ -18,6 +18,18 @@ die() {
     exit 1
 }
 
+# Only directories need write access for unlinking entries. Never chmod files:
+# unchanged files may be hard-linked into a kept snapshot. Default find does
+# not follow symlinks; apply chmod before descending, even for mode-000 dirs.
+remove_backup_tree() {
+    local path
+    for path in "$@"; do
+        [[ -e $path || -L $path ]] || continue
+        find "$path" -type d -exec chmod u+rwx -- {} \; || return 1
+        rm -rf -- "$path" || return 1
+    done
+}
+
 is_unraid() {
     case ${MILEAGE_PLATFORM:-} in
         unraid) return 0 ;;
@@ -480,7 +492,7 @@ report_link_restore_effects() {
     root=$(realpath -m -- "$dir") || return 1
     saved_root=$(realpath -m -- "$snapshot") || return 1
     if ! make_link_restore_plan "$dir" "$list" "$plan"; then
-        rm -rf -- "$plan"
+        remove_backup_tree "$plan"
         rm -f -- "$list"
         return 1
     fi
@@ -535,7 +547,7 @@ report_link_restore_effects() {
     if (( count > 20 )); then
         log "WARNING: and $((count - 20)) more links with restore warnings"
     fi
-    rm -rf -- "$plan" || status=1
+    remove_backup_tree "$plan" || status=1
     rm -f -- "$list" || status=1
     return "$status"
 }

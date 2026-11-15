@@ -147,7 +147,7 @@ cleanup() {
         log "Restore did not finish; starting the services again"
         start_services || log "Could not start the services; check docker compose and the monitor profile"
     fi
-    rm -rf "${scratch:-}"
+    remove_backup_tree "${scratch:-}"
     exit "$status"
 }
 

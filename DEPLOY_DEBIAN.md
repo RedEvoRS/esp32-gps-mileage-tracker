@@ -1496,6 +1496,8 @@ off-host destination. Each run:
   previous snapshot, and a run where nothing changed doesn't add a
   snapshot at all, so daily runs cost almost nothing.
 - keeps the newest 14 snapshots plus the first of each month for 7 years.
+  Local pruning and scratch cleanup make directories writable only when removing
+  them; file modes and kept snapshots are preserved.
 - rsyncs to the off-host copy, then reads the newest snapshot back from
   there and checks it matches byte for byte. It copies only if the
   destination holds a file named `.mileage-backup-target` (see 10a): a share

@@ -1531,6 +1531,9 @@ one lacks `SYMLINKS`; older snapshots still restore. A failure to record the
 links is logged, prevents reuse and fails the run after the copy, withholding
 the heartbeat; fix the logged error and rerun the backup.
 
+Local cleanup and pruning make only directories writable just before removing
+them. Kept snapshots retain their modes, including files shared by hard links.
+
 Each SQLite snapshot is consistent individually; the databases and trip files
 are captured in sequence, rather than in one shared transaction.
 
