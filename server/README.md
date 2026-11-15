@@ -1543,6 +1543,13 @@ removing them. Kept snapshots retain file modes, including files shared by hard
 links. Pruning an SSH destination also needs Bash, find, chmod and rm there;
 it removes only named snapshots and never mirrors or deletes the remote root.
 
+The nightly local trip copy compares contents with rsync `--checksum`, reading
+live files and their previous copies even when size and time match: a local
+warm-cache test of 3,000 files (1 GB) took 0.46 s versus 0.14 s without it.
+A slow mounted destination reading 10–30 MB/s would need about 33–100 s per GB
+read; off-host copying keeps its metadata test, with the newest copy checked
+every run and older copies checked in the weekly rotation.
+
 Each SQLite snapshot is consistent individually; the databases and trip files
 are captured in sequence, rather than in one shared transaction.
 

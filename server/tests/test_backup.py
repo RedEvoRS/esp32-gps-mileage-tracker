@@ -548,6 +548,38 @@ exec {real_sha} "$@"
         self.assertIn("Nothing changed", self.run_script("backup.sh").stderr)
         self.assertEqual(len(self.snapshots()), 1)
 
+    def test_same_size_and_time_content_change_creates_snapshot_then_dedupes(self):
+        self.run_script("backup.sh")
+        [old] = self.snapshots()
+        path = self.data / "2026-10/2026-10-01T15-00-00.gpx"
+        original = path.read_bytes()
+        self.silently_corrupt(path)
+        changed = path.read_bytes()
+        self.assertNotEqual(original, changed)
+        result = self.run_script("backup.sh")
+        self.assertNotIn("Nothing changed", result.stderr)
+        self.assertEqual(len(self.snapshots()), 2)
+        new = self.snapshots()[-1]
+        for root in (self.backups, self.remote):
+            before = root / "snapshots" / old / "data/2026-10" / path.name
+            after = root / "snapshots" / new / "data/2026-10" / path.name
+            self.assertEqual(before.read_bytes(), original)
+            self.assertEqual(after.read_bytes(), changed)
+            self.assertNotEqual(before.stat().st_ino, after.stat().st_ino)
+        self.assertIn("Nothing changed", self.run_script("backup.sh").stderr)
+        self.assertEqual(len(self.snapshots()), 2)
+        self.run_script("restore.sh", "check")
+
+    def test_remote_same_size_time_damage_is_detected_in_deep_check(self):
+        names = self.seed_verification(2)
+        self.run_script("backup.sh", "--verify")
+        path = self.remote / "snapshots" / names[0] / "data/2026-10/2026-10-01T15-00-00.gpx"
+        self.silently_corrupt(path)
+        result = self.run_script("backup.sh", "--verify", check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"Deep check FAILED remote {names[0]}", result.stderr)
+        self.assertEqual(self.verify_state()["result"], "failed")
+
     def test_outside_links_reported_and_copied_without_targets(self):
         outside = self.tmp / "outside"
         outside.mkdir()

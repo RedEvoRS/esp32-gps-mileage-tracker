@@ -138,7 +138,8 @@ link=()
 # Ingest holds this lock for the whole write of a trip's GPX + JSON.
 open_upload_lock
 flock -w 300 7
-rsync -a --numeric-ids --exclude=/.upload.lock --exclude='/.upload-lock.*' --exclude='*.tmp' \
+# Compare bytes even when a manual replacement preserves size and mtime.
+rsync -a --checksum --numeric-ids --exclude=/.upload.lock --exclude='/.upload-lock.*' --exclude='*.tmp' \
         --exclude=/diagnostics/events.db --exclude='/diagnostics/events.db-*' "${link[@]}" \
         "$COMPOSE_DIR/data/" "$work/data/"
 # A failed link check must not cost tonight's off-host copy: note it,
