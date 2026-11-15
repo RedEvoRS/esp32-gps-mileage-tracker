@@ -109,17 +109,28 @@ class ViewerRemovalTests(unittest.TestCase):
                             "csrf_token": "test-csrf", "reason": "test removal"})
                         self.assertEqual(denied.status_code, 403)
                         with patch.object(self.viewer, "_safe_trip_paths", side_effect=AssertionError("route path check")):
-                            response = self.post(f"/trip/{key}/{action}", reason="test removal")
+                            response = self.post(f"/trip/{key}/{action}?year=2026", reason="test removal")
                         self.assertEqual(response.status_code, 302)
-                        self.assertIn(f"/trip/{key}", response.location)
+                        expected = "/?year=2026" if action == "remove" else "/admin/removed?year=2026"
+                        self.assertEqual(response.location, expected)
                         self.assertNotIn(b"outside-file-sentinel", response.data)
-                        self.assertNotIn(b"outside-file-sentinel", self.admin.get(response.location).data)
+                        landing = self.admin.get(response.location)
+                        self.assertEqual(landing.status_code, 200)
+                        self.assertNotIn(b"outside-file-sentinel", landing.data)
                         with closing(sqlite3.connect(self.db)) as conn:
                             row = conn.execute("SELECT trip_key FROM trip_removals WHERE trip_key=?", (key,)).fetchone()
                         self.assertEqual(row, (key,) if action == "remove" else None)
                 finally:
                     link.unlink()
                     target.rename(link)
+
+    def test_normal_remove_restore_redirects_keep_trip_and_year(self):
+        key = self.add_trip("drive")
+        for action in ("remove", "restore"):
+            response = self.post(f"/trip/{key}/{action}?year=2026", reason="test removal")
+            self.assertEqual(response.status_code, 302)
+            self.assertEqual(response.location, f"/trip/{key}?year=2026")
+            self.assertEqual(self.admin.get(response.location).status_code, 200)
 
     def test_remove_restore_malformed_addresses_still_404(self):
         for key in ("2026-01/bad.key", "2026-01/drive%0A", "2026-x1/drive"):

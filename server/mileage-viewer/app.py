@@ -3318,6 +3318,11 @@ def remove_trip(ym, trip_id):
         _abort_if_year_closed(trip_log.closed_years(conn), trip)
         trip_log.add_removal(conn, key, reason, g.user)
         trip_log.record(conn, key, "remove", {"reason": reason}, actor=g.user, actor_role=g.role)
+    # A successful change needs a landing page that can show refused files.
+    try:
+        next(trip_merges.source_file_pairs(DATA_ROOT, [f"{ym}/{trip_id}"]))
+    except ValueError:
+        return redirect(url_for("index", year=year or ""))
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
 
 
@@ -3345,6 +3350,11 @@ def restore_trip(ym, trip_id):
         trip_log.delete_removal(conn, key)
         trip_log.record(conn, key, "restore", {"reason": removal["reason"]},
                         actor=g.user, actor_role=g.role)
+    # A successful change needs a landing page that can show refused files.
+    try:
+        next(trip_merges.source_file_pairs(DATA_ROOT, [f"{ym}/{trip_id}"]))
+    except ValueError:
+        return redirect(url_for("admin_removed", year=year or ""))
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
 
 
