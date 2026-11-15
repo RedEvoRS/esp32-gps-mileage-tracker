@@ -4449,8 +4449,9 @@ def split_trip(ym, trip_id):
             abort(409, description="This merge no longer exists. Reopen the trip list.")
         trips, entries = _load_trips(conn, trip_key=key)
         if entries or not any(t['trip_key'] == key for t in trips):
-            abort(409, description=('This merge cannot restore its original trips. '
-                                    'Ask the admin to restore its files from backups or review the saved merge on the trip list.'))
+            advice = ('Restore its files from backups or review the saved merge on the trip list.' if g.role == 'admin' else
+                      'Ask the admin to restore its files from backups or review the saved merge on the trip list.')
+            abort(409, description='This merge has missing or unreadable parts. ' + advice)
         _abort_if_key_in_closed_year(conn, key)
         _undo_merge(conn, key, keys)
     first_ym, first_id = keys[0].split("/")

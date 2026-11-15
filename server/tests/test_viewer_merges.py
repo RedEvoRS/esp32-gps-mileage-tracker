@@ -289,6 +289,23 @@ class ViewerMerges(unittest.TestCase):
             self.assertEqual(self.viewer.trip_merges.parts(conn, key), parts)
             self.assertEqual(conn.execute("SELECT count(*) FROM trip_history WHERE action='discard_damaged_merge'").fetchone()[0], 0)
 
+    def test_damaged_split_refusal_addresses_each_role(self):
+        key, _, _ = self.damaged_merge()
+        from test_viewer_roles import ViewerRolesTests
+        ViewerRolesTests.seed_editor(self)
+        for role, advice in (
+            ('admin', 'Restore its files from backups or review the saved merge on the trip list.'),
+            ('editor', 'Ask the admin to restore its files from backups or review the saved merge on the trip list.'),
+        ):
+            if role == 'editor':
+                ViewerRolesTests.signed_in(self, role)
+                with self.client.session_transaction() as session:
+                    session['csrf'] = 'test-csrf'
+            response = self.split(key)
+            self.assertEqual(response.status_code, 409)
+            self.assertIn('This merge has missing or unreadable parts. ' + advice,
+                          html.unescape(response.get_data(as_text=True)))
+
     def test_discard_refuses_healthy_unused_or_repaired_merges_and_preserves_files(self):
         a, b = self.trip('a', 0), self.trip('b', 180, .01)
         key = self.merged_key(self.merge(a, b))
