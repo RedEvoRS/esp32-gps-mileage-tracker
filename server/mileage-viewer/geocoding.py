@@ -150,6 +150,10 @@ class Geocoder:
                 else:
                     refuse = True
                 if refuse or wait > deadline - time.monotonic():
+                    # Only a success gap ("") has a known end, so only it says
+                    # how long to wait (#704). That includes the rare case where
+                    # a polled lookup succeeds just as this request's wait budget
+                    # runs out: the gap is real and the page retries once.
                     raise GeocodeError("Address lookup is busy or cooling down. Try again later.", 429,
                                        retry_after=remaining if gate[1] == "" else None)
             # The transaction and connection have ended before sleeping.
