@@ -425,6 +425,22 @@ class BackupScripts(unittest.TestCase):
         self.assertTrue((self.backups / "last-success").exists())
         self.assertFalse(ping.exists())
 
+    def test_link_check_error_still_copies_then_fails(self):
+        # A failing link check (here, realpath) must not cost the off-host copy.
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        ping = self.tmp / "ping"
+        self.shim("curl", f'touch "{ping}"\n')
+        self.symlink(self.data / "2026-01", self.tmp, True)
+        self.shim("realpath", "exit 1\n")
+        result = self.run_script("backup.sh", check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("couldn't check data for links outside it", result.stderr)
+        snap = self.remote / "snapshots" / self.snapshots()[-1]
+        self.assertTrue((snap / "data/2026-10/2026-10-01T15-00-00.gpx").is_file())
+        self.assertFalse((snap / ".outside-links").exists())
+        self.assertTrue((self.backups / "last-success").exists())
+        self.assertFalse(ping.exists())
+
     def test_nested_links_escape_names_cap_and_never_open_fifo(self):
         outside = self.tmp / "outside"
         outside.mkdir()
@@ -507,7 +523,7 @@ class BackupScripts(unittest.TestCase):
         self.legacy_link_snapshot()
         result = self.run_script("restore.sh", "check")
         self.assertIn("data/linked-month", result.stderr)
-        self.assertIn("contents are not in this backup", result.stderr)
+        self.assertIn("contents of 1 linked item(s) are not in this backup", result.stderr)
         self.assertTrue(result.stderr.rstrip().endswith(
             "Restore test passed, but 1 linked item(s) are not in this backup"))
 
@@ -517,7 +533,7 @@ class BackupScripts(unittest.TestCase):
         folder.mkdir()
         (folder / "keep.gpx").write_text("keep")
         result = self.run_script("restore.sh", "restore", "latest", "--yes")
-        self.assertIn("contents are not in this backup", result.stderr)
+        self.assertIn("contents of 1 linked item(s) are not in this backup", result.stderr)
         self.assertFalse(folder.is_symlink())
         self.assertEqual((folder / "keep.gpx").read_text(), "keep")
         self.assertEqual(os.readlink(self.data / "inside"), "2026-10")

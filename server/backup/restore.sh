@@ -106,7 +106,7 @@ fetch_and_check() {
     log "Snapshot holds $gpx trip GPX files and $json summaries"
     report_outside_links "$snap/data" "$scratch/outside-links"
     if (( LINKS_NOT_BACKED_UP > 0 )); then
-        log "WARNING: $LINKS_NOT_BACKED_UP linked item(s)' contents are not in this backup"
+        log "WARNING: the contents of $LINKS_NOT_BACKED_UP linked item(s) are not in this backup"
     fi
     [[ -f $snap/INFO ]] && log "Snapshot INFO: $(tr '\n' ' ' < "$snap/INFO")"
 }

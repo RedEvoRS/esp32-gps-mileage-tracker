@@ -132,7 +132,15 @@ flock -w 300 7
 rsync -a --numeric-ids --exclude=/.upload.lock --exclude='/.upload-lock.*' --exclude='*.tmp' \
         --exclude=/diagnostics/events.db --exclude='/diagnostics/events.db-*' "${link[@]}" \
         "$COMPOSE_DIR/data/" "$work/data/"
-report_outside_links "$COMPOSE_DIR/data" "$work/.outside-links"
+# A failed link check must not cost tonight's off-host copy: note it,
+# finish the backup, then fail the run below.
+coverage_error=0
+if ! report_outside_links "$COMPOSE_DIR/data" "$work/.outside-links"; then
+    log "ERROR: couldn't check data for links outside it; this run will fail after the copy"
+    rm -f -- "$work/.outside-links"
+    LINKS_NOT_BACKED_UP=0
+    coverage_error=1
+fi
 exec 7<&-
 trips=$(find "$work/data" -type f -name '*.gpx' | wc -l)
 
@@ -372,7 +380,11 @@ deep_verify() (
 failed=0
 deep_verify || { log "Deep check failed; today's backup was copied. Check the failed snapshots and rerun backup.sh."; failed=1; }
 if (( LINKS_NOT_BACKED_UP > 0 )); then
-    log "WARNING: $LINKS_NOT_BACKED_UP linked item(s) are not in this backup; move their contents into data and rerun backup.sh."
+    log "WARNING: $LINKS_NOT_BACKED_UP linked item(s) are not in this backup; replace each link with the real folder or file (or delete a link with nothing behind it) and rerun backup.sh."
+    failed=1
+fi
+if (( coverage_error )); then
+    log "ERROR: data wasn't checked for links outside it; fix the error above and rerun backup.sh."
     failed=1
 fi
 (( failed == 0 )) || exit 1

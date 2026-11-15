@@ -2794,7 +2794,7 @@ show_backup_deep_check() {
         esac
     done <<< "$status"
     if [[ $links =~ ^[0-9]+$ && $links == *[1-9]* ]]; then
-        warn "$links linked item(s) are not in this backup; move their contents into data and rerun the backup"
+        warn "$links linked item(s) are not in this backup; replace each link with the real folder or file (or delete a link with nothing behind it) and rerun the backup"
     fi
     # A fresh completed off-host copy distinguishes coverage from copy failure.
     if (( $# )); then

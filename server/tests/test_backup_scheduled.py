@@ -100,6 +100,7 @@ class ScheduledBackup(unittest.TestCase):
         for value, expected in (("2", "2"), ("garbage", ""), ("$(touch injected)", "")):
             (latest / "INFO").write_text(f"links_not_backed_up={value}\n")
             self.assertEqual(self.status()["last_backup_links_not_backed_up"], expected)
+        self.assertFalse((self.tmp / "injected").exists())
         self.conf.unlink()
         self.assertEqual(self.status()["last_backup_links_not_backed_up"], "")
 
