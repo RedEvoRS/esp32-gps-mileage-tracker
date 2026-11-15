@@ -288,7 +288,8 @@ deep_verify() (
         awk -v cursor="$VERIFY_CURSOR" 'NF && $0 <= cursor' <<< "$names")
 
     # List REMOTE with rsync, never ssh shell commands. Retry a previously
-    # failing remote-only snapshot even if another name is now oldest.
+    # failing remote-only snapshot even if another name is now oldest, unless
+    # it is no longer listed there (deleted after the failure, #703).
     remote_checks=$VERIFY_REMOTE_PENDING
     if remote_names=$(list_remote_snapshots); then
         remote_checks=''

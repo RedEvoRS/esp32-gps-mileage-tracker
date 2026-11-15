@@ -450,12 +450,19 @@ backup, and also works with periodic checks off. On Unraid this direct run does
 not update the wrapper attempt/log, so inspect its output and `--status` deep
 result, then use `bash backup/scheduled.sh` for the normal recorded run.
 
-If a damaged snapshot exists only off-host, there is no local copy to repair it
-from. Check other snapshots with `bash backup/restore.sh check <snapshot-name>`
-before deciding what to keep. If the damaged snapshot cannot be repaired, delete
-that snapshot's folder on the destination. The next backup removes it from the
-retry list once it can list the destination's snapshots; other failures still
-need attention.
+If a damaged snapshot exists only off-host (the log says
+`Deep check FAILED remote-only <snapshot-name>`), there is no local copy to
+repair it from. Check other snapshots with
+`bash backup/restore.sh check <snapshot-name>` before deciding what to keep. If
+the damaged one cannot be repaired, remove only that snapshot's folder,
+`<REMOTE>/snapshots/<snapshot-name>`, from the destination. Never remove the
+destination itself or its `.mileage-backup-target` file. To keep the damaged
+copy while you investigate, move the folder out of `snapshots/` instead, for
+example to `<REMOTE>/damaged-<snapshot-name>`; backups only look inside
+`snapshots/`. The next nightly backup then drops the name from its retry list,
+as long as it can list the destination's snapshots. With periodic checks off,
+run `bash backup/backup.sh --verify`, then `bash backup/scheduled.sh` for the
+normal recorded run. Other failures in the same check still need attention.
 
 ## Step 5 — Build on Unraid, flash from the PC
 
