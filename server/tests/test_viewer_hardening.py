@@ -227,13 +227,57 @@ class ViewerHardeningTests(unittest.TestCase):
         target = self.db.parent / "private-track.gpx"
         gpx.rename(target)
         self.symlink(gpx, target)
-        self.assertFalse(self.viewer.load_trips()[0][0]["has_gpx"])
-        for route in ("/", "/export.csv", "/export.xlsx"):
+        target.write_text("outside-track-sentinel", encoding="utf-8")
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual(trips, [])
+        self.assertEqual([t["trip_key"] for t in unreadable], ["2026-01/drive"])
+        self.assertEqual(unreadable[0]["problem"], "the file could not be read")
+        self.assertEqual(unreadable[0]["device_id"], "example")
+        self.assertEqual(unreadable[0]["start_time"], "2026-01-02T12:00:00Z")
+        self.assertNotIn("distance_miles", unreadable[0])
+        with self.viewer._trip_read(trip_key="2026-01/drive") as (_, targeted, damaged):
+            self.assertEqual(targeted, trips)
+            self.assertEqual(damaged, unreadable)
+        self.assertEqual(self.viewer.mileage_totals(trips)["all"], 0)
+        for route in ("/", "/export.csv", "/export.xlsx", "/admin/year/2026"):
             with self.subTest(route=route):
                 response = self.client.get(route)
                 self.assertEqual(response.status_code, 200)
+                if route.endswith(".xlsx"):
+                    book = load_workbook(io.BytesIO(response.data))
+                    try:
+                        self.assertEqual(book["Mileage"].max_row, 1)
+                        self.assertEqual(book["Totals"]["D2"].value, 0)
+                        text = str([list(sheet.values) for sheet in book])
+                    finally:
+                        book.close()
+                else:
+                    text = response.get_data(as_text=True)
+                if route.endswith(".xlsx"):
+                    self.assertIn("drive", text)
+                elif route.endswith(".csv"):
+                    self.assertIn(",unreadable,", text)
+                else:
+                    self.assertIn("the file could not be read", text)
+                self.assertNotIn("outside-track-sentinel", text)
+                self.assertNotIn(str(target), text)
+                if route.endswith(".csv"):
+                    self.assertNotIn(",trip,", text)
                 response.close()
-        self.assertEqual(self.client.get("/gpx/2026-01/drive").status_code, 404)
+        response = self.client.get("/gpx/2026-01/drive")
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn(b"outside-track-sentinel", response.data)
+
+    def test_missing_gpx_keeps_summary_readable_and_miles_counted(self):
+        (self.viewer.DATA_ROOT / "2026-01/drive.gpx").unlink()
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual(unreadable, [])
+        self.assertEqual([t["trip_key"] for t in trips], ["2026-01/drive"])
+        self.assertFalse(trips[0]["has_gpx"])
+        self.assertEqual(self.viewer.mileage_totals(trips)["all"], 1)
+        with self.viewer._trip_read(trip_key="2026-01/drive") as (_, targeted, damaged):
+            self.assertEqual(targeted, trips)
+            self.assertEqual(damaged, [])
 
     def test_unreadable_summary_hides_os_error_paths_but_logs_details(self):
         self.signed_in("admin")

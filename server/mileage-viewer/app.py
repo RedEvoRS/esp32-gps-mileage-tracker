@@ -947,7 +947,20 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
         trip_key = f"{ym}/{trip_id}"
         ann = annotations.get(trip_key, {})
         summary, problem = _cached_summary(json_path, root=root)
-        has_gpx = _trip_file_exists(root, json_path.with_suffix(".gpx"))
+        try:
+            gpx_path = trip_merges.checked_path(root, json_path.with_suffix(".gpx"))
+        except ValueError:
+            # A refused track makes the recording unreadable; a missing one
+            # still lets its summary count. Keep only usable identity.
+            summary = {field: summary[field] for field in ("device_id", "start_time")
+                       if summary and isinstance(summary.get(field), str)}
+            problem = "the file could not be read"
+            has_gpx = False
+        else:
+            try:
+                has_gpx = gpx_path.exists()
+            except OSError:
+                has_gpx = False
         if only_merge_key is not None and problem == "the file is missing" and not has_gpx:
             continue
         trip = {
