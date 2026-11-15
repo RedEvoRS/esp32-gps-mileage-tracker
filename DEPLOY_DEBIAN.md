@@ -2749,6 +2749,18 @@ cannot search. Do not follow an outside link. Reload the viewer and let a
 queued upload retry after every blocking folder is usable. Diagnostics
 uploads are unaffected.
 
+A month folder that can be read and entered but not written to, such as
+mode 500 (or root-owned mode 755 without group/other write access), refuses
+only that month's new trips with a named HTTP 503 and one log line without
+a traceback. The tracker keeps those trips queued while other months upload.
+The viewer shows existing trips and a notice; nothing is counted as missing
+and merge suggestions continue. Apply the same owner-and-mode repair steps
+above to the real month folder, reload the viewer, and let a queued trip retry.
+The viewer uses existing owner/group/mode metadata, with no extra filesystem
+call per folder; it does not test write access on its normal read-only mount.
+Mode bits cannot describe ACLs or ingest's mount flags. A genuinely full disk
+or I/O error still gets 500.
+
 A month link to a folder that another month name already
 uses is normally a notice: its trips are counted once, under the other name.
 If the link's final target has a different name, ingest refuses new trips for

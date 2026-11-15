@@ -880,6 +880,24 @@ as root without `sudo`. Reload the viewer and let a queued upload retry;
 the alert clears and uploads resume once every blocking folder is usable.
 Diagnostics uploads are unaffected.
 
+A month folder that can be read and entered but cannot be written to (for
+example, mode 500) refuses only that month's new trips with a named HTTP 503
+and one log line, without a traceback. The tracker keeps them queued; other
+months keep uploading. Existing trips are shown and counted. The viewer
+shows a notice, with no missing-mileage count or merge block. Use the same
+owner-and-mode repair commands above for the real folder, then reload and
+let a queued trip retry. A root-owned mode-755 folder also needs repair unless
+the services' group or other bits grant write access. Disk-full and I/O
+write failures remain 500.
+
+The viewer judges write permission from the owner, group and mode metadata
+it already reads: owner bits take precedence, then the services' primary or
+supplementary groups, then other bits. This adds no filesystem call per folder
+and caches the services' identity once per worker. It never tests `W_OK` on
+its read-only `data/` mount, so that normal mount causes no notice. ACLs and
+the ingest mount's actual flags cannot be inferred from these mode bits;
+ingest's real file-creation result is authoritative.
+
 If a month name is a link to a file instead of a folder, remove only the
 link, keeping its target. If the month name is a plain file, move it somewhere
 safe outside the month names. The viewer reports either case as a folder

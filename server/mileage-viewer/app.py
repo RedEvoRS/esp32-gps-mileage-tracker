@@ -894,6 +894,29 @@ def load_trips(conn=None, include_removed=False):
         return trips, unreadable
 
 
+# Both services run as the same user. Cache process identity once, not per
+# folder; Windows development has no POSIX identity and uses the shipped UID.
+_MONTH_SERVICE_UID = getattr(os, 'geteuid', lambda: 1000)()
+_MONTH_SERVICE_GROUPS = frozenset([getattr(os, 'getegid', lambda: 1000)(),
+                                 *getattr(os, 'getgroups', lambda: [])()])
+
+
+def _month_mode_writable(metadata):
+    """Judge ingest's mode access without testing the viewer's read-only mount.
+
+    POSIX selects owner, group or other bits in that order; an owner's missing
+    write bit cannot be rescued by a group/other write bit. ACLs and the ingest
+    mount's actual flags are outside the metadata available to this viewer.
+    """
+    if _MONTH_SERVICE_UID == 0:
+        return True
+    if metadata.st_uid == _MONTH_SERVICE_UID:
+        return bool(metadata.st_mode & stat.S_IWUSR)
+    if metadata.st_gid in _MONTH_SERVICE_GROUPS:
+        return bool(metadata.st_mode & stat.S_IWGRP)
+    return bool(metadata.st_mode & stat.S_IWOTH)
+
+
 def _month_trip_names(checked_month):
     """List a checked directory without following a replacement final link."""
     # Listing an empty directory can succeed without search permission. One
@@ -925,6 +948,7 @@ FOLDER_PROBLEMS = {
     "link_not_folder": "the month name is a link to something other than a folder",
     "not_folder": "the month name is a file, not a folder",
     "unused_merge": "saved merge under an unused month name",
+    "unwritable": "trips are shown and counted, but the folder's owner or mode prevents the server writing to it",
 }
 
 MONTH_UPLOAD_REFUSAL = ("The tracker cannot upload new trips for this month until the link is {repair}; "
@@ -1018,8 +1042,11 @@ def folder_description(entry):
         text = f"This is a link to {entry['counted_as']}/, whose trips are counted there"
     else:
         text = entry["problem"]
-    if entry.get("uploads_refused") or entry["folder_reason"] == "ingest_refused":
-        if entry["folder_reason"] == "not_folder":
+    if entry.get("uploads_refused") or entry["folder_reason"] in ("ingest_refused", "unwritable"):
+        if entry["folder_reason"] == "unwritable":
+            text += (". The tracker cannot upload new trips for this month until the folder's owner or mode is fixed; "
+                     "the tracker keeps them queued")
+        elif entry["folder_reason"] == "not_folder":
             text += ". The tracker cannot upload new trips for this month until this name is a folder; the tracker keeps them queued"
         else:
             repair = "removed" if entry["folder_reason"] in ("duplicate", "link_not_folder") else "replaced by a real folder"
@@ -1053,7 +1080,7 @@ def folder_hint(entry, role):
         return "Remove only the link, keeping its target; ingest can then create a real month folder for queued trips."
     if entry["folder_reason"] == "not_folder":
         return "Move the file to a safe place outside the month names; ingest can then create a real month folder for queued trips."
-    if entry["folder_reason"] == "unreadable":
+    if entry["folder_reason"] in ("unreadable", "unwritable"):
         return "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only."
     return "Replace the link with the real folder, or mount the other disk at that path."
 
@@ -1079,7 +1106,7 @@ def folder_message(entry, role):
 
 def missing_mileage(entry):
     return entry.get("folder_reason") not in ("duplicate", "saved_keys", "ingest_refused", "unused_merge",
-                                             "not_folder", "link_not_folder")
+                                             "not_folder", "link_not_folder", "unwritable")
 
 
 def _folder_row_type(entry):
@@ -1277,7 +1304,8 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                 refuse_month(month.name)
                 continue
             try:
-                if not stat.S_ISDIR(checked_month.stat().st_mode):
+                month_stat = checked_month.stat()
+                if not stat.S_ISDIR(month_stat.st_mode):
                     continue
                 names = _month_trip_names(checked_month)
             except OSError as exc:
@@ -1285,6 +1313,8 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                 # not repeat the access check to discover the same fact.
                 refuse_month(month.name, "unreadable", all_uploads_refused=True if isinstance(exc, PermissionError) else None)
                 continue
+            if not _month_mode_writable(month_stat):
+                refuse_month(month.name, 'unwritable', uploads_refused=True)
             for name in names:
                 path = Path(name)
                 if path.suffix in (".json", ".gpx"):
@@ -4421,6 +4451,7 @@ def export_xlsx():
                     "unused_merge": " (saved merge under unused month name)",
                     "not_folder": " (notice: month name is a file; new uploads refused)",
                     "link_not_folder": " (notice: month link is not a folder; new uploads refused)",
+                    "unwritable": " (notice: folder not writable; existing trips counted)",
                 }.get(t["folder_reason"], " (whole month folder)")
                 values["trip_id"] += suffix
             sheet.append(_xlsx_clean([values[name] for name in UNREADABLE_COLUMNS]))

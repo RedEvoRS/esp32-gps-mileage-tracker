@@ -420,6 +420,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   be filed under the wrong month). Diagnostics are unaffected.
   A month folder the services cannot read or enter refuses every trip upload
   with a named 503; disk I/O and other server faults remain 500.
+  A readable/searchable month that denies temporary-file creation gets a named
+  503 for only that month's new trips; healthy uploads gain no extra probe.
   `install.sh --check` reports direct links in `data/` as problems; install
   warns and continues. If listing needs a new sudo prompt, check warns it skipped links.
   Ingest runs with umask 077; `install.sh` keeps `data/` at mode 700
@@ -480,6 +482,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   notices excluded from miles and missing counts, with admin undo, only when
   every part is counted under another name and both files match saved stamps.
   A missing folder alone remains damage; direct trip loads and undo agree.
+  A file occupying a month name, or a folder whose owner/mode denies ingest
+  writing, is a notice with no missing count or merge block. Write notices
+  reuse scanned metadata, never W_OK on the viewer's read-only mount.
   Closing a year
   saves its totals
   in `tax_years.snapshot`; the year review compares saved and current totals,

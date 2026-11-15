@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from month_link_layouts import (GLOBAL_UPLOAD_LAYOUTS, MONTH_LINK_LAYOUTS, MONTH_PROBLEM_LAYOUTS, PERMISSION_MONTH_LAYOUTS,
-                                make_layout, restricted_layout)
+                                WRITABLE_MONTH_LAYOUTS, make_layout, restricted_layout)
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "mileage-ingest" / "app.py"
@@ -317,6 +317,42 @@ class UploadSafety(unittest.TestCase):
                 self.assertEqual(response.status_code, expected, response.get_json())
                 if expected == 503:
                     self.assertIn("month folder 2026-03", response.get_json()["error"])
+
+    @unittest.skipIf(os.name == 'nt' or getattr(os, 'geteuid', lambda: 0)() == 0, 'requires non-root POSIX permissions')
+    def test_unwritable_month_refuses_only_its_uploads_without_partial_files_and_recovers(self):
+        for label, layout in WRITABLE_MONTH_LAYOUTS.items():
+            root = self.root / label
+            with restricted_layout(root, layout, self.symlink):
+                ingest = load_ingest(root)
+                client = ingest.app.test_client()
+                for month, status in layout['uploads'].items():
+                    payload = body().replace(b'2026-04-14', (month + '-14').encode())
+                    if status == 503:
+                        with self.assertLogs(ingest.app.logger, 'ERROR') as logs:
+                            response = client.post('/upload', data=payload, headers=HEADERS)
+                        self.assertEqual(len(logs.records), 1)
+                        self.assertIsNone(logs.records[0].exc_info)
+                        self.assertEqual(response.get_json()['error'],
+                                         f'month folder {month} cannot be written to; new trips for this month are refused '
+                                         'until its owner and permissions are fixed')
+                        self.assertEqual(list((root / month).iterdir()), [])
+                    else:
+                        response = client.post('/upload', data=payload, headers=HEADERS)
+                    self.assertEqual(response.status_code, status)
+            self.assertEqual(client.post('/upload', data=body().replace(b'2026-04-14', b'2026-02-14'),
+                                         headers=HEADERS).status_code, 200)
+            self.assertEqual(len(list((root / '2026-02').iterdir())), 2)
+
+    def test_temp_creation_permission_refusal_preserves_disk_and_io_errors_as_500(self):
+        for code, status in ((errno.EACCES, 503), (errno.EPERM, 503), (errno.ENOSPC, 500), (errno.EIO, 500)):
+            with self.subTest(errno=code), mock.patch.object(self.ing.tempfile, 'mkstemp',
+                                                           side_effect=OSError(code, 'synthetic write failure')), \
+                    self.assertLogs(self.ing.app.logger, 'ERROR') as logs:
+                response = self.upload()
+            self.assertEqual(response.status_code, status)
+            self.assertEqual(len(logs.records), 1)
+            self.assertIsNone(logs.records[0].exc_info)
+            self.assertEqual(list((self.root / '2026-04').iterdir()), [])
 
     def test_loop_refuses_when_resolve_leaves_it_unresolved(self):
         month = self.root / "2026-03"

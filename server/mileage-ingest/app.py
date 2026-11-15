@@ -245,7 +245,12 @@ def _atomic_write_bytes(target, data):
     reader never sees a half-written file -- it sees either the old
     version or the complete new one.
     """
-    fd, name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=target.parent)
+    try:
+        fd, name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=target.parent)
+    except PermissionError:
+        # Creating the temporary file needs directory write permission. No
+        # file was created, and ENOSPC/EIO still reach the ordinary 500 path.
+        raise UnwritableMonthError(target.parent.name) from None
     temp = Path(name)
     try:
         with os.fdopen(fd, "wb") as f:
@@ -316,6 +321,10 @@ class UnreadableMonthError(Exception):
 
 class NotDirectoryMonthError(Exception):
     """The destination month name is occupied by something other than a folder."""
+
+
+class UnwritableMonthError(Exception):
+    """The destination month refuses creation of a trip's temporary file."""
 
 
 def _stored_trip_directories(root, safe_id):
@@ -713,6 +722,11 @@ def upload_trip():
             if not gpx_file.exists():
                 _atomic_write_bytes(gpx_file, raw)
             _atomic_write_json(json_file, record)
+    except UnwritableMonthError as e:
+        message = (f"month folder {e} cannot be written to; new trips for this month are refused "
+                   "until its owner and permissions are fixed")
+        app.logger.error(message)
+        return jsonify({"error": message}), 503
     except NotDirectoryMonthError as e:
         message = (f"month folder {e} is not a directory; new trips for this month are refused "
                    "until that name is a real folder")

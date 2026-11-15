@@ -381,6 +381,18 @@ class ViewerMerges(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as conn:
             self.assertEqual(json.loads(conn.execute('SELECT snapshot FROM tax_years').fetchone()[0])['unreadable'], 0)
 
+    @unittest.skipIf(os.name == 'nt' or getattr(os, 'geteuid', lambda: 0)() == 0, 'requires non-root POSIX permissions')
+    def test_unwritable_month_notice_does_not_block_merge(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        self.addCleanup(self.month.chmod, 0o700)
+        self.month.chmod(0o500)
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual([entry['folder_reason'] for entry in entries], ['unwritable'])
+        first = next(t for t in trips if t['trip_key'] == a)
+        candidate, reason = self.viewer.trip_merges.next_trip(first, trips, entries)
+        self.assertEqual(candidate['trip_key'] if candidate else None, b, reason)
+        self.assertEqual(self.merge(a, b).status_code, 302)
+
     def test_duplicate_month_notice_does_not_block_merge(self):
         a, b = self.trip("a", 0), self.trip("b", 180, .01)
         try:

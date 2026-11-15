@@ -74,6 +74,25 @@ See [diagnostics retention](DIAGNOSTICS.md#diagnostics-event-retention).
 The installer creates `data/` with that ownership and mode 700. On an existing
 folder, it checks the owner UID and permissions.
 
+A hand-set month folder that UID 1000 can read and enter but not write
+(for example mode 500, or root-owned mode 755 without group/other write
+access) refuses that month's new trips with HTTP 503; other months still
+upload and the tracker keeps the refused trips queued. The viewer shows a
+notice and counts existing trips, without blocking merges. From the install
+directory, repair the real month folder as root (replace the example month):
+
+```bash
+chown -R 1000:1000 -- data/2026-02
+find data/2026-02 -type d -exec chmod 700 {} +
+find data/2026-02 -type f -exec chmod 600 {} +
+```
+
+For an internal link, inspect its target and parents first; do not follow an
+outside link. Reload the viewer and let a queued upload retry. The viewer
+uses the folder's owner/group/mode, not a write-access probe on its normal
+read-only mount. An unreadable or unsearchable month instead blocks every
+trip upload until repaired; disk-full and I/O write failures remain 500.
+
 Allow space on both the install pool and Docker's storage. Setup checks
 them separately: a Docker image disk can fill while the pool still has
 space. Allow at least 10 GiB free for the first firmware build.

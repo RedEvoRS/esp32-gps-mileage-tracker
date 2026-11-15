@@ -8,6 +8,8 @@ import io
 import os
 import json
 import sqlite3
+import stat
+from types import SimpleNamespace
 from pathlib import Path
 import unittest
 from contextlib import closing, ExitStack
@@ -19,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 import test_viewer_roles as roles
 from month_link_layouts import (GLOBAL_UPLOAD_LAYOUTS, MONTH_LINK_LAYOUTS, MONTH_PROBLEM_LAYOUTS, PERMISSION_MONTH_LAYOUTS,
-                                make_layout, restricted_layout)
+                                WRITABLE_MONTH_LAYOUTS, make_layout, restricted_layout)
 
 
 ADMIN_REFUSAL = ("This trip&#39;s files can&#39;t be opened: its summary, track or month folder is a link that leads "
@@ -547,6 +549,7 @@ class ViewerHardeningTests(unittest.TestCase):
             "link_not_folder": "The month name is a link to something other than a folder.",
             "not_folder": "The month name is a file, not a folder.",
             "unused_merge": "This merge is saved under a month name no longer in use (2026-01/, 2026-12/). Its miles and merged annotation are not applied.",
+            "unwritable": "Trips are shown and counted, but the folder's owner or mode prevents the server writing to it. The tracker cannot upload new trips for this month until the folder's owner or mode is fixed; the tracker keeps them queued.",
         }
         hints = {
             "duplicate": "Remove the extra link.",
@@ -556,6 +559,7 @@ class ViewerHardeningTests(unittest.TestCase):
             "link_not_folder": "Remove only the link, keeping its target; ingest can then create a real month folder for queued trips.",
             "not_folder": "Move the file to a safe place outside the month names; ingest can then create a real month folder for queued trips.",
             "unused_merge": "To use it again, restore its original month link to the trip folder and leave that name in use. The admin can also undo this saved merge on the trip list; original annotations stay in the database.",
+            "unwritable": "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only.",
         }
         cases = [(reason, False, False) for reason in descriptions]
         cases += [("saved_keys", True, False), ("duplicate", True, False), ("dangling", True, False)]
@@ -774,6 +778,67 @@ class ViewerHardeningTests(unittest.TestCase):
             self.viewer.load_trips()
         self.assertEqual(access.call_count, 1)
         self.assertEqual(access.call_args.args, (self.viewer.DATA_ROOT / "2026-01", os.R_OK | os.X_OK))
+
+    @unittest.skipIf(os.name == 'nt' or getattr(os, 'geteuid', lambda: 0)() == 0, 'requires non-root POSIX permissions')
+    def test_unwritable_month_notice_matches_ingest_layout_and_every_surface(self):
+        summary = (self.viewer.DATA_ROOT / '2026-01/drive.json').read_bytes()
+        for label, layout in WRITABLE_MONTH_LAYOUTS.items():
+            root = self.viewer.DATA_ROOT / label
+            make_layout(root, layout, self.symlink)
+            (root / '2026-02/drive.json').write_bytes(summary)
+            with restricted_layout(root, layout, self.symlink), patch.object(self.viewer, 'DATA_ROOT', root):
+                trips, entries = self.viewer.load_trips()
+                self.assertEqual([t['trip_key'] for t in trips], ['2026-02/drive'])
+                self.assertEqual([e['folder_reason'] for e in entries], ['unwritable'])
+                self.assertFalse(entries[0]['all_uploads_refused'])
+                self.assertTrue(entries[0]['uploads_refused'])
+                self.assertEqual(self.viewer.year_figures(trips, entries)['unreadable'], 0)
+                for role in ('admin', 'editor'):
+                    self.signed_in(role)
+                    message = self.viewer.folder_message(entries[0], role)
+                    for path, texts in self.folder_surface_messages(self.client, include_review=role == 'admin').items():
+                        self.assertTrue(any(message in text for text in texts), (role, path))
+                    self.assertNotIn('Uploads are blocked.', self.client.get('/').get_data(as_text=True))
+                self.signed_in('admin')
+                rows = list(csv.DictReader(io.StringIO(self.client.get('/export.csv').get_data(as_text=True))))
+                self.assertEqual(next(row for row in rows if row['trip_id'] == '2026-02/')['row_type'], 'folder_notice')
+            with patch.object(self.viewer, 'DATA_ROOT', root):
+                self.assertEqual(self.viewer.load_trips()[1], [])
+
+    def test_month_write_modes_select_owner_group_or_other_without_filesystem_calls(self):
+        cases = ((1000, 1000, 0o700, True), (1000, 1000, 0o500, False), (1000, 1000, 0o577, False),
+                 (0, 0, 0o700, False), (0, 0, 0o755, False), (0, 1000, 0o770, True),
+                 (0, 2000, 0o770, True), (0, 1000, 0o757, False), (0, 3000, 0o777, True),
+                 (0, 3000, 0o775, False))
+        with patch.object(self.viewer, '_MONTH_SERVICE_UID', 1000), \
+                patch.object(self.viewer, '_MONTH_SERVICE_GROUPS', {1000, 2000}), \
+                patch.object(Path, 'stat', side_effect=AssertionError('extra metadata call')):
+            for uid, gid, mode, writable in cases:
+                metadata = SimpleNamespace(st_uid=uid, st_gid=gid, st_mode=stat.S_IFDIR | mode)
+                self.assertEqual(self.viewer._month_mode_writable(metadata), writable, (uid, gid, mode))
+
+    def test_read_only_viewer_mount_with_healthy_owner_and_mode_has_no_write_notice(self):
+        month = self.viewer.DATA_ROOT / '2026-01'
+        original_stat, original_access = Path.stat, self.viewer.os.access
+        def metadata(path, *args, **kwargs):
+            result = original_stat(path, *args, **kwargs)
+            if path == month:
+                fields = list(result)
+                fields[0:3] = [stat.S_IFDIR | 0o700, result.st_ino, result.st_dev]
+                fields[4:6] = [1000, 1000]
+                return os.stat_result(fields)
+            return result
+        def read_only_access(path, mode, *args, **kwargs):
+            if mode & os.W_OK:
+                return False  # Model the mount separately from its healthy owner/mode.
+            return original_access(path, mode, *args, **kwargs)
+        with patch.object(self.viewer, '_MONTH_SERVICE_UID', 1000), \
+                patch.object(self.viewer, '_MONTH_SERVICE_GROUPS', {1000}), \
+                patch.object(Path, 'stat', metadata), patch.object(self.viewer.os, 'access', side_effect=read_only_access) as access:
+            trips, entries = self.viewer.load_trips()
+        self.assertEqual(len(trips), 1)
+        self.assertEqual(entries, [])
+        self.assertFalse(any(call.args[1] & os.W_OK for call in access.call_args_list))
 
     def test_earlier_link_keeps_saved_annotations_and_removal(self):
         target = self.linked_archive()

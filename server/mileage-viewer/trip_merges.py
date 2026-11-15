@@ -373,7 +373,7 @@ def next_trip(trip, trips, unreadable, removed=()):
         current_start = _parse_iso(trip["start_time"])
         for damaged in unreadable:
             if damaged.get("folder_reason") in ("duplicate", "ingest_refused", "saved_keys", "unused_merge",
-                                                "not_folder", "link_not_folder"):
+                                                "not_folder", "link_not_folder", "unwritable"):
                 continue  # No recordings are missing because of this notice.
             if damaged.get("folder"):
                 return None, f"Cannot establish the next trip: a month folder has a problem ({damaged['problem']}). Fix it before merging."

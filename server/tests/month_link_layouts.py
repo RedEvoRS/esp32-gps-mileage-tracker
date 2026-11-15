@@ -11,6 +11,11 @@ PERMISSION_MONTH_LAYOUTS = {
                       "modes": {"locked": 0o000}},
 }
 
+WRITABLE_MONTH_LAYOUTS = {
+    'read-enter-only': {'directories': ['2026-02', '2026-04'], 'links': [],
+                        'modes': {'2026-02': 0o500}, 'uploads': {'2026-02': 503, '2026-04': 200}},
+}
+
 
 @contextmanager
 def restricted_layout(root, layout, symlink):
