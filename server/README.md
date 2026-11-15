@@ -997,8 +997,10 @@ remain damaged merges: they count as missing mileage, appear in year review
 and close snapshots, block uncertain merge suggestions, and cannot be undone
 through **Undo saved merge**. An unused-name notice adds no saved miles or
 merged annotation and does not block merge suggestions for healthy trips.
-To use that merge again, restore its
-original month link to the original trip folder and keep that name in use
+Moving or renaming a real month folder with file times kept also produces an
+unused-name merge when every recording matches under the new name.
+To use that merge again, restore the original month name, as a link or by
+renaming the folder back, and keep that name in use
 (follow the conflict steps above before removing competing links). Or use
 **Undo saved merge** on the trip list as admin and confirm removing that
 merge and its merged annotation. Original annotations and source files stay

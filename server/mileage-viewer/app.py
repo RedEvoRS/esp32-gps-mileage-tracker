@@ -1065,9 +1065,11 @@ def folder_description(entry):
 def folder_hint(entry, role):
     if entry["folder_reason"] == "unused_merge":
         if role != "admin":
-            return "Please ask the admin to restore its original month link or undo this saved merge."
-        return ("To use it again, restore its original month link to the trip folder and leave that name in use. "
-                "The admin can also undo this saved merge on the trip list; original annotations stay in the database.")
+            return ("Please ask the admin to restore the original month name, as a link or by renaming the folder back, "
+                    "or use Undo saved merge to keep the separate trips and their own annotations.")
+        return ("To use this merge again, restore the original month name, as a link or by renaming the folder back, "
+                "and leave that name in use. Or use Undo saved merge on the trip list; "
+                "this keeps the separate trips and their own annotations.")
     if role != "admin":
         return "Please ask the admin to fix it."
     if entry["folder_reason"] == "duplicate":
@@ -2641,7 +2643,7 @@ LIST_HTML = """
         <form method="post" action="{{ url_for('undo_unused_merge', ym=u.ym, merge_id=u.id) }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <label><input type="checkbox" name="confirm" value="yes" required>
-            Remove this unused merge and its merged annotation; keep original annotations.</label>
+            Remove this unused merge and its merged annotation; keep the separate trips and their own annotations.</label>
           <button class="btn" type="submit">Undo saved merge</button>
         </form>
         {% endif %}
@@ -4212,7 +4214,7 @@ def _undo_merge(conn, key, keys):
 def undo_unused_merge(ym, merge_id):
     _validate_trip_address(ym, merge_id)
     if request.form.get("confirm") != "yes":
-        abort(400, description="Confirm removing this unused merge and its merged annotation; original annotations stay saved.")
+        abort(400, description="Confirm removing this unused merge and its merged annotation; the separate trips and their own annotations stay saved.")
     key = f"{ym}/{merge_id}"
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         conn.row_factory = sqlite3.Row

@@ -558,7 +558,7 @@ class ViewerHardeningTests(unittest.TestCase):
             "unreadable": "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only.",
             "link_not_folder": "Remove only the link, keeping its target; ingest can then create a real month folder for queued trips.",
             "not_folder": "Move the file to a safe place outside the month names; ingest can then create a real month folder for queued trips.",
-            "unused_merge": "To use it again, restore its original month link to the trip folder and leave that name in use. The admin can also undo this saved merge on the trip list; original annotations stay in the database.",
+            "unused_merge": "To use this merge again, restore the original month name, as a link or by renaming the folder back, and leave that name in use. Or use Undo saved merge on the trip list; this keeps the separate trips and their own annotations.",
             "unwritable": "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only.",
         }
         cases = [(reason, False, False) for reason in descriptions]
@@ -606,6 +606,9 @@ class ViewerHardeningTests(unittest.TestCase):
                 for entry in entries:
                     message = self.viewer.folder_message(entry, "editor")
                     self.assertIn("Please ask the admin", message)
+                    if entry['folder_reason'] == 'unused_merge':
+                        self.assertIn('restore the original month name, as a link or by renaming the folder back', message)
+                        self.assertIn('or use Undo saved merge to keep the separate trips and their own annotations.', message)
                     self.assertTrue(any(message in text for text in texts), path)
 
     def test_month_upload_notices_match_ingest_shared_link_layouts_on_every_surface(self):

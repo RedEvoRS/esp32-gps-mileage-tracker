@@ -2814,8 +2814,10 @@ partial matches, changed files or unreadable parts remain damaged merges,
 counted as missing in year review and close snapshots, with uncertain merge
 suggestions blocked and no **Undo saved merge**. An unused-name notice adds
 no saved miles or merged annotation; it does not block healthy merge
-suggestions. To use it again, restore its original month link to the original
-trip folder and keep that name in use, following the conflict steps above.
+suggestions. Moving or renaming a real month folder with file times kept also
+produces an unused-name merge when every recording matches under the new name.
+To use it again, restore the original month name, as a link or by renaming the
+folder back, and keep that name in use, following the conflict steps above.
 Alternatively, the admin can select **Undo saved merge** on the trip list
 and confirm. This removes only the saved merge and merged annotation,
 preserves original annotations and source files, and records the undo in
