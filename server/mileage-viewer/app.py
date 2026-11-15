@@ -917,16 +917,19 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
         json_paths = []
         refused_months = set()
 
-        def refuse_month(ym):
+        def refuse_month(ym, problem="the folder links outside the data folder"):
             if ym not in refused_months:
                 refused_months.add(ym)
                 unreadable.append({"folder": True, "ym": ym, "id": "", "trip_key": f"{ym}/",
-                                   "has_gpx": False, "problem": "the folder links outside the data folder",
+                                   "has_gpx": False, "problem": problem,
                                    "refused_file": "folder", "problem_file": "folder"})
 
         # Check before listing: refused folders must not expose filenames,
         # including when the link's target no longer exists.
-        for month in DATA_ROOT.iterdir():
+        counted_directories = set()
+        # Prefer real directories so their existing annotation keys survive;
+        # link-only targets use the first name in sorted order.
+        for month in sorted(DATA_ROOT.iterdir(), key=lambda path: (path.is_symlink(), path.name)):
             try:
                 checked_month = trip_merges.checked_path(root, month)
             except ValueError:
@@ -936,6 +939,10 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                     app.logger.warning("Refused data folder entry: %s", month.name)
                 continue
             if checked_month.is_dir():
+                if checked_month in counted_directories:
+                    refuse_month(month.name, "the folder is a link to another folder that is already counted")
+                    continue
+                counted_directories.add(checked_month)
                 for path in checked_month.iterdir():
                     if path.suffix in (".json", ".gpx"):
                         json_paths.append(month / path.with_suffix(".json").name)
@@ -2213,7 +2220,7 @@ LIST_HTML = """
       {% for u in unreadable %}
       {% if u.get('folder') %}
       <li><code>{{ u.trip_key }}</code> (month folder): {{ u.problem }}; none of its trips are shown or counted.
-        {% if g.role == 'admin' %}Replace the link with the real folder, or mount the other disk at that path.{% else %}Please ask the admin to fix it.{% endif %}
+        {% if g.role == 'admin' %}{% if 'already counted' in u.problem %}Remove the duplicate folder link.{% else %}Replace the link with the real folder, or mount the other disk at that path.{% endif %}{% else %}Please ask the admin to fix it.{% endif %}
       </li>
       {% else %}
       <li><code>{% if u.get('parts') %}{{ u.gpx_file }}{% else %}{{ u.trip_key }}.{{ u.get('problem_file') or 'json' }}{% endif %}</code>{% if not u.get('parts') and u.get('refused_file') == 'gpx' and u.get('problem_file') == 'json' %} (its GPX links outside the data folder){% elif not u.has_gpx and (u.get('parts') or not u.get('refused_file')) %} (no GPX either){% endif %}: {{ u.problem }}

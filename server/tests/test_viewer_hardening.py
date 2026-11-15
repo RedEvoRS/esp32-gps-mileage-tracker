@@ -234,8 +234,67 @@ class ViewerHardeningTests(unittest.TestCase):
         self.symlink(self.viewer.DATA_ROOT / "other", self.db.parent / "missing", directory=True)
         with self.assertLogs(self.viewer.app.logger, "WARNING"):
             trips, unreadable = self.viewer.load_trips()
+        self.assertEqual([t["trip_key"] for t in unreadable], ["2026-01/"])
+        self.assertEqual({t["trip_key"] for t in trips}, {"2026-02/drive"})
+
+    def assert_alias_counted_once(self, key, alias):
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual([t["trip_key"] for t in trips], [key])
+        self.assertEqual(self.viewer.mileage_totals(trips)["all"], 1)
+        self.assertEqual([t["trip_key"] for t in unreadable], [alias + "/"])
+        self.assertTrue(unreadable[0]["folder"])
+        self.assertIn("already counted", unreadable[0]["problem"])
+        self.assertNotIn(str(self.viewer.DATA_ROOT), unreadable[0]["problem"])
+        for role in ("admin", "editor"):
+            client = self.signed_in(role, self.viewer.app.test_client())
+            page = client.get("/").get_data(as_text=True)
+            self.assertIn(key, page)
+            self.assertIn("example", page)
+            self.assertNotIn(f'/trip/{alias}/drive', page)
+            import csv
+            rows = list(csv.DictReader(io.StringIO(client.get("/export.csv").get_data(as_text=True))))
+            self.assertEqual(len([r for r in rows if r["row_type"] == "trip"]), 1)
+            self.assertEqual([float(r["distance_miles"]) for r in rows
+                              if r["row_type"] == "total" and r["category"] == "all"], [1])
+            self.assertEqual([r["trip_id"] for r in rows if r["row_type"] == "unreadable_folder"], [alias + "/"])
+            book = load_workbook(io.BytesIO(client.get("/export.xlsx").data))
+            self.assertEqual(book["Mileage"].max_row, 2)
+            self.assertEqual([r[3] for r in book["Totals"].values if r[2] == "all"], [1])
+            self.assertEqual(book["Unreadable trips"].max_row, 2)
+            self.assertIn(alias + "/", str(list(book["Unreadable trips"].values)))
+            book.close()
+        self.signed_in("admin")
+        for year in (int(alias[:4]) - 1, int(alias[:4])):
+            page = self.client.get(f"/admin/year/{year}").get_data(as_text=True)
+            self.assertEqual(page.count(f"<code>{alias}/</code> (month folder)"), 1)
+        page = self.client.get("/admin/year/2026").get_data(as_text=True)
+        self.assertIn("<td>all</td><td>1</td><td>1.000</td>", page)
+
+    def test_internal_alias_prefers_real_month_and_keeps_annotations(self):
+        self.symlink(self.viewer.DATA_ROOT / "2025-01", self.viewer.DATA_ROOT / "2026-01", directory=True)
+        self.assert_alias_counted_once("2026-01/drive", "2025-01")
+        trips, _ = self.viewer.load_trips()
+        self.assertEqual(trips[0]["category"], "business")
+        self.assertEqual(trips[0]["purpose_note"], "example")
+
+    def test_two_month_links_to_nonmonth_folder_count_once_in_sorted_order(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        target = self.viewer.DATA_ROOT / "archive" / "trips"
+        target.parent.mkdir()
+        month.rename(target)
+        self.symlink(self.viewer.DATA_ROOT / "2027-01", target, directory=True)
+        self.symlink(month, target, directory=True)
+        self.assert_alias_counted_once("2026-01/drive", "2027-01")
+
+    def test_single_month_link_to_nonmonth_folder_scans_under_link_name(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        target = self.viewer.DATA_ROOT / "archive" / "trips"
+        target.parent.mkdir()
+        month.rename(target)
+        self.symlink(month, target, directory=True)
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual([t["trip_key"] for t in trips], ["2026-01/drive"])
         self.assertEqual(unreadable, [])
-        self.assertEqual({t["trip_key"] for t in trips}, {"2026-01/drive", "2026-02/drive"})
 
     def test_merged_trip_with_linked_month_part_keeps_undo(self):
         month = self.viewer.DATA_ROOT / "2026-01"
@@ -283,7 +342,7 @@ class ViewerHardeningTests(unittest.TestCase):
         first = next(t for t in trips if t["id"] == "first")
         candidate, reason = self.viewer.trip_merges.next_trip(first, trips, unreadable)
         self.assertIsNone(candidate)
-        self.assertIn("month folder links outside the data folder", reason)
+        self.assertIn("the folder links outside the data folder", reason)
 
     def test_refused_trip_links_hide_removal_and_stop_before_trip_reads(self):
         everyday = self.signed_in("editor", self.viewer.app.test_client())
