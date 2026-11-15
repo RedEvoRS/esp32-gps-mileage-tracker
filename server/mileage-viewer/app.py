@@ -52,6 +52,7 @@ import hmac
 import io
 import ipaddress
 import os
+import stat
 import re
 import secrets
 import sqlite3
@@ -891,6 +892,20 @@ def load_trips(conn=None, include_removed=False):
         return trips, unreadable
 
 
+def _month_trip_names(checked_month):
+    """List a checked directory without following a replacement final link."""
+    if (os.scandir in os.supports_fd and hasattr(os, "O_DIRECTORY")
+            and hasattr(os, "O_NOFOLLOW")):
+        fd = os.open(checked_month, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            with os.scandir(fd) as entries:
+                return [entry.name for entry in entries]
+        finally:
+            os.close(fd)
+    # Windows has no fd scandir; callers still check containment before listing.
+    return [path.name for path in checked_month.iterdir()]
+
+
 def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None):
     """Scan DATA_ROOT for trips and join annotations.
 
@@ -924,28 +939,36 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                                    "has_gpx": False, "problem": problem,
                                    "refused_file": "folder", "problem_file": "folder"})
 
-        # Check before listing: refused folders must not expose filenames,
-        # including when the link's target no longer exists.
+        # Only month names are trip identities accepted by the routes. Ignore
+        # other names before checking or listing their targets.
+        try:
+            months = [path for path in DATA_ROOT.iterdir() if trip_merges.YM_RE.fullmatch(path.name)]
+        except OSError:
+            months = []
         counted_directories = set()
-        # Prefer real directories so their existing annotation keys survive;
-        # link-only targets use the first name in sorted order.
-        for month in sorted(DATA_ROOT.iterdir(), key=lambda path: (path.is_symlink(), path.name)):
+        # Prefer real month directories to preserve their annotation keys;
+        # link-only targets use the first month name in sorted order.
+        for month in sorted(months, key=lambda path: (path.is_symlink(), path.name)):
             try:
                 checked_month = trip_merges.checked_path(root, month)
             except ValueError:
-                if trip_merges.YM_RE.fullmatch(month.name):
-                    refuse_month(month.name)
-                else:
-                    app.logger.warning("Refused data folder entry: %s", month.name)
+                refuse_month(month.name)
                 continue
-            if checked_month.is_dir():
+            try:
+                if not stat.S_ISDIR(checked_month.stat().st_mode):
+                    continue
                 if checked_month in counted_directories:
                     refuse_month(month.name, "the folder is a link to another folder that is already counted")
                     continue
-                counted_directories.add(checked_month)
-                for path in checked_month.iterdir():
-                    if path.suffix in (".json", ".gpx"):
-                        json_paths.append(month / path.with_suffix(".json").name)
+                names = _month_trip_names(checked_month)
+            except OSError:
+                refuse_month(month.name, "the folder could not be read")
+                continue
+            counted_directories.add(checked_month)
+            for name in names:
+                path = Path(name)
+                if path.suffix in (".json", ".gpx"):
+                    json_paths.append(month / path.with_suffix(".json").name)
         json_paths = list(dict.fromkeys(json_paths))
         with _summary_cache_lock:
             live = set(json_paths)
