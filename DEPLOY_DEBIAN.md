@@ -2720,9 +2720,38 @@ removed one by one. A month link to a folder that another month name already
 uses is normally a notice: its trips are counted once, under the other name, so
 delete the extra link. When only links reach a folder, the viewer keeps the name
 that has saved trip data. If several names have saved data, a warning names
-them; review their annotations, removals and merges before removing links.
+them. The admin warning gives each name's counts of annotations, removals,
+merges, merge parts, old merge addresses, history entries and closed-year trip
+entries, and marks the name in use. These are database counts, including entries
+whose trip files are gone, not additional miles.
 The viewer counts trips under the first saved name in sorted order, leaves the
 database rows in place, and refuses to close a year until the conflict is fixed.
+Every open year review shows the conflict beside a disabled Close button,
+including years unrelated to the linked folder.
+
+To resolve a saved-name conflict:
+
+1. Back up the trip files and `annotations.db` using the normal backup process.
+   Record each link's month name and target. Use the counts and the name marked
+   in use to choose which name's saved data to keep applying. The viewer does
+   not move or combine saved data between names.
+2. Keep that link and remove only the other links, not the target directory or
+   files. Removing a losing name leaves the current name's data applied.
+   Removing the name in use quietly orphans its saved data: the viewer chooses
+   a remaining name, whose annotations, removals and merges then apply instead.
+   The removed name's data is no longer applied; nothing is deleted from the
+   database. Check the list, Removed trips, merges and year totals afterwards.
+3. Recreate the same link name to the same target to get back. If several saved
+   names are restored, the conflict returns and the first saved name in sorted
+   order wins again. To inspect another name's saved data in the viewer,
+   temporarily leave only its link. Restore the recorded links to return to
+   the original selection. Avoid edits and year closes while comparing names;
+   existing closed-year snapshots remain in the database.
+4. Replace the final link with a real folder containing the existing trips,
+   or mount the disk at that path. Preserve the selected month name so its
+   saved-data keys still match. Check the viewer and `install.sh --check`;
+   queued tracker trips can then retry.
+
 A link to a non-month folder inside `data/` shows existing trips and counts
 them, but a notice warns that ingest refuses new trips for that month with
 503. The tracker keeps those trips queued. Replace the link with a real folder

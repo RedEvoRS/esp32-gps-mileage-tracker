@@ -953,6 +953,7 @@ def folder_description(entry):
         names = ", ".join(name + "/" for name in entry["saved_months"])
         text = (f"Warning: saved trip data exists under {names}. Trips are shown and counted under "
                 f"{entry['counted_as']}/; saved data under the other names is not applied")
+        text += ". Years cannot be closed until this conflict is resolved"
         if entry.get("uploads_refused"):
             text += ". " + FOLDER_PROBLEMS["ingest_refused"]
         return text
@@ -967,7 +968,10 @@ def folder_hint(entry, role):
     if entry["folder_reason"] == "duplicate":
         return "Remove the extra link."
     if entry["folder_reason"] == "saved_keys":
-        return "Review the saved annotations, removals and merges under these names before removing links. Resolve this conflict before closing the year."
+        return ("Choose which name's saved data to use and keep only that link. "
+                "Removing a link leaves its saved data unapplied; removing the name in use quietly orphans that data. "
+                "Nothing is deleted from the database. Recreate the same link to get back; "
+                "competing saved names bring the conflict back. See DEPLOY_DEBIAN.md, Troubleshooting, for steps.")
     if entry["folder_reason"] == "ingest_refused":
         return "Replace the link with a real folder containing these trips, or mount the disk there, so queued trips can upload."
     if entry["folder_reason"] == "unreadable":
@@ -981,6 +985,11 @@ def folder_message(entry, role):
     sentences = [description[0].upper() + description[1:].rstrip(".") + "."]
     if missing_mileage(entry):
         sentences.append("None of its trips are shown or counted.")
+    if role == "admin":
+        for name, counts in entry.get("saved_counts", {}).items():
+            status = "in use" if name == entry["counted_as"] else "not applied"
+            amounts = ", ".join(f"{count} {label}" for label, count in counts.items())
+            sentences.append(f"{name}/ ({status}): {amounts}.")
     sentences.append(folder_hint(entry, role))
     return " ".join(sentences)
 
@@ -1019,6 +1028,27 @@ def _saved_month_names(conn, names):
     params = [value for name in names for value in (name, name + "/", name + "0")]
     query = f"WITH candidates(name, low, high) AS (VALUES {values}) SELECT name FROM candidates WHERE "
     return sorted(row[0] for row in conn.execute(query + " OR ".join(tests), params))
+
+
+def _saved_month_counts(conn, names):
+    """Inventory only an actual saved-name conflict; ordinary scans do no work."""
+    counts = {
+        "annotations": "SELECT count(*) FROM annotations WHERE trip_key >= low AND trip_key < high",
+        "removals": "SELECT count(*) FROM trip_removals WHERE trip_key >= low AND trip_key < high",
+        "merges": "SELECT count(*) FROM trip_merges WHERE trip_key >= low AND trip_key < high",
+        "merge parts": """SELECT count(*) FROM trip_merge_parts WHERE
+            (part_key >= low AND part_key < high) OR (merge_key >= low AND merge_key < high)""",
+        "old merge addresses": "SELECT count(*) FROM trip_merge_aliases WHERE alias_key >= low AND alias_key < high",
+        "history entries": "SELECT count(*) FROM trip_history WHERE trip_key >= low AND trip_key < high",
+        "closed-year trip entries": """SELECT count(*) FROM tax_years,
+            json_each(CASE WHEN json_valid(snapshot) THEN snapshot ELSE '{}' END, '$.trip_keys')
+            WHERE json_each.value >= low AND json_each.value < high""",
+    }
+    values = ",".join("(?,?,?)" for _ in names)
+    params = [value for name in names for value in (name, name + "/", name + "0")]
+    query = f"WITH candidates(name, low, high) AS (VALUES {values}) SELECT name, "
+    query += ", ".join(f"({sql})" for sql in counts.values()) + " FROM candidates ORDER BY name"
+    return {row[0]: dict(zip(counts, row[1:], strict=True)) for row in conn.execute(query, params)}
 
 
 def _month_choices(conn, root):
@@ -1122,6 +1152,7 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                                    "has_gpx": False, "problem": problem,
                                    "folder_reason": reason, "counted_as": counted_as,
                                    "saved_months": saved_months,
+                                   "saved_counts": _saved_month_counts(conn, saved_months) if reason == "saved_keys" else {},
                                    "uploads_refused": uploads_refused,
                                    "refused_file": "folder", "problem_file": "folder"})
 
@@ -3238,6 +3269,7 @@ first recorded time), the same as the trip list and exports.</p>
 
 <section aria-labelledby="status-heading">
 <h2 id="status-heading">Status</h2>
+{% for entry in saved_conflicts %}<p class="warn" role="alert">{{ folder_message(entry, g.role) }}</p>{% endfor %}
 {% if closed %}
 <p><span class="tag other">Closed for edits</span> by {{ closed.closed_by }} on {{ fmt_date(closed.closed_at) }}.
 Nobody can annotate, merge, undo a merge, remove or restore a trip in {{ year }} until you reopen it.
@@ -3251,11 +3283,15 @@ marked in the exports. To categorize it, reopen the year and close it again: tha
 <button class="btn secondary" type="submit">Reopen {{ year }}</button></form>
 {% else %}
 <p>{{ year }} is open. Close it once its return is filed, so its trips can't change by accident.</p>
+{% if saved_conflicts %}
+<button class="btn" disabled>Close {{ year }}</button>
+{% else %}
 <form method="post" action="{{ url_for('close_year', year=year) }}">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 <p class="muted">Closing also saves this year's trip count and miles, so any later change to them shows on this page.</p>
 <label><input type="checkbox" name="confirm" value="yes" required> Confirm closing {{ year }} for edits</label>
 <button class="btn" type="submit">Close {{ year }}</button></form>
+{% endif %}
 {% endif %}
 </section>
 
@@ -3474,6 +3510,7 @@ def admin_year(year):
         # and exports use, applied to the log without its removed trips.
         live = [t for t in trips if "removal" not in t]
         live_unreadable = [t for t in unreadable if "removal" not in t]
+        saved_conflicts = [t for t in live_unreadable if t.get("folder_reason") == "saved_keys"]
         members, broken = year_members(live, live_unreadable, year)
         gone, gone_unreadable = year_members(
             [t for t in trips if "removal" in t], [t for t in unreadable if "removal" in t], year)
@@ -3505,7 +3542,8 @@ def admin_year(year):
     covered = trip_merges.trips_inside_merges(live)
     inside_merge = [{"trip": t, "merge": covered[t["trip_key"]]} for t in members if t["trip_key"] in covered]
     return render_template_string(
-        YEAR_HTML, year=year, closed=closed, totals=totals, counts=counts, edits=edits,
+        YEAR_HTML, year=year, closed=closed, saved_conflicts=saved_conflicts,
+        totals=totals, counts=counts, edits=edits,
         inside_merge=inside_merge, late=late, late_miles=sum(t.get("distance_miles") or 0 for t in late),
         comparison=comparison, joined=joined, left=left, undated=undated, undated_miles=sum(t.get("distance_miles") or 0 for t in undated),
         uncategorized=[t for t in members if t.get("category") not in CATEGORIES],

@@ -873,10 +873,40 @@ data and year locks attached to the same trips. A real month folder still wins.
 If several link names hold saved data, the viewer uses the first of those names
 in sorted order and shows a warning naming all of them (`row_type=folder_warning`
 in CSV). The trips are counted, but saved data under the other names is not
-applied. Review the annotations, removals and merges before removing any link;
-the viewer does not move or combine database rows. Merge suggestions and closing
-any year wait until this conflict is resolved. Existing year locks remain in
+applied. The admin sees counts per name of annotations, removals, merges, merge
+parts, old merge addresses, history entries and trip entries in closed-year
+snapshots, with the name in use marked. Counts describe saved database entries,
+including ones for files no longer present; they do not add miles. Every open
+year's review shows the conflict beside a disabled Close button, even if the
+folder belongs to another year. Closed-year reviews also show the conflict in
+their status section. Merge suggestions and closing any year wait until this
+conflict is resolved. Existing year locks remain in
 force; folder warnings are not counted as missing mileage in year snapshots.
+
+To resolve competing saved names:
+
+1. Make a normal backup of the trip files and `annotations.db`. Record each
+   link's name and target so you can recreate it. Read the counts and the name
+   in use in the admin warning. Choose which name's saved data you want to use;
+   the viewer cannot combine the names' annotations, removals or merges.
+2. Keep that name's link and remove only the other symbolic links, not their
+   target folder or trip files. Removing a name stops applying the saved data
+   under it. Removing a losing name leaves the current name's data in use.
+   Removing the name in use quietly orphans its saved data: another remaining
+   name is chosen and its annotations, removals and merges apply instead.
+   Nothing is deleted from the database. Check the trip list, Removed trips,
+   merges and year totals after changing the links.
+3. To undo, recreate the same link name to the same target. Its saved data can
+   be used again; if several saved names are present, the conflict returns and
+   sorted order decides which is in use. To inspect a losing name's saved data
+   in the viewer, temporarily leave only its link, then restore the recorded
+   links to return to the original selection. Avoid editing or closing years
+   while comparing names. Closed-year snapshots are left in place.
+4. Once the desired name is the only link, replace it with a real month folder
+   containing the existing trip files, or mount the disk at that month path.
+   Keep the month name to preserve its saved-data keys. Verify the viewer and
+   `install.sh --check`, then let the tracker retry queued uploads.
+
 The XLSX `Unreadable trips` sheet also lists folder notices and saved-data
 warnings. Their row labels say whether trips are counted elsewhere, a link
 blocks new uploads, or saved names conflict. Only a folder whose trips cannot
