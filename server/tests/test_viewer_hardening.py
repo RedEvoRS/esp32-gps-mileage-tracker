@@ -18,7 +18,8 @@ from openpyxl import load_workbook
 from zoneinfo import ZoneInfo
 
 import test_viewer_roles as roles
-from month_link_layouts import GLOBAL_UPLOAD_LAYOUTS, MONTH_LINK_LAYOUTS, make_layout
+from month_link_layouts import (GLOBAL_UPLOAD_LAYOUTS, MONTH_LINK_LAYOUTS, PERMISSION_MONTH_LAYOUTS,
+                                make_layout, restricted_layout)
 
 
 ADMIN_REFUSAL = ("This trip&#39;s files can&#39;t be opened: its summary, track or month folder is a link that leads "
@@ -560,7 +561,7 @@ class ViewerHardeningTests(unittest.TestCase):
                 repair = "removed" if reason == "duplicate" else "replaced by a real folder"
                 text += f" The tracker cannot upload new trips for this month until the link is {repair}; the tracker keeps them queued."
             if all_refused:
-                text += " All of the tracker's trip uploads are refused until the unsafe month links are replaced; the tracker keeps them queued."
+                text += " All of the tracker's trip uploads are refused until the month folder problems below are fixed; the tracker keeps them queued."
             if reason in ("outside", "dangling", "loop", "unreadable"):
                 text += " None of its trips are shown or counted."
             text += " " + hints.get(reason, "Replace the link with the real folder, or mount the other disk at that path.")
@@ -614,7 +615,7 @@ class ViewerHardeningTests(unittest.TestCase):
     def test_global_upload_warning_matches_ingest_layouts_on_every_surface_and_year(self):
         summary = (self.viewer.DATA_ROOT / "2026-01/drive.json").read_bytes()
         self.signed_in("admin")
-        expected = ("All of the tracker's trip uploads are refused until the unsafe month links are replaced; "
+        expected = ("All of the tracker's trip uploads are refused until the month folder problems below are fixed; "
                     "the tracker keeps them queued.")
         for label, layout in GLOBAL_UPLOAD_LAYOUTS.items():
             root = self.viewer.DATA_ROOT / label
@@ -640,7 +641,7 @@ class ViewerHardeningTests(unittest.TestCase):
                 # Unrelated years do not gain missing mileage in their snapshot.
                 self.assertEqual(self.viewer.year_figures(*self.viewer.year_members(trips, entries, 2020))["unreadable"], 0)
 
-    def test_month_resolution_permission_error_is_not_called_a_global_503(self):
+    def test_month_resolution_permission_error_is_a_global_503(self):
         month = self.viewer.DATA_ROOT / "2026-03"
         month.mkdir()
         original = Path.resolve
@@ -653,7 +654,30 @@ class ViewerHardeningTests(unittest.TestCase):
         with patch.object(Path, "resolve", denied):
             entries = self.viewer.load_trips()[1]
         self.assertEqual(len(entries), 1)
-        self.assertFalse(entries[0]["all_uploads_refused"])
+        self.assertEqual(entries[0]["folder_reason"], "unreadable")
+        self.assertTrue(entries[0]["all_uploads_refused"])
+
+    @unittest.skipIf(os.name == "nt" or getattr(os, "geteuid", lambda: 0)() == 0, "requires non-root POSIX permissions")
+    def test_permission_layouts_show_folder_warning_and_global_alert(self):
+        for label, layout in PERMISSION_MONTH_LAYOUTS.items():
+            root = self.viewer.DATA_ROOT / label
+            with restricted_layout(root, layout, self.symlink), patch.object(self.viewer, "DATA_ROOT", root):
+                trips, entries = self.viewer.load_trips()
+                self.assertEqual(trips, [])
+                self.assertEqual([(e["ym"], e["folder_reason"], e["all_uploads_refused"]) for e in entries],
+                                 [("2026-02", "unreadable", True)], label)
+                for role in ("admin", "editor"):
+                    self.signed_in(role)
+                    text = html.unescape(self.client.get("/?year=2020").get_data(as_text=True))
+                    self.assertIn("Uploads are blocked.", text)
+                    self.assertIn("2026-02/", text)
+                self.signed_in("admin")
+                message = self.viewer.folder_message(entries[0], "admin")
+                for path, texts in self.folder_surface_messages(self.client).items():
+                    self.assertTrue(any(message in text for text in texts), (label, path))
+            with patch.object(self.viewer, "DATA_ROOT", root):
+                self.assertEqual(self.viewer.load_trips(), ([], []))
+                self.assertNotIn("Uploads are blocked.", self.client.get("/").get_data(as_text=True))
 
     def test_upload_alert_gives_role_specific_advice(self):
         entry = {"folder": True, "ym": "2027-02", "trip_key": "2027-02/", "id": "",

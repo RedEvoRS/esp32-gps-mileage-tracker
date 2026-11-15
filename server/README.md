@@ -852,8 +852,27 @@ folders (recovering existing files from their actual storage or a backup), or
 mount their disks at the month paths. Do not delete their targets or trip files.
 Then run `install.sh --check`, review the viewer totals and let the tracker retry.
 A missing target **inside** `data/` is unreadable in the viewer but does not
-trigger this all-month 503 rule. Other permission or filesystem errors can still
-make uploads fail; the viewer does not label those as this link-specific block.
+trigger this all-month 503 rule. Disk I/O and other server faults still return 500.
+
+One month folder that the server cannot read or enter also blocks **every trip
+upload for every month**, including retries, with HTTP 503 naming that folder.
+The viewer includes it in the "Uploads are blocked" alert. Both services run
+as UID 1000. Copying or restoring folders by hand with `sudo` under a strict
+umask can leave a root-owned mode-700 folder that neither service can use.
+For a real month folder, run from the install directory containing `data/`:
+
+```bash
+sudo chown -R 1000:1000 -- data/2026-02
+sudo find data/2026-02 -type d -exec chmod 700 {} +
+sudo find data/2026-02 -type f -exec chmod 600 {} +
+```
+
+Use the folder named by the alert. For an internal link, inspect its real
+target and each parent (`namei -l data/2026-02`) and fix their owner and search
+permissions too; do not follow an outside link. On Unraid run these commands
+as root without `sudo`. Reload the viewer and let a queued upload retry;
+the alert clears and uploads resume once every blocking folder is usable.
+Diagnostics uploads are unaffected.
 
 The viewer checks containment before it lists a folder or reads a file, and on
 Linux it lists each month through a directory handle that refuses a month

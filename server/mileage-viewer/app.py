@@ -919,7 +919,7 @@ FOLDER_PROBLEMS = {
 
 MONTH_UPLOAD_REFUSAL = ("The tracker cannot upload new trips for this month until the link is {repair}; "
                         "the tracker keeps them queued")
-ALL_UPLOADS_REFUSAL = ("All of the tracker's trip uploads are refused until the unsafe month links are replaced; "
+ALL_UPLOADS_REFUSAL = ("All of the tracker's trip uploads are refused until the month folder problems below are fixed; "
                       "the tracker keeps them queued.")
 
 
@@ -928,7 +928,7 @@ def _month_blocks_all_uploads(month, root):
 
     Called only for a folder problem, never on an ordinary healthy scan.
     A dangling inside link is not the same as a dangling outside link.
-    Other metadata errors make ingest return 500, not this link-specific 503.
+    Permission failures refuse every upload too; I/O/resource faults stay 500.
     """
     try:
         # Use ingest's resolution rule here. checked_path converts every
@@ -940,15 +940,19 @@ def _month_blocks_all_uploads(month, root):
         target = Path(normalized).resolve()
     except RuntimeError:
         return True
+    except PermissionError:
+        return True
     except OSError:
         return False
     if root not in target.parents:
         return True
     try:
-        target.stat()
+        mode = target.stat().st_mode
+    except PermissionError:
+        return True
     except OSError as exc:
         return exc.errno == errno.ELOOP
-    return False
+    return stat.S_ISDIR(mode) and not os.access(target, os.R_OK)
 
 
 def _month_link_problem(month, root):
@@ -1110,8 +1114,9 @@ def _month_choices(conn, root):
             target = trip_merges.checked_path(root, month)
             if stat.S_ISDIR(target.stat().st_mode):
                 groups.setdefault(target, []).append(month)
-        except ValueError:
-            problems.append((month.name, "outside", None, ()))
+        except ValueError as exc:
+            reason = "unreadable" if isinstance(exc.__cause__, PermissionError) else "outside"
+            problems.append((month.name, reason, None, ()))
         except OSError:
             problems.append((month.name, "unreadable", None, ()))
     for target, candidates in groups.items():

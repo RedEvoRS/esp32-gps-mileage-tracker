@@ -1,5 +1,27 @@
 """Identical hand-made folder layouts for viewer and ingest regressions."""
 
+from contextlib import contextmanager
+
+
+PERMISSION_MONTH_LAYOUTS = {
+    "no-access": {"directories": ["2026-02"], "links": [], "modes": {"2026-02": 0o000}},
+    "search-only": {"directories": ["2026-02"], "links": [], "modes": {"2026-02": 0o100}},
+    "locked-parent": {"directories": ["locked/2026-02"], "links": [("2026-02", "locked/2026-02")],
+                      "modes": {"locked": 0o000}},
+}
+
+
+@contextmanager
+def restricted_layout(root, layout, symlink):
+    make_layout(root, layout, symlink)
+    try:
+        for name, mode in layout["modes"].items():
+            (root / name).chmod(mode)
+        yield
+    finally:
+        for name in layout["modes"]:
+            (root / name).chmod(0o700)
+
 
 MONTH_LINK_LAYOUTS = {
     "other-month": {

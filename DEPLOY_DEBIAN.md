@@ -2724,7 +2724,27 @@ backup), or mount the disk at that month path. Remove only the links, not their
 targets or trip files. Run `install.sh --check`, check the viewer totals, then
 allow the tracker to retry. These trips can't be removed one by one in the
 viewer. A missing target inside `data/` is unreadable, but does not cause this
-all-month 503; other permission or disk errors can still cause upload failures.
+all-month 503. Disk I/O and other server faults still return 500.
+
+One month folder the server cannot read or enter blocks **every trip upload
+for every month**, including retries, with HTTP 503 naming the folder. Both
+services run as UID 1000; the viewer's "Uploads are blocked" alert includes
+these folders. A hand copy or restore with `sudo` under a strict umask can
+leave root-owned mode-700 folders. From `~/mileage-tracker`, fix the
+real month folder named in the alert (replace this example month):
+
+```bash
+sudo chown -R 1000:1000 -- data/2026-02
+sudo find data/2026-02 -type d -exec chmod 700 {} +
+sudo find data/2026-02 -type f -exec chmod 600 {} +
+```
+
+If it is an internal link, inspect its target and parents with
+`namei -l data/2026-02` and fix the real target and any parent that UID 1000
+cannot search. Do not follow an outside link. Reload the viewer and let a
+queued upload retry after every blocking folder is usable. Diagnostics
+uploads are unaffected.
+
 A month link to a folder that another month name already
 uses is normally a notice: its trips are counted once, under the other name.
 If the link's final target has a different name, ingest refuses new trips for

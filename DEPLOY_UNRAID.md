@@ -644,3 +644,21 @@ and shows how to apply the limit.
   policies. Editing `.env` alone does not recreate existing containers.
 - **Python container cannot start:** the first use may need an image pull.
   Check Docker download access and space. Installing host Python is optional.
+- **All trip uploads return 503 naming a month folder:** one month folder
+  that UID 1000 cannot read or enter blocks every upload, including retries
+  for other months. The viewer's "Uploads are blocked" alert names it.
+  Copying or restoring folders by hand as root under a strict umask (or with
+  `sudo` on another host) can leave root-owned mode-700 folders. For a real
+  month folder, run as root from the install directory containing `data/`, replacing
+  the example month:
+
+  ```bash
+  chown -R 1000:1000 -- data/2026-02
+  find data/2026-02 -type d -exec chmod 700 {} +
+  find data/2026-02 -type f -exec chmod 600 {} +
+  ```
+
+  For an internal link also inspect its real target and parent folders;
+  UID 1000 needs search permission on each parent. Do not follow an outside
+  link. Reload the viewer and let a queued upload retry once every blocking
+  folder is usable. Diagnostics uploads are unaffected.
