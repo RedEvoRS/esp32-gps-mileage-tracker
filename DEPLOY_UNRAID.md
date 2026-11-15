@@ -450,6 +450,13 @@ backup, and also works with periodic checks off. On Unraid this direct run does
 not update the wrapper attempt/log, so inspect its output and `--status` deep
 result, then use `bash backup/scheduled.sh` for the normal recorded run.
 
+If a damaged snapshot exists only off-host, there is no local copy to repair it
+from. Check other snapshots with `bash backup/restore.sh check <snapshot-name>`
+before deciding what to keep. If the damaged snapshot cannot be repaired, delete
+that snapshot's folder on the destination. The next backup removes it from the
+retry list once it can list the destination's snapshots; other failures still
+need attention.
+
 ## Step 5 — Build on Unraid, flash from the PC
 
 The Windows helper's first-install and `-Cleanup` flows, and the macOS/Linux

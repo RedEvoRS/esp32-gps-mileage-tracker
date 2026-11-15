@@ -291,6 +291,14 @@ deep_verify() (
     # failing remote-only snapshot even if another name is now oldest.
     remote_checks=$VERIFY_REMOTE_PENDING
     if remote_names=$(list_remote_snapshots); then
+        remote_checks=''
+        for old in $VERIFY_REMOTE_PENDING; do
+            if grep -Fxq -- "$old" <<< "$remote_names"; then
+                remote_checks+="$old "
+            else
+                log "Deep check: $old is no longer on REMOTE; removed from the retry list"
+            fi
+        done
         remote_oldest=$(head -n 1 <<< "$remote_names")
         if [[ -n $remote_oldest && $remote_oldest != "$current" && ! -d $SNAPSHOTS/$remote_oldest \
                 && " $remote_checks " != *" $remote_oldest "* ]]; then
