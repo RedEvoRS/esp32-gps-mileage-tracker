@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from zoneinfo import ZoneInfo
 
 import test_viewer_roles as roles
-from month_link_layouts import MONTH_LINK_LAYOUTS, make_layout
+from month_link_layouts import GLOBAL_UPLOAD_LAYOUTS, MONTH_LINK_LAYOUTS, make_layout
 
 
 ADMIN_REFUSAL = ("This trip&#39;s files can&#39;t be opened: its summary, track or month folder is a link that leads "
@@ -514,8 +514,11 @@ class ViewerHardeningTests(unittest.TestCase):
                 if path.endswith(".xlsx"):
                     book = load_workbook(io.BytesIO(response.data))
                     try:
-                        rows = list(book["Unreadable trips"].values)
-                        result[path] = [r[rows[0].index("purpose_note")] for r in rows[1:]]
+                        if "Unreadable trips" in book:
+                            rows = list(book["Unreadable trips"].values)
+                            result[path] = [r[rows[0].index("purpose_note")] for r in rows[1:]]
+                        else:
+                            result[path] = []
                     finally:
                         book.close()
                 elif path.endswith(".csv"):
@@ -544,16 +547,20 @@ class ViewerHardeningTests(unittest.TestCase):
             "saved_keys": "Choose which name's saved data to use and keep only that link. Removing a link leaves its saved data unapplied; removing the name in use quietly orphans that data. Nothing is deleted from the database. Recreate the same link to get back; competing saved names bring the conflict back. See DEPLOY_DEBIAN.md, Troubleshooting, for steps.",
             "unreadable": "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only.",
         }
-        cases = [(reason, False) for reason in descriptions] + [("saved_keys", True), ("duplicate", True)]
-        for number, (reason, refused) in enumerate(cases, 1):
+        cases = [(reason, False, False) for reason in descriptions]
+        cases += [("saved_keys", True, False), ("duplicate", True, False)]
+        cases += [(reason, False, True) for reason in ("outside", "dangling", "loop", "unreadable")]
+        for number, (reason, refused, all_refused) in enumerate(cases, 1):
             entries.append({"folder": True, "ym": f"2026-{number:02}", "trip_key": f"2026-{number:02}/",
                             "id": "", "folder_reason": reason, "problem": self.viewer.FOLDER_PROBLEMS[reason],
                             "counted_as": "2026-12", "saved_months": ["2026-01", "2026-12"],
-                            "uploads_refused": refused, "has_gpx": False})
+                            "uploads_refused": refused, "all_uploads_refused": all_refused, "has_gpx": False})
             text = descriptions[reason]
             if refused:
                 repair = "removed" if reason == "duplicate" else "replaced by a real folder"
                 text += f" The tracker cannot upload new trips for this month until the link is {repair}; the tracker keeps them queued."
+            if all_refused:
+                text += " All of the tracker's trip uploads are refused until the unsafe month links are replaced; the tracker keeps them queued."
             if reason in ("outside", "dangling", "loop", "unreadable"):
                 text += " None of its trips are shown or counted."
             text += " " + hints.get(reason, "Replace the link with the real folder, or mount the other disk at that path.")
@@ -596,6 +603,70 @@ class ViewerHardeningTests(unittest.TestCase):
                     for path, texts in self.folder_surface_messages(self.client).items():
                         with self.subTest(layout=label, month=entry["ym"], surface=path):
                             self.assertTrue(any(message in text for text in texts))
+
+    def test_global_upload_warning_matches_ingest_layouts_on_every_surface_and_year(self):
+        summary = (self.viewer.DATA_ROOT / "2026-01/drive.json").read_bytes()
+        self.signed_in("admin")
+        expected = ("All of the tracker's trip uploads are refused until the unsafe month links are replaced; "
+                    "the tracker keeps them queued.")
+        for label, layout in GLOBAL_UPLOAD_LAYOUTS.items():
+            root = self.viewer.DATA_ROOT / label
+            make_layout(root, layout, self.symlink)
+            (root / "2026-01").mkdir()
+            (root / "2026-01/drive.json").write_bytes(summary)
+            with patch.object(self.viewer, "DATA_ROOT", root):
+                trips, entries = self.viewer.load_trips()
+                self.assertEqual([t["trip_key"] for t in trips], ["2026-01/drive"])
+                blocked = [e for e in entries if e["all_uploads_refused"]]
+                self.assertEqual(bool(blocked), layout["blocked"], label)
+                for path, texts in self.folder_surface_messages(self.client, year=2027).items():
+                    with self.subTest(layout=label, surface=path):
+                        self.assertEqual(any(expected in text for text in texts), layout["blocked"])
+                        for entry in blocked:
+                            self.assertTrue(any(self.viewer.folder_message(entry, "admin") in text for text in texts))
+                for path in ("/", "/?year=2020", "/admin/year/2020"):
+                    text = html.unescape(self.client.get(path).get_data(as_text=True))
+                    self.assertEqual(expected in text, layout["blocked"], (label, path))
+                    if layout["blocked"]:
+                        self.assertIn('role="alert"><b>Uploads are blocked.</b>', text)
+                        self.assertIn("2027-02/", text)
+                # Unrelated years do not gain missing mileage in their snapshot.
+                self.assertEqual(self.viewer.year_figures(*self.viewer.year_members(trips, entries, 2020))["unreadable"], 0)
+
+    def test_month_resolution_permission_error_is_not_called_a_global_503(self):
+        month = self.viewer.DATA_ROOT / "2026-03"
+        month.mkdir()
+        original = Path.resolve
+
+        def denied(path, *args, **kwargs):
+            if path == month:
+                raise PermissionError("synthetic resolution denial")
+            return original(path, *args, **kwargs)
+
+        with patch.object(Path, "resolve", denied):
+            entries = self.viewer.load_trips()[1]
+        self.assertEqual(len(entries), 1)
+        self.assertFalse(entries[0]["all_uploads_refused"])
+
+    def test_loop_blocks_all_uploads_when_resolve_leaves_it_unresolved(self):
+        month = self.viewer.DATA_ROOT / "2026-03"
+        self.symlink(month, month, directory=True)
+        original = Path.resolve
+
+        def unresolved(path, *args, **kwargs):
+            return path if path == month else original(path, *args, **kwargs)
+
+        with patch.object(Path, "resolve", unresolved):
+            entry = self.viewer.load_trips()[1][0]
+        self.assertEqual(entry["folder_reason"], "loop")
+        self.assertTrue(entry["all_uploads_refused"])
+
+    def test_top_upload_warning_uses_only_one_trip_scan(self):
+        self.signed_in("admin")
+        with patch.object(self.viewer, "load_trips", wraps=self.viewer.load_trips) as load, \
+                patch.object(self.viewer, "_month_blocks_all_uploads", side_effect=AssertionError("extra link check")):
+            self.assertEqual(self.client.get("/?year=2026").status_code, 200)
+            self.assertEqual(load.call_count, 1)
 
     def test_earlier_link_keeps_saved_annotations_and_removal(self):
         target = self.linked_archive()

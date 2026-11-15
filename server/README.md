@@ -841,6 +841,20 @@ with the real folder or mount the other disk at that path; for a folder that
 can't be read, check that it still exists, that its disk is available, and
 that UID 1000 (the viewer reads `data/` read-only) may read it.
 
+If any month link leads outside `data/`, to `data/` itself or above, or loops,
+ingest refuses **every trip upload for every month** with HTTP 503, including
+retries of already stored trips. An outside target need not exist. The folder
+warning explains this, and a separate alert at the top of the list and in every
+year review names the blocking folders, even when a different year is selected.
+The tracker keeps the trips queued; Device health shows server errors.
+Diagnostics uploads are unaffected. Replace all of those links with real month
+folders (recovering existing files from their actual storage or a backup), or
+mount their disks at the month paths. Do not delete their targets or trip files.
+Then run `install.sh --check`, review the viewer totals and let the tracker retry.
+A missing target **inside** `data/` is unreadable in the viewer but does not
+trigger this all-month 503 rule. Other permission or filesystem errors can still
+make uploads fail; the viewer does not label those as this link-specific block.
+
 The viewer checks containment before it lists a folder or reads a file, and on
 Linux it lists each month through a directory handle that refuses a month
 folder swapped for a link at the last moment. These checks can't stop someone

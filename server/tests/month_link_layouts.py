@@ -32,8 +32,21 @@ MONTH_LINK_LAYOUTS = {
     },
 }
 
+GLOBAL_UPLOAD_LAYOUTS = {
+    "outside": {"directories": ["../outside"], "links": [("2027-02", "../outside")], "blocked": True},
+    "outside-chain": {"directories": ["../outside/leaf"], "links": [("bridge", "../outside"), ("2027-02", "bridge/leaf")], "blocked": True},
+    "dangling-outside": {"directories": [], "links": [("2027-02", "../missing")], "blocked": True},
+    "loop": {"directories": [], "links": [("2027-02", "2027-02")], "blocked": True},
+    "loop-chain": {"directories": [], "links": [("2027-02", "2027-03"), ("2027-03", "2027-02")], "blocked": True},
+    "data-root": {"directories": [], "links": [("2027-02", ".")], "blocked": True},
+    "ancestor": {"directories": [], "links": [("2027-02", "..")], "blocked": True},
+    "dangling-inside": {"directories": [], "links": [("2027-02", "missing")], "blocked": False},
+    "nonmonth-outside": {"directories": ["../outside"], "links": [("archive", "../outside")], "blocked": False},
+}
+
 
 def make_layout(root, layout, symlink):
+    root.mkdir(parents=True, exist_ok=True)
     for name in layout["directories"]:
         (root / name).mkdir(parents=True, exist_ok=True)
     for name, target in layout["links"]:

@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from month_link_layouts import MONTH_LINK_LAYOUTS, make_layout
+from month_link_layouts import GLOBAL_UPLOAD_LAYOUTS, MONTH_LINK_LAYOUTS, make_layout
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "mileage-ingest" / "app.py"
@@ -225,6 +225,55 @@ class UploadSafety(unittest.TestCase):
         response = self.upload()
         self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
         self.assertTrue(any(p.suffix == ".gpx" for p in archive.iterdir()))
+
+    def test_unrelated_month_uploads_match_shared_global_block_layouts(self):
+        for label, layout in GLOBAL_UPLOAD_LAYOUTS.items():
+            root = self.root / label
+            make_layout(root, layout, self.symlink)
+            ingest = load_ingest(root)
+            with self.subTest(layout=label):
+                response = ingest.app.test_client().post("/upload", data=body(), headers=HEADERS)
+                self.assertEqual(response.status_code, 503 if layout["blocked"] else 200, response.get_json())
+                if layout["blocked"]:
+                    self.assertIn("month folder 2027-", response.get_json()["error"])
+                    self.assertFalse((root / "2026-04").exists())
+                    # Even a retry for an existing ID in an unrelated month
+                    # must refuse until every unsafe month link is repaired.
+                    (root / "2026-04").mkdir()
+                    (root / "2026-04/2026-04-14T14-30-00Z.gpx").write_bytes(body())
+                    response = ingest.app.test_client().post("/upload", data=body(), headers=HEADERS)
+                    self.assertEqual(response.status_code, 503)
+                    for name, _ in layout["links"]:
+                        (root / name).unlink()
+                    self.assertEqual(ingest.app.test_client().post("/upload", data=body(), headers=HEADERS).status_code, 200)
+
+    def test_month_resolution_permission_error_keeps_storage_500(self):
+        month = self.root / "2026-03"
+        month.mkdir()
+        original = Path.resolve
+
+        def denied(path, *args, **kwargs):
+            if path == month:
+                raise PermissionError("synthetic resolution denial")
+            return original(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "resolve", denied):
+            response = self.upload()
+        self.assertEqual(response.status_code, 500)
+        self.assertNotIn("month folder", response.get_data(as_text=True))
+
+    def test_loop_refuses_when_resolve_leaves_it_unresolved(self):
+        month = self.root / "2026-03"
+        self.symlink(month, month, directory=True)
+        original = Path.resolve
+
+        def unresolved(path, *args, **kwargs):
+            return path if path == month else original(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "resolve", unresolved):
+            response = self.upload()
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("month folder 2026-03", response.get_json()["error"])
 
     def test_dangling_outside_month_link_refuses(self):
         with tempfile.TemporaryDirectory() as outside:

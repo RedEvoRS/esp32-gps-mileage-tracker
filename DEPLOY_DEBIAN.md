@@ -2714,9 +2714,18 @@ sudo find ~/mileage-tracker/data -type l -ls
 A month folder that is a link leading outside `data/`, a link whose target is
 missing, or a link that loops is shown once as a folder warning, and its trips
 aren't counted. A link that leads outside `data/` (even if its target is
-missing) or loops also makes ingest refuse GPX uploads with 503 until fixed.
-Replace it with a real folder or mount the disk there; its trips can't be
-removed one by one. A month link to a folder that another month name already
+missing), points at `data/` itself or above, or loops also makes ingest refuse
+**all trip uploads for all months** with HTTP 503, including retries. The tracker
+keeps them queued; diagnostics uploads are unaffected. A separate warning at
+the top of the trip list and on every year review names these links, including
+when an unrelated year is selected. Replace every such link with a real month
+folder containing the existing trips (recover them from actual storage or a
+backup), or mount the disk at that month path. Remove only the links, not their
+targets or trip files. Run `install.sh --check`, check the viewer totals, then
+allow the tracker to retry. These trips can't be removed one by one in the
+viewer. A missing target inside `data/` is unreadable, but does not cause this
+all-month 503; other permission or disk errors can still cause upload failures.
+A month link to a folder that another month name already
 uses is normally a notice: its trips are counted once, under the other name.
 If the link's final target has a different name, ingest refuses new trips for
 the link's month with 503 and the tracker keeps them queued until the link is

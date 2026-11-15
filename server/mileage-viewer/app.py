@@ -919,6 +919,36 @@ FOLDER_PROBLEMS = {
 
 MONTH_UPLOAD_REFUSAL = ("The tracker cannot upload new trips for this month until the link is {repair}; "
                         "the tracker keeps them queued")
+ALL_UPLOADS_REFUSAL = ("All of the tracker's trip uploads are refused until the unsafe month links are replaced; "
+                      "the tracker keeps them queued.")
+
+
+def _month_blocks_all_uploads(month, root):
+    """Mirror ingest's _stored_trip_directories LinkedMonthError conditions.
+
+    Called only for a folder problem, never on an ordinary healthy scan.
+    A dangling inside link is not the same as a dangling outside link.
+    Other metadata errors make ingest return 500, not this link-specific 503.
+    """
+    try:
+        # Use ingest's resolution rule here. checked_path converts every
+        # resolve OSError to ValueError, which would overstate the 503 cases.
+        parent = os.path.realpath(month.parent)
+        normalized = os.path.abspath(os.path.join(parent, month.name))
+        if not normalized.startswith(os.path.join(str(root), "")):
+            return True
+        target = Path(normalized).resolve()
+    except RuntimeError:
+        return True
+    except OSError:
+        return False
+    if root not in target.parents:
+        return True
+    try:
+        target.stat()
+    except OSError as exc:
+        return exc.errno == errno.ELOOP
+    return False
 
 
 def _month_link_problem(month, root):
@@ -964,6 +994,8 @@ def folder_description(entry):
     if entry.get("uploads_refused") or entry["folder_reason"] == "ingest_refused":
         repair = "removed" if entry["folder_reason"] == "duplicate" else "replaced by a real folder"
         text += ". " + MONTH_UPLOAD_REFUSAL.format(repair=repair)
+    if entry.get("all_uploads_refused"):
+        text += ". " + ALL_UPLOADS_REFUSAL.rstrip(".")
     return text
 
 
@@ -1009,7 +1041,7 @@ def _folder_row_type(entry):
     return "unreadable_folder" if missing_mileage(entry) else "folder_notice"
 
 
-app.jinja_env.globals.update(folder_message=folder_message,
+app.jinja_env.globals.update(folder_message=folder_message, all_uploads_refusal=ALL_UPLOADS_REFUSAL,
                             missing_mileage=missing_mileage)
 app.jinja_env.tests["missing_mileage"] = missing_mileage
 
@@ -1169,6 +1201,8 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                                    "saved_months": saved_months,
                                    "saved_counts": _saved_month_counts(conn, saved_months) if reason == "saved_keys" else {},
                                    "uploads_refused": uploads_refused,
+                                   "all_uploads_refused": (_month_blocks_all_uploads(DATA_ROOT / ym, root)
+                                                           if missing_mileage({"folder_reason": reason}) else False),
                                    "refused_file": "folder", "problem_file": "folder"})
 
         counted, problems = _month_choices(conn, root)
@@ -1863,14 +1897,14 @@ def _flag_trips_inside_merges(trips):
         by_key[key]["inside_merge"] = {"ym": cover["ym"], "id": cover["id"], "trip_key": cover["trip_key"]}
 
 
-def selected_trips(include_history=False):
+def selected_trips(include_history=False, loaded=None):
     """Use local start year, or first recorded time for partly timed trips.
 
     Returns (trips, unreadable, year, years). Unreadable trips have no
     start time, so they're the exception: they go by folder.
     """
     year = selected_year()
-    trips, unreadable = load_trips()
+    trips, unreadable = load_trips() if loaded is None else loaded
     _flag_trips_inside_merges(trips)
     years = {y for y in map(_trip_local_year, trips) if y}
     selected = trips
@@ -2460,6 +2494,12 @@ LIST_HTML = """
   </div>
 </header>
 <div class="wrap">
+  {% if upload_blocks %}
+  <div class="warn" role="alert"><b>Uploads are blocked.</b> {{ all_uploads_refusal }}
+    Folders: {% for entry in upload_blocks %}<code>{{ entry.trip_key }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+    <a href="{{ url_for('index') }}">Review the folder warnings in All years.</a>
+  </div>
+  {% endif %}
   {% if unreadable %}
   <div class="warn" role="alert">
     {% set missing = unreadable|select('missing_mileage')|list %}
@@ -3284,6 +3324,9 @@ first recorded time), the same as the trip list and exports.</p>
 
 <section aria-labelledby="status-heading">
 <h2 id="status-heading">Status</h2>
+{% if upload_blocks %}<p class="warn" role="alert"><b>Uploads are blocked.</b> {{ all_uploads_refusal }}
+Folders: {% for entry in upload_blocks %}<code>{{ entry.trip_key }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+<a href="{{ url_for('index') }}">Review the folder warnings in All years.</a></p>{% endif %}
 {% for entry in saved_conflicts %}<p class="warn" role="alert">{{ folder_message(entry, g.role) }}</p>{% endfor %}
 {% if closed %}
 <p><span class="tag other">Closed for edits</span> by {{ closed.closed_by }} on {{ fmt_date(closed.closed_at) }}.
@@ -3526,6 +3569,7 @@ def admin_year(year):
         live = [t for t in trips if "removal" not in t]
         live_unreadable = [t for t in unreadable if "removal" not in t]
         saved_conflicts = [t for t in live_unreadable if t.get("folder_reason") == "saved_keys"]
+        upload_blocks = [t for t in live_unreadable if t.get("all_uploads_refused")]
         members, broken = year_members(live, live_unreadable, year)
         gone, gone_unreadable = year_members(
             [t for t in trips if "removal" in t], [t for t in unreadable if "removal" in t], year)
@@ -3557,7 +3601,7 @@ def admin_year(year):
     covered = trip_merges.trips_inside_merges(live)
     inside_merge = [{"trip": t, "merge": covered[t["trip_key"]]} for t in members if t["trip_key"] in covered]
     return render_template_string(
-        YEAR_HTML, year=year, closed=closed, saved_conflicts=saved_conflicts,
+        YEAR_HTML, year=year, closed=closed, saved_conflicts=saved_conflicts, upload_blocks=upload_blocks,
         totals=totals, counts=counts, edits=edits,
         inside_merge=inside_merge, late=late, late_miles=sum(t.get("distance_miles") or 0 for t in late),
         comparison=comparison, joined=joined, left=left, undated=undated, undated_miles=sum(t.get("distance_miles") or 0 for t in undated),
@@ -3734,11 +3778,13 @@ def logout():
 
 @app.route("/")
 def index():
-    trips, unreadable, year, years = selected_trips()
+    loaded = load_trips()
+    upload_blocks = [t for t in loaded[1] if t.get("all_uploads_refused")]
+    trips, unreadable, year, years = selected_trips(loaded=loaded)
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         year_closed = year in trip_log.closed_years(conn)
     return render_template_string(
-        LIST_HTML, trips=trips, unreadable=unreadable, year=year, years=years,
+        LIST_HTML, trips=trips, unreadable=unreadable, year=year, years=years, upload_blocks=upload_blocks,
         totals=mileage_totals(trips), timezone=DISPLAY_TZ_NAME, year_closed=year_closed,
     )
 
