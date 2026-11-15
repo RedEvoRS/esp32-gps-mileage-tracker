@@ -186,7 +186,32 @@ def combined_gpx(data_root, keys):
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
-def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=None):
+def unused_merge_months(data_root, keys, counted_months):
+    """All parts must belong to unused names; real damage stays damage.
+
+    Only a known alias or an absent directory entry proves a name unused.
+    Permission, I/O, unsafe links and empty real folders prove nothing here.
+    This costs at most one lstat per distinct part month, only for a merge.
+    """
+    if not keys or any(not TRIP_KEY_RE.fullmatch(key) for key in keys):
+        return []
+    months = sorted({key.split("/")[0] for key in keys})
+    for month in months:
+        if month in counted_months:
+            if counted_months[month] == month:
+                return []
+        else:
+            try:
+                (data_root / month).lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return []
+            return []
+    return months
+
+
+def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=None, counted_months=None):
     """Use persisted summaries, reparsing only when a source stamp changes.
 
     A broken/missing part makes the whole merged trip unreadable, rather than
@@ -204,8 +229,14 @@ def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=N
         row = dict(row)
         key = row["trip_key"]
         keys = parts(conn, key)
-        hidden.update(keys)
         ym, trip_id = key.split("/")
+        unused = unused_merge_months(data_root, keys, counted_months) if counted_months is not None else []
+        if unused:
+            broken.append({"folder": True, "folder_reason": "unused_merge", "unused_merge": True,
+                           "ym": ym, "id": trip_id, "trip_key": key, "parts": keys,
+                           "saved_months": unused, "has_gpx": False, "problem": "saved merge under an unused month name"})
+            continue
+        hidden.update(keys)
         t = {"ym": ym, "id": trip_id, "trip_key": key, "parts": keys,
              "has_gpx": True, **{f: row[f] or "" for f in ANNOTATION_FIELDS}}
         if keys:
@@ -304,7 +335,7 @@ def next_trip(trip, trips, unreadable, removed=()):
             return None, REMOVED_BETWEEN
         current_start = _parse_iso(trip["start_time"])
         for damaged in unreadable:
-            if damaged.get("folder_reason") in ("duplicate", "ingest_refused"):
+            if damaged.get("folder_reason") in ("duplicate", "ingest_refused", "saved_keys", "unused_merge"):
                 continue  # Existing recordings are present and counted.
             if damaged.get("folder"):
                 return None, f"Cannot establish the next trip: a month folder has a problem ({damaged['problem']}). Fix it before merging."

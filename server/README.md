@@ -932,8 +932,8 @@ snapshots, with the name in use marked. Counts describe saved database entries,
 including ones for files no longer present; they do not add miles. Every open
 year's review shows the conflict beside a disabled Close button, even if the
 folder belongs to another year. Closed-year reviews also show the conflict in
-their status section. Merge suggestions and closing any year wait until this
-conflict is resolved. Existing year locks remain in
+their status section. Closing any year waits until this conflict is resolved;
+healthy trips under the name in use can still have merge suggestions. Existing year locks remain in
 force; folder warnings are not counted as missing mileage in year snapshots.
 
 To resolve competing saved names:
@@ -959,6 +959,27 @@ To resolve competing saved names:
    containing the existing trip files, or mount the disk at that month path.
    Keep the month name to preserve its saved-data keys. Verify the viewer and
    `install.sh --check`, then let the tracker retry queued uploads.
+
+A merge whose parts are all saved under month names no longer in use is
+listed as saved data under an unused name, including after its link is
+removed. Its saved miles and merged annotation are not applied and it does
+not block merge suggestions for healthy trips. To use it again, restore its
+original month link to the original trip folder and keep that name in use
+(follow the conflict steps above before removing competing links). Or use
+**Undo saved merge** on the trip list as admin and confirm removing that
+merge and its merged annotation. Original annotations and source files stay
+intact; the undo is recorded in history. Closed-year locks still apply;
+reopen the affected year first. An everyday login must ask the admin.
+
+CSV lists an unused merge as `row_type=folder_notice`, with its saved key,
+recovery advice and no miles. XLSX shows the same notice in **Unreadable
+trips**, labelled as a saved merge under an unused name. Totals and new
+year-close snapshots include only trips under the name now in use; an unused
+merge adds no trip, missing-mileage count or snapshot key. Older snapshots
+stay unchanged, so the review can show a former merged key leaving and the
+currently counted trips joining. A missing or unreadable part under a name
+still in use remains a damaged merge, excluded from totals and subject to
+the existing conservative merge-suggestion checks.
 
 The XLSX `Unreadable trips` sheet also lists folder notices and saved-data
 warnings. Their row labels say whether trips are counted elsewhere, a link

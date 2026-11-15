@@ -25,6 +25,21 @@ def restricted_layout(root, layout, symlink):
 
 
 MONTH_LINK_LAYOUTS = {
+    "merge-conflict": {
+        "directories": ["archive"], "links": [("2026-03", "archive"), ("2026-04", "archive")],
+        "counted": "2026-03", "duplicates": ["2026-04"],
+        "uploads": {"2026-03": 503, "2026-04": 503, "2026-09": 200},
+    },
+    "merge-losing-link-removed": {
+        "directories": ["archive"], "links": [("2026-03", "archive")],
+        "counted": "2026-03", "duplicates": [],
+        "uploads": {"2026-03": 503, "2026-04": 200, "2026-09": 200},
+    },
+    "merge-original-name-restored": {
+        "directories": ["archive"], "links": [("2026-04", "archive")],
+        "counted": "2026-04", "duplicates": [],
+        "uploads": {"2026-03": 200, "2026-04": 503, "2026-09": 200},
+    },
     "other-month": {
         "directories": ["2026-11"],
         "links": [("2026-12", "2026-11")],

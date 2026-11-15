@@ -192,6 +192,7 @@ ENDPOINT_ROLES = {
     "lookup_place": {"admin", "editor"},
     "merge_trip": {"admin", "editor"},
     "split_trip": {"admin", "editor"},
+    "undo_unused_merge": {"admin"},
     "export_csv": {"admin", "editor"},
     "export_xlsx": {"admin", "editor"},
     "device_health": {"admin", "editor"},
@@ -921,6 +922,7 @@ FOLDER_PROBLEMS = {
     "ingest_refused": "trips are shown and counted",
     "link_not_folder": "the month name is a link to something other than a folder",
     "not_folder": "the month name is a file, not a folder",
+    "unused_merge": "saved merge under an unused month name",
 }
 
 MONTH_UPLOAD_REFUSAL = ("The tracker cannot upload new trips for this month until the link is {repair}; "
@@ -1000,7 +1002,11 @@ def _month_sort_key(month):
 
 
 def folder_description(entry):
-    if entry["folder_reason"] == "saved_keys":
+    if entry["folder_reason"] == "unused_merge":
+        names = ", ".join(name + "/" for name in entry["saved_months"])
+        text = (f"This merge is saved under a month name no longer in use ({names}). "
+                "Its miles and merged annotation are not applied")
+    elif entry["folder_reason"] == "saved_keys":
         names = ", ".join(name + "/" for name in entry["saved_months"])
         text = (f"Warning: saved trip data exists under {names}. Trips are shown and counted under "
                 f"{entry['counted_as']}/; saved data under the other names is not applied")
@@ -1021,6 +1027,11 @@ def folder_description(entry):
 
 
 def folder_hint(entry, role):
+    if entry["folder_reason"] == "unused_merge":
+        if role != "admin":
+            return "Please ask the admin to restore its original month link or undo this saved merge."
+        return ("To use it again, restore its original month link to the trip folder and leave that name in use. "
+                "The admin can also undo this saved merge on the trip list; original annotations stay in the database.")
     if role != "admin":
         return "Please ask the admin to fix it."
     if entry["folder_reason"] == "duplicate":
@@ -1063,7 +1074,7 @@ def folder_message(entry, role):
 
 
 def missing_mileage(entry):
-    return entry.get("folder_reason") not in ("duplicate", "saved_keys", "ingest_refused")
+    return entry.get("folder_reason") not in ("duplicate", "saved_keys", "ingest_refused", "unused_merge")
 
 
 def _folder_row_type(entry):
@@ -1358,7 +1369,8 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
         trips = [t for t in trips if t["ym"] not in refused_months]
         unreadable = [t for t in unreadable if t.get("folder") or t["ym"] not in refused_months]
     trips, unreadable = trip_merges.apply_merges(
-        conn, DATA_ROOT, trips, unreadable, refresh=refresh_merges, only_key=only_merge_key)
+        conn, DATA_ROOT, trips, unreadable, refresh=refresh_merges, only_key=only_merge_key,
+        counted_months=counted if only_merge_key is None else None)
     # Removal is keyed by the canonical key the list shows (a merged trip's
     # merge key, a part never), so filtering here, after the merges, hides a
     # merged trip as a whole. This is the only place that filters: the list,
@@ -2551,7 +2563,15 @@ LIST_HTML = """
     <ul>
       {% for u in unreadable %}
       {% if u.get('folder') %}
-      <li><code>{{ u.trip_key }}</code> (month folder): {{ folder_message(u, g.role) }}
+      <li><code>{{ u.trip_key }}</code> ({% if u.get('unused_merge') %}saved merge{% else %}month folder{% endif %}): {{ folder_message(u, g.role) }}
+        {% if u.get('unused_merge') and g.role == 'admin' %}
+        <form method="post" action="{{ url_for('undo_unused_merge', ym=u.ym, merge_id=u.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <label><input type="checkbox" name="confirm" value="yes" required>
+            Remove this unused merge and its merged annotation; keep original annotations.</label>
+          <button class="btn" type="submit">Undo saved merge</button>
+        </form>
+        {% endif %}
       </li>
       {% else %}
       <li><code>{% if u.get('parts') %}{{ u.gpx_file }}{% else %}{{ u.trip_key }}.{{ u.get('problem_file') or 'json' }}{% endif %}</code>{% if not u.get('parts') and u.get('refused_file') == 'gpx' and u.get('problem_file') == 'json' %} (its GPX links outside the data folder){% elif not u.has_gpx and (u.get('parts') or not u.get('refused_file')) %} (no GPX either){% endif %}: {{ u.problem }}
@@ -3350,7 +3370,7 @@ YEAR_HTML = """
 .changed { font-weight: 700; }
 </style></head><body>
 """ + ACCOUNT_HEADER + """<main class="wrap">
-{% macro trip_link(t) %}{% if t.get('folder') %}<code>{{ t.trip_key }}</code> (month folder){% else %}<a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{% if t.problem %}{{ t.trip_key }}{% else %}{{ fmt_trip_date(t) }}{% endif %}</a>{% endif %}{% endmacro %}
+{% macro trip_link(t) %}{% if t.get('folder') %}<code>{{ t.trip_key }}</code> ({% if t.get('unused_merge') %}saved merge{% else %}month folder{% endif %}){% else %}<a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{% if t.problem %}{{ t.trip_key }}{% else %}{{ fmt_trip_date(t) }}{% endif %}</a>{% endif %}{% endmacro %}
 <h1>{{ year }} year review</h1>
 <p class="muted">Times shown in {{ timezone }}. A trip belongs to the year it starts in (or, if partly timed, its
 first recorded time), the same as the trip list and exports.</p>
@@ -4081,6 +4101,58 @@ def merge_trip(ym, trip_id):
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
 
 
+def _undo_merge(conn, key, keys):
+    """Database-only undo; caller holds BEGIN IMMEDIATE and checks edit locks."""
+    merged = conn.execute("SELECT * FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
+    dropped = {field: (merged[field] or "") if merged else ""
+               for field in trip_merges.ANNOTATION_FIELDS}
+    restored = {part: {field: "" for field in trip_merges.ANNOTATION_FIELDS} for part in keys}
+    for row in conn.execute(
+        f"SELECT * FROM annotations WHERE trip_key IN ({','.join('?' * len(keys))})", keys
+    ):
+        restored[row["trip_key"]] = {field: row[field] or "" for field in trip_merges.ANNOTATION_FIELDS}
+    conn.execute("DELETE FROM trip_merge_aliases WHERE merge_key=?", (key,))
+    conn.execute("DELETE FROM trip_merge_parts WHERE merge_key=?", (key,))
+    conn.execute("DELETE FROM trip_merges WHERE trip_key=?", (key,))
+    trip_log.record(conn, key, "split", {"parts": keys, "dropped": dropped, "restored": restored},
+                    actor=g.user, actor_role=g.role)
+
+
+@app.route("/admin/unused-merge/<ym>/<merge_id>/undo", methods=["POST"])
+def undo_unused_merge(ym, merge_id):
+    _validate_trip_address(ym, merge_id)
+    if request.form.get("confirm") != "yes":
+        abort(400, description="Confirm removing this unused merge and its merged annotation; original annotations stay saved.")
+    key = f"{ym}/{merge_id}"
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        # Recheck the exact stored key. This route never follows a month alias
+        # or constructs a file path from the merge address.
+        trips, entries = _load_trips(conn, include_removed=True)
+        unused = next((entry for entry in entries if entry["trip_key"] == key and entry.get("unused_merge")), None)
+        if unused is None:
+            abort(409, description="This saved merge is no longer under an unused month name. Reopen the trip list.")
+        _abort_if_removed(conn, key)
+        _abort_if_key_in_closed_year(conn, key)
+        # A removed link can hide its original recording dates. The stored
+        # summary and prior snapshots retain evidence the folder fallback lacks.
+        row = conn.execute("SELECT summary FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
+        try:
+            summary = json.loads(row[0])
+            saved_year = _trip_local_year(summary)
+        except (TypeError, ValueError, AttributeError):
+            saved_year = None
+        closed = trip_log.closed_years(conn)
+        keys = unused["parts"]
+        for year, record in closed.items():
+            snapshot = record["snapshot"] or {}
+            if saved_year == year or {key, *keys} & set(snapshot.get("trip_keys", [])):
+                abort(409, description=f"{year} is closed for edits. The admin can reopen it on the year review page.")
+        _undo_merge(conn, key, keys)
+    return redirect(url_for("index"))
+
+
 @app.route("/trip/<ym>/<trip_id>/split", methods=["POST"])
 def split_trip(ym, trip_id):
     year = selected_year()
@@ -4096,20 +4168,7 @@ def split_trip(ym, trip_id):
         if not keys:
             abort(409, description="This merge no longer exists. Reopen the trip list.")
         _abort_if_key_in_closed_year(conn, key)
-        # What the undo throws away and brings back, kept in the history row.
-        merged = conn.execute("SELECT * FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
-        dropped = {field: (merged[field] or "") if merged else ""
-                   for field in trip_merges.ANNOTATION_FIELDS}
-        restored = {part: {field: "" for field in trip_merges.ANNOTATION_FIELDS} for part in keys}
-        for row in conn.execute(
-            f"SELECT * FROM annotations WHERE trip_key IN ({','.join('?' * len(keys))})", keys
-        ):
-            restored[row["trip_key"]] = {field: row[field] or "" for field in trip_merges.ANNOTATION_FIELDS}
-        conn.execute("DELETE FROM trip_merge_aliases WHERE merge_key=?", (key,))
-        conn.execute("DELETE FROM trip_merge_parts WHERE merge_key=?", (key,))
-        conn.execute("DELETE FROM trip_merges WHERE trip_key=?", (key,))
-        trip_log.record(conn, key, "split", {"parts": keys, "dropped": dropped, "restored": restored},
-                        actor=g.user, actor_role=g.role)
+        _undo_merge(conn, key, keys)
     first_ym, first_id = keys[0].split("/")
     return redirect(url_for("trip_view", ym=first_ym, trip_id=first_id, year=year or ""))
 
@@ -4336,6 +4395,7 @@ def export_xlsx():
                     "duplicate": " (extra link, trips counted elsewhere)",
                     "ingest_refused": " (link blocks new uploads; existing trips counted)",
                     "saved_keys": " (conflicting saved data; trips counted)",
+                    "unused_merge": " (saved merge under unused month name)",
                 }.get(t["folder_reason"], " (whole month folder)")
                 values["trip_id"] += suffix
             sheet.append(_xlsx_clean([values[name] for name in UNREADABLE_COLUMNS]))

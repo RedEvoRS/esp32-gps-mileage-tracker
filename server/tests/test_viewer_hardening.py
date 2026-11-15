@@ -505,10 +505,13 @@ class ViewerHardeningTests(unittest.TestCase):
             conn.execute("UPDATE annotations SET trip_key=?", (name + "/drive",))
         return root / "archive"
 
-    def folder_surface_messages(self, client, year=2026):
+    def folder_surface_messages(self, client, year=2026, include_review=True):
         """Read actual HTML and export cells, without matching CSV quoting."""
         result = {}
-        for path in ("/", f"/admin/year/{year}", "/export.csv", "/export.xlsx"):
+        paths = ["/", "/export.csv", "/export.xlsx"]
+        if include_review:
+            paths.append(f"/admin/year/{year}")
+        for path in paths:
             response = client.get(path)
             self.assertEqual(response.status_code, 200)
             try:
@@ -543,6 +546,7 @@ class ViewerHardeningTests(unittest.TestCase):
             "saved_keys": "Warning: saved trip data exists under 2026-01/, 2026-12/. Trips are shown and counted under 2026-12/; saved data under the other names is not applied. Years cannot be closed until this conflict is resolved.",
             "link_not_folder": "The month name is a link to something other than a folder.",
             "not_folder": "The month name is a file, not a folder.",
+            "unused_merge": "This merge is saved under a month name no longer in use (2026-01/, 2026-12/). Its miles and merged annotation are not applied.",
         }
         hints = {
             "duplicate": "Remove the extra link.",
@@ -551,6 +555,7 @@ class ViewerHardeningTests(unittest.TestCase):
             "unreadable": "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only.",
             "link_not_folder": "Remove only the link, keeping its target; ingest can then create a real month folder for queued trips.",
             "not_folder": "Move the file to a safe place outside the month names; ingest can then create a real month folder for queued trips.",
+            "unused_merge": "To use it again, restore its original month link to the trip folder and leave that name in use. The admin can also undo this saved merge on the trip list; original annotations stay in the database.",
         }
         cases = [(reason, False, False) for reason in descriptions]
         cases += [("saved_keys", True, False), ("duplicate", True, False), ("dangling", True, False)]
@@ -591,6 +596,13 @@ class ViewerHardeningTests(unittest.TestCase):
                     self.assertNotIn(". trips are shown", text)
                     self.assertNotIn("queued Replace", text)
                     self.assertNotIn("there Remove", text)
+        self.signed_in("editor")
+        with patch.object(self.viewer, "_load_trips", return_value=([], entries)):
+            for path, texts in self.folder_surface_messages(self.client, include_review=False).items():
+                for entry in entries:
+                    message = self.viewer.folder_message(entry, "editor")
+                    self.assertIn("Please ask the admin", message)
+                    self.assertTrue(any(message in text for text in texts), path)
 
     def test_month_upload_notices_match_ingest_shared_link_layouts_on_every_surface(self):
         summary = (self.viewer.DATA_ROOT / "2026-01/drive.json").read_bytes()
