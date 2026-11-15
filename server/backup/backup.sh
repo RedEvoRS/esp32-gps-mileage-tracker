@@ -97,6 +97,8 @@ remove_backup_tree "$BACKUP_DIR"/.link-scratch-* \
     || log "WARNING: could not remove abandoned link advice scratch"
 link_scratch=$(mktemp -d "$BACKUP_DIR/.link-scratch-XXXXXX")
 trap 'remove_backup_tree "$link_scratch" || log "WARNING: could not remove link advice scratch: $link_scratch"' EXIT
+checksum_escapes=yes
+probe_checksum_escaping "$link_scratch" || checksum_escapes=no
 mkdir "$work"
 
 # --- 1. Annotations database -------------------------------------------
@@ -173,6 +175,9 @@ if ! (cd "$work/data" && find . -type l -print0 | LC_ALL=C sort -z \
 fi
 write_snapshot_manifest "$work" > "$work/SHA256SUMS" \
     || die "couldn't write the snapshot checksum manifest; backup has not completed"
+if [[ $checksum_escapes == no ]] && grep -q "^\\\\" "$work/SHA256SUMS"; then
+    die "sha256sum cannot read back escaped filenames in SHA256SUMS; GNU coreutils is required. Backup has not completed."
+fi
 
 # Preserve changes in discovery status even if the database/file bytes match.
 if [[ -n $prev && $LINKS_NOT_BACKED_UP =~ ^[0-9]+$ && $link_manifest_error == 0 ]] \

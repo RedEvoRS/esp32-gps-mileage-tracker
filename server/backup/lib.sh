@@ -306,20 +306,29 @@ list_remote_snapshots() {
     awk '{ print $NF }' <<< "$listing" | grep -E "$SNAPSHOT_RE" | LC_ALL=C sort || true
 }
 
-# A format header distinguishes new NUL records from older sha256sum text.
-# Recomputing the sorted records checks bytes and the complete file inventory
-# in one pass, with no filename unescaping or per-file shell/checksum processes.
+# Keep the standard GNU text format, readable by sha256sum -c and v1.16.
 write_snapshot_manifest() (
     set -o pipefail
     cd "$1" || return 1
-    printf 'mileage-sha256-nul-v1\n' || return 1
     find . -type f ! -path ./SHA256SUMS ! -path ./INFO -print0 \
-        | LC_ALL=C sort -z | xargs -0 -r sha256sum --zero
+        | LC_ALL=C sort -z | xargs -0 -r sha256sum
 )
 
-# Older GNU checksum manifests escape backslash, newline and carriage return.
+# Probe once outside the snapshot. Some non-GNU tools write escaped records
+# they cannot read. Two one-byte reads test that, without rehashing trip data.
+# Ordinary names still work with those tools; reject escaped manifests below.
+probe_checksum_escaping() (
+    local probe=$1/checksum-probe name=$'line\nbreak\\literal\\n\r'
+    mkdir "$probe" || return 1
+    cd "$probe" || return 1
+    printf x > "$name" || return 1
+    sha256sum -- "$name" > SHA256SUMS \
+        && sha256sum --quiet --strict -c SHA256SUMS > /dev/null 2>&1
+)
+
+# GNU checksum manifests escape backslash, newline and carriage return.
 # Decode only escaped records, keeping literal backslash+n distinct from LF.
-legacy_manifest_paths() {
+manifest_paths() {
     local line path decoded char index
     while IFS= read -r line || [[ -n $line ]]; do
         path=${line:66}
@@ -346,34 +355,19 @@ legacy_manifest_paths() {
 # INFO and SHA256SUMS itself are the only exceptions, at the snapshot root.
 # sha256sum reports failed paths, never file contents or expected hashes.
 verify_snapshot() {
-    local snap=$1 header record path
+    local snap=$1 path
     [[ -f $snap/SHA256SUMS && -f $snap/annotations.db && -d $snap/data ]] || {
         log "snapshot doesn't look like a backup (SHA256SUMS, annotations.db or data missing)"
         return 1
     }
-    IFS= read -r header < "$snap/SHA256SUMS" || true
-    if [[ $header == mileage-sha256-nul-v1 ]]; then
-        if ! write_snapshot_manifest "$snap" | cmp -s -- "$snap/SHA256SUMS" -; then
-            log "checksums don't match or files are missing from or not in SHA256SUMS; this snapshot is damaged"
-            # Failure-only diagnostics: report escaped paths, never hashes or contents.
-            LC_ALL=C comm -z -3 <(tail -n +2 "$snap/SHA256SUMS" | LC_ALL=C sort -z) \
-                    <(write_snapshot_manifest "$snap" | tail -n +2 | LC_ALL=C sort -z) \
-                | while IFS= read -r -d '' record; do
-                    record=${record#$'\t'}
-                    log "File differs, is missing or is unlisted: $(printf '%q' "${record:66}")"
-                done || true
-            return 1
-        fi
-        return 0
-    fi
     (cd "$snap" && sha256sum --quiet --strict -c SHA256SUMS) >&2 || {
         log "checksums don't match; this snapshot is damaged"
         return 1
     }
-    if ! cmp -s <(legacy_manifest_paths "$snap/SHA256SUMS" | LC_ALL=C sort -z) \
+    if ! cmp -s <(manifest_paths "$snap/SHA256SUMS" | LC_ALL=C sort -z) \
             <(cd "$snap" && find . -type f ! -path ./SHA256SUMS ! -path ./INFO -print0 | LC_ALL=C sort -z); then
         log "snapshot has files missing from or not in SHA256SUMS"
-        LC_ALL=C comm -z -3 <(legacy_manifest_paths "$snap/SHA256SUMS" | LC_ALL=C sort -z) \
+        LC_ALL=C comm -z -3 <(manifest_paths "$snap/SHA256SUMS" | LC_ALL=C sort -z) \
                 <(cd "$snap" && find . -type f ! -path ./SHA256SUMS ! -path ./INFO -print0 | LC_ALL=C sort -z) \
             | while IFS= read -r -d '' path; do log "Unlisted or missing file: $(printf '%q' "${path#$'\t'}")"; done || true
         return 1

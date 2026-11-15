@@ -450,15 +450,14 @@ the saved copy and cannot recover omitted contents. Saved relative loops get
 the same explanation as backup; restore does not follow absolute links to the
 original host to diagnose their targets.
 
-New snapshots use NUL-delimited `SHA256SUMS` checksums and `SYMLINKS` link
-paths/text, preserving names with line breaks, backslashes or leading dashes.
-Use `restore.sh check` to verify them. Unraid's GNU coreutils supplies the
-required `sha256sum --zero` and `sort -z`. Older text manifests remain readable
-(escaped legacy names need GNU `sha256sum`); the format update makes one extra
-snapshot. Link-only adds, removals, retargets and swaps with real folders also
-create snapshots; unchanged links dedupe, and excluded links do not affect
-comparison. Manifest-writing errors fail the run and withhold the heartbeat;
-inspect the log and rerun.
+Snapshots use standard GNU text `SHA256SUMS` checksums and a sorted,
+NUL-delimited `SYMLINKS` list of copied link paths/text. GNU coreutils is required
+and ships with Unraid; a tiny startup probe rejects unsupported checksum escaping
+when needed, without hashing trips twice. Older snapshots without `SYMLINKS`
+cause one extra snapshot and remain restorable. Link-only adds, removals,
+retargets and swaps with real folders also create snapshots; unchanged links
+dedupe, and excluded links do not affect comparison. Manifest-writing errors
+fail the run and withhold the heartbeat; inspect the log and rerun.
 
 After today's backup has completed and been copied, the same run periodically
 checks older snapshots. In `backup/backup.conf`, `BACKUP_VERIFY_DAYS=7` means

@@ -588,16 +588,17 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   heartbeat. A failed coverage check records `unknown` ("not checked"); missing
   or unreadable backup information is `unavailable`, not a failed link check.
   Absolute internal aliases get warning-only restore advice; their real targets
-  may be saved at their own paths. Failure of advice only warns in backup, check and restore; scratch stays
-  outside snapshots and the coverage count is preserved. Restore uses the installed rsync `--safe-links`
+  may be saved at their own paths. Failure of advice only warns in backup, check
+  and restore; scratch stays outside snapshots and coverage is preserved.
+  Restore uses the installed rsync `--safe-links`
   to report skipped links and recreated chains that depend on them; it also
   states any recorded missing-content count. Proven loops are named warnings,
   with no missing-content count, failure or withheld heartbeat; other resolution
-  errors still fail coverage. Relative loops are recreated. NUL-delimited
-  `SHA256SUMS` and `SYMLINKS` preserve unusual names using
-  `sha256sum --zero` and `sort -z`. Restore reads old text manifests too (escaped
-  legacy names need GNU sha256sum). The format update forces one new snapshot;
-  copied link path/text changes create snapshots and unchanged links dedupe.
+  errors still fail coverage. Relative loops are recreated. Standard GNU text
+  `SHA256SUMS` preserves escaped names; GNU coreutils is required. A tiny tool
+  probe rejects unreadable escaping without rehashing trips. Sorted NUL-delimited
+  `SYMLINKS` records copied link paths/text; changes create snapshots and unchanged
+  links dedupe. Only a previous snapshot without `SYMLINKS` forces one new copy.
   Missing diagnostics/monitor databases are normal and recorded in `INFO`.
   Monitor discovery uses Compose config's project name and Docker's Compose
   project/volume labels, without recent config flags or logging credentials.

@@ -1469,9 +1469,9 @@ off-host destination. Each run:
   remove or correct those links. They do not fail the run, withhold the heartbeat
   or increase `links_not_backed_up`; relative loops are recreated by restore.
   Other resolution errors, including a walk exceeding 256 link steps without
-  proving a loop, still fail the coverage check. Failure of restore advice only warns in backup, check and restore; inspect
-  the log and rerun for that advice. Scratch stays outside snapshots, and the
-  coverage result is preserved.
+  proving a loop, still fail the coverage check. Failure of restore advice only
+  warns in backup, check and restore; inspect the log and rerun for that advice.
+  Scratch stays outside snapshots, and the coverage result is preserved.
 - stores `annotations.db`, optional `events.db` and optional `monitor.db`
   beside `data/`, all covered by `SHA256SUMS`. Human-readable `INFO` records
   annotation/event counts, monitor status and `links_not_backed_up` (missing
@@ -1485,14 +1485,14 @@ off-host destination. Each run:
   backup/destination check already explains the problem. A changed
   link count also makes a new snapshot. Restore checks report database integrity,
   event counts and monitor state tables.
-- writes NUL-delimited `SHA256SUMS` checksums and `SYMLINKS` link paths/text,
-  preserving unusual names, including line breaks and backslashes. Use
-  `restore.sh check` to verify them. GNU coreutils on Debian and Unraid supplies
-  the required `sha256sum --zero` and `sort -z`; old text manifests remain readable
-  (escaped legacy names need GNU `sha256sum`). The format change makes one extra
-  snapshot after updating. A copied link's add, removal, retarget or swap with a
-  real folder also creates a snapshot; excluded links do not affect comparison.
-  Failure to write a manifest fails the run and withholds the heartbeat.
+- writes standard GNU text `SHA256SUMS` checksums and a sorted, NUL-delimited
+  `SYMLINKS` list of copied link paths/text. GNU coreutils is required (Debian
+  and Unraid ship it); line breaks and backslashes round-trip. A tiny startup
+  probe rejects unsupported checksum escaping when needed, without hashing
+  trips twice. Older snapshots without `SYMLINKS` cause one extra snapshot and
+  remain restorable. A copied link's add, removal, retarget or swap with a real
+  folder also creates a snapshot; excluded links do not affect comparison.
+  Manifest-writing errors fail the run and withhold the heartbeat.
   Unchanged files are hard links to the previous snapshot; an unchanged run
   adds no snapshot.
 - keeps the newest 14 snapshots plus the first of each month for 7 years.

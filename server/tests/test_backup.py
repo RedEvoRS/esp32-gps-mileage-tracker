@@ -410,6 +410,7 @@ class BackupScripts(unittest.TestCase):
                        capture_output=True, timeout=10)
 
     def test_regular_unusual_names_round_trip_backup_check_and_restore(self):
+        self.require_gnu_checksums()
         self.conf_append("KEEP_RECENT=10\n")
         for name in ("line\nbreak.gpx", "back\\slash.gpx", "-leading.gpx", "-line\nbreak\\slash.gpx",
                      "literal\\n.gpx", "carriage\rreturn.gpx"):
@@ -421,18 +422,26 @@ class BackupScripts(unittest.TestCase):
                 for base in (self.backups / "latest", self.remote / "snapshots" / self.snapshots()[-1]):
                     self.assertEqual((base / "data/2026-10" / name).read_bytes(), path.read_bytes())
                     manifest = (base / "SHA256SUMS").read_bytes()
-                    self.assertTrue(manifest.startswith(b"mileage-sha256-nul-v1\n"))
-                    self.assertIn(os.fsencode(f"./data/2026-10/{name}") + b"\0", manifest)
+                    self.assertNotIn(b"\0", manifest)
+                    files = sorted(f"./{p.relative_to(base)}" for p in base.rglob("*")
+                                   if p.is_file() and not p.is_symlink()
+                                   and p.name not in ("INFO", "SHA256SUMS"))
+                    expected = subprocess.run(["sha256sum", *files], cwd=base,
+                                              capture_output=True, check=True).stdout
+                    self.assertEqual(manifest, expected)
                 self.run_script("restore.sh", "check")
                 path.unlink()
                 self.run_script("restore.sh", "restore", "latest", "--yes")
                 self.assertEqual(path.read_text(), "hand-placed trip")
         self.run_script("backup.sh", "--verify")  # Older snapshots use the same reader.
 
-    def test_legacy_gnu_escaped_manifest_remains_readable(self):
+    def require_gnu_checksums(self):
         version = subprocess.run(["sha256sum", "--version"], capture_output=True, text=True, check=True)
         if "GNU coreutils" not in version.stdout:
-            self.skipTest("legacy escaped checksum reading requires GNU sha256sum")
+            self.skipTest("escaped checksum reading requires GNU sha256sum")
+
+    def test_gnu_escaped_manifest_remains_readable(self):
+        self.require_gnu_checksums()
         for name in ("line\nbreak.gpx", "back\\slash.gpx", "-leading.gpx", "-line\nbreak\\slash.gpx",
                      "literal\\n.gpx", "carriage\rreturn.gpx"):
             (self.data / name).write_text("old snapshot trip")
@@ -444,14 +453,8 @@ class BackupScripts(unittest.TestCase):
         (snap / "SHA256SUMS").write_bytes(result.stdout)
         self.run_script("restore.sh", "check", str(snap))
 
-    def test_nul_manifest_corruption_and_checksum_writer_failure_are_loud(self):
+    def test_text_checksum_writer_failure_is_loud(self):
         self.run_script("backup.sh")
-        snap = self.remote / "snapshots" / self.snapshots()[-1]
-        sums = snap / "SHA256SUMS"
-        original = sums.read_bytes()
-        sums.write_bytes(original[:-1])  # A truncated final record must not pass.
-        self.assertNotEqual(self.run_script("restore.sh", "check", check=False).returncode, 0)
-        sums.write_bytes(original)
         stamp = (self.backups / "last-success").read_bytes()
         self.conf_append("PING_URL=https://ping.invalid/backup\n")
         ping = self.tmp / "ping"
@@ -459,7 +462,7 @@ class BackupScripts(unittest.TestCase):
         real_sha = shutil.which("sha256sum")
         self.shim("sha256sum", f'''\
 for arg in "$@"; do
-    if [[ $arg == --zero ]]; then exit 1; fi
+    if [[ $arg == ./annotations.db ]]; then exit 1; fi
 done
 exec {real_sha} "$@"
 ''')
@@ -468,6 +471,82 @@ exec {real_sha} "$@"
         self.assertIn("couldn't write the snapshot checksum manifest", result.stderr)
         self.assertEqual((self.backups / "last-success").read_bytes(), stamp)
         self.assertFalse(ping.exists())
+
+    def test_incompatible_escaped_checksum_tool_fails_without_success_or_ping(self):
+        self.run_script("backup.sh")
+        stamp = (self.backups / "last-success").read_bytes()
+        (self.data / "line\nbreak.gpx").write_text("trip")
+        ping = self.tmp / "ping"
+        self.shim("curl", f'touch "{ping}"\n')
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        real_sha = shutil.which("sha256sum")
+        self.shim("sha256sum", f'''
+for arg in "$@"; do
+    if [[ $arg == -c ]]; then exit 1; fi
+done
+exec {real_sha} "$@"
+''')
+        result = self.run_script("backup.sh", check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("sha256sum cannot read back escaped filenames", result.stderr)
+        self.assertIn("GNU coreutils is required", result.stderr)
+        self.assertEqual((self.backups / "last-success").read_bytes(), stamp)
+        self.assertFalse(ping.exists())
+        self.assertEqual(len(self.snapshots()), 1)
+
+    def test_snapshot_passes_v116_restore_check(self):
+        self.run_script("backup.sh")
+        legacy = self.tmp / "v116"
+        legacy.mkdir()
+        # Frozen with git show 53643cf:server/backup/{restore.sh,lib.sh}.
+        for name in ("restore.sh", "lib.sh"):
+            shutil.copy(SERVER / "tests/fixtures/backup_v116" / name, legacy / name)
+        result = subprocess.run(["bash", str(legacy / "restore.sh"), "check"], env=self.env,
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Restore test passed", result.stderr)
+
+    def test_plain_sha256sum_checks_every_file_and_detects_each_changed_file(self):
+        self.require_gnu_checksums()
+        for name in ("line\nbreak.gpx", "literal\\n.gpx", "carriage\rreturn.gpx"):
+            (self.data / name).write_text("trip")
+        self.run_script("backup.sh")
+        snap = self.backups / "latest"
+        files = [p for p in snap.rglob("*") if p.is_file() and not p.is_symlink()
+                 and p.name not in ("INFO", "SHA256SUMS")]
+        result = subprocess.run(["sha256sum", "-c", "SHA256SUMS"], cwd=snap,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count(": OK\n"), len(files))
+        for path in files:
+            with self.subTest(path=path.relative_to(snap)):
+                original = path.read_bytes()
+                path.write_bytes(bytes([original[0] ^ 1]) + original[1:] if original else b"x")
+                result = subprocess.run(["sha256sum", "-c", "SHA256SUMS"], cwd=snap,
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(result.stdout.count(": FAILED\n"), 1)
+                path.write_bytes(original)
+
+    def test_changed_file_is_logged_once_by_snapshot_check(self):
+        self.run_script("backup.sh")
+        snap = self.remote / "snapshots" / self.snapshots()[-1]
+        path = snap / "data/2026-10/2026-10-01T15-00-00.gpx"
+        path.write_text("changed bytes")
+        result = self.run_script("restore.sh", "check", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr.count("./data/2026-10/2026-10-01T15-00-00.gpx"), 1)
+
+    def test_text_manifest_does_not_force_an_extra_snapshot(self):
+        self.run_script("backup.sh")
+        snap = self.backups / "latest"
+        # The pre-#748 writer is the standard sha256sum text writer too.
+        files = sorted(f"./{p.relative_to(snap)}" for p in snap.rglob("*")
+                       if p.is_file() and p.name not in ("INFO", "SHA256SUMS"))
+        result = subprocess.run(["sha256sum", *files], cwd=snap, capture_output=True, check=True)
+        (snap / "SHA256SUMS").write_bytes(result.stdout)
+        self.assertIn("Nothing changed", self.run_script("backup.sh").stderr)
+        self.assertEqual(len(self.snapshots()), 1)
 
     def test_outside_links_reported_and_copied_without_targets(self):
         outside = self.tmp / "outside"
