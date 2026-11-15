@@ -1462,16 +1462,24 @@ means zero in an older readable `INFO`). If the link check fails, the value is
 `unknown`: linked items were **not checked**, so inspect the backup log, fix
 the error and rerun the backup. Status and restore checks report this plainly;
 an unchecked run always makes a new snapshot. A changed count also makes a new
-snapshot. Internal links and `*.tmp`
-are not reported. Move the contents into `data/` and rerun the backup. The
+snapshot. Relative internal links and `*.tmp` are not reported. Move the
+outside contents into `data/` and rerun the backup. The
 copy and deep check still run and `last-success` advances, but missing linked
 contents make the run exit non-zero and withhold `PING_URL`. Unraid status
 shows `last_backup_links_not_backed_up`; `install.sh --check` warns when it
 is above zero. A first backup failing only for this reason warns and install
-continues. Restore checks list outside links and can pass with a warning that
-their contents are missing; restore reports them too. Restore uses rsync
+continues. Absolute links inside `data/` get a separate warning: the link
+itself will not be restored, but its target is saved under its real path
+(or the warning says that path is missing or excluded). This warning does not
+fail the backup, withhold the heartbeat or increase `links_not_backed_up`.
+Restore checks list links that will be skipped and can pass with a warning;
+restore reports them too. For an absolute link, a relocated snapshot cannot
+establish whether its original target is saved elsewhere in the backup or
+absent, so the warning explains that uncertainty. Restore uses rsync
 `--safe-links`, skipping outside links and keeping existing real folders;
-relative links inside `data/` can be restored.
+relative links inside `data/` can be restored. Absolute links are never restored
+as links, even when their targets are inside `data/`. Replace an alias you need
+with a relative internal link or a real folder or file, then make a fresh backup.
 
 Each SQLite snapshot is consistent individually; the databases and trip files
 are captured in sequence, rather than in one shared transaction.

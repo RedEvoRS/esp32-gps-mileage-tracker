@@ -409,6 +409,13 @@ the fields. `last_success` comes from `BACKUP_DIR/last-success` and may be
 empty when its disk is absent. A direct `backup.sh` run does not update
 the wrapper's last-attempt record or persistent log.
 
+Absolute links are never restored as links, even when their targets are inside
+`data/`. Backup warns separately about those internal aliases without failing
+the run or counting their targets as missing. Their real target files are saved
+unless missing or excluded. Restore warns that it cannot determine an absolute
+link's original target coverage from a relocated snapshot. Replace an alias you
+need with a relative internal link or a real folder or file, then make a fresh backup.
+
 After today's backup has completed and been copied, the same run periodically
 checks older snapshots. In `backup/backup.conf`, `BACKUP_VERIFY_DAYS=7` means
 weekly; `0` disables periodic checks (allowed: whole days 0 to 36500).

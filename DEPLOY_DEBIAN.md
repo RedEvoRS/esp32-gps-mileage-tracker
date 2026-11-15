@@ -1455,9 +1455,13 @@ off-host destination. Each run:
   `diagnostics/events.db` and its SQLite sidecars are excluded from rsync.
   Links resolving outside `data/` are logged (up to 20 and a remainder count);
   their contents are missing from this and earlier snapshots made with the
-  link. Internal links and `*.tmp` are fine. Move the contents into `data/`
+  link. Relative internal links and `*.tmp` are fine. Move the contents into `data/`
   and rerun the backup. The copy and deep check still run, but the run exits
   non-zero and withholds the heartbeat.
+  Absolute links inside `data/` get a separate warning that their aliases will
+  not be restored; their targets are saved at their real paths unless missing
+  or excluded, which the warning explains. These warnings do not fail the run,
+  withhold the heartbeat or increase `links_not_backed_up`.
 - stores `annotations.db`, optional `events.db` and optional `monitor.db`
   beside `data/`, all covered by `SHA256SUMS`. Human-readable `INFO` records
   annotation/event counts, monitor status and `links_not_backed_up` (missing
@@ -1667,10 +1671,14 @@ Snapshot holds 1 trip GPX files and 1 summaries
 Restore test passed
 ```
 
-Outside links are listed; if any are found the check still exits 0 with
-`Restore test passed, but N linked item(s) are not in this backup`. Their
-contents are missing even if checksums pass. The counts should match what the
-viewer shows. The check changes nothing on the live system. Do this again before each filing.
+Links that will not be restored as links are listed; if any are found the check
+still exits 0 with `Restore test passed, but N linked item(s) will not be restored
+as links; see warnings above`. A relative outside link has no saved contents,
+even if checksums pass. For an absolute link, the relocated snapshot cannot
+determine whether its original target is saved elsewhere in the backup or
+absent; the warning explains this rather than claiming data is missing.
+Check the real trip files and annotations against the viewer. The check changes
+nothing on the live system. Do this again before each filing.
 
 On a new install the first snapshot is empty (`0 annotations`, `0 trip
 GPX files`): the installer deletes its test trip before it gets to
@@ -1850,7 +1858,10 @@ can create the volume on a replacement server without enabling notifications.
 It never deletes trip files that aren't in the snapshot. Restore reports
 outside links before restoring and uses rsync `--safe-links`: outside links
 are skipped, existing real folders are kept, and relative links inside `data/`
-are restored. The outside links' contents were not backed up.
+are restored. Absolute links are never restored as links, even when they point
+inside `data/`; the real target files may still be present in the backup.
+Replace an alias you need with a relative internal link or a real folder or file,
+then make a fresh backup. Outside links' contents were not backed up.
 
 If monitor discovery fails, restore warns, skips `monitor.db`, and leaves the
 monitor service running or stopped as it was, while restoring trips, annotations

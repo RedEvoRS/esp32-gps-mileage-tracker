@@ -353,11 +353,17 @@ read_verify_state() {
 
 # Resolve names only; never open a target or descend through a directory link.
 outside_links() {
-    local root path resolved
+    local root path resolved target mode=${2:-backup}
     root=$(realpath -m -- "$1") || return 1
     # The slash follows a linked start directory, without following links
     # found below it. This also works with BusyBox find.
     find "$1/" -name '*.tmp' -prune -o -type l -print0 | while IFS= read -r -d '' path; do
+        # rsync --safe-links rejects every absolute link. Its original
+        # target cannot be classified from a relocated snapshot safely.
+        if [[ $mode == restore ]]; then
+            IFS= read -r -d '' target < <(readlink -z -- "$path") || return 1
+            if [[ $target == /* ]]; then printf '%s\0' "$path"; continue; fi
+        fi
         IFS= read -r -d '' resolved < <(realpath -mz -- "$path") || return 1
         if [[ $resolved != "$root" && $resolved != "$root/"* ]]; then
             printf '%s\0' "$path"
@@ -367,20 +373,59 @@ outside_links() {
 
 # A bounded, escaped list keeps unusual filenames on one log line each.
 report_outside_links() {
-    local dir=$1 path target
-    LINKS_NOT_BACKED_UP=0
-    outside_links "$dir" > "$2" || return 1
+    local dir=$1 path target mode=${3:-backup} count=0
+    outside_links "$dir" "$mode" > "$2" || return 1
     while IFS= read -r -d '' path; do
-        LINKS_NOT_BACKED_UP=$((LINKS_NOT_BACKED_UP + 1))
-        if (( LINKS_NOT_BACKED_UP <= 20 )); then
+        count=$((count + 1))
+        if (( count <= 20 )); then
             IFS= read -r -d '' target < <(readlink -z -- "$path") || return 1
-            log "WARNING: not backed up: $(printf '%q' "data/${path#"$dir/"}") -> $(printf '%q' "$target")"
+            if [[ $mode == restore && $target == /* ]]; then
+                log "WARNING: $(printf '%q' "data/${path#"$dir/"}") -> $(printf '%q' "$target"): absolute link, will not be restored as a link; cannot determine from this snapshot whether its target is saved elsewhere in the backup or absent"
+            else
+                log "WARNING: not backed up: $(printf '%q' "data/${path#"$dir/"}") -> $(printf '%q' "$target")"
+            fi
         fi
     done < "$2"
-    if (( LINKS_NOT_BACKED_UP > 20 )); then
-        log "WARNING: and $((LINKS_NOT_BACKED_UP - 20)) more linked items not backed up"
+    if (( count > 20 )); then
+        if [[ $mode == restore ]]; then
+            log "WARNING: and $((count - 20)) more linked items that will not be restored as links"
+        else
+            log "WARNING: and $((count - 20)) more linked items not backed up"
+        fi
     fi
-    rm -f -- "$2"
+    rm -f -- "$2" || return 1
+    if [[ $mode == restore ]]; then LINKS_NOT_RESTORED=$count; else LINKS_NOT_BACKED_UP=$count; fi
+}
+
+# These links do not lose coverage of ordinary files: the copy holds their
+# targets at the real paths. Warn separately because --safe-links skips the
+# aliases themselves. Check the copied path too, since e.g. *.tmp is excluded.
+report_absolute_inside_links() {
+    local dir=$1 snapshot=$2 list=$3 root saved_root path target resolved saved message count=0
+    root=$(realpath -m -- "$dir") || return 1
+    saved_root=$(realpath -m -- "$snapshot") || return 1
+    find "$dir/" -name '*.tmp' -prune -o -type l -print0 > "$list" || return 1
+    while IFS= read -r -d '' path; do
+        IFS= read -r -d '' target < <(readlink -z -- "$path") || return 1
+        [[ $target == /* ]] || continue
+        IFS= read -r -d '' resolved < <(realpath -mz -- "$path") || return 1
+        [[ $resolved == "$root" || $resolved == "$root/"* ]] || continue
+        count=$((count + 1))
+        if (( count <= 20 )); then
+            saved=$snapshot
+            [[ $resolved == "$root" ]] || saved="$snapshot/${resolved#"$root/"}"
+            IFS= read -r -d '' saved < <(realpath -mz -- "$saved") || return 1
+            message='its target is not stored at its real path in this snapshot (it may be missing or excluded)'
+            if [[ ( $saved == "$saved_root" || $saved == "$saved_root/"* ) && -e $saved ]]; then
+                message='its target is in the backup under its real path'
+            fi
+            log "WARNING: $(printf '%q' "data/${path#"$dir/"}") -> $(printf '%q' "$target"): absolute link, will not be restored as a link; $message"
+        fi
+    done < "$list"
+    if (( count > 20 )); then
+        log "WARNING: and $((count - 20)) more absolute links inside data/ that will not be restored as links"
+    fi
+    rm -f -- "$list"
 }
 
 read_coverage_count() {

@@ -135,9 +135,10 @@ rsync -a --numeric-ids --exclude=/.upload.lock --exclude='/.upload-lock.*' --exc
 # A failed link check must not cost tonight's off-host copy: note it,
 # finish the backup, then fail the run below.
 coverage_error=0
-if ! report_outside_links "$COMPOSE_DIR/data" "$work/.outside-links"; then
+if ! report_outside_links "$COMPOSE_DIR/data" "$work/.outside-links" \
+        || ! report_absolute_inside_links "$COMPOSE_DIR/data" "$work/data" "$work/.absolute-links"; then
     log "ERROR: couldn't check data for links outside it; this run will fail after the copy"
-    rm -f -- "$work/.outside-links"
+    rm -f -- "$work/.outside-links" "$work/.absolute-links"
     LINKS_NOT_BACKED_UP=unknown
     coverage_error=1
 fi

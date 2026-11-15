@@ -513,6 +513,39 @@ class BackupScripts(unittest.TestCase):
         self.run_script("backup.sh")
         self.assertIn("links_not_backed_up=0", (self.backups / "latest/INFO").read_text())
 
+    def test_absolute_inside_links_warn_without_failing_and_restore_skips_only_links(self):
+        target = self.data / "2026-10/2026-10-01T15-00-00.gpx"
+        self.symlink(self.data / "2026-11", target.parent, True)
+        self.symlink(self.data / "2026-10/alias.gpx", target)
+        self.symlink(self.data / "relative", "2026-10", True)
+        ping = self.tmp / "ping"
+        self.shim("curl", f'touch "{ping}"\n')
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        result = self.run_script("backup.sh")
+        self.assertIn("data/2026-11", result.stderr)
+        self.assertIn("data/2026-10/alias.gpx", result.stderr)
+        self.assertEqual(result.stderr.count(
+            "absolute link, will not be restored as a link; its target is in the backup"), 2)
+        self.assertIn("links_not_backed_up=0\n", (self.backups / "latest/INFO").read_text())
+        self.assertTrue(ping.exists())
+        snap = self.remote / "snapshots" / self.snapshots()[-1]
+        self.assertEqual((snap / "data/2026-10" / target.name).read_bytes(), target.read_bytes())
+        for original_data_present in (True, False):
+            with self.subTest(original_data_present=original_data_present):
+                if not original_data_present:
+                    shutil.rmtree(self.data)
+                    self.data.mkdir()
+                result = self.run_script("restore.sh", "check")
+                self.assertIn("absolute link, will not be restored as a link", result.stderr)
+                self.assertIn("cannot determine", result.stderr)
+                self.assertNotIn("not in this backup", result.stderr)
+                self.assertIn("2 linked item(s) will not be restored as links", result.stderr)
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertFalse((self.data / "2026-11").is_symlink())
+        self.assertFalse((self.data / "2026-10/alias.gpx").is_symlink())
+        self.assertEqual(target.read_text(), "first.gpx")
+        self.assertEqual(os.readlink(self.data / "relative"), "2026-10")
+
     def test_link_count_changes_snapshot_and_then_dedupes(self):
         self.run_script("backup.sh")
         self.symlink(self.data / "linked", self.tmp / "missing")
@@ -520,6 +553,15 @@ class BackupScripts(unittest.TestCase):
         self.assertEqual(len(self.snapshots()), 2)
         self.assertEqual(self.run_script("backup.sh", check=False).returncode, 1)
         self.assertEqual(len(self.snapshots()), 2)
+
+    def test_absolute_inside_link_to_excluded_target_does_not_claim_target_was_saved(self):
+        (self.data / "omitted.tmp").write_text("excluded")
+        self.symlink(self.data / "alias", self.data / "omitted.tmp")
+        result = self.run_script("backup.sh")
+        self.assertIn("absolute link, will not be restored as a link", result.stderr)
+        self.assertIn("target is not stored at its real path", result.stderr)
+        self.assertNotIn("target is in the backup", result.stderr)
+        self.assertIn("links_not_backed_up=0\n", (self.backups / "latest/INFO").read_text())
 
     def test_links_and_deep_failure_both_reported(self):
         names = self.seed_verification(2)
@@ -572,9 +614,10 @@ class BackupScripts(unittest.TestCase):
         self.legacy_link_snapshot()
         result = self.run_script("restore.sh", "check")
         self.assertIn("data/linked-month", result.stderr)
-        self.assertIn("contents of 1 linked item(s) are not in this backup", result.stderr)
+        self.assertIn("absolute link, will not be restored as a link", result.stderr)
+        self.assertIn("cannot determine", result.stderr)
         self.assertTrue(result.stderr.rstrip().endswith(
-            "Restore test passed, but 1 linked item(s) are not in this backup"))
+            "Restore test passed, but 1 linked item(s) will not be restored as links; see warnings above"))
 
     def test_restore_outside_link_leaves_existing_real_folder(self):
         self.legacy_link_snapshot()
@@ -582,7 +625,7 @@ class BackupScripts(unittest.TestCase):
         folder.mkdir()
         (folder / "keep.gpx").write_text("keep")
         result = self.run_script("restore.sh", "restore", "latest", "--yes")
-        self.assertIn("contents of 1 linked item(s) are not in this backup", result.stderr)
+        self.assertIn("absolute link, will not be restored as a link", result.stderr)
         self.assertFalse(folder.is_symlink())
         self.assertEqual((folder / "keep.gpx").read_text(), "keep")
         self.assertEqual(os.readlink(self.data / "inside"), "2026-10")
@@ -595,6 +638,15 @@ class BackupScripts(unittest.TestCase):
         self.assertFalse((self.data / "linked-month").is_symlink())
         self.assertFalse((self.data / "linked-month").exists())
         self.assertEqual(os.readlink(self.data / "inside"), "2026-10")
+
+    def test_restore_relative_outside_link_reports_missing_contents(self):
+        snap = self.legacy_link_snapshot()
+        link = snap / "data/linked-month"
+        link.unlink()
+        self.symlink(link, "../../outside", True)
+        result = self.run_script("restore.sh", "check")
+        self.assertIn("not backed up: data/linked-month", result.stderr)
+        self.assertIn("1 linked item(s) will not be restored as links", result.stderr)
 
     # --- periodic deep verification ---
 

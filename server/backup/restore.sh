@@ -107,9 +107,9 @@ fetch_and_check() {
     if [[ $(read_coverage_count "$snap/INFO") == unknown ]]; then
         log "WARNING: linked items were not checked when this backup was made; inspect the backup log, fix the check error and make a fresh backup. Checking the saved links below."
     fi
-    report_outside_links "$snap/data" "$scratch/outside-links"
-    if (( LINKS_NOT_BACKED_UP > 0 )); then
-        log "WARNING: the contents of $LINKS_NOT_BACKED_UP linked item(s) are not in this backup"
+    report_outside_links "$snap/data" "$scratch/outside-links" restore
+    if (( LINKS_NOT_RESTORED > 0 )); then
+        log "WARNING: $LINKS_NOT_RESTORED linked item(s) will not be restored as links; relative outside links have no saved contents, while absolute link targets may be saved elsewhere in this backup or absent"
     fi
     [[ -f $snap/INFO ]] && log "Snapshot INFO: $(tr '\n' ' ' < "$snap/INFO")"
 }
@@ -168,8 +168,8 @@ show_verify_status
 fetch_and_check "$snapshot_arg"
 
 if [[ $command == check ]]; then
-    if (( LINKS_NOT_BACKED_UP > 0 )); then
-        log "Restore test passed, but $LINKS_NOT_BACKED_UP linked item(s) are not in this backup"
+    if (( LINKS_NOT_RESTORED > 0 )); then
+        log "Restore test passed, but $LINKS_NOT_RESTORED linked item(s) will not be restored as links; see warnings above"
     else
         log "Restore test passed"
     fi
@@ -260,7 +260,8 @@ fi
 log "Restoring trip files (anything replaced goes to $pre/data)"
 # Old backups may contain the unsafe live diagnostics copy. Never replay it
 # (or its journal) through rsync; only restore the checked SQLite snapshot.
-# Outside links contain no saved trips; skip them so live folders survive.
+# Skip unsafe and absolute links, keeping existing real folders. Saved target
+# files are restored at their own paths, even when an alias cannot be restored.
 rsync -a --safe-links --numeric-ids "${trip_owner[@]}" --backup --backup-dir="$pre/data" --itemize-changes \
     --exclude=/.upload.lock --exclude='/.upload-lock.*' \
     --exclude=/diagnostics/events.db --exclude='/diagnostics/events.db-*' \
