@@ -1,7 +1,9 @@
 """Viewer response headers and login redirect safety (2026-10-23 audit)."""
 
 import builtins
+import csv
 import errno
+import html
 import io
 import os
 import json
@@ -183,12 +185,12 @@ class ViewerHardeningTests(unittest.TestCase):
                         self.assertTrue(all(not v for k, v in row.items() if k not in ("trip_id", "row_type", "purpose_note")))
                     elif route == "/" or route.startswith("/admin/year/"):
                         self.assertIn("2026-01/", text)
-                        self.assertIn(problem, text)
+                        self.assertIn(problem, text.lower())
                         self.assertNotIn("2026-01/drive", text)
                         self.assertNotIn('/trip/2026-01/', text)
                         if route == "/":
                             self.assertIn("1 month folder(s)", text)
-                            self.assertIn("none of its trips are shown or counted", text)
+                            self.assertIn("None of its trips are shown or counted.", text)
                             self.assertNotIn("Remove from log", text)
                             self.assertIn("mount the other disk" if role == "admin" else "ask the admin", text)
                     response.close()
@@ -257,7 +259,7 @@ class ViewerHardeningTests(unittest.TestCase):
                                 book.close()
                             else:
                                 text = response.get_data(as_text=True)
-                            self.assertIn(problem, text)
+                            self.assertIn(problem, text.lower())
                             self.assertIn("mount the other disk" if role == "admin" else "ask the admin", text)
                             response.close()
                 finally:
@@ -484,7 +486,7 @@ class ViewerHardeningTests(unittest.TestCase):
         self.signed_in("admin")
         for path in ("/", "/admin/year/2026", "/export.csv"):
             text = self.client.get(path).get_data(as_text=True)
-            self.assertIn("trips are shown and counted", text)
+            self.assertIn("Trips are shown and counted", text)
             self.assertIn("cannot upload new trips for this month", text)
             self.assertIn("the tracker keeps them queued", text)
             self.assertNotIn("totals below may be short", text)
@@ -500,6 +502,70 @@ class ViewerHardeningTests(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute("UPDATE annotations SET trip_key=?", (name + "/drive",))
         return root / "archive"
+
+    def folder_surface_messages(self, client, year=2026):
+        """Read actual HTML and export cells, without matching CSV quoting."""
+        result = {}
+        for path in ("/", f"/admin/year/{year}", "/export.csv", "/export.xlsx"):
+            response = client.get(path)
+            self.assertEqual(response.status_code, 200)
+            try:
+                if path.endswith(".xlsx"):
+                    book = load_workbook(io.BytesIO(response.data))
+                    try:
+                        rows = list(book["Unreadable trips"].values)
+                        result[path] = [r[rows[0].index("purpose_note")] for r in rows[1:]]
+                    finally:
+                        book.close()
+                elif path.endswith(".csv"):
+                    result[path] = [r["purpose_note"] for r in csv.DictReader(io.StringIO(response.get_data(as_text=True)))
+                                    if r["trip_id"].endswith("/")]
+                else:
+                    result[path] = [html.unescape(response.get_data(as_text=True))]
+            finally:
+                response.close()
+        return result
+
+    def test_every_folder_reason_has_complete_sentences_on_every_surface(self):
+        entries, expected = [], []
+        descriptions = {
+            "outside": "The folder links outside the data folder.",
+            "dangling": "The folder link target is missing.",
+            "loop": "The folder link forms a loop.",
+            "unreadable": "The folder could not be read.",
+            "duplicate": "This is a link to 2026-12/, whose trips are counted there.",
+            "ingest_refused": "Trips are shown and counted, but the tracker cannot upload new trips for this month until the link is replaced by a real folder; the tracker keeps them queued.",
+            "saved_keys": "Warning: saved trip data exists under 2026-01/, 2026-12/. Trips are shown and counted under 2026-12/; saved data under the other names is not applied.",
+        }
+        hints = {
+            "duplicate": "Remove the extra link.",
+            "ingest_refused": "Replace the link with a real folder containing these trips, or mount the disk there, so queued trips can upload.",
+            "saved_keys": "Review the saved annotations, removals and merges under these names before removing links. Resolve this conflict before closing the year.",
+            "unreadable": "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only.",
+        }
+        cases = [(reason, False) for reason in descriptions] + [("saved_keys", True)]
+        for number, (reason, refused) in enumerate(cases, 1):
+            entries.append({"folder": True, "ym": f"2026-{number:02}", "trip_key": f"2026-{number:02}/",
+                            "id": "", "folder_reason": reason, "problem": self.viewer.FOLDER_PROBLEMS[reason],
+                            "counted_as": "2026-12", "saved_months": ["2026-01", "2026-12"],
+                            "uploads_refused": refused, "has_gpx": False})
+            text = descriptions[reason]
+            if refused:
+                text += " " + descriptions["ingest_refused"]
+            if reason in ("outside", "dangling", "loop", "unreadable"):
+                text += " None of its trips are shown or counted."
+            text += " " + hints.get(reason, "Replace the link with the real folder, or mount the other disk at that path.")
+            expected.append(text)
+        self.signed_in("admin")
+        with patch.object(self.viewer, "_load_trips", return_value=([], entries)):
+            for path, texts in self.folder_surface_messages(self.client).items():
+                for message in expected:
+                    with self.subTest(surface=path, message=message):
+                        self.assertTrue(any(message in text for text in texts))
+                for text in texts:
+                    self.assertNotIn(". trips are shown", text)
+                    self.assertNotIn("queued Replace", text)
+                    self.assertNotIn("there Remove", text)
 
     def test_earlier_link_keeps_saved_annotations_and_removal(self):
         target = self.linked_archive()

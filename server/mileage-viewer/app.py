@@ -914,7 +914,7 @@ FOLDER_PROBLEMS = {
     "unreadable": "the folder could not be read",
     "duplicate": "the folder is a link to another folder that is already counted",
     "saved_keys": "several month names for this folder have saved trip data",
-    "ingest_refused": "trips are shown and counted, but the tracker cannot upload new trips for this month until the link is replaced by a real folder; the tracker keeps them queued",
+    "ingest_refused": "Trips are shown and counted, but the tracker cannot upload new trips for this month until the link is replaced by a real folder; the tracker keeps them queued",
 }
 
 
@@ -957,7 +957,7 @@ def folder_description(entry):
             text += ". " + FOLDER_PROBLEMS["ingest_refused"]
         return text
     if entry["folder_reason"] == "duplicate":
-        return f"is a link to {entry['counted_as']}/, whose trips are counted there"
+        return f"This is a link to {entry['counted_as']}/, whose trips are counted there"
     return entry["problem"]
 
 
@@ -975,6 +975,16 @@ def folder_hint(entry, role):
     return "Replace the link with the real folder, or mount the other disk at that path."
 
 
+def folder_message(entry, role):
+    """Complete sentences shared by the list, year review and both exports."""
+    description = folder_description(entry)
+    sentences = [description[0].upper() + description[1:].rstrip(".") + "."]
+    if missing_mileage(entry):
+        sentences.append("None of its trips are shown or counted.")
+    sentences.append(folder_hint(entry, role))
+    return " ".join(sentences)
+
+
 def missing_mileage(entry):
     return entry.get("folder_reason") not in ("duplicate", "saved_keys", "ingest_refused")
 
@@ -985,7 +995,7 @@ def _folder_row_type(entry):
     return "unreadable_folder" if missing_mileage(entry) else "folder_notice"
 
 
-app.jinja_env.globals.update(folder_hint=folder_hint, folder_description=folder_description,
+app.jinja_env.globals.update(folder_message=folder_message,
                             missing_mileage=missing_mileage)
 app.jinja_env.tests["missing_mileage"] = missing_mileage
 
@@ -2417,8 +2427,7 @@ LIST_HTML = """
     <ul>
       {% for u in unreadable %}
       {% if u.get('folder') %}
-      <li><code>{{ u.trip_key }}</code> (month folder): {{ folder_description(u) }}{% if missing_mileage(u) %}; none of its trips are shown or counted.{% endif %}
-        {{ folder_hint(u, g.role) }}
+      <li><code>{{ u.trip_key }}</code> (month folder): {{ folder_message(u, g.role) }}
       </li>
       {% else %}
       <li><code>{% if u.get('parts') %}{{ u.gpx_file }}{% else %}{{ u.trip_key }}.{{ u.get('problem_file') or 'json' }}{% endif %}</code>{% if not u.get('parts') and u.get('refused_file') == 'gpx' and u.get('problem_file') == 'json' %} (its GPX links outside the data folder){% elif not u.has_gpx and (u.get('parts') or not u.get('refused_file')) %} (no GPX either){% endif %}: {{ u.problem }}
@@ -3366,7 +3375,7 @@ gap that was uploaded after the merge is counted a second time. Open the merged 
 {% if missing %}<p class="muted">Their miles can't be counted, so the totals above may be short.</p>{% endif %}
 <div class="review-table"><table>
 <thead><tr><th>Trip</th><th>Problem</th></tr></thead>
-<tbody>{% for t in unreadable %}<tr><td>{{ trip_link(t) }}{% if not t.get('folder') and not t.get('parts') %} <code>{{ t.trip_key }}.{{ t.get('problem_file') or 'json' }}</code>{% if t.get('refused_file') == 'gpx' and t.get('problem_file') == 'json' %} (its GPX links outside the data folder){% endif %}{% endif %}</td><td>{% if t.get("folder") %}{{ folder_description(t) }}. {{ folder_hint(t, g.role) }}{% else %}{{ t.problem }}{% endif %}</td></tr>
+<tbody>{% for t in unreadable %}<tr><td>{{ trip_link(t) }}{% if not t.get('folder') and not t.get('parts') %} <code>{{ t.trip_key }}.{{ t.get('problem_file') or 'json' }}</code>{% if t.get('refused_file') == 'gpx' and t.get('problem_file') == 'json' %} (its GPX links outside the data folder){% endif %}{% endif %}</td><td>{% if t.get("folder") %}{{ folder_message(t, g.role) }}{% else %}{{ t.problem }}{% endif %}</td></tr>
 {% else %}<tr><td colspan="2" class="muted">All trip files can be read.</td></tr>{% endfor %}</tbody>
 </table></div>
 </section>
@@ -4121,7 +4130,7 @@ def _unreadable_values(t):
     if t.get("folder"):
         values = dict.fromkeys(UNREADABLE_COLUMNS, "")
         values["trip_id"] = t["trip_key"]
-        values["purpose_note"] = folder_description(t) + ". " + folder_hint(t, g.role)
+        values["purpose_note"] = folder_message(t, g.role)
         return values
     return {
         "trip_id": t.get("trip_id") or t["id"],
