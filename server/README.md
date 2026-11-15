@@ -860,6 +860,8 @@ create the target on upload. Disk I/O and other server faults still return 500.
 
 One month folder that the server cannot read or enter also blocks **every trip
 upload for every month**, including retries, with HTTP 503 naming that folder.
+This includes a mode-100 or mode-300 folder: entering it is not enough;
+both services must be able to list it to find every existing trip ID.
 The viewer includes it in the "Uploads are blocked" alert. Both services run
 as UID 1000. Copying or restoring folders by hand with `sudo` under a strict
 umask can leave a root-owned mode-700 folder that neither service can use.

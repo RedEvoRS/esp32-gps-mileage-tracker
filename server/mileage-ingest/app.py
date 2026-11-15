@@ -341,6 +341,8 @@ def _stored_trip_directories(root, safe_id):
             raise UnreadableMonthError(name) from None
         try:
             mode = directory.stat().st_mode
+            # access() also returns False on races or I/O errors. A conservative
+            # 503 is acceptable here: the tracker retains the trip and retries.
             if stat.S_ISDIR(mode) and not os.access(directory, os.R_OK | os.X_OK):
                 raise UnreadableMonthError(name)
         except PermissionError:

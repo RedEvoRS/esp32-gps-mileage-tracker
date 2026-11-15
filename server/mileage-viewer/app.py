@@ -898,6 +898,8 @@ def _month_trip_names(checked_month):
     """List a checked directory without following a replacement final link."""
     # Listing an empty directory can succeed without search permission. One
     # metadata-class check per counted month catches that case without a walk.
+    # access() can also fail on a race or I/O error, not only permissions;
+    # conservative reporting is acceptable because the tracker keeps retrying.
     if not os.access(checked_month, os.R_OK | os.X_OK):
         raise PermissionError(errno.EACCES, "Month folder cannot be read or entered")
     if (os.scandir in os.supports_fd and hasattr(os, "O_DIRECTORY")
