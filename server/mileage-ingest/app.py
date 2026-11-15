@@ -304,6 +304,10 @@ def _trip_paths(root, directory, safe_id):
                          for suffix in (".gpx", ".json")))
 
 
+class LinkedMonthError(Exception):
+    """A month folder cannot safely be searched for an existing trip."""
+
+
 def _stored_trip_directories(root, safe_id):
     """Find either half of a stored pair; caller must hold _upload_lock.
 
@@ -319,8 +323,8 @@ def _stored_trip_directories(root, safe_id):
         try:
             directory = _checked_trip_path(root, directory)
         except ValueError:
-            app.logger.warning("Skipping month folder outside data root: %s", directory)
-            continue
+            # A skipped month could contain this trip, so refuse the upload.
+            raise LinkedMonthError(directory.name) from None
         # Check both files before any stat or read, even for a partial pair.
         directory, gpx_file, json_file = _trip_paths(root, directory, safe_id)
         for path in (gpx_file, json_file):
@@ -660,6 +664,10 @@ def upload_trip():
             if not gpx_file.exists():
                 _atomic_write_bytes(gpx_file, raw)
             _atomic_write_json(json_file, record)
+    except LinkedMonthError as e:
+        message = f"month folder {e} is a link outside the data folder; uploads are refused until it is replaced"
+        app.logger.error(message)
+        return jsonify({"error": message}), 503
     except Exception as e:
         app.logger.error("Failed to write trip %s: %s", safe_id, e)
         return jsonify({"error": "server error writing trip"}), 500
