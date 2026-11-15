@@ -2701,8 +2701,9 @@ sudo cp -p ~/mileage-backups/snapshots/<time>/data/$TRIP.gpx data/$TRIP.gpx
 This copy also uses `sudo`, because `data/` belongs to UID 1000 (mode 700).
 
 If the warning names the trip's `.gpx`, or the admin's trip page says a file
-links outside the data folder, then the trip's track, summary or month folder
-is a symbolic link pointing outside `data/`. The viewer never follows such a
+is a link that leads outside the data folder or can't be followed safely, then
+the trip's track, summary or month folder is a symbolic link pointing outside
+`data/` (or looping). The viewer never follows such a
 link, so it can't count the trip; the tracker and ingest never create links.
 Find them with:
 
@@ -2710,10 +2711,18 @@ Find them with:
 sudo find ~/mileage-tracker/data -type l -ls
 ```
 
-A linked month folder is shown once as a folder, and an outside or looping
-month link also causes ingest to refuse GPX uploads with 503 until fixed.
-Replace it with a real folder or mount the disk there; its trips cannot be
-removed one by one. Find out what made a file link, then replace it with the
+A month folder that is a link leading outside `data/`, a link whose target is
+missing, or a link that loops is shown once as a folder warning, and its trips
+aren't counted. A link that leads outside `data/` (even if its target is
+missing) or loops also makes ingest refuse GPX uploads with 503 until fixed.
+Replace it with a real folder or mount the disk there; its trips can't be
+removed one by one. A month link to a folder that another month name already
+uses is only a notice: its trips are counted once, under the other name, so
+delete the extra link. If the warning says a month folder can't be read, it's a
+real folder the viewer (UID 1000) isn't allowed to read. Check it with
+`sudo ls -ld ~/mileage-tracker/data/<month>`; like the rest of `data/`, it
+should belong to UID 1000, for example after
+`sudo chown -R 1000:1000 ~/mileage-tracker/data/<month>`. Find out what made a file link, then replace it with the
 real file (for example
 from a backup snapshot, as above) or delete it. Sending the GPX to ingest again
 does not fix a link. The admin can still remove such a trip from the log.

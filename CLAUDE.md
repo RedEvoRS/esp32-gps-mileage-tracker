@@ -464,9 +464,14 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   trip at this address" 404 for a removed, unknown or link-refused trip page,
   and lookups answer removed like unknown; the admin gets a link diagnostic.
   A summary or GPX linking outside `./data` makes the trip unreadable
-  (a merely missing GPX still counts). An outside or dangling month link is
-  shown once as a folder; its trips are not listed or counted. An internal
-  alias is warned once and the real folder is counted once. Closing a year
+  (a merely missing GPX still counts). Only first-level `YYYY-MM` folders hold
+  trips; other folders are ignored. A month folder link that leads outside
+  `./data` (or to it or above), dangles or loops, and a month folder the viewer
+  can't read, each show once as a folder (`row_type=unreadable_folder`) with a
+  hint for that cause; their trips aren't listed or counted and merge
+  suggestions wait. A month link to a folder another month name already counts
+  is a notice (`row_type=folder_notice`): counted once, no merge block, not
+  unreadable in year-close snapshots. Closing a year
   saves its totals
   in `tax_years.snapshot`; the year review compares saved and current totals,
   and lists trips received after the close (ingest `_received_at` later than

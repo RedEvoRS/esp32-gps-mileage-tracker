@@ -820,16 +820,28 @@ the data folder is treated the same way: the viewer never opens it, and the
 trip is listed as unreadable ("the file could not be read") with no miles
 counted. A track that is simply missing is different: the trip still counts
 and just has no map. The admin's page for a trip with such a link says a file
-links outside the data folder; replace the link with the real file. To an
+is a link that leads outside the data folder or can't be followed safely;
+replace the link with the real file. To an
 everyday login it reads like an address with no trip.
 
-A month folder linking outside `data/`, including a dangling link, appears
-only once as a folder (for example `2026-01/`) in both roles' warning box,
-as `row_type=unreadable_folder` in CSV, and on the XLSX `Unreadable trips`
-sheet. Its trips are neither listed nor counted; nothing outside `data/` is
-listed or opened. An alias to another folder inside `data/` gets one folder
-warning while the real folder's trips count once. Remove the duplicate alias;
-for an outside link, use a real folder or mount the other disk at that path.
+Only first-level folders named `YYYY-MM` hold trips; the viewer ignores any
+other folder in `data/` (such as `diagnostics/`). A month folder the viewer
+can't use appears once as a folder (for example `2026-01/`) in both roles'
+warning box, as `row_type=unreadable_folder` in CSV, on the XLSX `Unreadable
+trips` sheet and in the year review: a link that leads outside `data/` (or to
+`data/` itself or above), a link whose target is missing, a link that loops,
+or a real folder the viewer isn't allowed to read. Its trips are neither listed
+nor counted, and nothing outside `data/` is listed or opened. The admin's hint
+fits the cause: replace the link with the real folder or mount the other disk
+at that path; for a folder that can't be read, check its owner and permissions
+(the viewer runs as UID 1000 and reads `data/` read-only).
+
+A month link to a folder inside `data/` that no other month name uses (for
+example `2026-01` → `archive`) is read as that month, without a warning. If
+two month names reach the same folder, its trips count once, under the real
+month folder (or else the first link name in sorted order), and the other name
+gets a notice saying where they are counted (`row_type=folder_notice` in CSV).
+A notice doesn't mean miles are missing; remove the extra link.
 
 `install.sh --check` reports each symbolic link directly inside `data/` as
 a problem, with a hint to use a real folder or mount the other disk there.
@@ -952,8 +964,8 @@ The limit is the named `MERGE_MAX_GAP` constant in `trip_merges.py`. Older
 summaries without that timestamp use `end_time`, the last moving point, as
 a conservative fallback. Upload/receipt times are never used. Overlapping
 recordings, unknown device identities or unknown start times cannot be merged.
-A folder warning blocks merge suggestions with a folder-specific message until
-the folder is fixed. An unreadable summary blocks merging when its device is
+A folder warning (not a duplicate-link notice) blocks merge suggestions with a
+folder-specific message until the folder is fixed. An unreadable summary blocks merging when its device is
 unknown, or when it
 belongs to this device and could fall between these recordings. Usable start
 times or UTC timestamp trip IDs can rule out damage outside that interval;
