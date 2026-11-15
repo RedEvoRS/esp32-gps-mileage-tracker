@@ -1232,7 +1232,8 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
         json_paths = []
         refused_months = set()
 
-        def refuse_month(ym, reason="outside", counted_as=None, saved_months=(), uploads_refused=False):
+        def refuse_month(ym, reason="outside", counted_as=None, saved_months=(), uploads_refused=False,
+                         all_uploads_refused=None):
             if ym not in refused_months:
                 if missing_mileage({"folder_reason": reason}):
                     refused_months.add(ym)
@@ -1241,6 +1242,9 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                 if reason == "ancestor":
                     reason = "outside"
                     problem = "the folder link points at the data folder itself or above it"
+                if all_uploads_refused is None:
+                    all_uploads_refused = (missing_mileage({"folder_reason": reason}) and
+                                           _month_blocks_all_uploads(DATA_ROOT / ym, root))
                 unreadable.append({"folder": True, "ym": ym, "id": "", "trip_key": f"{ym}/",
                                    "has_gpx": False, "problem": problem,
                                    "folder_reason": reason, "counted_as": counted_as,
@@ -1249,8 +1253,7 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                                    "uploads_refused": (uploads_refused or
                                                        reason in ("not_folder", "link_not_folder") or
                                                        (reason == "dangling" and _month_refuses_new_uploads(DATA_ROOT / ym, root))),
-                                   "all_uploads_refused": (_month_blocks_all_uploads(DATA_ROOT / ym, root)
-                                                           if missing_mileage({"folder_reason": reason}) else False),
+                                   "all_uploads_refused": all_uploads_refused,
                                    "refused_file": "folder", "problem_file": "folder"})
 
         counted, problems = _month_choices(conn, root)
@@ -1269,8 +1272,10 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                 if not stat.S_ISDIR(checked_month.stat().st_mode):
                     continue
                 names = _month_trip_names(checked_month)
-            except OSError:
-                refuse_month(month.name, "unreadable")
+            except OSError as exc:
+                # A denied list/search already proves ingest must refuse. Do
+                # not repeat the access check to discover the same fact.
+                refuse_month(month.name, "unreadable", all_uploads_refused=True if isinstance(exc, PermissionError) else None)
                 continue
             for name in names:
                 path = Path(name)

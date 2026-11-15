@@ -704,7 +704,9 @@ class ViewerHardeningTests(unittest.TestCase):
         for label, layout in PERMISSION_MONTH_LAYOUTS.items():
             root = self.viewer.DATA_ROOT / label
             with restricted_layout(root, layout, self.symlink), patch.object(self.viewer, "DATA_ROOT", root):
-                trips, entries = self.viewer.load_trips()
+                with patch.object(self.viewer.os, "access", wraps=self.viewer.os.access) as access:
+                    trips, entries = self.viewer.load_trips()
+                self.assertLessEqual(access.call_count, 1, label)
                 self.assertEqual(trips, [])
                 self.assertEqual([(e["ym"], e["folder_reason"], e["all_uploads_refused"]) for e in entries],
                                  [("2026-02", "unreadable", True)], label)
