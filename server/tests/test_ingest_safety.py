@@ -179,6 +179,16 @@ class UploadSafety(unittest.TestCase):
             with self.assertLogs(self.ing.app.logger, "ERROR"):
                 self.assertEqual(self.upload().status_code, 503)
 
+    def test_looping_month_link_refuses_with_the_folder_named(self):
+        # #724: a link loop raised RuntimeError from resolve() and gave a
+        # generic 500 whose log didn't name the folder.
+        self.symlink(self.root / "2026-03", self.root / "2026-03", directory=True)
+        with self.assertLogs(self.ing.app.logger, "ERROR") as logs:
+            response = self.upload()
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("2026-03", response.get_json()["error"])
+        self.assertIn("month folder 2026-03", "\n".join(logs.output))
+
     def test_final_trip_symlinks_cannot_escape_data_root(self):
         month = self.root / "2026-04"
         month.mkdir()

@@ -322,8 +322,9 @@ def _stored_trip_directories(root, safe_id):
             continue
         try:
             directory = _checked_trip_path(root, directory)
-        except ValueError:
+        except (ValueError, RuntimeError):
             # A skipped month could contain this trip, so refuse the upload.
+            # RuntimeError is a symbolic link loop (Path.resolve on Python 3.12).
             raise LinkedMonthError(directory.name) from None
         # Check both files before any stat or read, even for a partial pair.
         directory, gpx_file, json_file = _trip_paths(root, directory, safe_id)
@@ -665,7 +666,8 @@ def upload_trip():
                 _atomic_write_bytes(gpx_file, raw)
             _atomic_write_json(json_file, record)
     except LinkedMonthError as e:
-        message = f"month folder {e} is a link outside the data folder; uploads are refused until it is replaced"
+        message = (f"month folder {e} is a symbolic link that can't be followed safely; "
+                   "uploads are refused until it is replaced with a real folder")
         app.logger.error(message)
         return jsonify({"error": message}), 503
     except Exception as e:
