@@ -191,7 +191,10 @@ class ViewerMerges(unittest.TestCase):
         self.assertIn('Discarded or undone saved merges (1)', self.client.get('/admin/year/2026').get_data(as_text=True))
         history = self.client.get('/admin/history').get_data(as_text=True)
         self.assertIn('Damaged merge discarded', history)
-        self.assertIn("The merged trip's saved miles and purpose were removed from the totals and kept in this history record.",
+        self.assertIn('Discarded damaged merge with 0.732 mi; saved annotation: business, example stop, merged note. '
+                      'Parts with readable trip summaries can be counted separately with the annotations saved under their names. '
+                      'Missing or unreadable summaries need recovery from backups. '
+                      "The merged trip's saved miles and purpose were removed from the totals and kept in this history record.",
                       html.unescape(history))
 
     def discard_with_readable_parts(self, missing_summaries=()):
@@ -354,6 +357,7 @@ class ViewerMerges(unittest.TestCase):
         self.assert_discard_current_statement(
             f'Now counted again: 2026-04/a (inside {merged}), 2026-04/b (inside {merged}); '
             'do not add these saved miles by hand.')
+        self.assertNotIn('Discard damaged merge', self.client.get('/').get_data(as_text=True))
 
     def test_history_count_computation_is_absent_on_list_and_reviews_without_records(self):
         self.trip('a', 0)
@@ -608,6 +612,9 @@ class ViewerMerges(unittest.TestCase):
 
     def test_unused_undo_names_annotations_and_keeps_full_summary_before_deletion(self):
         key, _ = self.moved_merge()
+        absent = self.undo_unused('2026-04/merge-absent', confirm='no')
+        self.assertEqual(absent.status_code, 400)
+        self.assertIn('Confirm removing this unused merge and its merged annotation.', absent.get_data(as_text=True))
         effect = ('The trips stay counted under 2026-05/ with only the annotations saved under that name. '
                   'Annotations saved under 2026-04/ are kept in the database but not applied. '
                   "The merged trip's saved miles and purpose leave the totals and are kept in history and the year review.")
