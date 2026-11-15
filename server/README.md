@@ -564,7 +564,12 @@ for storage, Python fallback and service setup.
    uploaded size-split piece starts at its own boundary fix. Retries search
    all month directories under the upload lock and keep the original folder,
    including after a `DISPLAY_TZ` change. Existing duplicate folders require
-   operator review; ingest returns 409 rather than choosing one.
+   operator review; ingest returns 409 rather than choosing one. An internal
+   month-folder alias counts once. If any `YYYY-MM` folder links outside
+   `data/` or loops, every GPX upload gets HTTP 503 and the ingest log names
+   the folder. Replace it with a real folder or mount the disk there. The
+   tracker keeps trips until HTTP 200 and retries after repair; Device health
+   shows server errors. Diagnostics uploads are unaffected.
    Older third-party timed uploads named with a custom header keep their old
    names on disk. Review those pairs before re-uploading: the new timestamp ID
    can create another record. Firmware uploads already use timestamp IDs.
@@ -808,13 +813,26 @@ trip's local end month: that year, plus the year before for a January
 folder. `DEPLOY_DEBIAN.md` → Troubleshooting says how to rebuild the
 summary from its GPX.
 
-A trip whose summary, track (GPX) or month folder is a link pointing outside
+A trip whose summary or track (GPX) is a link pointing outside
 the data folder is treated the same way: the viewer never opens it, and the
 trip is listed as unreadable ("the file could not be read") with no miles
 counted. A track that is simply missing is different: the trip still counts
 and just has no map. The admin's page for a trip with such a link says a file
 links outside the data folder; replace the link with the real file. To an
 everyday login it reads like an address with no trip.
+
+A month folder linking outside `data/`, including a dangling link, appears
+only once as a folder (for example `2026-01/`) in both roles' warning box,
+as `row_type=unreadable_folder` in CSV, and on the XLSX `Unreadable trips`
+sheet. Its trips are neither listed nor counted; nothing outside `data/` is
+listed or opened. An alias to another folder inside `data/` gets one folder
+warning while the real folder's trips count once. Remove the duplicate alias;
+for an outside link, use a real folder or mount the other disk at that path.
+
+`install.sh --check` reports each symbolic link directly inside `data/` as
+a problem, with a hint to use a real folder or mount the other disk there.
+Install mode warns and continues. If listing `data/` would require a new sudo
+prompt, `--check` warns that it did not check the links.
 
 ### Admin year review and close
 
@@ -830,7 +848,9 @@ after local January 1 of the following year.
 
 A trip belongs to the year shown by its local start time. An unreadable trip
 is assigned by its storage folder; a January folder can be listed under the
-previous year. A trip with no usable time is not locked by any year.
+previous year. Folder entries follow the same rule, so a January folder
+appears under both candidate years. A trip with no usable time is not locked
+by any year.
 
 The admin closes or reopens a year on its review page using a confirmation
 checkbox. Both actions appear in change history. While a year
@@ -892,7 +912,9 @@ summary files. The only thing it writes is the annotations database.
 ### Remove trips and review changes
 
 The admin removes a trip from the log with a required reason; unreadable trips
-can also be removed. It disappears from the trip list, totals, CSV/XLSX
+can also be removed. Folder warning entries cannot be removed trip by trip;
+fix the folder instead. A removed trip disappears from the trip list, totals,
+CSV/XLSX
 exports and merge suggestions for both roles. The GPX and JSON source files
 stay in `./data`; removal is a reversible record in `annotations.db`, not a
 file deletion. On `/admin/removed`, the admin can see each reason, who removed
@@ -928,7 +950,9 @@ The limit is the named `MERGE_MAX_GAP` constant in `trip_merges.py`. Older
 summaries without that timestamp use `end_time`, the last moving point, as
 a conservative fallback. Upload/receipt times are never used. Overlapping
 recordings, unknown device identities or unknown start times cannot be merged.
-An unreadable summary blocks merging when its device is unknown, or when it
+A folder warning blocks merge suggestions with a folder-specific message until
+the folder is fixed. An unreadable summary blocks merging when its device is
+unknown, or when it
 belongs to this device and could fall between these recordings. Usable start
 times or UTC timestamp trip IDs can rule out damage outside that interval;
 damage known to belong to another device does not block the action. The trip
@@ -1407,6 +1431,21 @@ without it the backup unit fails rather than copying. `install.sh` writes the
 marker for you, and `backup/backup.sh --mark-target` writes it if you set
 `REMOTE` by hand. `REMOTE_PRUNE` defaults to `no`; its rules, when you turn it
 on, are in `DEPLOY_DEBIAN.md` Step 10.
+Links anywhere under `data/` resolving outside it are logged as
+`WARNING: not backed up: data/<path> -> <target>` (first 20, then a count
+of the rest). Their contents are missing, including from earlier snapshots
+taken while the link existed. `INFO` records `links_not_backed_up=N` (missing
+means zero); a changed count makes a new snapshot. Internal links and `*.tmp`
+are not reported. Move the contents into `data/` and rerun the backup. The
+copy and deep check still run and `last-success` advances, but missing linked
+contents make the run exit non-zero and withhold `PING_URL`. Unraid status
+shows `last_backup_links_not_backed_up`; `install.sh --check` warns when it
+is above zero. A first backup failing only for this reason warns and install
+continues. Restore checks list outside links and can pass with a warning that
+their contents are missing; restore reports them too. Restore uses rsync
+`--safe-links`, skipping outside links and keeping existing real folders;
+relative links inside `data/` can be restored.
+
 Each SQLite snapshot is consistent individually; the databases and trip files
 are captured in sequence, rather than in one shared transaction.
 

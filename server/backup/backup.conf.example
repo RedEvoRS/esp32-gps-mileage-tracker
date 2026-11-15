@@ -67,7 +67,8 @@ REMOTE_PRUNE=no
 
 # Optional URL to GET after each successful backup, for a dead man's
 # switch (Uptime Kuma push monitor, healthchecks.io, ...). If the pings
-# stop arriving, backups have stopped working.
+# stop arriving, the copy or a deep check may have failed, or linked
+# contents may be missing from the backup. Check the backup log.
 #PING_URL=https://hc-ping.com/your-uuid
 
 # The directory holding docker-compose.yml. Default: the parent of this
