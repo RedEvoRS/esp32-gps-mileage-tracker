@@ -94,12 +94,17 @@ def fingerprint(data_root, keys):
     ingest stored under the rules of the day, so a merged trip must too: a
     later change to the distance rules reaches merges only when a source
     file changes (or the merge is undone and redone), not on first view.
+
+    It also leaves out the inode number. An inode belongs to the disk, not to
+    the content, so a restore or migration changes every one and would
+    rebuild every merged trip although no file changed. Name, modification
+    time and size are what a copy with times preserved keeps.
     """
     stamps = []
     for pair in source_file_pairs(data_root, keys):
         for source in pair:
             st = source.stat()
-            stamps.append((source.name, st.st_mtime_ns, st.st_size, st.st_ino))
+            stamps.append((source.name, st.st_mtime_ns, st.st_size))
     return json.dumps(stamps)
 
 
@@ -108,6 +113,8 @@ def same_sources(fresh, stored):
 
     Rows saved before the rule version was dropped start with that number;
     it is ignored, so upgrading does not rebuild every merge under new rules.
+    Rows saved by v1.06-v1.15 carry an inode as a fourth field; it is ignored
+    too, since it changes whenever the files move to another disk.
     """
     def stamps(text):
         try:
@@ -120,12 +127,10 @@ def same_sources(fresh, stored):
     left, right = stamps(fresh), stamps(stored)
     if left is None or right is None or len(left) != len(right):
         return False
-    # Upgrade older fingerprints without rebuilding under newer distance
-    # rules. Once upgraded, an atomic replacement with identical size/mtime
-    # also invalidates the merge. Keep the legacy version-prefix compatibility.
+    # Only name, modification time and size decide. Any extra field in a
+    # stored stamp (the version prefix above, or an old inode) is ignored.
     return all(isinstance(a, (list, tuple)) and isinstance(b, (list, tuple))
-               and len(a) in (3, 4) and len(b) in (3, 4)
-               and a[:3] == b[:3] and (len(a) == 3 or len(b) == 3 or a[3] == b[3])
+               and len(a) >= 3 and len(b) >= 3 and list(a[:3]) == list(b[:3])
                for a, b in zip(left, right, strict=True))
 
 
@@ -213,8 +218,9 @@ def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=N
                              (json.dumps(summary), stamp, key))
             else:
                 summary = json.loads(row["summary"])
-                # Record inode metadata for legacy rows without changing the
-                # stored summary's rules. This is a one-time cache upgrade.
+                # Rewrite a stamp that differs only in form (a version prefix
+                # or an old inode field) without changing the stored summary's
+                # rules. This is a one-time cache upgrade.
                 if stamp != row["fingerprint"]:
                     if not refresh:
                         raise MergeRefreshNeeded()
