@@ -149,7 +149,8 @@ class ViewerRemovalTests(unittest.TestCase):
                                  ("split", {"confirm": "yes"}),
                                  ("lookup-place", {"endpoint": "start"})):
                 response = client.post(f"/trip/{key}/{action}", data={"csrf_token": "test-csrf", **data})
-                self.assertEqual(response.status_code, 409, action)
+                expected = 404 if client is self.editor and action == "lookup-place" else 409
+                self.assertEqual(response.status_code, expected, action)
 
         restored = self.post(f"/trip/{key}/restore")
         self.assertEqual(restored.status_code, 302)
@@ -158,6 +159,28 @@ class ViewerRemovalTests(unittest.TestCase):
         self.assertIn("1.250 mi total", restored_listing)
         self.assertEqual([r["trip_id"] for r in self.exported_csv() if r["row_type"] == "trip"], ["drive"])
         self.assertEqual(self.data_hash(), original_hash)
+
+    def test_removed_lookup_matches_unknown_for_everyday_login(self):
+        first = self.add_trip("first", 0)
+        second = self.add_trip("second", 120)
+        plain = self.add_trip("plain", 3600)
+        merged = self.post(f"/trip/{first}/merge", next_trip=second)
+        self.assertEqual(merged.status_code, 302)
+        merged_key = merged.headers["Location"].split("/trip/", 1)[1].split("?", 1)[0]
+        for key in (plain, merged_key):
+            self.assertEqual(self.post(f"/trip/{key}/remove", reason="test reason").status_code, 302)
+        data = {"csrf_token": "test-csrf", "endpoint": "start"}
+        unknown = self.editor.post("/trip/2026-01/unknown/lookup-place", data=data)
+        self.assertEqual(unknown.status_code, 404)
+        for key in (plain, merged_key, first, second):
+            with self.subTest(key=key):
+                response = self.editor.post(f"/trip/{key}/lookup-place", data=data)
+                self.assertEqual(response.status_code, unknown.status_code)
+                self.assertEqual(response.data, unknown.data)
+                self.assertEqual(response.content_type, unknown.content_type)
+                admin = self.admin.post(f"/trip/{key}/lookup-place", data=data)
+                self.assertEqual(admin.status_code, 409)
+                self.assertIn(b"The admin has to restore it first.", admin.data)
 
     def test_reason_csrf_duplicate_and_missing_key_validation(self):
         key = self.add_trip("drive")

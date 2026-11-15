@@ -694,7 +694,13 @@ def _csrf_protect():
 # ---------------------------------------------------------------------
 
 
-def _safe_trip_paths(ym, trip_id):
+TRIP_NOT_FOUND = (
+    "No trip at this address. It may have been removed from the "
+    "log; ask the admin if you expected to see it."
+)
+
+
+def _safe_trip_paths(ym, trip_id, *, refused_description=None):
     """Validate URL components and return (gpx_path, json_path) under DATA_ROOT.
 
     Aborts with 404 on anything that doesn't match the strict patterns or
@@ -705,7 +711,7 @@ def _safe_trip_paths(ym, trip_id):
     try:
         return next(trip_merges.source_file_pairs(DATA_ROOT, [f"{ym}/{trip_id}"]))
     except ValueError:
-        abort(404)
+        abort(404, description=refused_description)
 
 
 def _trip_file_exists(root, path):
@@ -941,7 +947,20 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
         trip_key = f"{ym}/{trip_id}"
         ann = annotations.get(trip_key, {})
         summary, problem = _cached_summary(json_path, root=root)
-        has_gpx = _trip_file_exists(root, json_path.with_suffix(".gpx"))
+        try:
+            gpx_path = trip_merges.checked_path(root, json_path.with_suffix(".gpx"))
+        except ValueError:
+            # A refused track makes the recording unreadable; a missing one
+            # still lets its summary count. Keep only usable identity.
+            summary = {field: summary[field] for field in ("device_id", "start_time")
+                       if summary and isinstance(summary.get(field), str)}
+            problem = "the file could not be read"
+            has_gpx = False
+        else:
+            try:
+                has_gpx = gpx_path.exists()
+            except OSError:
+                has_gpx = False
         if only_merge_key is not None and problem == "the file is missing" and not has_gpx:
             continue
         trip = {
@@ -3387,7 +3406,11 @@ def index():
 @app.route("/trip/<ym>/<trip_id>")
 def trip_view(ym, trip_id):
     year = selected_year()
-    _safe_trip_paths(ym, trip_id)
+    _safe_trip_paths(ym, trip_id, refused_description=(
+        "This trip's files can't be opened: its summary, track or month folder links outside "
+        "the data folder, so the viewer won't read them. The trip list and exports flag it. "
+        "Replace the link with the real file to show the trip again."
+    ) if g.role == "admin" else TRIP_NOT_FOUND)
     key = f"{ym}/{trip_id}"
     # Resolve the requested recording/alias and read only its own sources.
     # Removed trips and redirects need no full chronology. Live pages use it
@@ -3405,10 +3428,7 @@ def trip_view(ym, trip_id):
             # A removed trip (for an everyday login) and an address that
             # matches no trip get the same words, so the page does not say
             # which one it is. Neither has a damaged file to repair.
-            abort(404, description=(
-                "No trip at this address. It may have been removed from the "
-                "log; ask the admin if you expected to see it."
-            ))
+            abort(404, description=TRIP_NOT_FOUND)
         abort(404, description=(
             f"This trip's summary file can't be read ({problem}), so its "
             "miles can't be counted. The trip list and exports flag it. To "
@@ -3466,7 +3486,11 @@ def lookup_place(ym, trip_id):
     # arbitrary geocoding proxy, even for an authenticated browser.
     _safe_trip_paths(ym, trip_id)
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
-        _abort_if_removed(conn, f"{ym}/{trip_id}")
+        if g.role == "admin":
+            _abort_if_removed(conn, f"{ym}/{trip_id}")
+        elif trip_log.removal(conn, trip_merges.canonical_key(conn, f"{ym}/{trip_id}")):
+            # An everyday lookup must not reveal whether this address was removed.
+            abort(404)
     t = resolved_trip(ym, trip_id)
     endpoint = request.form.get("endpoint", "")
     if endpoint not in ("start", "end"):
