@@ -286,6 +286,43 @@ class InstallerUnraid(unittest.TestCase):
         self.assertIn("FAILURES=0", out)
         self.assertEqual((self.work / "backup-calls").read_text().splitlines(), ["scheduled", "restore", "restore"])
 
+    def test_link_coverage_warns_in_check_mode(self):
+        self.conf()
+        self.scheduled(status="1")
+        path = self.work / "backup/scheduled.sh"
+        path.write_text(path.read_text().replace("last_attempt_start=", "last_backup_links_not_backed_up=2\nlast_attempt_start="))
+        out = self.run_step("install_unraid_cron; MODE=check; verify_unraid_backups")
+        self.assertIn("2 linked item(s) are not in this backup", out)
+        self.assertIn("FAILURES=1", out)
+
+    def test_first_backup_link_failure_warns_on_all_install_routes(self):
+        self.conf()
+        (self.work / "backup/scheduled.sh").write_text(
+            'if [[ ${1:-} == --status ]]; then cat "$WORK/status"; else bash "$WORK/backup/backup.sh"; fi\n')
+        (self.work / "backup/backup.sh").write_text(
+            'printf "last_success=%s\\nlast_backup_links_not_backed_up=%s\\nlast_deep_check_result=%s\\n" '
+            '"${STAMP:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" "$LINKS" "$DEEP" > "$WORK/status"\nexit 1\n')
+        common = """
+            restore_test() { echo restore; }
+            prepare_unraid_backup_paths() { :; }
+            ensure_backup_target() { :; }
+            unraid_cron_current() { return 1; }
+            install_unraid_cron() { echo cron; }
+            verify_unraid_backups() { :; }
+            install_backup_units() { :; }
+            as_root() { "$@"; }
+            systemctl() { if [[ $1 == start ]]; then bash "$WORK/backup/backup.sh"; fi; }
+            journalctl() { :; }
+        """
+        for route in ("first_backup", "install_backup_timer", "setup_unraid_backups"):
+            with self.subTest(route=route):
+                out = self.run_step(common + route, LINKS="2", DEEP="passed")
+                self.assertIn("2 linked item(s) are not in this backup", out)
+                for links, deep, stamp in (("0", "passed", ""), ("2", "failed", ""),
+                                           ("2", "running", ""), ("bad", "passed", ""),
+                                           ("2", "passed", "2000-01-01T00:00:00Z")):
+                    self.run_step(common + route, ok=False, LINKS=links, DEEP=deep, STAMP=stamp)
+
     def test_persistent_ssh_key_and_known_hosts_used_for_every_connection(self):
         out = self.run_step(r'''
             ssh-keygen() {
