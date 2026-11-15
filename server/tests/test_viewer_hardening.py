@@ -559,7 +559,7 @@ class ViewerHardeningTests(unittest.TestCase):
             "link_not_folder": "Remove only the link, keeping its target; ingest can then create a real month folder for queued trips.",
             "not_folder": "Move the file to a safe place outside the month names; ingest can then create a real month folder for queued trips.",
             "unused_merge": "To use this merge again, restore the original month name, as a link or by renaming the folder back, and leave that name in use. Or use Undo saved merge on the trip list; this keeps the separate trips and their own annotations.",
-            "unwritable": "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only.",
+            "unwritable": "Give the ingest service's user (UID 1000) write and search permission on the real month folder; check its owner and permissions.",
         }
         cases = [(reason, False, False) for reason in descriptions]
         cases += [("saved_keys", True, False), ("duplicate", True, False), ("dangling", True, False)]

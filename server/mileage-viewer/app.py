@@ -1088,7 +1088,9 @@ def folder_hint(entry, role):
         return "Remove only the link, keeping its target; ingest can then create a real month folder for queued trips."
     if entry["folder_reason"] == "not_folder":
         return "Move the file to a safe place outside the month names; ingest can then create a real month folder for queued trips."
-    if entry["folder_reason"] in ("unreadable", "unwritable"):
+    if entry["folder_reason"] == "unwritable":
+        return "Give the ingest service's user (UID 1000) write and search permission on the real month folder; check its owner and permissions."
+    if entry["folder_reason"] == "unreadable":
         return "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only."
     return "Replace the link with the real folder, or mount the other disk at that path."
 
