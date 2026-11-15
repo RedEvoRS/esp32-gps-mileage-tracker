@@ -42,6 +42,18 @@ function setup({auto = false, cached = [], endpoints = ['start', 'end'], storage
     submit(index) { return forms[index].submit({preventDefault() {}}); }};
 }
 async function run() {
+  for (const auto of [false, true]) {
+    const alias = setup({auto, endpoints: ['end'], value: ''});
+    if (!auto) alias.submit(0);
+    const message = 'This month address is an extra link. Reopen the trip from the trip list before making changes.';
+    await alias.respond(0, {error: message}, false, 409);
+    assert.equal(alias.labels.end.textContent, message, 'a stale alias explains how to reopen the trip');
+    assert.equal(alias.suggestion.textContent, 'End: ' + message);
+    assert.equal(alias.destination.value, '', 'an alias error never fills Destination');
+    assert.equal(alias.useEnd.disabled, true);
+    assert.equal(alias.calls.length, 1, '409 is not retried');
+    assert.equal(alias.timers.length, 0);
+  }
   const s = setup();
   assert.equal(s.calls.length, 0);
   assert.ok(s.forms.every(f => !f.querySelector().disabled));

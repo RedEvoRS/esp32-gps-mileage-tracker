@@ -765,6 +765,13 @@ class ViewerHardeningTests(unittest.TestCase):
                             "next_trip": counted + "/drive",
                         })
                         self.assertEqual(response.status_code, 409)
+                        message = "This month address is an extra link. Reopen the trip from the trip list before making changes."
+                        if rule.endpoint == "lookup_place":
+                            self.assertEqual(response.mimetype, "application/json")
+                            self.assertEqual(response.get_json(), {"error": message})
+                        else:
+                            self.assertEqual(response.mimetype, "text/html")
+                            self.assertIn(message, response.get_data(as_text=True))
                         response.close()
                 with closing(sqlite3.connect(self.db)) as conn:
                     self.assertEqual(list(conn.iterdump()), before)

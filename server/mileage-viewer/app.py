@@ -1105,7 +1105,10 @@ def _require_counted_month_address():
     if chosen == ym:
         return None
     if request.method not in ("GET", "HEAD"):
-        abort(409, description="This month address is an extra link. Reopen the trip from the trip list before making changes.")
+        message = "This month address is an extra link. Reopen the trip from the trip list before making changes."
+        if request.endpoint == "lookup_place":
+            return jsonify(error=message), 409
+        abort(409, description=message)
     target = url_for(request.endpoint, **{**address, "ym": chosen})
     if request.query_string:
         target += "?" + request.query_string.decode("latin-1")
