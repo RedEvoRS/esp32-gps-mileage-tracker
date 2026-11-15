@@ -152,11 +152,24 @@ trips=$(find "$work/data" -type f -name '*.gpx' | wc -l)
 
 # --- 3. Manifest, dedupe, prune ----------------------------------------
 
+# Compare the links actually copied, so rsync's exclusions apply identically.
+# Sorted NUL-delimited path/text pairs preserve whitespace and target newlines.
+# Keep the copy on a manifest error, but fail afterwards and never dedupe it.
+link_manifest_error=0
+if ! (cd "$work/data" && find . -type l -print0 | LC_ALL=C sort -z \
+    | while IFS= read -r -d '' path; do
+        printf '%s\0' "$path"
+        readlink -z -- "$path" || exit 1
+    done) > "$work/SYMLINKS"; then
+    log "ERROR: couldn't record the copied symbolic links; this run will fail after the copy"
+    rm -f -- "$work/SYMLINKS"
+    link_manifest_error=1
+fi
 (cd "$work" && find . -type f ! -name SHA256SUMS -print0 \
     | LC_ALL=C sort -z | xargs -0 -r sha256sum) > "$work/SHA256SUMS"
 
 # Preserve changes in discovery status even if the database/file bytes match.
-if [[ -n $prev && $LINKS_NOT_BACKED_UP =~ ^[0-9]+$ ]] \
+if [[ -n $prev && $LINKS_NOT_BACKED_UP =~ ^[0-9]+$ && $link_manifest_error == 0 ]] \
         && cmp -s "$work/SHA256SUMS" "$SNAPSHOTS/$prev/SHA256SUMS" \
         && grep -Fxq "monitor=$monitor" "$SNAPSHOTS/$prev/INFO" \
         && [[ $(read_coverage_count "$SNAPSHOTS/$prev/INFO") == "$LINKS_NOT_BACKED_UP" ]]; then
@@ -392,6 +405,10 @@ if [[ $LINKS_NOT_BACKED_UP =~ ^[0-9]+$ ]] && (( LINKS_NOT_BACKED_UP > 0 )); then
 fi
 if (( coverage_error )); then
     log "ERROR: data wasn't checked for links outside it; fix the error above and rerun backup.sh."
+    failed=1
+fi
+if (( link_manifest_error )); then
+    log "ERROR: copied symbolic links weren't recorded for snapshot comparison; fix the error above and rerun backup.sh."
     failed=1
 fi
 (( failed == 0 )) || exit 1

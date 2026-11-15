@@ -607,6 +607,122 @@ exec {real_rsync} "$@"
         self.assertEqual(self.run_script("backup.sh", check=False).returncode, 1)
         self.assertEqual(len(self.snapshots()), 2)
 
+    def test_link_only_add_retarget_remove_and_unchanged_snapshots(self):
+        self.conf_append("KEEP_RECENT=10\n")
+        self.run_script("backup.sh")
+        for index, name in enumerate(("alias with spaces", "alias\nwith newline")):
+            link = self.data / name
+            self.symlink(link, "2026-10")
+            self.run_script("backup.sh")
+            self.assertEqual(len(self.snapshots()), 2 + index * 3)
+            self.assertEqual(os.readlink(self.backups / "latest/data" / name), "2026-10")
+            self.run_script("backup.sh")
+            self.assertEqual(len(self.snapshots()), 2 + index * 3, "unchanged links must dedupe")
+            link.unlink()
+            self.symlink(link, "./2026-10")  # Same resolved target; different link text.
+            self.run_script("backup.sh")
+            self.assertEqual(len(self.snapshots()), 3 + index * 3)
+            snap = self.backups / "latest"
+            self.assertEqual(os.readlink(snap / "data" / name), "./2026-10")
+            self.assertEqual((snap / "SYMLINKS").read_bytes(),
+                             os.fsencode(f"./{name}") + b"\0./2026-10\0")
+            self.assertIn("./SYMLINKS", (snap / "SHA256SUMS").read_text())
+            self.run_script("restore.sh", "check")
+            link.unlink()
+            self.run_script("backup.sh")
+            self.assertEqual(len(self.snapshots()), 4 + index * 3)
+            self.assertFalse((self.backups / "latest/data" / name).is_symlink())
+        self.run_script("backup.sh")
+        self.assertEqual(len(self.snapshots()), 7)
+
+    def test_link_manifest_preserves_target_newlines_and_sorted_paths(self):
+        for name in ("z target\n", "a target with space"):
+            (self.data / name).mkdir()
+            self.symlink(self.data / f"alias {name}", name)
+        self.run_script("backup.sh")
+        expected = b"".join(os.fsencode(f"./alias {name}\0{name}\0")
+                            for name in ("a target with space", "z target\n"))
+        self.assertEqual((self.backups / "latest/SYMLINKS").read_bytes(), expected)
+        self.run_script("backup.sh")
+        self.assertEqual(len(self.snapshots()), 1)
+        self.run_script("restore.sh", "check")
+
+    def test_link_and_real_folder_swaps_are_snapshotted(self):
+        self.conf_append("KEEP_RECENT=10\n")
+        for index, populated in enumerate((False, True)):
+            target = self.data / f"target-{index}"
+            target.mkdir()
+            if populated:
+                (target / "trip.gpx").write_text("saved trip")
+            alias = self.data / f"alias-{index}"
+            self.symlink(alias, target.name, True)
+            self.run_script("backup.sh")
+            before = len(self.snapshots())
+            alias.unlink()
+            shutil.copytree(target, alias)
+            self.run_script("backup.sh")
+            self.assertEqual(len(self.snapshots()), before + 1)
+            self.assertFalse((self.backups / "latest/data" / alias.name).is_symlink())
+            shutil.rmtree(alias)
+            self.symlink(alias, target.name, True)
+            self.run_script("backup.sh")
+            self.assertEqual(len(self.snapshots()), before + 2)
+            self.assertTrue((self.backups / "latest/data" / alias.name).is_symlink())
+            self.run_script("backup.sh")
+            self.assertEqual(len(self.snapshots()), before + 2)
+
+    def test_excluded_links_do_not_change_snapshot_comparison(self):
+        (self.data / "omitted.tmp").mkdir()
+        (self.data / "diagnostics").mkdir()
+        self.run_script("backup.sh")
+        for name in ("omitted.tmp/alias", "alias.tmp", ".upload-lock.alias", "diagnostics/events.db-shm"):
+            self.symlink(self.data / name, "../2026-10" if "/" in name else "2026-10")
+        for action in ("add", "retarget", "remove"):
+            if action != "add":
+                for link in tuple(self.data.rglob("*")):
+                    if link.is_symlink():
+                        link.unlink()
+                        if action == "retarget":
+                            self.symlink(link, ".")
+            self.run_script("backup.sh")
+            self.assertEqual(len(self.snapshots()), 1, action)
+            self.assertEqual((self.backups / "latest/SYMLINKS").read_bytes(), b"")
+
+    def test_legacy_snapshot_without_link_manifest_forces_one_new_snapshot(self):
+        self.symlink(self.data / "alias", "2026-10")
+        self.run_script("backup.sh")
+        for root in (self.backups, self.remote):
+            snap = root / "snapshots" / self.snapshots()[-1]
+            (snap / "SYMLINKS").unlink()
+            sums = snap / "SHA256SUMS"
+            sums.write_text("".join(line for line in sums.read_text().splitlines(keepends=True)
+                                    if not line.endswith("  ./SYMLINKS\n")))
+        self.run_script("restore.sh", "check")  # Older snapshots remain valid.
+        self.run_script("backup.sh")
+        self.assertEqual(len(self.snapshots()), 2)
+        self.run_script("backup.sh")
+        self.assertEqual(len(self.snapshots()), 2)
+
+    def test_link_manifest_error_still_copies_and_withholds_heartbeat(self):
+        self.symlink(self.data / "alias", "2026-10")
+        real_readlink = shutil.which("readlink")
+        self.shim("readlink", f'''\
+if [[ ${{*: -1}} == ./alias ]]; then exit 1; fi
+exec {real_readlink} "$@"
+''')
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        ping = self.tmp / "ping"
+        self.shim("curl", f'touch "{ping}"\n')
+        result = self.run_script("backup.sh", check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("couldn't record the copied symbolic links", result.stderr)
+        self.assertIn("links_not_backed_up=0\n", (self.backups / "latest/INFO").read_text())
+        self.assertTrue((self.remote / "snapshots" / self.snapshots()[-1] / "data/alias").is_symlink())
+        self.assertTrue((self.backups / "last-success").exists())
+        self.assertFalse(ping.exists())
+        self.assertEqual(self.run_script("backup.sh", check=False).returncode, 1)
+        self.assertEqual(len(self.snapshots()), 2)
+
     def test_long_chains_through_absolute_file_and_folder_links(self):
         target = self.data / "2026-10/2026-10-01T15-00-00.gpx"
         self.symlink(self.data / "absolute-file", target)
