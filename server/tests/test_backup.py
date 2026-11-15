@@ -859,6 +859,16 @@ class BackupScripts(unittest.TestCase):
                         self.assertTrue(result.stderr.rstrip().endswith(
                             "Restore test passed, but 1 linked item(s) will not be restored as links; see warnings above"))
 
+    def test_restore_without_info_distinguishes_unavailable_information(self):
+        snap = self.legacy_link_snapshot()
+        (snap / "INFO").unlink()
+        for command in ("check", "restore"):
+            args = (str(snap), "--yes") if command == "restore" else (str(snap),)
+            result = self.run_script("restore.sh", command, *args)
+            self.assertIn("no readable INFO in this snapshot", result.stderr)
+            self.assertNotIn("not checked when this backup was made", result.stderr)
+            self.assertNotIn("fix the check error", result.stderr)
+
     def test_restore_outside_link_leaves_existing_real_folder(self):
         self.legacy_link_snapshot()
         folder = self.data / "linked-month"

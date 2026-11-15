@@ -107,6 +107,8 @@ fetch_and_check() {
     SNAPSHOT_LINKS_NOT_BACKED_UP=$(read_coverage_count "$snap/INFO")
     if [[ $SNAPSHOT_LINKS_NOT_BACKED_UP == unknown ]]; then
         log "WARNING: linked items were not checked when this backup was made; inspect the backup log, fix the check error and make a fresh backup. Checking the saved links below."
+    elif [[ $SNAPSHOT_LINKS_NOT_BACKED_UP == unavailable ]]; then
+        log "WARNING: no readable INFO in this snapshot; saved link coverage information is unavailable. Find a readable INFO or inspect the original backup log before relying on this backup. Checking the saved links below."
     elif [[ $SNAPSHOT_LINKS_NOT_BACKED_UP =~ ^[0-9]+$ && $SNAPSHOT_LINKS_NOT_BACKED_UP == *[1-9]* ]]; then
         log "WARNING: this backup recorded $SNAPSHOT_LINKS_NOT_BACKED_UP linked item(s) whose contents were not saved; recover those contents from the original target or another backup, move them into data/ and make a fresh backup."
     fi
@@ -114,7 +116,7 @@ fetch_and_check() {
     if (( LINKS_NOT_RESTORED > 0 )); then
         log "WARNING: $LINKS_NOT_RESTORED linked item(s) will not be restored as links; see warnings above for target coverage"
     fi
-    [[ -f $snap/INFO ]] && log "Snapshot INFO: $(tr '\n' ' ' < "$snap/INFO")"
+    if [[ -f $snap/INFO && -r $snap/INFO ]]; then log "Snapshot INFO: $(tr '\n' ' ' < "$snap/INFO")"; fi
 }
 
 start_services() {

@@ -60,7 +60,7 @@ if [[ $status_only == yes ]]; then
         . "$SCRIPT_DIR/lib.sh" > /dev/null 2>&1
         print_verify_status
         print_coverage_status
-    ) || printf 'last_deep_check=\nlast_deep_check_result=\nlast_backup_links_not_backed_up=not checked\n'
+    ) || printf 'last_deep_check=\nlast_deep_check_result=\nlast_backup_links_not_backed_up=unavailable\n'
     exit 0
 fi
 

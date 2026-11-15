@@ -335,6 +335,21 @@ class InstallerUnraid(unittest.TestCase):
         self.assertIn("rerun", out)
         self.assertIn("FAILURES=1", out)
 
+    def test_unavailable_link_information_does_not_add_check_failure_advice(self):
+        self.conf()
+        self.scheduled(status="", success="")
+        path = self.work / "backup/scheduled.sh"
+        path.write_text(path.read_text().replace(
+            "last_attempt_start=", "last_backup_links_not_backed_up=unavailable\nlast_attempt_start="))
+        out = self.run_step("install_unraid_cron; MODE=check; verify_unraid_backups", MOUNT_MISSING="yes")
+        self.assertIn("BACKUP destination mount is missing", out)
+        self.assertNotIn("not checked", out)
+        self.assertNotIn("fix the check error", out)
+        # The same display function is used on Debian, where latest can be gone.
+        out = self.run_step("MODE=check; show_backup_deep_check")
+        self.assertNotIn("not checked", out)
+        self.assertNotIn("fix the check error", out)
+
     def test_persistent_ssh_key_and_known_hosts_used_for_every_connection(self):
         out = self.run_step(r'''
             ssh-keygen() {

@@ -531,14 +531,15 @@ report_link_restore_effects() {
 
 read_coverage_count() {
     local count
-    [[ -f $1 && -r $1 ]] || { printf unknown; return 0; }
+    [[ -f $1 && -r $1 ]] || { printf unavailable; return 0; }
     # Only an older, readable INFO without this field means zero.
     if count=$(grep '^links_not_backed_up=' "$1" 2>/dev/null); then
         count=${count#links_not_backed_up=}
     elif [[ $? == 1 ]]; then
         count=0
     else
-        count=unknown
+        printf unavailable
+        return 0
     fi
     [[ $count =~ ^[0-9]+$ ]] || count=unknown
     printf '%s' "$count"

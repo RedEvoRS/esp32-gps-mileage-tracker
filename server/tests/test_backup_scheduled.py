@@ -71,7 +71,7 @@ class ScheduledBackup(unittest.TestCase):
             "last_attempt_start": "", "last_attempt_end": "", "last_attempt_status": "",
             "last_success": "", "log": str(self.log),
             "last_deep_check": "", "last_deep_check_result": "",
-            "last_backup_links_not_backed_up": "not checked"})
+            "last_backup_links_not_backed_up": "unavailable"})
         self.assertFalse(self.state.parent.exists())
         self.assertFalse(self.log.parent.exists())
 
@@ -97,7 +97,7 @@ class ScheduledBackup(unittest.TestCase):
     def test_status_reads_coverage_without_sourcing_info(self):
         latest = self.backups / "latest"
         latest.mkdir()
-        self.assertEqual(self.status()["last_backup_links_not_backed_up"], "not checked")
+        self.assertEqual(self.status()["last_backup_links_not_backed_up"], "unavailable")
         (latest / "INFO").write_text("trips=1\n")
         self.assertEqual(self.status()["last_backup_links_not_backed_up"], "0")
         for value, expected in (("0", "0"), ("2", "2"), ("unknown", "not checked"),
@@ -106,7 +106,17 @@ class ScheduledBackup(unittest.TestCase):
             self.assertEqual(self.status()["last_backup_links_not_backed_up"], expected)
         self.assertFalse((self.tmp / "injected").exists())
         self.conf.unlink()
-        self.assertEqual(self.status()["last_backup_links_not_backed_up"], "not checked")
+        self.assertEqual(self.status()["last_backup_links_not_backed_up"], "unavailable")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can read mode-000 INFO")
+    def test_status_unreadable_info_is_unavailable(self):
+        latest = self.backups / "latest"
+        latest.mkdir()
+        info = latest / "INFO"
+        info.write_text("links_not_backed_up=unknown\n")
+        info.chmod(0)
+        self.addCleanup(info.chmod, 0o600)
+        self.assertEqual(self.status()["last_backup_links_not_backed_up"], "unavailable")
 
     def test_success_records_utc_state_and_private_log_in_install_folder(self):
         result = self.run_wrapper()
