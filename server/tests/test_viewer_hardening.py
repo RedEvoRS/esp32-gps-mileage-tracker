@@ -1,11 +1,14 @@
 """Viewer response headers and login redirect safety (2026-10-23 audit)."""
 
+import builtins
+import errno
 import io
+import os
 import json
 import sqlite3
 from pathlib import Path
 import unittest
-from contextlib import closing
+from contextlib import closing, ExitStack
 from unittest.mock import patch
 from urllib.parse import quote
 
@@ -14,6 +17,11 @@ from zoneinfo import ZoneInfo
 
 import test_viewer_roles as roles
 
+
+ADMIN_REFUSAL = ("This trip&#39;s files can&#39;t be opened: its summary, track or month folder is a link that leads "
+                 "outside the data folder or can&#39;t be followed safely, so the viewer won&#39;t read them. "
+                 "If it is in the log, the trip list and exports flag it. "
+                 "Replace the link with the real file or folder to show the trip again.")
 
 BS = chr(92)
 
@@ -67,9 +75,11 @@ class ViewerHardeningTests(unittest.TestCase):
         except (OSError, NotImplementedError) as exc:
             self.skipTest(f"symlink creation unavailable: {type(exc).__name__}")
 
-    def assert_unreadable_link(self, key, target):
+    def assert_unreadable_link(self, key, target, folder=False):
+        if folder:
+            self.assert_unreadable_folder(key, target)
+            return
         self.signed_in("admin")
-        not_found = self.client.get("/no/such/page").get_data(as_text=True)
         # Catch application summary stats/opens, including a cache hit after
         # replacing a regular summary with a symlink.
         with patch.object(self.viewer, "read_summary", side_effect=AssertionError("outside summary opened")), \
@@ -104,10 +114,459 @@ class ViewerHardeningTests(unittest.TestCase):
                     if route == "/export.csv":
                         self.assertIn("unreadable", text)
                     elif route == f"/trip/{key}":
-                        self.assertEqual(text, not_found)
+                        self.assertIn(ADMIN_REFUSAL, text)
+                        self.assertNotIn("the file could not be read", text)
                     elif not route.endswith(".xlsx"):
                         self.assertIn("the file could not be read", text)
                     response.close()
+
+        everyday = self.signed_in("editor", self.viewer.app.test_client())
+        unknown = everyday.get("/trip/2026-03/none")
+        refused = everyday.get(f"/trip/{key}")
+        self.assertEqual((refused.status_code, refused.data, refused.content_type),
+                         (unknown.status_code, unknown.data, unknown.content_type))
+
+    def assert_unreadable_folder(self, key, target, reason="outside"):
+        problem = self.viewer.FOLDER_PROBLEMS[reason]
+        self.signed_in("admin")
+        with patch.object(self.viewer, "read_summary", side_effect=AssertionError("outside read")), \
+                patch.object(self.viewer, "_summary_stamp", side_effect=AssertionError("outside stat")):
+            trips, unreadable = self.viewer.load_trips()
+            self.assertEqual(trips, [])
+            self.assertEqual(len(unreadable), 1)
+            folder = unreadable[0]
+            self.assertTrue(folder["folder"])
+            self.assertEqual(folder["trip_key"], "2026-01/")
+            self.assertEqual(folder["refused_file"], "folder")
+            self.assertEqual(folder["problem_file"], "folder")
+            self.assertEqual(folder["problem"], problem)
+            self.assertEqual(folder["folder_reason"], reason)
+            with patch.object(self.viewer.os.path, "lexists", side_effect=AssertionError("unsafe presence probe")), \
+                    self.viewer._trip_read(trip_key=key) as (_, targeted, damaged):
+                self.assertEqual(targeted, [])
+                self.assertEqual([t["trip_key"] for t in damaged], [key])
+                self.assertEqual(damaged[0]["problem"], "the file could not be read")
+            self.assertEqual(self.viewer._recording_years(key), {2025, 2026})
+        for role in ("admin", "editor"):
+            client = self.signed_in(role, self.viewer.app.test_client())
+            routes = ["/", "/export.csv", "/export.xlsx", f"/trip/{key}", f"/gpx/{key}"]
+            if role == "admin":
+                routes += ["/admin/year/2025", "/admin/year/2026"]
+            for route in routes:
+                with self.subTest(role=role, route=route):
+                    response = client.get(route)
+                    self.assertEqual(response.status_code, 404 if route.startswith(("/trip/", "/gpx/")) else 200)
+                    if route.endswith(".xlsx"):
+                        book = load_workbook(io.BytesIO(response.data))
+                        text = str([list(sheet.values) for sheet in book])
+                        self.assertIn("2026-01/ (whole month folder)", text)
+                        book.close()
+                    else:
+                        text = response.get_data(as_text=True)
+                    if route == f"/trip/{key}":
+                        if role == "admin":
+                            self.assertIn(ADMIN_REFUSAL, text)
+                        else:
+                            unknown = client.get("/trip/2026-03/none")
+                            self.assertEqual((response.status_code, response.data, response.content_type),
+                                             (unknown.status_code, unknown.data, unknown.content_type))
+                            unknown.close()
+                    self.assertNotIn("(no GPX either)", text)
+                    self.assertNotIn("distinct-outside-name", text)
+                    self.assertNotIn("outside-file-sentinel", text)
+                    self.assertNotIn(str(target), text)
+                    if route == "/export.csv":
+                        import csv
+                        rows = list(csv.DictReader(io.StringIO(text)))
+                        row = next(r for r in rows if r["row_type"] == "unreadable_folder")
+                        self.assertEqual(row["trip_id"], "2026-01/")
+                        self.assertTrue(all(not v for k, v in row.items() if k not in ("trip_id", "row_type", "purpose_note")))
+                    elif route == "/" or route.startswith("/admin/year/"):
+                        self.assertIn("2026-01/", text)
+                        self.assertIn(problem, text)
+                        self.assertNotIn("2026-01/drive", text)
+                        self.assertNotIn('/trip/2026-01/', text)
+                        if route == "/":
+                            self.assertIn("1 month folder(s)", text)
+                            self.assertIn("none of its trips are shown or counted", text)
+                            self.assertNotIn("Remove from log", text)
+                            self.assertIn("mount the other disk" if role == "admin" else "ask the admin", text)
+                    response.close()
+
+    def test_scan_never_lists_or_opens_refused_target(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        target = self.db.parent / "outside-month"
+        month.rename(target)
+        self.symlink(month, target, directory=True)
+        def guard(original):
+            def checked(path, *args, **kwargs):
+                if not isinstance(path, int):
+                    candidate = Path(path).absolute()
+                    for refused in (month, target):
+                        self.assertFalse(candidate == refused or refused in candidate.parents,
+                                         f"outside listing/open: {candidate}")
+                return original(path, *args, **kwargs)
+            return checked
+
+        # Resolution may stat a target. Enumeration and file reads must stop
+        # before either the link name or its outside target is used.
+        with ExitStack() as stack:
+            for owner, names in ((Path, ("iterdir", "glob", "rglob", "open", "read_text", "read_bytes")),
+                                 (os, ("scandir", "listdir", "walk")), (builtins, ("open",))):
+                for name in names:
+                    stack.enter_context(patch.object(owner, name, guard(getattr(owner, name))))
+            self.assertEqual(self.viewer.load_trips()[1][0]["trip_key"], "2026-01/")
+
+    def test_nonmonth_directories_are_not_trip_folders(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        for name in ("archive", "diagnostics"):
+            folder = self.viewer.DATA_ROOT / name
+            folder.mkdir()
+            (folder / "drive.json").write_bytes((month / "drive.json").read_bytes())
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual([t["trip_key"] for t in trips], ["2026-01/drive"])
+        self.assertEqual(self.viewer.mileage_totals(trips)["all"], 1)
+        self.assertEqual(unreadable, [])
+
+    def test_unavailable_data_root_is_empty(self):
+        self.viewer.DATA_ROOT.rename(self.viewer.DATA_ROOT.with_name("vanished"))
+        self.assertEqual(self.viewer.load_trips(), ([], []))
+
+    def test_month_link_causes_and_hints(self):
+        root = self.viewer.DATA_ROOT
+        cases = (("missing-inside", root / "missing", "dangling", "the folder link target is missing"),
+                 ("missing-outside", self.db.parent / "missing", "dangling", "the folder link target is missing"),
+                 ("loop", root / "2027-02", "loop", "the folder link forms a loop"),
+                 ("root", root, "outside", "the folder link points at the data folder itself or above it"),
+                 ("parent", root.parent, "outside", "the folder link points at the data folder itself or above it"))
+        for label, target, reason, problem in cases:
+            with self.subTest(cause=label):
+                link = root / "2027-02"
+                self.symlink(link, target, directory=True)
+                try:
+                    entry = self.viewer.load_trips()[1][0]
+                    self.assertEqual(entry["folder_reason"], reason)
+                    self.assertEqual(entry["problem"], problem)
+                    for role in ("admin", "editor"):
+                        client = self.signed_in(role, self.viewer.app.test_client())
+                        for route in ("/", "/export.csv", "/export.xlsx") + (("/admin/year/2027",) if role == "admin" else ()):
+                            response = client.get(route)
+                            if route.endswith("xlsx"):
+                                book = load_workbook(io.BytesIO(response.data))
+                                text = str(list(book["Unreadable trips"].values))
+                                book.close()
+                            else:
+                                text = response.get_data(as_text=True)
+                            self.assertIn(problem, text)
+                            self.assertIn("mount the other disk" if role == "admin" else "ask the admin", text)
+                            response.close()
+                finally:
+                    link.unlink()
+
+    def test_real_month_metadata_errors_are_unreadable(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        original = Path.stat
+        for operation in ("stat", "lstat"):
+            def failing(path, *args, operation=operation, **kwargs):
+                if path == month and (operation == "lstat" or kwargs.get("follow_symlinks", True)):
+                    raise OSError(errno.EIO, "synthetic metadata failure")
+                return original(path, *args, **kwargs)
+
+            with self.subTest(operation=operation), patch.object(Path, "stat", failing):
+                trips, unreadable = self.viewer.load_trips()
+            self.assertEqual(trips, [])
+            self.assertEqual(unreadable[0]["folder_reason"], "unreadable")
+            self.assertEqual(unreadable[0]["problem"], "the folder could not be read")
+
+    def test_vanished_month_is_reported_and_other_month_loads(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        other = self.viewer.DATA_ROOT / "2026-02"
+        other.mkdir()
+        (other / "drive.json").write_bytes((month / "drive.json").read_bytes())
+        original = self.viewer.trip_merges.checked_path
+
+        def vanish(root, path, **kwargs):
+            checked = original(root, path, **kwargs)
+            if path == month:
+                month.rename(self.viewer.DATA_ROOT / "vanished")
+            return checked
+
+        with patch.object(self.viewer.trip_merges, "checked_path", side_effect=vanish):
+            trips, unreadable = self.viewer.load_trips()
+        self.assertEqual([t["trip_key"] for t in trips], ["2026-02/drive"])
+        self.assertEqual([t["trip_key"] for t in unreadable], ["2026-01/"])
+        self.assertEqual(unreadable[0]["problem"], "the folder could not be read")
+
+    @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() != 0, "requires non-root POSIX permissions")
+    def test_unlistable_month_is_reported_and_pages_still_load(self):
+        month = self.viewer.DATA_ROOT / "2026-02"
+        month.mkdir()
+        month.chmod(0)
+        self.addCleanup(month.chmod, 0o700)
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual([t["trip_key"] for t in trips], ["2026-01/drive"])
+        self.assertEqual([t["trip_key"] for t in unreadable], ["2026-02/"])
+        self.assertEqual(unreadable[0]["problem"], "the folder could not be read")
+        self.assertEqual(unreadable[0]["folder_reason"], "unreadable")
+        self.signed_in("admin")
+        for route in ("/", "/export.csv", "/export.xlsx"):
+            response = self.client.get(route)
+            self.assertEqual(response.status_code, 200)
+            if route.endswith("xlsx"):
+                book = load_workbook(io.BytesIO(response.data))
+                text = str(list(book["Unreadable trips"].values))
+                book.close()
+            else:
+                text = response.get_data(as_text=True)
+            self.assertIn("owner and permissions", text)
+            self.assertIn("UID 1000", text)
+            response.close()
+        review = self.client.get("/admin/year/2026").get_data(as_text=True)
+        self.assertIn("owner and permissions", review)
+
+    @unittest.skipUnless(os.scandir in os.supports_fd and hasattr(os, "O_NOFOLLOW"), "requires no-follow directory handles")
+    def test_month_swapped_before_listing_never_lists_outside(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        target = self.db.parent / "outside-month"
+        probe = self.viewer.DATA_ROOT / "probe"
+        self.symlink(probe, target, directory=True)
+        probe.unlink()
+        original_iterdir, original_open, original_scan = Path.iterdir, os.open, os.scandir
+        swapped = False
+
+        def swap():
+            nonlocal swapped
+            if not swapped:
+                month.rename(target)
+                month.symlink_to(target, target_is_directory=True)
+                swapped = True
+
+        def listing(path):
+            if path == month:
+                swap()
+                self.fail("path listing follows the swapped month link")
+            return original_iterdir(path)
+
+        def opening(path, *args, **kwargs):
+            if path == month:
+                swap()
+            return original_open(path, *args, **kwargs)
+
+        def scanning(path):
+            if isinstance(path, int):
+                self.assertNotEqual(os.fstat(path).st_ino, target.stat().st_ino)
+            else:
+                self.assertNotEqual(Path(path).resolve(), target)
+            return original_scan(path)
+
+        with patch.object(Path, "iterdir", listing), patch.object(os, "open", opening), \
+                patch.object(os, "scandir", scanning), \
+                patch.object(os, "supports_fd", os.supports_fd | {scanning}), \
+                patch.object(self.viewer, "read_summary", side_effect=AssertionError("outside read")):
+            trips, unreadable = self.viewer.load_trips()
+        self.assertTrue(swapped)
+        self.assertEqual(trips, [])
+        self.assertEqual([t["trip_key"] for t in unreadable], ["2026-01/"])
+        self.assertTrue(unreadable[0]["folder"])
+
+    def test_month_swapped_during_file_read_folds_into_folder(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        target = self.db.parent / "swapped-month"
+        # Establish symlink support before the mocked read.
+        probe = self.viewer.DATA_ROOT / "probe"
+        self.symlink(probe, target, directory=True)
+        probe.unlink()
+        cached = self.viewer._cached_summary
+        swapped = False
+
+        def swap(path, **kwargs):
+            nonlocal swapped
+            if not swapped:
+                month.rename(target)
+                month.symlink_to(target, target_is_directory=True)
+                swapped = True
+            return cached(path, **kwargs)
+
+        with patch.object(self.viewer, "_cached_summary", side_effect=swap):
+            trips, unreadable = self.viewer.load_trips()
+        self.assertEqual(trips, [])
+        self.assertEqual([t["trip_key"] for t in unreadable], ["2026-01/"])
+        self.assertTrue(unreadable[0]["folder"])
+
+    def test_internal_month_link_still_scans_and_nonmonth_link_is_ignored(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        target = self.viewer.DATA_ROOT / "2026-02"
+        month.rename(target)
+        self.symlink(month, target, directory=True)
+        self.symlink(self.viewer.DATA_ROOT / "other", self.db.parent / "missing", directory=True)
+        with self.assertNoLogs(self.viewer.app.logger, "WARNING"):
+            trips, unreadable = self.viewer.load_trips()
+        self.assertEqual([t["trip_key"] for t in unreadable], ["2026-01/"])
+        self.assertEqual({t["trip_key"] for t in trips}, {"2026-02/drive"})
+
+    def assert_alias_counted_once(self, key, alias):
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual([t["trip_key"] for t in trips], [key])
+        self.assertEqual(self.viewer.mileage_totals(trips)["all"], 1)
+        self.assertEqual([t["trip_key"] for t in unreadable], [alias + "/"])
+        self.assertTrue(unreadable[0]["folder"])
+        self.assertIn("already counted", unreadable[0]["problem"])
+        self.assertNotIn(str(self.viewer.DATA_ROOT), unreadable[0]["problem"])
+        for role in ("admin", "editor"):
+            client = self.signed_in(role, self.viewer.app.test_client())
+            page = client.get("/").get_data(as_text=True)
+            self.assertIn(key, page)
+            self.assertNotIn("totals below may be short", page)
+            self.assertNotIn("none of its trips are shown or counted", page)
+            self.assertIn("whose trips are counted there", page)
+            self.assertIn("Remove the extra link" if role == "admin" else "ask the admin", page)
+            self.assertIn("example", page)
+            self.assertNotIn(f'/trip/{alias}/drive', page)
+            import csv
+            rows = list(csv.DictReader(io.StringIO(client.get("/export.csv").get_data(as_text=True))))
+            self.assertEqual(len([r for r in rows if r["row_type"] == "trip"]), 1)
+            self.assertEqual([float(r["distance_miles"]) for r in rows
+                              if r["row_type"] == "total" and r["category"] == "all"], [1])
+            self.assertEqual([r["trip_id"] for r in rows if r["row_type"] == "folder_notice"], [alias + "/"])
+            book = load_workbook(io.BytesIO(client.get("/export.xlsx").data))
+            self.assertEqual(book["Mileage"].max_row, 2)
+            self.assertEqual([r[3] for r in book["Totals"].values if r[2] == "all"], [1])
+            self.assertEqual(book["Unreadable trips"].max_row, 2)
+            self.assertIn("whose trips are counted there", str(list(book["Unreadable trips"].values)))
+            notice = next(r for r in rows if r["row_type"] == "folder_notice")
+            self.assertIn("whose trips are counted there", notice["purpose_note"])
+            self.assertNotIn("missing", notice["purpose_note"])
+            self.assertIn(alias + "/", str(list(book["Unreadable trips"].values)))
+            book.close()
+        self.signed_in("admin")
+        for year in (int(alias[:4]) - 1, int(alias[:4])):
+            page = self.client.get(f"/admin/year/{year}").get_data(as_text=True)
+            self.assertEqual(page.count(f"<code>{alias}/</code> (month folder)"), 1)
+            self.assertNotIn("totals above may be short", page)
+            self.assertIn("whose trips are counted there", page)
+        page = self.client.get("/admin/year/2026").get_data(as_text=True)
+        self.assertIn("<td>all</td><td>1</td><td>1.000</td>", page)
+
+    def test_internal_alias_prefers_real_month_and_keeps_annotations(self):
+        self.symlink(self.viewer.DATA_ROOT / "2025-01", self.viewer.DATA_ROOT / "2026-01", directory=True)
+        self.assert_alias_counted_once("2026-01/drive", "2025-01")
+        trips, _ = self.viewer.load_trips()
+        self.assertEqual(trips[0]["category"], "business")
+        self.assertEqual(trips[0]["purpose_note"], "example")
+
+    def test_two_month_links_to_nonmonth_folder_count_once_in_sorted_order(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        target = self.viewer.DATA_ROOT / "archive"
+        month.rename(target)
+        self.symlink(self.viewer.DATA_ROOT / "2027-01", target, directory=True)
+        self.symlink(month, target, directory=True)
+        self.assert_alias_counted_once("2026-01/drive", "2027-01")
+
+    def test_single_month_link_to_nonmonth_folder_scans_under_link_name(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        target = self.viewer.DATA_ROOT / "archive"
+        month.rename(target)
+        self.symlink(month, target, directory=True)
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual([t["trip_key"] for t in trips], ["2026-01/drive"])
+        self.assertEqual(unreadable, [])
+        self.assertEqual(trips[0]["purpose_note"], "example")
+        self.assertEqual(trips[0]["category"], "business")
+
+    def test_merged_trip_with_linked_month_part_keeps_undo(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        target = self.db.parent / "outside-month"
+        month.rename(target)
+        self.symlink(month, target, directory=True)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO trip_merges (trip_key, summary, fingerprint) VALUES (?, ?, ?)",
+                         ("2026-02/merged", "{}", "[]"))
+            conn.execute("INSERT INTO trip_merge_parts VALUES (?, ?, ?)",
+                         ("2026-01/drive", "2026-02/merged", 0))
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual(trips, [])
+        self.assertEqual({t["trip_key"] for t in unreadable}, {"2026-01/", "2026-02/merged"})
+        self.signed_in("admin")
+        page = self.client.get("/")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn(b"Undo merge (split back)", page.data)
+
+    def test_dangling_month_is_reported_in_full_scan(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        target = self.db.parent / "missing-month"
+        for file in month.iterdir():
+            file.unlink()
+        month.rmdir()
+        self.symlink(month, target, directory=True)
+        self.assert_unreadable_folder("2026-01/missing", target, reason="dangling")
+
+    def test_linked_month_does_not_break_other_pages_or_merge_guard(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        target = self.db.parent / "outside-month"
+        month.rename(target)
+        self.symlink(month, target, directory=True)
+        other = self.viewer.DATA_ROOT / "2026-02"
+        other.mkdir()
+        for name in ("first", "second"):
+            data = json.loads((target / "drive.json").read_text())
+            data["start_time"] = "2026-02-02T12:00:00Z" if name == "first" else "2026-02-02T12:01:00Z"
+            data["end_time"] = data["start_time"]
+            (other / f"{name}.json").write_text(json.dumps(data))
+        self.signed_in("admin")
+        for route in ("/admin/history", "/admin/removed", "/trip/2026-02/first", "/admin/year/2026", "/export.csv"):
+            self.assertEqual(self.client.get(route).status_code, 200, route)
+        trips, unreadable = self.viewer.load_trips()
+        first = next(t for t in trips if t["id"] == "first")
+        candidate, reason = self.viewer.trip_merges.next_trip(first, trips, unreadable)
+        self.assertIsNone(candidate)
+        self.assertIn("the folder links outside the data folder", reason)
+
+    def test_refused_trip_links_hide_removal_and_stop_before_trip_reads(self):
+        everyday = self.signed_in("editor", self.viewer.app.test_client())
+        self.signed_in("admin")
+        unknown = everyday.get("/trip/2026-03/none")
+        outside = self.db.parent / "outside"
+        outside.mkdir()
+        for kind in ("summary", "gpx", "month"):
+            with self.subTest(kind=kind):
+                key = f"2026-02/{kind}"
+                month = self.viewer.DATA_ROOT / "2026-02"
+                if kind == "month":
+                    self.symlink(month, outside, directory=True)
+                    link = month
+                else:
+                    month.mkdir(exist_ok=True)
+                    link = month / (kind + (".json" if kind == "summary" else ".gpx"))
+                    target = outside / kind
+                    target.write_text("outside-file-sentinel", encoding="utf-8")
+                    self.symlink(link, target)
+                try:
+                    for removed in (False, True):
+                        if removed:
+                            with closing(sqlite3.connect(self.db)) as conn, conn:
+                                self.viewer.trip_log.add_removal(conn, key, "test reason", "driver")
+                        with patch.object(self.viewer, "read_summary", side_effect=AssertionError("trip read")), \
+                                patch.object(self.viewer, "_summary_stamp", side_effect=AssertionError("trip stat")), \
+                                patch.object(self.viewer.trip_log, "removal", side_effect=AssertionError("removal read")):
+                            response = everyday.get(f"/trip/{key}")
+                            self.assertEqual((response.status_code, response.data, response.content_type),
+                                             (unknown.status_code, unknown.data, unknown.content_type))
+                            admin = self.client.get(f"/trip/{key}")
+                            self.assertEqual(admin.status_code, 404)
+                            self.assertIn(ADMIN_REFUSAL, admin.get_data(as_text=True))
+                            for result in (response, admin):
+                                self.assertNotIn(b"outside-file-sentinel", result.data)
+                                self.assertNotIn(str(outside).encode(), result.data)
+                            for client in (everyday, self.client):
+                                plain = client.get("/no/such/page")
+                                for address in ("/trip/2026-x2/month", "/trip/2026-02/bad.key"):
+                                    malformed = client.get(address)
+                                    self.assertEqual((malformed.status_code, malformed.data, malformed.content_type),
+                                                     (plain.status_code, plain.data, plain.content_type))
+                finally:
+                    link.unlink()
+                    if kind != "month":
+                        month.rmdir()
 
     def test_summary_symlink_is_unreadable_in_lists_pages_exports_and_year_review(self):
         summary = self.viewer.DATA_ROOT / "2026-01/drive.json"
@@ -132,8 +591,10 @@ class ViewerHardeningTests(unittest.TestCase):
         month = self.viewer.DATA_ROOT / "2026-01"
         target = self.db.parent / "private-month"
         month.rename(target)
+        (target / "distinct-outside-name.json").write_text("{}")
+        (target / "distinct-outside-name.gpx").write_text("<gpx/>")
         self.symlink(month, target, directory=True)
-        self.assert_unreadable_link("2026-01/drive", target)
+        self.assert_unreadable_link("2026-01/drive", target, folder=True)
         self.assertFalse(self.viewer.load_trips()[1][0]["has_gpx"])
         self.assertEqual(self.client.get("/gpx/2026-01/drive").status_code, 404)
 
@@ -164,19 +625,147 @@ class ViewerHardeningTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 404)
                 response.close()
 
+    def test_looping_gpx_link_is_unreadable_on_every_python(self):
+        # #729: Python 3.13's resolve() no longer raises on a link loop, so a
+        # looping GPX beside a valid summary was counted on 3.13, not on 3.12.
+        self.signed_in("admin")
+        gpx = self.viewer.DATA_ROOT / "2026-01/drive.gpx"
+        gpx.unlink()
+        self.symlink(gpx, gpx)
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual(trips, [])
+        self.assertEqual([u["trip_key"] for u in unreadable], ["2026-01/drive"])
+        self.assertEqual(unreadable[0]["problem"], "the file could not be read")
+        self.assertEqual(self.client.get("/trip/2026-01/drive").status_code, 404)
+
     def test_escaping_gpx_is_not_available_to_pages_or_exports(self):
         self.signed_in("admin")
         gpx = self.viewer.DATA_ROOT / "2026-01/drive.gpx"
         target = self.db.parent / "private-track.gpx"
         gpx.rename(target)
         self.symlink(gpx, target)
-        self.assertFalse(self.viewer.load_trips()[0][0]["has_gpx"])
-        for route in ("/", "/export.csv", "/export.xlsx"):
+        target.write_text("outside-track-sentinel", encoding="utf-8")
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual(trips, [])
+        self.assertEqual([t["trip_key"] for t in unreadable], ["2026-01/drive"])
+        self.assertEqual(unreadable[0]["problem"], "the file could not be read")
+        self.assertEqual(unreadable[0]["device_id"], "example")
+        self.assertEqual(unreadable[0]["start_time"], "2026-01-02T12:00:00Z")
+        self.assertNotIn("distance_miles", unreadable[0])
+        with self.viewer._trip_read(trip_key="2026-01/drive") as (_, targeted, damaged):
+            self.assertEqual(targeted, trips)
+            self.assertEqual(damaged, unreadable)
+        # Mix a readable recording with the refused one so counting either
+        # recording incorrectly changes the total.
+        summary = self.viewer.DATA_ROOT / "2026-01/drive.json"
+        readable = json.loads(summary.read_text())
+        readable["distance_miles"] = 2.5
+        summary.with_name("readable.json").write_text(json.dumps(readable))
+        counted, _ = self.viewer.load_trips()
+        self.assertEqual(self.viewer.mileage_totals(counted)["all"], 2.5)
+        summary.with_name("readable.json").unlink()
+        for route in ("/", "/export.csv", "/export.xlsx", "/admin/year/2026"):
             with self.subTest(route=route):
                 response = self.client.get(route)
                 self.assertEqual(response.status_code, 200)
+                if route.endswith(".xlsx"):
+                    book = load_workbook(io.BytesIO(response.data))
+                    try:
+                        self.assertEqual(book["Mileage"].max_row, 1)
+                        self.assertEqual(book["Totals"]["D2"].value, 0)
+                        self.assertIn("Unreadable trips", book.sheetnames)
+                        rows = list(book["Unreadable trips"].values)
+                        self.assertEqual([row[rows[0].index("trip_id")] for row in rows[1:]], ["drive"])
+                        text = str([list(sheet.values) for sheet in book])
+                    finally:
+                        book.close()
+                else:
+                    text = response.get_data(as_text=True)
+                if route.endswith(".csv"):
+                    self.assertIn(",unreadable,", text)
+                elif not route.endswith(".xlsx"):
+                    self.assertIn("the file could not be read", text)
+                    self.assertIn("2026-01/drive.gpx", text)
+                    self.assertNotIn("2026-01/drive.json", text)
+                    self.assertNotIn("(no GPX either)", text)
+                    if route == "/":
+                        self.assertIn("1 trip file(s) can't be read.", text)
+                        self.assertIn("damaged summary from its GPX", text)
+                    else:
+                        self.assertIn("Trips whose files can't be read", text)
+                self.assertNotIn("refused_file", text)
+                self.assertNotIn("outside-track-sentinel", text)
+                self.assertNotIn(str(target), text)
+                if route.endswith(".csv"):
+                    self.assertNotIn(",trip,", text)
                 response.close()
-        self.assertEqual(self.client.get("/gpx/2026-01/drive").status_code, 404)
+        response = self.client.get("/gpx/2026-01/drive")
+        self.assertEqual(response.status_code, 404)
+        self.assertNotIn(b"outside-track-sentinel", response.data)
+
+    def assert_refused_gpx_label(self, suffix, problem):
+        self.signed_in("admin")
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual(trips, [])
+        self.assertEqual(len(unreadable), 1)
+        self.assertEqual(unreadable[0]["refused_file"], "gpx")
+        self.assertEqual(unreadable[0]["problem"], problem)
+        with self.viewer._trip_read(trip_key="2026-01/drive") as (_, targeted, damaged):
+            self.assertEqual(targeted, trips)
+            self.assertEqual(damaged, unreadable)
+        for route in ("/", "/admin/year/2026"):
+            with self.subTest(route=route):
+                response = self.client.get(route)
+                self.assertEqual(response.status_code, 200)
+                text = response.get_data(as_text=True)
+                self.assertIn(f"2026-01/drive.{suffix}</code>", text)
+                self.assertIn(problem, text)
+                self.assertNotIn("(no GPX either)", text)
+                self.assertNotIn("outside-file-sentinel", text)
+                if suffix == "json":
+                    self.assertIn("(its GPX links outside the data folder)", text)
+
+    def test_missing_summary_with_refused_gpx_names_track(self):
+        summary = self.viewer.DATA_ROOT / "2026-01/drive.json"
+        summary.unlink()
+        gpx = summary.with_suffix(".gpx")
+        gpx.unlink()
+        target = self.db.parent / "outside.gpx"
+        target.write_text("outside-file-sentinel", encoding="utf-8")
+        self.symlink(gpx, target)
+        self.assert_refused_gpx_label("gpx", "the file could not be read")
+
+    def test_damaged_summary_with_refused_gpx_keeps_summary_problem(self):
+        summary = self.viewer.DATA_ROOT / "2026-01/drive.json"
+        summary.write_text("{", encoding="utf-8")
+        _, problem = self.viewer.read_summary(summary, root=self.viewer.DATA_ROOT.resolve())
+        self.assertTrue(problem)
+        gpx = summary.with_suffix(".gpx")
+        gpx.unlink()
+        target = self.db.parent / "outside.gpx"
+        target.write_text("outside-file-sentinel", encoding="utf-8")
+        self.symlink(gpx, target)
+        self.assert_refused_gpx_label("json", problem)
+
+    def test_refused_month_never_labels_track_missing(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        target = self.db.parent / "outside-month"
+        month.rename(target)
+        (target / "drive.json").write_text("outside-file-sentinel", encoding="utf-8")
+        (target / "drive.gpx").write_text("outside-file-sentinel", encoding="utf-8")
+        self.symlink(month, target, directory=True)
+        self.assert_unreadable_link("2026-01/drive", target, folder=True)
+
+    def test_missing_gpx_keeps_summary_readable_and_miles_counted(self):
+        (self.viewer.DATA_ROOT / "2026-01/drive.gpx").unlink()
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual(unreadable, [])
+        self.assertEqual([t["trip_key"] for t in trips], ["2026-01/drive"])
+        self.assertFalse(trips[0]["has_gpx"])
+        self.assertEqual(self.viewer.mileage_totals(trips)["all"], 1)
+        with self.viewer._trip_read(trip_key="2026-01/drive") as (_, targeted, damaged):
+            self.assertEqual(targeted, trips)
+            self.assertEqual(damaged, [])
 
     def test_unreadable_summary_hides_os_error_paths_but_logs_details(self):
         self.signed_in("admin")
@@ -229,7 +818,10 @@ class ViewerHardeningTests(unittest.TestCase):
                         response = self.client.get(f"/{route}/2026-01/linked")
                         self.assertEqual(response.status_code, 404)
                         self.assertNotIn(b"private-file-sentinel", response.data)
-                        self.assertIn(b"The requested URL was not found on the server", response.data)
+                        if route == "trip":
+                            self.assertIn(ADMIN_REFUSAL, response.get_data(as_text=True))
+                        else:
+                            self.assertIn(b"The requested URL was not found on the server", response.data)
                         self.assertNotIn(b"the file could not be read", response.data)
                         response.close()
             finally:

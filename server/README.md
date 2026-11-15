@@ -564,7 +564,14 @@ for storage, Python fallback and service setup.
    uploaded size-split piece starts at its own boundary fix. Retries search
    all month directories under the upload lock and keep the original folder,
    including after a `DISPLAY_TZ` change. Existing duplicate folders require
-   operator review; ingest returns 409 rather than choosing one.
+   operator review; ingest returns 409 rather than choosing one. An internal
+   month-folder alias counts once. If any `YYYY-MM` folder links outside
+   `data/` or loops, every GPX upload gets HTTP 503 and the ingest log names
+   the folder. A new trip whose own month folder is a link to a folder with a
+   different name (say `2026-04` → `2026-03`) gets the same 503, because it
+   would otherwise be filed and shown under the other month. Replace it with a real folder or mount the disk there. The
+   tracker keeps trips until HTTP 200 and retries after repair; Device health
+   shows server errors. Diagnostics uploads are unaffected.
    Older third-party timed uploads named with a custom header keep their old
    names on disk. Review those pairs before re-uploading: the new timestamp ID
    can create another record. Firmware uploads already use timestamp IDs.
@@ -786,7 +793,7 @@ threads. It checks file identity, size and nanosecond modification time on
 each scan, rereads changed files and drops vanished entries. A restart clears
 the cache. Annotations, removals and year locks always come from the database.
 Ordinary reads use a consistent read transaction; only a changed merged
-summary (or an older fingerprint needing file identities) reserves the database
+summary (or an older merge fingerprint being rewritten once) reserves the database
 writer and rechecks the log before saving. SQLite can still briefly delay a
 writer's commit until a read transaction finishes.
 
@@ -808,6 +815,48 @@ trip's local end month: that year, plus the year before for a January
 folder. `DEPLOY_DEBIAN.md` → Troubleshooting says how to rebuild the
 summary from its GPX.
 
+A trip whose summary or track (GPX) is a link pointing outside
+the data folder is treated the same way: the viewer never opens it, and the
+trip is listed as unreadable ("the file could not be read") with no miles
+counted. A track that is simply missing is different: the trip still counts
+and just has no map. The admin's page for a trip with such a link says a file
+is a link that leads outside the data folder or can't be followed safely;
+replace the link with the real file. To an
+everyday login it reads like an address with no trip.
+
+Only first-level folders named `YYYY-MM` hold trips; the viewer ignores any
+other folder in `data/` (such as `diagnostics/`). A month folder the viewer
+can't use appears once as a folder (for example `2026-01/`) in both roles'
+warning box, as `row_type=unreadable_folder` in CSV, on the XLSX `Unreadable
+trips` sheet and in the year review: a link that leads outside `data/` (or to
+`data/` itself or above), a link whose target is missing, a link that loops,
+or a month entry the viewer could not inspect or list (it disappeared,
+permissions deny access, or the filesystem reported an error). Its trips are
+neither listed nor counted. The admin's hint fits the cause: replace the link
+with the real folder or mount the other disk at that path; for a folder that
+can't be read, check that it still exists, that its disk is available, and
+that UID 1000 (the viewer reads `data/` read-only) may read it.
+
+The viewer checks containment before it lists a folder or reads a file, and on
+Linux it lists each month through a directory handle that refuses a month
+folder swapped for a link at the last moment. These checks can't stop someone
+who can write to `data/` from swapping a *parent* directory in the instant
+between the check and a listing or read; the Windows test fallback also lacks
+the directory handle. Keep `data/` writable only by the containers' user and
+root.
+
+A month link to a folder inside `data/` that no other month name uses (for
+example `2026-01` → `archive`) is read as that month, without a warning. If
+two month names reach the same folder, its trips count once, under the real
+month folder (or else the first link name in sorted order), and the other name
+gets a notice saying where they are counted (`row_type=folder_notice` in CSV).
+A notice doesn't mean miles are missing; remove the extra link.
+
+`install.sh --check` reports each symbolic link directly inside `data/` as
+a problem, with a hint to use a real folder or mount the other disk there.
+Install mode warns and continues. If listing `data/` would require a new sudo
+prompt, `--check` warns that it did not check the links.
+
 ### Admin year review and close
 
 The admin-only `/admin/year/<YYYY>` page is linked from the trip list after
@@ -822,7 +871,9 @@ after local January 1 of the following year.
 
 A trip belongs to the year shown by its local start time. An unreadable trip
 is assigned by its storage folder; a January folder can be listed under the
-previous year. A trip with no usable time is not locked by any year.
+previous year. Folder entries follow the same rule, so a January folder
+appears under both candidate years. A trip with no usable time is not locked
+by any year.
 
 The admin closes or reopens a year on its review page using a confirmation
 checkbox. Both actions appear in change history. While a year
@@ -884,14 +935,18 @@ summary files. The only thing it writes is the annotations database.
 ### Remove trips and review changes
 
 The admin removes a trip from the log with a required reason; unreadable trips
-can also be removed. It disappears from the trip list, totals, CSV/XLSX
+can also be removed. Folder warning entries cannot be removed trip by trip;
+fix the folder instead. A removed trip disappears from the trip list, totals,
+CSV/XLSX
 exports and merge suggestions for both roles. The GPX and JSON source files
 stay in `./data`; removal is a reversible record in `annotations.db`, not a
 file deletion. On `/admin/removed`, the admin can see each reason, who removed
 it and when, then restore the trip. The admin's trip page shows a **Removed
-from the log** notice and a Restore button; an everyday login using the old
-trip address gets a 404. Permanently deleting source files remains a separate
-shell operation.
+from the log** notice and a Restore button. An everyday login using the old
+trip address gets the same 404 page as an address with no trip ("No trip at
+this address"), and an address lookup for it answers the same as one for a
+missing trip, so neither says whether the trip was removed. Permanently
+deleting source files remains a separate shell operation.
 
 The viewer has no real-delete button because it cannot write to the read-only
 `./data` mount, it could not undo a source-file deletion, and the session cookie
@@ -918,7 +973,9 @@ The limit is the named `MERGE_MAX_GAP` constant in `trip_merges.py`. Older
 summaries without that timestamp use `end_time`, the last moving point, as
 a conservative fallback. Upload/receipt times are never used. Overlapping
 recordings, unknown device identities or unknown start times cannot be merged.
-An unreadable summary blocks merging when its device is unknown, or when it
+A folder warning (not a duplicate-link notice) blocks merge suggestions with a
+folder-specific message until the folder is fixed. An unreadable summary blocks merging when its device is
+unknown, or when it
 belongs to this device and could fall between these recordings. Usable start
 times or UTC timestamp trip IDs can rule out damage outside that interval;
 damage known to belong to another device does not block the action. The trip
@@ -971,14 +1028,16 @@ in a serialized SQLite transaction so concurrent workers preserve existing
 annotations. The original annotation rows remain intact. Back up this database
 alongside the trip files: losing it also loses merges.
 
-The cached summary is refreshed only when a part's GPX/JSON inode (file identity),
-size or nanosecond modification time changes. An atomic file replacement is
-therefore noticed even if its size and timestamp stay the same. Older merge
-fingerprints gain file identities on first use without recalculating their
-stored mileage. A change to the shared summary rules (`SUMMARY_VERSION`) does not
-rebuild it by itself, the same as the plain trips' stored summaries, which keep the
-rules of the day they were written; otherwise one release would total merged
-trips under new rules and everything else under old ones. Ordinary list views
+The cached summary is refreshed only when a part's GPX/JSON size or nanosecond
+modification time changes. File identity (the inode number) is not used,
+because a restore or migration to another disk changes it for every file:
+copying the trip files elsewhere with their times preserved does not refresh a
+merged trip. Older merge fingerprints that carry an inode are rewritten once on
+first use without recalculating their stored mileage. A change to the shared
+summary rules (`SUMMARY_VERSION`) does not rebuild it by itself, the same as the
+plain trips' stored summaries, which keep the rules of the day they were
+written; otherwise one release would total merged trips under new rules and
+everything else under old ones. Ordinary list views
 read the cache without parsing every merged track. Both images ship the shared
 rules in `common/trip_summary.py` through the default-deny Docker build context.
 If a source disappears or becomes unreadable, the merged trip is flagged as
@@ -1069,9 +1128,13 @@ drift. Missing or invalid recordings cannot be looked up. The **End:** line bene
 Click its **Use** button to replace the editable Destination field, check it,
 then **Save**. Use stays disabled until a suggestion is available.
 With **Auto lookup: On**, an empty Destination is filled with the end
-suggestion as soon as it is known, and a note under it says so. A destination
-that was saved, typed or chosen with **Use** is never replaced. The filled
-text is not saved until you click **Save**, so check it first.
+suggestion as soon as it is known, and a note under it says so. This happens
+only on a trip that has never had an annotation saved: once **Save** has stored
+a purpose, note or destination for a trip, its Destination is never filled
+automatically again, even if you later clear it and save it empty. **Use**
+still fills it in one click. A destination that was saved, typed or chosen
+with **Use** is never replaced. The filled text is not saved until you click
+**Save**, so check it first.
 Lookup never changes a saved annotation. The saved destination appears in the
 trip list and CSV/XLSX exports through the existing annotation flow. Exports do
 not perform lookup or add unreviewed address suggestions.
@@ -1106,15 +1169,24 @@ a total budget of two seconds:
 - **After a provider failure**, it returns the busy message at once: the
   failure cooldown below applies.
 
-If the budget runs out, it returns the usual busy message. The database write
+If the budget runs out, it returns the usual busy message (HTTP 429). When the
+gate is closed only by the normal gap after a success (for example, an interval
+above two seconds, so **Look up both places** reaches the second endpoint
+early), that reply also says how long the gap has left, as a `retry_after`
+number of seconds in the JSON and a `Retry-After` header. The trip page then
+shows **Waiting for the lookup provider…**, waits that long (up to 60 seconds)
+and sends the same lookup once more; later lookups wait behind it. If that
+retry is refused too, the page shows the error and **Try again**. A busy reply
+during a running lookup or after a provider failure has no wait time, and the
+page does not retry it. The database write
 lock is released while waiting, so annotation saves can continue, and a cached
 result never waits. The gate records whether it closed after a success, during a
 running lookup or after a failure, so the viewer never has to guess from the
 time left. A running lookup's reservation covers the lookup deadline and cleanup
 plus five seconds of margin.
 Provider failures trigger a five-minute cooldown (longer `Retry-After` values are
-honoured up to seven days). There are no automatic retries,
-redirects, or ambient HTTP proxies. Responses have a 64 KiB size limit and a
+honoured up to seven days). The server never retries a provider call by itself,
+and uses no redirects or ambient HTTP proxies. Responses have a 64 KiB size limit and a
 ten-second whole-request deadline, including DNS resolution, connection,
 TLS, response headers, body and chunked framing. Each lookup runs in a
 short-lived subprocess; at the deadline the viewer kills it, closing its
@@ -1382,6 +1454,21 @@ without it the backup unit fails rather than copying. `install.sh` writes the
 marker for you, and `backup/backup.sh --mark-target` writes it if you set
 `REMOTE` by hand. `REMOTE_PRUNE` defaults to `no`; its rules, when you turn it
 on, are in `DEPLOY_DEBIAN.md` Step 10.
+Links anywhere under `data/` resolving outside it are logged as
+`WARNING: not backed up: data/<path> -> <target>` (first 20, then a count
+of the rest). Their contents are missing, including from earlier snapshots
+taken while the link existed. `INFO` records `links_not_backed_up=N` (missing
+means zero); a changed count makes a new snapshot. Internal links and `*.tmp`
+are not reported. Move the contents into `data/` and rerun the backup. The
+copy and deep check still run and `last-success` advances, but missing linked
+contents make the run exit non-zero and withhold `PING_URL`. Unraid status
+shows `last_backup_links_not_backed_up`; `install.sh --check` warns when it
+is above zero. A first backup failing only for this reason warns and install
+continues. Restore checks list outside links and can pass with a warning that
+their contents are missing; restore reports them too. Restore uses rsync
+`--safe-links`, skipping outside links and keeping existing real folders;
+relative links inside `data/` can be restored.
+
 Each SQLite snapshot is consistent individually; the databases and trip files
 are captured in sequence, rather than in one shared transaction.
 

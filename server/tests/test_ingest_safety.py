@@ -89,7 +89,10 @@ class UploadSafety(unittest.TestCase):
                 return real_stat(path, *args, **kwargs)
 
             with mock.patch.object(Path, "stat", stat):
-                self.assert_storage_error(target)
+                with self.assertLogs(self.ing.app.logger, "ERROR"):
+                    response = self.upload()
+            self.assertEqual(response.status_code, 503)
+            self.assertNotIn(str(target), response.get_data(as_text=True))
             self.assertEqual(outside_stats, [])
             self.assertEqual(list(target.iterdir()), [])
 
@@ -116,7 +119,7 @@ class UploadSafety(unittest.TestCase):
                     finally:
                         link.unlink()
 
-    def test_symlinked_other_month_is_skipped_without_trip_stat(self):
+    def test_symlinked_other_month_refuses_without_trip_stat(self):
         with tempfile.TemporaryDirectory() as outside:
             target = Path(outside)
             (target / "2026-04-14T14-30-00Z.gpx").write_bytes(b"outside-trip-sentinel")
@@ -130,12 +133,108 @@ class UploadSafety(unittest.TestCase):
                     raise AssertionError("outside trip stat")
                 return real_stat(path, *args, **kwargs)
 
-            with mock.patch.object(Path, "stat", stat), self.assertLogs(self.ing.app.logger, "WARNING"):
+            with mock.patch.object(Path, "stat", stat), self.assertLogs(self.ing.app.logger, "ERROR") as logs:
                 response = self.upload()
-            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.status_code, 503)
+            self.assertIn("2026-03", " ".join(logs.output))
+            self.assertNotIn(str(target), " ".join(logs.output) + response.get_data(as_text=True))
             self.assertEqual(outside_stats, [])
-            self.assertEqual(response.json["stored_as"], "2026-04/2026-04-14T14-30-00Z.gpx")
+            self.assertEqual(sorted(p.name for p in self.root.iterdir()), [".upload.lock", "2026-03"])
             self.assertEqual([p.read_bytes() for p in target.iterdir()], [b"outside-trip-sentinel"])
+
+    def test_linked_month_retry_and_recovery(self):
+        first = self.untimed_upload(datetime(2026, 3, 15, tzinfo=timezone.utc))
+        self.assertEqual(first.status_code, 200)
+        original = self.root / "2026-03"
+        saved = self.root / "saved"
+        original.rename(saved)
+        with tempfile.TemporaryDirectory() as outside:
+            self.symlink(original, Path(outside), directory=True)
+            with self.assertLogs(self.ing.app.logger, "ERROR"):
+                retry = self.untimed_upload(datetime(2026, 4, 15, tzinfo=timezone.utc))
+            self.assertEqual(retry.status_code, 503)
+            self.assertFalse((self.root / "2026-04").exists())
+            self.assertEqual(self.upload(b"invalid").status_code, 400)
+            from test_ingest_diagnostics import batch
+            events = self.client.post("/v1/device-events", json=batch(), headers=HEADERS)
+            self.assertEqual(events.status_code, 200)
+            original.unlink()
+        saved.rename(original)
+        retry = self.untimed_upload(datetime(2026, 4, 15, tzinfo=timezone.utc))
+        self.assertEqual(retry.status_code, 200)
+        self.assertEqual(retry.json["stored_as"], first.json["stored_as"])
+        self.assertFalse((self.root / "2026-04").exists())
+
+    def test_internal_month_link_and_non_month_link(self):
+        inside = self.root / "inside"
+        inside.mkdir()
+        self.symlink(self.root / "2026-03", inside, directory=True)
+        with tempfile.TemporaryDirectory() as outside:
+            self.symlink(self.root / "not-a-month", Path(outside), directory=True)
+            self.assertEqual(self.upload().status_code, 200)
+
+    def test_internal_alias_month_link_retry_is_not_a_conflict(self):
+        # #725: a month link to another month folder in the data folder made
+        # the same folder match twice, so a plain retry got 409.
+        first = self.upload()
+        self.assertEqual(first.status_code, 200)
+        month = Path(first.json["stored_as"]).parent
+        self.symlink(self.root / "2099-12", self.root / month, directory=True)
+        before = sorted(p.name for p in (self.root / month).iterdir())
+        retry = self.upload()
+        self.assertEqual(retry.status_code, 200, retry.get_data(as_text=True))
+        self.assertEqual(retry.json["stored_as"], first.json["stored_as"])
+        self.assertEqual(sorted(p.name for p in (self.root / month).iterdir()), before)
+
+    def test_new_trip_into_aliased_month_refuses(self):
+        # #727: a new trip whose month folder links to another month folder
+        # would be filed, and shown, under that other month.
+        real = self.root / "2026-03"
+        real.mkdir()
+        self.symlink(self.root / "2026-04", real, directory=True)
+        with self.assertLogs(self.ing.app.logger, "ERROR"):
+            response = self.upload()
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("month folder 2026-04", response.json["error"])
+        self.assertEqual(list(real.iterdir()), [])
+
+    def test_new_trip_into_same_named_internal_link_is_stored(self):
+        archive = self.root / "archive" / "2026-04"
+        archive.mkdir(parents=True)
+        self.symlink(self.root / "2026-04", archive, directory=True)
+        response = self.upload()
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        self.assertTrue(any(p.suffix == ".gpx" for p in archive.iterdir()))
+
+    def test_dangling_outside_month_link_refuses(self):
+        with tempfile.TemporaryDirectory() as outside:
+            self.symlink(self.root / "2026-03", Path(outside) / "missing", directory=True)
+            with self.assertLogs(self.ing.app.logger, "ERROR"):
+                self.assertEqual(self.upload().status_code, 503)
+
+    def test_looping_month_link_refuses_with_the_folder_named(self):
+        # #724: a link loop raised RuntimeError from resolve() and gave a
+        # generic 500 whose log didn't name the folder.
+        self.symlink(self.root / "2026-03", self.root / "2026-03", directory=True)
+        with self.assertLogs(self.ing.app.logger, "ERROR") as logs:
+            response = self.upload()
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("2026-03", response.get_json()["error"])
+        self.assertIn("month folder 2026-03", "\n".join(logs.output))
+
+    def test_looping_trip_file_is_not_reported_as_a_linked_month(self):
+        # Only a looping month folder is a "linked month"; a looping trip file
+        # inside a real month keeps the generic storage error.
+        first = self.upload()
+        self.assertEqual(first.status_code, 200)
+        gpx = self.root / first.json["stored_as"]
+        loop = gpx.with_name("loop.gpx")
+        gpx.rename(loop)
+        self.symlink(gpx, gpx)
+        with self.assertLogs(self.ing.app.logger, "ERROR"):
+            response = self.upload()
+        self.assertEqual(response.status_code, 500)
+        self.assertNotIn("month folder", response.get_data(as_text=True))
 
     def test_final_trip_symlinks_cannot_escape_data_root(self):
         month = self.root / "2026-04"

@@ -48,10 +48,12 @@ Authentication:
 """
 
 import csv
+import errno
 import hmac
 import io
 import ipaddress
 import os
+import stat
 import re
 import secrets
 import sqlite3
@@ -694,18 +696,29 @@ def _csrf_protect():
 # ---------------------------------------------------------------------
 
 
-def _safe_trip_paths(ym, trip_id):
+TRIP_NOT_FOUND = (
+    "No trip at this address. It may have been removed from the "
+    "log; ask the admin if you expected to see it."
+)
+
+
+def _validate_trip_address(ym, trip_id):
+    """Reject malformed addresses without consulting the filesystem."""
+    if not trip_merges.YM_RE.fullmatch(ym or "") or not trip_merges.ID_RE.fullmatch(trip_id or ""):
+        abort(404)
+
+
+def _safe_trip_paths(ym, trip_id, *, refused_description=None):
     """Validate URL components and return (gpx_path, json_path) under DATA_ROOT.
 
     Aborts with 404 on anything that doesn't match the strict patterns or
     that would resolve outside DATA_ROOT.
     """
-    if not trip_merges.YM_RE.fullmatch(ym or "") or not trip_merges.ID_RE.fullmatch(trip_id or ""):
-        abort(404)
+    _validate_trip_address(ym, trip_id)
     try:
         return next(trip_merges.source_file_pairs(DATA_ROOT, [f"{ym}/{trip_id}"]))
     except ValueError:
-        abort(404)
+        abort(404, description=refused_description)
 
 
 def _trip_file_exists(root, path):
@@ -880,6 +893,78 @@ def load_trips(conn=None, include_removed=False):
         return trips, unreadable
 
 
+def _month_trip_names(checked_month):
+    """List a checked directory without following a replacement final link."""
+    if (os.scandir in os.supports_fd and hasattr(os, "O_DIRECTORY")
+            and hasattr(os, "O_NOFOLLOW")):
+        fd = os.open(checked_month, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            with os.scandir(fd) as entries:
+                return [entry.name for entry in entries]
+        finally:
+            os.close(fd)
+    # Windows has no fd scandir; callers still check containment before listing.
+    return [path.name for path in checked_month.iterdir()]
+
+
+FOLDER_PROBLEMS = {
+    "outside": "the folder links outside the data folder",
+    "dangling": "the folder link target is missing",
+    "loop": "the folder link forms a loop",
+    "unreadable": "the folder could not be read",
+    "duplicate": "the folder is a link to another folder that is already counted",
+}
+
+
+def _month_link_problem(month, root):
+    # stat reports ELOOP consistently even where Path.resolve changed behavior.
+    # This probes metadata only; no target is listed or opened here.
+    try:
+        mode = month.lstat().st_mode
+    except OSError:
+        return "unreadable"
+    if not stat.S_ISLNK(mode):
+        return None
+    try:
+        month.stat()
+    except OSError as exc:
+        return {errno.ELOOP: "loop", errno.ENOENT: "dangling"}.get(exc.errno, "unreadable")
+    try:
+        target = month.resolve()
+    except (OSError, RuntimeError):
+        return "unreadable"
+    if target == root or target in root.parents:
+        return "ancestor"
+    return None
+
+
+def _month_sort_key(month):
+    try:
+        return month.is_symlink(), month.name
+    except OSError:
+        # Let the scan report an unavailable entry instead of failing the page.
+        return False, month.name
+
+
+def folder_description(entry):
+    if entry["folder_reason"] == "duplicate":
+        return f"is a link to {entry['counted_as']}/, whose trips are counted there"
+    return entry["problem"]
+
+
+def folder_hint(entry, role):
+    if role != "admin":
+        return "Please ask the admin to fix it."
+    if entry["folder_reason"] == "duplicate":
+        return "Remove the extra link."
+    if entry["folder_reason"] == "unreadable":
+        return "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only."
+    return "Replace the link with the real folder, or mount the other disk at that path."
+
+
+app.jinja_env.globals.update(folder_hint=folder_hint, folder_description=folder_description)
+
+
 def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None):
     """Scan DATA_ROOT for trips and join annotations.
 
@@ -889,6 +974,7 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
     trips whose summary read_summary() rejected or couldn't find, sorted
     by trip_key, retaining usable device/start identity but no mileage, plus
     problem. Their miles are unknown, so they're reported, never counted.
+    Duplicate folder notices also live here; their trips are counted elsewhere.
 
     Trips the admin removed from the log are left out of both lists. With
     include_removed (the admin's views) they stay, each carrying a "removal"
@@ -903,9 +989,56 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
     # first, so a failed or lost summary write leaves one behind. (A page
     # load in the middle of an upload can catch one for a moment, too.)
     if trip_key is None:
-        json_paths = list(dict.fromkeys([*DATA_ROOT.glob("*/*.json"), *(
-            gpx.with_suffix(".json") for gpx in DATA_ROOT.glob("*/*.gpx")
-        )]))
+        json_paths = []
+        refused_months = set()
+
+        def refuse_month(ym, reason="outside", counted_as=None):
+            if ym not in refused_months:
+                refused_months.add(ym)
+                problem = FOLDER_PROBLEMS.get(reason)
+                if reason == "ancestor":
+                    reason = "outside"
+                    problem = "the folder link points at the data folder itself or above it"
+                unreadable.append({"folder": True, "ym": ym, "id": "", "trip_key": f"{ym}/",
+                                   "has_gpx": False, "problem": problem,
+                                   "folder_reason": reason, "counted_as": counted_as,
+                                   "refused_file": "folder", "problem_file": "folder"})
+
+        # Only month names are trip identities accepted by the routes. Ignore
+        # other names before checking or listing their targets.
+        try:
+            months = [path for path in DATA_ROOT.iterdir() if trip_merges.YM_RE.fullmatch(path.name)]
+        except OSError:
+            months = []
+        counted_directories = {}
+        # Prefer real month directories to preserve their annotation keys;
+        # link-only targets use the first month name in sorted order.
+        for month in sorted(months, key=_month_sort_key):
+            cause = _month_link_problem(month, root)
+            if cause:
+                refuse_month(month.name, cause)
+                continue
+            try:
+                checked_month = trip_merges.checked_path(root, month)
+            except ValueError:
+                refuse_month(month.name)
+                continue
+            try:
+                if not stat.S_ISDIR(checked_month.stat().st_mode):
+                    continue
+                if checked_month in counted_directories:
+                    refuse_month(month.name, "duplicate", counted_directories[checked_month])
+                    continue
+                names = _month_trip_names(checked_month)
+            except OSError:
+                refuse_month(month.name, "unreadable")
+                continue
+            counted_directories[checked_month] = month.name
+            for name in names:
+                path = Path(name)
+                if path.suffix in (".json", ".gpx"):
+                    json_paths.append(month / path.with_suffix(".json").name)
+        json_paths = list(dict.fromkeys(json_paths))
         with _summary_cache_lock:
             live = set(json_paths)
             for path in _summary_cache.keys() - live:
@@ -917,11 +1050,12 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
         # the trip can be reported. Never construct paths from invalid keys.
         json_paths = [DATA_ROOT / f"{key}.json" for key in keys if trip_merges.TRIP_KEY_RE.fullmatch(key)]
         with _summary_cache_lock:
-            # Targeted pages do not enumerate the data tree. Still evict any
-            # vanished cached files, so repeated one-trip reads cannot retain
-            # an ever-growing history of files that have since been removed.
-            for path in list(_summary_cache):
-                if not _trip_file_exists(root, path):
+            # Targeted reads do not enumerate the data tree. Evict only the
+            # entries this read asked for whose file has gone: checking every
+            # cached file here cost a full pass on each lookup. The full scan
+            # still clears all vanished entries, which bounds the cache.
+            for path in json_paths:
+                if path in _summary_cache and not _trip_file_exists(root, path):
                     del _summary_cache[path]
     only_merge_key = trip_key
     for json_path in json_paths:
@@ -936,11 +1070,45 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                 if not (os.path.lexists(presence_path) or os.path.lexists(presence_path.with_suffix(".gpx"))):
                     continue
         ym = json_path.parent.name
+        if only_merge_key is None:
+            try:
+                trip_merges.checked_path(root, json_path.parent)
+            except ValueError:
+                if trip_merges.YM_RE.fullmatch(ym):
+                    refuse_month(ym)
+                continue
         trip_id = json_path.stem
         trip_key = f"{ym}/{trip_id}"
         ann = annotations.get(trip_key, {})
         summary, problem = _cached_summary(json_path, root=root)
-        has_gpx = _trip_file_exists(root, json_path.with_suffix(".gpx"))
+        refused_file = None
+        problem_file = "json"
+        try:
+            gpx_path = trip_merges.checked_path(root, json_path.with_suffix(".gpx"))
+        except ValueError:
+            refused_file = "gpx"
+            # A missing summary is normal during ingest; keep any real summary error.
+            if not problem or problem == "the file is missing":
+                problem_file = "gpx"
+                problem = "the file could not be read"
+            # A refused track makes the recording unreadable; a missing one
+            # still lets its summary count. Keep only usable identity.
+            summary = {field: summary[field] for field in ("device_id", "start_time")
+                       if summary and isinstance(summary.get(field), str)}
+            has_gpx = False
+        else:
+            try:
+                has_gpx = gpx_path.exists()
+            except OSError:
+                has_gpx = False
+        if only_merge_key is None and (problem or refused_file):
+            # Fold a refusal after a month swap into one folder warning.
+            try:
+                trip_merges.checked_path(root, json_path.parent)
+            except ValueError:
+                if trip_merges.YM_RE.fullmatch(ym):
+                    refuse_month(ym)
+                continue
         if only_merge_key is not None and problem == "the file is missing" and not has_gpx:
             continue
         trip = {
@@ -954,10 +1122,14 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
             "has_gpx": has_gpx,
         }
         if problem:
-            unreadable.append({**trip, "problem": problem})
+            unreadable.append({**trip, "problem": problem, "refused_file": refused_file,
+                               "problem_file": problem_file})
         else:
             trips.append(trip)
 
+    if only_merge_key is None:
+        trips = [t for t in trips if t["ym"] not in refused_months]
+        unreadable = [t for t in unreadable if t.get("folder") or t["ym"] not in refused_months]
     trips, unreadable = trip_merges.apply_merges(
         conn, DATA_ROOT, trips, unreadable, refresh=refresh_merges, only_key=only_merge_key)
     # Removal is keyed by the canonical key the list shows (a merged trip's
@@ -965,7 +1137,7 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
     # merged trip as a whole. This is the only place that filters: the list,
     # totals, exports and next_trip all take their input from this function.
     # An unreadable trip that is removed also leaves next_trip's "an
-    # unreadable summary may fall between" guard. That is intended: removing
+    # unreadable trip may fall between" guard. That is intended: removing
     # it is how the admin clears that warning.
     removed = trip_log.removals(conn)
     if include_removed:
@@ -1413,6 +1585,29 @@ def _last_edited_lookup(conn):
     return lookup
 
 
+def _ever_annotated(conn, trip):
+    # Current fields can be empty after a deliberate clear, so check history too.
+    # A merge gets a new key, so look under the same keys "Last edited" uses:
+    # the trip's own, its parts and its live merge aliases. Only 'annotate'
+    # rows under those keys count, so ask for them directly rather than load
+    # and parse the trip's whole related history on every page view.
+    if trip_merges.annotated(trip):
+        return True
+    _, keys = _history_trip_keys(conn, trip["trip_key"], trip.get("parts", ()))
+    ordered_keys = sorted(keys)
+    # Same chunking as _related_history_rows: stay under SQLite's parameter limit.
+    for start in range(0, len(ordered_keys), 400):
+        chunk = ordered_keys[start:start + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        if conn.execute(
+            "SELECT 1 FROM trip_history "
+            f"WHERE action = 'annotate' AND trip_key IN ({placeholders}) LIMIT 1",
+            chunk,
+        ).fetchone() is not None:
+            return True
+    return False
+
+
 def _last_edited(conn, trip):
     """Find the latest edit across a trip's current and historical merge keys."""
     return _last_edited_lookup(conn)(trip)
@@ -1582,7 +1777,8 @@ def year_figures(members, unreadable):
     counts["all"] = len(members)
     for trip in members:
         counts[trip.get("category") if trip.get("category") in CATEGORIES else "unclassified"] += 1
-    return {"trips": len(members), "unreadable": len(unreadable), "totals": totals, "counts": counts,
+    # A duplicate alias loses no mileage, so it is not missing at year close.
+    return {"trips": len(members), "unreadable": sum(t.get("folder_reason") != "duplicate" for t in unreadable), "totals": totals, "counts": counts,
             "trip_keys": sorted(t["trip_key"] for t in members)}
 
 
@@ -2109,13 +2305,20 @@ LIST_HTML = """
 <div class="wrap">
   {% if unreadable %}
   <div class="warn" role="alert">
-    <b>{{ unreadable|length }} trip summary file(s) can't be read.</b>
+    {% set missing = unreadable|rejectattr('folder_reason', 'equalto', 'duplicate')|list %}
+    {% if missing %}<b>{{ missing|rejectattr("folder")|list|length }} trip file(s) can't be read.{% set folders = missing|selectattr("folder")|list %}{% if folders %} {{ folders|length }} month folder(s) can't be read.{% endif %}</b>
     Their miles can't be counted, so the totals below may be short. The
     exports list these trips as unreadable, without miles. To rebuild a
-    summary from its GPX, see DEPLOY_DEBIAN.md → Troubleshooting.
+    damaged summary from its GPX, see DEPLOY_DEBIAN.md → Troubleshooting.
+    {% endif %}
     <ul>
       {% for u in unreadable %}
-      <li><code>{% if u.get('parts') %}{{ u.gpx_file }}{% else %}{{ u.trip_key }}.json{% endif %}</code>{% if not u.has_gpx %} (no GPX either){% endif %}: {{ u.problem }}
+      {% if u.get('folder') %}
+      <li><code>{{ u.trip_key }}</code> (month folder): {{ folder_description(u) }}{% if u.folder_reason != 'duplicate' %}; none of its trips are shown or counted.{% endif %}
+        {{ folder_hint(u, g.role) }}
+      </li>
+      {% else %}
+      <li><code>{% if u.get('parts') %}{{ u.gpx_file }}{% else %}{{ u.trip_key }}.{{ u.get('problem_file') or 'json' }}{% endif %}</code>{% if not u.get('parts') and u.get('refused_file') == 'gpx' and u.get('problem_file') == 'json' %} (its GPX links outside the data folder){% elif not u.has_gpx and (u.get('parts') or not u.get('refused_file')) %} (no GPX either){% endif %}: {{ u.problem }}
         {% if u.get('parts') %}
         <form method="post" action="{{ url_for('split_trip', ym=u.ym, trip_id=u.id, year=year or '') }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -2133,6 +2336,7 @@ LIST_HTML = """
         </form>
         {% endif %}
       </li>
+      {% endif %}
       {% endfor %}
     </ul>
   </div>
@@ -2271,7 +2475,7 @@ TRIP_HTML = """
       <label class="purpose-choice purpose-none"><input type="radio" name="category" value="" {% if not t.category %}checked{% endif %}><span>None</span></label>
     </fieldset>
     <label for="destination">Destination / place</label>
-    <input type="text" name="destination" id="destination" maxlength="{{ annotation_max }}" value="{{ t.destination or '' }}">
+    <input type="text" name="destination" id="destination"{% if destination_autofill %} data-autofill="true"{% endif %} maxlength="{{ annotation_max }}" value="{{ t.destination or '' }}">
     {% if geocoder_enabled and 'end' in places %}
     <div class="end-suggestion"><span role="status" id="end-suggestion">End: {% if places['end'] is none %}not looked up yet{% elif places['end'] %}{{ places['end'] }}{% else %}no mapped address found{% endif %}</span>
     <button type="button" class="btn secondary" id="use-end-place"
@@ -2910,7 +3114,7 @@ YEAR_HTML = """
 .changed { font-weight: 700; }
 </style></head><body>
 """ + ACCOUNT_HEADER + """<main class="wrap">
-{% macro trip_link(t) %}<a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{% if t.problem %}{{ t.trip_key }}{% else %}{{ fmt_trip_date(t) }}{% endif %}</a>{% endmacro %}
+{% macro trip_link(t) %}{% if t.get('folder') %}<code>{{ t.trip_key }}</code> (month folder){% else %}<a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{% if t.problem %}{{ t.trip_key }}{% else %}{{ fmt_trip_date(t) }}{% endif %}</a>{% endif %}{% endmacro %}
 <h1>{{ year }} year review</h1>
 <p class="muted">Times shown in {{ timezone }}. A trip belongs to the year it starts in (or, if partly timed, its
 first recorded time), the same as the trip list and exports.</p>
@@ -2978,7 +3182,7 @@ different trips. See "Other changes since the close" below.</p>
 <td>{% if r.miles_diff is none %}unknown{% elif r.differs %}{{ "%+d"|format(r.trip_diff) }} trips, {{ "%+.3f"|format(r.miles_diff) }} mi{% else %}none{% endif %}</td></tr>{% endfor %}</tbody>
 </table></div>
 {% if comparison.unreadable_saved is not none and comparison.unreadable_saved != comparison.unreadable %}
-<p class="warn">Trips with an unreadable summary: {{ comparison.unreadable_saved }} at the close, {{ comparison.unreadable }} now.</p>
+<p class="warn">Trips whose files can't be read: {{ comparison.unreadable_saved }} at the close, {{ comparison.unreadable }} now.</p>
 {% endif %}
 {% if joined or left %}
 <h3>Other changes since the close</h3>
@@ -3054,12 +3258,13 @@ gap that was uploaded after the merge is counted a second time. Open the merged 
 </section>
 
 <section aria-labelledby="unreadable-heading">
-<h2 id="unreadable-heading">Trips whose summary can't be read ({{ unreadable|length }})</h2>
-<p class="muted">Their miles can't be counted, so the totals above may be short.</p>
+{% set missing = unreadable|rejectattr('folder_reason', 'equalto', 'duplicate')|list %}
+<h2 id="unreadable-heading">Trips whose files can't be read ({{ missing|length }}) and folder notices</h2>
+{% if missing %}<p class="muted">Their miles can't be counted, so the totals above may be short.</p>{% endif %}
 <div class="review-table"><table>
 <thead><tr><th>Trip</th><th>Problem</th></tr></thead>
-<tbody>{% for t in unreadable %}<tr><td>{{ trip_link(t) }}</td><td>{{ t.problem }}</td></tr>
-{% else %}<tr><td colspan="2" class="muted">All summaries can be read.</td></tr>{% endfor %}</tbody>
+<tbody>{% for t in unreadable %}<tr><td>{{ trip_link(t) }}{% if not t.get('folder') and not t.get('parts') %} <code>{{ t.trip_key }}.{{ t.get('problem_file') or 'json' }}</code>{% if t.get('refused_file') == 'gpx' and t.get('problem_file') == 'json' %} (its GPX links outside the data folder){% endif %}{% endif %}</td><td>{% if t.get("folder") %}{{ folder_description(t) }}. {{ folder_hint(t, g.role) }}{% else %}{{ t.problem }}{% endif %}</td></tr>
+{% else %}<tr><td colspan="2" class="muted">All trip files can be read.</td></tr>{% endfor %}</tbody>
 </table></div>
 </section>
 
@@ -3262,7 +3467,7 @@ def reopen_year(year):
 @app.route("/trip/<ym>/<trip_id>/remove", methods=["POST"])
 def remove_trip(ym, trip_id):
     year = selected_year()
-    _safe_trip_paths(ym, trip_id)
+    _validate_trip_address(ym, trip_id)
     reason = request.form.get("reason", "").strip()
     if not 1 <= len(reason) <= 500:
         abort(400, description="Reason must be between 1 and 500 characters.")
@@ -3282,13 +3487,18 @@ def remove_trip(ym, trip_id):
         _abort_if_year_closed(trip_log.closed_years(conn), trip)
         trip_log.add_removal(conn, key, reason, g.user)
         trip_log.record(conn, key, "remove", {"reason": reason}, actor=g.user, actor_role=g.role)
+    # A successful change needs a landing page that can show refused files.
+    try:
+        next(trip_merges.source_file_pairs(DATA_ROOT, [f"{ym}/{trip_id}"]))
+    except ValueError:
+        return redirect(url_for("index", year=year or ""))
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
 
 
 @app.route("/trip/<ym>/<trip_id>/restore", methods=["POST"])
 def restore_trip(ym, trip_id):
     year = selected_year()
-    _safe_trip_paths(ym, trip_id)
+    _validate_trip_address(ym, trip_id)
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")
@@ -3309,6 +3519,11 @@ def restore_trip(ym, trip_id):
         trip_log.delete_removal(conn, key)
         trip_log.record(conn, key, "restore", {"reason": removal["reason"]},
                         actor=g.user, actor_role=g.role)
+    # The trip page can't show an unreadable trip (damaged summary, broken
+    # merge part, or a file that links outside the data folder), so after a
+    # successful restore land where the admin can see it worked (#716, #722).
+    if removed_trip is None:
+        return redirect(url_for("admin_removed", year=year or ""))
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
 
 
@@ -3363,7 +3578,12 @@ def index():
 @app.route("/trip/<ym>/<trip_id>")
 def trip_view(ym, trip_id):
     year = selected_year()
-    _safe_trip_paths(ym, trip_id)
+    _safe_trip_paths(ym, trip_id, refused_description=(
+        "This trip's files can't be opened: its summary, track or month folder is a link that leads "
+        "outside the data folder or can't be followed safely, so the viewer won't read them. "
+        "If it is in the log, the trip list and exports flag it. "
+        "Replace the link with the real file or folder to show the trip again."
+    ) if g.role == "admin" else TRIP_NOT_FOUND)
     key = f"{ym}/{trip_id}"
     # Resolve the requested recording/alias and read only its own sources.
     # Removed trips and redirects need no full chronology. Live pages use it
@@ -3376,7 +3596,12 @@ def trip_view(ym, trip_id):
     if t is None and g.role == "admin" and removed is not None:
         t = next((t for t in removed_trips + removed_unreadable if t["trip_key"] == key), None)
     if t is None:
-        problem = next((u["problem"] for u in unreadable if u["trip_key"] == key), "the file is missing")
+        problem = next((u["problem"] for u in unreadable if u["trip_key"] == key), None)
+        if problem is None:
+            # A removed trip (for an everyday login) and an address that
+            # matches no trip get the same words, so the page does not say
+            # which one it is. Neither has a damaged file to repair.
+            abort(404, description=TRIP_NOT_FOUND)
         abort(404, description=(
             f"This trip's summary file can't be read ({problem}), so its "
             "miles can't be counted. The trip list and exports flag it. To "
@@ -3402,6 +3627,7 @@ def trip_view(ym, trip_id):
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         conn.row_factory = sqlite3.Row
         last_edited = _last_edited(conn, t)
+        destination_autofill = not _ever_annotated(conn, t)
         closed = trip_log.closed_years(conn)
     lock_year = locked_year(t, closed) if closed else None
     year_lock = {"year": lock_year, **closed[lock_year]} if lock_year else None
@@ -3423,7 +3649,7 @@ def trip_view(ym, trip_id):
                                   previous_trip=newer_trip, next_trip=older_trip,
                                   geocoder_enabled=GEOCODER.enabled, geocoder_auto_lookup=GEOCODER_AUTO_LOOKUP, places=places, merge_next=merge_next,
                                   merge_block_reason=merge_block_reason,
-                                  last_edited=last_edited, year_lock=year_lock,
+                                  last_edited=last_edited, year_lock=year_lock, destination_autofill=destination_autofill,
                                   merge_conflict=bool(merge_next and trip_merges.annotated(t) and trip_merges.annotated(merge_next)))
 
 
@@ -3433,7 +3659,11 @@ def lookup_place(ym, trip_id):
     # arbitrary geocoding proxy, even for an authenticated browser.
     _safe_trip_paths(ym, trip_id)
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
-        _abort_if_removed(conn, f"{ym}/{trip_id}")
+        if g.role == "admin":
+            _abort_if_removed(conn, f"{ym}/{trip_id}")
+        elif trip_log.removal(conn, trip_merges.canonical_key(conn, f"{ym}/{trip_id}")):
+            # An everyday lookup must not reveal whether this address was removed.
+            abort(404)
     t = resolved_trip(ym, trip_id)
     endpoint = request.form.get("endpoint", "")
     if endpoint not in ("start", "end"):
@@ -3444,6 +3674,9 @@ def lookup_place(ym, trip_id):
     try:
         label = GEOCODER.lookup(endpoints[f"{endpoint}_latitude"], endpoints[f"{endpoint}_longitude"])
     except GeocodeError as exc:
+        if exc.retry_after is not None:
+            return (jsonify(error=str(exc), retry_after=exc.retry_after), exc.status,
+                    {"Retry-After": str(math.ceil(exc.retry_after))})
         return jsonify(error=str(exc)), exc.status
     return jsonify(label=label)
 
@@ -3526,9 +3759,10 @@ def _abort_if_removed(conn, key):
 
 def resolved_trip(ym, trip_id, allow_original=False, include_removed=False):
     key = f"{ym}/{trip_id}"
-    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+    # Read only this trip's own sources (or its merge's parts), not every
+    # trip, and resolve the alias in the same DB snapshot as the read.
+    with _trip_read(include_removed=include_removed, trip_key=key) as (conn, trips, _):
         key = trip_merges.canonical_key(conn, key)
-    trips, _ = load_trips(include_removed=include_removed)
     t = next((t for t in trips if t["trip_key"] == key or key in t.get("parts", [])), None)
     if t is None and not allow_original:
         abort(404)
@@ -3773,11 +4007,16 @@ UNREADABLE_COLUMNS = (
 
 
 def _unreadable_values(t):
-    """Export fields for a trip whose summary can't be read.
+    """Export fields for a trip whose files can't be read (summary or refused link).
 
     Just what identifies it and what was typed for it. Its miles are
     unknown, so they stay blank rather than reading as zero.
     """
+    if t.get("folder"):
+        values = dict.fromkeys(UNREADABLE_COLUMNS, "")
+        values["trip_id"] = t["trip_key"]
+        values["purpose_note"] = folder_description(t) + ". " + folder_hint(t, g.role)
+        return values
     return {
         "trip_id": t.get("trip_id") or t["id"],
         "gpx_file": t.get("gpx_file") or (f"{t['id']}.gpx" if t["has_gpx"] else ""),
@@ -3801,7 +4040,7 @@ def export_csv():
     for t in unreadable:
         values = _unreadable_values(t)
         writer.writerow(
-            [_csv_safe(values.get(name, "")) for name, _ in EXPORT_COLUMNS] + ["unreadable", ""]
+            [_csv_safe(values.get(name, "")) for name, _ in EXPORT_COLUMNS] + ["folder_notice" if t.get("folder_reason") == "duplicate" else "unreadable_folder" if t.get("folder") else "unreadable", ""]
         )
     for category, miles in mileage_totals(trips).items():
         # Keep the CSV rectangular and mark totals explicitly, so consumers
@@ -3840,6 +4079,8 @@ def export_xlsx():
         sheet.append(list(UNREADABLE_COLUMNS))
         for t in unreadable:
             values = _unreadable_values(t)
+            if t.get("folder"):
+                values["trip_id"] += " (whole month folder)"
             sheet.append(_xlsx_clean([values[name] for name in UNREADABLE_COLUMNS]))
             _xlsx_literal_text(sheet[sheet.max_row])
     buf = io.BytesIO()

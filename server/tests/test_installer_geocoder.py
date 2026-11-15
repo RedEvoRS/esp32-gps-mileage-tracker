@@ -15,6 +15,7 @@ trap settings_stop EXIT
 MODE=${TEST_MODE:-install}
 
 setup_geocoder
+section "Later section"
 if [[ ${TEST_START:-no} == yes ]]; then
     check_port_free() { :; }
     compose() {
@@ -150,6 +151,25 @@ class InstallerGeocoderTests(unittest.TestCase):
             result, text, _ = self.run_step(**presets)
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(text, "KEEP=unchanged\n")
+
+    def test_unreadable_value_in_check_and_install(self):
+        initial = "VIEWER_GEOCODER_URL='http://example.test/reverse\n"
+        for mode in ("check", "install"):
+            with self.subTest(mode=mode):
+                result, text, _ = self.run_step(initial, TEST_MODE=mode)
+                output = result.stdout + result.stderr
+                self.assertIn("Invalid address lookup settings in viewer.env", output)
+                self.assertIn("VIEWER_GEOCODER_URL", output)
+                self.assertIn("Address lookup", output)
+                self.assertNotIn("monitor.env", output)
+                self.assertEqual(text, initial)
+                if mode == "check":
+                    self.assertEqual(result.returncode, 0, output)
+                    self.assertIn("FAILURES=1\n", output)
+                    self.assertIn("Later section", output)
+                else:
+                    self.assertNotEqual(result.returncode, 0, output)
+                    self.assertNotIn("Later section", output)
 
     def test_check_warning_and_report(self):
         for host, warning in (("example.com", True), ("provider", False), ("100.64.0.1", False),

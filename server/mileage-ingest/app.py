@@ -41,6 +41,7 @@ raw GPX is kept byte-for-byte, so these rules can change and every
 summary be recomputed.
 """
 
+import errno
 import hashlib
 import hmac
 import io
@@ -304,6 +305,10 @@ def _trip_paths(root, directory, safe_id):
                          for suffix in (".gpx", ".json")))
 
 
+class LinkedMonthError(Exception):
+    """A month folder cannot safely be searched for an existing trip."""
+
+
 def _stored_trip_directories(root, safe_id):
     """Find either half of a stored pair; caller must hold _upload_lock.
 
@@ -316,11 +321,21 @@ def _stored_trip_directories(root, safe_id):
     for directory in root.iterdir():
         if not re.fullmatch(r"[0-9]{4}-[0-9]{2}", directory.name):
             continue
+        name = directory.name
         try:
             directory = _checked_trip_path(root, directory)
-        except ValueError:
-            app.logger.warning("Skipping month folder outside data root: %s", directory)
-            continue
+        except (ValueError, RuntimeError):
+            # A skipped month could contain this trip, so refuse the upload.
+            # RuntimeError is a symbolic link loop (Path.resolve on Python 3.12).
+            raise LinkedMonthError(directory.name) from None
+        try:
+            directory.stat()
+        except OSError as exc:
+            # Python 3.13+ resolve() no longer raises on a link loop, so a
+            # looping month folder shows up here; report it the same way. Other
+            # errors fall through to the per-file checks below, as before.
+            if exc.errno == errno.ELOOP:
+                raise LinkedMonthError(name) from None
         # Check both files before any stat or read, even for a partial pair.
         directory, gpx_file, json_file = _trip_paths(root, directory, safe_id)
         for path in (gpx_file, json_file):
@@ -330,7 +345,10 @@ def _stored_trip_directories(root, safe_id):
                 path.stat()
             except (FileNotFoundError, NotADirectoryError):
                 continue
-            matches.append(directory)
+            # A month link to another month folder in the data folder is the
+            # same folder, not a second copy of the trip (#725).
+            if directory not in matches:
+                matches.append(directory)
             break
     return matches
 
@@ -632,6 +650,11 @@ def upload_trip():
                 return jsonify({"error": "trip ID exists in multiple month directories"}), 409
             if existing_dirs:
                 target_dir = existing_dirs[0]
+            elif target_dir.is_symlink() and _checked_trip_path(root, target_dir).name != target_dir.name:
+                # A new trip must land in the folder named for its month. A link
+                # to a folder with another name would file it under that
+                # folder's month in the viewer (#727).
+                raise LinkedMonthError(target_dir.name)
             target_dir, gpx_file, json_file = _trip_paths(root, target_dir, safe_id)
             target_dir.mkdir(parents=True, exist_ok=True)
             _sync_directory(root)
@@ -660,6 +683,11 @@ def upload_trip():
             if not gpx_file.exists():
                 _atomic_write_bytes(gpx_file, raw)
             _atomic_write_json(json_file, record)
+    except LinkedMonthError as e:
+        message = (f"month folder {e} is a symbolic link that can't be followed safely; "
+                   "uploads are refused until it is replaced with a real folder")
+        app.logger.error(message)
+        return jsonify({"error": message}), 503
     except Exception as e:
         app.logger.error("Failed to write trip %s: %s", safe_id, e)
         return jsonify({"error": "server error writing trip"}), 500

@@ -859,7 +859,8 @@ recording's final timestamp (`recorded_until`). Older summaries fall back to
 `end_time` (last movement), never upload time. Both GPX files and reliable
 start/device information are required. An unreadable summary blocks merging
 only if its device is unknown or it could be an intervening trip from this
-device; repair that summary first. The trip page explains this block.
+device; repair that summary first. A folder warning also blocks suggestions
+until the folder is fixed. The trip page explains the block.
 You can repeat the action to build a chain. The merged trip replaces its parts
 in the list, map, CSV/XLSX exports and totals. Old part links lead to it.
 Export records remain traceable: `trip_id` is the first source trip ID and
@@ -1444,13 +1445,24 @@ off-host destination. Each run:
   trips, annotations and diagnostics still back up. No monitor helper is run
   unless its volume is known to exist. Snapshots are taken in sequence, so
   they do not share one transaction across databases.
-  An escaping diagnostics path stops backup or restore before access (restore also refuses final-file symlinks), and a failed nightly backup leaves `last-success` unchanged and is reported by `install.sh --check` or Unraid's `backup/scheduled.sh --status`.
+  An escaping diagnostics path stops backup or restore before access (restore
+  also refuses final-file symlinks). A copy failure leaves `last-success`
+  unchanged. A completed off-host copy advances it even if the deep check or
+  link coverage fails; `install.sh --check` or Unraid's
+  `backup/scheduled.sh --status` reports the failure.
 - copies `data/` while holding ingest's upload lock, so it never catches
   a trip with its GPX written and its summary not. The live
   `diagnostics/events.db` and its SQLite sidecars are excluded from rsync.
+  Links resolving outside `data/` are logged (up to 20 and a remainder count);
+  their contents are missing from this and earlier snapshots made with the
+  link. Internal links and `*.tmp` are fine. Move the contents into `data/`
+  and rerun the backup. The copy and deep check still run, but the run exits
+  non-zero and withholds the heartbeat.
 - stores `annotations.db`, optional `events.db` and optional `monitor.db`
   beside `data/`, all covered by `SHA256SUMS`. Human-readable `INFO` records
-  annotation/event counts and monitor status. Restore checks report database
+  annotation/event counts, monitor status and `links_not_backed_up` (missing
+  means zero). A changed link count makes a new snapshot. Restore checks report
+  database
   integrity, event counts and monitor state tables.
 - writes a `SHA256SUMS` manifest. Unchanged files are hard links to the
   previous snapshot, and a run where nothing changed doesn't add a
@@ -1585,6 +1597,20 @@ first, then forces a deep check, even if not due or periodic checks are off.
 Repeat named checks for other affected snapshots; the rotating check samples
 history rather than checking every retained snapshot in one run.
 
+If a damaged snapshot exists only off-host (the log says
+`Deep check FAILED remote-only <snapshot-name>`), there is no local copy to
+repair it from. Check other snapshots with
+`bash ~/mileage-tracker/backup/restore.sh check <snapshot-name>` before deciding
+what to keep. If the damaged one cannot be repaired, remove only that snapshot's
+folder, `<REMOTE>/snapshots/<snapshot-name>`, from the destination. Never remove
+the destination itself or its `.mileage-backup-target` file. To keep the damaged
+copy while you investigate, move the folder out of `snapshots/` instead, for
+example to `<REMOTE>/damaged-<snapshot-name>`; backups only look inside
+`snapshots/`. The next nightly backup then drops the name from its retry list,
+as long as it can list the destination's snapshots. With periodic checks off,
+run `bash ~/mileage-tracker/backup/backup.sh --verify` instead. Other failures
+in the same check still need attention.
+
 **Mark the destination.** A backup copies there only if the folder holds a
 file named `.mileage-backup-target`. `install.sh` writes it when it sets up
 backups; if you set them up by hand, write it once now, after checking that
@@ -1638,8 +1664,10 @@ Snapshot holds 1 trip GPX files and 1 summaries
 Restore test passed
 ```
 
-The counts should match what the viewer shows. It changes nothing on the
-live system. Do this again before each filing.
+Outside links are listed; if any are found the check still exits 0 with
+`Restore test passed, but N linked item(s) are not in this backup`. Their
+contents are missing even if checksums pass. The counts should match what the
+viewer shows. The check changes nothing on the live system. Do this again before each filing.
 
 On a new install the first snapshot is empty (`0 annotations`, `0 trip
 GPX files`): the installer deletes its test trip before it gets to
@@ -1714,8 +1742,9 @@ journal, but nobody looks there. Two options:
 
 - Set `PING_URL` in `backup.conf` to a push monitor (Uptime Kuma, or
   healthchecks.io). The script calls it only after the off-host copy is verified
-  and any due deep check has passed. Missing pings mean the backup or
-  a deep check needs attention.
+  and any due deep check has passed, and only when no linked contents were
+  left out of the backup. Missing pings mean the copy, a deep check, or a
+  link under `data/` needs attention; the backup log says which.
 - Or run `bash ~/mileage-tracker/install.sh --check` by hand now and then.
   It reports a failed backup unit as a problem. `last-success` records today's
   copied backup and still advances if the deep check fails; it alone cannot
@@ -1815,7 +1844,10 @@ backup API with their writers stopped: the ingest helper writes events.db;
 the viewer and monitor helpers write their own databases. It starts the default
 services again and restarts the monitor if it was running. A saved monitor DB
 can create the volume on a replacement server without enabling notifications.
-It never deletes trip files that aren't in the snapshot.
+It never deletes trip files that aren't in the snapshot. Restore reports
+outside links before restoring and uses rsync `--safe-links`: outside links
+are skipped, existing real folders are kept, and relative links inside `data/`
+are restored. The outside links' contents were not backed up.
 
 If monitor discovery fails, restore warns, skips `monitor.db`, and leaves the
 monitor service running or stopped as it was, while restoring trips, annotations
@@ -2523,7 +2555,10 @@ a broken send can hide the rejection. Check ingest's log for 401s too.
 that a 503 keeps the trip queued, raises E5008, and uploads successfully after
 the server recovers; retried diagnostics batches created no duplicate events.
 Nothing needs doing on the board: it retries on its own. Look in
-`docker compose logs mileage-ingest` for the cause on the server.
+`docker compose logs mileage-ingest` for the cause on the server. A month
+folder linking outside `data/` or in a link loop causes 503 for every GPX
+upload; the log names the folder. Replace it with a real folder or mount the
+disk at that path. Diagnostics uploads are unaffected.
 
 **Trips stop arriving from the board, but the server checks out** — the
 board can't reach it. The usual cause is something that changed since it
@@ -2622,11 +2657,12 @@ Unexpected blank tiles mean your browser can't reach the configured tile
 host (default `tile.openstreetmap.org`). With `MAP_TILE_URL=none`, a plain
 background with the track and endpoints is expected.
 
-**The trip list says a trip summary file can't be read** — the `.json` next
-to that trip's GPX is damaged or missing (disk trouble, a hand edit, or a
-summary write that failed after the GPX was saved), so the viewer can't
-count its miles, and the exports list it as unreadable. The GPX is the
-record: send it to ingest again, and ingest rebuilds the summary from it.
+**The trip list says a trip file can't be read** — when the warning names a
+`.json`, the summary next to that trip's GPX is damaged or missing (disk
+trouble, a hand edit, or a summary write that failed after the GPX was saved),
+so the viewer can't count its miles, and the exports list it as unreadable.
+(When it names a `.gpx`, see the link case at the end of this entry.) The GPX
+is the record: send it to ingest again, and ingest rebuilds the summary from it.
 
 ```bash
 cd ~/mileage-tracker
@@ -2663,6 +2699,34 @@ sudo cp -p ~/mileage-backups/snapshots/<time>/data/$TRIP.gpx data/$TRIP.gpx
 ```
 
 This copy also uses `sudo`, because `data/` belongs to UID 1000 (mode 700).
+
+If the warning names the trip's `.gpx`, or the admin's trip page says a file
+is a link that leads outside the data folder or can't be followed safely, then
+the trip's track, summary or month folder is a symbolic link pointing outside
+`data/` (or looping). The viewer never follows such a
+link, so it can't count the trip; the tracker and ingest never create links.
+Find them with:
+
+```bash
+sudo find ~/mileage-tracker/data -type l -ls
+```
+
+A month folder that is a link leading outside `data/`, a link whose target is
+missing, or a link that loops is shown once as a folder warning, and its trips
+aren't counted. A link that leads outside `data/` (even if its target is
+missing) or loops also makes ingest refuse GPX uploads with 503 until fixed.
+Replace it with a real folder or mount the disk there; its trips can't be
+removed one by one. A month link to a folder that another month name already
+uses is only a notice: its trips are counted once, under the other name, so
+delete the extra link. If the warning says a month folder can't be read, the
+viewer could not inspect or list it. Check that the folder (or its link's
+target) still exists and that its disk is available. To test access as the
+viewer's user, run `sudo -u '#1000' ls -la ~/mileage-tracker/data/<month>/`.
+If that is denied, look at the ownership, permissions and ACLs of the folder
+it lists and of its parent folders, and correct the actual cause. Find out what made a file link, then replace it with the
+real file (for example
+from a backup snapshot, as above) or delete it. Sending the GPX to ingest again
+does not fix a link. The admin can still remove such a trip from the log.
 
 **Port already in use** — `sudo ss -tlnp | grep -E '8090|8091|8092|8093'` shows
 which program has it. Stop or reconfigure that program to free the required

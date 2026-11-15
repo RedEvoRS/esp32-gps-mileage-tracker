@@ -5,6 +5,8 @@ import csv
 import io
 import json
 import os
+import re
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -79,6 +81,27 @@ class ViewerMerges(unittest.TestCase):
 
     def split(self, key):
         return self.client.post(f"/trip/{key}/split", data={"csrf_token": "test-csrf", "confirm": "yes"})
+
+    def test_duplicate_month_notice_does_not_block_merge(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        try:
+            (self.data / "2026-05").symlink_to(self.month, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        trips, unreadable = self.viewer.load_trips()
+        first = next(t for t in trips if t["trip_key"] == a)
+        candidate, reason = self.viewer.trip_merges.next_trip(first, trips, unreadable)
+        self.assertEqual(candidate["trip_key"] if candidate else None, b, reason)
+        self.assertEqual(unreadable[0]["folder_reason"], "duplicate")
+        self.assertEqual(self.viewer.year_figures(trips, unreadable)["unreadable"], 0)
+        # A notice remains harmless even if its display text changes.
+        unreadable[0]["problem"] = "display text only"
+        self.assertEqual(self.viewer.trip_merges.next_trip(first, trips, unreadable)[0]["trip_key"], b)
+        response = self.client.post("/admin/year/2026/close", data={"csrf_token": "test-csrf", "confirm": "yes"})
+        self.assertEqual(response.status_code, 302)
+        with closing(sqlite3.connect(self.db)) as conn:
+            saved = json.loads(conn.execute("SELECT snapshot FROM tax_years WHERE year=2026").fetchone()[0])
+        self.assertEqual(saved["unreadable"], 0)
 
     def test_escaping_merge_source_symlinks_make_the_merge_unreadable(self):
         a, b = self.trip("a", 0), self.trip("b", 180, .01)
@@ -279,6 +302,88 @@ class ViewerMerges(unittest.TestCase):
         rebuilt = self.viewer.load_trips()[0][0]["distance_miles"]
         self.assertNotEqual(rebuilt, 123.0)
 
+    def stored_merge(self, key):
+        with closing(sqlite3.connect(self.db)) as conn:
+            return conn.execute("SELECT summary, fingerprint FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
+
+    def test_stamp_has_no_inode_so_a_restored_copy_keeps_its_merged_summary(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        # A summary built under earlier rules must survive a move to a new disk.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            summary, _ = self.stored_merge(key)
+            conn.execute("UPDATE trip_merges SET summary=? WHERE trip_key=?",
+                         (json.dumps({**json.loads(summary), "distance_miles": 123.0}), key))
+        stored = self.stored_merge(key)
+        self.assertTrue(all(len(entry) == 3 for entry in json.loads(stored[1])))
+        copy = self.root / "restored"
+        shutil.copytree(self.data, copy, copy_function=shutil.copy2)
+        self.assertNotEqual((self.month / "a.gpx").stat().st_ino, (copy / "2026-04" / "a.gpx").stat().st_ino)
+        with patch.object(self.viewer, "DATA_ROOT", copy), patch.object(
+                self.viewer.trip_merges, "combined_summary", side_effect=AssertionError("rebuilt")):
+            trips, unreadable = self.viewer.load_trips()
+        self.assertFalse(unreadable)
+        self.assertEqual(trips[0]["distance_miles"], 123.0)
+        self.assertEqual(self.stored_merge(key), stored)
+
+    def test_four_field_stamp_from_an_older_release_is_rewritten_once_without_a_rebuild(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        summary, fresh = self.stored_merge(key)
+        # Build the v1.06-v1.15 shape (name, mtime, size, inode) from the first
+        # three fields, so the fixture does not depend on the code under test.
+        old = json.dumps([[*entry[:3], 987654 + i] for i, entry in enumerate(json.loads(fresh))])
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("UPDATE trip_merges SET fingerprint=? WHERE trip_key=?", (old, key))
+            # Count later writes to the row.
+            conn.execute("CREATE TABLE writes (n INTEGER)")
+            conn.execute("CREATE TRIGGER count_writes AFTER UPDATE ON trip_merges BEGIN INSERT INTO writes VALUES (1); END")
+
+        def writes():
+            with closing(sqlite3.connect(self.db)) as conn:
+                return conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0]
+        with patch.object(self.viewer.trip_merges, "combined_summary", side_effect=AssertionError("rebuilt")):
+            self.viewer.load_trips()
+            self.assertEqual(self.stored_merge(key), (summary, fresh))
+            self.assertEqual(writes(), 1)
+            self.viewer.load_trips()
+            self.assertEqual(writes(), 1)
+
+    def test_changed_size_or_time_still_rebuilds_a_merged_trip(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        helper = self.viewer.trip_merges
+        path = self.month / "a.json"
+        with patch.object(helper, "combined_summary", wraps=helper.combined_summary) as compute:
+            self.viewer.load_trips()
+            self.assertEqual(compute.call_count, 0)
+            # Same size, later modification time.
+            st = path.stat()
+            os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
+            self.viewer.load_trips()
+            self.assertEqual(compute.call_count, 1)
+            # Different size, same modification time as the last load saw.
+            st = path.stat()
+            path.write_bytes(path.read_bytes() + b" ")
+            os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+            self.viewer.load_trips()
+            self.assertEqual(compute.call_count, 2)
+            self.viewer.load_trips()
+            self.assertEqual(compute.call_count, 2)
+        self.assertEqual(json.loads(self.stored_merge(key)[1]), json.loads(helper.fingerprint(self.data, [a, b])))
+
+    def test_same_size_same_time_replacement_no_longer_rebuilds_a_merged_trip(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        self.merged_key(self.merge(a, b))
+        path = self.month / "a.gpx"
+        st = path.stat()
+        replacement = path.with_name("a.new")
+        replacement.write_bytes(path.read_bytes())
+        os.utime(replacement, ns=(st.st_atime_ns, st.st_mtime_ns))
+        os.replace(replacement, path)
+        with patch.object(self.viewer.trip_merges, "combined_summary", side_effect=AssertionError("rebuilt")):
+            self.viewer.load_trips()
+
     def test_chain_and_old_merged_link_then_split_to_all_originals(self):
         a, b, c = self.trip("a", 0), self.trip("b", 120, .001), self.trip("c", 240, .002)
         self.annotate(a, "business", "Original A")
@@ -465,7 +570,7 @@ class ViewerMerges(unittest.TestCase):
         with self.assertLogs(self.viewer.app.logger, "WARNING"):
             self.assertEqual(self.merge(a, b).status_code, 409)
             page = self.client.get(f"/trip/{a}").get_data(as_text=True)
-        self.assertIn("an unreadable summary with an unknown device may fall between", page)
+        self.assertIn("an unreadable trip with an unknown device may fall between", page)
         self.assertNotIn("No eligible next trip", page)
 
     def test_damaged_summary_from_another_device_does_not_block(self):
@@ -496,7 +601,7 @@ class ViewerMerges(unittest.TestCase):
                 with self.assertLogs(self.viewer.app.logger, "WARNING"):
                     page = self.client.get(f"/trip/{a}").get_data(as_text=True)
                     response = self.merge(a, b)
-                reason = "an unreadable summary from this device may fall between these recordings"
+                reason = "an unreadable trip from this device may fall between these recordings"
                 self.assertIn(reason, page)
                 self.assertNotIn("No eligible next trip", page)
                 self.assertNotIn(">Merge with next trip</button>", page)
@@ -648,6 +753,39 @@ class ViewerMerges(unittest.TestCase):
         self.assertIn("!mileage-viewer/trip_merges.py", dockerignore)
         for service in ("mileage-ingest", "mileage-viewer"):
             self.assertIn("COPY common/ /app/common/", (SERVER / service / "Dockerfile").read_text())
+
+    def autofill_allowed(self, key):
+        response = self.client.get(f"/trip/{key}")
+        self.assertEqual(response.status_code, 200)
+        field = re.search(r'<input[^>]*id="destination"[^>]*>', response.get_data(as_text=True)).group()
+        return 'data-autofill="true"' in field
+
+    def test_autofill_counts_annotations_saved_before_a_merge(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        # A was annotated, then saved blank; its history sits under A's key.
+        self.assertEqual(self.annotate(a, "business", "Example note", "Example place").status_code, 302)
+        self.assertEqual(self.annotate(a).status_code, 302)
+        self.assertFalse(self.autofill_allowed(a))
+        merged = self.merged_key(self.merge(a, b))
+        self.assertNotIn(merged, (a, b))
+        self.assertFalse(self.autofill_allowed(merged))
+
+        # A part annotated before the merge stays annotated after a split.
+        self.split(merged)
+        self.assertFalse(self.autofill_allowed(a))
+        self.assertTrue(self.autofill_allowed(b))
+
+    def test_autofill_stops_after_a_merged_trip_is_annotated_under_its_own_key(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        merged = self.merged_key(self.merge(a, b))
+        # A fresh merge of never-annotated trips may still autofill.
+        self.assertTrue(self.autofill_allowed(merged))
+        # A blank save changes nothing, so it records no history and keeps it allowed.
+        self.assertEqual(self.annotate(merged).status_code, 302)
+        self.assertTrue(self.autofill_allowed(merged))
+        for note in ("Example note", ""):
+            self.assertEqual(self.annotate(merged, note=note).status_code, 302)
+            self.assertFalse(self.autofill_allowed(merged))
 
 
 if __name__ == "__main__":

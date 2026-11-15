@@ -73,6 +73,7 @@ jobs:
         run: |
           node server/tests/test_viewer_map.js
           node server/tests/test_viewer_places.js
+          node server/tests/test_viewer_annotation.js
 
   firmware-host:
     if: github.event_name != 'push'

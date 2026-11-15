@@ -330,17 +330,21 @@ settings_stop() {
     fi
 }
 
-settings_request() {  # RULE|quote|value VALUE; result in SETTINGS_REPLY
+settings_query() {  # RULE|quote|value VALUE; result in SETTINGS_REPLY
     settings_start
     if ! (trap '' PIPE; printf '%s\0%s\0' "$1" "$2" >&"$SETTINGS_IN") 2> /dev/null \
         || ! IFS= read -r -d '' -u "$SETTINGS_OUT" SETTINGS_REPLY; then
         die "The monitor settings checker stopped." "Check Python or Docker, then run install.sh again." >&2
     fi
-    if [[ $SETTINGS_REPLY != +* ]]; then
+    if [[ $SETTINGS_REPLY != +* ]]; then return 1; fi
+    SETTINGS_REPLY=${SETTINGS_REPLY:1}
+}
+
+settings_request() {
+    if ! settings_query "$1" "$2"; then
         die "A monitor.env value could not be read safely." \
             "Use one line per setting and single-quote literal dollar signs (DEPLOY_DEBIAN.md Step 11b)." >&2
     fi
-    SETTINGS_REPLY=${SETTINGS_REPLY:1}
 }
 
 settings_valid() { settings_request "$1" "$2"; [[ $SETTINGS_REPLY == yes ]]; }
@@ -531,7 +535,7 @@ preflight() {
         common/__init__.py common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json} \
         mileage-ingest/{Dockerfile,app.py,diag_store.py,reset_high_water.py,requirements.txt} \
         mileage-viewer/{Dockerfile,app.py,geocoding.py,trip_merges.py,trip_log.py,users.py,manage_users.py,diagnostics_settings.py,requirements.txt} \
-        mileage-viewer/static/{leaflet.js,leaflet.css,gpx.js,endpoint-places.js} \
+        mileage-viewer/static/{leaflet.js,leaflet.css,gpx.js,endpoint-places.js,trip-annotation.js} \
         mileage-monitor/{Dockerfile,monitor.py,gelf.py,prometheus.py,loki.py,shared.py,settings_rules.py} ntfy/server.yml \
         backup/{backup.sh,restore.sh,lib.sh,backup.conf.example} \
         backup/mileage-backup@.{service,timer}; do
@@ -924,6 +928,37 @@ setup_data_dir() {
     else
         ok "data/ is private (mode 700)"
     fi
+
+    # List only the directory entries, without following their targets.
+    local links link quoted hint
+    local -a list_links=(find data -mindepth 1 -maxdepth 1 -type l -print0)
+    if [[ ! -r data || ! -x data ]]; then
+        # Use sudo only where this run already has it (install mode, or a
+        # --check that needed it earlier); never start a new prompt here.
+        if [[ $MODE == install || $SUDO_READY == yes ]]; then
+            need_sudo
+            list_links=(as_root "${list_links[@]}")
+        else
+            warn "Couldn't list data/, so links inside it weren't checked" \
+                "Run install.sh to repair data/ (owner UID $CONTAINER_UID, mode 700)."
+            return 0
+        fi
+    fi
+    links=$(mktemp) || { problem "Cannot check data/ for symbolic links"; return 0; }
+    TMP_FILES+=("$links")
+    if ! "${list_links[@]}" > "$links"; then
+        problem "Cannot check data/ for symbolic links" "Run install.sh with access to data/."
+        return 0
+    fi
+    hint="The viewer won't read trips through it and backups copy only the link. Replace it with a real folder or mount the other disk at that path."
+    while IFS= read -r -d '' link; do
+        printf -v quoted '%q' "$link"
+        if [[ $MODE == check ]]; then
+            problem "$quoted is a symbolic link" "$hint"
+        else
+            warn "$quoted is a symbolic link" "$hint"
+        fi
+    done < "$links"
 }
 
 setup_env() {
@@ -1250,10 +1285,17 @@ PY
 
 setup_geocoder() {
     section "Address lookup"
-    local url agent gap auto kind='' answer error key
+    local url agent gap auto kind='' answer error key hint
     local -a values=()
     for key in URL USER_AGENT INTERVAL AUTO_LOOKUP; do
-        settings_request value "$(env_raw viewer.env "VIEWER_GEOCODER_$key")"
+        if ! settings_query value "$(env_raw viewer.env "VIEWER_GEOCODER_$key")"; then
+            hint="For VIEWER_GEOCODER_$key, use one KEY=value per line, with single quotes around the value (DEPLOY_DEBIAN.md Address lookup)."
+            if [[ $MODE == check ]]; then
+                problem "Invalid address lookup settings in viewer.env" "$hint"
+                return 0
+            fi
+            die "Invalid address lookup settings in viewer.env" "$hint"
+        fi
         values+=("$SETTINGS_REPLY")
     done
     url=${values[0]} agent=${values[1]:-GPSMileageTracker/1.0}
@@ -2436,7 +2478,7 @@ verify_unraid_backups() {
 }
 
 setup_unraid_backups() {
-    local first=no refresh=no
+    local first=no refresh=no began
     [[ $SCRIPT_DIR =~ ^/[-a-zA-Z0-9_./]+$ && $SCRIPT_DIR != *'/../'* ]] \
         || die "The install path must be a simple absolute path for the persistent cron entries."
     if [[ $MODE == check ]]; then
@@ -2456,9 +2498,10 @@ setup_unraid_backups() {
     if ! unraid_cron_current; then refresh=yes; fi
     if [[ $first == yes || $refresh == yes ]]; then
         note "Running one backup through scheduled.sh, the same wrapper cron uses"
+        began=$(date +%s)
         if ! bash "$SCRIPT_DIR/backup/scheduled.sh" < /dev/null; then
             unraid_backup_log
-            die "The scheduled backup failed. Fix the destination or backup.conf and rerun."
+            show_backup_deep_check "$began" || die "The scheduled backup failed. Fix the destination or backup.conf and rerun."
         fi
         FIRST_BACKUP=yes
         restore_test
@@ -2669,9 +2712,11 @@ ensure_backup_target() {
 }
 
 first_backup() {
+    local began
+    began=$(date +%s)
     note "Running the first backup"
     if ! "${AS_ME[@]}" bash "$SCRIPT_DIR/backup/backup.sh" < /dev/null 2>&1 | indent; then
-        die "The first backup failed (output above)." \
+        show_backup_deep_check "$began" || die "The first backup failed (output above)." \
             "Fix backup/backup.conf or the destination, then run this again."
     fi
     ok "Backed up, and checked the copy at $(conf_get REMOTE)"
@@ -2722,26 +2767,43 @@ install_backup_units() {
 }
 
 install_backup_timer() {
-    local unit
+    local unit began
     unit=$(backup_unit)
     install_backup_units
     as_root systemctl enable --now --quiet "$unit.timer"
     note "Running the backup once through systemd, the way the timer will"
+    began=$(date +%s)
     if ! as_root systemctl start "$unit.service"; then
         as_root journalctl -u "$unit.service" -n 20 --no-pager 2>&1 | indent || true
-        die "The backup failed when systemd ran it (log above)." \
+        show_backup_deep_check "$began" || die "The backup failed when systemd ran it (log above)." \
             "journalctl -u $unit.service has the whole log."
     fi
     ok "The backup works when systemd runs it"
 }
 
 show_backup_deep_check() {
-    local status key value when='' result=''
-    [[ -f $SCRIPT_DIR/backup/scheduled.sh ]] || return 0
-    status=$("${AS_ME[@]}" bash "$SCRIPT_DIR/backup/scheduled.sh" --status 2>/dev/null) || return 0
+    local status key value when='' result='' links='' last='' epoch now
+    [[ -f $SCRIPT_DIR/backup/scheduled.sh ]] || { [[ $# == 0 ]]; return; }
+    status=$("${AS_ME[@]}" bash "$SCRIPT_DIR/backup/scheduled.sh" --status 2>/dev/null) || { [[ $# == 0 ]]; return; }
     while IFS='=' read -r key value; do
-        case $key in last_deep_check) when=$value ;; last_deep_check_result) result=$value ;; esac
+        case $key in
+            last_deep_check) when=$value ;;
+            last_deep_check_result) result=$value ;;
+            last_backup_links_not_backed_up) links=$value ;;
+            last_success) last=$value ;;
+        esac
     done <<< "$status"
+    if [[ $links =~ ^[0-9]+$ && $links == *[1-9]* ]]; then
+        warn "$links linked item(s) are not in this backup; replace each link with the real folder or file (or delete a link with nothing behind it) and rerun the backup"
+    fi
+    # A fresh completed off-host copy distinguishes coverage from copy failure.
+    if (( $# )); then
+        epoch=$(date -d "$last" +%s 2>/dev/null) || epoch=0
+        now=$(date +%s)
+        [[ $links =~ ^[0-9]+$ && $links == *[1-9]* && ( $result == passed || -z $result ) ]] \
+            && (( epoch >= $1 && epoch <= now ))
+        return
+    fi
     note "Last deep check: ${when:-never} (result: ${result:-not run})"
     if [[ $result == failed ]]; then
         warn "The last deep check failed; inspect the backup log and rerun the backup"

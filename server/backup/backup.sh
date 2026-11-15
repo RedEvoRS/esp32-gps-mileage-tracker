@@ -22,6 +22,9 @@
 #      reported as a problem by install.sh --check) and withholds PING_URL.
 #      last-success still advances, so Unraid's hourly catch-up skips it;
 #      the next nightly run retries the failed snapshots.
+#      Links outside data are listed and counted in INFO; their contents
+#      are not copied. They also fail the run and withhold PING_URL after
+#      the off-host copy and deep check, while last-success advances.
 #
 # Layout under BACKUP_DIR (the same under REMOTE, minus `latest`):
 #   snapshots/2026-10-06T033012Z/{annotations.db,events.db?,monitor.db?,data/,SHA256SUMS,INFO}
@@ -129,6 +132,15 @@ flock -w 300 7
 rsync -a --numeric-ids --exclude=/.upload.lock --exclude='/.upload-lock.*' --exclude='*.tmp' \
         --exclude=/diagnostics/events.db --exclude='/diagnostics/events.db-*' "${link[@]}" \
         "$COMPOSE_DIR/data/" "$work/data/"
+# A failed link check must not cost tonight's off-host copy: note it,
+# finish the backup, then fail the run below.
+coverage_error=0
+if ! report_outside_links "$COMPOSE_DIR/data" "$work/.outside-links"; then
+    log "ERROR: couldn't check data for links outside it; this run will fail after the copy"
+    rm -f -- "$work/.outside-links"
+    LINKS_NOT_BACKED_UP=0
+    coverage_error=1
+fi
 exec 7<&-
 trips=$(find "$work/data" -type f -name '*.gpx' | wc -l)
 
@@ -139,7 +151,8 @@ trips=$(find "$work/data" -type f -name '*.gpx' | wc -l)
 
 # Preserve changes in discovery status even if the database/file bytes match.
 if [[ -n $prev ]] && cmp -s "$work/SHA256SUMS" "$SNAPSHOTS/$prev/SHA256SUMS" \
-        && grep -Fxq "monitor=$monitor" "$SNAPSHOTS/$prev/INFO"; then
+        && grep -Fxq "monitor=$monitor" "$SNAPSHOTS/$prev/INFO" \
+        && [[ $(read_coverage_count "$SNAPSHOTS/$prev/INFO") == "$LINKS_NOT_BACKED_UP" ]]; then
     log "Nothing changed since $prev; keeping that snapshot"
     rm -rf "$work"
     current=$prev
@@ -159,6 +172,7 @@ trips=$trips
 annotations=$annotations
 events=$events
 monitor=$monitor
+links_not_backed_up=$LINKS_NOT_BACKED_UP
 EOF
     mv "$work" "$SNAPSHOTS/$name"
     current=$name
@@ -288,9 +302,18 @@ deep_verify() (
         awk -v cursor="$VERIFY_CURSOR" 'NF && $0 <= cursor' <<< "$names")
 
     # List REMOTE with rsync, never ssh shell commands. Retry a previously
-    # failing remote-only snapshot even if another name is now oldest.
+    # failing remote-only snapshot even if another name is now oldest, unless
+    # it is no longer listed there (deleted after the failure, #703).
     remote_checks=$VERIFY_REMOTE_PENDING
     if remote_names=$(list_remote_snapshots); then
+        remote_checks=''
+        for old in $VERIFY_REMOTE_PENDING; do
+            if grep -Fxq -- "$old" <<< "$remote_names"; then
+                remote_checks+="$old "
+            else
+                log "Deep check: $old is no longer on REMOTE; removed from the retry list"
+            fi
+        done
         remote_oldest=$(head -n 1 <<< "$remote_names")
         if [[ -n $remote_oldest && $remote_oldest != "$current" && ! -d $SNAPSHOTS/$remote_oldest \
                 && " $remote_checks " != *" $remote_oldest "* ]]; then
@@ -354,7 +377,17 @@ deep_verify() (
     return "$failed"
 )
 
-deep_verify || die "Deep check failed; today's backup was copied. Check the failed snapshots and rerun backup.sh."
+failed=0
+deep_verify || { log "Deep check failed; today's backup was copied. Check the failed snapshots and rerun backup.sh."; failed=1; }
+if (( LINKS_NOT_BACKED_UP > 0 )); then
+    log "WARNING: $LINKS_NOT_BACKED_UP linked item(s) are not in this backup; replace each link with the real folder or file (or delete a link with nothing behind it) and rerun backup.sh."
+    failed=1
+fi
+if (( coverage_error )); then
+    log "ERROR: data wasn't checked for links outside it; fix the error above and rerun backup.sh."
+    failed=1
+fi
+(( failed == 0 )) || exit 1
 
 # Only ping after the deep check passes or is not due.
 if [[ -n $PING_URL ]]; then

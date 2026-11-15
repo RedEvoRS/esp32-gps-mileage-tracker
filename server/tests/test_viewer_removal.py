@@ -89,6 +89,91 @@ class ViewerRemovalTests(unittest.TestCase):
     def exported_csv(self):
         return list(csv.DictReader(io.StringIO(self.admin.get("/export.csv").data.decode("utf-8"))))
 
+    def test_remove_restore_link_refused_trips(self):
+        for kind in ("json", "gpx", "month"):
+            with self.subTest(kind=kind):
+                key = self.add_trip(kind)
+                link = self.month if kind == "month" else self.month / f"{kind}.{kind}"
+                target = self.root / f"outside-{kind}"
+                link.rename(target)
+                if kind != "month":
+                    target.write_text("outside-file-sentinel", encoding="utf-8")
+                try:
+                    link.symlink_to(target, target_is_directory=kind == "month")
+                except (OSError, NotImplementedError) as exc:
+                    target.rename(link)
+                    self.skipTest(f"symlink creation unavailable: {type(exc).__name__}")
+                try:
+                    for action in ("remove", "restore"):
+                        denied = self.editor.post(f"/trip/{key}/{action}", data={
+                            "csrf_token": "test-csrf", "reason": "test removal"})
+                        self.assertEqual(denied.status_code, 403)
+                        with patch.object(self.viewer, "_safe_trip_paths", side_effect=AssertionError("route path check")):
+                            response = self.post(f"/trip/{key}/{action}?year=2026", reason="test removal")
+                        if kind == "month":
+                            self.assertEqual(response.status_code, 404 if action == "remove" else 409)
+                            with closing(sqlite3.connect(self.db)) as conn:
+                                self.assertIsNone(conn.execute("SELECT 1 FROM trip_removals WHERE trip_key=?", (key,)).fetchone())
+                            continue
+                        self.assertEqual(response.status_code, 302)
+                        expected = "/?year=2026" if action == "remove" else "/admin/removed?year=2026"
+                        self.assertEqual(response.location, expected)
+                        self.assertNotIn(b"outside-file-sentinel", response.data)
+                        landing = self.admin.get(response.location)
+                        self.assertEqual(landing.status_code, 200)
+                        self.assertNotIn(b"outside-file-sentinel", landing.data)
+                        with closing(sqlite3.connect(self.db)) as conn:
+                            row = conn.execute("SELECT trip_key FROM trip_removals WHERE trip_key=?", (key,)).fetchone()
+                        self.assertEqual(row, (key,) if action == "remove" else None)
+                finally:
+                    link.unlink()
+                    target.rename(link)
+
+    def test_restore_of_an_unreadable_trip_lands_on_a_working_page(self):
+        # #722: the trip page can't show an unreadable trip, so a successful
+        # Restore must not send the admin there to a 404.
+        first = self.add_trip("first", 600)
+        second = self.add_trip("second", 720)
+        merged = self.admin.post(f"/trip/{first}/merge", data={
+            "csrf_token": "test-csrf", "next_trip": second,
+        })
+        self.assertEqual(merged.status_code, 302, merged.get_data(as_text=True))
+        merge_key = merged.headers["Location"].split("/trip/")[1].split("?")[0]
+        # Damage a plain trip only after the merge: an unreadable trip from the
+        # same device with no start time would block the merge suggestion.
+        damaged = self.add_trip("damaged")
+        (self.month / "damaged.json").write_text("[not a summary]", encoding="utf-8")
+        for key in (damaged, merge_key):
+            with self.assertLogs(self.viewer.app.logger, "WARNING"):
+                removed = self.post(f"/trip/{key}/remove?year=2026", reason="test removal")
+            self.assertEqual(removed.status_code, 302)
+        (self.month / "second.gpx").unlink()  # the merged trip is now unreadable too
+        for key in (damaged, merge_key):
+            with self.subTest(key=key):
+                with self.assertLogs(self.viewer.app.logger, "WARNING"):
+                    restored = self.post(f"/trip/{key}/restore?year=2026")
+                self.assertEqual(restored.status_code, 302)
+                self.assertEqual(restored.location, "/admin/removed?year=2026")
+                with self.assertLogs(self.viewer.app.logger, "WARNING"):
+                    self.assertEqual(self.admin.get(restored.location).status_code, 200)
+                with closing(sqlite3.connect(self.db)) as conn:
+                    self.assertIsNone(conn.execute(
+                        "SELECT 1 FROM trip_removals WHERE trip_key=?", (key,)).fetchone())
+
+    def test_normal_remove_restore_redirects_keep_trip_and_year(self):
+        key = self.add_trip("drive")
+        for action in ("remove", "restore"):
+            response = self.post(f"/trip/{key}/{action}?year=2026", reason="test removal")
+            self.assertEqual(response.status_code, 302)
+            self.assertEqual(response.location, f"/trip/{key}?year=2026")
+            self.assertEqual(self.admin.get(response.location).status_code, 200)
+
+    def test_remove_restore_malformed_addresses_still_404(self):
+        for key in ("2026-01/bad.key", "2026-01/drive%0A", "2026-x1/drive"):
+            for action in ("remove", "restore"):
+                with self.subTest(key=key, action=action):
+                    self.assertEqual(self.post(f"/trip/{key}/{action}", reason="test removal").status_code, 404)
+
     def test_remove_hides_all_outputs_and_restore_returns_trip_without_touching_data(self):
         key = self.add_trip("drive")
         original_hash = self.data_hash()
@@ -149,7 +234,8 @@ class ViewerRemovalTests(unittest.TestCase):
                                  ("split", {"confirm": "yes"}),
                                  ("lookup-place", {"endpoint": "start"})):
                 response = client.post(f"/trip/{key}/{action}", data={"csrf_token": "test-csrf", **data})
-                self.assertEqual(response.status_code, 409, action)
+                expected = 404 if client is self.editor and action == "lookup-place" else 409
+                self.assertEqual(response.status_code, expected, action)
 
         restored = self.post(f"/trip/{key}/restore")
         self.assertEqual(restored.status_code, 302)
@@ -158,6 +244,28 @@ class ViewerRemovalTests(unittest.TestCase):
         self.assertIn("1.250 mi total", restored_listing)
         self.assertEqual([r["trip_id"] for r in self.exported_csv() if r["row_type"] == "trip"], ["drive"])
         self.assertEqual(self.data_hash(), original_hash)
+
+    def test_removed_lookup_matches_unknown_for_everyday_login(self):
+        first = self.add_trip("first", 0)
+        second = self.add_trip("second", 120)
+        plain = self.add_trip("plain", 3600)
+        merged = self.post(f"/trip/{first}/merge", next_trip=second)
+        self.assertEqual(merged.status_code, 302)
+        merged_key = merged.headers["Location"].split("/trip/", 1)[1].split("?", 1)[0]
+        for key in (plain, merged_key):
+            self.assertEqual(self.post(f"/trip/{key}/remove", reason="test reason").status_code, 302)
+        data = {"csrf_token": "test-csrf", "endpoint": "start"}
+        unknown = self.editor.post("/trip/2026-01/unknown/lookup-place", data=data)
+        self.assertEqual(unknown.status_code, 404)
+        for key in (plain, merged_key, first, second):
+            with self.subTest(key=key):
+                response = self.editor.post(f"/trip/{key}/lookup-place", data=data)
+                self.assertEqual(response.status_code, unknown.status_code)
+                self.assertEqual(response.data, unknown.data)
+                self.assertEqual(response.content_type, unknown.content_type)
+                admin = self.admin.post(f"/trip/{key}/lookup-place", data=data)
+                self.assertEqual(admin.status_code, 409)
+                self.assertIn(b"The admin has to restore it first.", admin.data)
 
     def test_reason_csrf_duplicate_and_missing_key_validation(self):
         key = self.add_trip("drive")

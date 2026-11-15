@@ -249,6 +249,57 @@ class ViewerRecords(unittest.TestCase):
                          ({"trip_id": "extra", "distance_miles": 1.5, "start_time": None}, None))
         self.assertEqual(self.client.get("/export.xlsx").status_code, 200)
 
+    def everyday_client(self):
+        stamp = "2027-01-01T00:00:00+00:00"
+        with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn, conn:
+            conn.execute("INSERT OR IGNORE INTO users VALUES (?, ?, 0, 0, ?, ?)",
+                         ("helper", generate_password_hash("everyday-password"), stamp, stamp))
+        client = self.viewer.app.test_client()
+        user = self.viewer.users.get_user(self.viewer.DB_PATH, "helper")
+        with client.session_transaction() as session:
+            session.update(user="helper", kind="editor", csrf="test-csrf",
+                           pw_tag=self.viewer.users.session_tag(self.viewer.VIEWER_SECRET_KEY, user))
+        return client
+
+    def test_removed_or_unknown_trip_says_no_trip_here_not_a_damaged_file(self):
+        # #707: neither case has a damaged file, so Troubleshooting is the
+        # wrong advice, and the two must read the same to an everyday login.
+        self.trip("gone", "2027-01-01T08:00:00Z")
+        with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn, conn:
+            self.viewer.trip_log.add_removal(conn, "2027-01/gone", "test reason", "driver")
+        self.addCleanup(self._clear_removals)
+        everyday = self.everyday_client()
+        bodies = {}
+        for name, client, key in (("removed", everyday, "gone"), ("unknown", everyday, "nope"),
+                                  ("unknown, admin", self.client, "nope")):
+            with self.subTest(name=name):
+                response = client.get(f"/trip/2027-01/{key}")
+                self.assertEqual(response.status_code, 404)
+                body = bodies[name] = response.get_data(as_text=True)
+                self.assertIn("No trip at this address. It may have been removed from the log; "
+                              "ask the admin if you expected to see it.", body)
+                self.assertNotIn("summary file", body)
+                self.assertNotIn("Troubleshooting", body)
+        self.assertEqual(bodies["removed"], bodies["unknown"])
+        # The admin still sees the removed trip itself.
+        self.assertEqual(self.client.get("/trip/2027-01/gone").status_code, 200)
+
+    def test_damaged_summary_page_still_points_to_troubleshooting(self):
+        (self.month / "broken.json").write_bytes(b'{"trip_id": "broken", "distance_mi')
+        everyday = self.everyday_client()
+        for client in (self.client, everyday):
+            with self.assertLogs(self.viewer.app.logger, "WARNING"):
+                response = client.get("/trip/2027-01/broken")
+            self.assertEqual(response.status_code, 404)
+            body = response.get_data(as_text=True)
+            self.assertIn("summary file can&#39;t be read (", body)
+            self.assertIn("Troubleshooting", body)
+            self.assertNotIn("No trip at this address", body)
+
+    def _clear_removals(self):
+        with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn, conn:
+            conn.execute("DELETE FROM trip_removals")
+
     def test_valid_json_missing_its_fields_is_unreadable_not_a_zero_mile_trip(self):
         self.trip("good", "2026-08-01T12:00:00Z", 2, "business")
         incomplete = {

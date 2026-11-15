@@ -143,8 +143,8 @@ names no issue numbers on purpose, because they go stale; keep it that way.
 - **History and visibility:** this repo starts from a clean snapshot
   taken 2026-10-13. Earlier commits, PRs and closed issues stay in a
   private, archived repo, so commit hashes and PR numbers in the audit
-  docs point there. This repo is private for now and will go public when
-  the owner decides.
+  docs point there. This repo has been public since the v1.00 release
+  (2026-11-01), so everything committed or posted here is public.
 - **Conventions:** when a PR fixes an issue, say "Fixes #N" (one line per
   issue) so merging it closes the issue. File every new finding as its own
   issue, however small, never as an item on a checklist issue.
@@ -173,7 +173,8 @@ tests and the firmware release check still run:
   `ruff check` (server, tools and install; rules F, E9 and B).
 - Server: `python -m unittest discover -s server/tests`,
   `python tools/generate_error_catalog.py --check`,
-  `node server/tests/test_viewer_map.js` and `node server/tests/test_viewer_places.js`.
+  `node server/tests/test_viewer_map.js`, `node server/tests/test_viewer_places.js`
+  and `node server/tests/test_viewer_annotation.js`.
   Needs the service requirements installed. Monitor needs no additional
   dependencies and uses fake time, real SQLite, and local fake HTTP receivers
   for ntfy, GELF and Loki.
@@ -413,6 +414,12 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   uploads may use a custom ID outside that namespace (installer test uploads are
   untimed copies of `sample.gpx`). Every upload looks for its ID in all month
   folders under the upload lock, so a `DISPLAY_TZ` change can't duplicate a trip.
+  Internal aliases count once; an outside or looping month link refuses all
+  GPX uploads with 503 naming the folder until repaired, and a new trip whose
+  month folder links to a differently named folder gets the same 503 (it would
+  be filed under the wrong month). Diagnostics are unaffected.
+  `install.sh --check` reports direct links in `data/` as problems; install
+  warns and continues. If listing needs a new sudo prompt, check warns it skipped links.
   Ingest runs with umask 077; `install.sh` keeps `data/` at mode 700
 - Upload limits: 16 MiB body cap (`INGEST_MAX_UPLOAD_BYTES`, ~39 h of
   nonstop driving). It protects the server's memory: the ingest parses the
@@ -453,7 +460,19 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   the source setting; restore restarts viewer and rebuilds the unbacked-up mirror.
 - Viewer port: 8091, admin/everyday session logins (LAN-only), reads `./data`
   read-only, owns `annotations.db` (SQLite) in `viewer-db`. Removal only marks
-  a trip in that DB; it never touches `./data`. Closing a year saves its totals
+  a trip in that DB; it never touches `./data`. Everyday logins get one "No
+  trip at this address" 404 for a removed, unknown or link-refused trip page,
+  and lookups answer removed like unknown; the admin gets a link diagnostic.
+  A summary or GPX linking outside `./data` makes the trip unreadable
+  (a merely missing GPX still counts). Only first-level `YYYY-MM` folders hold
+  trips; other folders are ignored. A month folder link that leads outside
+  `./data` (or to it or above), dangles or loops, and a month folder the viewer
+  can't read, each show once as a folder (`row_type=unreadable_folder`) with a
+  hint for that cause; their trips aren't listed or counted and merge
+  suggestions wait. A month link to a folder another month name already counts
+  is a notice (`row_type=folder_notice`): counted once, no merge block, not
+  unreadable in year-close snapshots. Closing a year
+  saves its totals
   in `tax_years.snapshot`; the year review compares saved and current totals,
   and lists trips received after the close (ingest `_received_at` later than
   `closed_at`), undated trips and trips inside a merge. Exports mark late trips
@@ -462,21 +481,25 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   `frame-ancestors 'none'`, `X-Frame-Options: DENY` and `nosniff`. Notes and
   destinations are limited to 2,000 characters without XML-illegal control
   characters. Merged summaries keep the rules they were built with until a
-  source file changes. The DB includes `users`,
+  source file's size or modification time changes; their stamp has no inode,
+  so a restore or migration with times preserved keeps them. The DB includes `users`,
   `trip_removals`, `trip_history` and `tax_years`. Optional `geocoding.py`
   sends a selected endpoint to an explicitly configured provider only on an
   authenticated, CSRF-protected browser request, caching suggestions locally.
   Installer Address lookup uses common/settings.py validators through host_python;
   env_set updates viewer.env before compose up applies it on both platforms.
   Configurable interval, default 0.1 s for self-hosted providers; third-party
-  providers need an interval matching their rate policy. Viewer-only
+  providers need an interval matching their rate policy. A gap the server
+  won't wait out (over 2 s) gets 429 with `retry_after` and `Retry-After`; the
+  page waits and retries that lookup once (0–60 s). Viewer-only
   `MAP_TILE_URL` selects base tiles (default OSM; `none` disables); attribution is plain text.
   Page views look up uncached endpoints only with opt-in
   `VIEWER_GEOCODER_AUTO_LOOKUP=true`; Auto lookup beside Next defaults On,
   with an Off choice saved per browser. On hides manual lookup buttons except
   endpoint retries after errors; End suggestion and Use sit beneath Destination.
   On also fills an empty, untouched Destination with the end suggestion
-  (shown with a note, unsaved until Save).
+  (shown with a note, unsaved until Save), but only on a trip that has never
+  had an annotation saved (`data-autofill`); Use still fills any trip.
   Trip annotations use clearable purpose radios and a panel left of the map
   (above it on narrow windows); shared phone headers use Menu with a no-JS row.
   No lookup on exports or uploads; never
@@ -556,7 +579,14 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   still exits non-zero (failed Debian unit / Unraid `last_attempt_status`,
   reported as a problem by `install.sh --check`) and withholds the `PING_URL`
   heartbeat. The next nightly run retries; Unraid's hourly overdue catch-up
-  does nothing while `last-success` is fresh.
+  does nothing while `last-success` is fresh. A failed remote-only snapshot
+  that has since been deleted from REMOTE leaves the retry list once a REMOTE
+  listing succeeds; a failed listing keeps it.
+  Outside links under `data/` are reported and counted in `INFO` as
+  `links_not_backed_up`; their contents are absent. Copy and deep check still
+  run and `last-success` advances, but the run exits non-zero without a
+  heartbeat. Restore reports these links and uses rsync `--safe-links` to
+  skip them; relative internal links can be restored.
   Missing diagnostics/monitor databases are normal and recorded in `INFO`.
   Monitor discovery uses Compose config's project name and Docker's Compose
   project/volume labels, without recent config flags or logging credentials.
@@ -622,15 +652,15 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 - Power SX1262 LoRa without antenna (RF damage risk)
 - Commit to the frozen `tbeam-v1.2` branch, or port fixes back to it
 - Commit `secrets.h`, `.env`, `viewer.env`, or `monitor.env` to version control
-- Commit anything personal. The repo will go public, and that exposes
-  everything from its private period too, so docs, examples, tests,
+- Commit anything personal. The repo is public, including everything from
+  its private period, so docs, examples, tests,
   commit messages, issues and PRs use placeholders (`<user>`, `<host>`,
   `<username>`, `~\Documents\...`), never a real name, account path,
   email, SSID/MAC, real coordinates, or a photo with EXIF. Use the
   GitHub noreply email and commit with TZ=UTC. `tools/check_pii.py` enforces
   this in CI for files and commits (not issue or PR text); names come from
   the `PII_DENYLIST` secret or a gitignored `.pii-denylist`
-- Change the repo's visibility. The owner decides when it goes public
+- Change the repo's visibility. Only the owner changes it
 - Bring commits over from the private archive repo: no merge, cherry-pick,
   or adding it as a remote. Its history carries a personal email and
   account paths, which is why this repo started from a clean snapshot.

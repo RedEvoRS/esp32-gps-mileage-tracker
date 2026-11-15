@@ -1,5 +1,6 @@
 """Viewer-owned merge records; original files and annotations stay untouched."""
 
+import errno
 import json
 import os
 import re
@@ -67,6 +68,14 @@ def checked_path(root, path, *, preserve_final=False):
         raise ValueError("Unreadable trip path") from exc
     if root not in resolved.parents:
         raise ValueError("Invalid trip path")
+    # Python 3.13+ resolve() no longer raises on a symbolic link loop, so check
+    # for one here, after containment: a loop is unreadable on every version, as
+    # on 3.12. A missing file is still allowed (callers test presence themselves).
+    try:
+        os.stat(resolved)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError("Unreadable trip path") from exc
     # Keep the resolve/ancestor check: a lexical prefix cannot see final-file
     # symlinks. lexists callers retain a safe dangling link's own identity.
     return candidate if preserve_final else resolved
@@ -94,12 +103,17 @@ def fingerprint(data_root, keys):
     ingest stored under the rules of the day, so a merged trip must too: a
     later change to the distance rules reaches merges only when a source
     file changes (or the merge is undone and redone), not on first view.
+
+    It also leaves out the inode number. An inode belongs to the disk, not to
+    the content, so a restore or migration changes every one and would
+    rebuild every merged trip although no file changed. Name, modification
+    time and size are what a copy with times preserved keeps.
     """
     stamps = []
     for pair in source_file_pairs(data_root, keys):
         for source in pair:
             st = source.stat()
-            stamps.append((source.name, st.st_mtime_ns, st.st_size, st.st_ino))
+            stamps.append((source.name, st.st_mtime_ns, st.st_size))
     return json.dumps(stamps)
 
 
@@ -108,6 +122,8 @@ def same_sources(fresh, stored):
 
     Rows saved before the rule version was dropped start with that number;
     it is ignored, so upgrading does not rebuild every merge under new rules.
+    Rows saved by v1.06-v1.15 carry an inode as a fourth field; it is ignored
+    too, since it changes whenever the files move to another disk.
     """
     def stamps(text):
         try:
@@ -120,12 +136,10 @@ def same_sources(fresh, stored):
     left, right = stamps(fresh), stamps(stored)
     if left is None or right is None or len(left) != len(right):
         return False
-    # Upgrade older fingerprints without rebuilding under newer distance
-    # rules. Once upgraded, an atomic replacement with identical size/mtime
-    # also invalidates the merge. Keep the legacy version-prefix compatibility.
+    # Only name, modification time and size decide. Any extra field in a
+    # stored stamp (the version prefix above, or an old inode) is ignored.
     return all(isinstance(a, (list, tuple)) and isinstance(b, (list, tuple))
-               and len(a) in (3, 4) and len(b) in (3, 4)
-               and a[:3] == b[:3] and (len(a) == 3 or len(b) == 3 or a[3] == b[3])
+               and len(a) >= 3 and len(b) >= 3 and list(a[:3]) == list(b[:3])
                for a, b in zip(left, right, strict=True))
 
 
@@ -213,8 +227,9 @@ def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=N
                              (json.dumps(summary), stamp, key))
             else:
                 summary = json.loads(row["summary"])
-                # Record inode metadata for legacy rows without changing the
-                # stored summary's rules. This is a one-time cache upgrade.
+                # Rewrite a stamp that differs only in form (a version prefix
+                # or an old inode field) without changing the stored summary's
+                # rules. This is a one-time cache upgrade.
                 if stamp != row["fingerprint"]:
                     if not refresh:
                         raise MergeRefreshNeeded()
@@ -289,6 +304,10 @@ def next_trip(trip, trips, unreadable, removed=()):
             return None, REMOVED_BETWEEN
         current_start = _parse_iso(trip["start_time"])
         for damaged in unreadable:
+            if damaged.get("folder_reason") == "duplicate":
+                continue  # Its recordings are already present under the counted month.
+            if damaged.get("folder"):
+                return None, f"Cannot establish the next trip: a month folder has a problem ({damaged['problem']}). Fix it before merging."
             damaged_device = damaged.get("device_id")
             if _known_device(damaged_device) and damaged_device != device:
                 continue
@@ -299,8 +318,8 @@ def next_trip(trip, trips, unreadable, removed=()):
             if damaged_start is not None and not current_start <= damaged_start <= start:
                 continue
             if not _known_device(damaged_device):
-                return None, "Cannot establish the next trip: an unreadable summary with an unknown device may fall between these recordings. Repair the summary before merging."
-            return None, "Cannot establish the next trip: an unreadable summary from this device may fall between these recordings. Repair the summary before merging."
+                return None, "Cannot establish the next trip: an unreadable trip with an unknown device may fall between these recordings. Repair its files before merging."
+            return None, "Cannot establish the next trip: an unreadable trip from this device may fall between these recordings. Repair its files before merging."
         return candidate, ""
     return None, ""
 

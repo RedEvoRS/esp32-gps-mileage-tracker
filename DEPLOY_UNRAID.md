@@ -398,7 +398,9 @@ after exceeding 1 MiB and keeps `.1` through `.3`. State lives in
 `backup/state/last-attempt`, with UTC start, end and exit status. These
 directories are mode 700. `--status` prints `last_attempt_start`,
 `last_attempt_end`, `last_attempt_status`, `last_success`, the absolute
-log path, `last_deep_check` and `last_deep_check_result`. Empty values can mean
+log path, `last_deep_check`, `last_deep_check_result`, and
+`last_backup_links_not_backed_up` (an older `INFO` without the count means
+zero). Empty values can mean
 it has never run. Status 0 means success;
 `running` has no final result yet. Reading status itself exits 0, so inspect
 the fields. `last_success` comes from `BACKUP_DIR/last-success` and may be
@@ -434,7 +436,14 @@ The `PING_URL` heartbeat is withheld, so an external monitor can alert.
 The log names the snapshot, local or remote, and failed file paths. Failed or
 interrupted checks retry on the next nightly backup run rather than waiting a
 week. The hourly overdue catch-up does nothing while `last-success` is fresh;
-a deep-check failure alone does not start another backup every hour.
+a deep-check or link-coverage failure alone does not start another backup every hour.
+Outside links under `data/` leave their contents out of the snapshot, cause a
+non-zero exit and withhold the heartbeat after copy and deep check.
+`install.sh --check` warns if the latest count is above zero; an initial backup
+failing only for this reason warns and installation continues. Fix the links
+and rerun the backup. Earlier snapshots made while linked lack those contents.
+Do not link month folders to another disk or share; put the whole `data/`
+folder where you want it instead.
 Failed selections remain protected from pruning until a retry passes or
 periodic verification is disabled; rotation advances only on success.
 
@@ -449,6 +458,20 @@ deep check now, run `bash backup/backup.sh --verify`; it first completes the nor
 backup, and also works with periodic checks off. On Unraid this direct run does
 not update the wrapper attempt/log, so inspect its output and `--status` deep
 result, then use `bash backup/scheduled.sh` for the normal recorded run.
+
+If a damaged snapshot exists only off-host (the log says
+`Deep check FAILED remote-only <snapshot-name>`), there is no local copy to
+repair it from. Check other snapshots with
+`bash backup/restore.sh check <snapshot-name>` before deciding what to keep. If
+the damaged one cannot be repaired, remove only that snapshot's folder,
+`<REMOTE>/snapshots/<snapshot-name>`, from the destination. Never remove the
+destination itself or its `.mileage-backup-target` file. To keep the damaged
+copy while you investigate, move the folder out of `snapshots/` instead, for
+example to `<REMOTE>/damaged-<snapshot-name>`; backups only look inside
+`snapshots/`. The next nightly backup then drops the name from its retry list,
+as long as it can list the destination's snapshots. With periodic checks off,
+run `bash backup/backup.sh --verify`, then `bash backup/scheduled.sh` for the
+normal recorded run. Other failures in the same check still need attention.
 
 ## Step 5 — Build on Unraid, flash from the PC
 

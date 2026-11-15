@@ -404,6 +404,149 @@ class BackupScripts(unittest.TestCase):
         root = (root or self.backups) / "snapshots"
         return sorted(p.name for p in root.iterdir() if not p.name.startswith("."))
 
+    def test_outside_links_reported_and_copied_without_targets(self):
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "never-read.gpx").write_text("sentinel")
+        self.symlink(self.data / "2026-01", outside, True)
+        self.symlink(self.data / "2026-10/linked.gpx", outside / "never-read.gpx")
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        ping = self.tmp / "ping"
+        self.shim("curl", f'touch "{ping}"\n')
+        result = self.run_script("backup.sh", check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("data/2026-01", result.stderr)
+        self.assertIn("data/2026-10/linked.gpx", result.stderr)
+        snap = self.remote / "snapshots" / self.snapshots()[-1]
+        self.assertIn("links_not_backed_up=2", (snap / "INFO").read_text())
+        self.assertTrue((snap / "data/2026-10/2026-10-01T15-00-00.gpx").is_file())
+        self.assertNotIn("sentinel", (snap / "SHA256SUMS").read_text())
+        self.assertTrue((snap / "data/2026-01").is_symlink())
+        self.assertTrue((self.backups / "last-success").exists())
+        self.assertFalse(ping.exists())
+
+    def test_link_check_error_still_copies_then_fails(self):
+        # A failing link check (here, realpath) must not cost the off-host copy.
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        ping = self.tmp / "ping"
+        self.shim("curl", f'touch "{ping}"\n')
+        self.symlink(self.data / "2026-01", self.tmp, True)
+        self.shim("realpath", "exit 1\n")
+        result = self.run_script("backup.sh", check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("couldn't check data for links outside it", result.stderr)
+        snap = self.remote / "snapshots" / self.snapshots()[-1]
+        self.assertTrue((snap / "data/2026-10/2026-10-01T15-00-00.gpx").is_file())
+        self.assertFalse((snap / ".outside-links").exists())
+        self.assertTrue((self.backups / "last-success").exists())
+        self.assertFalse(ping.exists())
+
+    def test_nested_links_escape_names_cap_and_never_open_fifo(self):
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        os.mkfifo(outside / "unreadable.gpx")
+        nested = self.data / "2026-10/nested"
+        nested.mkdir()
+        for index in range(23):
+            self.symlink(nested / f"item-{index}\n.gpx", outside / "unreadable.gpx")
+        result = self.run_script("backup.sh", check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        warnings = [line for line in result.stderr.splitlines() if "WARNING: not backed up:" in line]
+        self.assertEqual(len(warnings), 20)
+        self.assertTrue(all("\\n" in line for line in warnings))
+        self.assertIn("and 3 more", result.stderr)
+        self.assertIn("links_not_backed_up=23", (self.backups / "latest/INFO").read_text())
+
+    def test_inside_dangling_inside_and_tmp_links_are_allowed(self):
+        self.symlink(self.data / "inside", "2026-10", True)
+        self.symlink(self.data / "dangling", "missing")
+        self.symlink(self.data / "ignored.tmp", self.tmp / "outside")
+        self.run_script("backup.sh")
+        self.assertIn("links_not_backed_up=0", (self.backups / "latest/INFO").read_text())
+
+    def test_link_count_changes_snapshot_and_then_dedupes(self):
+        self.run_script("backup.sh")
+        self.symlink(self.data / "linked", self.tmp / "missing")
+        self.assertEqual(self.run_script("backup.sh", check=False).returncode, 1)
+        self.assertEqual(len(self.snapshots()), 2)
+        self.assertEqual(self.run_script("backup.sh", check=False).returncode, 1)
+        self.assertEqual(len(self.snapshots()), 2)
+
+    def test_links_and_deep_failure_both_reported(self):
+        names = self.seed_verification(2)
+        self.silently_corrupt(self.backups / "snapshots" / names[0] / "annotations.db")
+        self.symlink(self.data / "linked", self.tmp / "missing")
+        result = self.run_script("backup.sh", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("not backed up: data/linked", result.stderr)
+        self.assertIn("Deep check FAILED", result.stderr)
+        self.assertEqual(self.verify_state()["result"], "failed")
+
+    def test_link_failure_scheduler_catchup_and_recovery(self):
+        self.symlink(self.data / "linked", self.tmp / "missing")
+        ping = self.tmp / "ping"
+        self.shim("curl", f'touch "{ping}"\n')
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        scripts = self.tmp / "scripts"
+        scripts.mkdir()
+        for name in ("scheduled.sh", "backup.sh", "lib.sh"):
+            shutil.copyfile(BACKUP / name, scripts / name)
+
+        def run(*args):
+            return subprocess.run(["bash", str(scripts / "scheduled.sh"), *args],
+                                  env=self.env, capture_output=True, text=True, timeout=30)
+
+        self.assertEqual(run().returncode, 1)
+        self.assertIn("status=1", (scripts / "state/last-attempt").read_text())
+        before = (scripts / "logs/backup.log").read_bytes()
+        self.assertEqual(run("--if-overdue", "26").returncode, 0)
+        self.assertEqual((scripts / "logs/backup.log").read_bytes(), before)
+        self.assertEqual(run().returncode, 1)
+        self.assertFalse(ping.exists())
+        (self.data / "linked").unlink()
+        (self.data / "linked").mkdir()
+        self.assertEqual(run().returncode, 0)
+        self.assertTrue(ping.exists())
+
+    def legacy_link_snapshot(self):
+        self.run_script("backup.sh")
+        snap = self.remote / "snapshots" / self.snapshots()[-1]
+        # Old INFO has no coverage key; inspect the actual links.
+        info = snap / "INFO"
+        info.write_text("\n".join(line for line in info.read_text().splitlines()
+                                   if not line.startswith("links_not_backed_up=")) + "\n")
+        self.symlink(snap / "data/linked-month", self.tmp / "outside", True)
+        self.symlink(snap / "data/inside", "2026-10", True)
+        return snap
+
+    def test_restore_check_warns_for_legacy_outside_link(self):
+        self.legacy_link_snapshot()
+        result = self.run_script("restore.sh", "check")
+        self.assertIn("data/linked-month", result.stderr)
+        self.assertIn("contents of 1 linked item(s) are not in this backup", result.stderr)
+        self.assertTrue(result.stderr.rstrip().endswith(
+            "Restore test passed, but 1 linked item(s) are not in this backup"))
+
+    def test_restore_outside_link_leaves_existing_real_folder(self):
+        self.legacy_link_snapshot()
+        folder = self.data / "linked-month"
+        folder.mkdir()
+        (folder / "keep.gpx").write_text("keep")
+        result = self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertIn("contents of 1 linked item(s) are not in this backup", result.stderr)
+        self.assertFalse(folder.is_symlink())
+        self.assertEqual((folder / "keep.gpx").read_text(), "keep")
+        self.assertEqual(os.readlink(self.data / "inside"), "2026-10")
+
+    def test_restore_outside_link_never_created_on_empty_data(self):
+        self.legacy_link_snapshot()
+        shutil.rmtree(self.data)
+        self.data.mkdir()
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertFalse((self.data / "linked-month").is_symlink())
+        self.assertFalse((self.data / "linked-month").exists())
+        self.assertEqual(os.readlink(self.data / "inside"), "2026-10")
+
     # --- periodic deep verification ---
 
     def seed_verification(self, count=6):
@@ -543,7 +686,41 @@ class BackupScripts(unittest.TestCase):
         self.assertEqual(self.verify_state()["remote_pending"].strip(), names[0])
         self.assertEqual(list(self.backups.glob(".verify-state.*")), [])
         retry = self.run_script("backup.sh", check=False)
+        self.assertNotEqual(retry.returncode, 0)
         self.assertIn(f"FAILED remote-only {names[0]}", retry.stderr)
+        self.assertEqual(self.verify_state()["remote_pending"].strip(), names[0])
+
+        shutil.rmtree(self.remote / "snapshots" / names[0])
+        recovered = self.run_script("backup.sh", check=False)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(self.verify_state()["remote_pending"].strip(), "")
+        self.assertEqual(self.verify_state()["result"], "passed")
+        self.assertIn(
+            f"Deep check: {names[0]} is no longer on REMOTE; removed from the retry list",
+            recovered.stderr)
+
+    def test_deep_check_listing_failure_keeps_remote_pending(self):
+        names = self.seed_verification(2)
+        self.run_script("backup.sh")
+        shutil.rmtree(self.backups / "snapshots" / names[0])
+        self.silently_corrupt(self.remote / "snapshots" / names[0] / "annotations.db")
+        self.make_verify_due()
+        self.assertNotEqual(self.run_script("backup.sh", check=False).returncode, 0)
+        self.assertEqual(self.verify_state()["remote_pending"].strip(), names[0])
+        shutil.rmtree(self.remote / "snapshots" / names[0])
+        real_rsync = shutil.which("rsync")
+        self.shim("rsync", f'''\
+for arg in "$@"; do
+    if [[ $arg == --list-only && ${{*: -1}} == */snapshots/ ]]; then exit 1; fi
+done
+exec {real_rsync} "$@"
+''')
+        retry = self.run_script("backup.sh", check=False)
+        self.assertNotEqual(retry.returncode, 0)
+        self.assertIn("Deep check FAILED remote: cannot list snapshots", retry.stderr)
+        self.assertEqual(self.verify_state()["remote_pending"].strip(), names[0])
+        self.assertEqual(self.verify_state()["result"], "failed")
+        self.assertNotIn("removed from the retry list", retry.stderr)
 
     def test_deep_check_rejects_unlisted_files_and_reports_status_everywhere(self):
         names = self.seed_verification(2)
