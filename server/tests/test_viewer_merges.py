@@ -82,6 +82,27 @@ class ViewerMerges(unittest.TestCase):
     def split(self, key):
         return self.client.post(f"/trip/{key}/split", data={"csrf_token": "test-csrf", "confirm": "yes"})
 
+    def test_duplicate_month_notice_does_not_block_merge(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        try:
+            (self.data / "2026-05").symlink_to(self.month, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        trips, unreadable = self.viewer.load_trips()
+        first = next(t for t in trips if t["trip_key"] == a)
+        candidate, reason = self.viewer.trip_merges.next_trip(first, trips, unreadable)
+        self.assertEqual(candidate["trip_key"] if candidate else None, b, reason)
+        self.assertEqual(unreadable[0]["folder_reason"], "duplicate")
+        self.assertEqual(self.viewer.year_figures(trips, unreadable)["unreadable"], 0)
+        # A notice remains harmless even if its display text changes.
+        unreadable[0]["problem"] = "display text only"
+        self.assertEqual(self.viewer.trip_merges.next_trip(first, trips, unreadable)[0]["trip_key"], b)
+        response = self.client.post("/admin/year/2026/close", data={"csrf_token": "test-csrf", "confirm": "yes"})
+        self.assertEqual(response.status_code, 302)
+        with closing(sqlite3.connect(self.db)) as conn:
+            saved = json.loads(conn.execute("SELECT snapshot FROM tax_years WHERE year=2026").fetchone()[0])
+        self.assertEqual(saved["unreadable"], 0)
+
     def test_escaping_merge_source_symlinks_make_the_merge_unreadable(self):
         a, b = self.trip("a", 0), self.trip("b", 180, .01)
         key = self.merged_key(self.merge(a, b))

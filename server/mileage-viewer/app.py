@@ -48,6 +48,7 @@ Authentication:
 """
 
 import csv
+import errno
 import hmac
 import io
 import ipaddress
@@ -906,6 +907,64 @@ def _month_trip_names(checked_month):
     return [path.name for path in checked_month.iterdir()]
 
 
+FOLDER_PROBLEMS = {
+    "outside": "the folder links outside the data folder",
+    "dangling": "the folder link target is missing",
+    "loop": "the folder link forms a loop",
+    "unreadable": "the folder could not be read",
+    "duplicate": "the folder is a link to another folder that is already counted",
+}
+
+
+def _month_link_problem(month, root):
+    # stat reports ELOOP consistently even where Path.resolve changed behavior.
+    # This probes metadata only; no target is listed or opened here.
+    try:
+        mode = month.lstat().st_mode
+    except OSError:
+        return "unreadable"
+    if not stat.S_ISLNK(mode):
+        return None
+    try:
+        month.stat()
+    except OSError as exc:
+        return {errno.ELOOP: "loop", errno.ENOENT: "dangling"}.get(exc.errno, "unreadable")
+    try:
+        target = month.resolve()
+    except (OSError, RuntimeError):
+        return "unreadable"
+    if target == root or target in root.parents:
+        return "ancestor"
+    return None
+
+
+def _month_sort_key(month):
+    try:
+        return month.is_symlink(), month.name
+    except OSError:
+        # Let the scan report an unavailable entry instead of failing the page.
+        return False, month.name
+
+
+def folder_description(entry):
+    if entry["folder_reason"] == "duplicate":
+        return f"is a link to {entry['counted_as']}/, whose trips are counted there"
+    return entry["problem"]
+
+
+def folder_hint(entry, role):
+    if role != "admin":
+        return "Please ask the admin to fix it."
+    if entry["folder_reason"] == "duplicate":
+        return "Remove the extra link."
+    if entry["folder_reason"] == "unreadable":
+        return "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only."
+    return "Replace the link with the real folder, or mount the other disk at that path."
+
+
+app.jinja_env.globals.update(folder_hint=folder_hint, folder_description=folder_description)
+
+
 def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None):
     """Scan DATA_ROOT for trips and join annotations.
 
@@ -915,6 +974,7 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
     trips whose summary read_summary() rejected or couldn't find, sorted
     by trip_key, retaining usable device/start identity but no mileage, plus
     problem. Their miles are unknown, so they're reported, never counted.
+    Duplicate folder notices also live here; their trips are counted elsewhere.
 
     Trips the admin removed from the log are left out of both lists. With
     include_removed (the admin's views) they stay, each carrying a "removal"
@@ -932,11 +992,16 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
         json_paths = []
         refused_months = set()
 
-        def refuse_month(ym, problem="the folder links outside the data folder"):
+        def refuse_month(ym, reason="outside", counted_as=None):
             if ym not in refused_months:
                 refused_months.add(ym)
+                problem = FOLDER_PROBLEMS.get(reason)
+                if reason == "ancestor":
+                    reason = "outside"
+                    problem = "the folder link points at the data folder itself or above it"
                 unreadable.append({"folder": True, "ym": ym, "id": "", "trip_key": f"{ym}/",
                                    "has_gpx": False, "problem": problem,
+                                   "folder_reason": reason, "counted_as": counted_as,
                                    "refused_file": "folder", "problem_file": "folder"})
 
         # Only month names are trip identities accepted by the routes. Ignore
@@ -945,10 +1010,14 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
             months = [path for path in DATA_ROOT.iterdir() if trip_merges.YM_RE.fullmatch(path.name)]
         except OSError:
             months = []
-        counted_directories = set()
+        counted_directories = {}
         # Prefer real month directories to preserve their annotation keys;
         # link-only targets use the first month name in sorted order.
-        for month in sorted(months, key=lambda path: (path.is_symlink(), path.name)):
+        for month in sorted(months, key=_month_sort_key):
+            cause = _month_link_problem(month, root)
+            if cause:
+                refuse_month(month.name, cause)
+                continue
             try:
                 checked_month = trip_merges.checked_path(root, month)
             except ValueError:
@@ -958,13 +1027,13 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                 if not stat.S_ISDIR(checked_month.stat().st_mode):
                     continue
                 if checked_month in counted_directories:
-                    refuse_month(month.name, "the folder is a link to another folder that is already counted")
+                    refuse_month(month.name, "duplicate", counted_directories[checked_month])
                     continue
                 names = _month_trip_names(checked_month)
             except OSError:
-                refuse_month(month.name, "the folder could not be read")
+                refuse_month(month.name, "unreadable")
                 continue
-            counted_directories.add(checked_month)
+            counted_directories[checked_month] = month.name
             for name in names:
                 path = Path(name)
                 if path.suffix in (".json", ".gpx"):
@@ -1708,7 +1777,8 @@ def year_figures(members, unreadable):
     counts["all"] = len(members)
     for trip in members:
         counts[trip.get("category") if trip.get("category") in CATEGORIES else "unclassified"] += 1
-    return {"trips": len(members), "unreadable": len(unreadable), "totals": totals, "counts": counts,
+    # A duplicate alias loses no mileage, so it is not missing at year close.
+    return {"trips": len(members), "unreadable": sum(t.get("folder_reason") != "duplicate" for t in unreadable), "totals": totals, "counts": counts,
             "trip_keys": sorted(t["trip_key"] for t in members)}
 
 
@@ -2235,15 +2305,17 @@ LIST_HTML = """
 <div class="wrap">
   {% if unreadable %}
   <div class="warn" role="alert">
-    <b>{{ unreadable|rejectattr("folder")|list|length }} trip file(s) can't be read.{% set folders = unreadable|selectattr("folder")|list %}{% if folders %} {{ folders|length }} month folder(s) can't be read.{% endif %}</b>
+    {% set missing = unreadable|rejectattr('folder_reason', 'equalto', 'duplicate')|list %}
+    {% if missing %}<b>{{ missing|rejectattr("folder")|list|length }} trip file(s) can't be read.{% set folders = missing|selectattr("folder")|list %}{% if folders %} {{ folders|length }} month folder(s) can't be read.{% endif %}</b>
     Their miles can't be counted, so the totals below may be short. The
     exports list these trips as unreadable, without miles. To rebuild a
     damaged summary from its GPX, see DEPLOY_DEBIAN.md → Troubleshooting.
+    {% endif %}
     <ul>
       {% for u in unreadable %}
       {% if u.get('folder') %}
-      <li><code>{{ u.trip_key }}</code> (month folder): {{ u.problem }}; none of its trips are shown or counted.
-        {% if g.role == 'admin' %}{% if 'already counted' in u.problem %}Remove the duplicate folder link.{% else %}Replace the link with the real folder, or mount the other disk at that path.{% endif %}{% else %}Please ask the admin to fix it.{% endif %}
+      <li><code>{{ u.trip_key }}</code> (month folder): {{ folder_description(u) }}{% if u.folder_reason != 'duplicate' %}; none of its trips are shown or counted.{% endif %}
+        {{ folder_hint(u, g.role) }}
       </li>
       {% else %}
       <li><code>{% if u.get('parts') %}{{ u.gpx_file }}{% else %}{{ u.trip_key }}.{{ u.get('problem_file') or 'json' }}{% endif %}</code>{% if not u.get('parts') and u.get('refused_file') == 'gpx' and u.get('problem_file') == 'json' %} (its GPX links outside the data folder){% elif not u.has_gpx and (u.get('parts') or not u.get('refused_file')) %} (no GPX either){% endif %}: {{ u.problem }}
@@ -3186,11 +3258,12 @@ gap that was uploaded after the merge is counted a second time. Open the merged 
 </section>
 
 <section aria-labelledby="unreadable-heading">
-<h2 id="unreadable-heading">Trips whose files can't be read ({{ unreadable|length }})</h2>
-<p class="muted">Their miles can't be counted, so the totals above may be short.</p>
+{% set missing = unreadable|rejectattr('folder_reason', 'equalto', 'duplicate')|list %}
+<h2 id="unreadable-heading">Trips whose files can't be read ({{ missing|length }}) and folder notices</h2>
+{% if missing %}<p class="muted">Their miles can't be counted, so the totals above may be short.</p>{% endif %}
 <div class="review-table"><table>
 <thead><tr><th>Trip</th><th>Problem</th></tr></thead>
-<tbody>{% for t in unreadable %}<tr><td>{{ trip_link(t) }}{% if not t.get('folder') and not t.get('parts') %} <code>{{ t.trip_key }}.{{ t.get('problem_file') or 'json' }}</code>{% if t.get('refused_file') == 'gpx' and t.get('problem_file') == 'json' %} (its GPX links outside the data folder){% endif %}{% endif %}</td><td>{{ t.problem }}</td></tr>
+<tbody>{% for t in unreadable %}<tr><td>{{ trip_link(t) }}{% if not t.get('folder') and not t.get('parts') %} <code>{{ t.trip_key }}.{{ t.get('problem_file') or 'json' }}</code>{% if t.get('refused_file') == 'gpx' and t.get('problem_file') == 'json' %} (its GPX links outside the data folder){% endif %}{% endif %}</td><td>{% if t.get("folder") %}{{ folder_description(t) }}. {{ folder_hint(t, g.role) }}{% else %}{{ t.problem }}{% endif %}</td></tr>
 {% else %}<tr><td colspan="2" class="muted">All trip files can be read.</td></tr>{% endfor %}</tbody>
 </table></div>
 </section>
@@ -3939,7 +4012,10 @@ def _unreadable_values(t):
     unknown, so they stay blank rather than reading as zero.
     """
     if t.get("folder"):
-        return {name: t["trip_key"] if name == "trip_id" else "" for name in UNREADABLE_COLUMNS}
+        values = dict.fromkeys(UNREADABLE_COLUMNS, "")
+        values["trip_id"] = t["trip_key"]
+        values["purpose_note"] = folder_description(t) + ". " + folder_hint(t, g.role)
+        return values
     return {
         "trip_id": t.get("trip_id") or t["id"],
         "gpx_file": t.get("gpx_file") or (f"{t['id']}.gpx" if t["has_gpx"] else ""),
@@ -3963,7 +4039,7 @@ def export_csv():
     for t in unreadable:
         values = _unreadable_values(t)
         writer.writerow(
-            [_csv_safe(values.get(name, "")) for name, _ in EXPORT_COLUMNS] + ["unreadable_folder" if t.get("folder") else "unreadable", ""]
+            [_csv_safe(values.get(name, "")) for name, _ in EXPORT_COLUMNS] + ["folder_notice" if t.get("folder_reason") == "duplicate" else "unreadable_folder" if t.get("folder") else "unreadable", ""]
         )
     for category, miles in mileage_totals(trips).items():
         # Keep the CSV rectangular and mark totals explicitly, so consumers
