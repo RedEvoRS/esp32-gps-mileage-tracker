@@ -494,6 +494,22 @@ exec {real_sha} "$@"
         self.assertFalse(ping.exists())
         self.assertEqual(len(self.snapshots()), 1)
 
+    def test_native_checksum_tool_round_trips_or_fails_loudly(self):
+        path = self.data / "line\nbreak.gpx"
+        path.write_text("trip")
+        listing = subprocess.run(["sha256sum", path.name], cwd=self.data,
+                                 capture_output=True, check=True).stdout
+        probe = subprocess.run(["sha256sum", "--strict", "-c"], cwd=self.data,
+                               input=listing, capture_output=True)
+        result = self.run_script("backup.sh", check=False)
+        if probe.returncode == 0:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.run_script("restore.sh", "check")
+        else:
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("sha256sum cannot read back escaped filenames", result.stderr)
+            self.assertFalse((self.backups / "last-success").exists())
+
     def test_snapshot_passes_v116_restore_check(self):
         self.run_script("backup.sh")
         legacy = self.tmp / "v116"

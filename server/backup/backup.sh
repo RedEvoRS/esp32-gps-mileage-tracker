@@ -180,6 +180,12 @@ if [[ $checksum_escapes == no ]] && grep -q "^\\\\" "$work/SHA256SUMS"; then
     die "sha256sum cannot read back escaped filenames in SHA256SUMS; GNU coreutils is required. Backup has not completed."
 fi
 
+# Check the writer's filename inventory too, without rehashing file contents.
+if ! cmp -s <(manifest_paths "$work/SHA256SUMS" | LC_ALL=C sort -z) \
+        <(cd "$work" && find . -type f ! -path ./SHA256SUMS ! -path ./INFO -print0 | LC_ALL=C sort -z); then
+    die "sha256sum wrote an unreadable filename list in SHA256SUMS; GNU coreutils is required. Backup has not completed."
+fi
+
 # Preserve changes in discovery status even if the database/file bytes match.
 if [[ -n $prev && $LINKS_NOT_BACKED_UP =~ ^[0-9]+$ && $link_manifest_error == 0 ]] \
         && cmp -s "$work/SHA256SUMS" "$SNAPSHOTS/$prev/SHA256SUMS" \
