@@ -1,6 +1,7 @@
 """Viewer response headers and login redirect safety (2026-10-23 audit)."""
 
 import builtins
+import errno
 import io
 import os
 import json
@@ -124,7 +125,8 @@ class ViewerHardeningTests(unittest.TestCase):
         self.assertEqual((refused.status_code, refused.data, refused.content_type),
                          (unknown.status_code, unknown.data, unknown.content_type))
 
-    def assert_unreadable_folder(self, key, target):
+    def assert_unreadable_folder(self, key, target, reason="outside"):
+        problem = self.viewer.FOLDER_PROBLEMS[reason]
         self.signed_in("admin")
         with patch.object(self.viewer, "read_summary", side_effect=AssertionError("outside read")), \
                 patch.object(self.viewer, "_summary_stamp", side_effect=AssertionError("outside stat")):
@@ -136,7 +138,8 @@ class ViewerHardeningTests(unittest.TestCase):
             self.assertEqual(folder["trip_key"], "2026-01/")
             self.assertEqual(folder["refused_file"], "folder")
             self.assertEqual(folder["problem_file"], "folder")
-            self.assertEqual(folder["problem"], "the folder links outside the data folder")
+            self.assertEqual(folder["problem"], problem)
+            self.assertEqual(folder["folder_reason"], reason)
             with patch.object(self.viewer.os.path, "lexists", side_effect=AssertionError("unsafe presence probe")), \
                     self.viewer._trip_read(trip_key=key) as (_, targeted, damaged):
                 self.assertEqual(targeted, [])
@@ -176,10 +179,10 @@ class ViewerHardeningTests(unittest.TestCase):
                         rows = list(csv.DictReader(io.StringIO(text)))
                         row = next(r for r in rows if r["row_type"] == "unreadable_folder")
                         self.assertEqual(row["trip_id"], "2026-01/")
-                        self.assertTrue(all(not v for k, v in row.items() if k not in ("trip_id", "row_type")))
+                        self.assertTrue(all(not v for k, v in row.items() if k not in ("trip_id", "row_type", "purpose_note")))
                     elif route == "/" or route.startswith("/admin/year/"):
                         self.assertIn("2026-01/", text)
-                        self.assertIn("the folder links outside the data folder", text)
+                        self.assertIn(problem, text)
                         self.assertNotIn("2026-01/drive", text)
                         self.assertNotIn('/trip/2026-01/', text)
                         if route == "/":
@@ -228,6 +231,52 @@ class ViewerHardeningTests(unittest.TestCase):
         self.viewer.DATA_ROOT.rename(self.viewer.DATA_ROOT.with_name("vanished"))
         self.assertEqual(self.viewer.load_trips(), ([], []))
 
+    def test_month_link_causes_and_hints(self):
+        root = self.viewer.DATA_ROOT
+        cases = (("missing-inside", root / "missing", "dangling", "the folder link target is missing"),
+                 ("missing-outside", self.db.parent / "missing", "dangling", "the folder link target is missing"),
+                 ("loop", root / "2027-02", "loop", "the folder link forms a loop"),
+                 ("root", root, "outside", "the folder link points at the data folder itself or above it"),
+                 ("parent", root.parent, "outside", "the folder link points at the data folder itself or above it"))
+        for label, target, reason, problem in cases:
+            with self.subTest(cause=label):
+                link = root / "2027-02"
+                self.symlink(link, target, directory=True)
+                try:
+                    entry = self.viewer.load_trips()[1][0]
+                    self.assertEqual(entry["folder_reason"], reason)
+                    self.assertEqual(entry["problem"], problem)
+                    for role in ("admin", "editor"):
+                        client = self.signed_in(role, self.viewer.app.test_client())
+                        for route in ("/", "/export.csv", "/export.xlsx") + (("/admin/year/2027",) if role == "admin" else ()):
+                            response = client.get(route)
+                            if route.endswith("xlsx"):
+                                book = load_workbook(io.BytesIO(response.data))
+                                text = str(list(book["Unreadable trips"].values))
+                                book.close()
+                            else:
+                                text = response.get_data(as_text=True)
+                            self.assertIn(problem, text)
+                            self.assertIn("mount the other disk" if role == "admin" else "ask the admin", text)
+                            response.close()
+                finally:
+                    link.unlink()
+
+    def test_real_month_metadata_errors_are_unreadable(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        original = Path.stat
+        for operation in ("stat", "lstat"):
+            def failing(path, *args, operation=operation, **kwargs):
+                if path == month and (operation == "lstat" or kwargs.get("follow_symlinks", True)):
+                    raise OSError(errno.EIO, "synthetic metadata failure")
+                return original(path, *args, **kwargs)
+
+            with self.subTest(operation=operation), patch.object(Path, "stat", failing):
+                trips, unreadable = self.viewer.load_trips()
+            self.assertEqual(trips, [])
+            self.assertEqual(unreadable[0]["folder_reason"], "unreadable")
+            self.assertEqual(unreadable[0]["problem"], "the folder could not be read")
+
     def test_vanished_month_is_reported_and_other_month_loads(self):
         month = self.viewer.DATA_ROOT / "2026-01"
         other = self.viewer.DATA_ROOT / "2026-02"
@@ -257,11 +306,22 @@ class ViewerHardeningTests(unittest.TestCase):
         self.assertEqual([t["trip_key"] for t in trips], ["2026-01/drive"])
         self.assertEqual([t["trip_key"] for t in unreadable], ["2026-02/"])
         self.assertEqual(unreadable[0]["problem"], "the folder could not be read")
+        self.assertEqual(unreadable[0]["folder_reason"], "unreadable")
         self.signed_in("admin")
         for route in ("/", "/export.csv", "/export.xlsx"):
             response = self.client.get(route)
             self.assertEqual(response.status_code, 200)
+            if route.endswith("xlsx"):
+                book = load_workbook(io.BytesIO(response.data))
+                text = str(list(book["Unreadable trips"].values))
+                book.close()
+            else:
+                text = response.get_data(as_text=True)
+            self.assertIn("owner and permissions", text)
+            self.assertIn("UID 1000", text)
             response.close()
+        review = self.client.get("/admin/year/2026").get_data(as_text=True)
+        self.assertIn("owner and permissions", review)
 
     @unittest.skipUnless(os.scandir in os.supports_fd and hasattr(os, "O_NOFOLLOW"), "requires no-follow directory handles")
     def test_month_swapped_before_listing_never_lists_outside(self):
@@ -355,6 +415,10 @@ class ViewerHardeningTests(unittest.TestCase):
             client = self.signed_in(role, self.viewer.app.test_client())
             page = client.get("/").get_data(as_text=True)
             self.assertIn(key, page)
+            self.assertNotIn("totals below may be short", page)
+            self.assertNotIn("none of its trips are shown or counted", page)
+            self.assertIn("whose trips are counted there", page)
+            self.assertIn("Remove the extra link" if role == "admin" else "ask the admin", page)
             self.assertIn("example", page)
             self.assertNotIn(f'/trip/{alias}/drive', page)
             import csv
@@ -362,17 +426,23 @@ class ViewerHardeningTests(unittest.TestCase):
             self.assertEqual(len([r for r in rows if r["row_type"] == "trip"]), 1)
             self.assertEqual([float(r["distance_miles"]) for r in rows
                               if r["row_type"] == "total" and r["category"] == "all"], [1])
-            self.assertEqual([r["trip_id"] for r in rows if r["row_type"] == "unreadable_folder"], [alias + "/"])
+            self.assertEqual([r["trip_id"] for r in rows if r["row_type"] == "folder_notice"], [alias + "/"])
             book = load_workbook(io.BytesIO(client.get("/export.xlsx").data))
             self.assertEqual(book["Mileage"].max_row, 2)
             self.assertEqual([r[3] for r in book["Totals"].values if r[2] == "all"], [1])
             self.assertEqual(book["Unreadable trips"].max_row, 2)
+            self.assertIn("whose trips are counted there", str(list(book["Unreadable trips"].values)))
+            notice = next(r for r in rows if r["row_type"] == "folder_notice")
+            self.assertIn("whose trips are counted there", notice["purpose_note"])
+            self.assertNotIn("missing", notice["purpose_note"])
             self.assertIn(alias + "/", str(list(book["Unreadable trips"].values)))
             book.close()
         self.signed_in("admin")
         for year in (int(alias[:4]) - 1, int(alias[:4])):
             page = self.client.get(f"/admin/year/{year}").get_data(as_text=True)
             self.assertEqual(page.count(f"<code>{alias}/</code> (month folder)"), 1)
+            self.assertNotIn("totals above may be short", page)
+            self.assertIn("whose trips are counted there", page)
         page = self.client.get("/admin/year/2026").get_data(as_text=True)
         self.assertIn("<td>all</td><td>1</td><td>1.000</td>", page)
 
@@ -427,7 +497,7 @@ class ViewerHardeningTests(unittest.TestCase):
             file.unlink()
         month.rmdir()
         self.symlink(month, target, directory=True)
-        self.assert_unreadable_folder("2026-01/missing", target)
+        self.assert_unreadable_folder("2026-01/missing", target, reason="dangling")
 
     def test_linked_month_does_not_break_other_pages_or_merge_guard(self):
         month = self.viewer.DATA_ROOT / "2026-01"
