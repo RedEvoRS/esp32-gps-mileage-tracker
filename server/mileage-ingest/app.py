@@ -650,6 +650,11 @@ def upload_trip():
                 return jsonify({"error": "trip ID exists in multiple month directories"}), 409
             if existing_dirs:
                 target_dir = existing_dirs[0]
+            elif target_dir.is_symlink() and _checked_trip_path(root, target_dir).name != target_dir.name:
+                # A new trip must land in the folder named for its month. A link
+                # to a folder with another name would file it under that
+                # folder's month in the viewer (#727).
+                raise LinkedMonthError(target_dir.name)
             target_dir, gpx_file, json_file = _trip_paths(root, target_dir, safe_id)
             target_dir.mkdir(parents=True, exist_ok=True)
             _sync_directory(root)

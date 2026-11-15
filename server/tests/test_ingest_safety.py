@@ -186,6 +186,26 @@ class UploadSafety(unittest.TestCase):
         self.assertEqual(retry.json["stored_as"], first.json["stored_as"])
         self.assertEqual(sorted(p.name for p in (self.root / month).iterdir()), before)
 
+    def test_new_trip_into_aliased_month_refuses(self):
+        # #727: a new trip whose month folder links to another month folder
+        # would be filed, and shown, under that other month.
+        real = self.root / "2026-03"
+        real.mkdir()
+        self.symlink(self.root / "2026-04", real, directory=True)
+        with self.assertLogs(self.ing.app.logger, "ERROR"):
+            response = self.upload()
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("month folder 2026-04", response.json["error"])
+        self.assertEqual(list(real.iterdir()), [])
+
+    def test_new_trip_into_same_named_internal_link_is_stored(self):
+        archive = self.root / "archive" / "2026-04"
+        archive.mkdir(parents=True)
+        self.symlink(self.root / "2026-04", archive, directory=True)
+        response = self.upload()
+        self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+        self.assertTrue(any(p.suffix == ".gpx" for p in archive.iterdir()))
+
     def test_dangling_outside_month_link_refuses(self):
         with tempfile.TemporaryDirectory() as outside:
             self.symlink(self.root / "2026-03", Path(outside) / "missing", directory=True)
