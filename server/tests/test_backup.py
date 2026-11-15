@@ -543,7 +543,41 @@ class BackupScripts(unittest.TestCase):
         self.assertEqual(self.verify_state()["remote_pending"].strip(), names[0])
         self.assertEqual(list(self.backups.glob(".verify-state.*")), [])
         retry = self.run_script("backup.sh", check=False)
+        self.assertNotEqual(retry.returncode, 0)
         self.assertIn(f"FAILED remote-only {names[0]}", retry.stderr)
+        self.assertEqual(self.verify_state()["remote_pending"].strip(), names[0])
+
+        shutil.rmtree(self.remote / "snapshots" / names[0])
+        recovered = self.run_script("backup.sh", check=False)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(self.verify_state()["remote_pending"].strip(), "")
+        self.assertEqual(self.verify_state()["result"], "passed")
+        self.assertIn(
+            f"Deep check: {names[0]} is no longer on REMOTE; removed from the retry list",
+            recovered.stderr)
+
+    def test_deep_check_listing_failure_keeps_remote_pending(self):
+        names = self.seed_verification(2)
+        self.run_script("backup.sh")
+        shutil.rmtree(self.backups / "snapshots" / names[0])
+        self.silently_corrupt(self.remote / "snapshots" / names[0] / "annotations.db")
+        self.make_verify_due()
+        self.assertNotEqual(self.run_script("backup.sh", check=False).returncode, 0)
+        self.assertEqual(self.verify_state()["remote_pending"].strip(), names[0])
+        shutil.rmtree(self.remote / "snapshots" / names[0])
+        real_rsync = shutil.which("rsync")
+        self.shim("rsync", f'''\
+for arg in "$@"; do
+    if [[ $arg == --list-only && ${{*: -1}} == */snapshots/ ]]; then exit 1; fi
+done
+exec {real_rsync} "$@"
+''')
+        retry = self.run_script("backup.sh", check=False)
+        self.assertNotEqual(retry.returncode, 0)
+        self.assertIn("Deep check FAILED remote: cannot list snapshots", retry.stderr)
+        self.assertEqual(self.verify_state()["remote_pending"].strip(), names[0])
+        self.assertEqual(self.verify_state()["result"], "failed")
+        self.assertNotIn("removed from the retry list", retry.stderr)
 
     def test_deep_check_rejects_unlisted_files_and_reports_status_everywhere(self):
         names = self.seed_verification(2)

@@ -1585,6 +1585,13 @@ first, then forces a deep check, even if not due or periodic checks are off.
 Repeat named checks for other affected snapshots; the rotating check samples
 history rather than checking every retained snapshot in one run.
 
+If a damaged snapshot exists only off-host, there is no local copy to repair it
+from. Check other snapshots with `bash ~/mileage-tracker/backup/restore.sh check <snapshot-name>`
+before deciding what to keep. If the damaged snapshot cannot be repaired, delete
+that snapshot's folder on the destination. The next backup removes it from the
+retry list once it can list the destination's snapshots; other failures still
+need attention.
+
 **Mark the destination.** A backup copies there only if the folder holds a
 file named `.mileage-backup-target`. `install.sh` writes it when it sets up
 backups; if you set them up by hand, write it once now, after checking that
