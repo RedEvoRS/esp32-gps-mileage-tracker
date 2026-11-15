@@ -2814,11 +2814,12 @@ partial matches, changed files or unreadable parts remain damaged merges,
 counted as missing in year review and close snapshots, with uncertain merge
 suggestions blocked and no **Undo saved merge**. Neither role can use ordinary
 **Undo merge (split back)** on damage. Only the admin can **Discard damaged
-merge**, after confirming that originals cannot be restored from the viewer
-and the saved miles and purpose will leave the log. Recover files from backups
-instead. Before deletion, the same transaction saves the complete summary,
+merge**, after confirming that parts with readable summaries return separately with
+annotations saved under their names; parts without readable summaries do not.
+The merged trip's saved miles and purpose leave the totals and are kept in history. Before deletion, the same transaction saves the complete summary,
 annotation and part keys in history. **Discarded damaged merges** in the year
-review permanently shows saved miles, purpose, date and login, even after closing.
+review permanently shows saved miles, purpose, date and login, and which parts
+are now counted again, separately or in a current merge, even after closing.
 The deliberate discard confirmation and visible record allow closing without
 another acknowledgement; reopen any affected closed year before discarding.
 Healthy merge undo is unchanged for both roles. An unused-name notice adds

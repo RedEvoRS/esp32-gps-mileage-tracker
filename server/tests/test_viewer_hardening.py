@@ -622,8 +622,13 @@ class ViewerHardeningTests(unittest.TestCase):
             self.signed_in(role)
             message = self.viewer.folder_message(entry, role)
             self.assertIn('Saved merge: 0.732 mi; purpose: business.', message)
-            self.assertIn('The original trips cannot be restored from the viewer; restore the files from backups.', message)
-            self.assertIn('Or use Discard damaged merge:' if role == 'admin' else 'Please ask the admin', message)
+            effect = ('Parts whose trip summaries can still be read return as separate trips with the annotations saved under their names. '
+                      'Parts without readable summaries do not return. '
+                      "The merged trip's saved miles and purpose leave the totals and are kept in history and the year review.")
+            self.assertEqual(message, 'A merge part is missing or unreadable. Saved merge: 0.732 mi; purpose: business. '
+                             'Its saved miles are not in the totals. Restore missing or unreadable files from backups. '
+                             + ('Or use Discard damaged merge. ' if role == 'admin' else
+                                'Please ask the admin to restore the files or discard this damaged merge. ') + effect)
             with patch.object(self.viewer, '_load_trips', return_value=([], [entry])):
                 for path, texts in self.folder_surface_messages(self.client, include_review=role == 'admin').items():
                     self.assertTrue(any(message in text for text in texts), (role, path))

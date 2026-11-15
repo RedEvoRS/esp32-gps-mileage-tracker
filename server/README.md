@@ -997,12 +997,14 @@ remain damaged merges: they count as missing mileage, appear in year review
 and close snapshots, block uncertain merge suggestions, and cannot be undone
 through **Undo saved merge**. Ordinary **Undo merge (split back)** is also
 refused for damage, for both roles. The admin can use **Discard damaged merge**
-after confirming that the viewer cannot restore the originals and the saved
-miles and purpose will leave the log; recover files from backups instead.
+after confirming that parts with readable summaries return separately with
+annotations saved under their names; parts without readable summaries do not.
+The merged trip's saved miles and purpose leave the totals and are kept in history.
 The same transaction preserves the complete saved summary, annotation and
 part keys in history before deleting the merge. The year review permanently
 lists the saved miles, purpose, date and login under **Discarded damaged merges**,
-including after closing. This deliberate confirmation and visible record are
+including which parts are now counted again, on their own or in a current merge.
+This remains visible after closing. This deliberate confirmation and visible record are
 enough to allow closing; there is no second acknowledgement. Reopen a closed
 year before discarding. Healthy merge undo remains available to both roles.
 An unused-name notice adds no saved miles or

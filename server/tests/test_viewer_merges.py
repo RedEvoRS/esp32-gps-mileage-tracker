@@ -138,8 +138,7 @@ class ViewerMerges(unittest.TestCase):
         page = html.unescape(self.client.get('/').get_data(as_text=True))
         self.assertNotIn('>Undo merge (split back)</button>', page)
         self.assertIn('>Discard damaged merge</button>', page)
-        self.assertIn('The original trips cannot be restored from the viewer; backups are needed to get the files back.', page)
-        self.assertIn('its saved miles and purpose will leave the log', page)
+        self.assertIn(self.viewer.DAMAGED_MERGE_DISCARD_EFFECT, page)
         self.assertEqual(self.client.get(f'/admin/damaged-merge/{key}/discard').status_code, 405)
         self.assertEqual(self.discard(key, csrf_token='bad').status_code, 400)
         self.assertEqual(self.discard(key, confirm='no').status_code, 400)
@@ -182,17 +181,80 @@ class ViewerMerges(unittest.TestCase):
         review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
         self.assertIn('Discarded damaged merges (1)', review)
         self.assertIn(f"{json.loads(summary)['distance_miles']:.3f} mi", review)
-        self.assertIn('business; merged note', review)
+        self.assertIn('purpose: business; purpose note: merged note', review)
         self.assertIn('driver', review)
         self.assertIn(self.viewer.fmt_date(row[3]), review)
-        self.assertIn('The original trips were not restored', review)
+        self.assertIn('None of its trips are in the log; these saved miles are not in the totals.', review)
         self.assertNotIn('Discarded damaged merges', self.client.get('/admin/year/2025').get_data(as_text=True))
         self.assertIn(2026, [r['year'] for r in self.viewer._year_list()])
         self.assertEqual(self.close_year().status_code, 302)
         self.assertIn('Discarded damaged merges (1)', self.client.get('/admin/year/2026').get_data(as_text=True))
         history = self.client.get('/admin/history').get_data(as_text=True)
         self.assertIn('Damaged merge discarded', history)
-        self.assertIn('Original trips were not restored.', history)
+        self.assertIn("The merged trip's saved miles and purpose were removed from the totals and kept in this history record.",
+                      html.unescape(history))
+
+    def discard_with_readable_parts(self, missing_summaries=()):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        self.annotate(a, 'personal', 'original note')
+        key = self.merged_key(self.merge(a, b))
+        self.annotate(key, 'business', 'merged note')
+        (self.month / 'b.gpx').unlink()
+        for name in missing_summaries:
+            (self.month / (name + '.json')).unlink()
+        self.assertEqual(self.discard(key).status_code, 302)
+        return key
+
+    def assert_discard_current_statement(self, statement):
+        with closing(sqlite3.connect(self.db)) as conn:
+            rows = self.viewer._discarded_merge_rows(conn, 2026, self.viewer.load_trips()[0])
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        expected = (f"Damaged merge discarded. Saved miles: 0.732 mi; purpose: business; purpose note: merged note; "
+                    f"trip date: 2026-04-14 12:00 UTC. Recorded at: {self.viewer.fmt_date(row['at'])}; login: driver. "
+                    + statement)
+        self.assertEqual(self.viewer.merge_history_message(row), expected)
+        review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
+        self.assertIn(expected, review)
+        self.assertNotIn('Saved miles (excluded)', review)
+
+    def test_discard_with_all_summaries_readable_reports_both_counted_again(self):
+        self.discard_with_readable_parts()
+        self.assert_discard_current_statement(
+            'Now counted again: 2026-04/a, 2026-04/b; do not add these saved miles by hand.')
+        trips, _ = self.viewer.load_trips()
+        self.assertEqual({t['trip_key']: t['category'] for t in trips}, {'2026-04/a': 'personal', '2026-04/b': ''})
+
+    def test_discard_with_one_summary_readable_reports_mixed_membership(self):
+        self.discard_with_readable_parts(('b',))
+        self.assert_discard_current_statement(
+            'Now counted again: 2026-04/a; do not add these saved miles by hand. Not currently counted: 2026-04/b.')
+
+    def test_discard_with_no_summaries_readable_reports_none_counted(self):
+        self.discard_with_readable_parts(('a', 'b'))
+        self.assert_discard_current_statement('None of its trips are in the log; these saved miles are not in the totals.')
+
+    def test_discard_then_restore_and_remerge_reports_parts_inside_current_merge(self):
+        key, parts, _ = self.damaged_merge()
+        self.assertEqual(self.discard(key).status_code, 302)
+        self.month.mkdir()
+        self.trip('a', 0)
+        self.trip('b', 180, .01)
+        merged = self.merged_key(self.merge(*parts))
+        self.annotate(merged, 'business', 'merged note')
+        self.assert_discard_current_statement(
+            f'Now counted again: 2026-04/a (inside {merged}), 2026-04/b (inside {merged}); '
+            'do not add these saved miles by hand.')
+
+    def test_history_count_computation_is_absent_on_list_and_reviews_without_records(self):
+        self.trip('a', 0)
+        with patch.object(self.viewer, '_merge_history_counted_parts', side_effect=AssertionError('unexpected work')):
+            self.assertEqual(self.client.get('/').status_code, 200)
+            self.assertEqual(self.client.get('/admin/year/2026').status_code, 200)
+        self.discard_with_readable_parts()
+        with patch.object(self.viewer, '_merge_history_counted_parts', side_effect=AssertionError('unexpected work')):
+            self.assertEqual(self.client.get('/').status_code, 200)
+            self.assertEqual(self.client.get('/admin/year/2025').status_code, 200)
 
     def test_discard_and_history_roll_back_together_if_deletion_fails(self):
         key, parts, _ = self.damaged_merge()

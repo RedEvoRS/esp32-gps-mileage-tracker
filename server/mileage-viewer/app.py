@@ -1096,6 +1096,13 @@ def folder_hint(entry, role):
     return "Replace the link with the real folder, or mount the other disk at that path."
 
 
+DAMAGED_MERGE_DISCARD_EFFECT = (
+    "Parts whose trip summaries can still be read return as separate trips with the annotations saved under their names. "
+    "Parts without readable summaries do not return. "
+    "The merged trip's saved miles and purpose leave the totals and are kept in history and the year review."
+)
+
+
 def folder_message(entry, role):
     """Complete sentences shared by the list, year review and both exports."""
     if entry.get("damaged_merge"):
@@ -1103,12 +1110,10 @@ def folder_message(entry, role):
         distance = f"{miles:.3f} mi" if _is_number(miles) else "unknown miles"
         text = (f"A merge part is missing or unreadable. Saved merge: {distance}; "
                 f"purpose: {entry.get('category') or 'unclassified'}. "
-                "Its miles are not in the totals. The original trips cannot be restored from the viewer; "
-                "restore the files from backups. ")
+                "Its saved miles are not in the totals. Restore missing or unreadable files from backups. ")
         if role == "admin":
-            return text + ("Or use Discard damaged merge: its saved miles and purpose will leave the log, "
-                           "with a permanent record in history and the year review.")
-        return text + "Please ask the admin to restore the files or discard this damaged merge."
+            return text + "Or use Discard damaged merge. " + DAMAGED_MERGE_DISCARD_EFFECT
+        return text + "Please ask the admin to restore the files or discard this damaged merge. " + DAMAGED_MERGE_DISCARD_EFFECT
     description = folder_description(entry)
     sentences = [description[0].upper() + description[1:].rstrip(".") + "."]
     if missing_mileage(entry):
@@ -1138,7 +1143,7 @@ def _folder_row_type(entry):
 
 
 app.jinja_env.globals.update(folder_message=folder_message, all_uploads_refusal=ALL_UPLOADS_REFUSAL,
-                            missing_mileage=missing_mileage)
+                            missing_mileage=missing_mileage, damaged_merge_discard_effect=DAMAGED_MERGE_DISCARD_EFFECT)
 app.jinja_env.tests["missing_mileage"] = missing_mileage
 
 
@@ -2669,8 +2674,7 @@ LIST_HTML = """
         <form method="post" action="{{ url_for('discard_damaged_merge', ym=u.ym, merge_id=u.id) }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <label><input type="checkbox" name="confirm" value="yes" required>
-            The original trips cannot be restored from the viewer; backups are needed to get the files back.
-            Discard this damaged merge: its saved miles and purpose will leave the log, with a permanent record in history and the year review.</label>
+            {{ damaged_merge_discard_effect }}</label>
           <button class="btn" type="submit">Discard damaged merge</button>
         </form>
         {% endif %}
@@ -3349,7 +3353,9 @@ def _history_summary(row):
         miles = summary.get('distance_miles')
         distance = f"{miles:.3f} mi" if _is_number(miles) else "unknown miles"
         return (f"Discarded damaged merge with {distance}; saved annotation: {_annotation_words(details.get('dropped'))}. "
-                "Original trips were not restored. Files must be recovered from backups.")
+                "Parts with readable trip summaries can be counted separately with the annotations saved under their names. "
+                "Missing or unreadable summaries need recovery from backups. "
+                "The merged trip's saved miles and purpose were removed from the totals and kept in this history record.")
     if action == "remove":
         return "Removed from the log: " + str(details.get("reason", ""))
     if action == "restore":
@@ -3646,15 +3652,12 @@ gap that was uploaded after the merge is counted a second time. Open the merged 
 {% if discarded_merges %}
 <section aria-labelledby="discarded-merges-heading">
 <h2 id="discarded-merges-heading">Discarded damaged merges ({{ discarded_merges|length }})</h2>
-<p class="warn">These damaged merges were deliberately discarded by the admin. Their saved miles and purpose
-are no longer in the log or the totals above. The original trips were not restored; recover their files from backups.
-This permanent history record remains visible after the year is closed. Closing needs no further acknowledgement.</p>
+<p class="warn">These saved merge records remain visible after the year is closed.
+Check each row before using saved miles: its trips may already be counted again.</p>
 <div class="review-table"><table>
-<thead><tr><th>Saved merge</th><th>Saved miles (excluded)</th><th>Purpose and note</th><th>Discarded by</th><th>Discarded at ({{ timezone }})</th></tr></thead>
+<thead><tr><th>Saved merge</th><th>History and current log</th></tr></thead>
 <tbody>{% for row in discarded_merges %}<tr><td><code>{{ row.trip_key }}</code><br>
-Parts: {{ row.parsed_details.parts|join(', ') }}</td><td>{{ row.saved_miles }}</td>
-<td>{{ row.parsed_details.dropped.category or 'unclassified' }}; {{ row.parsed_details.dropped.purpose_note or 'none' }}</td>
-<td>{{ row.actor }}</td><td>{{ fmt_date(row.at) }}</td></tr>{% endfor %}</tbody>
+Parts: {{ row.parsed_details.parts|join(', ') }}</td><td>{{ merge_history_message(row) }}</td></tr>{% endfor %}</tbody>
 </table></div>
 </section>
 {% endif %}
@@ -3744,7 +3747,75 @@ def _late_edit_rows(conn, year, trips):
     return result
 
 
-def _discarded_merge_rows(conn, year=None):
+def _merge_history_counted_parts(conn, rows, trips):
+    """Only history-bearing reviews/exports inspect current part membership.
+
+    Count live summaries, including parts of current merges, never file presence
+    alone. Saved summary stamps also identify a part after a month rename.
+    """
+    current = {key: t for t in trips if not t.get('removal')
+               for key in (t.get('parts') or [t['trip_key']])}
+    counted, _ = _month_choices(conn, DATA_ROOT.resolve())
+    for row in rows:
+        details = row['parsed_details']
+        try:
+            stamps = json.loads(details.get('fingerprint', 'null'))
+            if stamps and isinstance(stamps[0], int):
+                stamps = stamps[1:]
+        except (TypeError, ValueError):
+            stamps = None
+        again, absent = [], []
+        for index, part in enumerate(details.get('parts', [])):
+            month, name = part.split('/')
+            alternate = counted.get(month, month) + '/' + name
+            match = part if part in current else alternate if alternate in current else None
+            if match is None and isinstance(stamps, list) and len(stamps) > 2 * index + 1:
+                saved = json.dumps([stamps[2 * index + 1]])  # readable JSON suffices for ordinary totals
+                matches = []
+                for candidate in current:
+                    if candidate.split('/')[1] != name:
+                        continue
+                    try:
+                        source = trip_merges.checked_path(DATA_ROOT.resolve(), DATA_ROOT / (candidate + '.json'))
+                        metadata = source.stat()
+                        fresh = json.dumps([[source.name, metadata.st_mtime_ns, metadata.st_size]])
+                        if trip_merges.same_sources(fresh, saved):
+                            matches.append(candidate)
+                    except (OSError, ValueError):
+                        continue
+                if len(matches) == 1:
+                    match = matches[0]
+            if match is None:
+                absent.append(part)
+                continue
+            label = part if match == part else f'{part} as {match}'
+            if current[match].get('parts'):
+                label += f" (inside {current[match]['trip_key']})"
+            again.append(label)
+        row['counted_again'], row['not_counted'] = again, absent
+
+
+def merge_history_message(row):
+    """One saved record and current-count statement for review and exports."""
+    details = row['parsed_details']
+    annotation = details.get('dropped', {})
+    text = (f"Damaged merge discarded. Saved miles: {row['saved_miles']}; "
+            f"purpose: {annotation.get('category') or 'unclassified'}; "
+            f"purpose note: {annotation.get('purpose_note') or 'none'}; "
+            f"trip date: {fmt_date(details.get('saved_summary', {}).get('start_time'))}. "
+            f"Recorded at: {fmt_date(row['at'])}; login: {row['actor']}. ")
+    if not row['counted_again']:
+        return text + "None of its trips are in the log; these saved miles are not in the totals."
+    text += "Now counted again: " + ', '.join(row['counted_again']) + "; do not add these saved miles by hand."
+    if row['not_counted']:
+        text += " Not currently counted: " + ', '.join(row['not_counted']) + "."
+    return text
+
+
+app.jinja_env.globals['merge_history_message'] = merge_history_message
+
+
+def _discarded_merge_rows(conn, year=None, trips=None):
     """Permanent loss records, even after every source and merge row is gone."""
     rows = []
     for raw in conn.execute(
@@ -3764,6 +3835,8 @@ def _discarded_merge_rows(conn, year=None):
         row.update(parsed_details=details, saved_year=saved_year,
                    saved_miles=f'{miles:.3f} mi' if _is_number(miles) else 'unknown miles')
         rows.append(row)
+    if rows and trips is not None:
+        _merge_history_counted_parts(conn, rows, trips)
     return rows
 
 
@@ -3783,7 +3856,7 @@ def admin_year(year):
         gone, gone_unreadable = year_members(
             [t for t in trips if "removal" in t], [t for t in unreadable if "removal" in t], year)
         edits = _late_edit_rows(conn, year, members + broken + gone + gone_unreadable)
-        discarded_merges = _discarded_merge_rows(conn, year)
+        discarded_merges = _discarded_merge_rows(conn, year, trips)
     current = year_figures(members, broken)
     totals, counts = current["totals"], current["counts"]
     late, comparison, joined, left = [], None, [], []
@@ -4275,6 +4348,7 @@ def _undo_merge(conn, key, keys, *, damaged=False):
         trip_log.record(conn, key, 'discard_damaged_merge', {
             'parts': keys, 'saved_summary': trip_merges.saved_summary(merged),
             'saved_summary_raw': merged['summary'], 'dropped': dropped,
+            'fingerprint': merged['fingerprint'],
             'original_annotations': restored,
         }, actor=g.user, actor_role=g.role)
     else:
@@ -4300,9 +4374,7 @@ def _abort_if_saved_merge_closed(conn, key, keys):
 def discard_damaged_merge(ym, merge_id):
     _validate_trip_address(ym, merge_id)
     if request.form.get('confirm') != 'yes':
-        abort(400, description=('Confirm discarding this damaged merge: the original trips cannot be restored from the viewer; '
-                                'backups are needed to get the files back. Its saved miles and purpose will leave the log, '
-                                'with a permanent record in history and the year review.'))
+        abort(400, description='Confirm discarding this damaged merge. ' + DAMAGED_MERGE_DISCARD_EFFECT)
     key = f'{ym}/{merge_id}'
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         conn.row_factory = sqlite3.Row
