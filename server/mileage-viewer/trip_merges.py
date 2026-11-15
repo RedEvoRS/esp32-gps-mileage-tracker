@@ -52,6 +52,15 @@ def canonical_key(conn, key):
     return row[0] if row else key
 
 
+def saved_summary(row):
+    """Read a saved merge summary without consulting its source files."""
+    try:
+        summary = json.loads(row["summary"])
+    except (TypeError, ValueError):
+        return {}
+    return summary if isinstance(summary, dict) else {}
+
+
 def checked_path(root, path, *, preserve_final=False):
     """Check a trip path; optionally retain its final link for presence tests."""
     try:
@@ -273,6 +282,8 @@ def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=N
         if unused:
             broken.append({"folder": True, "folder_reason": "unused_merge", "unused_merge": True,
                            "ym": ym, "id": trip_id, "trip_key": key, "parts": keys,
+                           "saved_summary": saved_summary(row),
+                           **{f: row[f] or "" for f in ANNOTATION_FIELDS},
                            "saved_months": unused, "has_gpx": False, "problem": "saved merge under an unused month name"})
             continue
         hidden.update(keys)

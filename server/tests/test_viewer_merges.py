@@ -149,8 +149,10 @@ class ViewerMerges(unittest.TestCase):
         rows = list(csv.DictReader(io.StringIO(self.client.get("/export.csv").get_data(as_text=True))))
         notice = next(r for r in rows if r["trip_id"] == key)
         self.assertEqual(notice["row_type"], "folder_notice")
-        self.assertEqual(notice["distance_miles"], "")
+        self.assertEqual(float(notice["distance_miles"]), unused["saved_summary"]["distance_miles"])
+        self.assertEqual(notice["category"], "business")
         self.assertEqual(sum(r["row_type"] == "trip" for r in rows), 2)
+        self.assert_unused_close_refused(key)
         page = self.client.get("/").get_data(as_text=True)
         self.assertIn(f'action="/admin/unused-merge/{key}/undo"', page)
         part_page = self.client.get("/trip/2026-03/a").get_data(as_text=True)
@@ -161,22 +163,119 @@ class ViewerMerges(unittest.TestCase):
         self.assert_unused_merge(key, conflict=True)
         (self.data / "2026-04").unlink()
         self.assert_unused_merge(key, conflict=False)
-        self.assertEqual(self.client.post("/admin/year/2026/close", data={
-            "csrf_token": "test-csrf", "confirm": "yes"}).status_code, 302)
-        with closing(sqlite3.connect(self.db)) as conn:
-            snapshot = json.loads(conn.execute("SELECT snapshot FROM tax_years").fetchone()[0])
-        self.assertEqual(snapshot["unreadable"], 0)
-        self.assertEqual(set(snapshot["trip_keys"]), {"2026-03/a", "2026-03/b"})
         (self.data / "2026-03").unlink()
         self.symlink(self.month, self.data / "archive", directory=True)
         trips, entries = self.viewer.load_trips()
         self.assertEqual([t["trip_key"] for t in trips], [key])
         self.assertFalse(any(e.get("unused_merge") for e in entries))
         self.assertEqual(trips[0]["purpose_note"], "merged note")
-        review = self.client.get("/admin/year/2026").get_data(as_text=True)
-        self.assertIn(key, review)  # The old close snapshot is retained for comparison.
+        self.assertEqual(self.close_year().status_code, 302)
         with closing(sqlite3.connect(self.db)) as conn:
-            self.assertEqual(json.loads(conn.execute("SELECT snapshot FROM tax_years").fetchone()[0]), snapshot)
+            snapshot = json.loads(conn.execute("SELECT snapshot FROM tax_years").fetchone()[0])
+        self.assertEqual(snapshot['trip_keys'], [key])
+        self.assertEqual(snapshot['totals']['business'], round(trips[0]['distance_miles'], 3))
+
+    def close_year(self, year=2026):
+        return self.client.post(f'/admin/year/{year}/close', data={'csrf_token': 'test-csrf', 'confirm': 'yes'})
+
+    def assert_unused_close_refused(self, key, year=2026):
+        response = self.close_year(year)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn(self.viewer.UNUSED_MERGE_CLOSE_REFUSAL, html.unescape(response.get_data(as_text=True)))
+        review = html.unescape(self.client.get(f'/admin/year/{year}').get_data(as_text=True))
+        section = review.split('<h2 id="unused-merges-heading">', 1)[1].split('</section>', 1)[0]
+        self.assertIn(key, section)
+        self.assertIn('These saved miles and this purpose are not in the totals shown.', section)
+        self.assertIn('The trips it was made from are counted separately.', section)
+        self.assertIn(f'<button class="btn" disabled>Close {year}</button>', review)
+
+    def moved_merge(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        self.annotate(a, 'personal', 'original note')
+        key = self.merged_key(self.merge(a, b))
+        self.annotate(key, 'business', 'merged note')
+        summary = self.viewer.load_trips()[0][0]
+        self.month.rename(self.data / '2026-05')
+        return key, summary
+
+    def test_moved_real_month_blocks_close_and_exports_saved_miles_without_counting_them(self):
+        key, saved = self.moved_merge()
+        self.assert_unused_close_refused(key)
+        trips, entries = self.viewer.load_trips()
+        figures = self.viewer.year_figures(*self.viewer.year_members(trips, entries, 2026))
+        self.assertEqual(figures['unreadable'], 0)
+        self.assertEqual(figures['totals']['business'], 0)
+        self.assertLess(figures['totals']['all'], saved['distance_miles'])
+        review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
+        self.assertIn(f"Saved miles: {saved['distance_miles']:.3f} mi; purpose: business; purpose note: merged note.", review)
+        rows = list(csv.DictReader(io.StringIO(self.client.get('/export.csv?year=2026').get_data(as_text=True))))
+        notice = next(r for r in rows if r['trip_id'] == key)
+        self.assertEqual(float(notice['distance_miles']), saved['distance_miles'])
+        self.assertEqual(notice['row_type'], 'folder_notice')
+        self.assertEqual(float(next(r for r in rows if r['row_type'] == 'total' and r['category'] == 'all')['distance_miles']),
+                         figures['totals']['all'])
+        book = load_workbook(io.BytesIO(self.client.get('/export.xlsx?year=2026').data))
+        try:
+            header, row = list(book['Unreadable trips'].values)
+            values = dict(zip(header, row, strict=True))
+            self.assertEqual(values['distance_miles'], saved['distance_miles'])
+            self.assertIn('not in the totals shown', values['purpose_note'])
+            self.assertEqual(book['Mileage'].max_row, 3)
+            self.assertEqual(list(book['Totals'].values)[-1][-1], figures['totals']['all'])
+        finally:
+            book.close()
+        self.assertEqual(self.undo_unused(key).status_code, 302)
+        self.assertEqual(self.close_year().status_code, 302)
+
+    def test_moved_real_month_restored_by_renaming_allows_close_with_saved_purpose(self):
+        key, saved = self.moved_merge()
+        self.assert_unused_close_refused(key)
+        (self.data / '2026-05').rename(self.month)
+        self.assertEqual(self.close_year().status_code, 302)
+        with closing(sqlite3.connect(self.db)) as conn:
+            snapshot = json.loads(conn.execute('SELECT snapshot FROM tax_years').fetchone()[0])
+        self.assertEqual(snapshot['trip_keys'], [key])
+        self.assertEqual(snapshot['totals']['business'], round(saved['distance_miles'], 3))
+
+    def test_unused_merge_uses_saved_summary_year_and_unknown_year_blocks_every_close(self):
+        key, _ = self.moved_merge()
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            raw = conn.execute('SELECT summary FROM trip_merges').fetchone()[0]
+            summary = json.loads(raw)
+            summary['start_time'] = '2025-12-31T12:00:00Z'
+            conn.execute('UPDATE trip_merges SET summary=?', (json.dumps(summary),))
+        self.assert_unused_close_refused(key, 2025)
+        self.assertIn(2025, [r['year'] for r in self.viewer._year_list()])
+        self.assertEqual(self.close_year(2024).status_code, 302)
+        self.assertNotIn('unused-merges-heading', self.client.get('/admin/year/2026').get_data(as_text=True))
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('UPDATE trip_merges SET summary=?', (json.dumps({'distance_miles': .732}),))
+        for year in (2023, 2025, 2026):
+            self.assert_unused_close_refused(key, year)
+        # Unknown saved dates also cannot bypass an existing year lock.
+        self.assertEqual(self.undo_unused(key).status_code, 409)
+        self.assertEqual(self.client.post('/admin/year/2024/reopen', data={
+            'csrf_token': 'test-csrf', 'confirm': 'yes'}).status_code, 302)
+
+    def test_unused_merge_after_close_shows_saved_current_comparison_and_can_reopen(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        self.annotate(key, 'business', 'merged note')
+        self.assertEqual(self.close_year().status_code, 302)
+        with closing(sqlite3.connect(self.db)) as conn:
+            snapshot = conn.execute('SELECT snapshot FROM tax_years').fetchone()[0]
+        self.month.rename(self.data / '2026-05')
+        review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
+        self.assertIn('The totals now differ from the ones saved at the close.', review)
+        self.assertIn('Saved merges under unused month names (1)', review)
+        self.assertIn('No longer counted: ' + key, review)
+        self.assertIn('Now counted:', review)
+        self.assertIn('Reopen 2026', review)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute('SELECT snapshot FROM tax_years').fetchone()[0], snapshot)
+        self.assertEqual(self.client.post('/admin/year/2026/reopen', data={
+            'csrf_token': 'test-csrf', 'confirm': 'yes'}).status_code, 302)
+        self.assert_unused_close_refused(key)
 
     def test_admin_can_undo_unused_merge_with_or_without_original_link(self):
         key = self.unused_merge()
@@ -203,6 +302,7 @@ class ViewerMerges(unittest.TestCase):
             history = json.loads(conn.execute("SELECT details FROM trip_history WHERE action='split'").fetchone()[0])
             self.assertEqual(history["dropped"]["purpose_note"], "merged note")
         self.assertEqual({p: p.read_bytes() for p in files}, files)
+        self.assertEqual(self.close_year().status_code, 302)
 
     def test_undo_unused_merge_rechecks_selection_before_mutating(self):
         key = self.unused_merge()

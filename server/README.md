@@ -1006,12 +1006,16 @@ intact; the undo is recorded in history. Closed-year locks still apply;
 reopen the affected year first. An everyday login must ask the admin.
 
 CSV lists an unused merge as `row_type=folder_notice`, with its saved key,
-recovery advice and no miles. XLSX shows the same notice in **Unreadable
-trips**, labelled as a saved merge under an unused name. Totals and new
-year-close snapshots include only trips under the name now in use; an unused
-merge adds no trip, missing-mileage count or snapshot key. Older snapshots
-stay unchanged, so the review can show a former merged key leaving and the
-currently counted trips joining. The undo checks all replacement recordings
+saved `distance_miles`, category and recovery advice saying it is excluded
+from totals. XLSX shows the same notice and saved miles in **Unreadable
+trips**, outside **Mileage** and **Totals**. The year review lists each merge
+in **Saved merges under unused month names**, with its saved miles, purpose
+and month name; its parts count separately. Closing its saved-summary year
+is refused until the name is restored or the admin uses **Undo saved merge**.
+If the saved year is unknown, every year is blocked. Reopening stays possible.
+An unused merge adds no unreadable-file count. Older snapshots stay unchanged;
+the review compares saved and current totals and names the former merged key
+leaving and the currently counted trips joining. The undo checks all replacement recordings
 again under its database write transaction; a stale form cannot discard a
 merge whose replacement parts have gone missing.
 

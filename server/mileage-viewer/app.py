@@ -1030,8 +1030,14 @@ def _month_sort_key(month):
 def folder_description(entry):
     if entry["folder_reason"] == "unused_merge":
         names = ", ".join(name + "/" for name in entry["saved_months"])
+        miles = entry.get("saved_summary", {}).get("distance_miles")
+        distance = f"{miles:.3f} mi" if _is_number(miles) else "unknown"
         text = (f"This merge is saved under a month name no longer in use ({names}). "
-                "Its miles and merged annotation are not applied")
+                f"Saved miles: {distance}; purpose: {entry.get('category') or 'unclassified'}; "
+                f"purpose note: {entry.get('purpose_note') or 'none'}. "
+                "These saved miles and this purpose are not in the totals shown. "
+                "The trips it was made from are counted separately. "
+                "Its tax year cannot be closed until this saved merge is resolved")
     elif entry["folder_reason"] == "saved_keys":
         names = ", ".join(name + "/" for name in entry["saved_months"])
         text = (f"Warning: saved trip data exists under {names}. Trips are shown and counted under "
@@ -1965,8 +1971,19 @@ def _trip_local_year(trip):
 def year_members(trips, unreadable, year):
     """The trips of one local year: the single rule behind list, exports and review."""
     return ([t for t in trips if _trip_local_year(t) == year],
-            [t for t in unreadable if any(_may_start_in(ym, year)
-                                         for ym in (t.get("saved_months") or [t["ym"]]))])
+            [t for t in unreadable if (_unused_merge_in_year(t, year) if t.get("unused_merge") else
+                                      any(_may_start_in(ym, year)
+                                          for ym in (t.get("saved_months") or [t["ym"]])))])
+
+
+def _unused_merge_in_year(trip, year):
+    saved_year = _trip_local_year(trip.get("saved_summary", {}))
+    return saved_year is None or saved_year == year
+
+
+UNUSED_MERGE_CLOSE_REFUSAL = ("A saved merge under an unused month name has miles and purpose outside the totals. "
+                              "Restore its original month name or use Undo saved merge before closing this year. "
+                              "See Saved merges under unused month names on the year review.")
 
 
 def trip_neighbours(trip_key, trips, year=None):
@@ -2007,6 +2024,8 @@ def selected_trips(include_history=False, loaded=None):
     trips, unreadable = load_trips() if loaded is None else loaded
     _flag_trips_inside_merges(trips)
     years = {y for y in map(_trip_local_year, trips) if y}
+    years |= {y for t in unreadable if t.get('unused_merge')
+              if (y := _trip_local_year(t.get('saved_summary', {}))) is not None}
     selected = trips
     if year:
         years.add(year)
@@ -2124,7 +2143,10 @@ def locked_year(trip, closed):
 def _abort_if_year_closed(closed, *trips):
     """409 for an edit that touches a trip in a closed year."""
     for trip in trips:
-        year = locked_year(trip, closed)
+        if trip.get("unused_merge"):
+            year = next((y for y in sorted(closed) if _unused_merge_in_year(trip, y)), None)
+        else:
+            year = locked_year(trip, closed)
         if year:
             abort(409, description=(
                 f"{year} is closed for edits. The admin can reopen it on the year review page."))
@@ -3409,7 +3431,8 @@ def _year_list():
         closed = trip_log.closed_years(conn)
     years = {y for y in map(_trip_local_year, trips) if y} | closed.keys()
     for trip in unreadable:
-        years |= _folder_years(trip["ym"])
+        saved_year = _trip_local_year(trip.get('saved_summary', {})) if trip.get('unused_merge') else None
+        years |= {saved_year} if saved_year else _folder_years(trip["ym"])
     return [{"year": year, "closed": closed.get(year)} for year in sorted(years, reverse=True)]
 
 
@@ -3450,7 +3473,7 @@ marked in the exports. To categorize it, reopen the year and close it again: tha
 <button class="btn secondary" type="submit">Reopen {{ year }}</button></form>
 {% else %}
 <p>{{ year }} is open. Close it once its return is filed, so its trips can't change by accident.</p>
-{% if saved_conflicts %}
+{% if saved_conflicts or unused_merges %}
 <button class="btn" disabled>Close {{ year }}</button>
 {% else %}
 <form method="post" action="{{ url_for('close_year', year=year) }}">
@@ -3461,6 +3484,15 @@ marked in the exports. To categorize it, reopen the year and close it again: tha
 {% endif %}
 {% endif %}
 </section>
+
+{% if unused_merges %}
+<section aria-labelledby="unused-merges-heading">
+<h2 id="unused-merges-heading">Saved merges under unused month names ({{ unused_merges|length }})</h2>
+<p class="warn" role="alert">{{ unused_merge_close_refusal }}</p>
+<ul>{% for t in unused_merges %}<li><code>{{ t.trip_key }}</code>: {{ folder_message(t, g.role) }}</li>{% endfor %}</ul>
+<p><a href="{{ url_for('index', year=year) }}">Review saved merges on the trip list</a></p>
+</section>
+{% endif %}
 
 <section aria-labelledby="totals-heading">
 <h2 id="totals-heading">Totals by category</h2>
@@ -3680,6 +3712,7 @@ def admin_year(year):
         saved_conflicts = [t for t in live_unreadable if t.get("folder_reason") == "saved_keys"]
         upload_blocks = [t for t in live_unreadable if t.get("all_uploads_refused")]
         members, broken = year_members(live, live_unreadable, year)
+        unused_merges = [t for t in broken if t.get("unused_merge")]
         gone, gone_unreadable = year_members(
             [t for t in trips if "removal" in t], [t for t in unreadable if "removal" in t], year)
         edits = _late_edit_rows(conn, year, members + broken + gone + gone_unreadable)
@@ -3711,11 +3744,12 @@ def admin_year(year):
     inside_merge = [{"trip": t, "merge": covered[t["trip_key"]]} for t in members if t["trip_key"] in covered]
     return render_template_string(
         YEAR_HTML, year=year, closed=closed, saved_conflicts=saved_conflicts, upload_blocks=upload_blocks,
+        unused_merges=unused_merges, unused_merge_close_refusal=UNUSED_MERGE_CLOSE_REFUSAL,
         totals=totals, counts=counts, edits=edits,
         inside_merge=inside_merge, late=late, late_miles=sum(t.get("distance_miles") or 0 for t in late),
         comparison=comparison, joined=joined, left=left, undated=undated, undated_miles=sum(t.get("distance_miles") or 0 for t in undated),
         uncategorized=[t for t in members if t.get("category") not in CATEGORIES],
-        incomplete=incomplete, unreadable=broken, removed=removed, timezone=DISPLAY_TZ_NAME,
+        incomplete=incomplete, unreadable=[t for t in broken if not t.get("unused_merge")], removed=removed, timezone=DISPLAY_TZ_NAME,
         year_end=f"{year + 1}-01-01 00:00",
     )
 
@@ -3760,6 +3794,8 @@ def _change_year(raw_year, closing_it):
             # Save the totals as they stand, so a later change can't go unseen.
             # The history row carries the figures; the key list stays in tax_years.
             all_trips, all_unreadable = _load_trips(conn)
+            if any(t.get("unused_merge") and _unused_merge_in_year(t, year) for t in all_unreadable):
+                abort(409, description=UNUSED_MERGE_CLOSE_REFUSAL)
             if any(t.get("folder_reason") == "saved_keys" for t in all_unreadable):
                 abort(409, description="Several month names for one folder have saved trip data. Resolve the folder warning on the trip list before closing a year.")
             snapshot = year_figures(*year_members(all_trips, all_unreadable, year))
@@ -4367,7 +4403,7 @@ def _xlsx_literal_text(row):
 
 UNREADABLE_COLUMNS = (
     "trip_id", "gpx_file", "category", "purpose_note", "destination",
-    "last_edited_by", "last_edited_at",
+    "last_edited_by", "last_edited_at", "distance_miles",
 )
 
 
@@ -4381,6 +4417,10 @@ def _unreadable_values(t):
         values = dict.fromkeys(UNREADABLE_COLUMNS, "")
         values["trip_id"] = t["trip_key"]
         values["purpose_note"] = folder_message(t, g.role)
+        if t.get("unused_merge"):
+            miles = t.get("saved_summary", {}).get("distance_miles")
+            values["distance_miles"] = miles if _is_number(miles) else ""
+            values["category"] = t.get("category", "")
         return values
     return {
         "trip_id": t.get("trip_id") or t["id"],
@@ -4390,6 +4430,7 @@ def _unreadable_values(t):
         "destination": t["destination"],
         "last_edited_by": t.get("last_edited_by", ""),
         "last_edited_at": t.get("last_edited_at", ""),
+        "distance_miles": "",
     }
 
 

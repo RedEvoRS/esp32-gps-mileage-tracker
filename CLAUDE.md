@@ -482,6 +482,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   notices excluded from miles and missing counts, with admin undo, only when
   every part is counted under another name and both files match saved stamps.
   A missing folder alone remains damage; direct trip loads and undo agree.
+  Unused-name merges block closing their saved-summary year (every year if
+  unknown); review and export notices retain saved miles outside totals.
   A file occupying a month name, or a folder whose owner/mode denies ingest
   writing, is a notice with no missing count or merge block. Write notices
   reuse scanned metadata, never W_OK on the viewer's read-only mount.

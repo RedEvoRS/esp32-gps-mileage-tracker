@@ -2824,11 +2824,15 @@ the admin. The undo rechecks every replacement recording under its database
 write transaction; a stale form is refused if any evidence is gone or the
 merge's name is back in use.
 
-Exports show it as a notice with its saved key, recovery advice and no miles
-(`folder_notice` in CSV; labelled in XLSX's **Unreadable trips** sheet).
-New year-close snapshots count only the trips under the name in use, with
-no missing-mileage count or trip key for the unused merge. Existing snapshots
-remain unchanged and the year review shows changes from their old keys.
+The year review lists each unused-name merge separately, with its saved miles,
+purpose and month name. These are excluded from totals; its parts count separately.
+Closing its saved-summary year is refused until the name is restored or the
+admin uses **Undo saved merge**. An unknown saved year blocks every year;
+reopening stays possible. It adds no unreadable-file count. CSV shows a
+`folder_notice` row with its saved `distance_miles`, category and recovery
+advice, explicitly excluded from totals. XLSX shows the same on **Unreadable
+trips**, outside **Mileage** and **Totals**. Existing close snapshots remain
+unchanged; the review compares saved and current totals and names changed keys.
 Genuinely missing or unreadable parts under any name retain the
 existing damaged-merge warning and conservative merge-suggestion checks.
 
