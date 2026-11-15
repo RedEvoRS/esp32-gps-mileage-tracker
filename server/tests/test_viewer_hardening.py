@@ -648,6 +648,37 @@ class ViewerHardeningTests(unittest.TestCase):
         with patch.object(self.viewer, "_month_choices", side_effect=AssertionError("extra month scan")):
             self.assertEqual(self.client.get("/gpx/2026-01/drive").status_code, 200)
 
+    def test_folder_export_labels_separate_unreadable_notices_and_saved_conflicts(self):
+        import csv
+        target = self.linked_archive("2026-01")
+        self.symlink(self.viewer.DATA_ROOT / "2026-02", target, directory=True)
+        self.symlink(self.viewer.DATA_ROOT / "2026-03", self.viewer.DATA_ROOT / "missing", directory=True)
+        self.signed_in("admin")
+
+        def exported():
+            response = self.client.get("/export.xlsx")
+            book = load_workbook(io.BytesIO(response.data))
+            try:
+                rows = list(book["Unreadable trips"].values)
+                labels = [row[rows[0].index("trip_id")] for row in rows[1:]]
+            finally:
+                book.close()
+                response.close()
+            csv_rows = list(csv.DictReader(io.StringIO(self.client.get("/export.csv").get_data(as_text=True))))
+            return labels, {r["trip_id"]: r["row_type"] for r in csv_rows if r["trip_id"].endswith("/")}
+
+        labels, types = exported()
+        self.assertEqual(labels, ["2026-01/ (link blocks new uploads; existing trips counted)",
+                                  "2026-02/ (extra link, trips counted elsewhere)",
+                                  "2026-03/ (whole month folder)"])
+        self.assertEqual(types, {"2026-01/": "folder_notice", "2026-02/": "folder_notice",
+                                 "2026-03/": "unreadable_folder"})
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO annotations (trip_key) VALUES ('2026-02/drive')")
+        labels, types = exported()
+        self.assertEqual(labels[0], "2026-01/ (conflicting saved data; trips counted)")
+        self.assertEqual(types["2026-01/"], "folder_warning")
+
     def test_merged_trip_with_linked_month_part_keeps_undo(self):
         month = self.viewer.DATA_ROOT / "2026-01"
         target = self.db.parent / "outside-month"

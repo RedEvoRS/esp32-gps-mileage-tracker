@@ -4184,7 +4184,12 @@ def export_xlsx():
         for t in unreadable:
             values = _unreadable_values(t)
             if t.get("folder"):
-                values["trip_id"] += " (whole month folder)"
+                suffix = {
+                    "duplicate": " (extra link, trips counted elsewhere)",
+                    "ingest_refused": " (link blocks new uploads; existing trips counted)",
+                    "saved_keys": " (conflicting saved data; trips counted)",
+                }.get(t["folder_reason"], " (whole month folder)")
+                values["trip_id"] += suffix
             sheet.append(_xlsx_clean([values[name] for name in UNREADABLE_COLUMNS]))
             _xlsx_literal_text(sheet[sheet.max_row])
     buf = io.BytesIO()

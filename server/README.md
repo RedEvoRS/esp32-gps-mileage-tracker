@@ -877,6 +877,11 @@ applied. Review the annotations, removals and merges before removing any link;
 the viewer does not move or combine database rows. Merge suggestions and closing
 any year wait until this conflict is resolved. Existing year locks remain in
 force; folder warnings are not counted as missing mileage in year snapshots.
+The XLSX `Unreadable trips` sheet also lists folder notices and saved-data
+warnings. Their row labels say whether trips are counted elsewhere, a link
+blocks new uploads, or saved names conflict. Only a folder whose trips cannot
+be read is labeled "whole month folder"; the CSV row types distinguish these
+same cases.
 
 `install.sh --check` reports each symbolic link directly inside `data/` as
 a problem, with a hint to use a real folder or mount the other disk there.
