@@ -1938,6 +1938,8 @@ starts fresh when the owning service next creates it. The optional ntfy volume
 into `data/` (owned by UID 1000, mode 700): it fails after stopping the
 services, restarts them on exit, and nothing is restored. Restored files keep
 UID 1000 ownership, so no `chown` is needed afterwards.
+After a restore run as root, files have mode 600 and folders mode 700; if the
+snapshot's modes differed, the next backup makes one new snapshot, as expected.
 
 **A restore also brings back everyday logins as they were in that snapshot.**
 A password reset, account disable or removal made since then is undone. Open

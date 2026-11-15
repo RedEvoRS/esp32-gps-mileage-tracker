@@ -1613,6 +1613,8 @@ replacement server, a saved monitor DB can populate its volume without enabling
 the monitor. Older snapshots still restore trips and annotations: missing new
 DB snapshots are reported and current databases are left unchanged. Any old
 live diagnostics copy under `data/` is excluded from restore too.
+After a restore run as root, files have mode 600 and folders mode 700; if the
+snapshot's modes differed, the next backup makes one new snapshot, as expected.
 
 If monitor discovery fails during restore, the script warns and restores trips,
 annotations and diagnostics, leaving the monitor service and its database alone.
