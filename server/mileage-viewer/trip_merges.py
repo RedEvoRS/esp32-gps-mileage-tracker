@@ -198,12 +198,12 @@ def unused_merge_months(conn, data_root, keys, counted_months, originals, stored
     if not keys or any(not TRIP_KEY_RE.fullmatch(key) for key in keys):
         return []
     months = sorted({key.split("/")[0] for key in keys})
+    if any(counted_months.get(month) == month for month in months):
+        return []  # Healthy merges need no path or replacement probes.
     replacements = {}
     root = data_root.resolve()
     for month in months:
         if month in counted_months:
-            if counted_months[month] == month:
-                return []
             try:
                 if checked_path(root, data_root / month) != checked_path(root, data_root / counted_months[month]):
                     return []

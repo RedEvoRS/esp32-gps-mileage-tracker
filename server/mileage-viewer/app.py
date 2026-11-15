@@ -1328,8 +1328,9 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
         trip_key = trip_merges.canonical_key(conn, trip_key)
         merge_parts = trip_merges.parts(conn, trip_key)
         keys = merge_parts or [trip_key]
-        if merge_parts and any((DATA_ROOT / key.split('/')[0]).is_symlink() or
-                               not (DATA_ROOT / key.split('/')[0]).is_dir() for key in merge_parts):
+        part_months = {key.split('/')[0] for key in merge_parts if trip_merges.TRIP_KEY_RE.fullmatch(key)}
+        if part_months and any((DATA_ROOT / month).is_symlink() or
+                               not (DATA_ROOT / month).is_dir() for month in part_months):
             # Only unusual merge addresses need the full counted-name evidence.
             # Use exactly the list/undo classifier, retaining only this merge.
             loaded = _load_trips(conn, include_removed=include_removed, refresh_merges=refresh_merges)

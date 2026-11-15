@@ -349,6 +349,40 @@ class ViewerMerges(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as conn:
             self.assertEqual(conn.execute('SELECT count(*) FROM trip_merges').fetchone()[0], 2)
 
+    def test_removed_month_requires_one_unambiguous_replacement_folder(self):
+        key = self.unused_merge()
+        (self.data / '2026-04').unlink()
+        # Matching stamps in two different counted folders cannot establish
+        # which one is the recording the stored merge refers to.
+        shutil.copytree(self.data / 'archive', self.data / '2026-05')
+        entries = self.viewer.load_trips()[1]
+        broken = next(t for t in entries if t['trip_key'] == key)
+        self.assertNotIn('unused_merge', broken)
+        self.assertEqual(self.undo_unused(key).status_code, 409)
+
+    def test_matching_parts_split_between_folders_are_damage(self):
+        key = self.unused_merge()
+        (self.data / '2026-04').unlink()
+        other = self.data / '2026-05'
+        other.mkdir()
+        for suffix in ('.json', '.gpx'):
+            (self.data / ('archive/b' + suffix)).rename(other / ('b' + suffix))
+        entries = self.viewer.load_trips()[1]
+        broken = next(t for t in entries if t['trip_key'] == key)
+        self.assertNotIn('unused_merge', broken)
+        self.assertEqual(self.undo_unused(key).status_code, 409)
+
+    @unittest.skipIf(os.name == 'nt' or getattr(os, 'geteuid', lambda: 0)() == 0, 'requires non-root POSIX permissions')
+    def test_unreadable_replacement_track_is_damage_even_with_matching_stamps(self):
+        key = self.unused_merge()
+        (self.data / '2026-04').unlink()
+        source = self.data / 'archive/b.gpx'
+        self.addCleanup(source.chmod, 0o600)
+        source.chmod(0o000)
+        entries = self.viewer.load_trips()[1]
+        self.assertNotIn('unused_merge', next(t for t in entries if t['trip_key'] == key))
+        self.assertEqual(self.undo_unused(key).status_code, 409)
+
     def test_nonmonth_link_upload_notice_does_not_block_merge(self):
         a, b = self.trip("a", 0), self.trip("b", 180, .01)
         archive = self.data / "archive"
