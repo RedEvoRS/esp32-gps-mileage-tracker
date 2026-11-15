@@ -567,7 +567,9 @@ for storage, Python fallback and service setup.
    operator review; ingest returns 409 rather than choosing one. An internal
    month-folder alias counts once. If any `YYYY-MM` folder links outside
    `data/` or loops, every GPX upload gets HTTP 503 and the ingest log names
-   the folder. Replace it with a real folder or mount the disk there. The
+   the folder. A new trip whose own month folder is a link to a folder with a
+   different name (say `2026-04` → `2026-03`) gets the same 503, because it
+   would otherwise be filed and shown under the other month. Replace it with a real folder or mount the disk there. The
    tracker keeps trips until HTTP 200 and retries after repair; Device health
    shows server errors. Diagnostics uploads are unaffected.
    Older third-party timed uploads named with a custom header keep their old

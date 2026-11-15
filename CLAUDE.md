@@ -415,7 +415,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   untimed copies of `sample.gpx`). Every upload looks for its ID in all month
   folders under the upload lock, so a `DISPLAY_TZ` change can't duplicate a trip.
   Internal aliases count once; an outside or looping month link refuses all
-  GPX uploads with 503 naming the folder until repaired. Diagnostics are unaffected.
+  GPX uploads with 503 naming the folder until repaired, and a new trip whose
+  month folder links to a differently named folder gets the same 503 (it would
+  be filed under the wrong month). Diagnostics are unaffected.
   `install.sh --check` reports direct links in `data/` as problems; install
   warns and continues. If listing needs a new sudo prompt, check warns it skipped links.
   Ingest runs with umask 077; `install.sh` keeps `data/` at mode 700
