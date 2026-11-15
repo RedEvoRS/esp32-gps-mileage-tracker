@@ -917,11 +917,12 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
         # the trip can be reported. Never construct paths from invalid keys.
         json_paths = [DATA_ROOT / f"{key}.json" for key in keys if trip_merges.TRIP_KEY_RE.fullmatch(key)]
         with _summary_cache_lock:
-            # Targeted pages do not enumerate the data tree. Still evict any
-            # vanished cached files, so repeated one-trip reads cannot retain
-            # an ever-growing history of files that have since been removed.
-            for path in list(_summary_cache):
-                if not _trip_file_exists(root, path):
+            # Targeted reads do not enumerate the data tree. Evict only the
+            # entries this read asked for whose file has gone: checking every
+            # cached file here cost a full pass on each lookup. The full scan
+            # still clears all vanished entries, which bounds the cache.
+            for path in json_paths:
+                if path in _summary_cache and not _trip_file_exists(root, path):
                     del _summary_cache[path]
     only_merge_key = trip_key
     for json_path in json_paths:
@@ -3384,7 +3385,15 @@ def trip_view(ym, trip_id):
     if t is None and g.role == "admin" and removed is not None:
         t = next((t for t in removed_trips + removed_unreadable if t["trip_key"] == key), None)
     if t is None:
-        problem = next((u["problem"] for u in unreadable if u["trip_key"] == key), "the file is missing")
+        problem = next((u["problem"] for u in unreadable if u["trip_key"] == key), None)
+        if problem is None:
+            # A removed trip (for an everyday login) and an address that
+            # matches no trip get the same words, so the page does not say
+            # which one it is. Neither has a damaged file to repair.
+            abort(404, description=(
+                "No trip at this address. It may have been removed from the "
+                "log; ask the admin if you expected to see it."
+            ))
         abort(404, description=(
             f"This trip's summary file can't be read ({problem}), so its "
             "miles can't be counted. The trip list and exports flag it. To "
@@ -3538,9 +3547,10 @@ def _abort_if_removed(conn, key):
 
 def resolved_trip(ym, trip_id, allow_original=False, include_removed=False):
     key = f"{ym}/{trip_id}"
-    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+    # Read only this trip's own sources (or its merge's parts), not every
+    # trip, and resolve the alias in the same DB snapshot as the read.
+    with _trip_read(include_removed=include_removed, trip_key=key) as (conn, trips, _):
         key = trip_merges.canonical_key(conn, key)
-    trips, _ = load_trips(include_removed=include_removed)
     t = next((t for t in trips if t["trip_key"] == key or key in t.get("parts", [])), None)
     if t is None and not allow_original:
         abort(404)

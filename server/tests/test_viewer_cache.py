@@ -10,6 +10,8 @@ from contextlib import closing
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+from werkzeug.exceptions import NotFound
+
 import test_viewer_roles as roles
 import test_viewer_merges as merges
 
@@ -233,6 +235,30 @@ class SummaryCacheTests(unittest.TestCase):
             load.assert_called_once_with(include_removed=True)
         self.assertEqual(set(self.viewer._summary_cache), {self.path})
 
+    def test_targeted_read_checks_only_its_own_cache_entries(self):
+        # Part of #706: a one-trip read used to stat every cached summary.
+        other = self.path.with_name("other.json")
+        other.write_text(self.path.read_text())
+        self.viewer.load_trips()
+        self.assertIn(other, self.viewer._summary_cache)
+        other.unlink()
+        with patch.object(self.viewer, "_trip_file_exists", wraps=self.viewer._trip_file_exists) as exists:
+            with self.viewer._trip_read(trip_key="2026-01/drive") as (_, trips, _unreadable):
+                self.assertEqual([t["trip_key"] for t in trips], ["2026-01/drive"])
+        self.assertNotIn(other, [call.args[1] for call in exists.call_args_list])
+        # The next full scan still clears unrelated vanished entries.
+        self.viewer.load_trips()
+        self.assertNotIn(other, self.viewer._summary_cache)
+
+    def test_targeted_read_evicts_its_own_vanished_summary(self):
+        self.viewer.load_trips()
+        self.assertIn(self.path, self.viewer._summary_cache)
+        self.path.unlink()
+        self.path.with_suffix(".gpx").unlink()
+        with self.viewer._trip_read(trip_key="2026-01/drive") as (_, trips, unreadable):
+            self.assertEqual((trips, unreadable), ([], []))
+        self.assertNotIn(self.path, self.viewer._summary_cache)
+
     def test_trip_missing_from_full_load_retries_once_then_returns_not_found(self):
         with patch.object(self.viewer, "load_trips", return_value=([], [])) as load, patch.object(
                 self.viewer.app.logger, "warning") as warning:
@@ -387,3 +413,73 @@ class MergeCacheTransactionTests(unittest.TestCase):
         self.assertFalse(broken)
         self.assertEqual(trips[0]["category"], "personal")
         self.assertEqual(trips[0]["removal"]["reason"], "test reason")
+
+    # Part of #706: lookups and tracks read one trip, not the whole log.
+    def resolve(self, key, **kwargs):
+        ym, trip_id = key.split("/")
+        try:
+            return self.viewer.resolved_trip(ym, trip_id, **kwargs)
+        except NotFound:
+            return "404"
+
+    def full_lookup(self, key, include_removed=False, allow_original=False):
+        # resolved_trip's lookup as it was before #706: the full trip log.
+        with closing(sqlite3.connect(self.db)) as conn:
+            key = self.viewer.trip_merges.canonical_key(conn, key)
+        trips, _ = self.viewer.load_trips(include_removed=include_removed)
+        found = next((t for t in trips if t["trip_key"] == key or key in t.get("parts", [])), None)
+        return "404" if found is None and not allow_original else found
+
+    def test_resolved_trip_matches_a_full_log_lookup(self):
+        first, second, merged = self.make_merge()
+        plain, removed, damaged = self.trip("c", 3600, .01), self.trip("d", 7200, .02), self.trip("e", 10800, .03)
+        (self.data / (damaged + ".json")).write_text("{broken")
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            self.viewer.trip_log.add_removal(conn, removed, "test reason", "driver")
+        identity = ("trip_key", "ym", "id", "parts")
+        cases = [(plain, {}), (merged, {}), (first, {}), (second, {}), (removed, {}),
+                 (removed, {"include_removed": True}), ("2026-04/nope", {}),
+                 ("2026-04/nope", {"allow_original": True}), (damaged, {}),
+                 (damaged, {"allow_original": True})]
+        with self.assertLogs(self.viewer.app.logger, "WARNING"):
+            for key, kwargs in cases:
+                with self.subTest(key=key, **kwargs):
+                    expected, actual = self.full_lookup(key, **kwargs), self.resolve(key, **kwargs)
+                    if isinstance(expected, dict):
+                        self.assertIsInstance(actual, dict)
+                        self.assertEqual({f: actual.get(f) for f in identity},
+                                         {f: expected.get(f) for f in identity})
+                        self.assertEqual(actual, expected)
+                    else:
+                        self.assertEqual(actual, expected)
+        self.assertEqual(self.resolve(first)["trip_key"], merged)
+        self.assertEqual(self.resolve(removed, include_removed=True)["removal"]["reason"], "test reason")
+        self.assertEqual(self.resolve(removed), "404")
+        self.assertEqual(self.resolve(damaged), "404")
+
+    def test_lookup_and_track_do_not_scan_the_data_folder(self):
+        _, second, merged = self.make_merge()
+        plain = self.trip("c", 3600, .01)
+        root = self.viewer.DATA_ROOT
+        path_type = type(root)
+        original = path_type.glob
+        scanned = []
+
+        def glob(path, *args, **kwargs):
+            if path == root or root in path.parents:
+                scanned.append(path)
+            return original(path, *args, **kwargs)
+
+        with patch.object(path_type, "glob", glob):
+            for key in (plain, merged, second):
+                with self.subTest(key=key):
+                    self.assertEqual(self.client.post(f"/trip/{key}/lookup-place",
+                                                      data={"csrf_token": "test-csrf"}).status_code, 400)
+                    response = self.client.get(f"/gpx/{key}")
+                    self.assertEqual(response.status_code, 200)
+                    response.close()
+        self.assertEqual(scanned, [])
+        # The same patch does see a full log load, so the check is live.
+        with patch.object(path_type, "glob", glob):
+            self.viewer.load_trips()
+        self.assertTrue(scanned)
