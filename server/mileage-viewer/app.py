@@ -1074,7 +1074,8 @@ def folder_message(entry, role):
 
 
 def missing_mileage(entry):
-    return entry.get("folder_reason") not in ("duplicate", "saved_keys", "ingest_refused", "unused_merge")
+    return entry.get("folder_reason") not in ("duplicate", "saved_keys", "ingest_refused", "unused_merge",
+                                             "not_folder", "link_not_folder")
 
 
 def _folder_row_type(entry):
@@ -4414,6 +4415,8 @@ def export_xlsx():
                     "ingest_refused": " (link blocks new uploads; existing trips counted)",
                     "saved_keys": " (conflicting saved data; trips counted)",
                     "unused_merge": " (saved merge under unused month name)",
+                    "not_folder": " (notice: month name is a file; new uploads refused)",
+                    "link_not_folder": " (notice: month link is not a folder; new uploads refused)",
                 }.get(t["folder_reason"], " (whole month folder)")
                 values["trip_id"] += suffix
             sheet.append(_xlsx_clean([values[name] for name in UNREADABLE_COLUMNS]))

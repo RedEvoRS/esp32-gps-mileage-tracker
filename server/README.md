@@ -881,7 +881,8 @@ Diagnostics uploads are unaffected.
 If a month name is a link to a file instead of a folder, remove only the
 link, keeping its target. If the month name is a plain file, move it somewhere
 safe outside the month names. The viewer reports either case as a folder
-warning: no trips are counted there, and new trips for that month get HTTP
+notice: a file cannot hold trips, so it adds no missing mileage, no year-close
+unreadable count and no merge-suggestion block. New trips for that month get HTTP
 503 and stay queued. Other months still upload. Once that name is free,
 ingest can create a real month folder on retry.
 

@@ -575,7 +575,7 @@ class ViewerHardeningTests(unittest.TestCase):
                     text += f" The tracker cannot upload new trips for this month until the link is {repair}; the tracker keeps them queued."
             if all_refused:
                 text += " All of the tracker's trip uploads are refused until the month folder problems below are fixed; the tracker keeps them queued."
-            if reason in ("outside", "dangling", "loop", "unreadable", "link_not_folder", "not_folder"):
+            if reason in ("outside", "dangling", "loop", "unreadable"):
                 text += " None of its trips are shown or counted."
             text += " " + hints.get(reason, "Replace the link with the real folder, or mount the other disk at that path.")
             expected.append(text)
@@ -672,6 +672,17 @@ class ViewerHardeningTests(unittest.TestCase):
                 self.assertEqual(len(entries), 1)
                 entry = entries[0]
                 self.assertEqual(entry["folder_reason"], layout["reason"])
+                if layout['reason'] in ('not_folder', 'link_not_folder'):
+                    self.assertFalse(self.viewer.missing_mileage(entry))
+                    self.assertEqual(self.viewer.year_figures(*self.viewer.year_members(trips, entries, 2026))['unreadable'], 0)
+                    self.assertNotIn('None of its trips are shown or counted.', self.viewer.folder_message(entry, 'admin'))
+                    rows = list(csv.DictReader(io.StringIO(self.client.get('/export.csv').get_data(as_text=True))))
+                    self.assertEqual(rows[0]['row_type'], 'folder_notice')
+                    book = load_workbook(io.BytesIO(self.client.get('/export.xlsx').data))
+                    try:
+                        self.assertIn('notice:', str(list(book['Unreadable trips'].values)))
+                    finally:
+                        book.close()
                 self.assertFalse(entry["all_uploads_refused"])
                 self.assertEqual(entry["uploads_refused"], layout["uploads"]["2026-02"] == 503)
                 for role in ("admin", "editor"):
