@@ -42,7 +42,7 @@ class EndpointPlaceTests(unittest.TestCase):
 
         class Handler(BaseHTTPRequestHandler):
             def setup(self):
-                cls.handlers.append(threading.current_thread())
+                cls.handlers.append((threading.current_thread(), cls.mode))
                 super().setup()
 
             def do_GET(self):
@@ -159,10 +159,14 @@ class EndpointPlaceTests(unittest.TestCase):
         # A killed fetch child closes its socket, but a slow provider handler
         # may notice only on its next write. Finish those handlers before the
         # next test changes the provider's mode, response or clock.
-        for handler in self.handlers:
-            handler.join(timeout=3)
-        self.assertFalse(any(handler.is_alive() for handler in self.handlers))
-        self.handlers.clear()
+        try:
+            for handler, _mode in self.handlers:
+                handler.join(timeout=3)
+            stuck_modes = [mode for handler, mode in self.handlers if handler.is_alive()]
+            self.assertFalse(stuck_modes, f"Fake provider handlers did not finish; modes: {stuck_modes}")
+        finally:
+            # A stuck handler belongs to this test, not every subsequent test.
+            self.handlers.clear()
 
     def post(self, endpoint="end", **extra):
         return self.client.post(self.route, data={"csrf_token": "test-csrf", "endpoint": endpoint, **extra})
