@@ -700,14 +700,19 @@ TRIP_NOT_FOUND = (
 )
 
 
+def _validate_trip_address(ym, trip_id):
+    """Reject malformed addresses without consulting the filesystem."""
+    if not trip_merges.YM_RE.fullmatch(ym or "") or not trip_merges.ID_RE.fullmatch(trip_id or ""):
+        abort(404)
+
+
 def _safe_trip_paths(ym, trip_id, *, refused_description=None):
     """Validate URL components and return (gpx_path, json_path) under DATA_ROOT.
 
     Aborts with 404 on anything that doesn't match the strict patterns or
     that would resolve outside DATA_ROOT.
     """
-    if not trip_merges.YM_RE.fullmatch(ym or "") or not trip_merges.ID_RE.fullmatch(trip_id or ""):
-        abort(404)
+    _validate_trip_address(ym, trip_id)
     try:
         return next(trip_merges.source_file_pairs(DATA_ROOT, [f"{ym}/{trip_id}"]))
     except ValueError:
@@ -3293,7 +3298,7 @@ def reopen_year(year):
 @app.route("/trip/<ym>/<trip_id>/remove", methods=["POST"])
 def remove_trip(ym, trip_id):
     year = selected_year()
-    _safe_trip_paths(ym, trip_id)
+    _validate_trip_address(ym, trip_id)
     reason = request.form.get("reason", "").strip()
     if not 1 <= len(reason) <= 500:
         abort(400, description="Reason must be between 1 and 500 characters.")
@@ -3319,7 +3324,7 @@ def remove_trip(ym, trip_id):
 @app.route("/trip/<ym>/<trip_id>/restore", methods=["POST"])
 def restore_trip(ym, trip_id):
     year = selected_year()
-    _safe_trip_paths(ym, trip_id)
+    _validate_trip_address(ym, trip_id)
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN IMMEDIATE")

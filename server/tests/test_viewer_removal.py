@@ -89,6 +89,44 @@ class ViewerRemovalTests(unittest.TestCase):
     def exported_csv(self):
         return list(csv.DictReader(io.StringIO(self.admin.get("/export.csv").data.decode("utf-8"))))
 
+    def test_remove_restore_link_refused_trips(self):
+        for kind in ("json", "gpx", "month"):
+            with self.subTest(kind=kind):
+                key = self.add_trip(kind)
+                link = self.month if kind == "month" else self.month / f"{kind}.{kind}"
+                target = self.root / f"outside-{kind}"
+                link.rename(target)
+                if kind != "month":
+                    target.write_text("outside-file-sentinel", encoding="utf-8")
+                try:
+                    link.symlink_to(target, target_is_directory=kind == "month")
+                except (OSError, NotImplementedError) as exc:
+                    target.rename(link)
+                    self.skipTest(f"symlink creation unavailable: {type(exc).__name__}")
+                try:
+                    for action in ("remove", "restore"):
+                        denied = self.editor.post(f"/trip/{key}/{action}", data={
+                            "csrf_token": "test-csrf", "reason": "test removal"})
+                        self.assertEqual(denied.status_code, 403)
+                        with patch.object(self.viewer, "_safe_trip_paths", side_effect=AssertionError("route path check")):
+                            response = self.post(f"/trip/{key}/{action}", reason="test removal")
+                        self.assertEqual(response.status_code, 302)
+                        self.assertIn(f"/trip/{key}", response.location)
+                        self.assertNotIn(b"outside-file-sentinel", response.data)
+                        self.assertNotIn(b"outside-file-sentinel", self.admin.get(response.location).data)
+                        with closing(sqlite3.connect(self.db)) as conn:
+                            row = conn.execute("SELECT trip_key FROM trip_removals WHERE trip_key=?", (key,)).fetchone()
+                        self.assertEqual(row, (key,) if action == "remove" else None)
+                finally:
+                    link.unlink()
+                    target.rename(link)
+
+    def test_remove_restore_malformed_addresses_still_404(self):
+        for key in ("2026-01/bad.key", "2026-01/drive%0A", "2026-x1/drive"):
+            for action in ("remove", "restore"):
+                with self.subTest(key=key, action=action):
+                    self.assertEqual(self.post(f"/trip/{key}/{action}", reason="test removal").status_code, 404)
+
     def test_remove_hides_all_outputs_and_restore_returns_trip_without_touching_data(self):
         key = self.add_trip("drive")
         original_hash = self.data_hash()
