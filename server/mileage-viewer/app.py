@@ -997,7 +997,7 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
     # merged trip as a whole. This is the only place that filters: the list,
     # totals, exports and next_trip all take their input from this function.
     # An unreadable trip that is removed also leaves next_trip's "an
-    # unreadable summary may fall between" guard. That is intended: removing
+    # unreadable trip may fall between" guard. That is intended: removing
     # it is how the admin clears that warning.
     removed = trip_log.removals(conn)
     if include_removed:
@@ -3033,7 +3033,7 @@ different trips. See "Other changes since the close" below.</p>
 <td>{% if r.miles_diff is none %}unknown{% elif r.differs %}{{ "%+d"|format(r.trip_diff) }} trips, {{ "%+.3f"|format(r.miles_diff) }} mi{% else %}none{% endif %}</td></tr>{% endfor %}</tbody>
 </table></div>
 {% if comparison.unreadable_saved is not none and comparison.unreadable_saved != comparison.unreadable %}
-<p class="warn">Trips with an unreadable summary: {{ comparison.unreadable_saved }} at the close, {{ comparison.unreadable }} now.</p>
+<p class="warn">Trips whose files can't be read: {{ comparison.unreadable_saved }} at the close, {{ comparison.unreadable }} now.</p>
 {% endif %}
 {% if joined or left %}
 <h3>Other changes since the close</h3>
@@ -3856,7 +3856,7 @@ UNREADABLE_COLUMNS = (
 
 
 def _unreadable_values(t):
-    """Export fields for a trip whose summary can't be read.
+    """Export fields for a trip whose files can't be read (summary or refused link).
 
     Just what identifies it and what was typed for it. Its miles are
     unknown, so they stay blank rather than reading as zero.
