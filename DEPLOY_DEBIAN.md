@@ -1529,8 +1529,8 @@ needs UID 1000 (Step 0).
 
 Anything you can rsync to: a network attached storage (NAS) device, another
 always-on machine, or a mounted share. Over SSH, the far end needs `rsync`
-and a login the backup can use without a password. In these examples, `<backup-user>` and
-`<backup-host>` are the login and host for that other machine, and
+and a login the backup can use without a password. In these examples,
+`<backup-user>` and `<backup-host>` are the login and host for that other machine, and
 `/<backup-path>` is the absolute destination directory there. On this server:
 
 ```bash

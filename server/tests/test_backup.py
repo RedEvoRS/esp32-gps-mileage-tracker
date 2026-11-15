@@ -999,8 +999,11 @@ exec {real_rsync} "$@"
         for root in (self.backups, self.remote):
             kept = [root / "snapshots" / name / "data/2026-10/ro/saved.gpx" for name in names[1:]]
             self.assertEqual(kept[0].stat().st_ino, kept[1].stat().st_ino)
+            # A non-root rsync receiver makes read-only files writable to
+            # delete them; a root receiver does not need that chmod.
+            expected_mode = 0o600 if root == self.remote and os.geteuid() != 0 else 0o400
             for path in kept:
-                self.assertEqual(path.stat().st_mode & 0o777, 0o600 if root == self.remote else 0o400)
+                self.assertEqual(path.stat().st_mode & 0o777, expected_mode)
                 self.assertEqual(path.read_text(), "saved read-only trip")
                 self.assertEqual(path.parent.stat().st_mode & 0o777, 0o500)
 
