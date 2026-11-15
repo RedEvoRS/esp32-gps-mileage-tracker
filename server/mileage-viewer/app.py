@@ -4423,10 +4423,11 @@ def undo_unused_merge(ym, merge_id):
         # or constructs a file path from the merge address.
         trips, entries = _load_trips(conn, include_removed=True)
         unused = next((entry for entry in entries if entry["trip_key"] == key and entry.get("unused_merge")), None)
+        if request.form.get('confirm') != 'yes':
+            effect = ' ' + unused_merge_undo_effect(unused) if unused is not None else ''
+            abort(400, description='Confirm removing this unused merge and its merged annotation.' + effect)
         if unused is None:
             abort(409, description="This saved merge is no longer under an unused month name. Reopen the trip list.")
-        if request.form.get('confirm') != 'yes':
-            abort(400, description='Confirm removing this unused merge and its merged annotation. ' + unused_merge_undo_effect(unused))
         _abort_if_removed(conn, key)
         keys = unused["parts"]
         _abort_if_saved_merge_closed(conn, key, keys)
