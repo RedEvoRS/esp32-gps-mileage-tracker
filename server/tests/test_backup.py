@@ -914,7 +914,7 @@ exec {real_rsync} "$@"
                 self.assertEqual(path.stat().st_mode & 0o777, 0o400)
                 self.assertEqual(path.parent.stat().st_mode & 0o777, 0o500)
 
-    def assert_remote_pruning_preserves_kept_hardlink_modes(self):
+    def assert_remote_pruning_keeps_bytes_with_v116_modes(self):
         self.read_only_data_folder()
         self.conf_append("KEEP_RECENT=2\nKEEP_MONTHLY=0\nREMOTE_PRUNE=yes\n")
         names = []
@@ -927,21 +927,24 @@ exec {real_rsync} "$@"
             kept = [root / "snapshots" / name / "data/2026-10/ro/saved.gpx" for name in names[1:]]
             self.assertEqual(kept[0].stat().st_ino, kept[1].stat().st_ino)
             for path in kept:
-                self.assertEqual(path.stat().st_mode & 0o777, 0o400)
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600 if root == self.remote else 0o400)
+                self.assertEqual(path.read_text(), "saved read-only trip")
                 self.assertEqual(path.parent.stat().st_mode & 0o777, 0o500)
 
-    def test_remote_pruning_preserves_kept_hardlink_modes(self):
-        self.assert_remote_pruning_preserves_kept_hardlink_modes()
+        self.run_script("restore.sh", "check")
 
-    def test_ssh_remote_pruning_preserves_kept_hardlink_modes(self):
-        # Exercise remote shell quoting as well as the injected removal helper.
+    def test_remote_pruning_keeps_bytes_with_v116_modes(self):
+        self.assert_remote_pruning_keeps_bytes_with_v116_modes()
+
+    def test_ssh_remote_pruning_keeps_bytes_with_v116_modes(self):
+        # Exercise rsync's remote path quoting too.
         original = self.remote
         self.remote = self.tmp / "nas with 'quote"
         original.rename(self.remote)
         conf = Path(self.env["MILEAGE_BACKUP_CONF"])
         conf.write_text(conf.read_text().replace(f"REMOTE={original}", f'REMOTE="{self.remote}"'))
         self.use_ssh_remote()
-        self.assert_remote_pruning_preserves_kept_hardlink_modes()
+        self.assert_remote_pruning_keeps_bytes_with_v116_modes()
 
     def test_tree_removal_never_chmods_hardlinked_files_or_outside_links(self):
         self.addCleanup(self.writable_fixture_directories)
@@ -2620,6 +2623,9 @@ fi
 
     def test_rsync_only_ssh_backup_without_remote_pruning(self):
         self.assert_rsync_only_ssh_backup("no")
+
+    def test_rsync_only_ssh_backup_with_remote_pruning(self):
+        self.assert_rsync_only_ssh_backup("yes")
 
     def test_unit_file_limits_the_run_and_waits_for_mounts(self):
         unit = (BACKUP / "mileage-backup@.service").read_text()

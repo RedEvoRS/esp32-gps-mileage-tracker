@@ -617,8 +617,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   Optional ntfy state needs a separate backup. Runbook: DEPLOY_DEBIAN Step 10.
   The off-host copy goes only to a destination holding `.mileage-backup-target`
   (written by install.sh or `backup.sh --mark-target`; otherwise the unit fails).
-  `REMOTE_PRUNE=yes` never uses rsync `--delete`: it applies the retention rule
-  to the remote's own snapshot names and refuses, with a warning, when the
+  `REMOTE_PRUNE=yes` uses rsync deletion limited to selected snapshot names,
+  never the remote root, and refuses, with a warning, when the
   remote has snapshots newer than or missing from the local set. rsync has a
   600 s I/O timeout, the unit 6 h. Restore saves a corrupt live DB's raw files
   in the pre-restore folder and continues; its scratch is under `$BACKUP_DIR`.

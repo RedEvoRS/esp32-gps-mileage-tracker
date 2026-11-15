@@ -1498,8 +1498,8 @@ off-host destination. Each run:
   Unchanged files are hard links to the previous snapshot; an unchanged run
   adds no snapshot.
 - keeps the newest 14 snapshots plus the first of each month for 7 years.
-  Pruning and scratch cleanup make only directories writable when removing them;
-  file modes in kept snapshots are preserved.
+  Local pruning and scratch cleanup make only directories writable when removing
+  them; file modes in kept local snapshots are preserved.
 - rsyncs to the off-host copy, then reads the newest snapshot back from
   there and checks it matches byte for byte. It copies only if the
   destination holds a file named `.mileage-backup-target` (see 10a): a share
@@ -1528,9 +1528,8 @@ needs UID 1000 (Step 0).
 ### 10a — Pick the off-host destination
 
 Anything you can rsync to: a network attached storage (NAS) device, another
-always-on machine, or a mounted share. Over SSH, the far end needs `rsync`,
-Bash, find, chmod and rm for pruning, plus a login the backup
-can use without a password. In these examples, `<backup-user>` and
+always-on machine, or a mounted share. Over SSH, the far end needs `rsync`
+and a login the backup can use without a password. In these examples, `<backup-user>` and
 `<backup-host>` are the login and host for that other machine, and
 `/<backup-path>` is the absolute destination directory there. On this server:
 

@@ -1543,11 +1543,11 @@ To check files by hand with GNU coreutils, run `cd <snapshot>` then
 exit 0. For the complete check, including unlisted files, links and databases, use
 `restore.sh check <snapshot>`.
 
-Cleanup and local/off-host pruning make only directories writable before
-removing them. Kept snapshots retain file modes, including files shared by hard
-links. Pruning an SSH destination also needs Bash, find,
-chmod and rm there; pruning removes only named snapshots and never mirrors or
-deletes the remote root.
+Local cleanup and pruning make only directories writable before removing them;
+kept local snapshots retain file modes. Remote pruning uses only rsync, limited
+to selected snapshot names, and never mirrors or deletes the remote root.
+A read-only file shared between snapshots may become owner-writable on the
+remote after pruning; contents and checksums are unaffected.
 
 The nightly local trip copy compares contents with rsync `--checksum`, reading
 live files and their previous copies even when size and time match: a local
