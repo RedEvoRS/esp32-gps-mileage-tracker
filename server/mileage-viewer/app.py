@@ -1025,7 +1025,11 @@ def folder_message(entry, role):
     if role == "admin":
         for name, counts in entry.get("saved_counts", {}).items():
             status = "in use" if name == entry["counted_as"] else "not applied"
-            amounts = ", ".join(f"{count} {label}" for label, count in counts.items())
+            singulars = {"annotations": "annotation", "removals": "removal", "merges": "merge",
+                         "merge parts": "merge part", "old merge addresses": "old merge address",
+                         "history entries": "history entry", "closed-year trip entries": "closed-year trip entry"}
+            amounts = ", ".join(f"{count} {singulars[label] if count == 1 else label}"
+                                for label, count in counts.items())
             sentences.append(f"{name}/ ({status}): {amounts}.")
     sentences.append(folder_hint(entry, role))
     return " ".join(sentences)

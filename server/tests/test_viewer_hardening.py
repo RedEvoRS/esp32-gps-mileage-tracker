@@ -565,6 +565,13 @@ class ViewerHardeningTests(unittest.TestCase):
                 text += " None of its trips are shown or counted."
             text += " " + hints.get(reason, "Replace the link with the real folder, or mount the other disk at that path.")
             expected.append(text)
+        nouns = (("annotations", "annotation"), ("removals", "removal"), ("merges", "merge"),
+                 ("merge parts", "merge part"), ("old merge addresses", "old merge address"),
+                 ("history entries", "history entry"), ("closed-year trip entries", "closed-year trip entry"))
+        for count in (0, 1, 2):
+            entries.append({**entries[6], "saved_counts": {"2026-12": dict.fromkeys(dict(nouns), count)}})
+            amounts = ", ".join(f"{count} {singular if count == 1 else plural}" for plural, singular in nouns)
+            expected.append(f"2026-12/ (in use): {amounts}.")
         self.signed_in("admin")
         with patch.object(self.viewer, "_load_trips", return_value=([], entries)):
             for path, texts in self.folder_surface_messages(self.client).items():
@@ -756,14 +763,14 @@ class ViewerHardeningTests(unittest.TestCase):
         self.signed_in("admin")
         for path, texts in self.folder_surface_messages(self.client).items():
             for name, status in (("2026-01", "in use"), ("2026-02", "not applied")):
-                self.assertTrue(any(f"{name}/ ({status}): 1 annotations, 0 removals, 0 merges, "
+                self.assertTrue(any(f"{name}/ ({status}): 1 annotation, 0 removals, 0 merges, "
                                     "0 merge parts, 0 old merge addresses, 0 history entries, "
                                     "0 closed-year trip entries." in text for text in texts), path)
         for year in (2020, 2026, 2030):
             text = html.unescape(self.client.get(f"/admin/year/{year}").get_data(as_text=True))
             self.assertIn("Years cannot be closed until this conflict is resolved.", text)
-            self.assertIn("2026-01/ (in use): 1 annotations, 0 removals, 0 merges", text)
-            self.assertIn("2026-02/ (not applied): 1 annotations, 0 removals, 0 merges", text)
+            self.assertIn("2026-01/ (in use): 1 annotation, 0 removals, 0 merges", text)
+            self.assertIn("2026-02/ (not applied): 1 annotation, 0 removals, 0 merges", text)
             self.assertIn("Nothing is deleted from the database.", text)
             if year != 2020:
                 self.assertIn(f'<button class="btn" disabled>Close {year}</button>', text)
