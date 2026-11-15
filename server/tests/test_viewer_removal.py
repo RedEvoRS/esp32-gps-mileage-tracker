@@ -124,6 +124,37 @@ class ViewerRemovalTests(unittest.TestCase):
                     link.unlink()
                     target.rename(link)
 
+    def test_restore_of_an_unreadable_trip_lands_on_a_working_page(self):
+        # #722: the trip page can't show an unreadable trip, so a successful
+        # Restore must not send the admin there to a 404.
+        first = self.add_trip("first", 600)
+        second = self.add_trip("second", 720)
+        merged = self.admin.post(f"/trip/{first}/merge", data={
+            "csrf_token": "test-csrf", "next_trip": second,
+        })
+        self.assertEqual(merged.status_code, 302, merged.get_data(as_text=True))
+        merge_key = merged.headers["Location"].split("/trip/")[1].split("?")[0]
+        # Damage a plain trip only after the merge: an unreadable trip from the
+        # same device with no start time would block the merge suggestion.
+        damaged = self.add_trip("damaged")
+        (self.month / "damaged.json").write_text("[not a summary]", encoding="utf-8")
+        for key in (damaged, merge_key):
+            with self.assertLogs(self.viewer.app.logger, "WARNING"):
+                removed = self.post(f"/trip/{key}/remove?year=2026", reason="test removal")
+            self.assertEqual(removed.status_code, 302)
+        (self.month / "second.gpx").unlink()  # the merged trip is now unreadable too
+        for key in (damaged, merge_key):
+            with self.subTest(key=key):
+                with self.assertLogs(self.viewer.app.logger, "WARNING"):
+                    restored = self.post(f"/trip/{key}/restore?year=2026")
+                self.assertEqual(restored.status_code, 302)
+                self.assertEqual(restored.location, "/admin/removed?year=2026")
+                with self.assertLogs(self.viewer.app.logger, "WARNING"):
+                    self.assertEqual(self.admin.get(restored.location).status_code, 200)
+                with closing(sqlite3.connect(self.db)) as conn:
+                    self.assertIsNone(conn.execute(
+                        "SELECT 1 FROM trip_removals WHERE trip_key=?", (key,)).fetchone())
+
     def test_normal_remove_restore_redirects_keep_trip_and_year(self):
         key = self.add_trip("drive")
         for action in ("remove", "restore"):

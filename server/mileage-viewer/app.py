@@ -3369,10 +3369,10 @@ def restore_trip(ym, trip_id):
         trip_log.delete_removal(conn, key)
         trip_log.record(conn, key, "restore", {"reason": removal["reason"]},
                         actor=g.user, actor_role=g.role)
-    # A successful change needs a landing page that can show refused files.
-    try:
-        next(trip_merges.source_file_pairs(DATA_ROOT, [f"{ym}/{trip_id}"]))
-    except ValueError:
+    # The trip page can't show an unreadable trip (damaged summary, broken
+    # merge part, or a file that links outside the data folder), so after a
+    # successful restore land where the admin can see it worked (#716, #722).
+    if removed_trip is None:
         return redirect(url_for("admin_removed", year=year or ""))
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
 
