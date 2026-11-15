@@ -425,6 +425,22 @@ class BackupScripts(unittest.TestCase):
         self.assertTrue((self.backups / "last-success").exists())
         self.assertFalse(ping.exists())
 
+    def test_outside_links_descends_into_linked_data_only(self):
+        real_data = self.compose_dir / "real-data"
+        self.data.rename(real_data)
+        self.symlink(self.data, real_data, True)
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        self.symlink(outside / "not-scanned", self.tmp / "missing")
+        self.symlink(real_data / "linked-month", outside, True)
+        result = subprocess.run(
+            ["bash", "-c", 'source "$LIB"; outside_links "$DATA"'],
+            env=dict(self.env, LIB=str(BACKUP / "lib.sh"), DATA=str(self.data)),
+            capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(b"\0"),
+                         [os.fsencode(self.data / "linked-month"), b""])
+
     def test_link_check_error_still_copies_then_fails(self):
         # A failing link check (here, realpath) must not cost the off-host copy.
         self.conf_append("PING_URL=https://ping.invalid/backup\n")

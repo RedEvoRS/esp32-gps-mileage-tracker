@@ -929,9 +929,13 @@ setup_data_dir() {
         ok "data/ is private (mode 700)"
     fi
 
-    # List only the directory entries, without following their targets.
+    check_data_links
+}
+
+check_data_links() {
+    # Follow only the start directory; never follow an entry's target.
     local links link quoted hint
-    local -a list_links=(find data -mindepth 1 -maxdepth 1 -type l -print0)
+    local -a list_links=(find data/ -mindepth 1 -maxdepth 1 -type l -print0)
     if [[ ! -r data || ! -x data ]]; then
         # Use sudo only where this run already has it (install mode, or a
         # --check that needed it earlier); never start a new prompt here.

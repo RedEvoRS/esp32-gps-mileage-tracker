@@ -355,7 +355,9 @@ read_verify_state() {
 outside_links() {
     local root path resolved
     root=$(realpath -m -- "$1") || return 1
-    find "$1" -name '*.tmp' -prune -o -type l -print0 | while IFS= read -r -d '' path; do
+    # The slash follows a linked start directory, without following links
+    # found below it. This also works with BusyBox find.
+    find "$1/" -name '*.tmp' -prune -o -type l -print0 | while IFS= read -r -d '' path; do
         IFS= read -r -d '' resolved < <(realpath -mz -- "$path") || return 1
         if [[ $resolved != "$root" && $resolved != "$root/"* ]]; then
             printf '%s\0' "$path"
