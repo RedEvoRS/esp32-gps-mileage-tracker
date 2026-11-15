@@ -830,11 +830,20 @@ can't use appears once as a folder (for example `2026-01/`) in both roles'
 warning box, as `row_type=unreadable_folder` in CSV, on the XLSX `Unreadable
 trips` sheet and in the year review: a link that leads outside `data/` (or to
 `data/` itself or above), a link whose target is missing, a link that loops,
-or a real folder the viewer isn't allowed to read. Its trips are neither listed
-nor counted, and nothing outside `data/` is listed or opened. The admin's hint
-fits the cause: replace the link with the real folder or mount the other disk
-at that path; for a folder that can't be read, check its owner and permissions
-(the viewer runs as UID 1000 and reads `data/` read-only).
+or a month entry the viewer could not inspect or list (it disappeared,
+permissions deny access, or the filesystem reported an error). Its trips are
+neither listed nor counted. The admin's hint fits the cause: replace the link
+with the real folder or mount the other disk at that path; for a folder that
+can't be read, check that it still exists, that its disk is available, and
+that UID 1000 (the viewer reads `data/` read-only) may read it.
+
+The viewer checks containment before it lists a folder or reads a file, and on
+Linux it lists each month through a directory handle that refuses a month
+folder swapped for a link at the last moment. These checks can't stop someone
+who can write to `data/` from swapping a *parent* directory in the instant
+between the check and a listing or read; the Windows test fallback also lacks
+the directory handle. Keep `data/` writable only by the containers' user and
+root.
 
 A month link to a folder inside `data/` that no other month name uses (for
 example `2026-01` → `archive`) is read as that month, without a warning. If

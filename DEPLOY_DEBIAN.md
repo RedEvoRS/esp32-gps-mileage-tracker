@@ -2718,11 +2718,12 @@ missing) or loops also makes ingest refuse GPX uploads with 503 until fixed.
 Replace it with a real folder or mount the disk there; its trips can't be
 removed one by one. A month link to a folder that another month name already
 uses is only a notice: its trips are counted once, under the other name, so
-delete the extra link. If the warning says a month folder can't be read, it's a
-real folder the viewer (UID 1000) isn't allowed to read. Check it with
-`sudo ls -ld ~/mileage-tracker/data/<month>`; like the rest of `data/`, it
+delete the extra link. If the warning says a month folder can't be read, the
+viewer could not inspect or list it: check that the folder (or its link's
+target) still exists, that its disk is available, and that UID 1000 may read
+it (`sudo ls -ld ~/mileage-tracker/data/<month>`; like the rest of `data/`, it
 should belong to UID 1000, for example after
-`sudo chown -R 1000:1000 ~/mileage-tracker/data/<month>`. Find out what made a file link, then replace it with the
+`sudo chown -R 1000:1000 ~/mileage-tracker/data/<month>`). Find out what made a file link, then replace it with the
 real file (for example
 from a backup snapshot, as above) or delete it. Sending the GPX to ingest again
 does not fix a link. The admin can still remove such a trip from the log.
