@@ -106,6 +106,185 @@ class ViewerMerges(unittest.TestCase):
         return self.client.post(f"/admin/unused-merge/{key}/undo", data={
             "csrf_token": "test-csrf", "confirm": "yes", **data})
 
+    def discard(self, key, **data):
+        return self.client.post(f'/admin/damaged-merge/{key}/discard', data={
+            'csrf_token': 'test-csrf', 'confirm': 'yes', **data})
+
+    def damaged_merge(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        self.annotate(a, 'personal', 'original note', 'original stop')
+        key = self.merged_key(self.merge(a, b))
+        self.annotate(key, 'business', 'merged note', 'example stop')
+        with closing(sqlite3.connect(self.db)) as conn:
+            summary = conn.execute('SELECT summary FROM trip_merges').fetchone()[0]
+        shutil.rmtree(self.month)
+        return key, [a, b], summary
+
+    def test_damaged_merge_discard_is_admin_only_post_csrf_and_explicit_confirmation(self):
+        key, _, _ = self.damaged_merge()
+        from test_viewer_roles import ViewerRolesTests
+        ViewerRolesTests.seed_editor(self)
+        ViewerRolesTests.signed_in(self, 'editor')
+        with self.client.session_transaction() as session:
+            session['csrf'] = 'test-csrf'
+        page = html.unescape(self.client.get('/').get_data(as_text=True))
+        self.assertNotIn('>Undo merge (split back)</button>', page)
+        self.assertNotIn('>Discard damaged merge</button>', page)
+        self.assertIn('Please ask the admin to restore the files or discard this damaged merge.', page)
+        self.assertEqual(self.split(key).status_code, 409)
+        self.assertEqual(self.discard(key).status_code, 403)
+        self.assertEqual(self.client.get('/admin/year/2026').status_code, 403)
+        self.authenticate(self.client)
+        page = html.unescape(self.client.get('/').get_data(as_text=True))
+        self.assertNotIn('>Undo merge (split back)</button>', page)
+        self.assertIn('>Discard damaged merge</button>', page)
+        self.assertIn('The original trips cannot be restored from the viewer; backups are needed to get the files back.', page)
+        self.assertIn('its saved miles and purpose will leave the log', page)
+        self.assertEqual(self.client.get(f'/admin/damaged-merge/{key}/discard').status_code, 405)
+        self.assertEqual(self.discard(key, csrf_token='bad').status_code, 400)
+        self.assertEqual(self.discard(key, confirm='no').status_code, 400)
+        anonymous = self.viewer.app.test_client()
+        self.assertEqual(anonymous.post(f'/admin/damaged-merge/{key}/discard').status_code, 401)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute('SELECT count(*) FROM trip_merges').fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT count(*) FROM trip_history WHERE action='discard_damaged_merge'").fetchone()[0], 0)
+
+    def test_discard_preserves_full_saved_record_before_deletion_and_in_year_review(self):
+        key, parts, summary = self.damaged_merge()
+        original_record = self.viewer.trip_log.record
+        def record(conn, record_key, action, details, **actor):
+            if action == 'discard_damaged_merge':
+                self.assertTrue(conn.in_transaction)
+                self.assertEqual(conn.execute('SELECT summary FROM trip_merges WHERE trip_key=?', (key,)).fetchone()[0], summary)
+            return original_record(conn, record_key, action, details, **actor)
+        with patch.object(self.viewer.trip_log, 'record', side_effect=record):
+            self.assertEqual(self.discard(key).status_code, 302)
+        self.assertEqual(self.discard(key).status_code, 409)
+        with closing(sqlite3.connect(self.db)) as conn:
+            rows = conn.execute("SELECT trip_key, actor, actor_role, at, details FROM trip_history WHERE action='discard_damaged_merge'").fetchall()
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row[:3], (key, 'driver', 'admin'))
+            self.assertIsNotNone(self.viewer.trip_log.parse_utc(row[3]))
+            details = json.loads(row[4])
+            self.assertEqual(details['parts'], parts)
+            self.assertEqual(details['saved_summary_raw'], summary)
+            self.assertEqual(details['saved_summary'], json.loads(summary))
+            for field in ('start_time', 'end_time', 'distance_miles'):
+                self.assertIsNotNone(details['saved_summary'][field])
+            self.assertEqual(details['dropped'], {'category': 'business', 'purpose_note': 'merged note', 'destination': 'example stop'})
+            self.assertEqual(details['original_annotations'][parts[0]],
+                             {'category': 'personal', 'purpose_note': 'original note', 'destination': 'original stop'})
+            for table in ('trip_merges', 'trip_merge_parts', 'trip_merge_aliases'):
+                self.assertEqual(conn.execute('SELECT count(*) FROM ' + table).fetchone()[0], 0)
+            self.assertEqual(conn.execute('SELECT purpose_note FROM annotations WHERE trip_key=?', (parts[0],)).fetchone()[0], 'original note')
+            self.assertEqual(conn.execute("SELECT count(*) FROM trip_history WHERE action='split'").fetchone()[0], 0)
+        review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
+        self.assertIn('Discarded damaged merges (1)', review)
+        self.assertIn(f"{json.loads(summary)['distance_miles']:.3f} mi", review)
+        self.assertIn('business; merged note', review)
+        self.assertIn('driver', review)
+        self.assertIn(self.viewer.fmt_date(row[3]), review)
+        self.assertIn('The original trips were not restored', review)
+        self.assertNotIn('Discarded damaged merges', self.client.get('/admin/year/2025').get_data(as_text=True))
+        self.assertIn(2026, [r['year'] for r in self.viewer._year_list()])
+        self.assertEqual(self.close_year().status_code, 302)
+        self.assertIn('Discarded damaged merges (1)', self.client.get('/admin/year/2026').get_data(as_text=True))
+        history = self.client.get('/admin/history').get_data(as_text=True)
+        self.assertIn('Damaged merge discarded', history)
+        self.assertIn('Original trips were not restored.', history)
+
+    def test_discard_and_history_roll_back_together_if_deletion_fails(self):
+        key, parts, _ = self.damaged_merge()
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("CREATE TRIGGER refuse_delete BEFORE DELETE ON trip_merges BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END")
+        self.viewer.app.config['TESTING'] = True
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.discard(key)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute('SELECT count(*) FROM trip_merges').fetchone()[0], 1)
+            self.assertEqual(self.viewer.trip_merges.parts(conn, key), parts)
+            self.assertEqual(conn.execute("SELECT count(*) FROM trip_history WHERE action='discard_damaged_merge'").fetchone()[0], 0)
+
+    def test_discard_refuses_healthy_unused_or_repaired_merges_and_preserves_files(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        files = {p: p.read_bytes() for p in self.month.iterdir()}
+        self.assertEqual(self.discard(key).status_code, 409)
+        (self.month / 'b.gpx').unlink()
+        self.assertIn('>Discard damaged merge</button>', self.client.get('/').get_data(as_text=True))
+        (self.month / 'b.gpx').write_bytes(files[self.month / 'b.gpx'])
+        self.assertEqual(self.discard(key).status_code, 409)
+        self.assertEqual({p: p.read_bytes() for p in self.month.iterdir()}, files)
+        self.viewer.load_trips()  # Commit the repaired source's refreshed stamp.
+        self.month.rename(self.data / '2026-05')
+        self.assertTrue(self.viewer.load_trips()[1][0]['unused_merge'])
+        self.assertEqual(self.discard(key).status_code, 409)
+
+    def test_discard_respects_closed_year_and_saved_snapshot_then_reopen_allows_it(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        self.assertEqual(self.close_year().status_code, 302)
+        shutil.rmtree(self.month)
+        self.assertEqual(self.discard(key).status_code, 409)
+        self.assertEqual(self.split(key).status_code, 409)
+        self.assertEqual(self.client.post('/admin/year/2026/reopen', data={
+            'csrf_token': 'test-csrf', 'confirm': 'yes'}).status_code, 302)
+        # Snapshot membership still locks it even if the saved date is another year.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('INSERT INTO tax_years VALUES (2025,\'driver\',\'\',?)', (json.dumps({'trip_keys': [key]}),))
+        self.assertEqual(self.discard(key).status_code, 409)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('DELETE FROM tax_years')
+        self.assertEqual(self.discard(key).status_code, 302)
+
+    def test_healthy_merge_undo_still_restores_original_annotations_for_both_roles(self):
+        from test_viewer_roles import ViewerRolesTests
+        ViewerRolesTests.seed_editor(self)
+        for index, role in enumerate(('admin', 'editor')):
+            a = self.trip(f'a{index}', index * 600)
+            b = self.trip(f'b{index}', index * 600 + 180, .01)
+            self.annotate(a, 'personal', 'original note')
+            key = self.merged_key(self.merge(a, b))
+            self.annotate(key, 'business', 'merged note')
+            if role == 'editor':
+                ViewerRolesTests.signed_in(self, role)
+                with self.client.session_transaction() as session:
+                    session['csrf'] = 'test-csrf'
+            page = self.client.get('/trip/' + key).get_data(as_text=True)
+            self.assertIn('>Undo merge (split back)</button>', page)
+            self.assertIn('Restore each original trip and annotation, removing the current merged annotation.', page)
+            self.assertEqual(self.split(key).status_code, 302)
+            trips = {t['trip_key']: t for t in self.viewer.load_trips()[0]}
+            self.assertEqual(trips[a]['purpose_note'], 'original note')
+            self.assertEqual(trips[a]['category'], 'personal')
+            self.assertEqual(trips[b]['purpose_note'], '')
+            self.authenticate(self.client)
+
+    def test_discard_uses_exact_damaged_saved_key_without_following_month_alias(self):
+        key = self.unused_merge()
+        (self.data / 'archive/b.gpx').unlink()
+        self.assertEqual(self.discard(key.replace('2026-04/', '2026-03/')).status_code, 409)
+        self.assertEqual(self.split(key).status_code, 409)
+        self.assertEqual(self.discard(key).status_code, 302)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT trip_key FROM trip_history WHERE action='discard_damaged_merge'").fetchone()[0], key)
+
+    @unittest.skipIf(os.name == 'nt' or getattr(os, 'geteuid', lambda: 0)() == 0, 'requires non-root POSIX permissions')
+    def test_unreadable_part_without_stamp_change_requires_admin_discard(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        source = self.month / 'b.gpx'
+        saved_stat = source.stat()
+        self.addCleanup(source.chmod, 0o600)
+        source.chmod(0o000)
+        self.assertEqual(source.stat().st_mtime_ns, saved_stat.st_mtime_ns)
+        self.assertEqual(source.stat().st_size, saved_stat.st_size)
+        broken = self.viewer.load_trips()[1][0]
+        self.assertTrue(broken['damaged_merge'])
+        self.assertEqual(self.split(key).status_code, 409)
+        self.assertEqual(self.discard(key).status_code, 302)
+
     def assert_unused_merge(self, key, conflict):
         trips, entries = self.viewer.load_trips()
         self.assertEqual({t["trip_key"] for t in trips}, {"2026-03/a", "2026-03/b"})
@@ -348,23 +527,34 @@ class ViewerMerges(unittest.TestCase):
         trips, entries = self.viewer.load_trips()
         broken = next(t for t in entries if t["trip_key"] == key)
         self.assertNotIn("unused_merge", broken)
-        self.assertEqual(broken["problem"], "A merge part is missing or unreadable; restore it or undo the merge.")
+        self.assertEqual(broken["problem"], self.viewer.trip_merges.DAMAGED_MERGE_PROBLEM)
         first = next(t for t in trips if t["trip_key"] == c)
         candidate, reason = self.viewer.trip_merges.next_trip(first, trips, entries)
         self.assertIsNone(candidate)
         self.assertIn("unknown device", reason)
         self.assertEqual(self.viewer.year_figures(trips, entries)["unreadable"], 1)
         self.assertEqual(self.undo_unused(key).status_code, 409)
-        self.assertEqual(self.split(key).status_code, 302)
+        self.assertEqual(self.split(key).status_code, 409)
 
     def assert_damaged_saved_merge(self, key, first_key, missing=1):
         trips, entries = self.viewer.load_trips()
         broken = next(t for t in entries if t['trip_key'] == key)
         self.assertNotIn('unused_merge', broken)
-        self.assertEqual(broken['problem'], 'A merge part is missing or unreadable; restore it or undo the merge.')
+        self.assertEqual(broken['problem'], self.viewer.trip_merges.DAMAGED_MERGE_PROBLEM)
         page = self.client.get('/').get_data(as_text=True)
         self.assertIn(broken['problem'], page)
         self.assertNotIn('Undo saved merge', page)
+        self.assertNotIn('>Undo merge (split back)</button>', page)
+        self.assertIn('>Discard damaged merge</button>', page)
+        from test_viewer_roles import ViewerRolesTests
+        if self.viewer.users.get_user(self.db, 'helper') is None:
+            ViewerRolesTests.seed_editor(self)
+        ViewerRolesTests.signed_in(self, 'editor')
+        editor_page = self.client.get('/').get_data(as_text=True)
+        self.assertNotIn('>Undo merge (split back)</button>', editor_page)
+        self.assertNotIn('>Discard damaged merge</button>', editor_page)
+        self.authenticate(self.client)
+        self.assertEqual(self.split(key).status_code, 409)
         first = next(t for t in trips if t['trip_key'] == first_key)
         candidate, reason = self.viewer.trip_merges.next_trip(first, trips, entries)
         self.assertIsNone(candidate)
@@ -1129,7 +1319,7 @@ class ViewerMerges(unittest.TestCase):
         self.assertEqual(self.client.post(f"/trip/{key}/split", data={"csrf_token": "test-csrf"}).status_code, 400)
         self.assertEqual(len(self.viewer.load_trips()[0]), 1)
 
-    def test_cache_invalidates_and_missing_part_is_unreadable_but_undo_works(self):
+    def test_cache_invalidates_and_missing_part_requires_deliberate_admin_discard(self):
         a, b = self.trip("a", 0), self.trip("b", 120, .001)
         key = self.merged_key(self.merge(a, b))
         helper = self.viewer.trip_merges
@@ -1144,11 +1334,13 @@ class ViewerMerges(unittest.TestCase):
         self.assertEqual(trips, [])
         self.assertEqual([t["trip_key"] for t in unreadable], [key])
         page = self.client.get("/").get_data(as_text=True)
-        self.assertIn("Undo merge (split back)", page)
+        self.assertNotIn('>Undo merge (split back)</button>', page)
+        self.assertIn('>Discard damaged merge</button>', page)
         self.assertIn(f"{a}.gpx; {b}.gpx", page)
         self.assertNotIn(key + ".gpx", page)
         self.assert_export_sources("unreadable", "Unreadable trips", "a", f"{a}.gpx; {b}.gpx")
-        self.assertEqual(self.split(key).status_code, 302)
+        self.assertEqual(self.split(key).status_code, 409)
+        self.assertEqual(self.discard(key).status_code, 302)
 
     def test_old_schema_migrates_concurrently_preserving_rows(self):
         db = self.root / "old.db"

@@ -4,6 +4,7 @@ import errno
 import json
 import os
 import re
+import stat
 import xml.etree.ElementTree as ET
 from xml.parsers import expat
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,10 @@ ANNOTATION_FIELDS = ("category", "purpose_note", "destination")
 YM_RE = re.compile(r"[0-9]{4}-[0-9]{2}")
 ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 TRIP_KEY_RE = re.compile(rf"({YM_RE.pattern})/({ID_RE.pattern})")
+_SOURCE_UID = getattr(os, 'geteuid', lambda: None)()
+_SOURCE_GROUPS = frozenset([getattr(os, 'getegid', lambda: None)(),
+                           *getattr(os, 'getgroups', lambda: [])()])
+DAMAGED_MERGE_PROBLEM = "A merge part is missing or unreadable."
 
 
 class MergeRefreshNeeded(Exception):
@@ -122,6 +127,14 @@ def fingerprint(data_root, keys):
     for pair in source_file_pairs(data_root, keys):
         for source in pair:
             st = source.stat()
+            # Reuse the metadata already needed for the stamp. Losing read
+            # permission need not change size/mtime; never treat that cached
+            # merge as healthy. No extra file probes or reads on healthy scans.
+            if _SOURCE_UID not in (None, 0):
+                bit = (stat.S_IRUSR if st.st_uid == _SOURCE_UID else
+                       stat.S_IRGRP if st.st_gid in _SOURCE_GROUPS else stat.S_IROTH)
+                if not st.st_mode & bit:
+                    raise PermissionError("A merge source cannot be read")
             stamps.append((source.name, st.st_mtime_ns, st.st_size))
     return json.dumps(stamps)
 
@@ -322,7 +335,8 @@ def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=N
                 t["received_at"] = received
             merged.append(t)
         except (OSError, ValueError):
-            broken.append({**t, "problem": "A merge part is missing or unreadable; restore it or undo the merge."})
+            broken.append({**t, "damaged_merge": True, "saved_summary": saved_summary(row),
+                           "problem": DAMAGED_MERGE_PROBLEM})
     return ([t for t in trips if t["trip_key"] not in hidden] + merged,
             [t for t in unreadable if t["trip_key"] not in hidden] + broken)
 

@@ -484,6 +484,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   A missing folder alone remains damage; direct trip loads and undo agree.
   Unused-name merges block closing their saved-summary year (every year if
   unknown); review and export notices retain saved miles outside totals.
+  Damaged merges have admin-only discard with the saved summary kept in
+  history in the same transaction and permanently listed in year review.
   A file occupying a month name, or a folder whose owner/mode denies ingest
   writing, is a notice with no missing count or merge block. Write notices
   reuse scanned metadata, never W_OK on the viewer's read-only mount.

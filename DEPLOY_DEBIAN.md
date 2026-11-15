@@ -2812,7 +2812,16 @@ folder. If its link was removed, the file stamps are the remaining evidence;
 the database has no historical folder identity. A lost real month folder,
 partial matches, changed files or unreadable parts remain damaged merges,
 counted as missing in year review and close snapshots, with uncertain merge
-suggestions blocked and no **Undo saved merge**. An unused-name notice adds
+suggestions blocked and no **Undo saved merge**. Neither role can use ordinary
+**Undo merge (split back)** on damage. Only the admin can **Discard damaged
+merge**, after confirming that originals cannot be restored from the viewer
+and the saved miles and purpose will leave the log. Recover files from backups
+instead. Before deletion, the same transaction saves the complete summary,
+annotation and part keys in history. **Discarded damaged merges** in the year
+review permanently shows saved miles, purpose, date and login, even after closing.
+The deliberate discard confirmation and visible record allow closing without
+another acknowledgement; reopen any affected closed year before discarding.
+Healthy merge undo is unchanged for both roles. An unused-name notice adds
 no saved miles or merged annotation; it does not block healthy merge
 suggestions. Moving or renaming a real month folder with file times kept also
 produces an unused-name merge when every recording matches under the new name.

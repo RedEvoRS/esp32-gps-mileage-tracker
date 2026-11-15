@@ -87,6 +87,7 @@ class ViewerRolesTests(unittest.TestCase):
             'merge_trip': ('/trip/2026-01/drive/merge', 'POST', 409),
             'split_trip': ('/trip/2026-01/drive/split', 'POST', 400),
             'undo_unused_merge': ('/admin/unused-merge/2026-01/merge-example/undo', 'POST', 400),
+            'discard_damaged_merge': ('/admin/damaged-merge/2026-01/merge-example/discard', 'POST', 400),
             'export_csv': ('/export.csv', 'GET', 200), 'export_xlsx': ('/export.xlsx', 'GET', 200),
             'device_health': ('/device-health', 'GET', 200), 'logout': ('/logout', 'POST', 302),
             'admin': ('/admin', 'GET', 200),
@@ -120,7 +121,7 @@ class ViewerRolesTests(unittest.TestCase):
                         expected = (200 if endpoint == 'health' or (endpoint == 'login' and method == 'GET')
                                     else (302 if method == 'GET' else 401))
                     elif endpoint in {'admin', 'admin_removed', 'admin_history', 'admin_year', 'close_year', 'reopen_year',
-                                      'remove_trip', 'restore_trip', 'undo_unused_merge'} and role == 'editor':
+                                      'remove_trip', 'restore_trip', 'undo_unused_merge', 'discard_damaged_merge'} and role == 'editor':
                         expected = 403
                     response = self.client.open(path, method=method, data={'csrf_token': 'known-token'})
                     self.assertEqual(response.status_code, expected)

@@ -529,7 +529,7 @@ class ViewerHardeningTests(unittest.TestCase):
                         book.close()
                 elif path.endswith(".csv"):
                     result[path] = [r["purpose_note"] for r in csv.DictReader(io.StringIO(response.get_data(as_text=True)))
-                                    if r["trip_id"].endswith("/")]
+                                    if r["row_type"] in ('unreadable', 'unreadable_folder', 'folder_notice', 'folder_warning')]
                 else:
                     result[path] = [html.unescape(response.get_data(as_text=True))]
             finally:
@@ -610,6 +610,23 @@ class ViewerHardeningTests(unittest.TestCase):
                         self.assertIn('restore the original month name, as a link or by renaming the folder back', message)
                         self.assertIn('or use Undo saved merge to keep the separate trips and their own annotations.', message)
                     self.assertTrue(any(message in text for text in texts), path)
+
+    def test_damaged_merge_has_same_recovery_message_on_every_surface_for_both_roles(self):
+        entry = {'trip_key': '2026-01/merge-example', 'ym': '2026-01', 'id': 'merge-example',
+                 'parts': ['2026-01/a', '2026-01/b'], 'gpx_file': '2026-01/a.gpx; 2026-01/b.gpx',
+                 'has_gpx': False, 'damaged_merge': True, 'category': 'business',
+                 'purpose_note': 'example note', 'destination': '',
+                 'saved_summary': {'start_time': '2026-01-02T12:00:00Z', 'distance_miles': .732},
+                 'problem': self.viewer.trip_merges.DAMAGED_MERGE_PROBLEM}
+        for role in ('admin', 'editor'):
+            self.signed_in(role)
+            message = self.viewer.folder_message(entry, role)
+            self.assertIn('Saved merge: 0.732 mi; purpose: business.', message)
+            self.assertIn('The original trips cannot be restored from the viewer; restore the files from backups.', message)
+            self.assertIn('Or use Discard damaged merge:' if role == 'admin' else 'Please ask the admin', message)
+            with patch.object(self.viewer, '_load_trips', return_value=([], [entry])):
+                for path, texts in self.folder_surface_messages(self.client, include_review=role == 'admin').items():
+                    self.assertTrue(any(message in text for text in texts), (role, path))
 
     def test_month_upload_notices_match_ingest_shared_link_layouts_on_every_surface(self):
         summary = (self.viewer.DATA_ROOT / "2026-01/drive.json").read_bytes()
@@ -1183,7 +1200,7 @@ class ViewerHardeningTests(unittest.TestCase):
             self.assertIn("and folder notices</h2>", self.client.get("/admin/year/2027").get_data(as_text=True))
             self.assertNotIn("and folder notices", self.client.get("/admin/year/2026").get_data(as_text=True))
 
-    def test_merged_trip_with_linked_month_part_keeps_undo(self):
+    def test_damaged_merge_with_linked_month_part_requires_admin_discard(self):
         month = self.viewer.DATA_ROOT / "2026-01"
         target = self.db.parent / "outside-month"
         month.rename(target)
@@ -1199,7 +1216,10 @@ class ViewerHardeningTests(unittest.TestCase):
         self.signed_in("admin")
         page = self.client.get("/")
         self.assertEqual(page.status_code, 200)
-        self.assertIn(b"Undo merge (split back)", page.data)
+        self.assertNotIn(b'>Undo merge (split back)</button>', page.data)
+        self.assertIn(b'>Discard damaged merge</button>', page.data)
+        self.assertEqual(self.client.post('/trip/2026-02/merged/split', data={
+            'csrf_token': 'known-token', 'confirm': 'yes'}).status_code, 409)
 
     def test_dangling_month_is_reported_in_full_scan(self):
         month = self.viewer.DATA_ROOT / "2026-01"
