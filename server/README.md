@@ -960,10 +960,18 @@ To resolve competing saved names:
    Keep the month name to preserve its saved-data keys. Verify the viewer and
    `install.sh --check`, then let the tracker retry queued uploads.
 
-A merge whose parts are all saved under month names no longer in use is
-listed as saved data under an unused name, including after its link is
-removed. Its saved miles and merged annotation are not applied and it does
-not block merge suggestions for healthy trips. To use it again, restore its
+A merge is listed as saved data under an unused name only when every part
+is readable and counted under another name, with both its GPX and summary
+matching the saved file names, sizes and modification times. All parts from
+one old month must match one unambiguous counted folder. A surviving alias
+must reach that folder; after its link is removed, the saved file stamps
+are the remaining evidence (the database stores no historical folder identity).
+A deleted real folder, partial matches, changed files or unreadable parts
+remain damaged merges: they count as missing mileage, appear in year review
+and close snapshots, block uncertain merge suggestions, and cannot be undone
+through **Undo saved merge**. An unused-name notice adds no saved miles or
+merged annotation and does not block merge suggestions for healthy trips.
+To use that merge again, restore its
 original month link to the original trip folder and keep that name in use
 (follow the conflict steps above before removing competing links). Or use
 **Undo saved merge** on the trip list as admin and confirm removing that
@@ -977,9 +985,9 @@ trips**, labelled as a saved merge under an unused name. Totals and new
 year-close snapshots include only trips under the name now in use; an unused
 merge adds no trip, missing-mileage count or snapshot key. Older snapshots
 stay unchanged, so the review can show a former merged key leaving and the
-currently counted trips joining. A missing or unreadable part under a name
-still in use remains a damaged merge, excluded from totals and subject to
-the existing conservative merge-suggestion checks.
+currently counted trips joining. The undo checks all replacement recordings
+again under its database write transaction; a stale form cannot discard a
+merge whose replacement parts have gone missing.
 
 The XLSX `Unreadable trips` sheet also lists folder notices and saved-data
 warnings. Their row labels say whether trips are counted elsewhere, a link

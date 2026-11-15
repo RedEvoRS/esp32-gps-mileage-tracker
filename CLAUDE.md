@@ -477,7 +477,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   across routes; saved-name conflicts preserve saved keys and block year closing,
   and folder messages share one formatter across the list, review and exports.
   The upload alert names global folder refusals; unused-name merges are saved-data
-  notices excluded from miles and missing counts, with admin undo.
+  notices excluded from miles and missing counts, with admin undo, only when
+  every part is counted under another name and both files match saved stamps.
+  A missing folder alone remains damage; direct trip loads and undo agree.
   Closing a year
   saves its totals
   in `tax_years.snapshot`; the year review compares saved and current totals,

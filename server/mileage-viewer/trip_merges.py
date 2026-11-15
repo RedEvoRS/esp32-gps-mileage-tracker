@@ -186,28 +186,64 @@ def combined_gpx(data_root, keys):
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
-def unused_merge_months(data_root, keys, counted_months):
-    """All parts must belong to unused names; real damage stays damage.
+def unused_merge_months(conn, data_root, keys, counted_months, originals, stored_stamp):
+    """Require all recordings under another counted name, never just absence.
 
-    Only a known alias or an absent directory entry proves a name unused.
-    Permission, I/O, unsafe links and empty real folders prove nothing here.
-    This costs at most one lstat per distinct part month, only for a merge.
+    A surviving alias must reach that same folder. After a link is removed,
+    the database retains no folder identity: require an unambiguous replacement
+    folder for each old month, with both files' saved names, sizes and mtimes.
+    IDs alone cannot distinguish a lost folder from unrelated recordings.
+    Only inactive merges pay for the replacement search and source checks.
     """
     if not keys or any(not TRIP_KEY_RE.fullmatch(key) for key in keys):
         return []
     months = sorted({key.split("/")[0] for key in keys})
+    replacements = {}
+    root = data_root.resolve()
     for month in months:
         if month in counted_months:
             if counted_months[month] == month:
                 return []
+            try:
+                if checked_path(root, data_root / month) != checked_path(root, data_root / counted_months[month]):
+                    return []
+            except ValueError:
+                return []
+            replacements[month] = [counted_months[month]]
         else:
             try:
                 (data_root / month).lstat()
             except FileNotFoundError:
+                replacements[month] = sorted({name for name, chosen in counted_months.items() if name == chosen})
                 continue
             except OSError:
                 return []
             return []
+    try:
+        stamps = json.loads(stored_stamp)
+        if stamps and isinstance(stamps[0], int):
+            stamps = stamps[1:]  # Legacy summary-rule prefix.
+        if not isinstance(stamps, list) or len(stamps) != 2 * len(keys):
+            return []
+        removed = trip_log.removals(conn)
+        for month in months:
+            indices = [i for i, key in enumerate(keys) if key.split('/')[0] == month]
+            saved = json.dumps([stamp for i in indices for stamp in stamps[2 * i:2 * i + 2]])
+            matches = []
+            for candidate in replacements[month]:
+                alternate = [candidate + '/' + keys[i].split('/')[1] for i in indices]
+                if any(key not in originals or canonical_key(conn, key) in removed for key in alternate):
+                    continue
+                # A readable summary alone counts on ordinary pages, but this
+                # exception also needs every source GPX present and readable.
+                if not all(os.access(path, os.R_OK) for pair in source_file_pairs(data_root, alternate) for path in pair):
+                    continue
+                if same_sources(fingerprint(data_root, alternate), saved):
+                    matches.append(candidate)
+            if len(matches) != 1:
+                return []
+    except (OSError, ValueError, TypeError, IndexError):
+        return []
     return months
 
 
@@ -230,7 +266,8 @@ def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=N
         key = row["trip_key"]
         keys = parts(conn, key)
         ym, trip_id = key.split("/")
-        unused = unused_merge_months(data_root, keys, counted_months) if counted_months is not None else []
+        unused = (unused_merge_months(conn, data_root, keys, counted_months, originals, row['fingerprint'])
+                  if counted_months is not None else [])
         if unused:
             broken.append({"folder": True, "folder_reason": "unused_merge", "unused_merge": True,
                            "ym": ym, "id": trip_id, "trip_key": key, "parts": keys,

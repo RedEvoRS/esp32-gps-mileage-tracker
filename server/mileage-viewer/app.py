@@ -1189,6 +1189,9 @@ def _require_counted_month_address():
         return None
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         counted, _ = _month_choices(conn, DATA_ROOT.resolve())
+        if (request.endpoint == 'trip_view' and request.method in ('GET', 'HEAD') and
+                conn.execute('SELECT 1 FROM trip_merges WHERE trip_key=?', (f'{ym}/{trip_id}',)).fetchone()):
+            return None  # Diagnose the saved merge itself, not a nonexistent alias address.
     chosen = counted.get(ym, ym)
     if chosen == ym:
         return None
@@ -1288,7 +1291,14 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                 del _summary_cache[path]
     else:
         trip_key = trip_merges.canonical_key(conn, trip_key)
-        keys = trip_merges.parts(conn, trip_key) or [trip_key]
+        merge_parts = trip_merges.parts(conn, trip_key)
+        keys = merge_parts or [trip_key]
+        if merge_parts and any((DATA_ROOT / key.split('/')[0]).is_symlink() or
+                               not (DATA_ROOT / key.split('/')[0]).is_dir() for key in merge_parts):
+            # Only unusual merge addresses need the full counted-name evidence.
+            # Use exactly the list/undo classifier, retaining only this merge.
+            loaded = _load_trips(conn, include_removed=include_removed, refresh_merges=refresh_merges)
+            return tuple([t for t in entries if t['trip_key'] == trip_key] for entries in loaded)
         # Keep the lexical identity even for escaping/unreadable sources so
         # the trip can be reported. Never construct paths from invalid keys.
         json_paths = [DATA_ROOT / f"{key}.json" for key in keys if trip_merges.TRIP_KEY_RE.fullmatch(key)]
@@ -3873,6 +3883,9 @@ def trip_view(ym, trip_id):
     if t is None and g.role == "admin" and removed is not None:
         t = next((t for t in removed_trips + removed_unreadable if t["trip_key"] == key), None)
     if t is None:
+        unused = next((u for u in unreadable if u['trip_key'] == key and u.get('unused_merge')), None)
+        if unused is not None:
+            abort(404, description=folder_message(unused, g.role))
         problem = next((u["problem"] for u in unreadable if u["trip_key"] == key), None)
         if problem is None:
             # A removed trip (for an everyday login) and an address that

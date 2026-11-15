@@ -2792,23 +2792,32 @@ To resolve a saved-name conflict:
    saved-data keys still match. Check the viewer and `install.sh --check`;
    queued tracker trips can then retry.
 
-A merge saved entirely under month names no longer in use appears as saved
-data under an unused name, even after its link is removed. Its saved miles
-and merged annotation are not applied; it does not block healthy merge
+A merge appears as saved data under an unused name only if every part is
+readable and counted under another name and both source files match their
+saved names, sizes and modification times. All parts from each old month
+must match one unambiguous counted folder. A surviving alias must reach that
+folder. If its link was removed, the file stamps are the remaining evidence;
+the database has no historical folder identity. A lost real month folder,
+partial matches, changed files or unreadable parts remain damaged merges,
+counted as missing in year review and close snapshots, with uncertain merge
+suggestions blocked and no **Undo saved merge**. An unused-name notice adds
+no saved miles or merged annotation; it does not block healthy merge
 suggestions. To use it again, restore its original month link to the original
 trip folder and keep that name in use, following the conflict steps above.
 Alternatively, the admin can select **Undo saved merge** on the trip list
 and confirm. This removes only the saved merge and merged annotation,
 preserves original annotations and source files, and records the undo in
 history. Reopen any affected closed year first. Everyday logins must ask
-the admin. A stale undo form is refused if the merge's name is back in use.
+the admin. The undo rechecks every replacement recording under its database
+write transaction; a stale form is refused if any evidence is gone or the
+merge's name is back in use.
 
 Exports show it as a notice with its saved key, recovery advice and no miles
 (`folder_notice` in CSV; labelled in XLSX's **Unreadable trips** sheet).
 New year-close snapshots count only the trips under the name in use, with
 no missing-mileage count or trip key for the unused merge. Existing snapshots
 remain unchanged and the year review shows changes from their old keys.
-Genuinely missing or unreadable parts under a name still in use retain the
+Genuinely missing or unreadable parts under any name retain the
 existing damaged-merge warning and conservative merge-suggestion checks.
 
 A link to a non-month folder inside `data/` shows existing trips and counts
