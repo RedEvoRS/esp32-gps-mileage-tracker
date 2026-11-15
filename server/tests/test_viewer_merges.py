@@ -548,7 +548,7 @@ class ViewerMerges(unittest.TestCase):
         with self.assertLogs(self.viewer.app.logger, "WARNING"):
             self.assertEqual(self.merge(a, b).status_code, 409)
             page = self.client.get(f"/trip/{a}").get_data(as_text=True)
-        self.assertIn("an unreadable summary with an unknown device may fall between", page)
+        self.assertIn("an unreadable trip with an unknown device may fall between", page)
         self.assertNotIn("No eligible next trip", page)
 
     def test_damaged_summary_from_another_device_does_not_block(self):
@@ -579,7 +579,7 @@ class ViewerMerges(unittest.TestCase):
                 with self.assertLogs(self.viewer.app.logger, "WARNING"):
                     page = self.client.get(f"/trip/{a}").get_data(as_text=True)
                     response = self.merge(a, b)
-                reason = "an unreadable summary from this device may fall between these recordings"
+                reason = "an unreadable trip from this device may fall between these recordings"
                 self.assertIn(reason, page)
                 self.assertNotIn("No eligible next trip", page)
                 self.assertNotIn(">Merge with next trip</button>", page)

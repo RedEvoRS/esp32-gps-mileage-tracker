@@ -16,7 +16,7 @@ import test_viewer_roles as roles
 
 
 ADMIN_REFUSAL = ("This trip&#39;s files can&#39;t be opened: its summary, track or month folder links outside "
-                 "the data folder, so the viewer won&#39;t read them. The trip list and exports flag it. "
+                 "the data folder, so the viewer won&#39;t read them. If it is in the log, the trip list and exports flag it. "
                  "Replace the link with the real file to show the trip again.")
 
 BS = chr(92)
@@ -238,7 +238,15 @@ class ViewerHardeningTests(unittest.TestCase):
         with self.viewer._trip_read(trip_key="2026-01/drive") as (_, targeted, damaged):
             self.assertEqual(targeted, trips)
             self.assertEqual(damaged, unreadable)
-        self.assertEqual(self.viewer.mileage_totals(trips)["all"], 0)
+        # Mix a readable recording with the refused one so counting either
+        # recording incorrectly changes the total.
+        summary = self.viewer.DATA_ROOT / "2026-01/drive.json"
+        readable = json.loads(summary.read_text())
+        readable["distance_miles"] = 2.5
+        summary.with_name("readable.json").write_text(json.dumps(readable))
+        counted, _ = self.viewer.load_trips()
+        self.assertEqual(self.viewer.mileage_totals(counted)["all"], 2.5)
+        summary.with_name("readable.json").unlink()
         for route in ("/", "/export.csv", "/export.xlsx", "/admin/year/2026"):
             with self.subTest(route=route):
                 response = self.client.get(route)
@@ -248,17 +256,27 @@ class ViewerHardeningTests(unittest.TestCase):
                     try:
                         self.assertEqual(book["Mileage"].max_row, 1)
                         self.assertEqual(book["Totals"]["D2"].value, 0)
+                        self.assertIn("Unreadable trips", book.sheetnames)
+                        rows = list(book["Unreadable trips"].values)
+                        self.assertEqual([row[rows[0].index("trip_id")] for row in rows[1:]], ["drive"])
                         text = str([list(sheet.values) for sheet in book])
                     finally:
                         book.close()
                 else:
                     text = response.get_data(as_text=True)
-                if route.endswith(".xlsx"):
-                    self.assertIn("drive", text)
-                elif route.endswith(".csv"):
+                if route.endswith(".csv"):
                     self.assertIn(",unreadable,", text)
-                else:
+                elif not route.endswith(".xlsx"):
                     self.assertIn("the file could not be read", text)
+                    self.assertIn("2026-01/drive.gpx", text)
+                    self.assertNotIn("2026-01/drive.json", text)
+                    self.assertNotIn("(no GPX either)", text)
+                    if route == "/":
+                        self.assertIn("1 trip file(s) can't be read.", text)
+                        self.assertIn("damaged summary from its GPX", text)
+                    else:
+                        self.assertIn("Trips whose files can't be read", text)
+                self.assertNotIn("refused_file", text)
                 self.assertNotIn("outside-track-sentinel", text)
                 self.assertNotIn(str(target), text)
                 if route.endswith(".csv"):
