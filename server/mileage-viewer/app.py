@@ -4616,8 +4616,6 @@ def _unreadable_values(t):
         values["trip_id"] = t["trip_key"]
         values["purpose_note"] = folder_message(t, g.role)
         if t.get("unused_merge"):
-            miles = t.get("saved_summary", {}).get("distance_miles")
-            values["distance_miles"] = miles if _is_number(miles) else ""
             values["category"] = t.get("category", "")
         return values
     return {

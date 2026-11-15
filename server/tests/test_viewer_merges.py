@@ -411,7 +411,7 @@ class ViewerMerges(unittest.TestCase):
         rows = list(csv.DictReader(io.StringIO(self.client.get("/export.csv").get_data(as_text=True))))
         notice = next(r for r in rows if r["trip_id"] == key)
         self.assertEqual(notice["row_type"], "folder_notice")
-        self.assertEqual(float(notice["distance_miles"]), unused["saved_summary"]["distance_miles"])
+        self.assertEqual(notice["distance_miles"], "")
         self.assertEqual(notice["category"], "business")
         self.assertEqual(sum(r["row_type"] == "trip" for r in rows), 2)
         self.assert_unused_close_refused(key)
@@ -472,15 +472,17 @@ class ViewerMerges(unittest.TestCase):
         self.assertIn(f"Saved miles: {saved['distance_miles']:.3f} mi; purpose: business; purpose note: merged note.", review)
         rows = list(csv.DictReader(io.StringIO(self.client.get('/export.csv?year=2026').get_data(as_text=True))))
         notice = next(r for r in rows if r['trip_id'] == key)
-        self.assertEqual(float(notice['distance_miles']), saved['distance_miles'])
+        self.assertEqual(notice['distance_miles'], '')
         self.assertEqual(notice['row_type'], 'folder_notice')
+        self.assertAlmostEqual(sum(float(r['distance_miles'] or 0) for r in rows if r['row_type'] != 'total'),
+                               sum(t['distance_miles'] for t in trips))
         self.assertEqual(float(next(r for r in rows if r['row_type'] == 'total' and r['category'] == 'all')['distance_miles']),
                          figures['totals']['all'])
         book = load_workbook(io.BytesIO(self.client.get('/export.xlsx?year=2026').data))
         try:
             header, row = list(book['Unreadable trips'].values)
             values = dict(zip(header, row, strict=True))
-            self.assertEqual(values['distance_miles'], saved['distance_miles'])
+            self.assertIsNone(values['distance_miles'])
             self.assertIn('not in the totals shown', values['purpose_note'])
             self.assertEqual(book['Mileage'].max_row, 3)
             self.assertEqual(list(book['Totals'].values)[-1][-1], figures['totals']['all'])

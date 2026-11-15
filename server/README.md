@@ -1027,8 +1027,8 @@ current-count statement. Source files stay intact. Closed-year locks still apply
 reopen the affected year first. An everyday login must ask the admin.
 
 CSV lists an unused merge as `row_type=folder_notice`, with its saved key,
-saved `distance_miles`, category and recovery advice saying it is excluded
-from totals. XLSX shows the same notice and saved miles in **Unreadable
+category and recovery advice. Miles stay blank in CSV and XLSX numeric cells;
+saved miles appear only in the note. XLSX shows the notice in **Unreadable
 trips**, outside **Mileage** and **Totals**. The year review lists each merge
 in **Saved merges under unused month names**, with its saved miles, purpose
 and month name; its parts count separately. Closing its saved-summary year

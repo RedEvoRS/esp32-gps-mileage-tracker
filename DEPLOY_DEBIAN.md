@@ -2847,9 +2847,9 @@ purpose and month name. These are excluded from totals; its parts count separate
 Closing its saved-summary year is refused until the name is restored or the
 admin uses **Undo saved merge**. An unknown saved year blocks every year;
 reopening stays possible. It adds no unreadable-file count. CSV shows a
-`folder_notice` row with its saved `distance_miles`, category and recovery
-advice, explicitly excluded from totals. XLSX shows the same on **Unreadable
-trips**, outside **Mileage** and **Totals**. Existing close snapshots remain
+`folder_notice` row with its category and recovery advice. Saved miles appear
+only in the note; numeric miles cells stay blank in CSV and XLSX. XLSX shows
+the same on **Unreadable trips**, outside **Mileage** and **Totals**. Existing close snapshots remain
 unchanged; the review compares saved and current totals and names changed keys.
 Genuinely missing or unreadable parts under any name retain the
 existing damaged-merge warning and conservative merge-suggestion checks.
