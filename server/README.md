@@ -1521,15 +1521,16 @@ still fail the backup run, withhold the heartbeat and count in
 Replace an alias you need with a working relative internal chain or a real
 folder or file, then make a fresh backup.
 
-Snapshots also contain `SYMLINKS`, a sorted, NUL-delimited list of the copied
-links' paths and link text, covered by `SHA256SUMS`. Adding, removing or
-retargeting a copied link makes a new snapshot, including names or targets with
-spaces/newlines and swaps between a link and a real folder. Excluded links do
-not enter this comparison. An unchanged tree with links still reuses the last
-snapshot. The first run after updating makes one extra snapshot if the previous
-one lacks `SYMLINKS`; older snapshots still restore. A failure to record the
-links is logged, prevents reuse and fails the run after the copy, withholding
-the heartbeat; fix the logged error and rerun the backup.
+Snapshots contain a NUL-delimited `SHA256SUMS` checksum list and `SYMLINKS` list
+of copied link paths/text, so spaces, line breaks, backslashes and leading dashes
+in names round-trip. Use `restore.sh check` to verify them. The tools need
+`sha256sum --zero` and `sort -z`, supplied by GNU coreutils on Debian and Unraid.
+Older text manifests still restore; escaped names in those need GNU `sha256sum`.
+The first run after this format update makes one extra snapshot. Later link-only
+adds, removals, retargets or swaps with real folders also create a snapshot;
+unchanged links dedupe and excluded links do not affect comparison. Failure to
+write either manifest fails the run and withholds the heartbeat; inspect the log
+and rerun.
 
 Local cleanup and pruning make only directories writable just before removing
 them. Kept snapshots retain their modes, including files shared by hard links.

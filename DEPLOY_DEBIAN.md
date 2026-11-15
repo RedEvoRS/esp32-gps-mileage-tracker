@@ -1485,16 +1485,16 @@ off-host destination. Each run:
   backup/destination check already explains the problem. A changed
   link count also makes a new snapshot. Restore checks report database integrity,
   event counts and monitor state tables.
-- writes `SHA256SUMS` and a sorted, NUL-delimited `SYMLINKS` manifest of copied
-  link paths and link text. Link-only adds, removals, retargets and swaps with
-  real folders now make a new snapshot; excluded links do not affect this
-  comparison. Spaces and newlines in link names/targets are preserved. Older
-  snapshots without `SYMLINKS` force one extra snapshot after the update and
-  remain restorable. Failure to record links is logged and fails the run after
-  the copy, withholding the heartbeat; fix the logged error and rerun.
-  Unchanged files are hard links to the
-  previous snapshot, and a run where nothing changed doesn't add a
-  snapshot at all, so daily runs cost almost nothing.
+- writes NUL-delimited `SHA256SUMS` checksums and `SYMLINKS` link paths/text,
+  preserving unusual names, including line breaks and backslashes. Use
+  `restore.sh check` to verify them. GNU coreutils on Debian and Unraid supplies
+  the required `sha256sum --zero` and `sort -z`; old text manifests remain readable
+  (escaped legacy names need GNU `sha256sum`). The format change makes one extra
+  snapshot after updating. A copied link's add, removal, retarget or swap with a
+  real folder also creates a snapshot; excluded links do not affect comparison.
+  Failure to write a manifest fails the run and withholds the heartbeat.
+  Unchanged files are hard links to the previous snapshot; an unchanged run
+  adds no snapshot.
 - keeps the newest 14 snapshots plus the first of each month for 7 years.
   Local pruning and scratch cleanup make directories writable only when removing
   them; file modes and kept snapshots are preserved.

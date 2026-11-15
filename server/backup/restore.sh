@@ -164,7 +164,7 @@ for arg in "$@"; do
     esac
 done
 [[ $command == check || -n $snapshot_arg ]] || die "say which snapshot to restore (latest, a name, or a path)"
-require_commands rsync sha256sum
+require_commands rsync sha256sum cmp
 
 # The snapshot, trip files included, is copied here. Debian 13 keeps /tmp
 # in RAM, so by default this is next to the snapshots (same disk, mode 700).

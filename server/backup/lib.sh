@@ -306,24 +306,76 @@ list_remote_snapshots() {
     awk '{ print $NF }' <<< "$listing" | grep -E "$SNAPSHOT_RE" | LC_ALL=C sort || true
 }
 
+# A format header distinguishes new NUL records from older sha256sum text.
+# Recomputing the sorted records checks bytes and the complete file inventory
+# in one pass, with no filename unescaping or per-file shell/checksum processes.
+write_snapshot_manifest() (
+    set -o pipefail
+    cd "$1" || return 1
+    printf 'mileage-sha256-nul-v1\n' || return 1
+    find . -type f ! -path ./SHA256SUMS ! -path ./INFO -print0 \
+        | LC_ALL=C sort -z | xargs -0 -r sha256sum --zero
+)
+
+# Older GNU checksum manifests escape backslash, newline and carriage return.
+# Decode only escaped records, keeping literal backslash+n distinct from LF.
+legacy_manifest_paths() {
+    local line path decoded char index
+    while IFS= read -r line || [[ -n $line ]]; do
+        path=${line:66}
+        if [[ $line == \\* ]]; then
+            path=${line:67} decoded=''
+            for ((index=0; index<${#path}; index++)); do
+                char=${path:index:1}
+                if [[ $char == \\ ]]; then
+                    index=$((index + 1))
+                    case ${path:index:1} in
+                        n) char=$'\n' ;; r) char=$'\r' ;; \\) char=\\ ;;
+                        *) return 1 ;;
+                    esac
+                fi
+                decoded+=$char
+            done
+            path=$decoded
+        fi
+        printf '%s\0' "$path"
+    done < "$1"
+}
+
 # Shared with restore: files not covered by the manifest are not verified.
 # INFO and SHA256SUMS itself are the only exceptions, at the snapshot root.
 # sha256sum reports failed paths, never file contents or expected hashes.
 verify_snapshot() {
-    local snap=$1 listed actual
+    local snap=$1 header record path
     [[ -f $snap/SHA256SUMS && -f $snap/annotations.db && -d $snap/data ]] || {
         log "snapshot doesn't look like a backup (SHA256SUMS, annotations.db or data missing)"
         return 1
     }
+    IFS= read -r header < "$snap/SHA256SUMS" || true
+    if [[ $header == mileage-sha256-nul-v1 ]]; then
+        if ! write_snapshot_manifest "$snap" | cmp -s -- "$snap/SHA256SUMS" -; then
+            log "checksums don't match or files are missing from or not in SHA256SUMS; this snapshot is damaged"
+            # Failure-only diagnostics: report escaped paths, never hashes or contents.
+            LC_ALL=C comm -z -3 <(tail -n +2 "$snap/SHA256SUMS" | LC_ALL=C sort -z) \
+                    <(write_snapshot_manifest "$snap" | tail -n +2 | LC_ALL=C sort -z) \
+                | while IFS= read -r -d '' record; do
+                    record=${record#$'\t'}
+                    log "File differs, is missing or is unlisted: $(printf '%q' "${record:66}")"
+                done || true
+            return 1
+        fi
+        return 0
+    fi
     (cd "$snap" && sha256sum --quiet --strict -c SHA256SUMS) >&2 || {
         log "checksums don't match; this snapshot is damaged"
         return 1
     }
-    listed=$(sed -E 's/^[0-9a-f]{64} [ *]//' "$snap/SHA256SUMS" | LC_ALL=C sort) || return 1
-    actual=$(cd "$snap" && find . -type f ! -path ./SHA256SUMS ! -path ./INFO | LC_ALL=C sort) || return 1
-    if [[ $listed != "$actual" ]]; then
-        log "snapshot has files missing from or not in SHA256SUMS (paths below)"
-        LC_ALL=C comm -3 <(printf '%s\n' "$listed") <(printf '%s\n' "$actual") >&2
+    if ! cmp -s <(legacy_manifest_paths "$snap/SHA256SUMS" | LC_ALL=C sort -z) \
+            <(cd "$snap" && find . -type f ! -path ./SHA256SUMS ! -path ./INFO -print0 | LC_ALL=C sort -z); then
+        log "snapshot has files missing from or not in SHA256SUMS"
+        LC_ALL=C comm -z -3 <(legacy_manifest_paths "$snap/SHA256SUMS" | LC_ALL=C sort -z) \
+                <(cd "$snap" && find . -type f ! -path ./SHA256SUMS ! -path ./INFO -print0 | LC_ALL=C sort -z) \
+            | while IFS= read -r -d '' path; do log "Unlisted or missing file: $(printf '%q' "${path#$'\t'}")"; done || true
         return 1
     fi
 }

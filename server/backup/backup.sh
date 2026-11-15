@@ -171,8 +171,8 @@ if ! (cd "$work/data" && find . -type l -print0 | LC_ALL=C sort -z \
     rm -f -- "$work/SYMLINKS"
     link_manifest_error=1
 fi
-(cd "$work" && find . -type f ! -name SHA256SUMS -print0 \
-    | LC_ALL=C sort -z | xargs -0 -r sha256sum) > "$work/SHA256SUMS"
+write_snapshot_manifest "$work" > "$work/SHA256SUMS" \
+    || die "couldn't write the snapshot checksum manifest; backup has not completed"
 
 # Preserve changes in discovery status even if the database/file bytes match.
 if [[ -n $prev && $LINKS_NOT_BACKED_UP =~ ^[0-9]+$ && $link_manifest_error == 0 ]] \

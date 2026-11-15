@@ -404,6 +404,71 @@ class BackupScripts(unittest.TestCase):
         root = (root or self.backups) / "snapshots"
         return sorted(p.name for p in root.iterdir() if not p.name.startswith("."))
 
+    def verify_saved_snapshot(self, snap):
+        subprocess.run(["bash", "-c", 'source "$1"; verify_snapshot "$2"', "bash",
+                        str(BACKUP / "lib.sh"), str(snap)], env=self.env, check=True,
+                       capture_output=True, timeout=10)
+
+    def test_regular_unusual_names_round_trip_backup_check_and_restore(self):
+        self.conf_append("KEEP_RECENT=10\n")
+        for name in ("line\nbreak.gpx", "back\\slash.gpx", "-leading.gpx", "-line\nbreak\\slash.gpx",
+                     "literal\\n.gpx", "carriage\rreturn.gpx"):
+            with self.subTest(name=name):
+                path = self.data / "2026-10" / name
+                path.write_text("hand-placed trip")
+                self.run_script("backup.sh")
+                self.assertTrue((self.backups / "last-success").is_file())
+                for base in (self.backups / "latest", self.remote / "snapshots" / self.snapshots()[-1]):
+                    self.assertEqual((base / "data/2026-10" / name).read_bytes(), path.read_bytes())
+                    manifest = (base / "SHA256SUMS").read_bytes()
+                    self.assertTrue(manifest.startswith(b"mileage-sha256-nul-v1\n"))
+                    self.assertIn(os.fsencode(f"./data/2026-10/{name}") + b"\0", manifest)
+                self.run_script("restore.sh", "check")
+                path.unlink()
+                self.run_script("restore.sh", "restore", "latest", "--yes")
+                self.assertEqual(path.read_text(), "hand-placed trip")
+        self.run_script("backup.sh", "--verify")  # Older snapshots use the same reader.
+
+    def test_legacy_gnu_escaped_manifest_remains_readable(self):
+        version = subprocess.run(["sha256sum", "--version"], capture_output=True, text=True, check=True)
+        if "GNU coreutils" not in version.stdout:
+            self.skipTest("legacy escaped checksum reading requires GNU sha256sum")
+        for name in ("line\nbreak.gpx", "back\\slash.gpx", "-leading.gpx", "-line\nbreak\\slash.gpx",
+                     "literal\\n.gpx", "carriage\rreturn.gpx"):
+            (self.data / name).write_text("old snapshot trip")
+        self.run_script("backup.sh")
+        snap = self.backups / "latest"
+        files = sorted(f"./{p.relative_to(snap)}" for p in snap.rglob("*")
+                       if p.is_file() and p.name not in ("INFO", "SHA256SUMS"))
+        result = subprocess.run(["sha256sum", *files], cwd=snap, capture_output=True, check=True)
+        (snap / "SHA256SUMS").write_bytes(result.stdout)
+        self.run_script("restore.sh", "check", str(snap))
+
+    def test_nul_manifest_corruption_and_checksum_writer_failure_are_loud(self):
+        self.run_script("backup.sh")
+        snap = self.remote / "snapshots" / self.snapshots()[-1]
+        sums = snap / "SHA256SUMS"
+        original = sums.read_bytes()
+        sums.write_bytes(original[:-1])  # A truncated final record must not pass.
+        self.assertNotEqual(self.run_script("restore.sh", "check", check=False).returncode, 0)
+        sums.write_bytes(original)
+        stamp = (self.backups / "last-success").read_bytes()
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        ping = self.tmp / "ping"
+        self.shim("curl", f'touch "{ping}"\n')
+        real_sha = shutil.which("sha256sum")
+        self.shim("sha256sum", f'''\
+for arg in "$@"; do
+    if [[ $arg == --zero ]]; then exit 1; fi
+done
+exec {real_sha} "$@"
+''')
+        result = self.run_script("backup.sh", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("couldn't write the snapshot checksum manifest", result.stderr)
+        self.assertEqual((self.backups / "last-success").read_bytes(), stamp)
+        self.assertFalse(ping.exists())
+
     def test_outside_links_reported_and_copied_without_targets(self):
         outside = self.tmp / "outside"
         outside.mkdir()
@@ -845,9 +910,7 @@ exec {real_rsync} "$@"
         for root in (self.backups, self.remote):
             snap = root / "snapshots" / self.snapshots()[-1]
             (snap / "SYMLINKS").unlink()
-            sums = snap / "SHA256SUMS"
-            sums.write_text("".join(line for line in sums.read_text().splitlines(keepends=True)
-                                    if not line.endswith("  ./SYMLINKS\n")))
+            self.refresh_manifest(snap)  # Recreate the older text manifest as well.
         self.run_script("restore.sh", "check")  # Older snapshots remain valid.
         self.run_script("backup.sh")
         self.assertEqual(len(self.snapshots()), 2)
@@ -1775,8 +1838,7 @@ fi
             snap = root / name
             self.assertEqual(
                 (snap / "data/2026-10/2026-10-01T15-00-00.gpx").read_text(), "first.gpx")
-            subprocess.run(["sha256sum", "--quiet", "-c", "SHA256SUMS"],
-                           cwd=snap, check=True)
+            self.verify_saved_snapshot(snap)
             with sqlite3.connect(snap / "annotations.db") as conn:
                 row = conn.execute("SELECT category, destination FROM annotations").fetchone()
             conn.close()
@@ -2031,7 +2093,7 @@ fi
                 with sqlite3.connect(snap / f"{kind}.db") as conn:
                     self.assertEqual(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone(), (1,))
                 conn.close()
-            subprocess.run(["sha256sum", "--quiet", "-c", "SHA256SUMS"], cwd=snap, check=True)
+            self.verify_saved_snapshot(snap)
 
     def test_compose_config_failure_still_backs_up_without_monitor(self):
         self.add_events()

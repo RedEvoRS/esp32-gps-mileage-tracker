@@ -593,9 +593,11 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   to report skipped links and recreated chains that depend on them; it also
   states any recorded missing-content count. Proven loops are named warnings,
   with no missing-content count, failure or withheld heartbeat; other resolution
-  errors still fail coverage. Relative loops are recreated. A sorted NUL-delimited
-  `SYMLINKS` manifest makes copied link path/text changes create a snapshot;
-  unchanged links still dedupe; a previous snapshot without it forces one new copy.
+  errors still fail coverage. Relative loops are recreated. NUL-delimited
+  `SHA256SUMS` and `SYMLINKS` preserve unusual names using
+  `sha256sum --zero` and `sort -z`. Restore reads old text manifests too (escaped
+  legacy names need GNU sha256sum). The format update forces one new snapshot;
+  copied link path/text changes create snapshots and unchanged links dedupe.
   Missing diagnostics/monitor databases are normal and recorded in `INFO`.
   Monitor discovery uses Compose config's project name and Docker's Compose
   project/volume labels, without recent config flags or logging credentials.
