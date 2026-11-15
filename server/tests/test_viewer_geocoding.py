@@ -155,6 +155,58 @@ class EndpointPlaceTests(unittest.TestCase):
         with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn, conn:
             conn.execute("DELETE FROM geocode_gate")
 
+    def test_autofill_permission_ends_after_any_saved_annotation(self):
+        with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn, conn:
+            conn.execute("DELETE FROM annotations")
+            conn.execute("DELETE FROM trip_history")
+        def permitted():
+            response = self.client.get("/trip/2026-10/sample")
+            self.assertEqual(response.status_code, 200)
+            field = re.search(r'<input[^>]*id="destination"[^>]*>', response.get_data(as_text=True)).group()
+            return 'data-autofill="true"' in field
+        self.assertTrue(permitted())
+        for note in ("Example note", ""):
+            response = self.client.post("/trip/2026-10/sample/annotate", data={
+                "csrf_token": "test-csrf", "category": "", "purpose_note": note, "destination": ""})
+            self.assertEqual(response.status_code, 302)
+            self.assertFalse(permitted())
+
+    def test_long_success_gap_reports_retry_delay(self):
+        geocoder = self.viewer.GEOCODER
+        with patch.object(geocoder, "interval", 5), patch("geocoding.time.time", return_value=time.time()), \
+             patch.object(geocoder, "_fetch", return_value="Example") as fetch:
+            self.assertEqual(geocoder.lookup(1, 3), "Example")
+            with self.assertRaises(self.viewer.GeocodeError) as error:
+                geocoder.lookup(2, 4)
+            self.assertAlmostEqual(error.exception.retry_after, 5)
+            response = self.post()
+            self.assertEqual(response.status_code, 429)
+            self.assertEqual(response.json["retry_after"], 5)
+            self.assertEqual(response.headers["Retry-After"], "5")
+            fetch.assert_called_once()
+        with patch.object(geocoder, "lookup", side_effect=self.viewer.GeocodeError("Busy", 429, retry_after=4.2)):
+            self.assertEqual(self.post().headers["Retry-After"], "5")
+
+    def test_failure_cooldown_has_no_retry_delay(self):
+        geocoder = self.viewer.GEOCODER
+        with patch.object(geocoder, "_fetch", side_effect=self.viewer.GeocodeError("Unavailable")):
+            with self.assertRaises(self.viewer.GeocodeError) as error:
+                geocoder.lookup(1, 3)
+            self.assertIsNone(error.exception.retry_after)
+        response = self.post()
+        self.assertEqual(response.status_code, 429)
+        self.assertNotIn("retry_after", response.json)
+        self.assertNotIn("Retry-After", response.headers)
+
+    def test_default_gap_waits_without_retry_delay(self):
+        geocoder = self.viewer.GEOCODER
+        with patch.object(geocoder, "_fetch", return_value="Example"):
+            self.assertEqual(self.post("start").status_code, 200)
+            response = self.post()
+            self.assertEqual(response.status_code, 200)
+            self.assertNotIn("retry_after", response.json)
+            self.assertNotIn("Retry-After", response.headers)
+
     def test_only_explicit_lookup_sends_selected_coordinate_and_no_trip_metadata(self):
         for route in ("/", "/trip/2026-10/sample", "/export.csv", "/export.xlsx"):
             self.assertEqual(self.client.get(route).status_code, 200)

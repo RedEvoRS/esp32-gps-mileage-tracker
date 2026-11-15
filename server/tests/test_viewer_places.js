@@ -4,7 +4,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../mileage-viewer/static/endpoint-places.js'), 'utf8');
 const tick = () => new Promise(resolve => setImmediate(resolve));
-function setup({auto = false, cached = [], endpoints = ['start', 'end'], storage = new Map(), throws = [], value = 'Unsaved edit'} = {}) {
+function setup({auto = false, cached = [], endpoints = ['start', 'end'], storage = new Map(), throws = [], value = 'Unsaved edit', autofill = true} = {}) {
   const autoSwitch = {hidden: true, attributes: {}, textContent: '',
     setAttribute(k, v) { this.attributes[k] = v; }, addEventListener(_, fn) { this.click = fn; }};
   const autoStatus = {textContent: ''};
@@ -13,7 +13,7 @@ function setup({auto = false, cached = [], endpoints = ['start', 'end'], storage
     setItem(k, v) { if (throws.includes('set')) throw Error('blocked'); storage.set(k, v); },
     removeItem(k) { if (throws.includes('remove')) throw Error('blocked'); storage.delete(k); },
   };
-  const destination = {value, focus() { this.focused = true; }, addEventListener(_, fn) { this.input = fn; },
+  const destination = {value, dataset: autofill ? {autofill: 'true'} : {}, focus() { this.focused = true; }, addEventListener(_, fn) { this.input = fn; },
     type(text) { this.value = text; this.input(); }};
   const note = {hidden: true};
   const useEnd = {disabled: !cached.includes('end'), addEventListener(_, fn) { this.click = fn; }};
@@ -27,17 +27,18 @@ function setup({auto = false, cached = [], endpoints = ['start', 'end'], storage
       closest() { return {dataset: {endpoint}, querySelector() { return labels[endpoint]; }}; }};
   });
   const calls = [];
-  vm.runInNewContext(source, {localStorage, document: {
+  const timers = [];
+  vm.runInNewContext(source, {setTimeout(fn, delay) { timers.push({fn, delay}); }, localStorage, document: {
     currentScript: {dataset: auto ? {autoLookup: 'true'} : {}},
     getElementById(id) { return {'end-suggestion': suggestion, 'auto-lookup': auto ? autoSwitch : null, 'use-end-place': useEnd, 'lookup-both-places': endpoints.length === 2 ? both : null, destination, 'destination-autofill': note}[id]; },
     querySelector(selector) { return selector === '[data-auto-lookup-status]' ? autoStatus : labels.end; }, querySelectorAll() { return forms; }},
     FormData: class {constructor(form) { this.form = form; }},
     fetch(url, options) { return new Promise(resolve => calls.push({url, options, resolve})); }});
-  async function respond(index, data, ok = true) {
-    calls[index].resolve({ok, async json() { if (data === null) throw Error('not JSON'); return data; }});
+  async function respond(index, data, ok = true, status = ok ? 200 : 503) {
+    calls[index].resolve({ok, status, async json() { if (data === null) throw Error('not JSON'); return data; }});
     await tick();
   }
-  return {note, suggestion, autoSwitch, autoStatus, storage, forms, labels, both, calls, destination, useEnd, respond,
+  return {timers, note, suggestion, autoSwitch, autoStatus, storage, forms, labels, both, calls, destination, useEnd, respond,
     submit(index) { return forms[index].submit({preventDefault() {}}); }};
 }
 async function run() {
@@ -149,6 +150,37 @@ async function run() {
     assert.equal(blocked.calls.length, 1, 'storage errors preserve queue deduplication');
     await blocked.respond(0, {label: ''});
     await blocked.respond(1, {label: ''});
+  }
+  const noFill = setup({auto: true, cached: ['start', 'end'], value: '', autofill: false});
+  assert.equal(noFill.destination.value, '', 'saved empty Destination stays empty without permission');
+  assert.equal(noFill.note.hidden, true);
+  noFill.useEnd.click();
+  assert.equal(noFill.destination.value, 'Cached end', 'Use still works without autofill permission');
+  for (const secondRefusal of [false, true]) {
+    const gap = setup({auto: true});
+    await gap.respond(0, {error: 'Busy', retry_after: 5}, false, 429);
+    assert.equal(gap.labels.start.textContent, 'Waiting for the lookup provider\u2026');
+    assert.equal(gap.calls.length, 1, 'later endpoints wait behind the retry');
+    assert.equal(gap.timers.length, 1);
+    assert.equal(gap.timers[0].delay, 5000);
+    gap.timers[0].fn(); await tick();
+    assert.equal(gap.calls.length, 2);
+    assert.equal(gap.calls[1].options.body.form, gap.forms[0]);
+    await gap.respond(1, secondRefusal ? {error: 'Still busy', retry_after: 5} : {label: 'Example'}, !secondRefusal, secondRefusal ? 429 : 200);
+    assert.equal(gap.timers.length, 1, 'each queued lookup retries only once');
+    assert.equal(gap.labels.start.textContent, secondRefusal ? 'Still busy' : 'Example');
+    assert.equal(gap.forms[0].querySelector().hidden, !secondRefusal);
+    if (secondRefusal) assert.equal(gap.forms[0].querySelector().textContent, 'Try again');
+    assert.equal(gap.calls[2].options.body.form, gap.forms[1]);
+    await gap.respond(2, {label: ''});
+  }
+  for (const delay of [undefined, -1, 61, '5', NaN, Infinity]) {
+    const refused = setup({auto: true, endpoints: ['end']});
+    await refused.respond(0, {error: 'Busy', retry_after: delay}, false, 429);
+    assert.equal(refused.timers.length, 0);
+    assert.equal(refused.calls.length, 1);
+    assert.equal(refused.labels.end.textContent, 'Busy');
+    assert.equal(refused.forms[0].querySelector().textContent, 'Try again');
   }
   // Auto lookup fills an empty Destination with the end suggestion (#694).
   const cachedFill = setup({auto: true, cached: ['start', 'end'], value: ''});
