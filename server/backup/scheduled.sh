@@ -59,7 +59,8 @@ if [[ $status_only == yes ]]; then
         # shellcheck source=lib.sh
         . "$SCRIPT_DIR/lib.sh" > /dev/null 2>&1
         print_verify_status
-    ) || printf 'last_deep_check=\nlast_deep_check_result=\n'
+        print_coverage_status
+    ) || printf 'last_deep_check=\nlast_deep_check_result=\nlast_backup_links_not_backed_up=\n'
     exit 0
 fi
 

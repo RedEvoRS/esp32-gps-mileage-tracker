@@ -70,7 +70,8 @@ class ScheduledBackup(unittest.TestCase):
         self.assertEqual(self.status(), {
             "last_attempt_start": "", "last_attempt_end": "", "last_attempt_status": "",
             "last_success": "", "log": str(self.log),
-            "last_deep_check": "", "last_deep_check_result": ""})
+            "last_deep_check": "", "last_deep_check_result": "",
+            "last_backup_links_not_backed_up": "0"})
         self.assertFalse(self.state.parent.exists())
         self.assertFalse(self.log.parent.exists())
 
@@ -92,6 +93,15 @@ class ScheduledBackup(unittest.TestCase):
             self.assertEqual(status["last_deep_check"], stamp)
             self.assertEqual(status["last_deep_check_result"], result)
             self.assertFalse((self.tmp / "injected").exists())
+
+    def test_status_reads_coverage_without_sourcing_info(self):
+        latest = self.backups / "latest"
+        latest.mkdir()
+        for value, expected in (("2", "2"), ("garbage", ""), ("$(touch injected)", "")):
+            (latest / "INFO").write_text(f"links_not_backed_up={value}\n")
+            self.assertEqual(self.status()["last_backup_links_not_backed_up"], expected)
+        self.conf.unlink()
+        self.assertEqual(self.status()["last_backup_links_not_backed_up"], "")
 
     def test_success_records_utc_state_and_private_log_in_install_folder(self):
         result = self.run_wrapper()

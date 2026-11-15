@@ -104,6 +104,10 @@ fetch_and_check() {
     gpx=$(find "$snap/data" -type f -name '*.gpx' | wc -l)
     json=$(find "$snap/data" -type f -name '*.json' | wc -l)
     log "Snapshot holds $gpx trip GPX files and $json summaries"
+    report_outside_links "$snap/data" "$scratch/outside-links"
+    if (( LINKS_NOT_BACKED_UP > 0 )); then
+        log "WARNING: $LINKS_NOT_BACKED_UP linked item(s)' contents are not in this backup"
+    fi
     [[ -f $snap/INFO ]] && log "Snapshot INFO: $(tr '\n' ' ' < "$snap/INFO")"
 }
 
@@ -161,7 +165,11 @@ show_verify_status
 fetch_and_check "$snapshot_arg"
 
 if [[ $command == check ]]; then
-    log "Restore test passed"
+    if (( LINKS_NOT_BACKED_UP > 0 )); then
+        log "Restore test passed, but $LINKS_NOT_BACKED_UP linked item(s) are not in this backup"
+    else
+        log "Restore test passed"
+    fi
     exit 0
 fi
 
@@ -249,7 +257,8 @@ fi
 log "Restoring trip files (anything replaced goes to $pre/data)"
 # Old backups may contain the unsafe live diagnostics copy. Never replay it
 # (or its journal) through rsync; only restore the checked SQLite snapshot.
-rsync -a --numeric-ids "${trip_owner[@]}" --backup --backup-dir="$pre/data" --itemize-changes \
+# Outside links contain no saved trips; skip them so live folders survive.
+rsync -a --safe-links --numeric-ids "${trip_owner[@]}" --backup --backup-dir="$pre/data" --itemize-changes \
     --exclude=/.upload.lock --exclude='/.upload-lock.*' \
     --exclude=/diagnostics/events.db --exclude='/diagnostics/events.db-*' \
     "$scratch/snapshot/data/" "$COMPOSE_DIR/data/" >&2

@@ -351,6 +351,48 @@ read_verify_state() {
     return 0
 }
 
+# Resolve names only; never open a target or descend through a directory link.
+outside_links() {
+    local root path resolved
+    root=$(realpath -m -- "$1") || return 1
+    find "$1" -name '*.tmp' -prune -o -type l -print0 | while IFS= read -r -d '' path; do
+        IFS= read -r -d '' resolved < <(realpath -mz -- "$path") || return 1
+        if [[ $resolved != "$root" && $resolved != "$root/"* ]]; then
+            printf '%s\0' "$path"
+        fi
+    done
+}
+
+# A bounded, escaped list keeps unusual filenames on one log line each.
+report_outside_links() {
+    local dir=$1 path target
+    LINKS_NOT_BACKED_UP=0
+    outside_links "$dir" > "$2" || return 1
+    while IFS= read -r -d '' path; do
+        LINKS_NOT_BACKED_UP=$((LINKS_NOT_BACKED_UP + 1))
+        if (( LINKS_NOT_BACKED_UP <= 20 )); then
+            IFS= read -r -d '' target < <(readlink -z -- "$path") || return 1
+            log "WARNING: not backed up: $(printf '%q' "data/${path#"$dir/"}") -> $(printf '%q' "$target")"
+        fi
+    done < "$2"
+    if (( LINKS_NOT_BACKED_UP > 20 )); then
+        log "WARNING: and $((LINKS_NOT_BACKED_UP - 20)) more linked items not backed up"
+    fi
+    rm -f -- "$2"
+}
+
+read_coverage_count() {
+    local count
+    count=$(grep '^links_not_backed_up=' "$1" 2>/dev/null) || count=links_not_backed_up=0
+    count=${count#links_not_backed_up=}
+    [[ $count =~ ^[0-9]+$ ]] || count=
+    printf '%s' "$count"
+}
+
+print_coverage_status() {
+    printf 'last_backup_links_not_backed_up=%s\n' "$(read_coverage_count "$BACKUP_DIR/latest/INFO")"
+}
+
 print_verify_status() {
     read_verify_state
     printf 'last_deep_check=%s\nlast_deep_check_result=%s\n' "$VERIFY_TIME" "$VERIFY_RESULT"

@@ -2478,7 +2478,7 @@ verify_unraid_backups() {
 }
 
 setup_unraid_backups() {
-    local first=no refresh=no
+    local first=no refresh=no began
     [[ $SCRIPT_DIR =~ ^/[-a-zA-Z0-9_./]+$ && $SCRIPT_DIR != *'/../'* ]] \
         || die "The install path must be a simple absolute path for the persistent cron entries."
     if [[ $MODE == check ]]; then
@@ -2498,9 +2498,10 @@ setup_unraid_backups() {
     if ! unraid_cron_current; then refresh=yes; fi
     if [[ $first == yes || $refresh == yes ]]; then
         note "Running one backup through scheduled.sh, the same wrapper cron uses"
+        began=$(date +%s)
         if ! bash "$SCRIPT_DIR/backup/scheduled.sh" < /dev/null; then
             unraid_backup_log
-            die "The scheduled backup failed. Fix the destination or backup.conf and rerun."
+            show_backup_deep_check "$began" || die "The scheduled backup failed. Fix the destination or backup.conf and rerun."
         fi
         FIRST_BACKUP=yes
         restore_test
@@ -2711,9 +2712,11 @@ ensure_backup_target() {
 }
 
 first_backup() {
+    local began
+    began=$(date +%s)
     note "Running the first backup"
     if ! "${AS_ME[@]}" bash "$SCRIPT_DIR/backup/backup.sh" < /dev/null 2>&1 | indent; then
-        die "The first backup failed (output above)." \
+        show_backup_deep_check "$began" || die "The first backup failed (output above)." \
             "Fix backup/backup.conf or the destination, then run this again."
     fi
     ok "Backed up, and checked the copy at $(conf_get REMOTE)"
@@ -2764,26 +2767,43 @@ install_backup_units() {
 }
 
 install_backup_timer() {
-    local unit
+    local unit began
     unit=$(backup_unit)
     install_backup_units
     as_root systemctl enable --now --quiet "$unit.timer"
     note "Running the backup once through systemd, the way the timer will"
+    began=$(date +%s)
     if ! as_root systemctl start "$unit.service"; then
         as_root journalctl -u "$unit.service" -n 20 --no-pager 2>&1 | indent || true
-        die "The backup failed when systemd ran it (log above)." \
+        show_backup_deep_check "$began" || die "The backup failed when systemd ran it (log above)." \
             "journalctl -u $unit.service has the whole log."
     fi
     ok "The backup works when systemd runs it"
 }
 
 show_backup_deep_check() {
-    local status key value when='' result=''
-    [[ -f $SCRIPT_DIR/backup/scheduled.sh ]] || return 0
-    status=$("${AS_ME[@]}" bash "$SCRIPT_DIR/backup/scheduled.sh" --status 2>/dev/null) || return 0
+    local status key value when='' result='' links='' last='' epoch now
+    [[ -f $SCRIPT_DIR/backup/scheduled.sh ]] || { [[ $# == 0 ]]; return; }
+    status=$("${AS_ME[@]}" bash "$SCRIPT_DIR/backup/scheduled.sh" --status 2>/dev/null) || { [[ $# == 0 ]]; return; }
     while IFS='=' read -r key value; do
-        case $key in last_deep_check) when=$value ;; last_deep_check_result) result=$value ;; esac
+        case $key in
+            last_deep_check) when=$value ;;
+            last_deep_check_result) result=$value ;;
+            last_backup_links_not_backed_up) links=$value ;;
+            last_success) last=$value ;;
+        esac
     done <<< "$status"
+    if [[ $links =~ ^[0-9]+$ && $links == *[1-9]* ]]; then
+        warn "$links linked item(s) are not in this backup; move their contents into data and rerun the backup"
+    fi
+    # A fresh completed off-host copy distinguishes coverage from copy failure.
+    if (( $# )); then
+        epoch=$(date -d "$last" +%s 2>/dev/null) || epoch=0
+        now=$(date +%s)
+        [[ $links =~ ^[0-9]+$ && $links == *[1-9]* && ( $result == passed || -z $result ) ]] \
+            && (( epoch >= $1 && epoch <= now ))
+        return
+    fi
     note "Last deep check: ${when:-never} (result: ${result:-not run})"
     if [[ $result == failed ]]; then
         warn "The last deep check failed; inspect the backup log and rerun the backup"
