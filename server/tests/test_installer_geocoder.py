@@ -165,7 +165,7 @@ class InstallerGeocoderTests(unittest.TestCase):
                 self.assertEqual(text, initial)
                 if mode == "check":
                     self.assertEqual(result.returncode, 0, output)
-                    self.assertIn("FAILURES=1", output)
+                    self.assertIn("FAILURES=1\n", output)
                     self.assertIn("Later section", output)
                 else:
                     self.assertNotEqual(result.returncode, 0, output)

@@ -1254,11 +1254,11 @@ PY
 
 setup_geocoder() {
     section "Address lookup"
-    local url agent gap auto kind='' answer error key
+    local url agent gap auto kind='' answer error key hint
     local -a values=()
     for key in URL USER_AGENT INTERVAL AUTO_LOOKUP; do
         if ! settings_query value "$(env_raw viewer.env "VIEWER_GEOCODER_$key")"; then
-            local hint="For VIEWER_GEOCODER_$key, use one KEY=value per line, with single quotes around the value (DEPLOY_DEBIAN.md Address lookup)."
+            hint="For VIEWER_GEOCODER_$key, use one KEY=value per line, with single quotes around the value (DEPLOY_DEBIAN.md Address lookup)."
             if [[ $MODE == check ]]; then
                 problem "Invalid address lookup settings in viewer.env" "$hint"
                 return 0
