@@ -157,7 +157,7 @@ if ! report_link_restore_effects "$COMPOSE_DIR/data" "$work/data" "$link_scratch
     log "WARNING: couldn't check how data links will restore; inspect the backup log and rerun backup.sh for restore warnings."
 fi
 exec 7<&-
-trips=$(find "$work/data" -type f -name '*.gpx' | wc -l)
+trips=$(count_files "$work/data" -name '*.gpx')
 
 # --- 3. Manifest, dedupe, prune ----------------------------------------
 

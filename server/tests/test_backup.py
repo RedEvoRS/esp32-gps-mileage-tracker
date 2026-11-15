@@ -580,6 +580,34 @@ exec {real_sha} "$@"
         self.assertIn(f"Deep check FAILED remote {names[0]}", result.stderr)
         self.assertEqual(self.verify_state()["result"], "failed")
 
+    def test_trip_and_summary_counts_ignore_filename_line_breaks(self):
+        self.require_gnu_checksums()
+        self.add_trip("2026-10/extra\ntrip", "extra")
+        result = self.run_script("backup.sh")
+        self.assertIn("(2 trips,", result.stderr)
+        self.assertIn("trips=2\n", (self.backups / "latest/INFO").read_text())
+        result = self.run_script("restore.sh", "check")
+        self.assertIn("Snapshot holds 2 trip GPX files and 2 summaries", result.stderr)
+
+    def assert_filename_independent_count(self):
+        self.add_trip("2026-10/extra\ntrip", "extra")
+        self.symlink(self.data / "alias\ntrip.gpx", "2026-10/extra\ntrip.gpx")
+        result = subprocess.run(["bash", "-c", 'source "$1"; count_files "$2" -name "*.gpx"',
+                                 "bash", str(BACKUP / "lib.sh"), str(self.data)],
+                                env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "2")
+
+    def test_file_count_ignores_filename_newlines(self):
+        self.assert_filename_independent_count()
+
+    def test_file_count_ignores_filename_newlines_with_busybox_find(self):
+        busybox = shutil.which("busybox")
+        if not busybox:
+            self.skipTest("BusyBox not installed")
+        self.shim("find", f'exec {busybox} find "$@"\n')
+        self.assert_filename_independent_count()
+
     def test_outside_links_reported_and_copied_without_targets(self):
         outside = self.tmp / "outside"
         outside.mkdir()

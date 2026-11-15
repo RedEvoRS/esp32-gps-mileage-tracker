@@ -30,6 +30,12 @@ remove_backup_tree() {
     done
 }
 
+# Count terminators, never lines in names. GNU and BusyBox find both support
+# -print0; unlike -printf, this also works with Unraid's BusyBox find.
+count_files() {
+    find "$@" -type f -print0 | tr -cd '\000' | wc -c
+}
+
 is_unraid() {
     case ${MILEAGE_PLATFORM:-} in
         unraid) return 0 ;;
@@ -235,7 +241,7 @@ salvage_raw_db() {
     mkdir -p "$dir"
     "$runner" "$PY_RAW_COPY" "$path" "$root" | tar -x -f - -C "$dir" --no-same-owner \
         || die "$path can't be read as a database, and its raw files couldn't be saved either; nothing more was restored"
-    count=$(find "$dir" -type f | wc -l)
+    count=$(count_files "$dir")
     [[ $count -gt 0 ]] || die "$path can't be read as a database, and no raw file was found to save; nothing more was restored"
     log "WARNING: the current $path can't be read as a database (it is damaged)."
     log "WARNING: its raw files ($count) are saved in $dir. The restore replaces it."

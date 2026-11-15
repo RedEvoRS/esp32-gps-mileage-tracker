@@ -101,8 +101,8 @@ fetch_and_check() {
     done
 
     local gpx json
-    gpx=$(find "$snap/data" -type f -name '*.gpx' | wc -l)
-    json=$(find "$snap/data" -type f -name '*.json' | wc -l)
+    gpx=$(count_files "$snap/data" -name '*.gpx')
+    json=$(count_files "$snap/data" -name '*.json')
     log "Snapshot holds $gpx trip GPX files and $json summaries"
     SNAPSHOT_LINKS_NOT_BACKED_UP=$(read_coverage_count "$snap/INFO")
     if [[ $SNAPSHOT_LINKS_NOT_BACKED_UP == unknown ]]; then
