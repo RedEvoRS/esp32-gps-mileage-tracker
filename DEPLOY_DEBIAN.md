@@ -1742,9 +1742,9 @@ journal, but nobody looks there. Two options:
 
 - Set `PING_URL` in `backup.conf` to a push monitor (Uptime Kuma, or
   healthchecks.io). The script calls it only after the off-host copy is verified
-  and any due deep check has passed. Missing pings mean the backup or
-  a deep check or missing linked contents needs attention. A ping is sent
-  only when no outside linked contents are missing.
+  and any due deep check has passed, and only when no linked contents were
+  left out of the backup. Missing pings mean the copy, a deep check, or a
+  link under `data/` needs attention; the backup log says which.
 - Or run `bash ~/mileage-tracker/install.sh --check` by hand now and then.
   It reports a failed backup unit as a problem. `last-success` records today's
   copied backup and still advances if the deep check fails; it alone cannot

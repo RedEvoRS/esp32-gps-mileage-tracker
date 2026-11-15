@@ -143,8 +143,8 @@ names no issue numbers on purpose, because they go stale; keep it that way.
 - **History and visibility:** this repo starts from a clean snapshot
   taken 2026-10-13. Earlier commits, PRs and closed issues stay in a
   private, archived repo, so commit hashes and PR numbers in the audit
-  docs point there. This repo is private for now and will go public when
-  the owner decides.
+  docs point there. This repo has been public since the v1.00 release
+  (2026-11-01), so everything committed or posted here is public.
 - **Conventions:** when a PR fixes an issue, say "Fixes #N" (one line per
   issue) so merging it closes the issue. File every new finding as its own
   issue, however small, never as an item on a checklist issue.
