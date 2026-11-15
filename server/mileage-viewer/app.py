@@ -1040,6 +1040,30 @@ def _month_choices(conn, root):
     return counted, problems
 
 
+@app.before_request
+def _require_counted_month_address():
+    """Apply the list's month identity to every trip endpoint before it runs."""
+    address = request.view_args or {}
+    if "ym" not in address or "trip_id" not in address:
+        return None
+    ym, trip_id = address["ym"], address["trip_id"]
+    _validate_trip_address(ym, trip_id)
+    # Ordinary trip addresses need no folder scan or extra DB query.
+    if not (DATA_ROOT / ym).is_symlink():
+        return None
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+        counted, _ = _month_choices(conn, DATA_ROOT.resolve())
+    chosen = counted.get(ym, ym)
+    if chosen == ym:
+        return None
+    if request.method not in ("GET", "HEAD"):
+        abort(409, description="This month address is an extra link. Reopen the trip from the trip list before making changes.")
+    target = url_for(request.endpoint, **{**address, "ym": chosen})
+    if request.query_string:
+        target += "?" + request.query_string.decode("latin-1")
+    return redirect(target)
+
+
 def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None):
     """Scan DATA_ROOT for trips and join annotations.
 

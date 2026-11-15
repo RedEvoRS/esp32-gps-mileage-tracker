@@ -584,6 +584,50 @@ class ViewerHardeningTests(unittest.TestCase):
         self.assertEqual([t["trip_key"] for t in trips], ["2026-02/merge-example"])
         self.assertFalse(any(t.get("parts") for t in entries))
 
+    def assert_alias_routes(self, alias, counted):
+        self.signed_in("admin")
+        rules = [rule for rule in self.viewer.app.url_map.iter_rules()
+                 if {"ym", "trip_id"} <= rule.arguments]
+        self.assertEqual(len(rules), 8)  # Two reads and six state-changing routes.
+        with closing(sqlite3.connect(self.db)) as conn:
+            before = list(conn.iterdump())
+        for rule in rules:
+            path = rule.rule.replace("<ym>", alias).replace("<trip_id>", "drive")
+            with self.subTest(endpoint=rule.endpoint):
+                with patch.object(self.viewer.GEOCODER, "lookup", side_effect=AssertionError("lookup")):
+                    if "GET" in rule.methods:
+                        for method in ("GET", "HEAD"):
+                            response = self.client.open(path + "?year=2026", method=method)
+                            self.assertEqual(response.status_code, 302)
+                            self.assertEqual(response.headers["Location"], path.replace(alias, counted) + "?year=2026")
+                            response.close()
+                    else:
+                        response = self.client.post(path, data={
+                            "csrf_token": "known-token", "category": "business", "purpose_note": "changed",
+                            "reason": "example", "confirm": "yes", "endpoint": "start",
+                            "next_trip": counted + "/drive",
+                        })
+                        self.assertEqual(response.status_code, 409)
+                        response.close()
+                with closing(sqlite3.connect(self.db)) as conn:
+                    self.assertEqual(list(conn.iterdump()), before)
+
+    def test_all_alias_month_routes_redirect_reads_and_refuse_writes(self):
+        self.symlink(self.viewer.DATA_ROOT / "2026-12", self.viewer.DATA_ROOT / "2026-01", directory=True)
+        self.assert_alias_routes("2026-12", "2026-01")
+        self.assertEqual(self.client.get("/trip/2026-12/drive", follow_redirects=True).status_code, 200)
+        self.assertEqual(self.client.get("/gpx/2026-12/drive", follow_redirects=True).status_code, 200)
+
+    def test_link_only_alias_routes_use_saved_name(self):
+        target = self.linked_archive()
+        self.symlink(self.viewer.DATA_ROOT / "2026-01", target, directory=True)
+        self.assert_alias_routes("2026-01", "2026-02")
+
+    def test_ordinary_trip_route_needs_no_month_resolution_scan(self):
+        self.signed_in("admin")
+        with patch.object(self.viewer, "_month_choices", side_effect=AssertionError("extra month scan")):
+            self.assertEqual(self.client.get("/gpx/2026-01/drive").status_code, 200)
+
     def test_merged_trip_with_linked_month_part_keeps_undo(self):
         month = self.viewer.DATA_ROOT / "2026-01"
         target = self.db.parent / "outside-month"

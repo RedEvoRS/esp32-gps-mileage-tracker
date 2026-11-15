@@ -851,6 +851,10 @@ two month names reach the same folder, its trips count once, under the real
 month folder, and the other name
 gets a notice saying where they are counted (`row_type=folder_notice` in CSV).
 A notice doesn't mean miles are missing; remove the extra link.
+Opening a trip or GPX through an extra month link redirects to the counted
+address, keeping the selected year. A change submitted to an extra-link address
+gets HTTP 409 and saves nothing; reopen the trip from the list before editing,
+removing, restoring, merging, splitting or looking up an address.
 
 When only links reach that folder, the viewer keeps the name with saved trip
 data: annotations, removals, edit history, merges and old merge addresses, or
