@@ -43,7 +43,7 @@ contact services outside it:
 
 **Current versions:** firmware **v1.06** · server **v1.16**
 
-The tracker and server have been in daily use since **v1.00**. Later fixes
+The tracker and server have been in daily use since **v1.00**. The firmware side is mostly completed and most of the work now is going into the server side of things. Later fixes
 are listed on the
 [releases page](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases).
 
