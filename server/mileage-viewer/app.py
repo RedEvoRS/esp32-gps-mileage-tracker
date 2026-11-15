@@ -3451,7 +3451,11 @@ def lookup_place(ym, trip_id):
     # arbitrary geocoding proxy, even for an authenticated browser.
     _safe_trip_paths(ym, trip_id)
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
-        _abort_if_removed(conn, f"{ym}/{trip_id}")
+        if g.role == "admin":
+            _abort_if_removed(conn, f"{ym}/{trip_id}")
+        elif trip_log.removal(conn, trip_merges.canonical_key(conn, f"{ym}/{trip_id}")):
+            # An everyday lookup must not reveal whether this address was removed.
+            abort(404)
     t = resolved_trip(ym, trip_id)
     endpoint = request.form.get("endpoint", "")
     if endpoint not in ("start", "end"):
