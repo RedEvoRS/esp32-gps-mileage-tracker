@@ -18,6 +18,7 @@ from openpyxl import load_workbook
 from zoneinfo import ZoneInfo
 
 import test_viewer_roles as roles
+from month_link_layouts import MONTH_LINK_LAYOUTS, make_layout
 
 
 ADMIN_REFUSAL = ("This trip&#39;s files can&#39;t be opened: its summary, track or month folder is a link that leads "
@@ -534,7 +535,7 @@ class ViewerHardeningTests(unittest.TestCase):
             "loop": "The folder link forms a loop.",
             "unreadable": "The folder could not be read.",
             "duplicate": "This is a link to 2026-12/, whose trips are counted there.",
-            "ingest_refused": "Trips are shown and counted, but the tracker cannot upload new trips for this month until the link is replaced by a real folder; the tracker keeps them queued.",
+            "ingest_refused": "Trips are shown and counted. The tracker cannot upload new trips for this month until the link is replaced by a real folder; the tracker keeps them queued.",
             "saved_keys": "Warning: saved trip data exists under 2026-01/, 2026-12/. Trips are shown and counted under 2026-12/; saved data under the other names is not applied. Years cannot be closed until this conflict is resolved.",
         }
         hints = {
@@ -543,7 +544,7 @@ class ViewerHardeningTests(unittest.TestCase):
             "saved_keys": "Choose which name's saved data to use and keep only that link. Removing a link leaves its saved data unapplied; removing the name in use quietly orphans that data. Nothing is deleted from the database. Recreate the same link to get back; competing saved names bring the conflict back. See DEPLOY_DEBIAN.md, Troubleshooting, for steps.",
             "unreadable": "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only.",
         }
-        cases = [(reason, False) for reason in descriptions] + [("saved_keys", True)]
+        cases = [(reason, False) for reason in descriptions] + [("saved_keys", True), ("duplicate", True)]
         for number, (reason, refused) in enumerate(cases, 1):
             entries.append({"folder": True, "ym": f"2026-{number:02}", "trip_key": f"2026-{number:02}/",
                             "id": "", "folder_reason": reason, "problem": self.viewer.FOLDER_PROBLEMS[reason],
@@ -551,7 +552,8 @@ class ViewerHardeningTests(unittest.TestCase):
                             "uploads_refused": refused, "has_gpx": False})
             text = descriptions[reason]
             if refused:
-                text += " " + descriptions["ingest_refused"]
+                repair = "removed" if reason == "duplicate" else "replaced by a real folder"
+                text += f" The tracker cannot upload new trips for this month until the link is {repair}; the tracker keeps them queued."
             if reason in ("outside", "dangling", "loop", "unreadable"):
                 text += " None of its trips are shown or counted."
             text += " " + hints.get(reason, "Replace the link with the real folder, or mount the other disk at that path.")
@@ -566,6 +568,34 @@ class ViewerHardeningTests(unittest.TestCase):
                     self.assertNotIn(". trips are shown", text)
                     self.assertNotIn("queued Replace", text)
                     self.assertNotIn("there Remove", text)
+
+    def test_month_upload_notices_match_ingest_shared_link_layouts_on_every_surface(self):
+        summary = (self.viewer.DATA_ROOT / "2026-01/drive.json").read_bytes()
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("DELETE FROM annotations")
+        self.signed_in("admin")
+        for label, layout in MONTH_LINK_LAYOUTS.items():
+            root = self.viewer.DATA_ROOT / label
+            make_layout(root, layout, self.symlink)
+            (root / layout["counted"] / "drive.json").write_bytes(summary)
+            with patch.object(self.viewer, "DATA_ROOT", root):
+                trips, entries = self.viewer.load_trips()
+                self.assertEqual([t["trip_key"] for t in trips], [layout["counted"] + "/drive"])
+                self.assertEqual(self.viewer.year_figures(trips, entries)["unreadable"], 0)
+                self.assertEqual([e["ym"] for e in entries if e["folder_reason"] == "duplicate"], layout["duplicates"])
+                for entry in entries:
+                    expected = layout["uploads"][entry["ym"]] == 503
+                    self.assertEqual(entry["uploads_refused"], expected)
+                    message = self.viewer.folder_message(entry, "admin")
+                    if expected:
+                        repair = "removed" if entry["folder_reason"] == "duplicate" else "replaced by a real folder"
+                        self.assertIn(f"The tracker cannot upload new trips for this month until the link is {repair}; "
+                                      "the tracker keeps them queued.", message)
+                    else:
+                        self.assertNotIn("cannot upload", message)
+                    for path, texts in self.folder_surface_messages(self.client).items():
+                        with self.subTest(layout=label, month=entry["ym"], surface=path):
+                            self.assertTrue(any(message in text for text in texts))
 
     def test_earlier_link_keeps_saved_annotations_and_removal(self):
         target = self.linked_archive()

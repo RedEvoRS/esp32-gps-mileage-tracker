@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+from month_link_layouts import MONTH_LINK_LAYOUTS, make_layout
+
 
 APP_PATH = Path(__file__).resolve().parents[1] / "mileage-ingest" / "app.py"
 HEADERS = {"Authorization": "Bearer test-token", "X-Trip-Id": "audit-trip",
@@ -197,6 +199,24 @@ class UploadSafety(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertIn("month folder 2026-04", response.json["error"])
         self.assertEqual(list(real.iterdir()), [])
+
+    def test_new_month_upload_statuses_match_shared_link_layouts(self):
+        for label, layout in MONTH_LINK_LAYOUTS.items():
+            root = self.root / label
+            make_layout(root, layout, self.symlink)
+            ingest = load_ingest(root)
+            for month, status in layout["uploads"].items():
+                with self.subTest(layout=label, month=month):
+                    payload = body().replace(b"2026-04-14", (month + "-14").encode())
+                    before = sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+                    with mock.patch.object(ingest, "datetime", wraps=datetime) as clock:
+                        clock.now.return_value = datetime(2027, 1, 15, tzinfo=timezone.utc)
+                        response = ingest.app.test_client().post("/upload", data=payload, headers=HEADERS)
+                    self.assertEqual(response.status_code, status, response.get_json())
+                    if status == 503:
+                        self.assertIn(f"month folder {month}", response.get_json()["error"])
+                        after = sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.name != ".upload.lock")
+                        self.assertEqual(after, [p for p in before if p != ".upload.lock"])
 
     def test_new_trip_into_same_named_internal_link_is_stored(self):
         archive = self.root / "archive" / "2026-04"

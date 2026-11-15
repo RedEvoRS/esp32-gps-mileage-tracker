@@ -2717,8 +2717,15 @@ aren't counted. A link that leads outside `data/` (even if its target is
 missing) or loops also makes ingest refuse GPX uploads with 503 until fixed.
 Replace it with a real folder or mount the disk there; its trips can't be
 removed one by one. A month link to a folder that another month name already
-uses is normally a notice: its trips are counted once, under the other name, so
-delete the extra link. When only links reach a folder, the viewer keeps the name
+uses is normally a notice: its trips are counted once, under the other name.
+If the link's final target has a different name, ingest refuses new trips for
+the link's month with 503 and the tracker keeps them queued until the link is
+removed. This applies to `2026-12` → `2026-11`, both links in
+`2026-01` → `2026-02` → `archive`, and either month link to a non-month folder.
+A same-named final target, such as `2026-02` → `archive/2026-02`, does not refuse
+new trips for that reason. Remove only the extra link, not its target or files;
+ingest can create a real folder for the queued trips. For conflicting saved
+names, follow the steps below first. When only links reach a folder, the viewer keeps the name
 that has saved trip data. If several names have saved data, a warning names
 them. The admin warning gives each name's counts of annotations, removals,
 merges, merge parts, old merge addresses, history entries and closed-year trip

@@ -859,7 +859,16 @@ block merge suggestions or closing a year. If
 two month names reach the same folder, its trips count once, under the real
 month folder, and the other name
 gets a notice saying where they are counted (`row_type=folder_notice` in CSV).
-A notice doesn't mean miles are missing; remove the extra link.
+A notice doesn't mean miles are missing. If the link's final target has a
+different name, its notice also says that the tracker cannot upload new trips
+for that link's month and keeps them queued until the link is removed (HTTP
+503). This includes `2026-12` → `2026-11`, both month links in
+`2026-01` → `2026-02` → `archive`, and the unused name when two links reach one
+non-month folder. The final target's name decides this, not which name the
+viewer counts; a link to `archive/2026-02` can still accept February trips
+under `2026-02`. Remove only the extra link, keeping the target and its files;
+ingest can then create a real month folder for queued trips. If saved names
+conflict, follow the steps below before removing links.
 Opening a trip or GPX through an extra month link redirects to the counted
 address, keeping the selected year. A change submitted to an extra-link address
 gets HTTP 409 and saves nothing; reopen the trip from the list before editing,

@@ -914,8 +914,11 @@ FOLDER_PROBLEMS = {
     "unreadable": "the folder could not be read",
     "duplicate": "the folder is a link to another folder that is already counted",
     "saved_keys": "several month names for this folder have saved trip data",
-    "ingest_refused": "Trips are shown and counted, but the tracker cannot upload new trips for this month until the link is replaced by a real folder; the tracker keeps them queued",
+    "ingest_refused": "trips are shown and counted",
 }
+
+MONTH_UPLOAD_REFUSAL = ("The tracker cannot upload new trips for this month until the link is {repair}; "
+                        "the tracker keeps them queued")
 
 
 def _month_link_problem(month, root):
@@ -954,12 +957,14 @@ def folder_description(entry):
         text = (f"Warning: saved trip data exists under {names}. Trips are shown and counted under "
                 f"{entry['counted_as']}/; saved data under the other names is not applied")
         text += ". Years cannot be closed until this conflict is resolved"
-        if entry.get("uploads_refused"):
-            text += ". " + FOLDER_PROBLEMS["ingest_refused"]
-        return text
-    if entry["folder_reason"] == "duplicate":
-        return f"This is a link to {entry['counted_as']}/, whose trips are counted there"
-    return entry["problem"]
+    elif entry["folder_reason"] == "duplicate":
+        text = f"This is a link to {entry['counted_as']}/, whose trips are counted there"
+    else:
+        text = entry["problem"]
+    if entry.get("uploads_refused") or entry["folder_reason"] == "ingest_refused":
+        repair = "removed" if entry["folder_reason"] == "duplicate" else "replaced by a real folder"
+        text += ". " + MONTH_UPLOAD_REFUSAL.format(repair=repair)
+    return text
 
 
 def folder_hint(entry, role):
@@ -1079,12 +1084,17 @@ def _month_choices(conn, root):
         chosen = next((p for p in candidates if saved and p.name == saved[0]), candidates[0])
         for month in candidates:
             counted[month.name] = chosen.name
+            # Same rule as ingest upload_trip for a new ID. The final target
+            # name matters, including chains and a same-named nested target.
+            uploads_refused = month.is_symlink() and target.name != month.name
             if month != chosen:
-                problems.append((month.name, "duplicate", chosen.name, ()))
+                problems.append((month.name, "duplicate", chosen.name, (), uploads_refused))
+            else:
+                chosen_refused = uploads_refused
         if len(saved) > 1:
-            problems.append((chosen.name, "saved_keys", chosen.name, saved, target.name != chosen.name))
-        elif chosen.is_symlink() and target.name != chosen.name:
-            problems.append((chosen.name, "ingest_refused", chosen.name, ()))
+            problems.append((chosen.name, "saved_keys", chosen.name, saved, chosen_refused))
+        elif chosen_refused:
+            problems.append((chosen.name, "ingest_refused", chosen.name, (), True))
     return counted, problems
 
 
