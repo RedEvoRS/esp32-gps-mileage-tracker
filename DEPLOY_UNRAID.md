@@ -400,7 +400,9 @@ directories are mode 700. `--status` prints `last_attempt_start`,
 `last_attempt_end`, `last_attempt_status`, `last_success`, the absolute
 log path, `last_deep_check`, `last_deep_check_result`, and
 `last_backup_links_not_backed_up` (an older `INFO` without the count means
-zero). Empty values can mean
+zero). A failed link check records `unknown` in `INFO` and status shows
+`not checked`; inspect the backup log, fix the error and rerun the backup.
+Missing or unreadable `INFO` also shows `not checked`. Empty values can mean
 it has never run. Status 0 means success;
 `running` has no final result yet. Reading status itself exits 0, so inspect
 the fields. `last_success` comes from `BACKUP_DIR/last-success` and may be

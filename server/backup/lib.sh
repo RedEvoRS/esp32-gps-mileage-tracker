@@ -385,14 +385,24 @@ report_outside_links() {
 
 read_coverage_count() {
     local count
-    count=$(grep '^links_not_backed_up=' "$1" 2>/dev/null) || count=links_not_backed_up=0
-    count=${count#links_not_backed_up=}
-    [[ $count =~ ^[0-9]+$ ]] || count=
+    [[ -f $1 && -r $1 ]] || { printf unknown; return 0; }
+    # Only an older, readable INFO without this field means zero.
+    if count=$(grep '^links_not_backed_up=' "$1" 2>/dev/null); then
+        count=${count#links_not_backed_up=}
+    elif [[ $? == 1 ]]; then
+        count=0
+    else
+        count=unknown
+    fi
+    [[ $count =~ ^[0-9]+$ ]] || count=unknown
     printf '%s' "$count"
 }
 
 print_coverage_status() {
-    printf 'last_backup_links_not_backed_up=%s\n' "$(read_coverage_count "$BACKUP_DIR/latest/INFO")"
+    local count
+    count=$(read_coverage_count "$BACKUP_DIR/latest/INFO")
+    [[ $count != unknown ]] || count='not checked'
+    printf 'last_backup_links_not_backed_up=%s\n' "$count"
 }
 
 print_verify_status() {

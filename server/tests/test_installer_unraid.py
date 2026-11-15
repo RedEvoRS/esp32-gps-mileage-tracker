@@ -320,8 +320,20 @@ class InstallerUnraid(unittest.TestCase):
                 self.assertIn("2 linked item(s) are not in this backup", out)
                 for links, deep, stamp in (("0", "passed", ""), ("2", "failed", ""),
                                            ("2", "running", ""), ("bad", "passed", ""),
+                                           ("not checked", "passed", ""),
                                            ("2", "passed", "2000-01-01T00:00:00Z")):
                     self.run_step(common + route, ok=False, LINKS=links, DEEP=deep, STAMP=stamp)
+
+    def test_unknown_link_coverage_warns_in_check_mode(self):
+        self.conf()
+        self.scheduled(status="1")
+        path = self.work / "backup/scheduled.sh"
+        path.write_text(path.read_text().replace(
+            "last_attempt_start=", "last_backup_links_not_backed_up=not checked\nlast_attempt_start="))
+        out = self.run_step("install_unraid_cron; MODE=check; verify_unraid_backups")
+        self.assertIn("not checked", out)
+        self.assertIn("rerun", out)
+        self.assertIn("FAILURES=1", out)
 
     def test_persistent_ssh_key_and_known_hosts_used_for_every_connection(self):
         out = self.run_step(r'''

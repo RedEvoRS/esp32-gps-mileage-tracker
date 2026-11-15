@@ -1458,7 +1458,11 @@ Links anywhere under `data/` resolving outside it are logged as
 `WARNING: not backed up: data/<path> -> <target>` (first 20, then a count
 of the rest). Their contents are missing, including from earlier snapshots
 taken while the link existed. `INFO` records `links_not_backed_up=N` (missing
-means zero); a changed count makes a new snapshot. Internal links and `*.tmp`
+means zero in an older readable `INFO`). If the link check fails, the value is
+`unknown`: linked items were **not checked**, so inspect the backup log, fix
+the error and rerun the backup. Status and restore checks report this plainly;
+an unchecked run always makes a new snapshot. A changed count also makes a new
+snapshot. Internal links and `*.tmp`
 are not reported. Move the contents into `data/` and rerun the backup. The
 copy and deep check still run and `last-success` advances, but missing linked
 contents make the run exit non-zero and withhold `PING_URL`. Unraid status

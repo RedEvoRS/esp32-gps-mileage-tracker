@@ -138,7 +138,7 @@ coverage_error=0
 if ! report_outside_links "$COMPOSE_DIR/data" "$work/.outside-links"; then
     log "ERROR: couldn't check data for links outside it; this run will fail after the copy"
     rm -f -- "$work/.outside-links"
-    LINKS_NOT_BACKED_UP=0
+    LINKS_NOT_BACKED_UP=unknown
     coverage_error=1
 fi
 exec 7<&-
@@ -150,7 +150,8 @@ trips=$(find "$work/data" -type f -name '*.gpx' | wc -l)
     | LC_ALL=C sort -z | xargs -0 -r sha256sum) > "$work/SHA256SUMS"
 
 # Preserve changes in discovery status even if the database/file bytes match.
-if [[ -n $prev ]] && cmp -s "$work/SHA256SUMS" "$SNAPSHOTS/$prev/SHA256SUMS" \
+if [[ -n $prev && $LINKS_NOT_BACKED_UP =~ ^[0-9]+$ ]] \
+        && cmp -s "$work/SHA256SUMS" "$SNAPSHOTS/$prev/SHA256SUMS" \
         && grep -Fxq "monitor=$monitor" "$SNAPSHOTS/$prev/INFO" \
         && [[ $(read_coverage_count "$SNAPSHOTS/$prev/INFO") == "$LINKS_NOT_BACKED_UP" ]]; then
     log "Nothing changed since $prev; keeping that snapshot"
@@ -379,7 +380,7 @@ deep_verify() (
 
 failed=0
 deep_verify || { log "Deep check failed; today's backup was copied. Check the failed snapshots and rerun backup.sh."; failed=1; }
-if (( LINKS_NOT_BACKED_UP > 0 )); then
+if [[ $LINKS_NOT_BACKED_UP =~ ^[0-9]+$ ]] && (( LINKS_NOT_BACKED_UP > 0 )); then
     log "WARNING: $LINKS_NOT_BACKED_UP linked item(s) are not in this backup; replace each link with the real folder or file (or delete a link with nothing behind it) and rerun backup.sh."
     failed=1
 fi

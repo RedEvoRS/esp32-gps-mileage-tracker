@@ -1461,7 +1461,10 @@ off-host destination. Each run:
 - stores `annotations.db`, optional `events.db` and optional `monitor.db`
   beside `data/`, all covered by `SHA256SUMS`. Human-readable `INFO` records
   annotation/event counts, monitor status and `links_not_backed_up` (missing
-  means zero). A changed link count makes a new snapshot. Restore checks report
+  means zero in an older readable `INFO`). `unknown` means linked items were
+  not checked: inspect the backup log, fix the check error and rerun the backup.
+  Status and restore checks show "not checked"; an unchecked run always makes a
+  new snapshot. A changed link count also makes a new snapshot. Restore checks report
   database
   integrity, event counts and monitor state tables.
 - writes a `SHA256SUMS` manifest. Unchanged files are hard links to the

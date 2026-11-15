@@ -2799,6 +2799,8 @@ show_backup_deep_check() {
     done <<< "$status"
     if [[ $links =~ ^[0-9]+$ && $links == *[1-9]* ]]; then
         warn "$links linked item(s) are not in this backup; replace each link with the real folder or file (or delete a link with nothing behind it) and rerun the backup"
+    elif [[ ! $links =~ ^[0-9]+$ ]]; then
+        warn "Linked items in the last backup were not checked; inspect the backup log, fix the check error and rerun the backup"
     fi
     # A fresh completed off-host copy distinguishes coverage from copy failure.
     if (( $# )); then

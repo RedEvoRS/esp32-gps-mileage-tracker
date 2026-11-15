@@ -452,10 +452,43 @@ class BackupScripts(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("couldn't check data for links outside it", result.stderr)
         snap = self.remote / "snapshots" / self.snapshots()[-1]
+        self.assertIn("links_not_backed_up=unknown\n", (snap / "INFO").read_text())
+        self.assertEqual((snap / "INFO").read_bytes(),
+                         (self.backups / "latest/INFO").read_bytes())
         self.assertTrue((snap / "data/2026-10/2026-10-01T15-00-00.gpx").is_file())
         self.assertFalse((snap / ".outside-links").exists())
         self.assertTrue((self.backups / "last-success").exists())
         self.assertFalse(ping.exists())
+
+    def test_unknown_coverage_readers_and_recovery_never_dedupes(self):
+        self.conf_append("KEEP_RECENT=10\n")
+        self.run_script("backup.sh")
+        failing_check = self.shim("realpath", "exit 1\n")
+        for count in (2, 3):
+            result = self.run_script("backup.sh", check=False)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(len(self.snapshots()), count)
+            self.assertIn("links_not_backed_up=unknown\n",
+                          (self.backups / "latest/INFO").read_text())
+        status = self.run_script("scheduled.sh", "--status")
+        self.assertIn("last_backup_links_not_backed_up=not checked\n", status.stdout)
+        command = ('install_file=$1; backup_server=$2; shift 2; '
+                   'source <(sed \'$d\' "$install_file"); AS_ME=(); MODE=check; '
+                   'SCRIPT_DIR=$backup_server; show_backup_deep_check')
+        result = subprocess.run(["bash", "-c", command, "bash", str(SERVER / "install.sh"),
+                                 str(SERVER)], env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not checked", result.stdout)
+        self.assertIn("rerun", result.stdout)
+        failing_check.unlink()
+        result = self.run_script("restore.sh", "check")
+        self.assertIn("not checked when this backup was made", result.stderr)
+        self.assertIn("Restore test passed", result.stderr)
+        self.run_script("backup.sh")
+        self.assertEqual(len(self.snapshots()), 4, "a checked count must replace unknown coverage")
+        self.assertIn("links_not_backed_up=0\n", (self.backups / "latest/INFO").read_text())
+        self.run_script("backup.sh")
+        self.assertEqual(len(self.snapshots()), 4, "checked unchanged snapshots should still dedupe")
 
     def test_nested_links_escape_names_cap_and_never_open_fifo(self):
         outside = self.tmp / "outside"

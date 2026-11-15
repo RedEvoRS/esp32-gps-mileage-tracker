@@ -104,6 +104,9 @@ fetch_and_check() {
     gpx=$(find "$snap/data" -type f -name '*.gpx' | wc -l)
     json=$(find "$snap/data" -type f -name '*.json' | wc -l)
     log "Snapshot holds $gpx trip GPX files and $json summaries"
+    if [[ $(read_coverage_count "$snap/INFO") == unknown ]]; then
+        log "WARNING: linked items were not checked when this backup was made; inspect the backup log, fix the check error and make a fresh backup. Checking the saved links below."
+    fi
     report_outside_links "$snap/data" "$scratch/outside-links"
     if (( LINKS_NOT_BACKED_UP > 0 )); then
         log "WARNING: the contents of $LINKS_NOT_BACKED_UP linked item(s) are not in this backup"
