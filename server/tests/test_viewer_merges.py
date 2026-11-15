@@ -202,22 +202,98 @@ class ViewerMerges(unittest.TestCase):
         (self.month / 'b.gpx').unlink()
         for name in missing_summaries:
             (self.month / (name + '.json')).unlink()
+        self.assert_damaged_messages_for_both_roles(key)
         self.assertEqual(self.discard(key).status_code, 302)
         return key
 
-    def assert_discard_current_statement(self, statement):
+    def assert_damaged_messages_for_both_roles(self, key):
+        from test_viewer_roles import ViewerRolesTests
+        ViewerRolesTests.seed_editor(self)
+        effect = ('Parts whose trip summaries can still be read return as separate trips with the annotations saved under their names. '
+                  'Parts without readable summaries do not return. '
+                  "The merged trip's saved miles and purpose leave the totals and are kept in history and the year review.")
+        for role in ('admin', 'editor'):
+            if role == 'editor':
+                ViewerRolesTests.signed_in(self, role)
+            expected = ('A merge part is missing or unreadable. Saved merge: 0.732 mi; purpose: business. '
+                        'Its saved miles are not in the totals. Restore missing or unreadable files from backups. '
+                        + ('Or use Discard damaged merge. ' if role == 'admin' else
+                           'Please ask the admin to restore the files or discard this damaged merge. ') + effect)
+            for path in ('/', '/trip/' + key, '/export.csv?year=2026'):
+                self.assertIn(expected, html.unescape(self.client.get(path).get_data(as_text=True)), (role, path))
+            book = load_workbook(io.BytesIO(self.client.get('/export.xlsx?year=2026').data))
+            try:
+                self.assertIn(expected, str(list(book['Unreadable trips'].values)))
+            finally:
+                book.close()
+            if role == 'admin':
+                self.assertIn(expected, html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True)))
+                response = self.discard(key, confirm='no')
+                self.assertEqual(response.status_code, 400)
+                self.assertIn('Confirm discarding this damaged merge. ' + effect,
+                              html.unescape(response.get_data(as_text=True)))
+        self.authenticate(self.client)
+
+    def test_round_six_preserves_baseline_totals_on_all_four_surfaces(self):
+        # Captured from b60d550 using these exact synthetic scenarios. Notice
+        # and history rows must never change any of the four sets of totals.
+        for scenario, expected in (
+            ('healthy', (0, .041, 0, .041, .082)),
+            ('discard', (0, .041, 0, .041, .082)),
+            ('remerge', (.732, 0, 0, 0, .732)),
+            ('unused_undo', (0, 0, 0, .082, .082)),
+        ):
+            with self.subTest(scenario=scenario):
+                fixture = ViewerMerges()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                if scenario == 'unused_undo':
+                    key, _ = fixture.moved_merge()
+                    self.assertEqual(fixture.undo_unused(key).status_code, 302)
+                else:
+                    a, b = fixture.trip('a', 0), fixture.trip('b', 180, .01)
+                    fixture.annotate(a, 'personal', 'original note')
+                    if scenario != 'healthy':
+                        key = fixture.merged_key(fixture.merge(a, b))
+                        fixture.annotate(key, 'business', 'merged note')
+                        saved_gpx = (fixture.month / 'b.gpx').read_bytes()
+                        (fixture.month / 'b.gpx').unlink()
+                        self.assertEqual(fixture.discard(key).status_code, 302)
+                        if scenario == 'remerge':
+                            (fixture.month / 'b.gpx').write_bytes(saved_gpx)
+                            key = fixture.merged_key(fixture.merge(a, b))
+                            fixture.annotate(key, 'business', 'merged note')
+                totals = dict(zip(('business', 'personal', 'other', 'unclassified', 'all'), expected, strict=True))
+                trips, entries = fixture.viewer.load_trips()
+                self.assertEqual(fixture.viewer.mileage_totals(trips), totals)
+                page = fixture.client.get('/?year=2026').get_data(as_text=True)
+                self.assertIn(f'{totals["all"]:.3f} mi total', page)
+                review = fixture.client.get('/admin/year/2026').get_data(as_text=True)
+                section = review.split('<h2 id="totals-heading">', 1)[1].split('</section>', 1)[0]
+                self.assertEqual({name: float(miles) for name, miles in re.findall(
+                    r'<td>(business|personal|other|unclassified|all)</td><td>\d+</td><td>([\d.]+)</td>', section)}, totals)
+                rows = list(csv.DictReader(io.StringIO(fixture.client.get('/export.csv?year=2026').get_data(as_text=True))))
+                self.assertEqual({r['category']: float(r['distance_miles']) for r in rows if r['row_type'] == 'total'}, totals)
+                book = load_workbook(io.BytesIO(fixture.client.get('/export.xlsx?year=2026').data))
+                try:
+                    self.assertEqual({r[2]: r[3] for r in list(book['Totals'].values)[1:]}, totals)
+                finally:
+                    book.close()
+
+    def assert_discard_current_statement(self, statement, *, undone=False):
         with closing(sqlite3.connect(self.db)) as conn:
             rows = self.viewer._merge_history_rows(conn, 2026, self.viewer.load_trips()[0])
         self.assertEqual(len(rows), 1)
         row = rows[0]
-        expected = (f"Damaged merge discarded. Saved miles: 0.732 mi; purpose: business; purpose note: merged note; "
+        label = 'Unused-name merge undone' if undone else 'Damaged merge discarded'
+        expected = (f"{label}. Saved miles: 0.732 mi; purpose: business; purpose note: merged note; "
                     f"trip date: 2026-04-14 12:00 UTC. Recorded at: {self.viewer.fmt_date(row['at'])}; login: driver. "
                     + statement)
         self.assertEqual(self.viewer.merge_history_message(row), expected)
         review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
         self.assertIn(expected, review)
         self.assertNotIn('Saved miles (excluded)', review)
-        self.assert_history_exports(expected, 'damaged merge discarded')
+        self.assert_history_exports(expected, label.lower())
 
     def assert_history_exports(self, expected, label):
         for suffix in ('?year=2026', ''):
@@ -238,6 +314,18 @@ class ViewerMerges(unittest.TestCase):
                 book.close()
         rows = list(csv.DictReader(io.StringIO(self.client.get('/export.csv?year=2025').get_data(as_text=True))))
         self.assertFalse(any(label.capitalize() in r['purpose_note'] for r in rows))
+        from test_viewer_roles import ViewerRolesTests
+        if self.viewer.users.get_user(self.db, 'helper') is None:
+            ViewerRolesTests.seed_editor(self)
+        ViewerRolesTests.signed_in(self, 'editor')
+        rows = list(csv.DictReader(io.StringIO(self.client.get('/export.csv?year=2026').get_data(as_text=True))))
+        self.assertIn(expected, [r['purpose_note'] for r in rows if r['row_type'] == 'unreadable'])
+        book = load_workbook(io.BytesIO(self.client.get('/export.xlsx?year=2026').data))
+        try:
+            self.assertIn(expected, str(list(book['Unreadable trips'].values)))
+        finally:
+            book.close()
+        self.authenticate(self.client)
 
     def test_discard_with_all_summaries_readable_reports_both_counted_again(self):
         self.discard_with_readable_parts()
@@ -568,6 +656,28 @@ class ViewerMerges(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as conn:
             self.assertEqual(conn.execute('SELECT count(*) FROM trip_merges').fetchone()[0], 1)
             self.assertEqual(conn.execute("SELECT count(*) FROM trip_history WHERE action='split'").fetchone()[0], 0)
+
+    def test_unused_undo_record_tracks_mixed_missing_and_remerged_parts(self):
+        key, _ = self.moved_merge()
+        self.assertEqual(self.undo_unused(key).status_code, 302)
+        self.assert_discard_current_statement(
+            'Now counted again: 2026-04/a as 2026-05/a, 2026-04/b as 2026-05/b; do not add these saved miles by hand.',
+            undone=True)
+        folder = self.data / '2026-05'
+        files = {p: (p.read_bytes(), p.stat()) for p in folder.glob('*.json')}
+        (folder / 'b.json').unlink()
+        self.assert_discard_current_statement(
+            'Now counted again: 2026-04/a as 2026-05/a; do not add these saved miles by hand. Not currently counted: 2026-04/b.',
+            undone=True)
+        (folder / 'a.json').unlink()
+        self.assert_discard_current_statement('None of its trips are in the log; these saved miles are not in the totals.', undone=True)
+        for path, (data, metadata) in files.items():
+            path.write_bytes(data)
+            os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+        merged = self.merged_key(self.merge('2026-05/a', '2026-05/b'))
+        self.assert_discard_current_statement(
+            f'Now counted again: 2026-04/a as 2026-05/a (inside {merged}), 2026-04/b as 2026-05/b (inside {merged}); '
+            'do not add these saved miles by hand.', undone=True)
 
     def test_unused_merge_uses_saved_summary_year_and_unknown_year_blocks_every_close(self):
         key, _ = self.moved_merge()
