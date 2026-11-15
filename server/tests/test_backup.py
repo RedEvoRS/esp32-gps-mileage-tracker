@@ -623,6 +623,52 @@ exec {real_sha} "$@"
         self.require_gnu_checksums()
         self.assert_damaged_latest_is_replaced("trip with\nline break.gpx")
 
+    def assert_mode_change_creates_snapshot(self, relative, folder=False):
+        self.addCleanup(self.writable_fixture_directories)
+        path = self.data / relative
+        if folder:
+            path.mkdir(exist_ok=True)
+        else:
+            path.write_bytes(b"trip")
+        path.chmod(0o755 if folder else 0o644)
+        old_mode = path.stat().st_mode & 0o777
+        self.run_script("backup.sh")
+        [old] = self.snapshots()
+        new_mode = 0o500 if folder else 0o400
+        path.chmod(new_mode)
+        result = self.run_script("backup.sh")
+        self.assertNotIn("Nothing changed", result.stderr)
+        self.assertNotIn("differs from its own checksum list", result.stderr)
+        self.assertEqual(len(self.snapshots()), 2)
+        new = self.snapshots()[-1]
+        for root in (self.backups, self.remote):
+            before = root / "snapshots" / old / "data" / relative
+            after = root / "snapshots" / new / "data" / relative
+            self.assertEqual(before.stat().st_mode & 0o777, old_mode)
+            self.assertEqual(after.stat().st_mode & 0o777, new_mode)
+            self.assertNotEqual(before.stat().st_ino, after.stat().st_ino)
+            if not folder:
+                self.assertEqual(before.read_bytes(), after.read_bytes())
+        self.assertIn("Nothing changed", self.run_script("backup.sh").stderr)
+        self.assertEqual(len(self.snapshots()), 2)
+
+    def test_file_mode_only_change_creates_snapshot_then_dedupes(self):
+        self.assert_mode_change_creates_snapshot("trip with spaces.gpx")
+
+    def test_file_mode_only_change_with_filename_line_break(self):
+        self.require_gnu_checksums()
+        self.assert_mode_change_creates_snapshot("trip with\nline break.gpx")
+
+    def test_folder_mode_only_change_creates_snapshot_then_dedupes(self):
+        self.assert_mode_change_creates_snapshot("empty folder", folder=True)
+
+    def test_data_root_mode_only_change_creates_snapshot_then_dedupes(self):
+        self.assert_mode_change_creates_snapshot(".", folder=True)
+
+    def test_folder_mode_only_change_with_filename_line_break(self):
+        self.require_gnu_checksums()
+        self.assert_mode_change_creates_snapshot("empty\nfolder", folder=True)
+
     def test_trip_and_summary_counts_ignore_filename_line_breaks(self):
         self.require_gnu_checksums()
         self.add_trip("2026-10/extra\ntrip", "extra")

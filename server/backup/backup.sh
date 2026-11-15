@@ -190,9 +190,11 @@ if [[ -n $prev ]] && grep -Eq '^[<>ch.]f' "$link_scratch/copy-changes" \
     log "WARNING: previous snapshot $prev differs from its own checksum list; keeping the new snapshot"
 fi
 
-# Preserve changes in discovery status even if the database/file bytes match.
+# Keep copied files and directory mode changes even when contents still match.
+# Directory times can change for excluded files, so they alone do not count.
+# Preserve changes in discovery status too.
 if [[ -n $prev && $LINKS_NOT_BACKED_UP =~ ^[0-9]+$ && $link_manifest_error == 0 ]] \
-        && ! grep -Eq '^[<>ch.]f' "$link_scratch/copy-changes" \
+        && ! grep -Eq '^[<>ch.]f|^.d...p' "$link_scratch/copy-changes" \
         && cmp -s "$work/SHA256SUMS" "$SNAPSHOTS/$prev/SHA256SUMS" \
         && { write_symlink_manifest "$SNAPSHOTS/$prev/data" | cmp -s "$work/SYMLINKS" -; } \
         && grep -Fxq "monitor=$monitor" "$SNAPSHOTS/$prev/INFO" \
