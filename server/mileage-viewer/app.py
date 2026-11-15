@@ -1038,7 +1038,7 @@ def folder_description(entry):
                 f"purpose note: {entry.get('purpose_note') or 'none'}. "
                 "These saved miles and this purpose are not in the totals shown. "
                 "The trips it was made from are counted separately. "
-                "Its tax year cannot be closed until this saved merge is resolved")
+                "Its affected tax years cannot be closed until this saved merge is resolved")
     elif entry["folder_reason"] == "saved_keys":
         names = ", ".join(name + "/" for name in entry["saved_months"])
         text = (f"Warning: saved trip data exists under {names}. Trips are shown and counted under "
@@ -2009,7 +2009,8 @@ def year_members(trips, unreadable, year):
 
 def _unused_merge_in_year(trip, year):
     saved_year = _trip_local_year(trip.get("saved_summary", {}))
-    return saved_year is None or saved_year == year
+    return (saved_year is None or saved_year == year
+            or any(_trip_local_year(part) == year for part in trip.get('counted_parts', ())))
 
 
 UNUSED_MERGE_CLOSE_REFUSAL = ("A saved merge under an unused month name has miles and purpose outside the totals. "

@@ -300,6 +300,7 @@ def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=N
                            "saved_summary": saved_summary(row),
                            **{f: row[f] or "" for f in ANNOTATION_FIELDS},
                            "saved_months": list(unused), "counted_months": sorted(set(unused.values())),
+                           "counted_parts": [originals[unused[k.split('/')[0]] + '/' + k.split('/')[1]] for k in keys],
                            "has_gpx": False, "problem": "saved merge under an unused month name"})
             continue
         hidden.update(keys)

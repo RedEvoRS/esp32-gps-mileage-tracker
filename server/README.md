@@ -1032,7 +1032,8 @@ saved miles appear only in the note. XLSX shows the notice in **Unreadable
 trips**, outside **Mileage** and **Totals**. The year review lists each merge
 in **Saved merges under unused month names**, with its saved miles, purpose
 and month name; its parts count separately. Closing its saved-summary year
-is refused until the name is restored or the admin uses **Undo saved merge**.
+or any year containing one of its parts is refused until the name is restored
+or the admin uses **Undo saved merge**.
 If the saved year is unknown, every year is blocked. Reopening stays possible.
 An unused merge adds no unreadable-file count. Older snapshots stay unchanged;
 the review compares saved and current totals and names the former merged key

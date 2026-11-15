@@ -548,7 +548,7 @@ class ViewerHardeningTests(unittest.TestCase):
             "saved_keys": "Warning: saved trip data exists under 2026-01/, 2026-12/. Trips are shown and counted under 2026-12/; saved data under the other names is not applied. Years cannot be closed until this conflict is resolved. Healthy trips can still be merged under the name in use.",
             "link_not_folder": "The month name is a link to something other than a folder.",
             "not_folder": "The month name is a file, not a folder.",
-            "unused_merge": "This merge is saved under a month name no longer in use (2026-01/, 2026-12/). Saved miles: unknown; purpose: unclassified; purpose note: none. These saved miles and this purpose are not in the totals shown. The trips it was made from are counted separately. Its tax year cannot be closed until this saved merge is resolved.",
+            "unused_merge": "This merge is saved under a month name no longer in use (2026-01/, 2026-12/). Saved miles: unknown; purpose: unclassified; purpose note: none. These saved miles and this purpose are not in the totals shown. The trips it was made from are counted separately. Its affected tax years cannot be closed until this saved merge is resolved.",
             "unwritable": "Trips are shown and counted, but the folder's owner or mode prevents the server writing to it. The tracker cannot upload new trips for this month until the folder's owner or mode is fixed; the tracker keeps them queued.",
         }
         hints = {

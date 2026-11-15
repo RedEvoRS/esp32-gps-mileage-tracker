@@ -579,7 +579,7 @@ class ViewerMerges(unittest.TestCase):
         self.assert_unused_close_refused(key, 2025)
         self.assertIn(2025, [r['year'] for r in self.viewer._year_list()])
         self.assertEqual(self.close_year(2024).status_code, 302)
-        self.assertNotIn('unused-merges-heading', self.client.get('/admin/year/2026').get_data(as_text=True))
+        self.assert_unused_close_refused(key, 2026)  # Its parts still belong to this year.
         with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute('UPDATE trip_merges SET summary=?', (json.dumps({'distance_miles': .732}),))
         for year in (2023, 2025, 2026):
@@ -588,6 +588,13 @@ class ViewerMerges(unittest.TestCase):
         self.assertEqual(self.undo_unused(key).status_code, 409)
         self.assertEqual(self.client.post('/admin/year/2024/reopen', data={
             'csrf_token': 'test-csrf', 'confirm': 'yes'}).status_code, 302)
+
+    def test_unused_merge_spanning_year_boundary_blocks_both_part_years(self):
+        self.base = datetime(2026, 12, 31, 23, 58, tzinfo=timezone.utc)
+        key, _ = self.moved_merge()
+        self.assert_unused_close_refused(key, 2026)
+        self.assert_unused_close_refused(key, 2027)
+        self.assertEqual(self.close_year(2025).status_code, 302)
 
     def test_unused_merge_after_close_shows_saved_current_comparison_and_can_reopen(self):
         a, b = self.trip('a', 0), self.trip('b', 180, .01)
