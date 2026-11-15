@@ -202,6 +202,20 @@ class UploadSafety(unittest.TestCase):
         self.assertIn("2026-03", response.get_json()["error"])
         self.assertIn("month folder 2026-03", "\n".join(logs.output))
 
+    def test_looping_trip_file_is_not_reported_as_a_linked_month(self):
+        # Only a looping month folder is a "linked month"; a looping trip file
+        # inside a real month keeps the generic storage error.
+        first = self.upload()
+        self.assertEqual(first.status_code, 200)
+        gpx = self.root / first.json["stored_as"]
+        loop = gpx.with_name("loop.gpx")
+        gpx.rename(loop)
+        self.symlink(gpx, gpx)
+        with self.assertLogs(self.ing.app.logger, "ERROR"):
+            response = self.upload()
+        self.assertEqual(response.status_code, 500)
+        self.assertNotIn("month folder", response.get_data(as_text=True))
+
     def test_final_trip_symlinks_cannot_escape_data_root(self):
         month = self.root / "2026-04"
         month.mkdir()

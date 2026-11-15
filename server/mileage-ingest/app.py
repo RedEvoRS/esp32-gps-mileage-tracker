@@ -328,6 +328,14 @@ def _stored_trip_directories(root, safe_id):
             # A skipped month could contain this trip, so refuse the upload.
             # RuntimeError is a symbolic link loop (Path.resolve on Python 3.12).
             raise LinkedMonthError(directory.name) from None
+        try:
+            directory.stat()
+        except OSError as exc:
+            # Python 3.13+ resolve() no longer raises on a link loop, so a
+            # looping month folder shows up here; report it the same way. Other
+            # errors fall through to the per-file checks below, as before.
+            if exc.errno == errno.ELOOP:
+                raise LinkedMonthError(name) from None
         # Check both files before any stat or read, even for a partial pair.
         directory, gpx_file, json_file = _trip_paths(root, directory, safe_id)
         for path in (gpx_file, json_file):
@@ -337,12 +345,6 @@ def _stored_trip_directories(root, safe_id):
                 path.stat()
             except (FileNotFoundError, NotADirectoryError):
                 continue
-            except OSError as exc:
-                # Python 3.13+ resolve() no longer raises on a link loop, so
-                # the loop shows up here instead; report it the same way.
-                if exc.errno == errno.ELOOP:
-                    raise LinkedMonthError(name) from None
-                raise
             # A month link to another month folder in the data folder is the
             # same folder, not a second copy of the trip (#725).
             if directory not in matches:
