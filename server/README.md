@@ -1462,7 +1462,7 @@ means zero in an older readable `INFO`). If the link check fails, the value is
 `unknown`: linked items were **not checked**, so inspect the backup log, fix
 the error and rerun the backup. Status and restore checks report this plainly;
 an unchecked run always makes a new snapshot. A changed count also makes a new
-snapshot. Relative internal links and `*.tmp` are not reported. Move the
+snapshot. Working relative internal chains and `*.tmp` are not reported. Move the
 outside contents into `data/` and rerun the backup. The
 copy and deep check still run and `last-success` advances, but missing linked
 contents make the run exit non-zero and withhold `PING_URL`. Unraid status
@@ -1476,10 +1476,24 @@ Restore checks list links that will be skipped and can pass with a warning;
 restore reports them too. For an absolute link, a relocated snapshot cannot
 establish whether its original target is saved elsewhere in the backup or
 absent, so the warning explains that uncertainty. Restore uses rsync
-`--safe-links`, skipping outside links and keeping existing real folders;
-relative links inside `data/` can be restored. Absolute links are never restored
-as links, even when their targets are inside `data/`. Replace an alias you need
-with a relative internal link or a real folder or file, then make a fresh backup.
+`--safe-links`: it skips absolute links and relative paths rejected by its text
+check, keeping existing items at those paths. Too many leading `../` parts are
+rejected; current rsync also rejects `..` after a named path component. The report
+uses the installed rsync to decide which links survive. Rsync does not resolve other
+links when deciding which links to recreate. For example, `relative ->
+absolute/trip.gpx` is recreated even if `absolute` is an absolute link that is
+skipped. Backup and restore warn that `relative` depends on `data/absolute` and
+will dangle on an empty `data/`. Backup also reports whether the original target
+was saved at its real path; a relocated restore cannot establish that through
+an absolute link. Existing items may keep a chain usable on an existing install.
+Recreated links with target problems are counted separately from skipped links.
+Loops are reported without failing an otherwise complete backup; relative loops
+are recreated. A relative chain whose text passes rsync's check can still lead
+outside `data/`; it is recreated and warned about, while its outside contents
+still fail the backup run, withhold the heartbeat and count in
+`links_not_backed_up`. Backup never follows links to copy their contents.
+Replace an alias you need with a working relative internal chain or a real
+folder or file, then make a fresh backup.
 
 Each SQLite snapshot is consistent individually; the databases and trip files
 are captured in sequence, rather than in one shared transaction.

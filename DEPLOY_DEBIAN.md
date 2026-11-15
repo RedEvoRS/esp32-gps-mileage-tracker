@@ -1455,13 +1455,17 @@ off-host destination. Each run:
   `diagnostics/events.db` and its SQLite sidecars are excluded from rsync.
   Links resolving outside `data/` are logged (up to 20 and a remainder count);
   their contents are missing from this and earlier snapshots made with the
-  link. Relative internal links and `*.tmp` are fine. Move the contents into `data/`
-  and rerun the backup. The copy and deep check still run, but the run exits
+  link. Working relative internal chains and `*.tmp` are fine. Move the contents
+  into `data/` and rerun the backup. The copy and deep check still run, but the run exits
   non-zero and withholds the heartbeat.
   Absolute links inside `data/` get a separate warning that their aliases will
   not be restored; their targets are saved at their real paths unless missing
   or excluded, which the warning explains. These warnings do not fail the run,
   withhold the heartbeat or increase `links_not_backed_up`.
+  A relative link through a skipped link gets a separate warning naming that
+  dependency: it is recreated, but will dangle on an empty `data/`. Backup
+  reports the original target's real saved path when present. Relative loops
+  are reported and recreated; they do not fail an otherwise complete backup.
 - stores `annotations.db`, optional `events.db` and optional `monitor.db`
   beside `data/`, all covered by `SHA256SUMS`. Human-readable `INFO` records
   annotation/event counts, monitor status and `links_not_backed_up` (missing
@@ -1673,8 +1677,9 @@ Restore test passed
 
 Links that will not be restored as links are listed; if any are found the check
 still exits 0 with `Restore test passed, but N linked item(s) will not be restored
-as links; see warnings above`. A relative outside link has no saved contents,
-even if checksums pass. For an absolute link, the relocated snapshot cannot
+as links; see warnings above`. Links recreated with target problems have a
+separate warning and count, naming any skipped link they depend on. For an
+absolute link or a chain through one, the relocated snapshot cannot
 determine whether its original target is saved elsewhere in the backup or
 absent; the warning explains this rather than claiming data is missing.
 Check the real trip files and annotations against the viewer. The check changes
@@ -1855,13 +1860,21 @@ backup API with their writers stopped: the ingest helper writes events.db;
 the viewer and monitor helpers write their own databases. It starts the default
 services again and restarts the monitor if it was running. A saved monitor DB
 can create the volume on a replacement server without enabling notifications.
-It never deletes trip files that aren't in the snapshot. Restore reports
-outside links before restoring and uses rsync `--safe-links`: outside links
-are skipped, existing real folders are kept, and relative links inside `data/`
-are restored. Absolute links are never restored as links, even when they point
-inside `data/`; the real target files may still be present in the backup.
-Replace an alias you need with a relative internal link or a real folder or file,
-then make a fresh backup. Outside links' contents were not backed up.
+It never deletes trip files that aren't in the snapshot. Restore reports link
+problems before restoring and uses rsync `--safe-links`: absolute links and
+relative paths rejected by its text check are skipped, leaving existing items
+there alone. Too many leading `../` parts are rejected; current rsync also
+rejects `..` after a named path component. The report uses the installed rsync
+to determine which links survive. Other relative links are recreated. This checks
+each link's text, so `relative -> absolute/trip.gpx` is recreated even when `absolute` is a
+skipped absolute link. The warning names `data/absolute` and explains that
+`relative` will dangle on an empty `data/`; an existing item there may keep it
+usable. The real target files can still be saved at their own paths. Relative
+chains that lead outside despite passing rsync's text check are also recreated
+and warned about. Their outside contents still fail backup, withhold its
+heartbeat and count in `links_not_backed_up`; backup never follows links to copy
+their contents. Replace an alias you need with a working relative internal
+chain or a real folder or file, then make a fresh backup.
 
 If monitor discovery fails, restore warns, skips `monitor.db`, and leaves the
 monitor service running or stopped as it was, while restoring trips, annotations

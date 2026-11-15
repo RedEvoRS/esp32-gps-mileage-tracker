@@ -107,9 +107,9 @@ fetch_and_check() {
     if [[ $(read_coverage_count "$snap/INFO") == unknown ]]; then
         log "WARNING: linked items were not checked when this backup was made; inspect the backup log, fix the check error and make a fresh backup. Checking the saved links below."
     fi
-    report_outside_links "$snap/data" "$scratch/outside-links" restore
+    report_link_restore_effects "$snap/data" "$snap/data" "$scratch/link-effects" restore
     if (( LINKS_NOT_RESTORED > 0 )); then
-        log "WARNING: $LINKS_NOT_RESTORED linked item(s) will not be restored as links; relative outside links have no saved contents, while absolute link targets may be saved elsewhere in this backup or absent"
+        log "WARNING: $LINKS_NOT_RESTORED linked item(s) will not be restored as links; see warnings above for target coverage"
     fi
     [[ -f $snap/INFO ]] && log "Snapshot INFO: $(tr '\n' ' ' < "$snap/INFO")"
 }
@@ -168,6 +168,9 @@ show_verify_status
 fetch_and_check "$snapshot_arg"
 
 if [[ $command == check ]]; then
+    if (( LINKS_RESTORED_WITH_WARNINGS > 0 )); then
+        log "WARNING: $LINKS_RESTORED_WITH_WARNINGS linked item(s) will be restored as links with target problems; see warnings above"
+    fi
     if (( LINKS_NOT_RESTORED > 0 )); then
         log "Restore test passed, but $LINKS_NOT_RESTORED linked item(s) will not be restored as links; see warnings above"
     else

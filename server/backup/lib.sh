@@ -351,20 +351,77 @@ read_verify_state() {
     return 0
 }
 
-# Resolve names only; never open a target or descend through a directory link.
+# Walk path names, never file contents or directory trees. In restore mode,
+# stop at the first link rsync skips, without consulting its original target.
+# Backup mode also resolves absolute/outside names for coverage accounting.
+# Bound expanding loops; repeating a link with a different suffix can be valid.
+trace_data_link() {
+    local root=$1 pending=$2 mode=$3 safe_root=${4:-} current=$1
+    local part candidate target relative prior hops=0
+    local -A seen=()
+    LINK_DEPENDENCY='' LINK_LOOP=no LINK_LIMIT=no LINK_ESCAPES=no LINK_RESOLVED=''
+    while [[ -n $pending ]]; do
+        part=${pending%%/*}
+        if [[ $pending == */* ]]; then pending=${pending#*/}; else pending=; fi
+        case $part in
+            ''|.) continue ;;
+            ..)
+                current=${current%/*}
+                current=${current:-/}
+                if [[ $mode == restore && $current != "$root" && $current != "$root/"* ]]; then
+                    LINK_ESCAPES=yes
+                    break
+                fi
+                continue ;;
+        esac
+        candidate=${current%/}/$part
+        if [[ -L $candidate ]]; then
+            hops=$((hops + 1))
+            if [[ -n ${seen[$candidate]+yes} ]]; then
+                prior=${seen[$candidate]}
+                if [[ $pending == "$prior" || -z $prior || $pending == */"$prior" ]]; then
+                    LINK_LOOP=yes
+                    break
+                fi
+            fi
+            if (( hops > 256 )); then
+                LINK_LOOP=yes LINK_LIMIT=yes
+                break
+            fi
+            seen["$candidate"]=$pending
+            IFS= read -r -d '' target < <(readlink -z -- "$candidate") || return 1
+            if [[ -n $safe_root && $candidate == "$root/"* ]]; then
+                relative=${candidate#"$root/"}
+                if [[ ! -L $safe_root/$relative ]]; then
+                    [[ -n $LINK_DEPENDENCY ]] || LINK_DEPENDENCY=$relative
+                    [[ $mode != restore ]] || break
+                fi
+            fi
+            if [[ $target == /* ]]; then current=/; fi
+            pending=$target${pending:+/$pending}
+        else
+            current=$candidate
+        fi
+    done
+    LINK_RESOLVED=$current
+}
+
+# Coverage uses resolved targets, independently of restore eligibility.
 outside_links() {
-    local root path resolved target mode=${2:-backup}
+    local root path resolved
     root=$(realpath -m -- "$1") || return 1
     # The slash follows a linked start directory, without following links
     # found below it. This also works with BusyBox find.
     find "$1/" -name '*.tmp' -prune -o -type l -print0 | while IFS= read -r -d '' path; do
-        # rsync --safe-links rejects every absolute link. Its original
-        # target cannot be classified from a relocated snapshot safely.
-        if [[ $mode == restore ]]; then
-            IFS= read -r -d '' target < <(readlink -z -- "$path") || return 1
-            if [[ $target == /* ]]; then printf '%s\0' "$path"; continue; fi
+        # Detect cycles before realpath: expanding loops can keep it busy
+        # indefinitely. Keep its established resolution for ordinary paths.
+        trace_data_link "$root" "${path#"$1/"}" backup || return 1
+        if [[ $LINK_LOOP == yes ]]; then
+            [[ $LINK_LIMIT != yes ]] || return 1
+            resolved=$LINK_RESOLVED
+        else
+            IFS= read -r -d '' resolved < <(realpath -mz -- "$path") || return 1
         fi
-        IFS= read -r -d '' resolved < <(realpath -mz -- "$path") || return 1
         if [[ $resolved != "$root" && $resolved != "$root/"* ]]; then
             printf '%s\0' "$path"
         fi
@@ -373,59 +430,103 @@ outside_links() {
 
 # A bounded, escaped list keeps unusual filenames on one log line each.
 report_outside_links() {
-    local dir=$1 path target mode=${3:-backup} count=0
-    outside_links "$dir" "$mode" > "$2" || return 1
+    local dir=$1 path target count=0
+    outside_links "$dir" > "$2" || return 1
     while IFS= read -r -d '' path; do
         count=$((count + 1))
         if (( count <= 20 )); then
             IFS= read -r -d '' target < <(readlink -z -- "$path") || return 1
-            if [[ $mode == restore && $target == /* ]]; then
-                log "WARNING: $(printf '%q' "data/${path#"$dir/"}") -> $(printf '%q' "$target"): absolute link, will not be restored as a link; cannot determine from this snapshot whether its target is saved elsewhere in the backup or absent"
-            else
-                log "WARNING: not backed up: $(printf '%q' "data/${path#"$dir/"}") -> $(printf '%q' "$target")"
-            fi
+            log "WARNING: not backed up: $(printf '%q' "data/${path#"$dir/"}") -> $(printf '%q' "$target")"
         fi
     done < "$2"
     if (( count > 20 )); then
-        if [[ $mode == restore ]]; then
-            log "WARNING: and $((count - 20)) more linked items that will not be restored as links"
-        else
-            log "WARNING: and $((count - 20)) more linked items not backed up"
-        fi
+        log "WARNING: and $((count - 20)) more linked items not backed up"
     fi
     rm -f -- "$2" || return 1
-    if [[ $mode == restore ]]; then LINKS_NOT_RESTORED=$count; else LINKS_NOT_BACKED_UP=$count; fi
+    LINKS_NOT_BACKED_UP=$count
 }
 
-# These links do not lose coverage of ordinary files: the copy holds their
-# targets at the real paths. Warn separately because --safe-links skips the
-# aliases themselves. Check the copied path too, since e.g. *.tmp is excluded.
-report_absolute_inside_links() {
-    local dir=$1 snapshot=$2 list=$3 root saved_root path target resolved saved message count=0
+# Let the installed rsync decide eligibility, including version-specific rules
+# for embedded '..'. Copy only named links and their parent directories into an
+# empty private tree: no recursion, dereferencing, trip contents or --delete.
+make_link_restore_plan() {
+    local dir=$1 list=$2 plan=$3 path
+    find "$dir/" -name '*.tmp' -prune -o -type l -print0 > "$list" || return 1
+    mkdir -- "$plan" || return 1
+    while IFS= read -r -d '' path; do
+        printf '%s\0' "${path#"$dir/"}"
+    done < "$list" > "$plan/files"
+    rsync -l --dirs --safe-links --from0 --files-from="$plan/files" "$dir/" "$plan/data/"
+}
+
+# Explain skipped internal aliases and links that rsync recreates but cannot
+# make usable. These warnings do not change outside-target coverage counts.
+report_link_restore_effects() {
+    local dir=$1 snapshot=$2 list=$3 mode=${4:-backup}
+    local root saved_root path relative target resolved saved message effect count=0 status=0
+    local plan=$list.plan
+    LINKS_RESTORED_WITH_WARNINGS=0 LINKS_NOT_RESTORED=0
     root=$(realpath -m -- "$dir") || return 1
     saved_root=$(realpath -m -- "$snapshot") || return 1
-    find "$dir/" -name '*.tmp' -prune -o -type l -print0 > "$list" || return 1
+    if ! make_link_restore_plan "$dir" "$list" "$plan"; then
+        rm -rf -- "$plan"
+        rm -f -- "$list"
+        return 1
+    fi
     while IFS= read -r -d '' path; do
-        IFS= read -r -d '' target < <(readlink -z -- "$path") || return 1
-        [[ $target == /* ]] || continue
-        IFS= read -r -d '' resolved < <(realpath -mz -- "$path") || return 1
-        [[ $resolved == "$root" || $resolved == "$root/"* ]] || continue
+        IFS= read -r -d '' target < <(readlink -z -- "$path") || { status=1; break; }
+        relative=${path#"$dir/"}
+        effect=
+        if [[ -L $plan/data/$relative ]]; then
+            trace_data_link "$root" "$relative" "$mode" "$plan/data" || { status=1; break; }
+            if [[ -n $LINK_DEPENDENCY ]]; then
+                effect="will be restored as a link, but on an empty data/ it will dangle: it depends on $(printf '%q' "data/$LINK_DEPENDENCY"), which will not be restored as a link"
+            elif [[ $LINK_LOOP == yes ]]; then
+                effect='will be restored as a link, but its target cannot be reached (link loop or too many links)'
+            elif [[ $LINK_ESCAPES == yes || ( $LINK_RESOLVED != "$root" && $LINK_RESOLVED != "$root/"* ) ]]; then
+                effect='will be restored as a link, but its path leads outside data/; backup does not follow links to copy their contents'
+            fi
+            [[ -n $effect ]] || continue
+            LINKS_RESTORED_WITH_WARNINGS=$((LINKS_RESTORED_WITH_WARNINGS + 1))
+        else
+            trace_data_link "$root" "$relative" "$mode" "$plan/data" || { status=1; break; }
+            if [[ $mode == backup ]]; then
+                [[ $LINK_RESOLVED == "$root" || $LINK_RESOLVED == "$root/"* ]] || continue
+            else
+                LINKS_NOT_RESTORED=$((LINKS_NOT_RESTORED + 1))
+            fi
+            if [[ $target == /* ]]; then
+                effect='absolute link, will not be restored as a link'
+            else
+                effect='relative link rejected by rsync --safe-links, will not be restored as a link'
+            fi
+        fi
         count=$((count + 1))
         if (( count <= 20 )); then
-            saved=$snapshot
-            [[ $resolved == "$root" ]] || saved="$snapshot/${resolved#"$root/"}"
-            IFS= read -r -d '' saved < <(realpath -mz -- "$saved") || return 1
-            message='its target is not stored at its real path in this snapshot (it may be missing or excluded)'
-            if [[ ( $saved == "$saved_root" || $saved == "$saved_root/"* ) && -e $saved ]]; then
-                message='its target is in the backup under its real path'
+            message=
+            if [[ $mode == backup && $LINK_LOOP != yes ]]; then
+                resolved=$LINK_RESOLVED
+                if [[ $resolved == "$root" || $resolved == "$root/"* ]]; then
+                    relative=${resolved#"$root"}
+                    trace_data_link "$saved_root" "${relative#/}" restore "$plan/data" || { status=1; break; }
+                    saved=$LINK_RESOLVED
+                    message='; its target is not stored at its real path in this snapshot (it may be missing or excluded)'
+                    if [[ -z $LINK_DEPENDENCY && $LINK_ESCAPES == no && $LINK_LOOP == no && -e $saved ]]; then
+                        message="; its target is in the backup under its real path: $(printf '%q' "data$relative")"
+                    fi
+                fi
+            elif [[ $mode == restore && -n $LINK_DEPENDENCY ]]; then
+                message='; cannot determine from this snapshot whether its original target is saved elsewhere in the backup or absent'
             fi
-            log "WARNING: $(printf '%q' "data/${path#"$dir/"}") -> $(printf '%q' "$target"): absolute link, will not be restored as a link; $message"
+            log "WARNING: $(printf '%q' "data/${path#"$dir/"}") -> $(printf '%q' "$target"): $effect$message"
         fi
     done < "$list"
     if (( count > 20 )); then
-        log "WARNING: and $((count - 20)) more absolute links inside data/ that will not be restored as links"
+        log "WARNING: and $((count - 20)) more links with restore warnings"
     fi
-    rm -f -- "$list"
+    rm -rf -- "$plan" || status=1
+    rm -f -- "$list" || status=1
+    return "$status"
 }
 
 read_coverage_count() {

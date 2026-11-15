@@ -413,8 +413,23 @@ Absolute links are never restored as links, even when their targets are inside
 `data/`. Backup warns separately about those internal aliases without failing
 the run or counting their targets as missing. Their real target files are saved
 unless missing or excluded. Restore warns that it cannot determine an absolute
-link's original target coverage from a relocated snapshot. Replace an alias you
-need with a relative internal link or a real folder or file, then make a fresh backup.
+link's original target coverage from a relocated snapshot. rsync `--safe-links`
+also skips relative paths rejected by its text check: too many leading `../`
+parts, and (on current rsync) `..` after a named path component. The report uses
+the installed rsync to determine which links survive, leaving any existing item
+at a skipped path alone. It recreates other relative links without
+resolving the chain first. For example, `relative -> absolute/trip.gpx` is
+recreated when `absolute` is skipped. Backup and restore name `data/absolute` as
+the dependency and warn that `relative` will dangle on an empty `data/`; existing
+items may keep the chain usable. Recreated links with target problems are counted
+separately from skipped links. Backup reports the original target's saved real
+path when present; restore cannot establish that through a relocated absolute
+link. Relative loops are reported and recreated without failing an otherwise
+complete backup. Relative chains that pass rsync's text check but lead outside
+are recreated and warned about; their outside contents still fail backup,
+withhold the heartbeat and count in `links_not_backed_up`. Backup never follows
+links to copy their contents. Replace an alias you need with a working relative
+internal chain or a real folder or file, then make a fresh backup.
 
 After today's backup has completed and been copied, the same run periodically
 checks older snapshots. In `backup/backup.conf`, `BACKUP_VERIFY_DAYS=7` means

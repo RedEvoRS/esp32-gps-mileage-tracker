@@ -136,7 +136,7 @@ rsync -a --numeric-ids --exclude=/.upload.lock --exclude='/.upload-lock.*' --exc
 # finish the backup, then fail the run below.
 coverage_error=0
 if ! report_outside_links "$COMPOSE_DIR/data" "$work/.outside-links" \
-        || ! report_absolute_inside_links "$COMPOSE_DIR/data" "$work/data" "$work/.absolute-links"; then
+        || ! report_link_restore_effects "$COMPOSE_DIR/data" "$work/data" "$work/.absolute-links"; then
     log "ERROR: couldn't check data for links outside it; this run will fail after the copy"
     rm -f -- "$work/.outside-links" "$work/.absolute-links"
     LINKS_NOT_BACKED_UP=unknown

@@ -546,6 +546,33 @@ class BackupScripts(unittest.TestCase):
         self.assertEqual(target.read_text(), "first.gpx")
         self.assertEqual(os.readlink(self.data / "relative"), "2026-10")
 
+    def test_relative_chain_through_absolute_link_reports_restored_dangling_alias(self):
+        target = self.data / "2026-10/2026-10-01T15-00-00.gpx"
+        self.symlink(self.data / "absolute", target.parent, True)
+        self.symlink(self.data / "relative", f"absolute/{target.name}")
+        result = self.run_script("backup.sh")
+        self.assertIn("data/relative", result.stderr)
+        self.assertIn("depends on data/absolute", result.stderr)
+        self.assertIn("target is in the backup", result.stderr)
+        self.assertIn("links_not_backed_up=0\n", (self.backups / "latest/INFO").read_text())
+        for original_data_present in (True, False):
+            with self.subTest(original_data_present=original_data_present):
+                if not original_data_present:
+                    shutil.rmtree(self.data)
+                    self.data.mkdir()
+                result = self.run_script("restore.sh", "check")
+                self.assertIn("depends on data/absolute", result.stderr)
+                self.assertIn("on an empty data/ it will dangle", result.stderr)
+                self.assertIn("1 linked item(s) will not be restored as links", result.stderr)
+                self.assertNotIn("not backed up: data/relative", result.stderr)
+                self.assertNotIn("not in this backup", result.stderr)
+        result = self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertIn("depends on data/absolute", result.stderr)
+        self.assertFalse((self.data / "absolute").is_symlink())
+        self.assertEqual(os.readlink(self.data / "relative"), f"absolute/{target.name}")
+        self.assertFalse((self.data / "relative").exists())
+        self.assertEqual(target.read_text(), "first.gpx")
+
     def test_link_count_changes_snapshot_and_then_dedupes(self):
         self.run_script("backup.sh")
         self.symlink(self.data / "linked", self.tmp / "missing")
@@ -553,6 +580,200 @@ class BackupScripts(unittest.TestCase):
         self.assertEqual(len(self.snapshots()), 2)
         self.assertEqual(self.run_script("backup.sh", check=False).returncode, 1)
         self.assertEqual(len(self.snapshots()), 2)
+
+    def test_long_chains_through_absolute_file_and_folder_links(self):
+        target = self.data / "2026-10/2026-10-01T15-00-00.gpx"
+        self.symlink(self.data / "absolute-file", target)
+        self.symlink(self.data / "absolute-folder", target.parent, True)
+        links = {"folder": "absolute-folder", "file": "absolute-file",
+                 "hop": f"folder/{target.name}", "last": "hop", "last-folder": "folder"}
+        for name, value in links.items():
+            self.symlink(self.data / name, value)
+        result = self.run_script("backup.sh")
+        self.assertIn("depends on data/absolute-file", result.stderr)
+        self.assertIn("depends on data/absolute-folder", result.stderr)
+        self.assertIn("links_not_backed_up=0\n", (self.backups / "latest/INFO").read_text())
+        shutil.rmtree(self.data)
+        self.data.mkdir()
+        result = self.run_script("restore.sh", "check")
+        self.assertIn("2 linked item(s) will not be restored as links", result.stderr)
+        self.assertIn("5 linked item(s) will be restored as links with target problems", result.stderr)
+        self.assertNotIn("not backed up:", result.stderr)
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+        for name, value in links.items():
+            self.assertEqual(os.readlink(self.data / name), value)
+            self.assertFalse((self.data / name).exists())
+        self.assertEqual(target.read_text(), "first.gpx")
+
+    def test_relative_inside_chains_and_repeated_links_remain_usable(self):
+        links = {"folder": "2026-10", "folder-hop": "folder", "dot": ".",
+                 "file": "folder-hop/2026-10-01T15-00-00.gpx", "last": "file",
+                 "repeat": "dot/dot/folder-hop/2026-10-01T15-00-00.gpx",
+                 "2026-10/up": "../folder-hop"}
+        for name, value in links.items():
+            self.symlink(self.data / name, value)
+        ping = self.tmp / "ping"
+        self.shim("curl", f'touch "{ping}"\n')
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        result = self.run_script("backup.sh")
+        self.assertNotIn("WARNING:", result.stderr)
+        self.assertTrue(ping.exists())
+        shutil.rmtree(self.data)
+        self.data.mkdir()
+        self.assertNotIn("WARNING:", self.run_script("restore.sh", "check").stderr)
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+        for name, value in links.items():
+            self.assertEqual(os.readlink(self.data / name), value)
+            self.assertTrue((self.data / name).exists())
+        self.assertEqual((self.data / "last").read_text(), "first.gpx")
+        self.assertEqual((self.data / "repeat").read_text(), "first.gpx")
+
+    def test_relative_chain_through_outside_link_still_fails_backup(self):
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        os.mkfifo(outside / "trip.gpx")  # Reading a target would hang the test.
+        self.symlink(self.data / "bridge", "../../outside", True)
+        links = {"folder": "bridge", "file": "folder/trip.gpx", "last": "file"}
+        for name, value in links.items():
+            self.symlink(self.data / name, value)
+        ping = self.tmp / "ping"
+        self.shim("curl", f'touch "{ping}"\n')
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        result = self.run_script("backup.sh", check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("links_not_backed_up=4\n", (self.backups / "latest/INFO").read_text())
+        self.assertIn("depends on data/bridge", result.stderr)
+        self.assertTrue((self.backups / "last-success").exists())
+        self.assertFalse(ping.exists())
+        snapshot_data = self.backups / "latest/data"
+        self.assertEqual(list(snapshot_data.rglob("trip.gpx")), [])
+        shutil.rmtree(self.data)
+        self.data.mkdir()
+        result = self.run_script("restore.sh", "check")
+        self.assertIn("1 linked item(s) will not be restored as links", result.stderr)
+        self.assertIn("3 linked item(s) will be restored as links with target problems", result.stderr)
+        self.assertIn("depends on data/bridge", result.stderr)
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertFalse((self.data / "bridge").is_symlink())
+        for name, value in links.items():
+            self.assertEqual(os.readlink(self.data / name), value)
+            self.assertFalse((self.data / name).exists())
+        self.assertTrue((outside / "trip.gpx").is_fifo())
+
+    def test_embedded_parent_path_is_skipped_and_safe_alias_reports_dependency(self):
+        outside = self.compose_dir / "outside"
+        outside.mkdir()
+        (outside / "trip.gpx").write_text("outside sentinel")
+        self.symlink(self.data / "root", ".", True)
+        self.symlink(self.data / "2026-10/escape", "../root/../outside/trip.gpx")
+        self.symlink(self.data / "safe", "2026-10/escape")
+        result = self.run_script("backup.sh", check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("links_not_backed_up=2\n", (self.backups / "latest/INFO").read_text())
+        self.assertIn("depends on data/2026-10/escape", result.stderr)
+        shutil.rmtree(self.data)
+        self.data.mkdir()
+        result = self.run_script("restore.sh", "check")
+        self.assertIn("1 linked item(s) will not be restored as links", result.stderr)
+        self.assertIn("depends on data/2026-10/escape", result.stderr)
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertFalse((self.data / "2026-10/escape").is_symlink())
+        self.assertEqual(os.readlink(self.data / "safe"), "2026-10/escape")
+        self.assertFalse((self.data / "safe").exists())
+        self.assertEqual((outside / "trip.gpx").read_text(), "outside sentinel")
+
+    def test_link_loops_are_reported_without_failing_or_hanging(self):
+        links = {"loop-a": "loop-b", "loop-b": "loop-a", "self": "self",
+                 "expanding": "expanding/child", "via-absolute": "absolute-loop"}
+        for name, value in links.items():
+            self.symlink(self.data / name, value)
+        self.symlink(self.data / "absolute-loop", self.data / "loop-a")
+        result = self.run_script("backup.sh")
+        self.assertIn("link loop or too many links", result.stderr)
+        self.assertIn("links_not_backed_up=0\n", (self.backups / "latest/INFO").read_text())
+        shutil.rmtree(self.data)
+        self.data.mkdir()
+        result = self.run_script("restore.sh", "check")
+        self.assertIn("link loop or too many links", result.stderr)
+        self.assertIn("depends on data/absolute-loop", result.stderr)
+        self.assertIn("1 linked item(s) will not be restored as links", result.stderr)
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+        for name, value in links.items():
+            self.assertEqual(os.readlink(self.data / name), value)
+        self.assertFalse((self.data / "absolute-loop").is_symlink())
+
+    def test_unsafe_relative_text_can_have_a_saved_inside_target(self):
+        self.symlink(self.data / "alias", "../data/2026-10/2026-10-01T15-00-00.gpx")
+        result = self.run_script("backup.sh")
+        self.assertIn("relative link rejected by rsync --safe-links, will not be restored as a link", result.stderr)
+        self.assertIn("target is in the backup", result.stderr)
+        self.assertIn("links_not_backed_up=0\n", (self.backups / "latest/INFO").read_text())
+        result = self.run_script("restore.sh", "check")
+        self.assertIn("1 linked item(s) will not be restored as links", result.stderr)
+        self.assertNotIn("not backed up:", result.stderr)
+        shutil.rmtree(self.data)
+        self.data.mkdir()
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertFalse((self.data / "alias").is_symlink())
+        self.assertEqual((self.data / "2026-10/2026-10-01T15-00-00.gpx").read_text(), "first.gpx")
+
+    def test_chain_warning_accounts_for_missing_and_excluded_targets(self):
+        (self.data / "omitted.tmp").write_text("excluded")
+        for name in ("omitted.tmp", "missing"):
+            self.symlink(self.data / f"absolute-{name.removesuffix('.tmp')}", self.data / name)
+            self.symlink(self.data / f"relative-{name.removesuffix('.tmp')}",
+                         f"absolute-{name.removesuffix('.tmp')}")
+        result = self.run_script("backup.sh")
+        self.assertEqual(result.stderr.count("target is not stored at its real path"), 4)
+        self.assertNotIn("target is in the backup", result.stderr)
+        self.assertIn("links_not_backed_up=0\n", (self.backups / "latest/INFO").read_text())
+
+    def test_existing_skipped_dependency_can_keep_a_restored_chain_usable(self):
+        self.symlink(self.data / "absolute", self.data / "2026-10", True)
+        self.symlink(self.data / "relative", "absolute/2026-10-01T15-00-00.gpx")
+        self.run_script("backup.sh")
+        result = self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertIn("on an empty data/ it will dangle", result.stderr)
+        self.assertTrue((self.data / "absolute").is_symlink())
+        self.assertEqual((self.data / "relative").read_text(), "first.gpx")
+
+    def test_restore_dependency_warnings_are_bounded_and_escape_names(self):
+        self.symlink(self.data / "absolute\nfolder", self.data / "2026-10", True)
+        for index in range(23):
+            self.symlink(self.data / f"relative-{index}\n", "absolute\nfolder")
+        self.run_script("backup.sh")
+        result = self.run_script("restore.sh", "check")
+        warnings = [line for line in result.stderr.splitlines() if "depends on" in line]
+        details = [line for line in result.stderr.splitlines() if "WARNING:" in line and " -> " in line]
+        self.assertEqual(len(details), 20)
+        self.assertIn(len(warnings), (19, 20))  # find's order is platform-dependent.
+        self.assertTrue(all("\\n" in line for line in warnings))
+        self.assertIn("and 4 more links with restore warnings", result.stderr)
+        self.assertIn("23 linked item(s) will be restored as links with target problems", result.stderr)
+
+    def test_links_only_restore_plan_matches_actual_rsync_safe_links(self):
+        links = {"absolute": str(self.data / "2026-10"), "outside": "../outside",
+                 "returns": "../data/2026-10", "root": ".", "chain": "absolute/trip.gpx",
+                 "outside-chain": "outside/trip.gpx", "slashes": "./2026-10//trip.gpx",
+                 "2026-10/up": "../2026-10", "2026-10/escape": "../../outside",
+                 "2026-10/reenter": "../../data/2026-10",
+                 "traversal": "2026-10/../../outside", "missing": "missing/file",
+                 "2026-10/embedded": "../folder/../file", "trailing": "folder/.."}
+        for name, value in links.items():
+            self.symlink(self.data / name, value)
+        destination = self.tmp / "rsync-rule"
+        subprocess.run(["rsync", "-a", "--safe-links", f"{self.data}/", f"{destination}/"],
+                       check=True, capture_output=True, timeout=10)
+        plan, listing = self.tmp / "plan", self.tmp / "link-list"
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1"; make_link_restore_plan "$2" "$3" "$4"', "bash",
+             str(BACKUP / "lib.sh"), str(self.data), str(listing), str(plan)],
+            env=self.env, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list((plan / "data").rglob("*.gpx")), [])  # No trip contents copied.
+        for name in links:
+            with self.subTest(name=name):
+                self.assertEqual((plan / "data" / name).is_symlink(), (destination / name).is_symlink())
 
     def test_absolute_inside_link_to_excluded_target_does_not_claim_target_was_saved(self):
         (self.data / "omitted.tmp").write_text("excluded")
@@ -645,7 +866,7 @@ class BackupScripts(unittest.TestCase):
         link.unlink()
         self.symlink(link, "../../outside", True)
         result = self.run_script("restore.sh", "check")
-        self.assertIn("not backed up: data/linked-month", result.stderr)
+        self.assertIn("data/linked-month -> ../../outside: relative link rejected by rsync --safe-links", result.stderr)
         self.assertIn("1 linked item(s) will not be restored as links", result.stderr)
 
     # --- periodic deep verification ---
