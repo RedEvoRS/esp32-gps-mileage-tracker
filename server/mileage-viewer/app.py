@@ -3376,7 +3376,15 @@ def trip_view(ym, trip_id):
     if t is None and g.role == "admin" and removed is not None:
         t = next((t for t in removed_trips + removed_unreadable if t["trip_key"] == key), None)
     if t is None:
-        problem = next((u["problem"] for u in unreadable if u["trip_key"] == key), "the file is missing")
+        problem = next((u["problem"] for u in unreadable if u["trip_key"] == key), None)
+        if problem is None:
+            # A removed trip (for an everyday login) and an address that
+            # matches no trip get the same words, so the page does not say
+            # which one it is. Neither has a damaged file to repair.
+            abort(404, description=(
+                "No trip at this address. It may have been removed from the "
+                "log; ask the admin if you expected to see it."
+            ))
         abort(404, description=(
             f"This trip's summary file can't be read ({problem}), so its "
             "miles can't be counted. The trip list and exports flag it. To "
