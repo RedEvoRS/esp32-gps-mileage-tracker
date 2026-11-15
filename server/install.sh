@@ -928,6 +928,34 @@ setup_data_dir() {
     else
         ok "data/ is private (mode 700)"
     fi
+
+    # List only the directory entries, without following their targets.
+    local links link quoted hint
+    links=$(mktemp) || { problem "Cannot check data/ for symbolic links"; return 0; }
+    local -a list_links=(find data -mindepth 1 -maxdepth 1 -type l -print0)
+    if [[ ! -r data || ! -x data ]]; then
+        if [[ $MODE == install ]]; then
+            need_sudo
+            list_links=(as_root "${list_links[@]}")
+        elif [[ $MILEAGE_PLATFORM != unraid ]]; then
+            list_links=(sudo -n "${list_links[@]}")
+        fi
+    fi
+    if ! "${list_links[@]}" > "$links"; then
+        rm -f -- "$links"
+        problem "Cannot check data/ for symbolic links" "Run install.sh with access to data/."
+        return 0
+    fi
+    hint="The viewer won't read trips through it and backups copy only the link. Replace it with a real folder or mount the other disk at that path."
+    while IFS= read -r -d '' link; do
+        printf -v quoted '%q' "$link"
+        if [[ $MODE == check ]]; then
+            problem "$quoted is a symbolic link" "$hint"
+        else
+            warn "$quoted is a symbolic link" "$hint"
+        fi
+    done < "$links"
+    rm -f -- "$links"
 }
 
 setup_env() {
