@@ -1002,7 +1002,7 @@ annotations saved under their names; parts without readable summaries do not.
 The merged trip's saved miles and purpose leave the totals and are kept in history.
 The same transaction preserves the complete saved summary, annotation and
 part keys in history before deleting the merge. The year review permanently
-lists the saved miles, purpose, date and login under **Discarded damaged merges**,
+lists the saved miles, purpose, date and login under **Discarded or undone saved merges**,
 including which parts are now counted again, on their own or in a current merge.
 This remains visible after closing. This deliberate confirmation and visible record are
 enough to allow closing; there is no second acknowledgement. Reopen a closed
@@ -1015,8 +1015,12 @@ To use that merge again, restore the original month name, as a link or by
 renaming the folder back, and keep that name in use
 (follow the conflict steps above before removing competing links). Or use
 **Undo saved merge** on the trip list as admin and confirm removing that
-merge and its merged annotation. Original annotations and source files stay
-intact; the undo is recorded in history. Closed-year locks still apply;
+merge and its merged annotation. The trips stay counted under the name in use with only annotations saved
+under that name. Annotations under the unused name stay in the database but
+are not applied. The merged trip's saved miles and purpose leave the totals;
+the undo preserves its complete summary in history before deletion, in the
+same transaction as discard, and appears in the year review with the same
+current-count statement. Source files stay intact. Closed-year locks still apply;
 reopen the affected year first. An everyday login must ask the admin.
 
 CSV lists an unused merge as `row_type=folder_notice`, with its saved key,

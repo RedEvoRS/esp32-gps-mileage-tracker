@@ -558,7 +558,7 @@ class ViewerHardeningTests(unittest.TestCase):
             "unreadable": "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only.",
             "link_not_folder": "Remove only the link, keeping its target; ingest can then create a real month folder for queued trips.",
             "not_folder": "Move the file to a safe place outside the month names; ingest can then create a real month folder for queued trips.",
-            "unused_merge": "To use this merge again, restore the original month name, as a link or by renaming the folder back, and leave that name in use. Or use Undo saved merge on the trip list; this keeps the separate trips and their own annotations.",
+            "unused_merge": "To use this merge again, restore the original month name, as a link or by renaming the folder back, and leave that name in use. Or use Undo saved merge on the trip list. The trips stay counted under 2026-12/ with only the annotations saved under that name. Annotations saved under 2026-01/, 2026-12/ are kept in the database but not applied. The merged trip's saved miles and purpose leave the totals and are kept in history and the year review.",
             "unwritable": "Give the ingest service's user (UID 1000) write and search permission on the real month folder; check its owner and permissions.",
         }
         cases = [(reason, False, False) for reason in descriptions]
@@ -608,7 +608,7 @@ class ViewerHardeningTests(unittest.TestCase):
                     self.assertIn("Please ask the admin", message)
                     if entry['folder_reason'] == 'unused_merge':
                         self.assertIn('restore the original month name, as a link or by renaming the folder back', message)
-                        self.assertIn('or use Undo saved merge to keep the separate trips and their own annotations.', message)
+                        self.assertIn('or use Undo saved merge. The trips stay counted under 2026-12/ with only the annotations saved under that name.', message)
                     self.assertTrue(any(message in text for text in texts), path)
 
     def test_damaged_merge_has_same_recovery_message_on_every_surface_for_both_roles(self):

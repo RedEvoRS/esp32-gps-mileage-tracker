@@ -2817,7 +2817,7 @@ suggestions blocked and no **Undo saved merge**. Neither role can use ordinary
 merge**, after confirming that parts with readable summaries return separately with
 annotations saved under their names; parts without readable summaries do not.
 The merged trip's saved miles and purpose leave the totals and are kept in history. Before deletion, the same transaction saves the complete summary,
-annotation and part keys in history. **Discarded damaged merges** in the year
+annotation and part keys in history. **Discarded or undone saved merges** in the year
 review permanently shows saved miles, purpose, date and login, and which parts
 are now counted again, separately or in a current merge, even after closing.
 The deliberate discard confirmation and visible record allow closing without
@@ -2829,9 +2829,12 @@ produces an unused-name merge when every recording matches under the new name.
 To use it again, restore the original month name, as a link or by renaming the
 folder back, and keep that name in use, following the conflict steps above.
 Alternatively, the admin can select **Undo saved merge** on the trip list
-and confirm. This removes only the saved merge and merged annotation,
-preserves original annotations and source files, and records the undo in
-history. Reopen any affected closed year first. Everyday logins must ask
+and confirm. The trips stay counted under the name in use with only annotations saved
+under that name. Annotations under the unused name stay in the database but
+are not applied. The merged trip's saved miles and purpose leave the totals;
+the undo preserves its complete summary in history before deletion, in the
+same transaction as discard, and appears in the year review with the same
+current-count statement. Source files stay intact. Reopen any affected closed year first. Everyday logins must ask
 the admin. The undo rechecks every replacement recording under its database
 write transaction; a stale form is refused if any evidence is gone or the
 merge's name is back in use.

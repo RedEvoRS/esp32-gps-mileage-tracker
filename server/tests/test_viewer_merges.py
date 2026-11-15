@@ -179,16 +179,16 @@ class ViewerMerges(unittest.TestCase):
             self.assertEqual(conn.execute('SELECT purpose_note FROM annotations WHERE trip_key=?', (parts[0],)).fetchone()[0], 'original note')
             self.assertEqual(conn.execute("SELECT count(*) FROM trip_history WHERE action='split'").fetchone()[0], 0)
         review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
-        self.assertIn('Discarded damaged merges (1)', review)
+        self.assertIn('Discarded or undone saved merges (1)', review)
         self.assertIn(f"{json.loads(summary)['distance_miles']:.3f} mi", review)
         self.assertIn('purpose: business; purpose note: merged note', review)
         self.assertIn('driver', review)
         self.assertIn(self.viewer.fmt_date(row[3]), review)
         self.assertIn('None of its trips are in the log; these saved miles are not in the totals.', review)
-        self.assertNotIn('Discarded damaged merges', self.client.get('/admin/year/2025').get_data(as_text=True))
+        self.assertNotIn('Discarded or undone saved merges', self.client.get('/admin/year/2025').get_data(as_text=True))
         self.assertIn(2026, [r['year'] for r in self.viewer._year_list()])
         self.assertEqual(self.close_year().status_code, 302)
-        self.assertIn('Discarded damaged merges (1)', self.client.get('/admin/year/2026').get_data(as_text=True))
+        self.assertIn('Discarded or undone saved merges (1)', self.client.get('/admin/year/2026').get_data(as_text=True))
         history = self.client.get('/admin/history').get_data(as_text=True)
         self.assertIn('Damaged merge discarded', history)
         self.assertIn("The merged trip's saved miles and purpose were removed from the totals and kept in this history record.",
@@ -207,7 +207,7 @@ class ViewerMerges(unittest.TestCase):
 
     def assert_discard_current_statement(self, statement):
         with closing(sqlite3.connect(self.db)) as conn:
-            rows = self.viewer._discarded_merge_rows(conn, 2026, self.viewer.load_trips()[0])
+            rows = self.viewer._merge_history_rows(conn, 2026, self.viewer.load_trips()[0])
         self.assertEqual(len(rows), 1)
         row = rows[0]
         expected = (f"Damaged merge discarded. Saved miles: 0.732 mi; purpose: business; purpose note: merged note; "
@@ -477,6 +477,54 @@ class ViewerMerges(unittest.TestCase):
             snapshot = json.loads(conn.execute('SELECT snapshot FROM tax_years').fetchone()[0])
         self.assertEqual(snapshot['trip_keys'], [key])
         self.assertEqual(snapshot['totals']['business'], round(saved['distance_miles'], 3))
+
+    def test_unused_undo_names_annotations_and_keeps_full_summary_before_deletion(self):
+        key, _ = self.moved_merge()
+        effect = ('The trips stay counted under 2026-05/ with only the annotations saved under that name. '
+                  'Annotations saved under 2026-04/ are kept in the database but not applied. '
+                  "The merged trip's saved miles and purpose leave the totals and are kept in history and the year review.")
+        page = html.unescape(self.client.get('/').get_data(as_text=True))
+        self.assertIn('Remove this unused merge and its merged annotation. ' + effect, page)
+        refusal = self.undo_unused(key, confirm='no')
+        self.assertEqual(refusal.status_code, 400)
+        self.assertIn('Confirm removing this unused merge and its merged annotation. ' + effect,
+                      html.unescape(refusal.get_data(as_text=True)))
+        with closing(sqlite3.connect(self.db)) as conn:
+            summary = conn.execute('SELECT summary FROM trip_merges').fetchone()[0]
+        original_record = self.viewer.trip_log.record
+        def record(conn, record_key, action, details, **actor):
+            self.assertTrue(conn.in_transaction)
+            self.assertEqual(conn.execute('SELECT summary FROM trip_merges WHERE trip_key=?', (key,)).fetchone()[0], summary)
+            return original_record(conn, record_key, action, details, **actor)
+        with patch.object(self.viewer.trip_log, 'record', side_effect=record):
+            self.assertEqual(self.undo_unused(key).status_code, 302)
+        trips, _ = self.viewer.load_trips()
+        self.assertEqual({t['trip_key']: t['category'] for t in trips}, {'2026-05/a': '', '2026-05/b': ''})
+        with closing(sqlite3.connect(self.db)) as conn:
+            details = json.loads(conn.execute("SELECT details FROM trip_history WHERE action='split'").fetchone()[0])
+            self.assertEqual(details['saved_summary_raw'], summary)
+            self.assertEqual(details['saved_summary'], json.loads(summary))
+            self.assertEqual(details['dropped']['purpose_note'], 'merged note')
+            self.assertEqual(details['original_annotations']['2026-04/a']['category'], 'personal')
+            self.assertEqual(details['undo_effect'], effect)
+        review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
+        self.assertIn('Unused-name merge undone. Saved miles: 0.732 mi; purpose: business; purpose note: merged note;', review)
+        self.assertIn('Now counted again: 2026-04/a as 2026-05/a, 2026-04/b as 2026-05/b; do not add these saved miles by hand.', review)
+        history = html.unescape(self.client.get('/admin/history').get_data(as_text=True))
+        self.assertIn('Unused-name merge undone. ' + effect, history)
+        self.assertEqual(self.close_year().status_code, 302)
+        self.assertIn('Unused-name merge undone.', self.client.get('/admin/year/2026').get_data(as_text=True))
+
+    def test_unused_undo_history_rolls_back_if_deletion_fails(self):
+        key, _ = self.moved_merge()
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("CREATE TRIGGER refuse_delete BEFORE DELETE ON trip_merges BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END")
+        self.viewer.app.config['TESTING'] = True
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.undo_unused(key)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute('SELECT count(*) FROM trip_merges').fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT count(*) FROM trip_history WHERE action='split'").fetchone()[0], 0)
 
     def test_unused_merge_uses_saved_summary_year_and_unknown_year_blocks_every_close(self):
         key, _ = self.moved_merge()

@@ -1063,14 +1063,23 @@ def folder_description(entry):
     return text
 
 
+def unused_merge_undo_effect(entry):
+    names = entry.get('counted_months') or [entry.get('counted_as', '')]
+    counted = ', '.join(name + '/' for name in names)
+    unused = ', '.join(name + '/' for name in entry['saved_months'])
+    return (f"The trips stay counted under {counted} with only the annotations saved under "
+            f"{'that name' if len(names) == 1 else 'those names'}. "
+            f"Annotations saved under {unused} are kept in the database but not applied. "
+            "The merged trip's saved miles and purpose leave the totals and are kept in history and the year review.")
+
+
 def folder_hint(entry, role):
     if entry["folder_reason"] == "unused_merge":
         if role != "admin":
             return ("Please ask the admin to restore the original month name, as a link or by renaming the folder back, "
-                    "or use Undo saved merge to keep the separate trips and their own annotations.")
+                    "or use Undo saved merge. " + unused_merge_undo_effect(entry))
         return ("To use this merge again, restore the original month name, as a link or by renaming the folder back, "
-                "and leave that name in use. Or use Undo saved merge on the trip list; "
-                "this keeps the separate trips and their own annotations.")
+                "and leave that name in use. Or use Undo saved merge on the trip list. " + unused_merge_undo_effect(entry))
     if role != "admin":
         return "Please ask the admin to fix it."
     if entry["folder_reason"] == "duplicate":
@@ -1143,7 +1152,8 @@ def _folder_row_type(entry):
 
 
 app.jinja_env.globals.update(folder_message=folder_message, all_uploads_refusal=ALL_UPLOADS_REFUSAL,
-                            missing_mileage=missing_mileage, damaged_merge_discard_effect=DAMAGED_MERGE_DISCARD_EFFECT)
+                            missing_mileage=missing_mileage, damaged_merge_discard_effect=DAMAGED_MERGE_DISCARD_EFFECT,
+                            unused_merge_undo_effect=unused_merge_undo_effect)
 app.jinja_env.tests["missing_mileage"] = missing_mileage
 
 
@@ -2663,7 +2673,7 @@ LIST_HTML = """
         <form method="post" action="{{ url_for('undo_unused_merge', ym=u.ym, merge_id=u.id) }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <label><input type="checkbox" name="confirm" value="yes" required>
-            Remove this unused merge and its merged annotation; keep the separate trips and their own annotations.</label>
+            Remove this unused merge and its merged annotation. {{ unused_merge_undo_effect(u) }}</label>
           <button class="btn" type="submit">Undo saved merge</button>
         </form>
         {% endif %}
@@ -3340,6 +3350,8 @@ def _history_summary(row):
         source = details.get("annotation_from")
         return f"Merged {merged}; kept annotation from {source}."
     if action == "split":
+        if details.get('unused_name'):
+            return "Unused-name merge undone. " + details['undo_effect']
         text = "Restored original recordings: " + ", ".join(details.get("parts", ())) + "."
         # Older rows carry only the parts.
         if "dropped" in details:
@@ -3465,7 +3477,7 @@ def _year_list():
         saved_year = _trip_local_year(trip.get('saved_summary', {})) if trip.get('unused_merge') or trip.get('damaged_merge') else None
         years |= {saved_year} if saved_year else _folder_years(trip["ym"])
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
-        for row in _discarded_merge_rows(conn):
+        for row in _merge_history_rows(conn):
             years |= {row['saved_year']} if row['saved_year'] else _folder_years(row['trip_key'].split('/')[0])
     return [{"year": year, "closed": closed.get(year)} for year in sorted(years, reverse=True)]
 
@@ -3651,7 +3663,7 @@ gap that was uploaded after the merge is counted a second time. Open the merged 
 
 {% if discarded_merges %}
 <section aria-labelledby="discarded-merges-heading">
-<h2 id="discarded-merges-heading">Discarded damaged merges ({{ discarded_merges|length }})</h2>
+<h2 id="discarded-merges-heading">Discarded or undone saved merges ({{ discarded_merges|length }})</h2>
 <p class="warn">These saved merge records remain visible after the year is closed.
 Check each row before using saved miles: its trips may already be counted again.</p>
 <div class="review-table"><table>
@@ -3799,7 +3811,8 @@ def merge_history_message(row):
     """One saved record and current-count statement for review and exports."""
     details = row['parsed_details']
     annotation = details.get('dropped', {})
-    text = (f"Damaged merge discarded. Saved miles: {row['saved_miles']}; "
+    label = 'Unused-name merge undone' if details.get('unused_name') else 'Damaged merge discarded'
+    text = (f"{label}. Saved miles: {row['saved_miles']}; "
             f"purpose: {annotation.get('category') or 'unclassified'}; "
             f"purpose note: {annotation.get('purpose_note') or 'none'}; "
             f"trip date: {fmt_date(details.get('saved_summary', {}).get('start_time'))}. "
@@ -3815,17 +3828,19 @@ def merge_history_message(row):
 app.jinja_env.globals['merge_history_message'] = merge_history_message
 
 
-def _discarded_merge_rows(conn, year=None, trips=None):
+def _merge_history_rows(conn, year=None, trips=None):
     """Permanent loss records, even after every source and merge row is gone."""
     rows = []
     for raw in conn.execute(
         "SELECT id, trip_key, actor, actor_role, at, action, details FROM trip_history "
-        "WHERE action='discard_damaged_merge' ORDER BY at DESC, id DESC"
+        "WHERE action IN ('discard_damaged_merge', 'split') ORDER BY at DESC, id DESC"
     ):
         row = _history_row_dict(raw)
         try:
             details = json.loads(row['details'])
         except (TypeError, ValueError):
+            continue
+        if row['action'] == 'split' and not details.get('unused_name'):
             continue
         summary = details.get('saved_summary', {})
         saved_year = _trip_local_year(summary)
@@ -3856,7 +3871,7 @@ def admin_year(year):
         gone, gone_unreadable = year_members(
             [t for t in trips if "removal" in t], [t for t in unreadable if "removal" in t], year)
         edits = _late_edit_rows(conn, year, members + broken + gone + gone_unreadable)
-        discarded_merges = _discarded_merge_rows(conn, year, trips)
+        discarded_merges = _merge_history_rows(conn, year, trips)
     current = year_figures(members, broken)
     totals, counts = current["totals"], current["counts"]
     late, comparison, joined, left = [], None, [], []
@@ -4334,7 +4349,7 @@ def merge_trip(ym, trip_id):
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
 
 
-def _undo_merge(conn, key, keys, *, damaged=False):
+def _undo_merge(conn, key, keys, *, damaged=False, unused=None):
     """Database-only undo; caller holds BEGIN IMMEDIATE and checks edit locks."""
     merged = conn.execute("SELECT * FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
     dropped = {field: (merged[field] or "") if merged else ""
@@ -4344,13 +4359,17 @@ def _undo_merge(conn, key, keys, *, damaged=False):
         f"SELECT * FROM annotations WHERE trip_key IN ({','.join('?' * len(keys))})", keys
     ):
         restored[row["trip_key"]] = {field: row[field] or "" for field in trip_merges.ANNOTATION_FIELDS}
-    if damaged:
-        trip_log.record(conn, key, 'discard_damaged_merge', {
+    if damaged or unused is not None:
+        details = {
             'parts': keys, 'saved_summary': trip_merges.saved_summary(merged),
             'saved_summary_raw': merged['summary'], 'dropped': dropped,
             'fingerprint': merged['fingerprint'],
             'original_annotations': restored,
-        }, actor=g.user, actor_role=g.role)
+        }
+        if unused is not None:
+            details.update(unused_name=True, undo_effect=unused_merge_undo_effect(unused))
+        trip_log.record(conn, key, 'discard_damaged_merge' if damaged else 'split', details,
+                        actor=g.user, actor_role=g.role)
     else:
         trip_log.record(conn, key, "split", {"parts": keys, "dropped": dropped, "restored": restored},
                         actor=g.user, actor_role=g.role)
@@ -4393,8 +4412,6 @@ def discard_damaged_merge(ym, merge_id):
 @app.route("/admin/unused-merge/<ym>/<merge_id>/undo", methods=["POST"])
 def undo_unused_merge(ym, merge_id):
     _validate_trip_address(ym, merge_id)
-    if request.form.get("confirm") != "yes":
-        abort(400, description="Confirm removing this unused merge and its merged annotation; the separate trips and their own annotations stay saved.")
     key = f"{ym}/{merge_id}"
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
         conn.row_factory = sqlite3.Row
@@ -4405,10 +4422,12 @@ def undo_unused_merge(ym, merge_id):
         unused = next((entry for entry in entries if entry["trip_key"] == key and entry.get("unused_merge")), None)
         if unused is None:
             abort(409, description="This saved merge is no longer under an unused month name. Reopen the trip list.")
+        if request.form.get('confirm') != 'yes':
+            abort(400, description='Confirm removing this unused merge and its merged annotation. ' + unused_merge_undo_effect(unused))
         _abort_if_removed(conn, key)
         keys = unused["parts"]
         _abort_if_saved_merge_closed(conn, key, keys)
-        _undo_merge(conn, key, keys)
+        _undo_merge(conn, key, keys, unused=unused)
     return redirect(url_for("index"))
 
 

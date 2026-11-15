@@ -250,6 +250,7 @@ def unused_merge_months(conn, data_root, keys, counted_months, originals, stored
         if len(stamps) != 2 * len(keys):
             return []
         removed = trip_log.removals(conn)
+        in_use = {}
         for month in months:
             indices = [i for i, key in enumerate(keys) if key.split('/')[0] == month]
             saved = json.dumps([stamp for i in indices for stamp in stamps[2 * i:2 * i + 2]])
@@ -266,9 +267,10 @@ def unused_merge_months(conn, data_root, keys, counted_months, originals, stored
                     matches.append(candidate)
             if len(matches) != 1:
                 return []
+            in_use[month] = matches[0]
     except (OSError, ValueError, TypeError, IndexError):
         return []
-    return months
+    return in_use
 
 
 def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=None, counted_months=None):
@@ -297,7 +299,8 @@ def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=N
                            "ym": ym, "id": trip_id, "trip_key": key, "parts": keys,
                            "saved_summary": saved_summary(row),
                            **{f: row[f] or "" for f in ANNOTATION_FIELDS},
-                           "saved_months": unused, "has_gpx": False, "problem": "saved merge under an unused month name"})
+                           "saved_months": list(unused), "counted_months": sorted(set(unused.values())),
+                           "has_gpx": False, "problem": "saved merge under an unused month name"})
             continue
         hidden.update(keys)
         t = {"ym": ym, "id": trip_id, "trip_key": key, "parts": keys,
