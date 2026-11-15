@@ -2636,11 +2636,12 @@ Unexpected blank tiles mean your browser can't reach the configured tile
 host (default `tile.openstreetmap.org`). With `MAP_TILE_URL=none`, a plain
 background with the track and endpoints is expected.
 
-**The trip list says a trip summary file can't be read** — the `.json` next
-to that trip's GPX is damaged or missing (disk trouble, a hand edit, or a
-summary write that failed after the GPX was saved), so the viewer can't
-count its miles, and the exports list it as unreadable. The GPX is the
-record: send it to ingest again, and ingest rebuilds the summary from it.
+**The trip list says a trip file can't be read** — when the warning names a
+`.json`, the summary next to that trip's GPX is damaged or missing (disk
+trouble, a hand edit, or a summary write that failed after the GPX was saved),
+so the viewer can't count its miles, and the exports list it as unreadable.
+(When it names a `.gpx`, see the link case at the end of this entry.) The GPX
+is the record: send it to ingest again, and ingest rebuilds the summary from it.
 
 ```bash
 cd ~/mileage-tracker
@@ -2677,6 +2678,20 @@ sudo cp -p ~/mileage-backups/snapshots/<time>/data/$TRIP.gpx data/$TRIP.gpx
 ```
 
 This copy also uses `sudo`, because `data/` belongs to UID 1000 (mode 700).
+
+If the warning names the trip's `.gpx`, or the admin's trip page says a file
+links outside the data folder, then the trip's track, summary or month folder
+is a symbolic link pointing outside `data/`. The viewer never follows such a
+link, so it can't count the trip; the tracker and ingest never create links.
+Find them with:
+
+```bash
+sudo find ~/mileage-tracker/data -type l -ls
+```
+
+Find out what made the link, then replace it with the real file (for example
+from a backup snapshot, as above) or delete it. Sending the GPX to ingest again
+does not fix a link. The admin can still remove such a trip from the log.
 
 **Port already in use** — `sudo ss -tlnp | grep -E '8090|8091|8092|8093'` shows
 which program has it. Stop or reconfigure that program to free the required

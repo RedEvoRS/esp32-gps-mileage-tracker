@@ -808,6 +808,14 @@ trip's local end month: that year, plus the year before for a January
 folder. `DEPLOY_DEBIAN.md` → Troubleshooting says how to rebuild the
 summary from its GPX.
 
+A trip whose summary, track (GPX) or month folder is a link pointing outside
+the data folder is treated the same way: the viewer never opens it, and the
+trip is listed as unreadable ("the file could not be read") with no miles
+counted. A track that is simply missing is different: the trip still counts
+and just has no map. The admin's page for a trip with such a link says a file
+links outside the data folder; replace the link with the real file. To an
+everyday login it reads like an address with no trip.
+
 ### Admin year review and close
 
 The admin-only `/admin/year/<YYYY>` page is linked from the trip list after
@@ -889,9 +897,11 @@ exports and merge suggestions for both roles. The GPX and JSON source files
 stay in `./data`; removal is a reversible record in `annotations.db`, not a
 file deletion. On `/admin/removed`, the admin can see each reason, who removed
 it and when, then restore the trip. The admin's trip page shows a **Removed
-from the log** notice and a Restore button; an everyday login using the old
-trip address gets a 404. Permanently deleting source files remains a separate
-shell operation.
+from the log** notice and a Restore button. An everyday login using the old
+trip address gets the same 404 page as an address with no trip ("No trip at
+this address"), and an address lookup for it answers the same as one for a
+missing trip, so neither says whether the trip was removed. Permanently
+deleting source files remains a separate shell operation.
 
 The viewer has no real-delete button because it cannot write to the read-only
 `./data` mount, it could not undo a source-file deletion, and the session cookie

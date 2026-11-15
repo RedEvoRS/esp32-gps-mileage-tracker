@@ -454,7 +454,11 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   the source setting; restore restarts viewer and rebuilds the unbacked-up mirror.
 - Viewer port: 8091, admin/everyday session logins (LAN-only), reads `./data`
   read-only, owns `annotations.db` (SQLite) in `viewer-db`. Removal only marks
-  a trip in that DB; it never touches `./data`. Closing a year saves its totals
+  a trip in that DB; it never touches `./data`. Everyday logins get one "No
+  trip at this address" 404 for a removed, unknown or link-refused trip page,
+  and lookups answer removed like unknown; the admin gets a link diagnostic.
+  A summary, GPX or month folder linking outside `./data` makes the trip
+  unreadable (a merely missing GPX still counts). Closing a year saves its totals
   in `tax_years.snapshot`; the year review compares saved and current totals,
   and lists trips received after the close (ingest `_received_at` later than
   `closed_at`), undated trips and trips inside a merge. Exports mark late trips
