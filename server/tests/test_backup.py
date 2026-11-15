@@ -697,6 +697,90 @@ exec {real_sha} "$@"
         self.shim("find", f'exec {busybox} find "$@"\n')
         self.assert_filename_independent_count()
 
+    def test_unchanged_backups_with_busybox_find_dedupe(self):
+        busybox = shutil.which("busybox")
+        if not busybox:
+            self.skipTest("BusyBox not installed")
+        self.shim("find", f'exec {busybox} find "$@"\n')
+        self.run_script("backup.sh")
+        self.assertIn("Nothing changed", self.run_script("backup.sh").stderr)
+        self.assertEqual(len(self.snapshots()), 1)
+
+    def test_retention_with_busybox_find(self):
+        busybox = shutil.which("busybox")
+        if not busybox:
+            self.skipTest("BusyBox not installed")
+        self.shim("find", f'exec {busybox} find "$@"\n')
+        self.assert_remote_prune_applies_the_retention_rule()
+
+    def test_snapshot_listing_names_and_order_match_gnu_find(self):
+        folder = self.backups / "snapshots"
+        names = ["2026-07-03T030000Z", "2025-12-01T030000Z", "2026-07-01T030000Z"]
+        for name in [*names, "not-a-snapshot"]:
+            (folder / name).mkdir(parents=True)
+        (folder / "2026-01-01T030000Z").write_text("stray file")
+        command = 'source "$1"; '
+        old = subprocess.run(["bash", "-o", "pipefail", "-c", command +
+                              'find "$SNAPSHOTS" -mindepth 1 -maxdepth 1 -type d '
+                              '-printf "%f\\n" | grep -E "$SNAPSHOT_RE" | LC_ALL=C sort',
+                              "bash", str(BACKUP / "lib.sh")], env=self.env,
+                             capture_output=True, text=True, check=True)
+        new = subprocess.run(["bash", "-c", command + 'list_snapshots',
+                              "bash", str(BACKUP / "lib.sh")], env=self.env,
+                             capture_output=True, text=True, check=True)
+        self.assertEqual(old.stdout, "\n".join(sorted(names)) + "\n")
+        self.assertEqual(new.stdout, old.stdout)
+
+    def test_snapshot_listing_absent_or_empty_succeeds(self):
+        for present in (False, True):
+            with self.subTest(present=present):
+                if present:
+                    (self.backups / "snapshots").mkdir(parents=True)
+                result = subprocess.run(["bash", "-c", 'source "$1"; list_snapshots',
+                                         "bash", str(BACKUP / "lib.sh")], env=self.env,
+                                        capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout, "")
+
+    def test_snapshot_listing_command_failure_fails_every_caller(self):
+        self.run_script("backup.sh")
+        self.conf_append("REMOTE_PRUNE=yes\n")
+        real_find = shutil.which("find")
+        self.env["LIST_COUNT"] = str(self.tmp / "list-count")
+        self.env["SNAPSHOT_DIR"] = str(self.backups / "snapshots")
+        self.shim("find", f'''\
+if [[ $1 == "$SNAPSHOT_DIR" && $* == *"-maxdepth 1"* ]]; then
+    count=$(cat "$LIST_COUNT" 2>/dev/null || echo 0)
+    count=$((count + 1))
+    echo "$count" > "$LIST_COUNT"
+    if [[ $count == "$FAIL_LIST_AT" ]]; then
+        echo "$SNAPSHOT_DIR/2020-01-01T030000Z"
+        exit 1
+    fi
+fi
+exec {real_find} "$@"
+''')
+        # Previous snapshot, local retention, remote retention, deep check.
+        for position in range(1, 5):
+            with self.subTest(position=position):
+                Path(self.env["LIST_COUNT"]).write_text("0\n")
+                self.env["FAIL_LIST_AT"] = str(position)
+                result = self.run_script("backup.sh", "--verify", check=False)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertIn("ERROR: couldn't list local snapshots", result.stderr)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can read mode-000 folders")
+    def test_unreadable_snapshot_listing_fails_backup(self):
+        folder = self.backups / "snapshots"
+        folder.mkdir(parents=True)
+        folder.chmod(0)
+        try:
+            result = self.run_script("backup.sh", check=False)
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertIn("ERROR: couldn't list local snapshots", result.stderr)
+            self.assertFalse((self.backups / "last-success").exists())
+        finally:
+            folder.chmod(0o700)
+
     def mutate_snapshot_link(self, snap, action):
         link = snap / "data/link\nname"
         if action != "add":

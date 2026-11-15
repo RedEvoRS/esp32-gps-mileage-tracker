@@ -337,9 +337,11 @@ mark_target() {
 }
 
 list_snapshots() {
+    local listing
     [[ -d $SNAPSHOTS ]] || return 0
-    find "$SNAPSHOTS" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
-        | grep -E "$SNAPSHOT_RE" | LC_ALL=C sort || true
+    listing=$(find "$SNAPSHOTS" -mindepth 1 -maxdepth 1 -type d -print) \
+        || die "couldn't list local snapshots in $SNAPSHOTS"
+    awk -F / -v pattern="$SNAPSHOT_RE" '$NF ~ pattern { print $NF }' <<< "$listing" | LC_ALL=C sort
 }
 
 # The snapshot names on the off-host copy, oldest first. Fails if the

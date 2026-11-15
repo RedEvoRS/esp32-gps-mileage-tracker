@@ -265,7 +265,7 @@ $diffs"
 # starts with few or no local snapshots, and the history on the remote
 # must survive that.
 prune_remote() {
-    local names drops history_only newer empty old
+    local names drops history_only newer empty old local_names
     if ! names=$(list_remote_snapshots); then
         log "WARNING: couldn't list the snapshots on $REMOTE; not pruning it"
         return 0
@@ -281,7 +281,8 @@ prune_remote() {
     drops=$(retention_drops <<< "$names")
     # What the rule would keep that this server doesn't have: history that
     # exists only off-host, as after a rebuild or a changed BACKUP_DIR.
-    history_only=$(comm -23 <(comm -23 <(sort <<< "$names") <(sort <<< "$drops")) <(list_snapshots | sort))
+    local_names=$(list_snapshots) || return 1
+    history_only=$(comm -23 <(comm -23 <(sort <<< "$names") <(sort <<< "$drops")) <(sort <<< "$local_names"))
     if [[ -n $history_only ]]; then
         log "WARNING: not pruning $REMOTE: it holds $(wc -l <<< "$history_only") snapshot(s) that this server doesn't (first: $(head -n 1 <<< "$history_only"))."
         log "WARNING: That looks like a rebuilt server or a changed BACKUP_DIR. Nothing was deleted there."
@@ -329,7 +330,8 @@ deep_verify() (
         return 0
     fi
 
-    names=$(list_snapshots | grep -Fxv "$current" || true)
+    names=$(list_snapshots) || return 1
+    names=$(grep -Fxv "$current" <<< "$names" || true)
     oldest=$(head -n 1 <<< "$names")
     next_cursor=$VERIFY_CURSOR
     if [[ -n $oldest ]]; then selected=$oldest; fi
