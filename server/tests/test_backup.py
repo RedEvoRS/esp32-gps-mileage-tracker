@@ -492,6 +492,45 @@ class BackupScripts(unittest.TestCase):
         self.assertEqual(run().returncode, 0)
         self.assertTrue(ping.exists())
 
+    def legacy_link_snapshot(self):
+        self.run_script("backup.sh")
+        snap = self.remote / "snapshots" / self.snapshots()[-1]
+        # Old INFO has no coverage key; inspect the actual links.
+        info = snap / "INFO"
+        info.write_text("\n".join(line for line in info.read_text().splitlines()
+                                   if not line.startswith("links_not_backed_up=")) + "\n")
+        self.symlink(snap / "data/linked-month", self.tmp / "outside", True)
+        self.symlink(snap / "data/inside", "2026-10", True)
+        return snap
+
+    def test_restore_check_warns_for_legacy_outside_link(self):
+        self.legacy_link_snapshot()
+        result = self.run_script("restore.sh", "check")
+        self.assertIn("data/linked-month", result.stderr)
+        self.assertIn("contents are not in this backup", result.stderr)
+        self.assertTrue(result.stderr.rstrip().endswith(
+            "Restore test passed, but 1 linked item(s) are not in this backup"))
+
+    def test_restore_outside_link_leaves_existing_real_folder(self):
+        self.legacy_link_snapshot()
+        folder = self.data / "linked-month"
+        folder.mkdir()
+        (folder / "keep.gpx").write_text("keep")
+        result = self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertIn("contents are not in this backup", result.stderr)
+        self.assertFalse(folder.is_symlink())
+        self.assertEqual((folder / "keep.gpx").read_text(), "keep")
+        self.assertEqual(os.readlink(self.data / "inside"), "2026-10")
+
+    def test_restore_outside_link_never_created_on_empty_data(self):
+        self.legacy_link_snapshot()
+        shutil.rmtree(self.data)
+        self.data.mkdir()
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertFalse((self.data / "linked-month").is_symlink())
+        self.assertFalse((self.data / "linked-month").exists())
+        self.assertEqual(os.readlink(self.data / "inside"), "2026-10")
+
     # --- periodic deep verification ---
 
     def seed_verification(self, count=6):
