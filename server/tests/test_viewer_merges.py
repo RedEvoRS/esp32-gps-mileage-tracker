@@ -5,6 +5,7 @@ import csv
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -731,6 +732,39 @@ class ViewerMerges(unittest.TestCase):
         self.assertIn("!mileage-viewer/trip_merges.py", dockerignore)
         for service in ("mileage-ingest", "mileage-viewer"):
             self.assertIn("COPY common/ /app/common/", (SERVER / service / "Dockerfile").read_text())
+
+    def autofill_allowed(self, key):
+        response = self.client.get(f"/trip/{key}")
+        self.assertEqual(response.status_code, 200)
+        field = re.search(r'<input[^>]*id="destination"[^>]*>', response.get_data(as_text=True)).group()
+        return 'data-autofill="true"' in field
+
+    def test_autofill_counts_annotations_saved_before_a_merge(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        # A was annotated, then saved blank; its history sits under A's key.
+        self.assertEqual(self.annotate(a, "business", "Example note", "Example place").status_code, 302)
+        self.assertEqual(self.annotate(a).status_code, 302)
+        self.assertFalse(self.autofill_allowed(a))
+        merged = self.merged_key(self.merge(a, b))
+        self.assertNotIn(merged, (a, b))
+        self.assertFalse(self.autofill_allowed(merged))
+
+        # A part annotated before the merge stays annotated after a split.
+        self.split(merged)
+        self.assertFalse(self.autofill_allowed(a))
+        self.assertTrue(self.autofill_allowed(b))
+
+    def test_autofill_stops_after_a_merged_trip_is_annotated_under_its_own_key(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        merged = self.merged_key(self.merge(a, b))
+        # A fresh merge of never-annotated trips may still autofill.
+        self.assertTrue(self.autofill_allowed(merged))
+        # A blank save changes nothing, so it records no history and keeps it allowed.
+        self.assertEqual(self.annotate(merged).status_code, 302)
+        self.assertTrue(self.autofill_allowed(merged))
+        for note in ("Example note", ""):
+            self.assertEqual(self.annotate(merged, note=note).status_code, 302)
+            self.assertFalse(self.autofill_allowed(merged))
 
 
 if __name__ == "__main__":

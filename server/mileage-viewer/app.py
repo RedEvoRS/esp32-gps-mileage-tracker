@@ -1416,10 +1416,11 @@ def _last_edited_lookup(conn):
 
 def _ever_annotated(conn, trip):
     # Current fields can be empty after a deliberate clear, so check history too.
-    return trip_merges.annotated(trip) or conn.execute(
-        "SELECT 1 FROM trip_history WHERE trip_key = ? AND action = 'annotate' LIMIT 1",
-        (trip["trip_key"],),
-    ).fetchone() is not None
+    # A merge gets a new key, so look under the same keys "Last edited" uses:
+    # the trip's own, its parts and its live merge aliases.
+    return trip_merges.annotated(trip) or any(
+        row["action"] == "annotate"
+        for row in _related_history_rows(conn, trip["trip_key"], trip.get("parts", ())))
 
 
 def _last_edited(conn, trip):
