@@ -936,7 +936,12 @@ including ones for files no longer present; they do not add miles. Every open
 year's review shows the conflict beside a disabled Close button, even if the
 folder belongs to another year. Closed-year reviews also show the conflict in
 their status section. Closing any year waits until this conflict is resolved;
-healthy trips under the name in use can still have merge suggestions. Existing year locks remain in
+healthy trips under the name in use can still have merge suggestions. New
+merges are saved under that name, with the same file and adjacency checks as
+usual. If the admin keeps the other name, those new merges and merged
+annotations stay saved but unapplied. When all replacement files still match,
+they become unused-name notices under the rule below; otherwise they remain
+damaged merges. Restoring the name brings its saved merge back. Existing year locks remain in
 force; folder warnings are not counted as missing mileage in year snapshots.
 
 To resolve competing saved names:

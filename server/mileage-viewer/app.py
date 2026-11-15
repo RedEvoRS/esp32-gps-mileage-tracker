@@ -1012,7 +1012,8 @@ def folder_description(entry):
         names = ", ".join(name + "/" for name in entry["saved_months"])
         text = (f"Warning: saved trip data exists under {names}. Trips are shown and counted under "
                 f"{entry['counted_as']}/; saved data under the other names is not applied")
-        text += ". Years cannot be closed until this conflict is resolved"
+        text += (". Years cannot be closed until this conflict is resolved. "
+                 "Healthy trips can still be merged under the name in use")
     elif entry["folder_reason"] == "duplicate":
         text = f"This is a link to {entry['counted_as']}/, whose trips are counted there"
     else:
@@ -1043,6 +1044,7 @@ def folder_hint(entry, role):
     if entry["folder_reason"] == "saved_keys":
         return ("Choose which name's saved data to use and keep only that link. "
                 "Removing a link leaves its saved data unapplied; removing the name in use quietly orphans that data. "
+                "A new merge is saved under the name in use; choosing another name leaves that merge unapplied too. "
                 "Nothing is deleted from the database. Recreate the same link to get back; "
                 "competing saved names bring the conflict back. See DEPLOY_DEBIAN.md, Troubleshooting, for steps.")
     if entry["folder_reason"] == "ingest_refused":

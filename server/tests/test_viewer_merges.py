@@ -326,6 +326,29 @@ class ViewerMerges(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as conn:
             self.assertEqual(conn.execute('SELECT count(*) FROM trip_merges').fetchone()[0], 1)
 
+    def test_merge_during_saved_name_conflict_stays_under_chosen_name(self):
+        old = self.unused_merge()
+        new = self.merged_key(self.merge('2026-03/a', '2026-03/b'))
+        self.assertTrue(new.startswith('2026-03/'))
+        self.annotate(new, 'business', 'new merged note')
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual([t['trip_key'] for t in trips], [new])
+        self.assertTrue(any(t['trip_key'] == old and t.get('unused_merge') for t in entries))
+        distance = trips[0]['distance_miles']
+        (self.data / '2026-03').unlink()  # Resolve in favour of the original April name.
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual([t['trip_key'] for t in trips], [old])
+        self.assertEqual(trips[0]['purpose_note'], 'merged note')
+        self.assertEqual(trips[0]['distance_miles'], distance)
+        self.assertTrue(any(t['trip_key'] == new and t.get('unused_merge') for t in entries))
+        self.assertEqual(self.viewer.year_figures(trips, entries)['unreadable'], 0)
+        self.symlink(self.data / '2026-03', self.data / 'archive', directory=True)
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual([t['trip_key'] for t in trips], [new])
+        self.assertEqual(trips[0]['purpose_note'], 'new merged note')
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute('SELECT count(*) FROM trip_merges').fetchone()[0], 2)
+
     def test_nonmonth_link_upload_notice_does_not_block_merge(self):
         a, b = self.trip("a", 0), self.trip("b", 180, .01)
         archive = self.data / "archive"

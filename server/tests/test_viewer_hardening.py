@@ -543,7 +543,7 @@ class ViewerHardeningTests(unittest.TestCase):
             "unreadable": "The folder could not be read or entered.",
             "duplicate": "This is a link to 2026-12/, whose trips are counted there.",
             "ingest_refused": "Trips are shown and counted. The tracker cannot upload new trips for this month until the link is replaced by a real folder; the tracker keeps them queued.",
-            "saved_keys": "Warning: saved trip data exists under 2026-01/, 2026-12/. Trips are shown and counted under 2026-12/; saved data under the other names is not applied. Years cannot be closed until this conflict is resolved.",
+            "saved_keys": "Warning: saved trip data exists under 2026-01/, 2026-12/. Trips are shown and counted under 2026-12/; saved data under the other names is not applied. Years cannot be closed until this conflict is resolved. Healthy trips can still be merged under the name in use.",
             "link_not_folder": "The month name is a link to something other than a folder.",
             "not_folder": "The month name is a file, not a folder.",
             "unused_merge": "This merge is saved under a month name no longer in use (2026-01/, 2026-12/). Its miles and merged annotation are not applied.",
@@ -551,7 +551,7 @@ class ViewerHardeningTests(unittest.TestCase):
         hints = {
             "duplicate": "Remove the extra link.",
             "ingest_refused": "Replace the link with a real folder containing these trips, or mount the disk there, so queued trips can upload.",
-            "saved_keys": "Choose which name's saved data to use and keep only that link. Removing a link leaves its saved data unapplied; removing the name in use quietly orphans that data. Nothing is deleted from the database. Recreate the same link to get back; competing saved names bring the conflict back. See DEPLOY_DEBIAN.md, Troubleshooting, for steps.",
+            "saved_keys": "Choose which name's saved data to use and keep only that link. Removing a link leaves its saved data unapplied; removing the name in use quietly orphans that data. A new merge is saved under the name in use; choosing another name leaves that merge unapplied too. Nothing is deleted from the database. Recreate the same link to get back; competing saved names bring the conflict back. See DEPLOY_DEBIAN.md, Troubleshooting, for steps.",
             "unreadable": "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only.",
             "link_not_folder": "Remove only the link, keeping its target; ingest can then create a real month folder for queued trips.",
             "not_folder": "Move the file to a safe place outside the month names; ingest can then create a real month folder for queued trips.",
