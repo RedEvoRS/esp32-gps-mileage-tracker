@@ -139,9 +139,10 @@ link=()
 open_upload_lock
 flock -w 300 7
 # Compare bytes even when a manual replacement preserves size and mtime.
-rsync -a --checksum --numeric-ids --exclude=/.upload.lock --exclude='/.upload-lock.*' --exclude='*.tmp' \
+# Record item codes only, so whitespace in filenames cannot affect dedupe.
+rsync -a --checksum --out-format='%i' --numeric-ids --exclude=/.upload.lock --exclude='/.upload-lock.*' --exclude='*.tmp' \
         --exclude=/diagnostics/events.db --exclude='/diagnostics/events.db-*' "${link[@]}" \
-        "$COMPOSE_DIR/data/" "$work/data/"
+        "$COMPOSE_DIR/data/" "$work/data/" > "$link_scratch/copy-changes"
 # A failed link check must not cost tonight's off-host copy: note it,
 # finish the backup, then fail the run below.
 coverage_error=0
@@ -181,8 +182,17 @@ if ! cmp -s <(manifest_paths "$work/SHA256SUMS" | LC_ALL=C sort -z) \
     die "sha256sum wrote an unreadable filename list in SHA256SUMS; GNU coreutils is required. Backup has not completed."
 fi
 
+# A copied/re-created file must survive even if the old manifest describes the
+# same good bytes. Only rehash the previous snapshot in this unusual case.
+if [[ -n $prev ]] && grep -Eq '^[<>ch.]f' "$link_scratch/copy-changes" \
+        && cmp -s "$work/SHA256SUMS" "$SNAPSHOTS/$prev/SHA256SUMS" \
+        && ! (cd "$SNAPSHOTS/$prev" && sha256sum --quiet --strict -c SHA256SUMS) >&2; then
+    log "WARNING: previous snapshot $prev differs from its own checksum list; keeping the new snapshot"
+fi
+
 # Preserve changes in discovery status even if the database/file bytes match.
 if [[ -n $prev && $LINKS_NOT_BACKED_UP =~ ^[0-9]+$ && $link_manifest_error == 0 ]] \
+        && ! grep -Eq '^[<>ch.]f' "$link_scratch/copy-changes" \
         && cmp -s "$work/SHA256SUMS" "$SNAPSHOTS/$prev/SHA256SUMS" \
         && { write_symlink_manifest "$SNAPSHOTS/$prev/data" | cmp -s "$work/SYMLINKS" -; } \
         && grep -Fxq "monitor=$monitor" "$SNAPSHOTS/$prev/INFO" \

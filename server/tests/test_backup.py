@@ -596,6 +596,33 @@ exec {real_sha} "$@"
         self.assertIn(f"Deep check FAILED remote {names[0]}", result.stderr)
         self.assertEqual(self.verify_state()["result"], "failed")
 
+    def assert_damaged_latest_is_replaced(self, name):
+        live = self.data / name
+        live.write_bytes(b"undamaged trip")
+        self.run_script("backup.sh")
+        [old] = self.snapshots()
+        damaged = self.backups / "snapshots" / old / "data" / name
+        self.silently_corrupt(damaged)
+        result = self.run_script("backup.sh")
+        self.assertNotIn("Nothing changed", result.stderr)
+        self.assertIn(f"previous snapshot {old} differs from its own checksum list", result.stderr)
+        self.assertEqual(len(self.snapshots()), 2)
+        new = self.snapshots()[-1]
+        self.assertEqual(os.readlink(self.backups / "latest"), f"snapshots/{new}")
+        for root in (self.backups, self.remote):
+            self.assertEqual((root / "snapshots" / new / "data" / name).read_bytes(), live.read_bytes())
+        self.assertNotEqual(damaged.read_bytes(), live.read_bytes())
+        self.run_script("restore.sh", "check")
+        self.assertIn("Nothing changed", self.run_script("backup.sh").stderr)
+        self.assertEqual(len(self.snapshots()), 2)
+
+    def test_damaged_latest_with_same_size_and_time_is_replaced(self):
+        self.assert_damaged_latest_is_replaced("trip with spaces.gpx")
+
+    def test_damaged_latest_with_filename_line_break_is_replaced(self):
+        self.require_gnu_checksums()
+        self.assert_damaged_latest_is_replaced("trip with\nline break.gpx")
+
     def test_trip_and_summary_counts_ignore_filename_line_breaks(self):
         self.require_gnu_checksums()
         self.add_trip("2026-10/extra\ntrip", "extra")
