@@ -1035,6 +1035,9 @@ and month name; its parts count separately. Closing its saved-summary year
 or any year containing one of its parts is refused until the name is restored
 or the admin uses **Undo saved merge**.
 If the saved year is unknown, every year is blocked. Reopening stays possible.
+Saved removals under an unused name are not applied, like annotations under
+that name, so the parts of a formerly removed merge count again. Its saved
+removal still hides the unused-merge notice, so it does not block year closing.
 An unused merge adds no unreadable-file count. Older snapshots stay unchanged;
 the review compares saved and current totals and names the former merged key
 leaving and the currently counted trips joining. The undo checks all replacement recordings

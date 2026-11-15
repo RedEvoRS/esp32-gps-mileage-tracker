@@ -2846,7 +2846,10 @@ The year review lists each unused-name merge separately, with its saved miles,
 purpose and month name. These are excluded from totals; its parts count separately.
 Closing its saved-summary year and every year containing a part is refused
 until the name is restored or the admin uses **Undo saved merge**. An unknown saved year blocks every year;
-reopening stays possible. It adds no unreadable-file count. CSV shows a
+reopening stays possible. It adds no unreadable-file count.
+Saved removals under an unused name are not applied, like annotations under
+that name, so the parts of a formerly removed merge count again. Its saved
+removal still hides the unused-merge notice, so it does not block year closing. CSV shows a
 `folder_notice` row with its category and recovery advice. Saved miles appear
 only in the note; numeric miles cells stay blank in CSV and XLSX. XLSX shows
 the same on **Unreadable trips**, outside **Mileage** and **Totals**. Existing close snapshots remain

@@ -596,6 +596,19 @@ class ViewerMerges(unittest.TestCase):
         self.assert_unused_close_refused(key, 2027)
         self.assertEqual(self.close_year(2025).status_code, 302)
 
+    def test_removal_under_unused_name_stays_saved_but_does_not_remove_renamed_parts(self):
+        key, _ = self.moved_merge()
+        (self.data / '2026-05').rename(self.month)
+        self.assertEqual(self.remove(key, 'example removal').status_code, 302)
+        self.assertEqual(self.viewer.load_trips()[0], [])
+        self.month.rename(self.data / '2026-05')
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual({t['trip_key'] for t in trips}, {'2026-05/a', '2026-05/b'})
+        self.assertFalse(any(t.get('unused_merge') for t in entries))
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertIsNotNone(self.viewer.trip_log.removal(conn, key))
+        self.assertEqual(self.close_year().status_code, 302)
+
     def test_unused_merge_after_close_shows_saved_current_comparison_and_can_reopen(self):
         a, b = self.trip('a', 0), self.trip('b', 180, .01)
         key = self.merged_key(self.merge(a, b))
