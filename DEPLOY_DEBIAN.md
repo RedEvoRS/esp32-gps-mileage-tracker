@@ -1496,8 +1496,9 @@ off-host destination. Each run:
   Unchanged files are hard links to the previous snapshot; an unchanged run
   adds no snapshot.
 - keeps the newest 14 snapshots plus the first of each month for 7 years.
-  Local pruning and scratch cleanup make directories writable only when removing
-  them; file modes and kept snapshots are preserved.
+  Pruning and scratch cleanup make only directories writable when removing them;
+  file modes in kept snapshots are preserved. SSH pruning also needs Bash, find,
+  chmod and rm on the destination.
 - rsyncs to the off-host copy, then reads the newest snapshot back from
   there and checks it matches byte for byte. It copies only if the
   destination holds a file named `.mileage-backup-target` (see 10a): a share

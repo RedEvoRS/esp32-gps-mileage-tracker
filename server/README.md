@@ -1538,8 +1538,10 @@ To check files by hand with GNU coreutils, run `cd <snapshot>` then
 exit 0. For the complete check, including unlisted files and databases, use
 `restore.sh check <snapshot>`.
 
-Local cleanup and pruning make only directories writable just before removing
-them. Kept snapshots retain their modes, including files shared by hard links.
+Cleanup and local/off-host pruning make only directories writable before
+removing them. Kept snapshots retain file modes, including files shared by hard
+links. Pruning an SSH destination also needs Bash, find, chmod and rm there;
+it removes only named snapshots and never mirrors or deletes the remote root.
 
 Each SQLite snapshot is consistent individually; the databases and trip files
 are captured in sequence, rather than in one shared transaction.

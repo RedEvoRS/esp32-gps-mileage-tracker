@@ -250,7 +250,7 @@ $diffs"
 # starts with few or no local snapshots, and the history on the remote
 # must survive that.
 prune_remote() {
-    local names drops history_only newer empty old
+    local names drops history_only newer old
     if ! names=$(list_remote_snapshots); then
         log "WARNING: couldn't list the snapshots on $REMOTE; not pruning it"
         return 0
@@ -275,19 +275,13 @@ prune_remote() {
         return 0
     fi
     [[ -n $drops ]] || return 0
-    empty=$(mktemp -d "$BACKUP_DIR/.empty.XXXXXX")
     while read -r old; do
         [[ $old < $current ]] || continue            # never the snapshot just made
         if verify_pinned "$old"; then continue; fi
         log "Pruning off-host snapshot $old"
-        # rsync deletes the one named folder because the empty source lacks
-        # it; every other name is excluded, so it stays. Works the same
-        # for a path and for user@host:/path.
-        rsync_remote -r --delete --include="/$old/***" --exclude='*' \
-            "$empty/" "$REMOTE/snapshots/" < /dev/null \
+        remove_remote_snapshot "$old" \
             || { log "WARNING: couldn't delete $old from $REMOTE"; break; }
     done <<< "$drops"
-    rmdir "$empty"
 }
 if [[ $REMOTE_PRUNE == yes ]]; then
     prune_remote

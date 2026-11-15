@@ -272,6 +272,28 @@ rsync_remote() {
     rsync --timeout="$RSYNC_TIMEOUT" -e "$ssh_cmd" "$@"
 }
 
+# Delete only a validated snapshot name, using the same directory-only chmod
+# as local pruning. Rsync's deletion path chmods read-only regular files, even
+# when their parent is writable, changing every hard-linked snapshot's mode.
+remove_remote_snapshot() {
+    local name=$1 path ssh_cmd=${RSYNC_SSH:-ssh}
+    [[ $name =~ $SNAPSHOT_RE ]] || return 1
+    if [[ $REMOTE != *:* ]]; then
+        remove_backup_tree "${REMOTE%/}/snapshots/$name"
+        return
+    fi
+    path=${REMOTE#*:}
+    path=${path%/}/snapshots/$name
+    # Single-quote the path for the remote login shell, including literal '.
+    path="'${path//\'/\'\\\'\'}'"
+    [[ $ssh_cmd == *ServerAliveInterval* ]] || ssh_cmd="$ssh_cmd $SSH_KEEPALIVE"
+    # RSYNC_SSH is trusted shell configuration, just as in rsync -e. Pass the
+    # host and remote command as arguments, never as part of that shell text.
+    # shellcheck disable=SC2016  # Expanded by the remote helper, not locally.
+    { declare -f remove_backup_tree; printf 'remove_backup_tree "$1"\n'; } \
+        | bash -c "exec $ssh_cmd \"\$@\"" bash "${REMOTE%%:*}" "bash -s -- $path"
+}
+
 # A file at the top of the destination that says "this is the real backup
 # target". backup.sh refuses to copy without it, so an unmounted share or
 # disk (an empty folder on this machine's own disk) can't be mistaken for

@@ -92,7 +92,8 @@ while [[ $# -gt 0 ]]; do
         *) shift; break ;;
     esac
 done
-exec "$@"
+# OpenSSH sends the joined command to the remote login shell.
+exec bash -c "$*"
 """
 
 SCHEMA = """
@@ -185,8 +186,7 @@ class BackupScripts(unittest.TestCase):
         fake.write_text("#!/bin/bash\n" + FAKE_SSH)
         fake.chmod(0o755)
         conf = Path(self.env["MILEAGE_BACKUP_CONF"])
-        conf.write_text(conf.read_text().replace(
-            f"REMOTE={self.remote}", f"REMOTE=nasuser@nas.invalid:{self.remote}"))
+        conf.write_text(conf.read_text() + f'REMOTE="nasuser@nas.invalid:{self.remote}"\n')
         self.conf_append(f"RSYNC_SSH={fake}\n")
         return fake
 
@@ -731,6 +731,35 @@ exec {real_rsync} "$@"
             for path in files:
                 self.assertEqual(path.stat().st_mode & 0o777, 0o400)
                 self.assertEqual(path.parent.stat().st_mode & 0o777, 0o500)
+
+    def assert_remote_pruning_preserves_kept_hardlink_modes(self):
+        self.read_only_data_folder()
+        self.conf_append("KEEP_RECENT=2\nKEEP_MONTHLY=0\nREMOTE_PRUNE=yes\n")
+        names = []
+        for index in range(3):
+            self.add_trip("2026-10/new", "new" * (index + 1))
+            self.run_script("backup.sh")
+            names.append(self.snapshots()[-1])
+        self.assertFalse((self.remote / "snapshots" / names[0]).exists())
+        for root in (self.backups, self.remote):
+            kept = [root / "snapshots" / name / "data/2026-10/ro/saved.gpx" for name in names[1:]]
+            self.assertEqual(kept[0].stat().st_ino, kept[1].stat().st_ino)
+            for path in kept:
+                self.assertEqual(path.stat().st_mode & 0o777, 0o400)
+                self.assertEqual(path.parent.stat().st_mode & 0o777, 0o500)
+
+    def test_remote_pruning_preserves_kept_hardlink_modes(self):
+        self.assert_remote_pruning_preserves_kept_hardlink_modes()
+
+    def test_ssh_remote_pruning_preserves_kept_hardlink_modes(self):
+        # Exercise remote shell quoting as well as the injected removal helper.
+        original = self.remote
+        self.remote = self.tmp / "nas with 'quote"
+        original.rename(self.remote)
+        conf = Path(self.env["MILEAGE_BACKUP_CONF"])
+        conf.write_text(conf.read_text().replace(f"REMOTE={original}", f'REMOTE="{self.remote}"'))
+        self.use_ssh_remote()
+        self.assert_remote_pruning_preserves_kept_hardlink_modes()
 
     def test_tree_removal_never_chmods_hardlinked_files_or_outside_links(self):
         self.addCleanup(self.writable_fixture_directories)
