@@ -18,9 +18,10 @@ from zoneinfo import ZoneInfo
 import test_viewer_roles as roles
 
 
-ADMIN_REFUSAL = ("This trip&#39;s files can&#39;t be opened: its summary, track or month folder links outside "
-                 "the data folder, so the viewer won&#39;t read them. If it is in the log, the trip list and exports flag it. "
-                 "Replace the link with the real file to show the trip again.")
+ADMIN_REFUSAL = ("This trip&#39;s files can&#39;t be opened: its summary, track or month folder is a link that leads "
+                 "outside the data folder or can&#39;t be followed safely, so the viewer won&#39;t read them. "
+                 "If it is in the log, the trip list and exports flag it. "
+                 "Replace the link with the real file or folder to show the trip again.")
 
 BS = chr(92)
 

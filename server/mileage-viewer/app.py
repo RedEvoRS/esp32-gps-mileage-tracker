@@ -3579,9 +3579,10 @@ def index():
 def trip_view(ym, trip_id):
     year = selected_year()
     _safe_trip_paths(ym, trip_id, refused_description=(
-        "This trip's files can't be opened: its summary, track or month folder links outside "
-        "the data folder, so the viewer won't read them. If it is in the log, the trip list and exports flag it. "
-        "Replace the link with the real file to show the trip again."
+        "This trip's files can't be opened: its summary, track or month folder is a link that leads "
+        "outside the data folder or can't be followed safely, so the viewer won't read them. "
+        "If it is in the log, the trip list and exports flag it. "
+        "Replace the link with the real file or folder to show the trip again."
     ) if g.role == "admin" else TRIP_NOT_FOUND)
     key = f"{ym}/{trip_id}"
     # Resolve the requested recording/alias and read only its own sources.
