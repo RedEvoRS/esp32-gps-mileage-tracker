@@ -110,6 +110,11 @@ class ViewerRemovalTests(unittest.TestCase):
                         self.assertEqual(denied.status_code, 403)
                         with patch.object(self.viewer, "_safe_trip_paths", side_effect=AssertionError("route path check")):
                             response = self.post(f"/trip/{key}/{action}?year=2026", reason="test removal")
+                        if kind == "month":
+                            self.assertEqual(response.status_code, 404 if action == "remove" else 409)
+                            with closing(sqlite3.connect(self.db)) as conn:
+                                self.assertIsNone(conn.execute("SELECT 1 FROM trip_removals WHERE trip_key=?", (key,)).fetchone())
+                            continue
                         self.assertEqual(response.status_code, 302)
                         expected = "/?year=2026" if action == "remove" else "/admin/removed?year=2026"
                         self.assertEqual(response.location, expected)

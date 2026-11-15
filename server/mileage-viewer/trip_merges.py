@@ -295,6 +295,8 @@ def next_trip(trip, trips, unreadable, removed=()):
             return None, REMOVED_BETWEEN
         current_start = _parse_iso(trip["start_time"])
         for damaged in unreadable:
+            if damaged.get("folder"):
+                return None, f"Cannot establish the next trip: a month folder has a problem ({damaged['problem']}). Fix it before merging."
             damaged_device = damaged.get("device_id")
             if _known_device(damaged_device) and damaged_device != device:
                 continue

@@ -914,9 +914,39 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
     # first, so a failed or lost summary write leaves one behind. (A page
     # load in the middle of an upload can catch one for a moment, too.)
     if trip_key is None:
-        json_paths = list(dict.fromkeys([*DATA_ROOT.glob("*/*.json"), *(
-            gpx.with_suffix(".json") for gpx in DATA_ROOT.glob("*/*.gpx")
-        )]))
+        json_paths = []
+        refused_months = set()
+
+        def refuse_month(ym, problem="the folder links outside the data folder"):
+            if ym not in refused_months:
+                refused_months.add(ym)
+                unreadable.append({"folder": True, "ym": ym, "id": "", "trip_key": f"{ym}/",
+                                   "has_gpx": False, "problem": problem,
+                                   "refused_file": "folder", "problem_file": "folder"})
+
+        # Check before listing: refused folders must not expose filenames,
+        # including when the link's target no longer exists.
+        counted_directories = set()
+        # Prefer real directories so their existing annotation keys survive;
+        # link-only targets use the first name in sorted order.
+        for month in sorted(DATA_ROOT.iterdir(), key=lambda path: (path.is_symlink(), path.name)):
+            try:
+                checked_month = trip_merges.checked_path(root, month)
+            except ValueError:
+                if trip_merges.YM_RE.fullmatch(month.name):
+                    refuse_month(month.name)
+                else:
+                    app.logger.warning("Refused data folder entry: %s", month.name)
+                continue
+            if checked_month.is_dir():
+                if checked_month in counted_directories:
+                    refuse_month(month.name, "the folder is a link to another folder that is already counted")
+                    continue
+                counted_directories.add(checked_month)
+                for path in checked_month.iterdir():
+                    if path.suffix in (".json", ".gpx"):
+                        json_paths.append(month / path.with_suffix(".json").name)
+        json_paths = list(dict.fromkeys(json_paths))
         with _summary_cache_lock:
             live = set(json_paths)
             for path in _summary_cache.keys() - live:
@@ -948,6 +978,13 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                 if not (os.path.lexists(presence_path) or os.path.lexists(presence_path.with_suffix(".gpx"))):
                     continue
         ym = json_path.parent.name
+        if only_merge_key is None:
+            try:
+                trip_merges.checked_path(root, json_path.parent)
+            except ValueError:
+                if trip_merges.YM_RE.fullmatch(ym):
+                    refuse_month(ym)
+                continue
         trip_id = json_path.stem
         trip_key = f"{ym}/{trip_id}"
         ann = annotations.get(trip_key, {})
@@ -972,6 +1009,14 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                 has_gpx = gpx_path.exists()
             except OSError:
                 has_gpx = False
+        if only_merge_key is None and (problem or refused_file):
+            # Fold a refusal after a month swap into one folder warning.
+            try:
+                trip_merges.checked_path(root, json_path.parent)
+            except ValueError:
+                if trip_merges.YM_RE.fullmatch(ym):
+                    refuse_month(ym)
+                continue
         if only_merge_key is not None and problem == "the file is missing" and not has_gpx:
             continue
         trip = {
@@ -990,6 +1035,9 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
         else:
             trips.append(trip)
 
+    if only_merge_key is None:
+        trips = [t for t in trips if t["ym"] not in refused_months]
+        unreadable = [t for t in unreadable if t.get("folder") or t["ym"] not in refused_months]
     trips, unreadable = trip_merges.apply_merges(
         conn, DATA_ROOT, trips, unreadable, refresh=refresh_merges, only_key=only_merge_key)
     # Removal is keyed by the canonical key the list shows (a merged trip's
@@ -2164,12 +2212,17 @@ LIST_HTML = """
 <div class="wrap">
   {% if unreadable %}
   <div class="warn" role="alert">
-    <b>{{ unreadable|length }} trip file(s) can't be read.</b>
+    <b>{{ unreadable|rejectattr("folder")|list|length }} trip file(s) can't be read.{% set folders = unreadable|selectattr("folder")|list %}{% if folders %} {{ folders|length }} month folder(s) can't be read.{% endif %}</b>
     Their miles can't be counted, so the totals below may be short. The
     exports list these trips as unreadable, without miles. To rebuild a
     damaged summary from its GPX, see DEPLOY_DEBIAN.md → Troubleshooting.
     <ul>
       {% for u in unreadable %}
+      {% if u.get('folder') %}
+      <li><code>{{ u.trip_key }}</code> (month folder): {{ u.problem }}; none of its trips are shown or counted.
+        {% if g.role == 'admin' %}{% if 'already counted' in u.problem %}Remove the duplicate folder link.{% else %}Replace the link with the real folder, or mount the other disk at that path.{% endif %}{% else %}Please ask the admin to fix it.{% endif %}
+      </li>
+      {% else %}
       <li><code>{% if u.get('parts') %}{{ u.gpx_file }}{% else %}{{ u.trip_key }}.{{ u.get('problem_file') or 'json' }}{% endif %}</code>{% if not u.get('parts') and u.get('refused_file') == 'gpx' and u.get('problem_file') == 'json' %} (its GPX links outside the data folder){% elif not u.has_gpx and (u.get('parts') or not u.get('refused_file')) %} (no GPX either){% endif %}: {{ u.problem }}
         {% if u.get('parts') %}
         <form method="post" action="{{ url_for('split_trip', ym=u.ym, trip_id=u.id, year=year or '') }}">
@@ -2188,6 +2241,7 @@ LIST_HTML = """
         </form>
         {% endif %}
       </li>
+      {% endif %}
       {% endfor %}
     </ul>
   </div>
@@ -2965,7 +3019,7 @@ YEAR_HTML = """
 .changed { font-weight: 700; }
 </style></head><body>
 """ + ACCOUNT_HEADER + """<main class="wrap">
-{% macro trip_link(t) %}<a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{% if t.problem %}{{ t.trip_key }}{% else %}{{ fmt_trip_date(t) }}{% endif %}</a>{% endmacro %}
+{% macro trip_link(t) %}{% if t.get('folder') %}<code>{{ t.trip_key }}</code> (month folder){% else %}<a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{% if t.problem %}{{ t.trip_key }}{% else %}{{ fmt_trip_date(t) }}{% endif %}</a>{% endif %}{% endmacro %}
 <h1>{{ year }} year review</h1>
 <p class="muted">Times shown in {{ timezone }}. A trip belongs to the year it starts in (or, if partly timed, its
 first recorded time), the same as the trip list and exports.</p>
@@ -3113,7 +3167,7 @@ gap that was uploaded after the merge is counted a second time. Open the merged 
 <p class="muted">Their miles can't be counted, so the totals above may be short.</p>
 <div class="review-table"><table>
 <thead><tr><th>Trip</th><th>Problem</th></tr></thead>
-<tbody>{% for t in unreadable %}<tr><td>{{ trip_link(t) }}{% if not t.get('parts') %} <code>{{ t.trip_key }}.{{ t.get('problem_file') or 'json' }}</code>{% if t.get('refused_file') == 'gpx' and t.get('problem_file') == 'json' %} (its GPX links outside the data folder){% endif %}{% endif %}</td><td>{{ t.problem }}</td></tr>
+<tbody>{% for t in unreadable %}<tr><td>{{ trip_link(t) }}{% if not t.get('folder') and not t.get('parts') %} <code>{{ t.trip_key }}.{{ t.get('problem_file') or 'json' }}</code>{% if t.get('refused_file') == 'gpx' and t.get('problem_file') == 'json' %} (its GPX links outside the data folder){% endif %}{% endif %}</td><td>{{ t.problem }}</td></tr>
 {% else %}<tr><td colspan="2" class="muted">All trip files can be read.</td></tr>{% endfor %}</tbody>
 </table></div>
 </section>
@@ -3861,6 +3915,8 @@ def _unreadable_values(t):
     Just what identifies it and what was typed for it. Its miles are
     unknown, so they stay blank rather than reading as zero.
     """
+    if t.get("folder"):
+        return {name: t["trip_key"] if name == "trip_id" else "" for name in UNREADABLE_COLUMNS}
     return {
         "trip_id": t.get("trip_id") or t["id"],
         "gpx_file": t.get("gpx_file") or (f"{t['id']}.gpx" if t["has_gpx"] else ""),
@@ -3884,7 +3940,7 @@ def export_csv():
     for t in unreadable:
         values = _unreadable_values(t)
         writer.writerow(
-            [_csv_safe(values.get(name, "")) for name, _ in EXPORT_COLUMNS] + ["unreadable", ""]
+            [_csv_safe(values.get(name, "")) for name, _ in EXPORT_COLUMNS] + ["unreadable_folder" if t.get("folder") else "unreadable", ""]
         )
     for category, miles in mileage_totals(trips).items():
         # Keep the CSV rectangular and mark totals explicitly, so consumers
@@ -3923,6 +3979,8 @@ def export_xlsx():
         sheet.append(list(UNREADABLE_COLUMNS))
         for t in unreadable:
             values = _unreadable_values(t)
+            if t.get("folder"):
+                values["trip_id"] += " (whole month folder)"
             sheet.append(_xlsx_clean([values[name] for name in UNREADABLE_COLUMNS]))
             _xlsx_literal_text(sheet[sheet.max_row])
     buf = io.BytesIO()
