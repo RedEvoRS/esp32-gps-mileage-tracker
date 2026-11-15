@@ -1464,18 +1464,34 @@ off-host destination. Each run:
   withhold the heartbeat or increase `links_not_backed_up`.
   A relative link through a skipped link gets a separate warning naming that
   dependency: it is recreated, but will dangle on an empty `data/`. Backup
-  reports the original target's real saved path when present. Relative loops
-  are reported and recreated; they do not fail an otherwise complete backup.
+  reports the original target's real saved path when present. Proven loops
+  get a named warning that they loop and have nothing behind them to back up;
+  remove or correct those links. They do not fail the run, withhold the heartbeat
+  or increase `links_not_backed_up`; relative loops are recreated by restore.
+  Other resolution errors, including a walk exceeding 256 link steps without
+  proving a loop, still fail the coverage check. Failure of the separate restore
+  advice check only warns; inspect the log and rerun for that advice. It keeps
+  the valid coverage count and does not by itself fail the run.
 - stores `annotations.db`, optional `events.db` and optional `monitor.db`
   beside `data/`, all covered by `SHA256SUMS`. Human-readable `INFO` records
   annotation/event counts, monitor status and `links_not_backed_up` (missing
   means zero in an older readable `INFO`). `unknown` means linked items were
   not checked: inspect the backup log, fix the check error and rerun the backup.
   Status and restore checks show "not checked"; an unchecked run always makes a
-  new snapshot. A changed link count also makes a new snapshot. Restore checks report
-  database
-  integrity, event counts and monitor state tables.
-- writes a `SHA256SUMS` manifest. Unchanged files are hard links to the
+  new snapshot. Missing or unreadable backup information instead shows
+  `unavailable` in status: check the backup disk/mount, `latest` and `INFO`.
+  `install.sh --check` warns for a positive count or "not checked"; it leaves
+  missing-backup advice to its existing backup/destination checks. A changed
+  link count also makes a new snapshot. Restore checks report database integrity,
+  event counts and monitor state tables.
+- writes `SHA256SUMS` and a sorted, NUL-delimited `SYMLINKS` manifest of copied
+  link paths and link text. Link-only adds, removals, retargets and swaps with
+  real folders now make a new snapshot; excluded links do not affect this
+  comparison. Spaces and newlines in link names/targets are preserved. Older
+  snapshots without `SYMLINKS` force one extra snapshot after the update and
+  remain restorable. Failure to record links is logged and fails the run after
+  the copy, withholding the heartbeat; fix the logged error and rerun.
+  Unchanged files are hard links to the
   previous snapshot, and a run where nothing changed doesn't add a
   snapshot at all, so daily runs cost almost nothing.
 - keeps the newest 14 snapshots plus the first of each month for 7 years.
@@ -1675,13 +1691,26 @@ Snapshot holds 1 trip GPX files and 1 summaries
 Restore test passed
 ```
 
-Links that will not be restored as links are listed; if any are found the check
-still exits 0 with `Restore test passed, but N linked item(s) will not be restored
-as links; see warnings above`. Links recreated with target problems have a
+Check and restore first explain the saved `INFO` coverage result. A positive
+count says plainly `this backup recorded N linked item(s) whose contents were
+not saved`, even for absolute links. Recover the omitted contents from their
+original targets or another backup, move them into `data/`, and make a fresh
+backup. `unknown` says the backup run could not check; inspect its log, fix the
+error and rerun. Missing/unreadable `INFO` instead means coverage information is
+unavailable. With zero or an absent field in older readable `INFO`, per-link
+warnings stay neutral.
+
+Links that will not be restored as links are listed. The check still exits 0;
+its closing warning repeats any recorded missing-content count, otherwise
+`Restore test passed, but N linked item(s) will not be restored as links; see
+warnings above`. Links recreated with target problems have a
 separate warning and count, naming any skipped link they depend on. For an
 absolute link or a chain through one, the relocated snapshot cannot
 determine whether its original target is saved elsewhere in the backup or
-absent; the warning explains this rather than claiming data is missing.
+absent; the per-link warning explains this uncertainty while any recorded
+missing-content count remains explicit. Proven saved relative loops are named
+and described as having nothing behind them to back up. Restore does not follow
+absolute links to the original host to diagnose their targets.
 Check the real trip files and annotations against the viewer. The check changes
 nothing on the live system. Do this again before each filing.
 

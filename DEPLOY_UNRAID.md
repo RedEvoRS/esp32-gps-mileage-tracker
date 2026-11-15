@@ -402,7 +402,10 @@ log path, `last_deep_check`, `last_deep_check_result`, and
 `last_backup_links_not_backed_up` (an older `INFO` without the count means
 zero). A failed link check records `unknown` in `INFO` and status shows
 `not checked`; inspect the backup log, fix the error and rerun the backup.
-Missing or unreadable `INFO` also shows `not checked`. Empty values can mean
+Missing or unreadable backup information instead shows `unavailable`: check
+that the backup disk is mounted and `latest/INFO` can be read. The installer
+reports its backup/destination problem without adding link-check-failure advice.
+Empty values can mean
 it has never run. Status 0 means success;
 `running` has no final result yet. Reading status itself exits 0, so inspect
 the fields. `last_success` comes from `BACKUP_DIR/last-success` and may be
@@ -425,11 +428,36 @@ items may keep the chain usable. Recreated links with target problems are counte
 separately from skipped links. Backup reports the original target's saved real
 path when present; restore cannot establish that through a relocated absolute
 link. Relative loops are reported and recreated without failing an otherwise
-complete backup. Relative chains that pass rsync's text check but lead outside
-are recreated and warned about; their outside contents still fail backup,
+complete backup. A proven loop gets a warning naming the link and saying it
+loops and has nothing behind it to back up; remove or correct it. Loops do not
+withhold the heartbeat or increase `links_not_backed_up`. Other resolution errors
+(including more than 256 link steps without proving a loop) still fail the
+coverage check. If the separate restore-advice check fails, backup logs a warning,
+keeps the valid coverage count and does not fail for that alone; inspect the log
+and rerun for restore advice. Relative chains that pass rsync's text check but
+lead outside are recreated and warned about; their outside contents still fail backup,
 withhold the heartbeat and count in `links_not_backed_up`. Backup never follows
 links to copy their contents. Replace an alias you need with a working relative
 internal chain or a real folder or file, then make a fresh backup.
+
+Both check and restore state any positive `INFO` count plainly: the backup
+recorded that many linked items whose contents were not saved. Recover them
+from the original target or another backup, move them into `data/`, and make a
+fresh backup. `unknown` means the backup could not check; missing/unreadable
+`INFO` means the information is unavailable. Zero or an absent field in older
+readable `INFO` keeps per-link warnings neutral. A passing restore test checks
+the saved copy and cannot recover omitted contents. Saved relative loops get
+the same explanation as backup; restore does not follow absolute links to the
+original host to diagnose their targets.
+
+Each new snapshot includes a sorted, NUL-delimited `SYMLINKS` list of copied link
+paths and link text, covered by `SHA256SUMS`. A link-only add, removal, retarget,
+or swap with a real folder makes a new snapshot, including names/targets with
+spaces or newlines; excluded links do not enter that comparison. Unchanged links
+still reuse the last snapshot. An older snapshot without `SYMLINKS` forces one
+extra snapshot after updating and remains restorable. If recording links fails,
+the log explains the error and the run fails after copying, withholding the
+heartbeat; fix the logged error and rerun.
 
 After today's backup has completed and been copied, the same run periodically
 checks older snapshots. In `backup/backup.conf`, `BACKUP_VERIFY_DAYS=7` means

@@ -1467,15 +1467,35 @@ outside contents into `data/` and rerun the backup. The
 copy and deep check still run and `last-success` advances, but missing linked
 contents make the run exit non-zero and withhold `PING_URL`. Unraid status
 shows `last_backup_links_not_backed_up`; `install.sh --check` warns when it
-is above zero. A first backup failing only for this reason warns and install
-continues. Absolute links inside `data/` get a separate warning: the link
+is above zero or `not checked`. Missing or unreadable backup information shows
+`unavailable` in status: check the backup disk/mount, `latest`, and `INFO` before
+assuming a link check failed. The installer reports the underlying backup or
+destination problem without adding check-failure advice. A first backup failing
+only for missing linked contents warns and install continues.
+
+Absolute links inside `data/` get a separate warning: the link
 itself will not be restored, but its target is saved under its real path
 (or the warning says that path is missing or excluded). This warning does not
 fail the backup, withhold the heartbeat or increase `links_not_backed_up`.
+If this separate restore-warning check fails, the log says it couldn't check
+how links will restore; inspect the log and rerun the backup for that advice.
+Its failure alone does not fail the run or discard a valid outside-link count.
+
 Restore checks list links that will be skipped and can pass with a warning;
 restore reports them too. For an absolute link, a relocated snapshot cannot
 establish whether its original target is saved elsewhere in the backup or
-absent, so the warning explains that uncertainty. Restore uses rsync
+absent, so the warning explains that uncertainty.
+
+`INFO` also preserves the backup run's coverage result: if its count is positive,
+both check and restore state that the backup recorded that many linked items
+whose contents were not saved. Recover them from the original target or another
+backup, move them into `data/`, and make a fresh backup. `unknown` means the
+backup could not check; absent/unreadable `INFO` means that information is
+unavailable. Zero or an absent field in older readable `INFO` leaves the
+per-link warning neutral. A passing restore test verifies the saved copy;
+it does not recover omitted contents.
+
+Restore uses rsync
 `--safe-links`: it skips absolute links and relative paths rejected by its text
 check, keeping existing items at those paths. Too many leading `../` parts are
 rejected; current rsync also rejects `..` after a named path component. The report
@@ -1487,13 +1507,29 @@ will dangle on an empty `data/`. Backup also reports whether the original target
 was saved at its real path; a relocated restore cannot establish that through
 an absolute link. Existing items may keep a chain usable on an existing install.
 Recreated links with target problems are counted separately from skipped links.
-Loops are reported without failing an otherwise complete backup; relative loops
-are recreated. A relative chain whose text passes rsync's check can still lead
-outside `data/`; it is recreated and warned about, while its outside contents
+
+Proven loops are named with a warning that the link loops and has nothing behind
+it to back up; remove or correct the link. They do not fail the run, withhold the
+heartbeat or increase `links_not_backed_up`. Check and restore give the same
+explanation for saved relative loops, which are recreated. An unresolved error
+or a walk exceeding 256 link steps without proving a loop still fails the
+coverage check. Restore does not follow an absolute link back to the original
+host to diagnose its target. A relative chain whose text passes rsync's check can
+still lead outside `data/`; it is recreated and warned about, while its outside contents
 still fail the backup run, withhold the heartbeat and count in
 `links_not_backed_up`. Backup never follows links to copy their contents.
 Replace an alias you need with a working relative internal chain or a real
 folder or file, then make a fresh backup.
+
+Snapshots also contain `SYMLINKS`, a sorted, NUL-delimited list of the copied
+links' paths and link text, covered by `SHA256SUMS`. Adding, removing or
+retargeting a copied link makes a new snapshot, including names or targets with
+spaces/newlines and swaps between a link and a real folder. Excluded links do
+not enter this comparison. An unchanged tree with links still reuses the last
+snapshot. The first run after updating makes one extra snapshot if the previous
+one lacks `SYMLINKS`; older snapshots still restore. A failure to record the
+links is logged, prevents reuse and fails the run after the copy, withholding
+the heartbeat; fix the logged error and rerun the backup.
 
 Each SQLite snapshot is consistent individually; the databases and trip files
 are captured in sequence, rather than in one shared transaction.
