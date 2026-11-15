@@ -465,8 +465,9 @@ make_link_restore_plan() {
     mkdir -- "$plan" || return 1
     while IFS= read -r -d '' path; do
         printf '%s\0' "${path#"$dir/"}"
-    done < "$list" > "$plan/files"
-    rsync -l --dirs --safe-links --from0 --files-from="$plan/files" "$dir/" "$plan/data/"
+    done < "$list" > "$plan/files" || return 1
+    # Only scratch directories: preserve eligibility while making cleanup possible.
+    rsync -l --dirs --chmod=Du+rwx --safe-links --from0 --files-from="$plan/files" "$dir/" "$plan/data/"
 }
 
 # Explain skipped internal aliases and links that rsync recreates but cannot

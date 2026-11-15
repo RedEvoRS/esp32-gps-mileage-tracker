@@ -1477,9 +1477,9 @@ Absolute links inside `data/` get a separate warning: the link
 itself will not be restored, but its target is saved under its real path
 (or the warning says that path is missing or excluded). This warning does not
 fail the backup, withhold the heartbeat or increase `links_not_backed_up`.
-If this separate restore-warning check fails, the log says it couldn't check
-how links will restore; inspect the log and rerun the backup for that advice.
-Its failure alone does not fail the run or discard a valid outside-link count.
+If restore advice cannot be checked, backup, check and restore log a warning
+and continue; inspect the log and rerun for that advice. Its scratch stays
+outside snapshots, and failure preserves the outside-link coverage result.
 
 Restore checks list links that will be skipped and can pass with a warning;
 restore reports them too. For an absolute link, a relocated snapshot cannot

@@ -1469,9 +1469,9 @@ off-host destination. Each run:
   remove or correct those links. They do not fail the run, withhold the heartbeat
   or increase `links_not_backed_up`; relative loops are recreated by restore.
   Other resolution errors, including a walk exceeding 256 link steps without
-  proving a loop, still fail the coverage check. Failure of the separate restore
-  advice check only warns; inspect the log and rerun for that advice. It keeps
-  the valid coverage count and does not by itself fail the run.
+  proving a loop, still fail the coverage check. Failure of restore advice only warns in backup, check and restore; inspect
+  the log and rerun for that advice. Scratch stays outside snapshots, and the
+  coverage result is preserved.
 - stores `annotations.db`, optional `events.db` and optional `monitor.db`
   beside `data/`, all covered by `SHA256SUMS`. Human-readable `INFO` records
   annotation/event counts, monitor status and `links_not_backed_up` (missing

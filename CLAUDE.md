@@ -588,8 +588,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   heartbeat. A failed coverage check records `unknown` ("not checked"); missing
   or unreadable backup information is `unavailable`, not a failed link check.
   Absolute internal aliases get warning-only restore advice; their real targets
-  may be saved at their own paths. Failure of that advice check only warns and
-  preserves the coverage count. Restore uses the installed rsync `--safe-links`
+  may be saved at their own paths. Failure of advice only warns in backup, check and restore; scratch stays
+  outside snapshots and the coverage count is preserved. Restore uses the installed rsync `--safe-links`
   to report skipped links and recreated chains that depend on them; it also
   states any recorded missing-content count. Proven loops are named warnings,
   with no missing-content count, failure or withheld heartbeat; other resolution

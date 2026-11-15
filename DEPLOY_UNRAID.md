@@ -432,9 +432,9 @@ complete backup. A proven loop gets a warning naming the link and saying it
 loops and has nothing behind it to back up; remove or correct it. Loops do not
 withhold the heartbeat or increase `links_not_backed_up`. Other resolution errors
 (including more than 256 link steps without proving a loop) still fail the
-coverage check. If the separate restore-advice check fails, backup logs a warning,
-keeps the valid coverage count and does not fail for that alone; inspect the log
-and rerun for restore advice. Relative chains that pass rsync's text check but
+coverage check. If restore advice fails, backup, check and restore warn and continue; inspect
+the log and rerun for that advice. Scratch stays outside snapshots and the
+coverage result is preserved. Relative chains that pass rsync's text check but
 lead outside are recreated and warned about; their outside contents still fail backup,
 withhold the heartbeat and count in `links_not_backed_up`. Backup never follows
 links to copy their contents. Replace an alias you need with a working relative

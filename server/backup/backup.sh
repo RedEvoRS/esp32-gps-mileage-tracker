@@ -90,6 +90,9 @@ rm -rf "$SNAPSHOTS"/.partial-*        # left behind by a run that died
 find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -name '.restore-scratch-*' -mmin +1440 \
     -exec rm -rf {} + 2> /dev/null || true
 prev=$(list_snapshots | tail -n 1)
+# Coverage lists and restore advice must never enter a snapshot or its manifest.
+link_scratch=$(mktemp -d "$BACKUP_DIR/.link-scratch-XXXXXX")
+trap 'rm -rf -- "$link_scratch" || log "WARNING: could not remove link advice scratch: $link_scratch"' EXIT
 mkdir "$work"
 
 # --- 1. Annotations database -------------------------------------------
@@ -135,17 +138,16 @@ rsync -a --numeric-ids --exclude=/.upload.lock --exclude='/.upload-lock.*' --exc
 # A failed link check must not cost tonight's off-host copy: note it,
 # finish the backup, then fail the run below.
 coverage_error=0
-if ! report_outside_links "$COMPOSE_DIR/data" "$work/.outside-links"; then
+if ! report_outside_links "$COMPOSE_DIR/data" "$link_scratch/outside-links"; then
     log "ERROR: couldn't check data for links outside it; this run will fail after the copy"
-    rm -f -- "$work/.outside-links"
+    rm -f -- "$link_scratch/outside-links"
     LINKS_NOT_BACKED_UP=unknown
     coverage_error=1
 fi
 # Restore advice is warning-only. Failure here must not discard a valid
 # coverage count or turn a complete backup into a failed run.
-if ! report_link_restore_effects "$COMPOSE_DIR/data" "$work/data" "$work/.absolute-links"; then
+if ! report_link_restore_effects "$COMPOSE_DIR/data" "$work/data" "$link_scratch/link-effects"; then
     log "WARNING: couldn't check how data links will restore; inspect the backup log and rerun backup.sh for restore warnings."
-    rm -f -- "$work/.absolute-links"
 fi
 exec 7<&-
 trips=$(find "$work/data" -type f -name '*.gpx' | wc -l)

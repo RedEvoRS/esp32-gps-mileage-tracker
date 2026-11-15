@@ -112,11 +112,20 @@ fetch_and_check() {
     elif [[ $SNAPSHOT_LINKS_NOT_BACKED_UP =~ ^[0-9]+$ && $SNAPSHOT_LINKS_NOT_BACKED_UP == *[1-9]* ]]; then
         log "WARNING: this backup recorded $SNAPSHOT_LINKS_NOT_BACKED_UP linked item(s) whose contents were not saved; recover those contents from the original target or another backup, move them into data/ and make a fresh backup."
     fi
-    report_link_restore_effects "$snap/data" "$snap/data" "$scratch/link-effects" restore
+    if ! report_link_restore_effects "$snap/data" "$snap/data" "$scratch/link-effects" restore; then
+        log "WARNING: couldn't check how data links will restore; inspect the log and rerun for restore warnings."
+    fi
     if (( LINKS_NOT_RESTORED > 0 )); then
         log "WARNING: $LINKS_NOT_RESTORED linked item(s) will not be restored as links; see warnings above for target coverage"
     fi
-    if [[ -f $snap/INFO && -r $snap/INFO ]]; then log "Snapshot INFO: $(tr '\n' ' ' < "$snap/INFO")"; fi
+    if [[ -f $snap/INFO && -r $snap/INFO ]]; then
+        local info
+        if info=$(tr '\n' ' ' < "$snap/INFO"); then
+            log "Snapshot INFO: $info"
+        else
+            log "WARNING: couldn't display snapshot INFO; inspect the original backup log"
+        fi
+    fi
 }
 
 start_services() {

@@ -486,6 +486,61 @@ exec {real_rsync} "$@"
         self.assertIn("links_not_backed_up=1\n", (self.backups / "latest/INFO").read_text())
         self.assertFalse(ping.exists())
 
+    def test_read_only_link_parent_never_puts_advice_scratch_in_snapshot(self):
+        folder = self.data / "2026-10/ro"
+        folder.mkdir()
+        self.symlink(folder / "alias", "../2026-10-01T15-00-00.gpx")
+        folder.chmod(0o500)
+        # Test fixtures must also be removable before the general cleanup fix.
+        def writable_directories():
+            for root, _, _ in os.walk(self.tmp, followlinks=False):
+                os.chmod(root, 0o700)
+        self.addCleanup(writable_directories)
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        ping = self.tmp / "ping"
+        self.shim("curl", f'touch "{ping}"\n')
+        result = self.run_script("backup.sh")
+        self.assertNotIn("couldn't check how data links will restore", result.stderr)
+        self.assertTrue(ping.exists())
+        for base in (self.backups / "latest", self.remote / "snapshots" / self.snapshots()[-1]):
+            self.assertEqual((base / "data/2026-10/ro").stat().st_mode & 0o777, 0o500)
+            self.assertFalse([p for p in base.rglob("*") if ".plan" in p.name or "link-effects" in p.name])
+            sums = (base / "SHA256SUMS").read_text()
+            self.assertNotIn(".plan", sums)
+            self.assertNotIn("link-effects", sums)
+        self.assertEqual(list(self.backups.glob(".link-scratch-*")), [])
+
+    def test_restore_plan_rsync_failure_only_warns_for_check_and_restore(self):
+        self.run_script("backup.sh")
+        real_rsync = shutil.which("rsync")
+        self.shim("rsync", f'''\
+for arg in "$@"; do
+    if [[ $arg == --files-from=* ]]; then exit 1; fi
+done
+exec {real_rsync} "$@"
+''')
+        for command in ("check", "restore"):
+            args = ("latest", "--yes") if command == "restore" else ()
+            result = self.run_script("restore.sh", command, *args)
+            self.assertIn("WARNING: couldn't check how data links will restore", result.stderr)
+            self.assertIn("Restore test passed" if command == "check" else "Restore complete", result.stderr)
+            self.assertEqual(list(self.backups.glob(".restore-scratch-*")), [])
+
+    def test_restore_link_walk_limit_only_warns_for_check_and_restore(self):
+        self.run_script("backup.sh")
+        snap = self.backups / "latest"
+        self.symlink(snap / "data/dot", ".")
+        chain = "dot/" * 257 + "2026-10"
+        self.symlink(snap / "data/long-chain", chain)
+        # Links are advisory and not file-checksum entries in this older copy.
+        for command in ("check", "restore"):
+            args = (str(snap), "--yes") if command == "restore" else (str(snap),)
+            result = self.run_script("restore.sh", command, *args)
+            self.assertIn("without proving a loop", result.stderr)
+            self.assertIn("WARNING: couldn't check how data links will restore", result.stderr)
+            self.assertIn("Restore test passed" if command == "check" else "Restore complete", result.stderr)
+        self.assertEqual(os.readlink(self.data / "long-chain"), chain)
+
     def test_unknown_coverage_readers_and_recovery_never_dedupes(self):
         self.conf_append("KEEP_RECENT=10\n")
         self.run_script("backup.sh")
