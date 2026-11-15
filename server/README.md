@@ -1469,8 +1469,8 @@ contents make the run exit non-zero and withhold `PING_URL`. Unraid status
 shows `last_backup_links_not_backed_up`; `install.sh --check` warns when it
 is above zero or `not checked`. Missing or unreadable backup information shows
 `unavailable` in status: check the backup disk/mount, `latest`, and `INFO` before
-assuming a link check failed. The installer reports the underlying backup or
-destination problem without adding check-failure advice. A first backup failing
+assuming a link check failed. With a recent success, the installer warns when `latest/INFO` is unavailable,
+unless another backup/destination check already explains the problem. A first backup failing
 only for missing linked contents warns and install continues.
 
 Absolute links inside `data/` get a separate warning: the link

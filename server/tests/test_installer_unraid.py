@@ -345,6 +345,24 @@ class InstallerUnraid(unittest.TestCase):
         self.assertIn("BACKUP destination mount is missing", out)
         self.assertNotIn("not checked", out)
         self.assertNotIn("fix the check error", out)
+
+    def test_recent_backup_with_unavailable_info_warns_once_on_both_platforms(self):
+        self.conf()
+        self.scheduled()
+        path = self.work / "backup/scheduled.sh"
+        path.write_text(path.read_text().replace(
+            "last_attempt_start=", "last_backup_links_not_backed_up=unavailable\nlast_attempt_start="))
+        out = self.run_step("install_unraid_cron; MODE=check; verify_unraid_backups")
+        self.assertEqual(out.count("Latest backup information is unavailable"), 1)
+        self.assertNotIn("not checked", out)
+        out = self.run_step("install_unraid_cron; MODE=check; verify_unraid_backups", MOUNT_MISSING="yes")
+        self.assertIn("BACKUP destination mount is missing", out)
+        self.assertNotIn("Latest backup information is unavailable", out)
+        # Debian uses the same function after its destination and timestamp checks.
+        out = self.run_step("MODE=check; show_backup_deep_check")
+        self.assertEqual(out.count("Latest backup information is unavailable"), 1)
+        out = self.run_step("MODE=check; backup_info_problem_reported=yes; show_backup_deep_check")
+        self.assertNotIn("Latest backup information is unavailable", out)
         # The same display function is used on Debian, where latest can be gone.
         out = self.run_step("MODE=check; show_backup_deep_check")
         self.assertNotIn("not checked", out)

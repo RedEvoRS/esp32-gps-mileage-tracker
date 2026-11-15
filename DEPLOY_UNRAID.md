@@ -403,8 +403,8 @@ log path, `last_deep_check`, `last_deep_check_result`, and
 zero). A failed link check records `unknown` in `INFO` and status shows
 `not checked`; inspect the backup log, fix the error and rerun the backup.
 Missing or unreadable backup information instead shows `unavailable`: check
-that the backup disk is mounted and `latest/INFO` can be read. The installer
-reports its backup/destination problem without adding link-check-failure advice.
+that the backup disk is mounted and `latest/INFO` can be read. With a recent success, the installer reports unavailable `latest/INFO` unless
+another backup/destination check already explains the problem.
 Empty values can mean
 it has never run. Status 0 means success;
 `running` has no final result yet. Reading status itself exits 0, so inspect

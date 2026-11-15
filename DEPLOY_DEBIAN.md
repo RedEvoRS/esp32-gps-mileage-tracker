@@ -1480,8 +1480,9 @@ off-host destination. Each run:
   Status and restore checks show "not checked"; an unchecked run always makes a
   new snapshot. Missing or unreadable backup information instead shows
   `unavailable` in status: check the backup disk/mount, `latest` and `INFO`.
-  `install.sh --check` warns for a positive count or "not checked"; it leaves
-  missing-backup advice to its existing backup/destination checks. A changed
+  `install.sh --check` warns for a positive count or "not checked". With a
+  recent success, it also reports unavailable `latest/INFO` unless another
+  backup/destination check already explains the problem. A changed
   link count also makes a new snapshot. Restore checks report database integrity,
   event counts and monitor state tables.
 - writes `SHA256SUMS` and a sorted, NUL-delimited `SYMLINKS` manifest of copied
