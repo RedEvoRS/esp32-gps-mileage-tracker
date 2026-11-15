@@ -354,13 +354,23 @@ read_verify_state() {
 # Walk path names, never file contents or directory trees. In restore mode,
 # stop at the first link rsync skips, without consulting its original target.
 # Backup mode also resolves absolute/outside names for coverage accounting.
-# Bound expanding loops; repeating a link with a different suffix can be valid.
+# Resolve each link's text before its remaining suffix. A link encountered
+# again during its own expansion proves a loop; repeated completed expansions
+# (e.g. dot/dot/file with dot -> .) are valid. The hop bound is an error, not proof.
 trace_data_link() {
     local root=$1 pending=$2 mode=$3 safe_root=${4:-} current=$1
-    local part candidate target relative prior hops=0
-    local -A seen=()
+    local original=$2 part candidate target relative leaving frame hops=0
+    local -A active=()
+    local -a suffixes=() expanding=()
     LINK_DEPENDENCY='' LINK_LOOP=no LINK_LIMIT=no LINK_ESCAPES=no LINK_RESOLVED=''
-    while [[ -n $pending ]]; do
+    while [[ -n $pending || ${#expanding[@]} != 0 ]]; do
+        if [[ -z $pending ]]; then
+            frame=$((${#expanding[@]} - 1))
+            leaving=${expanding[frame]}
+            pending=${suffixes[frame]}
+            unset 'active[$leaving]' 'expanding[frame]' 'suffixes[frame]'
+            continue
+        fi
         part=${pending%%/*}
         if [[ $pending == */* ]]; then pending=${pending#*/}; else pending=; fi
         case $part in
@@ -377,18 +387,15 @@ trace_data_link() {
         candidate=${current%/}/$part
         if [[ -L $candidate ]]; then
             hops=$((hops + 1))
-            if [[ -n ${seen[$candidate]+yes} ]]; then
-                prior=${seen[$candidate]}
-                if [[ $pending == "$prior" || -z $prior || $pending == */"$prior" ]]; then
-                    LINK_LOOP=yes
-                    break
-                fi
-            fi
-            if (( hops > 256 )); then
-                LINK_LOOP=yes LINK_LIMIT=yes
+            if [[ -n ${active[$candidate]+yes} ]]; then
+                LINK_LOOP=yes
                 break
             fi
-            seen["$candidate"]=$pending
+            if (( hops > 256 )); then
+                LINK_LIMIT=yes
+                log "ERROR: could not resolve $(printf '%q' "data/$original"): more than 256 symbolic link steps without proving a loop"
+                return 1
+            fi
             IFS= read -r -d '' target < <(readlink -z -- "$candidate") || return 1
             if [[ -n $safe_root && $candidate == "$root/"* ]]; then
                 relative=${candidate#"$root/"}
@@ -397,8 +404,11 @@ trace_data_link() {
                     [[ $mode != restore ]] || break
                 fi
             fi
+            active["$candidate"]=yes
+            expanding+=("$candidate")
+            suffixes+=("$pending")
             if [[ $target == /* ]]; then current=/; fi
-            pending=$target${pending:+/$pending}
+            pending=$target
         else
             current=$candidate
         fi
@@ -408,7 +418,7 @@ trace_data_link() {
 
 # Coverage uses resolved targets, independently of restore eligibility.
 outside_links() {
-    local root path resolved
+    local root path resolved target
     root=$(realpath -m -- "$1") || return 1
     # The slash follows a linked start directory, without following links
     # found below it. This also works with BusyBox find.
@@ -417,11 +427,11 @@ outside_links() {
         # indefinitely. Keep its established resolution for ordinary paths.
         trace_data_link "$root" "${path#"$1/"}" backup || return 1
         if [[ $LINK_LOOP == yes ]]; then
-            [[ $LINK_LIMIT != yes ]] || return 1
-            resolved=$LINK_RESOLVED
-        else
-            IFS= read -r -d '' resolved < <(realpath -mz -- "$path") || return 1
+            IFS= read -r -d '' target < <(readlink -z -- "$path") || return 1
+            log "WARNING: $(printf '%q' "data/${path#"$1/"}") -> $(printf '%q' "$target"): link loops and has nothing behind it to back up; remove or correct this link."
+            continue
         fi
+        IFS= read -r -d '' resolved < <(realpath -mz -- "$path") || return 1
         if [[ $resolved != "$root" && $resolved != "$root/"* ]]; then
             printf '%s\0' "$path"
         fi
@@ -482,7 +492,7 @@ report_link_restore_effects() {
             if [[ -n $LINK_DEPENDENCY ]]; then
                 effect="will be restored as a link, but on an empty data/ it will dangle: it depends on $(printf '%q' "data/$LINK_DEPENDENCY"), which will not be restored as a link"
             elif [[ $LINK_LOOP == yes ]]; then
-                effect='will be restored as a link, but its target cannot be reached (link loop or too many links)'
+                effect='will be restored as a link, but the link loops and has nothing behind it to back up; remove or correct this link'
             elif [[ $LINK_ESCAPES == yes || ( $LINK_RESOLVED != "$root" && $LINK_RESOLVED != "$root/"* ) ]]; then
                 effect='will be restored as a link, but its path leads outside data/; backup does not follow links to copy their contents'
             fi

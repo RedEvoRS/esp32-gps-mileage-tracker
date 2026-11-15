@@ -710,23 +710,74 @@ exec {real_rsync} "$@"
 
     def test_link_loops_are_reported_without_failing_or_hanging(self):
         links = {"loop-a": "loop-b", "loop-b": "loop-a", "self": "self",
+                 "long-a": "long-b", "long-b": "long-c", "long-c": "long-a",
+                 "into-loop": "long-a", "name\nwith space": "self",
                  "expanding": "expanding/child", "via-absolute": "absolute-loop"}
         for name, value in links.items():
             self.symlink(self.data / name, value)
         self.symlink(self.data / "absolute-loop", self.data / "loop-a")
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        ping = self.tmp / "ping"
+        self.shim("curl", f'touch "{ping}"\n')
         result = self.run_script("backup.sh")
-        self.assertIn("link loop or too many links", result.stderr)
+        for name in links:
+            quoted = "$'data/name\\nwith space'" if "\n" in name else f"data/{name}"
+            self.assertTrue(any(quoted in line and "link loops and has nothing behind it to back up" in line
+                                for line in result.stderr.splitlines()), name)
+        self.assertTrue(ping.exists())
+        self.assertTrue((self.backups / "last-success").exists())
         self.assertIn("links_not_backed_up=0\n", (self.backups / "latest/INFO").read_text())
         shutil.rmtree(self.data)
         self.data.mkdir()
         result = self.run_script("restore.sh", "check")
-        self.assertIn("link loop or too many links", result.stderr)
+        self.assertIn("link loops and has nothing behind it to back up", result.stderr)
+        for name in ("loop-a", "loop-b", "self", "long-a", "long-b", "long-c", "into-loop", "expanding"):
+            self.assertTrue(any(f"data/{name} ->" in line and "link loops and has nothing behind it to back up" in line
+                                for line in result.stderr.splitlines()), name)
         self.assertIn("depends on data/absolute-loop", result.stderr)
         self.assertIn("1 linked item(s) will not be restored as links", result.stderr)
-        self.run_script("restore.sh", "restore", "latest", "--yes")
+        restored = self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertIn("link loops and has nothing behind it to back up", restored.stderr)
         for name, value in links.items():
             self.assertEqual(os.readlink(self.data / name), value)
         self.assertFalse((self.data / "absolute-loop").is_symlink())
+
+    def test_loops_do_not_hide_real_outside_link_coverage(self):
+        self.symlink(self.data / "a", "b")
+        self.symlink(self.data / "b", "a")
+        self.symlink(self.data / "outside", "../outside")
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        ping = self.tmp / "ping"
+        self.shim("curl", f'touch "{ping}"\n')
+        result = self.run_script("backup.sh", check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("link loops and has nothing behind it to back up", result.stderr)
+        self.assertIn("not backed up: data/outside", result.stderr)
+        self.assertIn("links_not_backed_up=1\n", (self.backups / "latest/INFO").read_text())
+        self.assertTrue((self.backups / "last-success").exists())
+        self.assertFalse(ping.exists())
+
+    def test_link_walk_limit_is_not_a_proven_loop(self):
+        for index in range(257):
+            self.symlink(self.data / f"hop-{index}", f"hop-{index + 1}")
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1"; trace_data_link "$2" hop-0 backup', "bash",
+             str(BACKUP / "lib.sh"), str(self.data)], env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("without proving a loop", result.stderr)
+
+    def test_readlink_error_still_fails_coverage_with_unknown_count(self):
+        self.symlink(self.data / "ordinary", "2026-10")
+        self.shim("readlink", "exit 1\n")
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        ping = self.tmp / "ping"
+        self.shim("curl", f'touch "{ping}"\n')
+        result = self.run_script("backup.sh", check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("link loops and has nothing behind it", result.stderr)
+        self.assertIn("links_not_backed_up=unknown\n", (self.backups / "latest/INFO").read_text())
+        self.assertTrue((self.backups / "last-success").exists())
+        self.assertFalse(ping.exists())
 
     def test_unsafe_relative_text_can_have_a_saved_inside_target(self):
         self.symlink(self.data / "alias", "../data/2026-10/2026-10-01T15-00-00.gpx")
