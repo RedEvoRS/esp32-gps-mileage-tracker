@@ -1417,10 +1417,24 @@ def _last_edited_lookup(conn):
 def _ever_annotated(conn, trip):
     # Current fields can be empty after a deliberate clear, so check history too.
     # A merge gets a new key, so look under the same keys "Last edited" uses:
-    # the trip's own, its parts and its live merge aliases.
-    return trip_merges.annotated(trip) or any(
-        row["action"] == "annotate"
-        for row in _related_history_rows(conn, trip["trip_key"], trip.get("parts", ())))
+    # the trip's own, its parts and its live merge aliases. Only 'annotate'
+    # rows under those keys count, so ask for them directly rather than load
+    # and parse the trip's whole related history on every page view.
+    if trip_merges.annotated(trip):
+        return True
+    _, keys = _history_trip_keys(conn, trip["trip_key"], trip.get("parts", ()))
+    ordered_keys = sorted(keys)
+    # Same chunking as _related_history_rows: stay under SQLite's parameter limit.
+    for start in range(0, len(ordered_keys), 400):
+        chunk = ordered_keys[start:start + 400]
+        placeholders = ",".join("?" for _ in chunk)
+        if conn.execute(
+            "SELECT 1 FROM trip_history "
+            f"WHERE action = 'annotate' AND trip_key IN ({placeholders}) LIMIT 1",
+            chunk,
+        ).fetchone() is not None:
+            return True
+    return False
 
 
 def _last_edited(conn, trip):
