@@ -104,8 +104,11 @@ fetch_and_check() {
     gpx=$(find "$snap/data" -type f -name '*.gpx' | wc -l)
     json=$(find "$snap/data" -type f -name '*.json' | wc -l)
     log "Snapshot holds $gpx trip GPX files and $json summaries"
-    if [[ $(read_coverage_count "$snap/INFO") == unknown ]]; then
+    SNAPSHOT_LINKS_NOT_BACKED_UP=$(read_coverage_count "$snap/INFO")
+    if [[ $SNAPSHOT_LINKS_NOT_BACKED_UP == unknown ]]; then
         log "WARNING: linked items were not checked when this backup was made; inspect the backup log, fix the check error and make a fresh backup. Checking the saved links below."
+    elif [[ $SNAPSHOT_LINKS_NOT_BACKED_UP =~ ^[0-9]+$ && $SNAPSHOT_LINKS_NOT_BACKED_UP == *[1-9]* ]]; then
+        log "WARNING: this backup recorded $SNAPSHOT_LINKS_NOT_BACKED_UP linked item(s) whose contents were not saved; recover those contents from the original target or another backup, move them into data/ and make a fresh backup."
     fi
     report_link_restore_effects "$snap/data" "$snap/data" "$scratch/link-effects" restore
     if (( LINKS_NOT_RESTORED > 0 )); then
@@ -171,7 +174,9 @@ if [[ $command == check ]]; then
     if (( LINKS_RESTORED_WITH_WARNINGS > 0 )); then
         log "WARNING: $LINKS_RESTORED_WITH_WARNINGS linked item(s) will be restored as links with target problems; see warnings above"
     fi
-    if (( LINKS_NOT_RESTORED > 0 )); then
+    if [[ $SNAPSHOT_LINKS_NOT_BACKED_UP =~ ^[0-9]+$ && $SNAPSHOT_LINKS_NOT_BACKED_UP == *[1-9]* ]]; then
+        log "Restore test passed, but this backup recorded $SNAPSHOT_LINKS_NOT_BACKED_UP linked item(s) whose contents were not saved; see warnings above"
+    elif (( LINKS_NOT_RESTORED > 0 )); then
         log "Restore test passed, but $LINKS_NOT_RESTORED linked item(s) will not be restored as links; see warnings above"
     else
         log "Restore test passed"

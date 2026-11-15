@@ -831,14 +831,33 @@ class BackupScripts(unittest.TestCase):
         self.symlink(snap / "data/inside", "2026-10", True)
         return snap
 
-    def test_restore_check_warns_for_legacy_outside_link(self):
-        self.legacy_link_snapshot()
+    def test_restore_check_reports_outside_links(self):
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "missing.gpx").write_text("not copied")
+        self.symlink(self.data / "linked-month", outside, True)
+        self.assertEqual(self.run_script("backup.sh", check=False).returncode, 1)
         result = self.run_script("restore.sh", "check")
-        self.assertIn("data/linked-month", result.stderr)
-        self.assertIn("absolute link, will not be restored as a link", result.stderr)
-        self.assertIn("cannot determine", result.stderr)
+        self.assertIn("this backup recorded 1 linked item(s) whose contents were not saved", result.stderr)
         self.assertTrue(result.stderr.rstrip().endswith(
-            "Restore test passed, but 1 linked item(s) will not be restored as links; see warnings above"))
+            "Restore test passed, but this backup recorded 1 linked item(s) whose contents were not saved; see warnings above"))
+
+    def test_restore_coverage_information_states(self):
+        snap = self.legacy_link_snapshot()
+        info = (snap / "INFO").read_text()
+        for value in ("2", "unknown", "0", None):
+            (snap / "INFO").write_text(info + (f"links_not_backed_up={value}\n" if value else ""))
+            for command in ("check", "restore"):
+                with self.subTest(value=value, command=command):
+                    args = ("latest", "--yes") if command == "restore" else ()
+                    result = self.run_script("restore.sh", command, *args)
+                    self.assertIn("absolute link, will not be restored as a link", result.stderr)
+                    self.assertIn("cannot determine", result.stderr)
+                    self.assertEqual("whose contents were not saved" in result.stderr, value == "2")
+                    self.assertEqual("not checked when this backup was made" in result.stderr, value == "unknown")
+                    if command == "check" and value in ("0", None):
+                        self.assertTrue(result.stderr.rstrip().endswith(
+                            "Restore test passed, but 1 linked item(s) will not be restored as links; see warnings above"))
 
     def test_restore_outside_link_leaves_existing_real_folder(self):
         self.legacy_link_snapshot()
