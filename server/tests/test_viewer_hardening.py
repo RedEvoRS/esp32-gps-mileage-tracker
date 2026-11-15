@@ -625,6 +625,19 @@ class ViewerHardeningTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 404)
                 response.close()
 
+    def test_looping_gpx_link_is_unreadable_on_every_python(self):
+        # #729: Python 3.13's resolve() no longer raises on a link loop, so a
+        # looping GPX beside a valid summary was counted on 3.13, not on 3.12.
+        self.signed_in("admin")
+        gpx = self.viewer.DATA_ROOT / "2026-01/drive.gpx"
+        gpx.unlink()
+        self.symlink(gpx, gpx)
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual(trips, [])
+        self.assertEqual([u["trip_key"] for u in unreadable], ["2026-01/drive"])
+        self.assertEqual(unreadable[0]["problem"], "the file could not be read")
+        self.assertEqual(self.client.get("/trip/2026-01/drive").status_code, 404)
+
     def test_escaping_gpx_is_not_available_to_pages_or_exports(self):
         self.signed_in("admin")
         gpx = self.viewer.DATA_ROOT / "2026-01/drive.gpx"

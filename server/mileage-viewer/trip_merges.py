@@ -1,5 +1,6 @@
 """Viewer-owned merge records; original files and annotations stay untouched."""
 
+import errno
 import json
 import os
 import re
@@ -67,6 +68,14 @@ def checked_path(root, path, *, preserve_final=False):
         raise ValueError("Unreadable trip path") from exc
     if root not in resolved.parents:
         raise ValueError("Invalid trip path")
+    # Python 3.13+ resolve() no longer raises on a symbolic link loop, so check
+    # for one here, after containment: a loop is unreadable on every version, as
+    # on 3.12. A missing file is still allowed (callers test presence themselves).
+    try:
+        os.stat(resolved)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError("Unreadable trip path") from exc
     # Keep the resolve/ancestor check: a lexical prefix cannot see final-file
     # symlinks. lexists callers retain a safe dangling link's own identity.
     return candidate if preserve_final else resolved
