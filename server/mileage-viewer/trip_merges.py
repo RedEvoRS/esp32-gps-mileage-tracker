@@ -221,9 +221,11 @@ def unused_merge_months(conn, data_root, keys, counted_months, originals, stored
             return []
     try:
         stamps = json.loads(stored_stamp)
+        if not isinstance(stamps, list):
+            return []
         if stamps and isinstance(stamps[0], int):
             stamps = stamps[1:]  # Legacy summary-rule prefix.
-        if not isinstance(stamps, list) or len(stamps) != 2 * len(keys):
+        if len(stamps) != 2 * len(keys):
             return []
         removed = trip_log.removals(conn)
         for month in months:

@@ -359,6 +359,12 @@ class ViewerMerges(unittest.TestCase):
         broken = next(t for t in entries if t['trip_key'] == key)
         self.assertNotIn('unused_merge', broken)
         self.assertEqual(self.undo_unused(key).status_code, 409)
+        # A malformed saved stamp is not evidence either, even with matching IDs.
+        for value in ({'invalid': 0}, 42, None):
+            with closing(sqlite3.connect(self.db)) as conn, conn:
+                conn.execute('UPDATE trip_merges SET fingerprint=? WHERE trip_key=?', (json.dumps(value), key))
+            broken = next(t for t in self.viewer.load_trips()[1] if t['trip_key'] == key)
+            self.assertNotIn('unused_merge', broken)
 
     def test_matching_parts_split_between_folders_are_damage(self):
         key = self.unused_merge()
