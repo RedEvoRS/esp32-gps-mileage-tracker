@@ -2822,7 +2822,10 @@ review permanently shows saved miles, purpose, date and login, and which parts
 are now counted again, separately or in a current merge, even after closing.
 The deliberate discard confirmation and visible record allow closing without
 another acknowledgement; reopen any affected closed year before discarding.
-Healthy merge undo is unchanged for both roles. An unused-name notice adds
+Healthy merge undo is unchanged for both roles.
+CSV retains discarded and undone merges as `unreadable` rows with blank miles;
+XLSX labels them on **Unreadable trips**. Their notes keep saved miles, purpose,
+trip date, action date and login, and say which parts are counted again. An unused-name notice adds
 no saved miles or merged annotation; it does not block healthy merge
 suggestions. Moving or renaming a real month folder with file times kept also
 produces an unused-name merge when every recording matches under the new name.

@@ -2045,7 +2045,7 @@ def _flag_trips_inside_merges(trips):
         by_key[key]["inside_merge"] = {"ym": cover["ym"], "id": cover["id"], "trip_key": cover["trip_key"]}
 
 
-def selected_trips(include_history=False, loaded=None):
+def selected_trips(include_history=False, loaded=None, include_merge_history=False):
     """Use local start year, or first recorded time for partly timed trips.
 
     Returns (trips, unreadable, year, years). Unreadable trips have no
@@ -2070,6 +2070,8 @@ def selected_trips(include_history=False, loaded=None):
                 _set_export_last_edited(lookup, trip)
             for trip in selected:
                 trip["received_after_close"] = "yes" if closed and late_in_closed_year(trip, closed) else ""
+            if include_merge_history:
+                unreadable += [{**row, 'merge_history': True} for row in _merge_history_rows(conn, year, trips)]
     return selected, unreadable, year, sorted(years, reverse=True)
 
 
@@ -4605,6 +4607,10 @@ def _unreadable_values(t):
     Just what identifies it and what was typed for it. Its miles are
     unknown, so they stay blank rather than reading as zero.
     """
+    if t.get('merge_history'):
+        values = dict.fromkeys(UNREADABLE_COLUMNS, '')
+        values.update(trip_id=t['trip_key'], purpose_note=merge_history_message(t))
+        return values
     if t.get("folder"):
         values = dict.fromkeys(UNREADABLE_COLUMNS, "")
         values["trip_id"] = t["trip_key"]
@@ -4629,7 +4635,7 @@ def _unreadable_values(t):
 
 @app.route("/export.csv")
 def export_csv():
-    trips, unreadable, year, _ = selected_trips(include_history=True)
+    trips, unreadable, year, _ = selected_trips(include_history=True, include_merge_history=True)
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow([name for name, _ in EXPORT_COLUMNS] + ["row_type", LATE_COLUMN])
@@ -4657,7 +4663,7 @@ def export_csv():
 
 @app.route("/export.xlsx")
 def export_xlsx():
-    trips, unreadable, year, _ = selected_trips(include_history=True)
+    trips, unreadable, year, _ = selected_trips(include_history=True, include_merge_history=True)
     wb = Workbook()
     ws = wb.active
     ws.title = "Mileage"
@@ -4678,6 +4684,9 @@ def export_xlsx():
         sheet.append(list(UNREADABLE_COLUMNS))
         for t in unreadable:
             values = _unreadable_values(t)
+            if t.get('merge_history'):
+                values['trip_id'] += (' (unused-name merge undone)' if t['parsed_details'].get('unused_name')
+                                      else ' (damaged merge discarded)')
             if t.get("folder"):
                 suffix = {
                     "duplicate": " (extra link, trips counted elsewhere)",

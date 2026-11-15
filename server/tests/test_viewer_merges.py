@@ -217,6 +217,27 @@ class ViewerMerges(unittest.TestCase):
         review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
         self.assertIn(expected, review)
         self.assertNotIn('Saved miles (excluded)', review)
+        self.assert_history_exports(expected, 'damaged merge discarded')
+
+    def assert_history_exports(self, expected, label):
+        for suffix in ('?year=2026', ''):
+            rows = list(csv.DictReader(io.StringIO(self.client.get('/export.csv' + suffix).get_data(as_text=True))))
+            records = [r for r in rows if r['row_type'] == 'unreadable' and label.capitalize() in r['purpose_note']]
+            # The label begins a sentence in the shared formatter.
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]['distance_miles'], '')
+            self.assertEqual(records[0]['purpose_note'], expected)
+            book = load_workbook(io.BytesIO(self.client.get('/export.xlsx' + suffix).data))
+            try:
+                header, *values = list(book['Unreadable trips'].values)
+                records = [dict(zip(header, r, strict=True)) for r in values if expected == r[header.index('purpose_note')]]
+                self.assertEqual(len(records), 1)
+                self.assertTrue(records[0]['trip_id'].endswith(' (' + label + ')'))
+                self.assertIsNone(records[0]['distance_miles'])
+            finally:
+                book.close()
+        rows = list(csv.DictReader(io.StringIO(self.client.get('/export.csv?year=2025').get_data(as_text=True))))
+        self.assertFalse(any(label.capitalize() in r['purpose_note'] for r in rows))
 
     def test_discard_with_all_summaries_readable_reports_both_counted_again(self):
         self.discard_with_readable_parts()
@@ -510,6 +531,9 @@ class ViewerMerges(unittest.TestCase):
         review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
         self.assertIn('Unused-name merge undone. Saved miles: 0.732 mi; purpose: business; purpose note: merged note;', review)
         self.assertIn('Now counted again: 2026-04/a as 2026-05/a, 2026-04/b as 2026-05/b; do not add these saved miles by hand.', review)
+        with closing(sqlite3.connect(self.db)) as conn:
+            row = self.viewer._merge_history_rows(conn, 2026, trips)[0]
+        self.assert_history_exports(self.viewer.merge_history_message(row), 'unused-name merge undone')
         history = html.unescape(self.client.get('/admin/history').get_data(as_text=True))
         self.assertIn('Unused-name merge undone. ' + effect, history)
         self.assertEqual(self.close_year().status_code, 302)

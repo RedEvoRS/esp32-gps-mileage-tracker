@@ -1007,6 +1007,9 @@ including which parts are now counted again, on their own or in a current merge.
 This remains visible after closing. This deliberate confirmation and visible record are
 enough to allow closing; there is no second acknowledgement. Reopen a closed
 year before discarding. Healthy merge undo remains available to both roles.
+CSV retains discarded and undone merges as `unreadable` rows with blank miles;
+XLSX labels them on **Unreadable trips**. Their notes keep saved miles, purpose,
+trip date, action date and login, and say which parts are counted again.
 An unused-name notice adds no saved miles or
 merged annotation and does not block merge suggestions for healthy trips.
 Moving or renaming a real month folder with file times kept also produces an
