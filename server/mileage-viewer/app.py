@@ -3362,7 +3362,7 @@ gap that was uploaded after the merge is counted a second time. Open the merged 
 
 <section aria-labelledby="unreadable-heading">
 {% set missing = unreadable|select('missing_mileage')|list %}
-<h2 id="unreadable-heading">Trips whose files can't be read ({{ missing|length }}) and folder notices</h2>
+<h2 id="unreadable-heading">Trips whose files can't be read ({{ missing|length }}){% if unreadable|selectattr('folder')|list %} and folder notices{% endif %}</h2>
 {% if missing %}<p class="muted">Their miles can't be counted, so the totals above may be short.</p>{% endif %}
 <div class="review-table"><table>
 <thead><tr><th>Trip</th><th>Problem</th></tr></thead>

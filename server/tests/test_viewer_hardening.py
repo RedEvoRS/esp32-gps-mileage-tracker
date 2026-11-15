@@ -715,6 +715,30 @@ class ViewerHardeningTests(unittest.TestCase):
         self.assertIn("1 month folder(s) can't be read", text)
         self.assertIn("To rebuild a damaged summary", text)
 
+    def test_year_heading_omits_folder_notices_without_folder_entries(self):
+        self.signed_in("admin")
+        page = self.client.get("/admin/year/2026").get_data(as_text=True)
+        self.assertIn('id="unreadable-heading">Trips whose files can\'t be read (0)</h2>', page)
+        self.assertNotIn("and folder notices", page)
+        (self.viewer.DATA_ROOT / "2026-01/drive.json").write_text("{broken", encoding="utf-8")
+        page = self.client.get("/admin/year/2026").get_data(as_text=True)
+        self.assertIn('id="unreadable-heading">Trips whose files can\'t be read (1)</h2>', page)
+        self.assertNotIn("and folder notices", page)
+
+    def test_year_heading_mentions_folders_only_for_years_with_folder_entries(self):
+        (self.viewer.DATA_ROOT / "2027-02").mkdir()
+        self.signed_in("admin")
+        original = self.viewer._month_trip_names
+
+        def listing(path):
+            if path.name == "2027-02":
+                raise PermissionError("synthetic folder denial")
+            return original(path)
+
+        with patch.object(self.viewer, "_month_trip_names", side_effect=listing):
+            self.assertIn("and folder notices</h2>", self.client.get("/admin/year/2027").get_data(as_text=True))
+            self.assertNotIn("and folder notices", self.client.get("/admin/year/2026").get_data(as_text=True))
+
     def test_merged_trip_with_linked_month_part_keeps_undo(self):
         month = self.viewer.DATA_ROOT / "2026-01"
         target = self.db.parent / "outside-month"
