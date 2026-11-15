@@ -465,6 +465,7 @@ class MergeCacheTransactionTests(unittest.TestCase):
         root = self.viewer.DATA_ROOT
         path_type = type(root)
         original = path_type.glob
+        original_iterdir = path_type.iterdir
         scanned = []
 
         def glob(path, *args, **kwargs):
@@ -472,7 +473,12 @@ class MergeCacheTransactionTests(unittest.TestCase):
                 scanned.append(path)
             return original(path, *args, **kwargs)
 
-        with patch.object(path_type, "glob", glob):
+        def iterdir(path):
+            if path == root or root in path.parents:
+                scanned.append(path)
+            return original_iterdir(path)
+
+        with patch.object(path_type, "glob", glob), patch.object(path_type, "iterdir", iterdir):
             for key in (plain, merged, second):
                 with self.subTest(key=key):
                     self.assertEqual(self.client.post(f"/trip/{key}/lookup-place",
@@ -482,6 +488,6 @@ class MergeCacheTransactionTests(unittest.TestCase):
                     response.close()
         self.assertEqual(scanned, [])
         # The same patch does see a full log load, so the check is live.
-        with patch.object(path_type, "glob", glob):
+        with patch.object(path_type, "glob", glob), patch.object(path_type, "iterdir", iterdir):
             self.viewer.load_trips()
         self.assertTrue(scanned)
