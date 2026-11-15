@@ -280,7 +280,7 @@ class ViewerHardeningTests(unittest.TestCase):
                 trips, unreadable = self.viewer.load_trips()
             self.assertEqual(trips, [])
             self.assertEqual(unreadable[0]["folder_reason"], "unreadable")
-            self.assertEqual(unreadable[0]["problem"], "the folder could not be read")
+            self.assertEqual(unreadable[0]["problem"], "the folder could not be read or entered")
 
     def test_vanished_month_is_reported_and_other_month_loads(self):
         month = self.viewer.DATA_ROOT / "2026-01"
@@ -299,7 +299,7 @@ class ViewerHardeningTests(unittest.TestCase):
             trips, unreadable = self.viewer.load_trips()
         self.assertEqual([t["trip_key"] for t in trips], ["2026-02/drive"])
         self.assertEqual([t["trip_key"] for t in unreadable], ["2026-01/"])
-        self.assertEqual(unreadable[0]["problem"], "the folder could not be read")
+        self.assertEqual(unreadable[0]["problem"], "the folder could not be read or entered")
 
     @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() != 0, "requires non-root POSIX permissions")
     def test_unlistable_month_is_reported_and_pages_still_load(self):
@@ -310,7 +310,7 @@ class ViewerHardeningTests(unittest.TestCase):
         trips, unreadable = self.viewer.load_trips()
         self.assertEqual([t["trip_key"] for t in trips], ["2026-01/drive"])
         self.assertEqual([t["trip_key"] for t in unreadable], ["2026-02/"])
-        self.assertEqual(unreadable[0]["problem"], "the folder could not be read")
+        self.assertEqual(unreadable[0]["problem"], "the folder could not be read or entered")
         self.assertEqual(unreadable[0]["folder_reason"], "unreadable")
         self.signed_in("admin")
         for route in ("/", "/export.csv", "/export.xlsx"):
@@ -537,7 +537,7 @@ class ViewerHardeningTests(unittest.TestCase):
             "outside": "The folder links outside the data folder.",
             "dangling": "The folder link target is missing.",
             "loop": "The folder link forms a loop.",
-            "unreadable": "The folder could not be read.",
+            "unreadable": "The folder could not be read or entered.",
             "duplicate": "This is a link to 2026-12/, whose trips are counted there.",
             "ingest_refused": "Trips are shown and counted. The tracker cannot upload new trips for this month until the link is replaced by a real folder; the tracker keeps them queued.",
             "saved_keys": "Warning: saved trip data exists under 2026-01/, 2026-12/. Trips are shown and counted under 2026-12/; saved data under the other names is not applied. Years cannot be closed until this conflict is resolved.",
@@ -711,6 +711,14 @@ class ViewerHardeningTests(unittest.TestCase):
                 patch.object(self.viewer, "_month_blocks_all_uploads", side_effect=AssertionError("extra link check")):
             self.assertEqual(self.client.get("/?year=2026").status_code, 200)
             self.assertEqual(load.call_count, 1)
+
+    def test_healthy_month_checks_access_once_without_extra_upload_block_probe(self):
+        original = self.viewer.os.access
+        with patch.object(self.viewer.os, "access", wraps=original) as access, \
+                patch.object(self.viewer, "_month_blocks_all_uploads", side_effect=AssertionError("extra block probe")):
+            self.viewer.load_trips()
+        self.assertEqual(access.call_count, 1)
+        self.assertEqual(access.call_args.args, (self.viewer.DATA_ROOT / "2026-01", os.R_OK | os.X_OK))
 
     def test_earlier_link_keeps_saved_annotations_and_removal(self):
         target = self.linked_archive()

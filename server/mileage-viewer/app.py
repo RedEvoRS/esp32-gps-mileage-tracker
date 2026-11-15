@@ -895,6 +895,10 @@ def load_trips(conn=None, include_removed=False):
 
 def _month_trip_names(checked_month):
     """List a checked directory without following a replacement final link."""
+    # Listing an empty directory can succeed without search permission. One
+    # metadata-class check per counted month catches that case without a walk.
+    if not os.access(checked_month, os.R_OK | os.X_OK):
+        raise PermissionError(errno.EACCES, "Month folder cannot be read or entered")
     if (os.scandir in os.supports_fd and hasattr(os, "O_DIRECTORY")
             and hasattr(os, "O_NOFOLLOW")):
         fd = os.open(checked_month, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -911,7 +915,7 @@ FOLDER_PROBLEMS = {
     "outside": "the folder links outside the data folder",
     "dangling": "the folder link target is missing",
     "loop": "the folder link forms a loop",
-    "unreadable": "the folder could not be read",
+    "unreadable": "the folder could not be read or entered",
     "duplicate": "the folder is a link to another folder that is already counted",
     "saved_keys": "several month names for this folder have saved trip data",
     "ingest_refused": "trips are shown and counted",
@@ -952,7 +956,7 @@ def _month_blocks_all_uploads(month, root):
         return True
     except OSError as exc:
         return exc.errno == errno.ELOOP
-    return stat.S_ISDIR(mode) and not os.access(target, os.R_OK)
+    return stat.S_ISDIR(mode) and not os.access(target, os.R_OK | os.X_OK)
 
 
 def _month_link_problem(month, root):

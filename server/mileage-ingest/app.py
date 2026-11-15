@@ -337,7 +337,7 @@ def _stored_trip_directories(root, safe_id):
             raise UnreadableMonthError(name) from None
         try:
             mode = directory.stat().st_mode
-            if stat.S_ISDIR(mode) and not os.access(directory, os.R_OK):
+            if stat.S_ISDIR(mode) and not os.access(directory, os.R_OK | os.X_OK):
                 raise UnreadableMonthError(name)
         except PermissionError:
             raise UnreadableMonthError(name) from None

@@ -4,6 +4,7 @@ from contextlib import contextmanager
 
 
 PERMISSION_MONTH_LAYOUTS = {
+    "list-only-empty": {"directories": ["2026-02"], "links": [], "modes": {"2026-02": 0o600}},
     "no-access": {"directories": ["2026-02"], "links": [], "modes": {"2026-02": 0o000}},
     "search-only": {"directories": ["2026-02"], "links": [], "modes": {"2026-02": 0o100}},
     "locked-parent": {"directories": ["locked/2026-02"], "links": [("2026-02", "locked/2026-02")],
