@@ -414,6 +414,10 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   uploads may use a custom ID outside that namespace (installer test uploads are
   untimed copies of `sample.gpx`). Every upload looks for its ID in all month
   folders under the upload lock, so a `DISPLAY_TZ` change can't duplicate a trip.
+  Internal aliases count once; an outside or looping month link refuses all
+  GPX uploads with 503 naming the folder until repaired. Diagnostics are unaffected.
+  `install.sh --check` reports direct links in `data/` as problems; install
+  warns and continues. If listing needs a new sudo prompt, check warns it skipped links.
   Ingest runs with umask 077; `install.sh` keeps `data/` at mode 700
 - Upload limits: 16 MiB body cap (`INGEST_MAX_UPLOAD_BYTES`, ~39 h of
   nonstop driving). It protects the server's memory: the ingest parses the
@@ -457,8 +461,11 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   a trip in that DB; it never touches `./data`. Everyday logins get one "No
   trip at this address" 404 for a removed, unknown or link-refused trip page,
   and lookups answer removed like unknown; the admin gets a link diagnostic.
-  A summary, GPX or month folder linking outside `./data` makes the trip
-  unreadable (a merely missing GPX still counts). Closing a year saves its totals
+  A summary or GPX linking outside `./data` makes the trip unreadable
+  (a merely missing GPX still counts). An outside or dangling month link is
+  shown once as a folder; its trips are not listed or counted. An internal
+  alias is warned once and the real folder is counted once. Closing a year
+  saves its totals
   in `tax_years.snapshot`; the year review compares saved and current totals,
   and lists trips received after the close (ingest `_received_at` later than
   `closed_at`), undated trips and trips inside a merge. Exports mark late trips
@@ -568,6 +575,11 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   does nothing while `last-success` is fresh. A failed remote-only snapshot
   that has since been deleted from REMOTE leaves the retry list once a REMOTE
   listing succeeds; a failed listing keeps it.
+  Outside links under `data/` are reported and counted in `INFO` as
+  `links_not_backed_up`; their contents are absent. Copy and deep check still
+  run and `last-success` advances, but the run exits non-zero without a
+  heartbeat. Restore reports these links and uses rsync `--safe-links` to
+  skip them; relative internal links can be restored.
   Missing diagnostics/monitor databases are normal and recorded in `INFO`.
   Monitor discovery uses Compose config's project name and Docker's Compose
   project/volume labels, without recent config flags or logging credentials.
