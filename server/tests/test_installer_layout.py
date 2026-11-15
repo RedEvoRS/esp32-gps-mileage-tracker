@@ -104,6 +104,25 @@ class InstallerLayout(unittest.TestCase):
                 if parent != Path("."):
                     self.assertIn("!" + parent.as_posix() + "/", rules)
 
+    def test_every_viewer_static_file_is_in_the_image_and_preflight(self):
+        # The default-deny .dockerignore silently drops any static file not listed.
+        static = {path.relative_to(SERVER).as_posix()
+                  for path in (SERVER / "mileage-viewer/static").iterdir() if path.is_file()}
+        self.assertTrue(static)
+        self.assertFalse(static - allowed_files(),
+                         f"Static files excluded by .dockerignore: {sorted(static - allowed_files())}")
+        self.assertFalse(static - preflight_files(),
+                         f"Static files missing from preflight: {sorted(static - preflight_files())}")
+
+    def test_static_files_the_viewer_page_loads_ship_in_the_image(self):
+        app = (SERVER / "mileage-viewer/app.py").read_text(encoding="utf-8")
+        names = set(re.findall(r"url_for\(\s*['\"]static['\"],\s*filename=['\"]([^'\"]+)['\"]", app))
+        self.assertTrue(names)
+        for name in names:
+            path = "mileage-viewer/static/" + name
+            self.assertTrue((SERVER / path).is_file(), path)
+            self.assertIn(path, allowed_files(), f"{path} is excluded by .dockerignore")
+
     def test_release_archive_includes_all_preflight_inputs(self):
         bundle = (SERVER.parent / "tools/build_release_bundle.sh").read_text(encoding="utf-8")
         command = re.search(r"^git archive .*?(?=\n\n)", bundle, re.M | re.S)[0]
@@ -134,6 +153,7 @@ class InstallerLayout(unittest.TestCase):
                                 "mileage-viewer/trip_log.py", "mileage-viewer/users.py", "mileage-viewer/manage_users.py",
                                 "common/retention.py", "mileage-viewer/diagnostics_settings.py",
                                 "mileage-viewer/geocoding.py", "mileage-viewer/static/endpoint-places.js",
+                                "mileage-viewer/static/trip-annotation.js",
                                 "mileage-monitor/monitor.py", "mileage-monitor/gelf.py",
                                 "mileage-monitor/prometheus.py", "mileage-monitor/loki.py", "mileage-monitor/shared.py",
                                 "mileage-monitor/settings_rules.py", "mileage-monitor/Dockerfile", "monitor.env.example", "ntfy/server.yml"):
