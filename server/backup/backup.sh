@@ -184,10 +184,12 @@ fi
 
 # A copied/re-created file must survive even if the old manifest describes the
 # same good bytes. Only rehash the previous snapshot in this unusual case.
+failed=0
 if [[ -n $prev ]] && grep -Eq '^[<>ch.]f' "$link_scratch/copy-changes" \
         && cmp -s "$work/SHA256SUMS" "$SNAPSHOTS/$prev/SHA256SUMS" \
         && ! (cd "$SNAPSHOTS/$prev" && sha256sum --quiet --strict -c SHA256SUMS) >&2; then
-    log "WARNING: previous snapshot $prev differs from its own checksum list; keeping the new snapshot"
+    log "ERROR: previous snapshot $prev differs from its own checksum list and is damaged; do not use it for a restore. The new snapshot is good; check the backup disk."
+    failed=1
 fi
 
 # Keep copied files and directory mode changes even when contents still match.
@@ -425,7 +427,6 @@ deep_verify() (
     return "$failed"
 )
 
-failed=0
 deep_verify || { log "Deep check failed; today's backup was copied. Check the failed snapshots and rerun backup.sh."; failed=1; }
 if [[ $LINKS_NOT_BACKED_UP =~ ^[0-9]+$ ]] && (( LINKS_NOT_BACKED_UP > 0 )); then
     log "WARNING: $LINKS_NOT_BACKED_UP linked item(s) are not in this backup; replace each link with the real folder or file (or delete a link with nothing behind it) and rerun backup.sh."

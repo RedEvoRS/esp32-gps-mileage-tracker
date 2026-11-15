@@ -603,17 +603,29 @@ exec {real_sha} "$@"
         [old] = self.snapshots()
         damaged = self.backups / "snapshots" / old / "data" / name
         self.silently_corrupt(damaged)
-        result = self.run_script("backup.sh")
+        stale_success = "2020-01-01T00:00:00Z\n"
+        (self.backups / "last-success").write_text(stale_success)
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        ping = self.tmp / "pinged"
+        self.shim("curl", f'touch "{ping}"\n')
+        result = self.run_script("backup.sh", check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(ping.exists())
+        self.assertNotEqual((self.backups / "last-success").read_text(), stale_success)
         self.assertNotIn("Nothing changed", result.stderr)
-        self.assertIn(f"previous snapshot {old} differs from its own checksum list", result.stderr)
+        self.assertIn(f"ERROR: previous snapshot {old} differs from its own checksum list", result.stderr)
+        self.assertIn("is damaged; do not use it for a restore", result.stderr)
+        self.assertIn("The new snapshot is good; check the backup disk", result.stderr)
         self.assertEqual(len(self.snapshots()), 2)
         new = self.snapshots()[-1]
         self.assertEqual(os.readlink(self.backups / "latest"), f"snapshots/{new}")
         for root in (self.backups, self.remote):
             self.assertEqual((root / "snapshots" / new / "data" / name).read_bytes(), live.read_bytes())
+            self.verify_saved_snapshot(root / "snapshots" / new)
         self.assertNotEqual(damaged.read_bytes(), live.read_bytes())
         self.run_script("restore.sh", "check")
         self.assertIn("Nothing changed", self.run_script("backup.sh").stderr)
+        self.assertTrue(ping.exists())
         self.assertEqual(len(self.snapshots()), 2)
 
     def test_damaged_latest_with_same_size_and_time_is_replaced(self):

@@ -576,7 +576,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   Weekly deep checks rotate older local/REMOTE copies and record
   `BACKUP_DIR/verify-state`. `last-success` advances once today's backup has
   completed and been copied off-host, before the deep check. A deep failure
-  still exits non-zero (failed Debian unit / Unraid `last_attempt_status`,
+  or detected damage in the previous local snapshot still exits non-zero
+  (failed Debian unit / Unraid `last_attempt_status`,
   reported as a problem by `install.sh --check`) and withholds the `PING_URL`
   heartbeat. The next nightly run retries; Unraid's hourly overdue catch-up
   does nothing while `last-success` is fresh. A failed remote-only snapshot
