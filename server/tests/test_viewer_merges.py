@@ -5,6 +5,7 @@ import csv
 import io
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -278,6 +279,86 @@ class ViewerMerges(unittest.TestCase):
         path.write_bytes(path.read_bytes() + b" ")
         rebuilt = self.viewer.load_trips()[0][0]["distance_miles"]
         self.assertNotEqual(rebuilt, 123.0)
+
+    def stored_merge(self, key):
+        with closing(sqlite3.connect(self.db)) as conn:
+            return conn.execute("SELECT summary, fingerprint FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
+
+    def test_stamp_has_no_inode_so_a_restored_copy_keeps_its_merged_summary(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        # A summary built under earlier rules must survive a move to a new disk.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            summary, _ = self.stored_merge(key)
+            conn.execute("UPDATE trip_merges SET summary=? WHERE trip_key=?",
+                         (json.dumps({**json.loads(summary), "distance_miles": 123.0}), key))
+        stored = self.stored_merge(key)
+        self.assertTrue(all(len(entry) == 3 for entry in json.loads(stored[1])))
+        copy = self.root / "restored"
+        shutil.copytree(self.data, copy, copy_function=shutil.copy2)
+        self.assertNotEqual((self.month / "a.gpx").stat().st_ino, (copy / "2026-04" / "a.gpx").stat().st_ino)
+        with patch.object(self.viewer, "DATA_ROOT", copy), patch.object(
+                self.viewer.trip_merges, "combined_summary", side_effect=AssertionError("rebuilt")):
+            trips, unreadable = self.viewer.load_trips()
+        self.assertFalse(unreadable)
+        self.assertEqual(trips[0]["distance_miles"], 123.0)
+        self.assertEqual(self.stored_merge(key), stored)
+
+    def test_four_field_stamp_from_an_older_release_is_rewritten_once_without_a_rebuild(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        summary, fresh = self.stored_merge(key)
+        old = json.dumps([[*entry, 987654 + i] for i, entry in enumerate(json.loads(fresh))])
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("UPDATE trip_merges SET fingerprint=? WHERE trip_key=?", (old, key))
+            # Count later writes to the row.
+            conn.execute("CREATE TABLE writes (n INTEGER)")
+            conn.execute("CREATE TRIGGER count_writes AFTER UPDATE ON trip_merges BEGIN INSERT INTO writes VALUES (1); END")
+
+        def writes():
+            with closing(sqlite3.connect(self.db)) as conn:
+                return conn.execute("SELECT COUNT(*) FROM writes").fetchone()[0]
+        with patch.object(self.viewer.trip_merges, "combined_summary", side_effect=AssertionError("rebuilt")):
+            self.viewer.load_trips()
+            self.assertEqual(self.stored_merge(key), (summary, fresh))
+            self.assertEqual(writes(), 1)
+            self.viewer.load_trips()
+            self.assertEqual(writes(), 1)
+
+    def test_changed_size_or_time_still_rebuilds_a_merged_trip(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        helper = self.viewer.trip_merges
+        path = self.month / "a.json"
+        with patch.object(helper, "combined_summary", wraps=helper.combined_summary) as compute:
+            self.viewer.load_trips()
+            self.assertEqual(compute.call_count, 0)
+            # Same size, later modification time.
+            st = path.stat()
+            os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
+            self.viewer.load_trips()
+            self.assertEqual(compute.call_count, 1)
+            # Different size, same modification time as the last load saw.
+            st = path.stat()
+            path.write_bytes(path.read_bytes() + b" ")
+            os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+            self.viewer.load_trips()
+            self.assertEqual(compute.call_count, 2)
+            self.viewer.load_trips()
+            self.assertEqual(compute.call_count, 2)
+        self.assertEqual(json.loads(self.stored_merge(key)[1]), json.loads(helper.fingerprint(self.data, [a, b])))
+
+    def test_same_size_same_time_replacement_no_longer_rebuilds_a_merged_trip(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        self.merged_key(self.merge(a, b))
+        path = self.month / "a.gpx"
+        st = path.stat()
+        replacement = path.with_name("a.new")
+        replacement.write_bytes(path.read_bytes())
+        os.utime(replacement, ns=(st.st_atime_ns, st.st_mtime_ns))
+        os.replace(replacement, path)
+        with patch.object(self.viewer.trip_merges, "combined_summary", side_effect=AssertionError("rebuilt")):
+            self.viewer.load_trips()
 
     def test_chain_and_old_merged_link_then_split_to_all_originals(self):
         a, b, c = self.trip("a", 0), self.trip("b", 120, .001), self.trip("c", 240, .002)

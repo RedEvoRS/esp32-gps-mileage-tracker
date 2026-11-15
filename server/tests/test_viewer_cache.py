@@ -319,7 +319,7 @@ class MergeCacheTransactionTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT fingerprint FROM trip_merges WHERE trip_key=?", (merged,)).fetchone()[0],
                              self.viewer.trip_merges.fingerprint(self.data, [first, second]))
 
-    def test_merge_replacement_with_same_stamps_refreshes_and_missing_part_does_not_write(self):
+    def test_merge_replacement_with_same_stamps_is_not_refreshed_and_missing_part_does_not_write(self):
         first, _, _ = self.make_merge()
         path = self.data / (first + ".gpx")
         stamp = path.stat()
@@ -330,7 +330,9 @@ class MergeCacheTransactionTests(unittest.TestCase):
         temporary.replace(path)
         with patch.object(self.viewer.trip_merges, "combined_summary", wraps=self.viewer.trip_merges.combined_summary) as rebuild:
             self.viewer.load_trips()
-            self.assertEqual(rebuild.call_count, 1)
+            # A merged trip's stamp has no inode, so a restore keeps it; the
+            # per-process summary cache for plain trips still uses the inode.
+            self.assertEqual(rebuild.call_count, 0)
         path.unlink()
         with closing(sqlite3.connect(self.db)) as writer:
             writer.execute("BEGIN IMMEDIATE")
