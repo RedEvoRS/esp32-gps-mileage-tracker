@@ -460,6 +460,32 @@ class BackupScripts(unittest.TestCase):
         self.assertTrue((self.backups / "last-success").exists())
         self.assertFalse(ping.exists())
 
+    def test_restore_warning_check_failure_preserves_coverage_and_heartbeat(self):
+        self.conf_append("PING_URL=https://ping.invalid/backup\n")
+        ping = self.tmp / "ping"
+        self.shim("curl", f'touch "{ping}"\n')
+        real_rsync = shutil.which("rsync")
+        self.shim("rsync", f'''\
+for arg in "$@"; do
+    if [[ $arg == --files-from=* ]]; then exit 1; fi
+done
+exec {real_rsync} "$@"
+''')
+        result = self.run_script("backup.sh")
+        self.assertIn("couldn't check how data links will restore", result.stderr)
+        self.assertNotIn("couldn't check data for links outside it", result.stderr)
+        self.assertIn("links_not_backed_up=0\n", (self.backups / "latest/INFO").read_text())
+        self.assertTrue(ping.exists())
+        self.assertTrue((self.backups / "last-success").exists())
+        self.assertFalse(list((self.backups / "latest").glob(".absolute-links*")))
+        ping.unlink()
+        self.symlink(self.data / "outside", "../outside")
+        result = self.run_script("backup.sh", check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("couldn't check how data links will restore", result.stderr)
+        self.assertIn("links_not_backed_up=1\n", (self.backups / "latest/INFO").read_text())
+        self.assertFalse(ping.exists())
+
     def test_unknown_coverage_readers_and_recovery_never_dedupes(self):
         self.conf_append("KEEP_RECENT=10\n")
         self.run_script("backup.sh")
