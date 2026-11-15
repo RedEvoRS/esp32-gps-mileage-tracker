@@ -2717,8 +2717,13 @@ aren't counted. A link that leads outside `data/` (even if its target is
 missing) or loops also makes ingest refuse GPX uploads with 503 until fixed.
 Replace it with a real folder or mount the disk there; its trips can't be
 removed one by one. A month link to a folder that another month name already
-uses is only a notice: its trips are counted once, under the other name, so
-delete the extra link. If the warning says a month folder can't be read, the
+uses is normally a notice: its trips are counted once, under the other name, so
+delete the extra link. When only links reach a folder, the viewer keeps the name
+that has saved trip data. If several names have saved data, a warning names
+them; review their annotations, removals and merges before removing links.
+The viewer counts trips under the first saved name in sorted order, leaves the
+database rows in place, and refuses to close a year until the conflict is fixed.
+If the warning says a month folder can't be read, the
 viewer could not inspect or list it. Check that the folder (or its link's
 target) still exists and that its disk is available. To test access as the
 viewer's user, run `sudo -u '#1000' ls -la ~/mileage-tracker/data/<month>/`.

@@ -848,9 +848,22 @@ root.
 A month link to a folder inside `data/` that no other month name uses (for
 example `2026-01` → `archive`) is read as that month, without a warning. If
 two month names reach the same folder, its trips count once, under the real
-month folder (or else the first link name in sorted order), and the other name
+month folder, and the other name
 gets a notice saying where they are counted (`row_type=folder_notice` in CSV).
 A notice doesn't mean miles are missing; remove the extra link.
+
+When only links reach that folder, the viewer keeps the name with saved trip
+data: annotations, removals, edit history, merges and old merge addresses, or
+trip keys in a closed-year snapshot. If none has saved data, it uses the first
+name in sorted order. Adding an earlier link therefore keeps existing saved
+data and year locks attached to the same trips. A real month folder still wins.
+If several link names hold saved data, the viewer uses the first of those names
+in sorted order and shows a warning naming all of them (`row_type=folder_warning`
+in CSV). The trips are counted, but saved data under the other names is not
+applied. Review the annotations, removals and merges before removing any link;
+the viewer does not move or combine database rows. Merge suggestions and closing
+any year wait until this conflict is resolved. Existing year locks remain in
+force; folder warnings are not counted as missing mileage in year snapshots.
 
 `install.sh --check` reports each symbolic link directly inside `data/` as
 a problem, with a hint to use a real folder or mount the other disk there.

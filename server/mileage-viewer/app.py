@@ -913,6 +913,7 @@ FOLDER_PROBLEMS = {
     "loop": "the folder link forms a loop",
     "unreadable": "the folder could not be read",
     "duplicate": "the folder is a link to another folder that is already counted",
+    "saved_keys": "several month names for this folder have saved trip data",
 }
 
 
@@ -947,6 +948,10 @@ def _month_sort_key(month):
 
 
 def folder_description(entry):
+    if entry["folder_reason"] == "saved_keys":
+        names = ", ".join(name + "/" for name in entry["saved_months"])
+        return (f"Warning: saved trip data exists under {names}. Trips are shown and counted under "
+                f"{entry['counted_as']}/; saved data under the other names is not applied")
     if entry["folder_reason"] == "duplicate":
         return f"is a link to {entry['counted_as']}/, whose trips are counted there"
     return entry["problem"]
@@ -957,12 +962,82 @@ def folder_hint(entry, role):
         return "Please ask the admin to fix it."
     if entry["folder_reason"] == "duplicate":
         return "Remove the extra link."
+    if entry["folder_reason"] == "saved_keys":
+        return "Review the saved annotations, removals and merges under these names before removing links. Resolve this conflict before closing the year."
     if entry["folder_reason"] == "unreadable":
         return "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only."
     return "Replace the link with the real folder, or mount the other disk at that path."
 
 
-app.jinja_env.globals.update(folder_hint=folder_hint, folder_description=folder_description)
+def missing_mileage(entry):
+    return entry.get("folder_reason") not in ("duplicate", "saved_keys")
+
+
+def _folder_row_type(entry):
+    if entry.get("folder_reason") == "saved_keys":
+        return "folder_warning"
+    return "unreadable_folder" if missing_mileage(entry) else "folder_notice"
+
+
+app.jinja_env.globals.update(folder_hint=folder_hint, folder_description=folder_description,
+                            missing_mileage=missing_mileage)
+app.jinja_env.tests["missing_mileage"] = missing_mileage
+
+
+def _saved_month_names(conn, names):
+    """One query per link-only conflict, using existing trip-key indexes.
+
+    Closed-year snapshots also retain trip keys. They are small year records,
+    not an indexed trip table; inspect them only for these unusual conflicts.
+    """
+    indexed_keys = (("annotations", "trip_key"), ("trip_removals", "trip_key"),
+                    ("trip_history", "trip_key"), ("trip_merges", "trip_key"),
+                    ("trip_merge_parts", "part_key"), ("trip_merge_parts", "merge_key"),
+                    ("trip_merge_aliases", "alias_key"))
+    tests = [f"EXISTS (SELECT 1 FROM {table} WHERE {column} >= low AND {column} < high)"
+             for table, column in indexed_keys]
+    tests.append("""EXISTS (SELECT 1 FROM tax_years,
+            json_each(CASE WHEN json_valid(snapshot) THEN snapshot ELSE '{}' END, '$.trip_keys')
+            WHERE json_each.value >= low AND json_each.value < high)""")
+    values = ",".join("(?,?,?)" for _ in names)
+    params = [value for name in names for value in (name, name + "/", name + "0")]
+    query = f"WITH candidates(name, low, high) AS (VALUES {values}) SELECT name FROM candidates WHERE "
+    return sorted(row[0] for row in conn.execute(query + " OR ".join(tests), params))
+
+
+def _month_choices(conn, root):
+    """Resolve month identities without listing any month's trip files."""
+    try:
+        months = [p for p in DATA_ROOT.iterdir() if trip_merges.YM_RE.fullmatch(p.name)]
+    except OSError:
+        months = []
+    groups, problems, counted = {}, [], {}
+    for month in sorted(months, key=_month_sort_key):
+        cause = _month_link_problem(month, root)
+        if cause:
+            problems.append((month.name, cause, None, ()))
+            continue
+        try:
+            target = trip_merges.checked_path(root, month)
+            if stat.S_ISDIR(target.stat().st_mode):
+                groups.setdefault(target, []).append(month)
+        except ValueError:
+            problems.append((month.name, "outside", None, ()))
+        except OSError:
+            problems.append((month.name, "unreadable", None, ()))
+    for candidates in groups.values():
+        saved = []
+        # Sorted real folders always win. Only competing links need DB work.
+        if len(candidates) > 1 and candidates[0].is_symlink():
+            saved = _saved_month_names(conn, [p.name for p in candidates])
+        chosen = next((p for p in candidates if saved and p.name == saved[0]), candidates[0])
+        for month in candidates:
+            counted[month.name] = chosen.name
+            if month != chosen:
+                problems.append((month.name, "duplicate", chosen.name, ()))
+        if len(saved) > 1:
+            problems.append((chosen.name, "saved_keys", chosen.name, saved))
+    return counted, problems
 
 
 def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None):
@@ -992,9 +1067,11 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
         json_paths = []
         refused_months = set()
 
-        def refuse_month(ym, reason="outside", counted_as=None):
+        def refuse_month(ym, reason="outside", counted_as=None, saved_months=()):
             if ym not in refused_months:
-                refused_months.add(ym)
+                if reason not in ("duplicate", "saved_keys"):
+                    refused_months.add(ym)
+                    unreadable[:] = [u for u in unreadable if u["ym"] != ym]
                 problem = FOLDER_PROBLEMS.get(reason)
                 if reason == "ancestor":
                     reason = "outside"
@@ -1002,22 +1079,16 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                 unreadable.append({"folder": True, "ym": ym, "id": "", "trip_key": f"{ym}/",
                                    "has_gpx": False, "problem": problem,
                                    "folder_reason": reason, "counted_as": counted_as,
+                                   "saved_months": saved_months,
                                    "refused_file": "folder", "problem_file": "folder"})
 
-        # Only month names are trip identities accepted by the routes. Ignore
-        # other names before checking or listing their targets.
-        try:
-            months = [path for path in DATA_ROOT.iterdir() if trip_merges.YM_RE.fullmatch(path.name)]
-        except OSError:
-            months = []
-        counted_directories = {}
-        # Prefer real month directories to preserve their annotation keys;
-        # link-only targets use the first month name in sorted order.
-        for month in sorted(months, key=_month_sort_key):
-            cause = _month_link_problem(month, root)
-            if cause:
-                refuse_month(month.name, cause)
+        counted, problems = _month_choices(conn, root)
+        for problem in problems:
+            refuse_month(*problem)
+        for name, chosen in counted.items():
+            if name != chosen:
                 continue
+            month = DATA_ROOT / name
             try:
                 checked_month = trip_merges.checked_path(root, month)
             except ValueError:
@@ -1026,14 +1097,10 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
             try:
                 if not stat.S_ISDIR(checked_month.stat().st_mode):
                     continue
-                if checked_month in counted_directories:
-                    refuse_month(month.name, "duplicate", counted_directories[checked_month])
-                    continue
                 names = _month_trip_names(checked_month)
             except OSError:
                 refuse_month(month.name, "unreadable")
                 continue
-            counted_directories[checked_month] = month.name
             for name in names:
                 path = Path(name)
                 if path.suffix in (".json", ".gpx"):
@@ -1675,7 +1742,8 @@ def _trip_local_year(trip):
 def year_members(trips, unreadable, year):
     """The trips of one local year: the single rule behind list, exports and review."""
     return ([t for t in trips if _trip_local_year(t) == year],
-            [t for t in unreadable if _may_start_in(t["ym"], year)])
+            [t for t in unreadable if any(_may_start_in(ym, year)
+                                         for ym in (t.get("saved_months") or [t["ym"]]))])
 
 
 def trip_neighbours(trip_key, trips, year=None):
@@ -1778,7 +1846,7 @@ def year_figures(members, unreadable):
     for trip in members:
         counts[trip.get("category") if trip.get("category") in CATEGORIES else "unclassified"] += 1
     # A duplicate alias loses no mileage, so it is not missing at year close.
-    return {"trips": len(members), "unreadable": sum(t.get("folder_reason") != "duplicate" for t in unreadable), "totals": totals, "counts": counts,
+    return {"trips": len(members), "unreadable": sum(missing_mileage(t) for t in unreadable), "totals": totals, "counts": counts,
             "trip_keys": sorted(t["trip_key"] for t in members)}
 
 
@@ -2305,7 +2373,7 @@ LIST_HTML = """
 <div class="wrap">
   {% if unreadable %}
   <div class="warn" role="alert">
-    {% set missing = unreadable|rejectattr('folder_reason', 'equalto', 'duplicate')|list %}
+    {% set missing = unreadable|select('missing_mileage')|list %}
     {% if missing %}<b>{{ missing|rejectattr("folder")|list|length }} trip file(s) can't be read.{% set folders = missing|selectattr("folder")|list %}{% if folders %} {{ folders|length }} month folder(s) can't be read.{% endif %}</b>
     Their miles can't be counted, so the totals below may be short. The
     exports list these trips as unreadable, without miles. To rebuild a
@@ -2314,7 +2382,7 @@ LIST_HTML = """
     <ul>
       {% for u in unreadable %}
       {% if u.get('folder') %}
-      <li><code>{{ u.trip_key }}</code> (month folder): {{ folder_description(u) }}{% if u.folder_reason != 'duplicate' %}; none of its trips are shown or counted.{% endif %}
+      <li><code>{{ u.trip_key }}</code> (month folder): {{ folder_description(u) }}{% if missing_mileage(u) %}; none of its trips are shown or counted.{% endif %}
         {{ folder_hint(u, g.role) }}
       </li>
       {% else %}
@@ -3258,7 +3326,7 @@ gap that was uploaded after the merge is counted a second time. Open the merged 
 </section>
 
 <section aria-labelledby="unreadable-heading">
-{% set missing = unreadable|rejectattr('folder_reason', 'equalto', 'duplicate')|list %}
+{% set missing = unreadable|select('missing_mileage')|list %}
 <h2 id="unreadable-heading">Trips whose files can't be read ({{ missing|length }}) and folder notices</h2>
 {% if missing %}<p class="muted">Their miles can't be counted, so the totals above may be short.</p>{% endif %}
 <div class="review-table"><table>
@@ -3441,7 +3509,10 @@ def _change_year(raw_year, closing_it):
         if closing_it:
             # Save the totals as they stand, so a later change can't go unseen.
             # The history row carries the figures; the key list stays in tax_years.
-            snapshot = year_figures(*_live_year_members(conn, year))
+            all_trips, all_unreadable = _load_trips(conn)
+            if any(t.get("folder_reason") == "saved_keys" for t in all_unreadable):
+                abort(409, description="Several month names for one folder have saved trip data. Resolve the folder warning on the trip list before closing a year.")
+            snapshot = year_figures(*year_members(all_trips, all_unreadable, year))
             trip_log.close_year(conn, year, g.user, snapshot)
             details = {"snapshot": {k: v for k, v in snapshot.items() if k != "trip_keys"}}
         else:
@@ -4040,7 +4111,7 @@ def export_csv():
     for t in unreadable:
         values = _unreadable_values(t)
         writer.writerow(
-            [_csv_safe(values.get(name, "")) for name, _ in EXPORT_COLUMNS] + ["folder_notice" if t.get("folder_reason") == "duplicate" else "unreadable_folder" if t.get("folder") else "unreadable", ""]
+            [_csv_safe(values.get(name, "")) for name, _ in EXPORT_COLUMNS] + [_folder_row_type(t) if t.get("folder") else "unreadable", ""]
         )
     for category, miles in mileage_totals(trips).items():
         # Keep the CSV rectangular and mark totals explicitly, so consumers

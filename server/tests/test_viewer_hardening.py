@@ -473,6 +473,117 @@ class ViewerHardeningTests(unittest.TestCase):
         self.assertEqual(trips[0]["purpose_note"], "example")
         self.assertEqual(trips[0]["category"], "business")
 
+    def linked_archive(self, name="2026-02"):
+        root = self.viewer.DATA_ROOT
+        (root / "2026-01").rename(root / "archive")
+        self.symlink(root / name, root / "archive", directory=True)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("UPDATE annotations SET trip_key=?", (name + "/drive",))
+        return root / "archive"
+
+    def test_earlier_link_keeps_saved_annotations_and_removal(self):
+        target = self.linked_archive()
+        self.signed_in("admin")
+        self.assertEqual(self.client.post("/trip/2026-02/drive/annotate", data={
+            "csrf_token": "known-token", "category": "business", "purpose_note": "kept note",
+        }).status_code, 302)
+        self.symlink(self.viewer.DATA_ROOT / "2026-01", target, directory=True)
+        trips, _ = self.viewer.load_trips()
+        self.assertEqual([(t["trip_key"], t["category"], t["purpose_note"]) for t in trips],
+                         [("2026-02/drive", "business", "kept note")])
+        self.assertEqual(self.client.post("/trip/2026-02/drive/remove", data={
+            "csrf_token": "known-token", "reason": "example removal",
+        }).status_code, 302)
+        self.assertEqual(self.viewer.load_trips()[0], [])
+        self.assertEqual(self.viewer.load_trips(include_removed=True)[0][0]["trip_key"], "2026-02/drive")
+
+    def test_link_choice_checks_each_persisted_trip_key_and_closed_snapshot(self):
+        target = self.linked_archive()
+        self.symlink(self.viewer.DATA_ROOT / "2026-01", target, directory=True)
+        statements = [
+            "INSERT INTO annotations (trip_key) VALUES ('2026-02/drive')",
+            "INSERT INTO trip_removals VALUES ('2026-02/drive', 'example', 'admin', '')",
+            "INSERT INTO trip_history (trip_key,actor,actor_role,at,action,details) VALUES ('2026-02/drive','admin','admin','','annotate','{}')",
+            "INSERT INTO trip_merges (trip_key,summary,fingerprint) VALUES ('2026-02/merge-example','{}','[]')",
+            "INSERT INTO trip_merge_parts VALUES ('2026-02/drive','2026-03/merge-example',0)",
+            "INSERT INTO trip_merge_parts VALUES ('2026-03/drive','2026-02/merge-example',0)",
+            "INSERT INTO trip_merge_aliases VALUES ('2026-02/merge-old','2026-03/merge-example')",
+            "INSERT INTO tax_years VALUES (2026,'admin','', '{\"trip_keys\":[\"2026-02/drive\"]}')",
+        ]
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            for statement in statements:
+                for table in ("annotations", "trip_removals", "trip_history", "trip_merges",
+                              "trip_merge_parts", "trip_merge_aliases", "tax_years"):
+                    conn.execute(f"DELETE FROM {table}")
+                conn.execute(statement)
+                with self.subTest(statement=statement):
+                    counted, problems = self.viewer._month_choices(conn, self.viewer.DATA_ROOT.resolve())
+                    self.assertEqual(counted["2026-01"], "2026-02")
+                    self.assertFalse(any(p[1] == "saved_keys" for p in problems))
+
+    def test_link_only_conflicts_use_one_query_and_no_rows_use_sorted_order(self):
+        target = self.linked_archive()
+        self.symlink(self.viewer.DATA_ROOT / "2026-01", target, directory=True)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("DELETE FROM annotations")
+            queries = []
+            conn.set_trace_callback(queries.append)
+            counted, _ = self.viewer._month_choices(conn, self.viewer.DATA_ROOT.resolve())
+            self.assertEqual(counted["2026-02"], "2026-01")
+            self.assertEqual(len(queries), 1)
+            self.assertIn("WITH candidates", queries[0])
+        # An ordinary folder plus an alias needs no saved-key query.
+        (self.viewer.DATA_ROOT / "2026-02").unlink()
+        (self.viewer.DATA_ROOT / "2026-01").unlink()
+        target.rename(self.viewer.DATA_ROOT / "2026-02")
+        self.symlink(self.viewer.DATA_ROOT / "2026-01", self.viewer.DATA_ROOT / "2026-02", directory=True)
+        with patch.object(self.viewer, "_saved_month_names", side_effect=AssertionError("extra DB query")):
+            self.assertEqual(self.viewer.load_trips()[0][0]["trip_key"], "2026-02/drive")
+
+    def test_conflicting_saved_names_warn_and_refuse_year_close(self):
+        target = self.linked_archive()
+        self.symlink(self.viewer.DATA_ROOT / "2026-01", target, directory=True)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO annotations (trip_key,category) VALUES ('2026-01/drive','personal')")
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual(trips[0]["trip_key"], "2026-01/drive")
+        warning = next(t for t in entries if t["folder_reason"] == "saved_keys")
+        self.assertEqual(warning["saved_months"], ["2026-01", "2026-02"])
+        self.assertEqual(self.viewer.year_figures(trips, entries)["unreadable"], 0)
+        self.signed_in("admin")
+        for path in ("/", "/admin/year/2026", "/export.csv"):
+            page = self.client.get(path).get_data(as_text=True)
+            self.assertIn("Warning: saved trip data exists under 2026-01/, 2026-02/", page)
+            self.assertNotIn("totals below may be short", page)
+        response = self.client.post("/admin/year/2026/close", data={"csrf_token": "known-token", "confirm": "yes"})
+        self.assertEqual(response.status_code, 409)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM tax_years").fetchone()[0], 0)
+
+    def test_closed_year_snapshot_keeps_link_key_and_lock_without_annotation(self):
+        target = self.linked_archive()
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("DELETE FROM annotations")
+        self.signed_in("admin")
+        self.assertEqual(self.client.post("/admin/year/2026/close", data={
+            "csrf_token": "known-token", "confirm": "yes"}).status_code, 302)
+        self.symlink(self.viewer.DATA_ROOT / "2026-01", target, directory=True)
+        self.assertEqual(self.viewer.load_trips()[0][0]["trip_key"], "2026-02/drive")
+        self.assertEqual(self.client.post("/trip/2026-02/drive/annotate", data={
+            "csrf_token": "known-token", "category": "business"}).status_code, 409)
+
+    def test_earlier_link_keeps_live_merge_parts(self):
+        target = self.linked_archive()
+        (target / "drive.gpx").write_bytes((roles.SERVER / "sample.gpx").read_bytes())
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("DELETE FROM annotations")
+            conn.execute("INSERT INTO trip_merges (trip_key,summary,fingerprint) VALUES ('2026-02/merge-example','{}','[]')")
+            conn.execute("INSERT INTO trip_merge_parts VALUES ('2026-02/drive','2026-02/merge-example',0)")
+        self.symlink(self.viewer.DATA_ROOT / "2026-01", target, directory=True)
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual([t["trip_key"] for t in trips], ["2026-02/merge-example"])
+        self.assertFalse(any(t.get("parts") for t in entries))
+
     def test_merged_trip_with_linked_month_part_keeps_undo(self):
         month = self.viewer.DATA_ROOT / "2026-01"
         target = self.db.parent / "outside-month"
