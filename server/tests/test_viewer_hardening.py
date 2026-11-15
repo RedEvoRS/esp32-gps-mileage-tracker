@@ -655,6 +655,19 @@ class ViewerHardeningTests(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertFalse(entries[0]["all_uploads_refused"])
 
+    def test_upload_alert_gives_role_specific_advice(self):
+        entry = {"folder": True, "ym": "2027-02", "trip_key": "2027-02/", "id": "",
+                 "folder_reason": "outside", "problem": self.viewer.FOLDER_PROBLEMS["outside"],
+                 "all_uploads_refused": True}
+        for role in ("admin", "editor"):
+            self.signed_in(role)
+            with patch.object(self.viewer, "_load_trips", return_value=([], [entry])):
+                page = html.unescape(self.client.get("/?year=2020").get_data(as_text=True))
+            alert = page.split('<b>Uploads are blocked.</b>', 1)[1].split('</div>', 1)[0]
+            expected = ("Review the folder warnings in All years and follow their repair steps." if role == "admin"
+                        else "Please tell the admin about these folders.")
+            self.assertIn(expected, alert)
+
     def test_loop_blocks_all_uploads_when_resolve_leaves_it_unresolved(self):
         month = self.viewer.DATA_ROOT / "2026-03"
         self.symlink(month, month, directory=True)

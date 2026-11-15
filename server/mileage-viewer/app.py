@@ -2501,7 +2501,8 @@ LIST_HTML = """
   {% if upload_blocks %}
   <div class="warn" role="alert"><b>Uploads are blocked.</b> {{ all_uploads_refusal }}
     Folders: {% for entry in upload_blocks %}<code>{{ entry.trip_key }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
-    <a href="{{ url_for('index') }}">Review the folder warnings in All years.</a>
+    {% if g.role == 'admin' %}<a href="{{ url_for('index') }}">Review the folder warnings in All years and follow their repair steps.</a>
+    {% else %}Please tell the admin about these folders.{% endif %}
   </div>
   {% endif %}
   {% if unreadable %}
@@ -3330,7 +3331,7 @@ first recorded time), the same as the trip list and exports.</p>
 <h2 id="status-heading">Status</h2>
 {% if upload_blocks %}<p class="warn" role="alert"><b>Uploads are blocked.</b> {{ all_uploads_refusal }}
 Folders: {% for entry in upload_blocks %}<code>{{ entry.trip_key }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
-<a href="{{ url_for('index') }}">Review the folder warnings in All years.</a></p>{% endif %}
+<a href="{{ url_for('index') }}">Review the folder warnings in All years and follow their repair steps.</a></p>{% endif %}
 {% for entry in saved_conflicts %}<p class="warn" role="alert">{{ folder_message(entry, g.role) }}</p>{% endfor %}
 {% if closed %}
 <p><span class="tag other">Closed for edits</span> by {{ closed.closed_by }} on {{ fmt_date(closed.closed_at) }}.
