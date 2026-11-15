@@ -1,4 +1,4 @@
-﻿"""Checks for links directly inside the installer's data directory."""
+"""Checks for links directly inside the installer's data directory."""
 
 import os
 from pathlib import Path
@@ -11,6 +11,7 @@ INSTALL = Path(__file__).resolve().parents[1] / "install.sh"
 HARNESS = r'''
 source <(sed '$d' "$INSTALL")
 MODE=$TEST_MODE
+SUDO_READY=${TEST_SUDO_READY:-no}
 CONTAINER_UID=$(id -u)
 cd "$WORK"
 setup_data_dir
@@ -27,8 +28,8 @@ class InstallerDataLinks(unittest.TestCase):
         self.data = self.work / "data"
         self.data.mkdir(mode=0o700)
 
-    def run_setup(self, mode):
-        env = dict(os.environ, INSTALL=str(INSTALL), WORK=str(self.work), TEST_MODE=mode)
+    def run_setup(self, mode, **extra):
+        env = dict(os.environ, INSTALL=str(INSTALL), WORK=str(self.work), TEST_MODE=mode, **extra)
         return subprocess.run(["bash", "-c", HARNESS], env=env, text=True,
                               capture_output=True, timeout=30)
 
@@ -71,3 +72,29 @@ class InstallerDataLinks(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("data/ must be a real directory, never a symlink.", result.stdout)
         self.assertNotIn("LATER SECTION", result.stdout)
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can always list data/")
+    def test_unreadable_data_uses_sudo_only_when_this_run_has_it(self):
+        # A fake sudo stands in for root: it logs its arguments and prints the
+        # NUL-separated listing that root would see.
+        bin_dir = self.work / "bin"
+        bin_dir.mkdir()
+        log = self.work / "sudo.log"
+        fake = bin_dir / "sudo"
+        fake.write_text("#!/bin/sh\n"
+                        f"printf '%s\\n' \"$*\" >> '{log}'\n"
+                        "printf 'data/2026-01\\0'\n")
+        fake.chmod(0o755)
+        self.data.chmod(0)
+        self.addCleanup(self.data.chmod, 0o700)
+        path = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+        result = self.run_setup("check", PATH=path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("weren't checked", result.stdout)
+        self.assertIn("FAILURES=0", result.stdout)
+        self.assertFalse(log.exists(), "check mode must not start a sudo prompt")
+        result = self.run_setup("check", PATH=path, TEST_SUDO_READY="yes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("FAIL  data/2026-01 is a symbolic link", result.stdout)
+        self.assertIn("FAILURES=1", result.stdout)
+        self.assertIn("find data -mindepth 1 -maxdepth 1 -type l -print0", log.read_text())

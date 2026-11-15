@@ -931,18 +931,22 @@ setup_data_dir() {
 
     # List only the directory entries, without following their targets.
     local links link quoted hint
-    links=$(mktemp) || { problem "Cannot check data/ for symbolic links"; return 0; }
     local -a list_links=(find data -mindepth 1 -maxdepth 1 -type l -print0)
     if [[ ! -r data || ! -x data ]]; then
-        if [[ $MODE == install ]]; then
+        # Use sudo only where this run already has it (install mode, or a
+        # --check that needed it earlier); never start a new prompt here.
+        if [[ $MODE == install || $SUDO_READY == yes ]]; then
             need_sudo
             list_links=(as_root "${list_links[@]}")
-        elif [[ $MILEAGE_PLATFORM != unraid ]]; then
-            list_links=(sudo -n "${list_links[@]}")
+        else
+            warn "Couldn't list data/, so links inside it weren't checked" \
+                "Run install.sh to repair data/ (owner UID $CONTAINER_UID, mode 700)."
+            return 0
         fi
     fi
+    links=$(mktemp) || { problem "Cannot check data/ for symbolic links"; return 0; }
+    TMP_FILES+=("$links")
     if ! "${list_links[@]}" > "$links"; then
-        rm -f -- "$links"
         problem "Cannot check data/ for symbolic links" "Run install.sh with access to data/."
         return 0
     fi
@@ -955,7 +959,6 @@ setup_data_dir() {
             warn "$quoted is a symbolic link" "$hint"
         fi
     done < "$links"
-    rm -f -- "$links"
 }
 
 setup_env() {
