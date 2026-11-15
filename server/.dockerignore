@@ -35,6 +35,7 @@ mileage-viewer/static/**
 !mileage-viewer/static/leaflet.css
 !mileage-viewer/static/gpx.js
 !mileage-viewer/static/endpoint-places.js
+!mileage-viewer/static/trip-annotation.js
 !mileage-monitor/
 mileage-monitor/**
 !mileage-monitor/Dockerfile
