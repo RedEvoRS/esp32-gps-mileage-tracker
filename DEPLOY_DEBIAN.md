@@ -2719,11 +2719,11 @@ Replace it with a real folder or mount the disk there; its trips can't be
 removed one by one. A month link to a folder that another month name already
 uses is only a notice: its trips are counted once, under the other name, so
 delete the extra link. If the warning says a month folder can't be read, the
-viewer could not inspect or list it: check that the folder (or its link's
-target) still exists, that its disk is available, and that UID 1000 may read
-it (`sudo ls -ld ~/mileage-tracker/data/<month>`; like the rest of `data/`, it
-should belong to UID 1000, for example after
-`sudo chown -R 1000:1000 ~/mileage-tracker/data/<month>`). Find out what made a file link, then replace it with the
+viewer could not inspect or list it. Check that the folder (or its link's
+target) still exists and that its disk is available. To test access as the
+viewer's user, run `sudo -u '#1000' ls -la ~/mileage-tracker/data/<month>/`.
+If that is denied, look at the ownership, permissions and ACLs of the folder
+it lists and of its parent folders, and correct the actual cause. Find out what made a file link, then replace it with the
 real file (for example
 from a backup snapshot, as above) or delete it. Sending the GPX to ingest again
 does not fix a link. The admin can still remove such a trip from the log.
