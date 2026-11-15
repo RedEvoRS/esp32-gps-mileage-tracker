@@ -16,6 +16,7 @@
     if (autofillNote) autofillNote.hidden = true;
   });
   function autofill() {
+    if (!destination || destination.dataset.autofill !== 'true') return;
     if (!(autoAllowed && autoLookup) || !destination || !endSuggestion || destinationTouched) return;
     const untouchedFill = autofilled !== null && destination.value === autofilled;
     if (destination.value.trim() !== '' && !untouchedFill) return;
@@ -45,10 +46,18 @@
       const label = container.querySelector('[data-place-label]');
       label.textContent = 'Looking up place…';
       try {
-        const response = await fetch(form.action, {
+        const lookup = () => fetch(form.action, {
           method: 'POST', credentials: 'same-origin', body: new FormData(form),
         });
-        const data = await response.json();
+        let response = await lookup();
+        let data = await response.json();
+        if (response.status === 429 && typeof data.retry_after === 'number' &&
+            data.retry_after >= 0 && data.retry_after <= 60) {
+          label.textContent = 'Waiting for the lookup provider\u2026';
+          await new Promise(resolve => setTimeout(resolve, data.retry_after * 1000));
+          response = await lookup();
+          data = await response.json();
+        }
         if (!response.ok || typeof data.label !== 'string') {
           failed.add(form);
           label.textContent = data.error || 'Address lookup failed. Try again later.';

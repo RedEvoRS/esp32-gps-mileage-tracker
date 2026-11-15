@@ -1413,6 +1413,14 @@ def _last_edited_lookup(conn):
     return lookup
 
 
+def _ever_annotated(conn, trip):
+    # Current fields can be empty after a deliberate clear, so check history too.
+    return trip_merges.annotated(trip) or conn.execute(
+        "SELECT 1 FROM trip_history WHERE trip_key = ? AND action = 'annotate' LIMIT 1",
+        (trip["trip_key"],),
+    ).fetchone() is not None
+
+
 def _last_edited(conn, trip):
     """Find the latest edit across a trip's current and historical merge keys."""
     return _last_edited_lookup(conn)(trip)
@@ -2271,7 +2279,7 @@ TRIP_HTML = """
       <label class="purpose-choice purpose-none"><input type="radio" name="category" value="" {% if not t.category %}checked{% endif %}><span>None</span></label>
     </fieldset>
     <label for="destination">Destination / place</label>
-    <input type="text" name="destination" id="destination" maxlength="{{ annotation_max }}" value="{{ t.destination or '' }}">
+    <input type="text" name="destination" id="destination"{% if destination_autofill %} data-autofill="true"{% endif %} maxlength="{{ annotation_max }}" value="{{ t.destination or '' }}">
     {% if geocoder_enabled and 'end' in places %}
     <div class="end-suggestion"><span role="status" id="end-suggestion">End: {% if places['end'] is none %}not looked up yet{% elif places['end'] %}{{ places['end'] }}{% else %}no mapped address found{% endif %}</span>
     <button type="button" class="btn secondary" id="use-end-place"
@@ -3402,6 +3410,7 @@ def trip_view(ym, trip_id):
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         conn.row_factory = sqlite3.Row
         last_edited = _last_edited(conn, t)
+        destination_autofill = not _ever_annotated(conn, t)
         closed = trip_log.closed_years(conn)
     lock_year = locked_year(t, closed) if closed else None
     year_lock = {"year": lock_year, **closed[lock_year]} if lock_year else None
@@ -3423,7 +3432,7 @@ def trip_view(ym, trip_id):
                                   previous_trip=newer_trip, next_trip=older_trip,
                                   geocoder_enabled=GEOCODER.enabled, geocoder_auto_lookup=GEOCODER_AUTO_LOOKUP, places=places, merge_next=merge_next,
                                   merge_block_reason=merge_block_reason,
-                                  last_edited=last_edited, year_lock=year_lock,
+                                  last_edited=last_edited, year_lock=year_lock, destination_autofill=destination_autofill,
                                   merge_conflict=bool(merge_next and trip_merges.annotated(t) and trip_merges.annotated(merge_next)))
 
 
@@ -3444,6 +3453,9 @@ def lookup_place(ym, trip_id):
     try:
         label = GEOCODER.lookup(endpoints[f"{endpoint}_latitude"], endpoints[f"{endpoint}_longitude"])
     except GeocodeError as exc:
+        if exc.retry_after is not None:
+            return (jsonify(error=str(exc), retry_after=exc.retry_after), exc.status,
+                    {"Retry-After": str(math.ceil(exc.retry_after))})
         return jsonify(error=str(exc)), exc.status
     return jsonify(label=label)
 

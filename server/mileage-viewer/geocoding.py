@@ -25,10 +25,11 @@ _fetch_process = None
 class GeocodeError(Exception):
     """A safe, fixed message suitable for display; never an upstream error."""
 
-    def __init__(self, message, status=503, cooldown=300):
+    def __init__(self, message, status=503, cooldown=300, retry_after=None):
         super().__init__(message)
         self.status = status
         self.cooldown = cooldown
+        self.retry_after = retry_after
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -149,7 +150,8 @@ class Geocoder:
                 else:
                     refuse = True
                 if refuse or wait > deadline - time.monotonic():
-                    raise GeocodeError("Address lookup is busy or cooling down. Try again later.", 429)
+                    raise GeocodeError("Address lookup is busy or cooling down. Try again later.", 429,
+                                       retry_after=remaining if gate[1] == "" else None)
             # The transaction and connection have ended before sleeping.
             time.sleep(wait)
         # Worker aborts (SystemExit/KeyboardInterrupt) still run finally. Treat
