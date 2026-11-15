@@ -4,19 +4,37 @@ const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../mileage-viewer/static/trip-annotation.js'), 'utf8');
 
-// Fake radios: like real ones, clicking checks the clicked one and unchecks the others.
+// Fake radios in one group: checking one unchecks the others, as in a browser.
 function setup(values, checkedValue) {
-  const inputs = values.map(value => ({value, checked: value === checkedValue, handlers: {},
-    addEventListener(type, fn) { this.handlers[type] = fn; }}));
+  const inputs = values.map(value => {
+    let on = value === checkedValue;
+    const input = {value, handlers: {}, addEventListener(type, fn) { this.handlers[type] = fn; },
+      uncheck() { on = false; }};
+    Object.defineProperty(input, 'checked', {
+      get() { return on; },
+      set(next) {
+        if (next) inputs.forEach(other => { if (other !== input) other.uncheck(); });
+        on = Boolean(next);
+      },
+    });
+    return input;
+  });
   vm.runInNewContext(source, {document: {
     querySelectorAll(selector) { return selector === '.purpose-choices input' ? inputs : []; }}});
   const by = value => inputs.find(input => input.value === value);
-  const checked = () => (inputs.find(input => input.checked) || {}).value;
+  function checked() {
+    const on = inputs.filter(input => input.checked);
+    assert.equal(on.length, 1, 'exactly one purpose is checked');
+    return on[0].value;
+  }
+  // A browser checks the clicked radio, runs its click handlers, then fires
+  // change only if the radio was not already checked before the click.
   function click(value) {
     const input = by(value);
-    inputs.forEach(other => { other.checked = other === input; });
+    const before = input.checked;
+    input.checked = true;
     input.handlers.click();
-    input.handlers.change();
+    if (!before) input.handlers.change();
   }
   return {click, checked};
 }

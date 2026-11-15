@@ -107,7 +107,7 @@ class InstallerLayout(unittest.TestCase):
     def test_every_viewer_static_file_is_in_the_image_and_preflight(self):
         # The default-deny .dockerignore silently drops any static file not listed.
         static = {path.relative_to(SERVER).as_posix()
-                  for path in (SERVER / "mileage-viewer/static").iterdir() if path.is_file()}
+                  for path in (SERVER / "mileage-viewer/static").rglob("*") if path.is_file()}
         self.assertTrue(static)
         self.assertFalse(static - allowed_files(),
                          f"Static files excluded by .dockerignore: {sorted(static - allowed_files())}")
@@ -116,7 +116,8 @@ class InstallerLayout(unittest.TestCase):
 
     def test_static_files_the_viewer_page_loads_ship_in_the_image(self):
         app = (SERVER / "mileage-viewer/app.py").read_text(encoding="utf-8")
-        names = set(re.findall(r"url_for\(\s*['\"]static['\"],\s*filename=['\"]([^'\"]+)['\"]", app))
+        names = set(re.findall(
+            r"url_for\(\s*['\"]static['\"]\s*,\s*filename\s*=\s*['\"]([^'\"]+)['\"]", app))
         self.assertTrue(names)
         for name in names:
             path = "mileage-viewer/static/" + name
