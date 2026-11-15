@@ -62,7 +62,7 @@ import json
 import math
 import unicodedata
 from threading import Lock
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote_from_bytes, unquote, urlsplit
 from xml.parsers import expat
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
@@ -1111,7 +1111,9 @@ def _require_counted_month_address():
         abort(409, description=message)
     target = url_for(request.endpoint, **{**address, "ym": chosen})
     if request.query_string:
-        target += "?" + request.query_string.decode("latin-1")
+        # Keep existing escapes and delimiters; encode raw bytes without a
+        # latin-1 -> UTF-8 round trip. Location must be an ASCII URI.
+        target += "?" + quote_from_bytes(request.query_string, safe="!$&'()*+,-./:;=?@_%~")
     return redirect(target)
 
 

@@ -787,6 +787,23 @@ class ViewerHardeningTests(unittest.TestCase):
         self.symlink(self.viewer.DATA_ROOT / "2026-01", target, directory=True)
         self.assert_alias_routes("2026-01", "2026-02")
 
+    def test_alias_read_redirect_preserves_query_bytes_and_existing_escapes(self):
+        self.symlink(self.viewer.DATA_ROOT / "2026-12", self.viewer.DATA_ROOT / "2026-01", directory=True)
+        self.signed_in("admin")
+        cases = [(b"x=\xe9", "x=%E9"), (b"x=\xc3\xa9", "x=%C3%A9"),
+                 (b"x=%c3%a9&year=2026&x=one+two&flag&value=a/b?c=d%26e",
+                  "x=%c3%a9&year=2026&x=one+two&flag&value=a/b?c=d%26e"),
+                 (b"x=\r\n", "x=%0D%0A")]
+        for route in ("trip", "gpx"):
+            for method in ("GET", "HEAD"):
+                for raw, expected in cases:
+                    with self.subTest(route=route, method=method, raw=raw):
+                        response = self.client.open(f"/{route}/2026-12/drive", method=method,
+                                                    environ_overrides={"QUERY_STRING": raw.decode("latin-1")})
+                        self.assertEqual(response.status_code, 302)
+                        self.assertEqual(response.headers["Location"], f"/{route}/2026-01/drive?{expected}")
+                        response.close()
+
     def test_ordinary_trip_route_needs_no_month_resolution_scan(self):
         self.signed_in("admin")
         with patch.object(self.viewer, "_month_choices", side_effect=AssertionError("extra month scan")):
