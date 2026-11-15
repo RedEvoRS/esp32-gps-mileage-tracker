@@ -330,17 +330,21 @@ settings_stop() {
     fi
 }
 
-settings_request() {  # RULE|quote|value VALUE; result in SETTINGS_REPLY
+settings_query() {  # RULE|quote|value VALUE; result in SETTINGS_REPLY
     settings_start
     if ! (trap '' PIPE; printf '%s\0%s\0' "$1" "$2" >&"$SETTINGS_IN") 2> /dev/null \
         || ! IFS= read -r -d '' -u "$SETTINGS_OUT" SETTINGS_REPLY; then
         die "The monitor settings checker stopped." "Check Python or Docker, then run install.sh again." >&2
     fi
-    if [[ $SETTINGS_REPLY != +* ]]; then
+    if [[ $SETTINGS_REPLY != +* ]]; then return 1; fi
+    SETTINGS_REPLY=${SETTINGS_REPLY:1}
+}
+
+settings_request() {
+    if ! settings_query "$1" "$2"; then
         die "A monitor.env value could not be read safely." \
             "Use one line per setting and single-quote literal dollar signs (DEPLOY_DEBIAN.md Step 11b)." >&2
     fi
-    SETTINGS_REPLY=${SETTINGS_REPLY:1}
 }
 
 settings_valid() { settings_request "$1" "$2"; [[ $SETTINGS_REPLY == yes ]]; }
@@ -1253,7 +1257,14 @@ setup_geocoder() {
     local url agent gap auto kind='' answer error key
     local -a values=()
     for key in URL USER_AGENT INTERVAL AUTO_LOOKUP; do
-        settings_request value "$(env_raw viewer.env "VIEWER_GEOCODER_$key")"
+        if ! settings_query value "$(env_raw viewer.env "VIEWER_GEOCODER_$key")"; then
+            local hint="For VIEWER_GEOCODER_$key, use one KEY=value per line, with single quotes around the value (DEPLOY_DEBIAN.md Address lookup)."
+            if [[ $MODE == check ]]; then
+                problem "Invalid address lookup settings in viewer.env" "$hint"
+                return 0
+            fi
+            die "Invalid address lookup settings in viewer.env" "$hint"
+        fi
         values+=("$SETTINGS_REPLY")
     done
     url=${values[0]} agent=${values[1]:-GPSMileageTracker/1.0}
