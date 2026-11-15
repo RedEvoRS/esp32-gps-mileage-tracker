@@ -10,6 +10,7 @@ import json
 import os
 import re
 from pathlib import Path
+import socket
 import sqlite3
 import subprocess
 import tempfile
@@ -41,10 +42,6 @@ class EndpointPlaceTests(unittest.TestCase):
         cls.handlers = []
 
         class Handler(BaseHTTPRequestHandler):
-            def setup(self):
-                cls.handlers.append((threading.current_thread(), cls.mode))
-                super().setup()
-
             def do_GET(self):
                 cls.received.append((self.path, dict(self.headers)))
                 cls.entered.set()
@@ -99,10 +96,17 @@ class EndpointPlaceTests(unittest.TestCase):
             def log_message(self, *args):
                 pass
 
-        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.thread.start()
-        cls.provider_url = f"http://127.0.0.1:{cls.server.server_port}/reverse"
+        class ProviderServer(ThreadingHTTPServer):
+            def process_request(self, request, client_address):
+                handler = threading.Thread(target=self.process_request_thread,
+                                           args=(request, client_address), daemon=True)
+                # Register on the accept side, even if the new thread has not
+                # reached Handler.setup() when the test body finishes.
+                cls.handlers.append((handler, cls.mode))
+                handler.start()
+
+        cls.server_class = ProviderServer
+        cls.handler_class = Handler
         with patch.dict(os.environ, {
             "INGEST_DATA_ROOT": str(cls.root / "data"),
             "VIEWER_DB_PATH": str(cls.root / "annotations.db"),
@@ -110,7 +114,8 @@ class EndpointPlaceTests(unittest.TestCase):
             "VIEWER_PASSWORD_HASH": generate_password_hash("pw", "pbkdf2:sha256:1000"),
             "VIEWER_SECRET_KEY": "endpoint-test-key-" * 4,
             "DISPLAY_TZ": "UTC",
-            "VIEWER_GEOCODER_URL": cls.provider_url,
+            # Each test supplies its own listening socket and URL in setUp.
+            "VIEWER_GEOCODER_URL": "http://127.0.0.1:1/reverse",
             "VIEWER_GEOCODER_USER_AGENT": "MileageTests/1.0",
             "VIEWER_GEOCODER_INTERVAL": "",
         }):
@@ -126,10 +131,6 @@ class EndpointPlaceTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.release.set()
-        cls.server.shutdown()
-        cls.server.server_close()
-        cls.thread.join()
         cls.temp.cleanup()
 
     def setUp(self):
@@ -153,12 +154,23 @@ class EndpointPlaceTests(unittest.TestCase):
         with self.client.session_transaction() as session:
             session.update(user="driver", pw_tag=self.viewer._password_tag(), csrf="test-csrf")
         self.route = "/trip/2026-10/sample/lookup-place"
+        self.server = cls.server_class(("127.0.0.1", 0), cls.handler_class)
+        self.provider_url = f"http://127.0.0.1:{self.server.server_port}/reverse"
+        self.viewer.GEOCODER.url = self.provider_url
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       kwargs={"poll_interval": .01}, daemon=True)
+        self.thread.start()
 
     def tearDown(self):
+        # Unblock handlers before shutdown; shutdown stops only the accept loop.
         self.release.set()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=3)
         # A killed fetch child closes its socket, but a slow provider handler
         # may notice only on its next write. Finish those handlers before the
-        # next test changes the provider's mode, response or clock.
+        # next test changes the provider's mode, response or clock. The accept
+        # loop has stopped, so the list cannot gain any more handlers.
         try:
             for handler, _mode in self.handlers:
                 handler.join(timeout=3)
@@ -167,6 +179,58 @@ class EndpointPlaceTests(unittest.TestCase):
         finally:
             # A stuck handler belongs to this test, not every subsequent test.
             self.handlers.clear()
+
+    def test_late_provider_handler_is_tracked_and_joined(self):
+        started = threading.Event()
+        begin_handler = threading.Event()
+        process_request = self.server.process_request_thread
+
+        def delayed_handler(*args):
+            started.set()
+            if begin_handler.wait(3):
+                process_request(*args)
+
+        with patch.object(self.server, "process_request_thread", delayed_handler), \
+                socket.create_connection(self.server.server_address, timeout=3) as connection:
+            connection.sendall(b"GET /late-handler HTTP/1.0\r\n\r\n")
+            try:
+                self.assertTrue(started.wait(3))
+                self.assertFalse(self.entered.is_set())
+                self.assertEqual(len(self.handlers), 1)
+                handler, mode = self.handlers[0]
+                self.assertEqual(mode, "normal")
+                shutdown = self.server.shutdown
+
+                def stop_accepting():
+                    shutdown()
+                    # Force setup() to start only after the accept loop stops.
+                    begin_handler.set()
+
+                with patch.object(self.server, "shutdown", stop_accepting):
+                    self.tearDown()
+                self.assertFalse(handler.is_alive())
+                self.assertFalse(self.thread.is_alive())
+                self.assertEqual(self.handlers, [])
+                self.assertEqual([path for path, _headers in self.received], ["/late-handler"])
+            finally:
+                begin_handler.set()
+
+    def test_provider_teardown_releases_blocked_handler(self):
+        self.release.clear()
+        with socket.create_connection(self.server.server_address, timeout=3) as connection:
+            connection.sendall(b"GET /blocked-handler HTTP/1.0\r\n\r\n")
+            self.assertTrue(self.entered.wait(3))
+            handler, _mode = self.handlers[0]
+            shutdown = self.server.shutdown
+
+            def stop_accepting():
+                self.assertTrue(self.release.is_set())
+                shutdown()
+
+            with patch.object(self.server, "shutdown", stop_accepting):
+                self.tearDown()
+            self.assertFalse(handler.is_alive())
+            self.assertEqual(self.handlers, [])
 
     def post(self, endpoint="end", **extra):
         return self.client.post(self.route, data={"csrf_token": "test-csrf", "endpoint": endpoint, **extra})
