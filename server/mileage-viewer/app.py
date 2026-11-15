@@ -3783,7 +3783,8 @@ def _merge_history_counted_parts(conn, rows, trips):
         for index, part in enumerate(details.get('parts', [])):
             month, name = part.split('/')
             alternate = counted.get(month, month) + '/' + name
-            match = part if part in current else alternate if alternate in current else None
+            recorded = details.get('counted_part_keys', {}).get(part, part)
+            match = next((key for key in (part, recorded, alternate) if key in current), None)
             if match is None and isinstance(stamps, list) and len(stamps) > 2 * index + 1:
                 saved = json.dumps([stamps[2 * index + 1]])  # readable JSON suffices for ordinary totals
                 matches = []
@@ -4370,7 +4371,8 @@ def _undo_merge(conn, key, keys, *, damaged=False, unused=None):
             'original_annotations': restored,
         }
         if unused is not None:
-            details.update(unused_name=True, undo_effect=unused_merge_undo_effect(unused))
+            details.update(unused_name=True, undo_effect=unused_merge_undo_effect(unused),
+                           counted_part_keys=dict(zip(keys, [t['trip_key'] for t in unused['counted_parts']], strict=True)))
         trip_log.record(conn, key, 'discard_damaged_merge' if damaged else 'split', details,
                         actor=g.user, actor_role=g.role)
     else:

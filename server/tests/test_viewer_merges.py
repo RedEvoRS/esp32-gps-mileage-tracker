@@ -642,6 +642,7 @@ class ViewerMerges(unittest.TestCase):
             self.assertEqual(details['dropped']['purpose_note'], 'merged note')
             self.assertEqual(details['original_annotations']['2026-04/a']['category'], 'personal')
             self.assertEqual(details['undo_effect'], effect)
+            self.assertEqual(details['counted_part_keys'], {'2026-04/a': '2026-05/a', '2026-04/b': '2026-05/b'})
         review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
         self.assertIn('Unused-name merge undone. Saved miles: 0.732 mi; purpose: business; purpose note: merged note;', review)
         self.assertIn('Now counted again: 2026-04/a as 2026-05/a, 2026-04/b as 2026-05/b; do not add these saved miles by hand.', review)
@@ -667,6 +668,10 @@ class ViewerMerges(unittest.TestCase):
     def test_unused_undo_record_tracks_mixed_missing_and_remerged_parts(self):
         key, _ = self.moved_merge()
         self.assertEqual(self.undo_unused(key).status_code, 302)
+        # Once verified at undo time, the counted names remain evidence even
+        # if ingest subsequently rewrites a still-counted source summary.
+        source = self.data / '2026-05/a.json'
+        source.write_bytes(source.read_bytes() + b'\n')
         self.assert_discard_current_statement(
             'Now counted again: 2026-04/a as 2026-05/a, 2026-04/b as 2026-05/b; do not add these saved miles by hand.',
             undone=True)
