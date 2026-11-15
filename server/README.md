@@ -1555,6 +1555,9 @@ warm-cache test of 3,000 files (1 GB) took 0.46 s versus 0.14 s without it.
 A slow mounted destination reading 10–30 MB/s would need about 33–100 s per GB
 read; off-host copying keeps its metadata test, with the newest copy checked
 every run and older copies checked in the weekly rotation.
+The comparison holds the ingest upload lock while reading every live file
+(perhaps 15–30 s on a cold disk with years of trips), so an arriving upload may
+wait past the tracker's 10 s reply timeout and be retried later.
 
 Each SQLite snapshot is consistent individually; the databases and trip files
 are captured in sequence, rather than in one shared transaction.
