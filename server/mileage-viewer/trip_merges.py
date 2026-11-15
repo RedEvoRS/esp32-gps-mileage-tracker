@@ -305,8 +305,8 @@ def next_trip(trip, trips, unreadable, removed=()):
             if damaged_start is not None and not current_start <= damaged_start <= start:
                 continue
             if not _known_device(damaged_device):
-                return None, "Cannot establish the next trip: an unreadable summary with an unknown device may fall between these recordings. Repair the summary before merging."
-            return None, "Cannot establish the next trip: an unreadable summary from this device may fall between these recordings. Repair the summary before merging."
+                return None, "Cannot establish the next trip: an unreadable trip with an unknown device may fall between these recordings. Repair its files before merging."
+            return None, "Cannot establish the next trip: an unreadable trip from this device may fall between these recordings. Repair its files before merging."
         return candidate, ""
     return None, ""
 

@@ -16,7 +16,7 @@ import test_viewer_roles as roles
 
 
 ADMIN_REFUSAL = ("This trip&#39;s files can&#39;t be opened: its summary, track or month folder links outside "
-                 "the data folder, so the viewer won&#39;t read them. The trip list and exports flag it. "
+                 "the data folder, so the viewer won&#39;t read them. If it is in the log, the trip list and exports flag it. "
                  "Replace the link with the real file to show the trip again.")
 
 BS = chr(92)
@@ -238,7 +238,15 @@ class ViewerHardeningTests(unittest.TestCase):
         with self.viewer._trip_read(trip_key="2026-01/drive") as (_, targeted, damaged):
             self.assertEqual(targeted, trips)
             self.assertEqual(damaged, unreadable)
-        self.assertEqual(self.viewer.mileage_totals(trips)["all"], 0)
+        # Mix a readable recording with the refused one so counting either
+        # recording incorrectly changes the total.
+        summary = self.viewer.DATA_ROOT / "2026-01/drive.json"
+        readable = json.loads(summary.read_text())
+        readable["distance_miles"] = 2.5
+        summary.with_name("readable.json").write_text(json.dumps(readable))
+        counted, _ = self.viewer.load_trips()
+        self.assertEqual(self.viewer.mileage_totals(counted)["all"], 2.5)
+        summary.with_name("readable.json").unlink()
         for route in ("/", "/export.csv", "/export.xlsx", "/admin/year/2026"):
             with self.subTest(route=route):
                 response = self.client.get(route)
@@ -248,17 +256,27 @@ class ViewerHardeningTests(unittest.TestCase):
                     try:
                         self.assertEqual(book["Mileage"].max_row, 1)
                         self.assertEqual(book["Totals"]["D2"].value, 0)
+                        self.assertIn("Unreadable trips", book.sheetnames)
+                        rows = list(book["Unreadable trips"].values)
+                        self.assertEqual([row[rows[0].index("trip_id")] for row in rows[1:]], ["drive"])
                         text = str([list(sheet.values) for sheet in book])
                     finally:
                         book.close()
                 else:
                     text = response.get_data(as_text=True)
-                if route.endswith(".xlsx"):
-                    self.assertIn("drive", text)
-                elif route.endswith(".csv"):
+                if route.endswith(".csv"):
                     self.assertIn(",unreadable,", text)
-                else:
+                elif not route.endswith(".xlsx"):
                     self.assertIn("the file could not be read", text)
+                    self.assertIn("2026-01/drive.gpx", text)
+                    self.assertNotIn("2026-01/drive.json", text)
+                    self.assertNotIn("(no GPX either)", text)
+                    if route == "/":
+                        self.assertIn("1 trip file(s) can't be read.", text)
+                        self.assertIn("damaged summary from its GPX", text)
+                    else:
+                        self.assertIn("Trips whose files can't be read", text)
+                self.assertNotIn("refused_file", text)
                 self.assertNotIn("outside-track-sentinel", text)
                 self.assertNotIn(str(target), text)
                 if route.endswith(".csv"):
@@ -267,6 +285,59 @@ class ViewerHardeningTests(unittest.TestCase):
         response = self.client.get("/gpx/2026-01/drive")
         self.assertEqual(response.status_code, 404)
         self.assertNotIn(b"outside-track-sentinel", response.data)
+
+    def assert_refused_gpx_label(self, suffix, problem):
+        self.signed_in("admin")
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual(trips, [])
+        self.assertEqual(len(unreadable), 1)
+        self.assertEqual(unreadable[0]["refused_file"], "gpx")
+        self.assertEqual(unreadable[0]["problem"], problem)
+        with self.viewer._trip_read(trip_key="2026-01/drive") as (_, targeted, damaged):
+            self.assertEqual(targeted, trips)
+            self.assertEqual(damaged, unreadable)
+        for route in ("/", "/admin/year/2026"):
+            with self.subTest(route=route):
+                response = self.client.get(route)
+                self.assertEqual(response.status_code, 200)
+                text = response.get_data(as_text=True)
+                self.assertIn(f"2026-01/drive.{suffix}</code>", text)
+                self.assertIn(problem, text)
+                self.assertNotIn("(no GPX either)", text)
+                self.assertNotIn("outside-file-sentinel", text)
+                if suffix == "json":
+                    self.assertIn("(its GPX links outside the data folder)", text)
+
+    def test_missing_summary_with_refused_gpx_names_track(self):
+        summary = self.viewer.DATA_ROOT / "2026-01/drive.json"
+        summary.unlink()
+        gpx = summary.with_suffix(".gpx")
+        gpx.unlink()
+        target = self.db.parent / "outside.gpx"
+        target.write_text("outside-file-sentinel", encoding="utf-8")
+        self.symlink(gpx, target)
+        self.assert_refused_gpx_label("gpx", "the file could not be read")
+
+    def test_damaged_summary_with_refused_gpx_keeps_summary_problem(self):
+        summary = self.viewer.DATA_ROOT / "2026-01/drive.json"
+        summary.write_text("{", encoding="utf-8")
+        _, problem = self.viewer.read_summary(summary, root=self.viewer.DATA_ROOT.resolve())
+        self.assertTrue(problem)
+        gpx = summary.with_suffix(".gpx")
+        gpx.unlink()
+        target = self.db.parent / "outside.gpx"
+        target.write_text("outside-file-sentinel", encoding="utf-8")
+        self.symlink(gpx, target)
+        self.assert_refused_gpx_label("json", problem)
+
+    def test_refused_month_never_labels_track_missing(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        target = self.db.parent / "outside-month"
+        month.rename(target)
+        (target / "drive.json").write_text("outside-file-sentinel", encoding="utf-8")
+        (target / "drive.gpx").write_text("outside-file-sentinel", encoding="utf-8")
+        self.symlink(month, target, directory=True)
+        self.assert_refused_gpx_label("json", "the file could not be read")
 
     def test_missing_gpx_keeps_summary_readable_and_miles_counted(self):
         (self.viewer.DATA_ROOT / "2026-01/drive.gpx").unlink()
