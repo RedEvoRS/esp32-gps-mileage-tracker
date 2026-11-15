@@ -335,7 +335,10 @@ def _stored_trip_directories(root, safe_id):
                 path.stat()
             except (FileNotFoundError, NotADirectoryError):
                 continue
-            matches.append(directory)
+            # A month link to another month folder in the data folder is the
+            # same folder, not a second copy of the trip (#725).
+            if directory not in matches:
+                matches.append(directory)
             break
     return matches
 

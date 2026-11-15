@@ -173,6 +173,19 @@ class UploadSafety(unittest.TestCase):
             self.symlink(self.root / "not-a-month", Path(outside), directory=True)
             self.assertEqual(self.upload().status_code, 200)
 
+    def test_internal_alias_month_link_retry_is_not_a_conflict(self):
+        # #725: a month link to another month folder in the data folder made
+        # the same folder match twice, so a plain retry got 409.
+        first = self.upload()
+        self.assertEqual(first.status_code, 200)
+        month = Path(first.json["stored_as"]).parent
+        self.symlink(self.root / "2099-12", self.root / month, directory=True)
+        before = sorted(p.name for p in (self.root / month).iterdir())
+        retry = self.upload()
+        self.assertEqual(retry.status_code, 200, retry.get_data(as_text=True))
+        self.assertEqual(retry.json["stored_as"], first.json["stored_as"])
+        self.assertEqual(sorted(p.name for p in (self.root / month).iterdir()), before)
+
     def test_dangling_outside_month_link_refuses(self):
         with tempfile.TemporaryDirectory() as outside:
             self.symlink(self.root / "2026-03", Path(outside) / "missing", directory=True)
