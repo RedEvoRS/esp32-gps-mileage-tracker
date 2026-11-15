@@ -786,7 +786,7 @@ threads. It checks file identity, size and nanosecond modification time on
 each scan, rereads changed files and drops vanished entries. A restart clears
 the cache. Annotations, removals and year locks always come from the database.
 Ordinary reads use a consistent read transaction; only a changed merged
-summary (or an older fingerprint needing file identities) reserves the database
+summary (or an older merge fingerprint being rewritten once) reserves the database
 writer and rechecks the log before saving. SQLite can still briefly delay a
 writer's commit until a read transaction finishes.
 
@@ -1071,9 +1071,13 @@ drift. Missing or invalid recordings cannot be looked up. The **End:** line bene
 Click its **Use** button to replace the editable Destination field, check it,
 then **Save**. Use stays disabled until a suggestion is available.
 With **Auto lookup: On**, an empty Destination is filled with the end
-suggestion as soon as it is known, and a note under it says so. A destination
-that was saved, typed or chosen with **Use** is never replaced. The filled
-text is not saved until you click **Save**, so check it first.
+suggestion as soon as it is known, and a note under it says so. This happens
+only on a trip that has never had an annotation saved: once **Save** has stored
+a purpose, note or destination for a trip, its Destination is never filled
+automatically again, even if you later clear it and save it empty. **Use**
+still fills it in one click. A destination that was saved, typed or chosen
+with **Use** is never replaced. The filled text is not saved until you click
+**Save**, so check it first.
 Lookup never changes a saved annotation. The saved destination appears in the
 trip list and CSV/XLSX exports through the existing annotation flow. Exports do
 not perform lookup or add unreviewed address suggestions.
@@ -1108,15 +1112,24 @@ a total budget of two seconds:
 - **After a provider failure**, it returns the busy message at once: the
   failure cooldown below applies.
 
-If the budget runs out, it returns the usual busy message. The database write
+If the budget runs out, it returns the usual busy message (HTTP 429). When the
+gate is closed only by the normal gap after a success (for example, an interval
+above two seconds, so **Look up both places** reaches the second endpoint
+early), that reply also says how long the gap has left, as a `retry_after`
+number of seconds in the JSON and a `Retry-After` header. The trip page then
+shows **Waiting for the lookup provider…**, waits that long (up to 60 seconds)
+and sends the same lookup once more; later lookups wait behind it. If that
+retry is refused too, the page shows the error and **Try again**. A busy reply
+during a running lookup or after a provider failure has no wait time, and the
+page does not retry it. The database write
 lock is released while waiting, so annotation saves can continue, and a cached
 result never waits. The gate records whether it closed after a success, during a
 running lookup or after a failure, so the viewer never has to guess from the
 time left. A running lookup's reservation covers the lookup deadline and cleanup
 plus five seconds of margin.
 Provider failures trigger a five-minute cooldown (longer `Retry-After` values are
-honoured up to seven days). There are no automatic retries,
-redirects, or ambient HTTP proxies. Responses have a 64 KiB size limit and a
+honoured up to seven days). The server never retries a provider call by itself,
+and uses no redirects or ambient HTTP proxies. Responses have a 64 KiB size limit and a
 ten-second whole-request deadline, including DNS resolution, connection,
 TLS, response headers, body and chunked framing. Each lookup runs in a
 short-lived subprocess; at the deadline the viewer kills it, closing its

@@ -173,7 +173,8 @@ tests and the firmware release check still run:
   `ruff check` (server, tools and install; rules F, E9 and B).
 - Server: `python -m unittest discover -s server/tests`,
   `python tools/generate_error_catalog.py --check`,
-  `node server/tests/test_viewer_map.js` and `node server/tests/test_viewer_places.js`.
+  `node server/tests/test_viewer_map.js`, `node server/tests/test_viewer_places.js`
+  and `node server/tests/test_viewer_annotation.js`.
   Needs the service requirements installed. Monitor needs no additional
   dependencies and uses fake time, real SQLite, and local fake HTTP receivers
   for ntfy, GELF and Loki.
@@ -462,21 +463,25 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   `frame-ancestors 'none'`, `X-Frame-Options: DENY` and `nosniff`. Notes and
   destinations are limited to 2,000 characters without XML-illegal control
   characters. Merged summaries keep the rules they were built with until a
-  source file changes. The DB includes `users`,
+  source file's size or modification time changes; their stamp has no inode,
+  so a restore or migration with times preserved keeps them. The DB includes `users`,
   `trip_removals`, `trip_history` and `tax_years`. Optional `geocoding.py`
   sends a selected endpoint to an explicitly configured provider only on an
   authenticated, CSRF-protected browser request, caching suggestions locally.
   Installer Address lookup uses common/settings.py validators through host_python;
   env_set updates viewer.env before compose up applies it on both platforms.
   Configurable interval, default 0.1 s for self-hosted providers; third-party
-  providers need an interval matching their rate policy. Viewer-only
+  providers need an interval matching their rate policy. A gap the server
+  won't wait out (over 2 s) gets 429 with `retry_after` and `Retry-After`; the
+  page waits and retries that lookup once (0–60 s). Viewer-only
   `MAP_TILE_URL` selects base tiles (default OSM; `none` disables); attribution is plain text.
   Page views look up uncached endpoints only with opt-in
   `VIEWER_GEOCODER_AUTO_LOOKUP=true`; Auto lookup beside Next defaults On,
   with an Off choice saved per browser. On hides manual lookup buttons except
   endpoint retries after errors; End suggestion and Use sit beneath Destination.
   On also fills an empty, untouched Destination with the end suggestion
-  (shown with a note, unsaved until Save).
+  (shown with a note, unsaved until Save), but only on a trip that has never
+  had an annotation saved (`data-autofill`); Use still fills any trip.
   Trip annotations use clearable purpose radios and a panel left of the map
   (above it on narrow windows); shared phone headers use Menu with a no-JS row.
   No lookup on exports or uploads; never
@@ -556,7 +561,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   still exits non-zero (failed Debian unit / Unraid `last_attempt_status`,
   reported as a problem by `install.sh --check`) and withholds the `PING_URL`
   heartbeat. The next nightly run retries; Unraid's hourly overdue catch-up
-  does nothing while `last-success` is fresh.
+  does nothing while `last-success` is fresh. A failed remote-only snapshot
+  that has since been deleted from REMOTE leaves the retry list once a REMOTE
+  listing succeeds; a failed listing keeps it.
   Missing diagnostics/monitor databases are normal and recorded in `INFO`.
   Monitor discovery uses Compose config's project name and Docker's Compose
   project/volume labels, without recent config flags or logging credentials.
