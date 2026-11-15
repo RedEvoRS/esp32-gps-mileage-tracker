@@ -1003,6 +1003,8 @@ def folder_hint(entry, role):
     if role != "admin":
         return "Please ask the admin to fix it."
     if entry["folder_reason"] == "duplicate":
+        if entry.get("saved_months"):
+            return "Follow the saved-name conflict steps before removing any link; choose which name's saved data to use."
         return "Remove the extra link."
     if entry["folder_reason"] == "saved_keys":
         return ("Choose which name's saved data to use and keep only that link. "
@@ -1124,7 +1126,7 @@ def _month_choices(conn, root):
             # name matters, including chains and a same-named nested target.
             uploads_refused = month.is_symlink() and target.name != month.name
             if month != chosen:
-                problems.append((month.name, "duplicate", chosen.name, (), uploads_refused))
+                problems.append((month.name, "duplicate", chosen.name, saved if len(saved) > 1 else (), uploads_refused))
             else:
                 chosen_refused = uploads_refused
         if len(saved) > 1:

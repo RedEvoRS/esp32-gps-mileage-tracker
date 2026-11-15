@@ -553,7 +553,7 @@ class ViewerHardeningTests(unittest.TestCase):
         for number, (reason, refused, all_refused) in enumerate(cases, 1):
             entries.append({"folder": True, "ym": f"2026-{number:02}", "trip_key": f"2026-{number:02}/",
                             "id": "", "folder_reason": reason, "problem": self.viewer.FOLDER_PROBLEMS[reason],
-                            "counted_as": "2026-12", "saved_months": ["2026-01", "2026-12"],
+                            "counted_as": "2026-12", "saved_months": [] if reason == "duplicate" else ["2026-01", "2026-12"],
                             "uploads_refused": refused, "all_uploads_refused": all_refused, "has_gpx": False})
             text = descriptions[reason]
             if refused:
@@ -756,6 +756,13 @@ class ViewerHardeningTests(unittest.TestCase):
         self.assertEqual(trips[0]["trip_key"], "2026-01/drive")
         warning = next(t for t in entries if t["folder_reason"] == "saved_keys")
         self.assertEqual(warning["saved_months"], ["2026-01", "2026-02"])
+        duplicate = next(t for t in entries if t["folder_reason"] == "duplicate")
+        message = self.viewer.folder_message(duplicate, "admin")
+        self.assertIn("Follow the saved-name conflict steps before removing any link", message)
+        self.assertNotIn("Remove the extra link.", message)
+        self.signed_in("admin")
+        for path, texts in self.folder_surface_messages(self.client).items():
+            self.assertTrue(any(message in text for text in texts), path)
         self.assertEqual(self.viewer.year_figures(trips, entries)["unreadable"], 0)
         self.signed_in("admin")
         for path in ("/", "/admin/year/2026", "/export.csv"):
