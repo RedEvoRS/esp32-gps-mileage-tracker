@@ -919,6 +919,8 @@ FOLDER_PROBLEMS = {
     "duplicate": "the folder is a link to another folder that is already counted",
     "saved_keys": "several month names for this folder have saved trip data",
     "ingest_refused": "trips are shown and counted",
+    "link_not_folder": "the month name is a link to something other than a folder",
+    "not_folder": "the month name is a file, not a folder",
 }
 
 MONTH_UPLOAD_REFUSAL = ("The tracker cannot upload new trips for this month until the link is {repair}; "
@@ -979,7 +981,7 @@ def _month_link_problem(month, root):
     try:
         month.stat()
     except OSError as exc:
-        return {errno.ELOOP: "loop", errno.ENOENT: "dangling"}.get(exc.errno, "unreadable")
+        return {errno.ELOOP: "loop", errno.ENOENT: "dangling", errno.ENOTDIR: "link_not_folder"}.get(exc.errno, "unreadable")
     try:
         target = month.resolve()
     except (OSError, RuntimeError):
@@ -1008,8 +1010,11 @@ def folder_description(entry):
     else:
         text = entry["problem"]
     if entry.get("uploads_refused") or entry["folder_reason"] == "ingest_refused":
-        repair = "removed" if entry["folder_reason"] == "duplicate" else "replaced by a real folder"
-        text += ". " + MONTH_UPLOAD_REFUSAL.format(repair=repair)
+        if entry["folder_reason"] == "not_folder":
+            text += ". The tracker cannot upload new trips for this month until this name is a folder; the tracker keeps them queued"
+        else:
+            repair = "removed" if entry["folder_reason"] in ("duplicate", "link_not_folder") else "replaced by a real folder"
+            text += ". " + MONTH_UPLOAD_REFUSAL.format(repair=repair)
     if entry.get("all_uploads_refused"):
         text += ". " + ALL_UPLOADS_REFUSAL.rstrip(".")
     return text
@@ -1029,6 +1034,10 @@ def folder_hint(entry, role):
                 "competing saved names bring the conflict back. See DEPLOY_DEBIAN.md, Troubleshooting, for steps.")
     if entry["folder_reason"] == "ingest_refused":
         return "Replace the link with a real folder containing these trips, or mount the disk there, so queued trips can upload."
+    if entry["folder_reason"] == "link_not_folder":
+        return "Remove only the link, keeping its target; ingest can then create a real month folder for queued trips."
+    if entry["folder_reason"] == "not_folder":
+        return "Move the file to a safe place outside the month names; ingest can then create a real month folder for queued trips."
     if entry["folder_reason"] == "unreadable":
         return "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only."
     return "Replace the link with the real folder, or mount the other disk at that path."
@@ -1126,6 +1135,9 @@ def _month_choices(conn, root):
             target = trip_merges.checked_path(root, month)
             if stat.S_ISDIR(target.stat().st_mode):
                 groups.setdefault(target, []).append(month)
+            else:
+                reason = "link_not_folder" if month.is_symlink() else "not_folder"
+                problems.append((month.name, reason, None, (), True))
         except ValueError as exc:
             reason = "unreadable" if isinstance(exc.__cause__, PermissionError) else "outside"
             problems.append((month.name, reason, None, ()))
@@ -1224,6 +1236,7 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                                    "saved_months": saved_months,
                                    "saved_counts": _saved_month_counts(conn, saved_months) if reason == "saved_keys" else {},
                                    "uploads_refused": (uploads_refused or
+                                                       reason in ("not_folder", "link_not_folder") or
                                                        (reason == "dangling" and _month_refuses_new_uploads(DATA_ROOT / ym, root))),
                                    "all_uploads_refused": (_month_blocks_all_uploads(DATA_ROOT / ym, root)
                                                            if missing_mileage({"folder_reason": reason}) else False),

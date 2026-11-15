@@ -68,6 +68,15 @@ GLOBAL_UPLOAD_LAYOUTS = {
 }
 
 MONTH_PROBLEM_LAYOUTS = {
+    "link-through-file": {"directories": [], "files": ["afile"], "links": [("2026-02", "afile/2026-02")],
+                          "reason": "link_not_folder", "uploads": {"2026-02": 503, "2026-04": 200}},
+    "link-to-file": {"directories": [], "files": ["afile"], "links": [("2026-02", "afile")],
+                     "reason": "link_not_folder", "uploads": {"2026-02": 503, "2026-04": 200}},
+    "link-to-same-named-file": {"directories": ["archive"], "files": ["archive/2026-02"],
+                                "links": [("2026-02", "archive/2026-02")],
+                                "reason": "link_not_folder", "uploads": {"2026-02": 503, "2026-04": 200}},
+    "plain-month-file": {"directories": [], "files": ["2026-02"], "links": [],
+                         "reason": "not_folder", "uploads": {"2026-02": 503, "2026-04": 200}},
     "missing-different-name": {"directories": [], "links": [("2026-02", "missing")],
                                "reason": "dangling", "uploads": {"2026-02": 503, "2026-04": 200}},
     "missing-same-name": {"directories": ["archive"], "links": [("2026-02", "archive/2026-02")],
@@ -79,5 +88,7 @@ def make_layout(root, layout, symlink):
     root.mkdir(parents=True, exist_ok=True)
     for name in layout["directories"]:
         (root / name).mkdir(parents=True, exist_ok=True)
+    for name in layout.get("files", []):
+        (root / name).write_text("synthetic non-folder", encoding="utf-8")
     for name, target in layout["links"]:
         symlink(root / name, root / target, directory=True)

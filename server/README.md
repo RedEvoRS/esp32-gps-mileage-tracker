@@ -878,6 +878,13 @@ as root without `sudo`. Reload the viewer and let a queued upload retry;
 the alert clears and uploads resume once every blocking folder is usable.
 Diagnostics uploads are unaffected.
 
+If a month name is a link to a file instead of a folder, remove only the
+link, keeping its target. If the month name is a plain file, move it somewhere
+safe outside the month names. The viewer reports either case as a folder
+warning: no trips are counted there, and new trips for that month get HTTP
+503 and stay queued. Other months still upload. Once that name is free,
+ingest can create a real month folder on retry.
+
 The viewer checks containment before it lists a folder or reads a file, and on
 Linux it lists each month through a directory handle that refuses a month
 folder swapped for a link at the last moment. These checks can't stop someone

@@ -541,15 +541,20 @@ class ViewerHardeningTests(unittest.TestCase):
             "duplicate": "This is a link to 2026-12/, whose trips are counted there.",
             "ingest_refused": "Trips are shown and counted. The tracker cannot upload new trips for this month until the link is replaced by a real folder; the tracker keeps them queued.",
             "saved_keys": "Warning: saved trip data exists under 2026-01/, 2026-12/. Trips are shown and counted under 2026-12/; saved data under the other names is not applied. Years cannot be closed until this conflict is resolved.",
+            "link_not_folder": "The month name is a link to something other than a folder.",
+            "not_folder": "The month name is a file, not a folder.",
         }
         hints = {
             "duplicate": "Remove the extra link.",
             "ingest_refused": "Replace the link with a real folder containing these trips, or mount the disk there, so queued trips can upload.",
             "saved_keys": "Choose which name's saved data to use and keep only that link. Removing a link leaves its saved data unapplied; removing the name in use quietly orphans that data. Nothing is deleted from the database. Recreate the same link to get back; competing saved names bring the conflict back. See DEPLOY_DEBIAN.md, Troubleshooting, for steps.",
             "unreadable": "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only.",
+            "link_not_folder": "Remove only the link, keeping its target; ingest can then create a real month folder for queued trips.",
+            "not_folder": "Move the file to a safe place outside the month names; ingest can then create a real month folder for queued trips.",
         }
         cases = [(reason, False, False) for reason in descriptions]
         cases += [("saved_keys", True, False), ("duplicate", True, False), ("dangling", True, False)]
+        cases += [("link_not_folder", True, False), ("not_folder", True, False)]
         cases += [(reason, False, True) for reason in ("outside", "dangling", "loop", "unreadable")]
         for number, (reason, refused, all_refused) in enumerate(cases, 1):
             entries.append({"folder": True, "ym": f"2026-{number:02}", "trip_key": f"2026-{number:02}/",
@@ -558,11 +563,14 @@ class ViewerHardeningTests(unittest.TestCase):
                             "uploads_refused": refused, "all_uploads_refused": all_refused, "has_gpx": False})
             text = descriptions[reason]
             if refused:
-                repair = "removed" if reason == "duplicate" else "replaced by a real folder"
-                text += f" The tracker cannot upload new trips for this month until the link is {repair}; the tracker keeps them queued."
+                if reason == "not_folder":
+                    text += " The tracker cannot upload new trips for this month until this name is a folder; the tracker keeps them queued."
+                else:
+                    repair = "removed" if reason in ("duplicate", "link_not_folder") else "replaced by a real folder"
+                    text += f" The tracker cannot upload new trips for this month until the link is {repair}; the tracker keeps them queued."
             if all_refused:
                 text += " All of the tracker's trip uploads are refused until the month folder problems below are fixed; the tracker keeps them queued."
-            if reason in ("outside", "dangling", "loop", "unreadable"):
+            if reason in ("outside", "dangling", "loop", "unreadable", "link_not_folder", "not_folder"):
                 text += " None of its trips are shown or counted."
             text += " " + hints.get(reason, "Replace the link with the real folder, or mount the other disk at that path.")
             expected.append(text)

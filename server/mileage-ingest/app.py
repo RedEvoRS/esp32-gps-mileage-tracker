@@ -314,6 +314,10 @@ class UnreadableMonthError(Exception):
     """A month folder's permissions prevent a complete duplicate-ID search."""
 
 
+class NotDirectoryMonthError(Exception):
+    """The destination month name is occupied by something other than a folder."""
+
+
 def _stored_trip_directories(root, safe_id):
     """Find either half of a stored pair; caller must hold _upload_lock.
 
@@ -677,7 +681,10 @@ def upload_trip():
                 # folder's month in the viewer (#727).
                 raise LinkedMonthError(target_dir.name)
             target_dir, gpx_file, json_file = _trip_paths(root, target_dir, safe_id)
-            target_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+            except (FileExistsError, NotADirectoryError):
+                raise NotDirectoryMonthError(year_month) from None
             _sync_directory(root)
             # An ID can be retried, but must never replace another trip's
             # immutable source (including sanitized-ID/device collisions).
@@ -704,6 +711,11 @@ def upload_trip():
             if not gpx_file.exists():
                 _atomic_write_bytes(gpx_file, raw)
             _atomic_write_json(json_file, record)
+    except NotDirectoryMonthError as e:
+        message = (f"month folder {e} is not a directory; new trips for this month are refused "
+                   "until that name is a real folder")
+        app.logger.error(message)
+        return jsonify({"error": message}), 503
     except UnreadableMonthError as e:
         message = (f"month folder {e} cannot be read or entered because its owner or mode stops the server reading it; "
                    "all trip uploads are refused until its owner and permissions are fixed")
