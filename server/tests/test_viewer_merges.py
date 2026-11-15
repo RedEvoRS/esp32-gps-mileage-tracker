@@ -308,7 +308,9 @@ class ViewerMerges(unittest.TestCase):
         a, b = self.trip("a", 0), self.trip("b", 180, .01)
         key = self.merged_key(self.merge(a, b))
         summary, fresh = self.stored_merge(key)
-        old = json.dumps([[*entry, 987654 + i] for i, entry in enumerate(json.loads(fresh))])
+        # Build the v1.06-v1.15 shape (name, mtime, size, inode) from the first
+        # three fields, so the fixture does not depend on the code under test.
+        old = json.dumps([[*entry[:3], 987654 + i] for i, entry in enumerate(json.loads(fresh))])
         with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute("UPDATE trip_merges SET fingerprint=? WHERE trip_key=?", (old, key))
             # Count later writes to the row.

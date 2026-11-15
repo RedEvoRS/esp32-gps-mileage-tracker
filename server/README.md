@@ -972,14 +972,15 @@ annotations. The original annotation rows remain intact. Back up this database
 alongside the trip files: losing it also loses merges.
 
 The cached summary is refreshed only when a part's GPX/JSON size or nanosecond
-modification time changes. File identity (the inode number) is not used, because a
-restore or migration to another disk changes it for every file: copying the trip
-files elsewhere with their times preserved does not refresh a merged trip. Older
-merge fingerprints that carry an inode are rewritten once on first use without
-recalculating their stored mileage. A change to the shared summary rules
-(`SUMMARY_VERSION`) does not rebuild it by itself, the same as the plain trips' stored summaries, which keep the
-rules of the day they were written; otherwise one release would total merged
-trips under new rules and everything else under old ones. Ordinary list views
+modification time changes. File identity (the inode number) is not used,
+because a restore or migration to another disk changes it for every file:
+copying the trip files elsewhere with their times preserved does not refresh a
+merged trip. Older merge fingerprints that carry an inode are rewritten once on
+first use without recalculating their stored mileage. A change to the shared
+summary rules (`SUMMARY_VERSION`) does not rebuild it by itself, the same as the
+plain trips' stored summaries, which keep the rules of the day they were
+written; otherwise one release would total merged trips under new rules and
+everything else under old ones. Ordinary list views
 read the cache without parsing every merged track. Both images ship the shared
 rules in `common/trip_summary.py` through the default-deny Docker build context.
 If a source disappears or becomes unreadable, the merged trip is flagged as
