@@ -286,6 +286,59 @@ class ViewerHardeningTests(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         self.assertNotIn(b"outside-track-sentinel", response.data)
 
+    def assert_refused_gpx_label(self, suffix, problem):
+        self.signed_in("admin")
+        trips, unreadable = self.viewer.load_trips()
+        self.assertEqual(trips, [])
+        self.assertEqual(len(unreadable), 1)
+        self.assertEqual(unreadable[0]["refused_file"], "gpx")
+        self.assertEqual(unreadable[0]["problem"], problem)
+        with self.viewer._trip_read(trip_key="2026-01/drive") as (_, targeted, damaged):
+            self.assertEqual(targeted, trips)
+            self.assertEqual(damaged, unreadable)
+        for route in ("/", "/admin/year/2026"):
+            with self.subTest(route=route):
+                response = self.client.get(route)
+                self.assertEqual(response.status_code, 200)
+                text = response.get_data(as_text=True)
+                self.assertIn(f"2026-01/drive.{suffix}</code>", text)
+                self.assertIn(problem, text)
+                self.assertNotIn("(no GPX either)", text)
+                self.assertNotIn("outside-file-sentinel", text)
+                if suffix == "json":
+                    self.assertIn("(its GPX links outside the data folder)", text)
+
+    def test_missing_summary_with_refused_gpx_names_track(self):
+        summary = self.viewer.DATA_ROOT / "2026-01/drive.json"
+        summary.unlink()
+        gpx = summary.with_suffix(".gpx")
+        gpx.unlink()
+        target = self.db.parent / "outside.gpx"
+        target.write_text("outside-file-sentinel", encoding="utf-8")
+        self.symlink(gpx, target)
+        self.assert_refused_gpx_label("gpx", "the file could not be read")
+
+    def test_damaged_summary_with_refused_gpx_keeps_summary_problem(self):
+        summary = self.viewer.DATA_ROOT / "2026-01/drive.json"
+        summary.write_text("{", encoding="utf-8")
+        _, problem = self.viewer.read_summary(summary, root=self.viewer.DATA_ROOT.resolve())
+        self.assertTrue(problem)
+        gpx = summary.with_suffix(".gpx")
+        gpx.unlink()
+        target = self.db.parent / "outside.gpx"
+        target.write_text("outside-file-sentinel", encoding="utf-8")
+        self.symlink(gpx, target)
+        self.assert_refused_gpx_label("json", problem)
+
+    def test_refused_month_never_labels_track_missing(self):
+        month = self.viewer.DATA_ROOT / "2026-01"
+        target = self.db.parent / "outside-month"
+        month.rename(target)
+        (target / "drive.json").write_text("outside-file-sentinel", encoding="utf-8")
+        (target / "drive.gpx").write_text("outside-file-sentinel", encoding="utf-8")
+        self.symlink(month, target, directory=True)
+        self.assert_refused_gpx_label("json", "the file could not be read")
+
     def test_missing_gpx_keeps_summary_readable_and_miles_counted(self):
         (self.viewer.DATA_ROOT / "2026-01/drive.gpx").unlink()
         trips, unreadable = self.viewer.load_trips()

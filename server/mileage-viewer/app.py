@@ -953,16 +953,19 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
         ann = annotations.get(trip_key, {})
         summary, problem = _cached_summary(json_path, root=root)
         refused_file = None
+        problem_file = "json"
         try:
             gpx_path = trip_merges.checked_path(root, json_path.with_suffix(".gpx"))
         except ValueError:
-            if not problem:
-                refused_file = "gpx"
+            refused_file = "gpx"
+            # A missing summary is normal during ingest; keep any real summary error.
+            if not problem or problem == "the file is missing":
+                problem_file = "gpx"
+                problem = "the file could not be read"
             # A refused track makes the recording unreadable; a missing one
             # still lets its summary count. Keep only usable identity.
             summary = {field: summary[field] for field in ("device_id", "start_time")
                        if summary and isinstance(summary.get(field), str)}
-            problem = "the file could not be read"
             has_gpx = False
         else:
             try:
@@ -982,7 +985,8 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
             "has_gpx": has_gpx,
         }
         if problem:
-            unreadable.append({**trip, "problem": problem, "refused_file": refused_file})
+            unreadable.append({**trip, "problem": problem, "refused_file": refused_file,
+                               "problem_file": problem_file})
         else:
             trips.append(trip)
 
@@ -2151,7 +2155,7 @@ LIST_HTML = """
     damaged summary from its GPX, see DEPLOY_DEBIAN.md → Troubleshooting.
     <ul>
       {% for u in unreadable %}
-      <li><code>{% if u.get('parts') %}{{ u.gpx_file }}{% else %}{{ u.trip_key }}.{{ u.get('refused_file') or 'json' }}{% endif %}</code>{% if not u.has_gpx and (u.get('parts') or not u.get('refused_file')) %} (no GPX either){% endif %}: {{ u.problem }}
+      <li><code>{% if u.get('parts') %}{{ u.gpx_file }}{% else %}{{ u.trip_key }}.{{ u.get('problem_file') or 'json' }}{% endif %}</code>{% if not u.get('parts') and u.get('refused_file') == 'gpx' and u.get('problem_file') == 'json' %} (its GPX links outside the data folder){% elif not u.has_gpx and (u.get('parts') or not u.get('refused_file')) %} (no GPX either){% endif %}: {{ u.problem }}
         {% if u.get('parts') %}
         <form method="post" action="{{ url_for('split_trip', ym=u.ym, trip_id=u.id, year=year or '') }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -3094,7 +3098,7 @@ gap that was uploaded after the merge is counted a second time. Open the merged 
 <p class="muted">Their miles can't be counted, so the totals above may be short.</p>
 <div class="review-table"><table>
 <thead><tr><th>Trip</th><th>Problem</th></tr></thead>
-<tbody>{% for t in unreadable %}<tr><td>{{ trip_link(t) }}{% if not t.get('parts') and t.get('refused_file') %} <code>{{ t.trip_key }}.{{ t.refused_file }}</code>{% endif %}</td><td>{{ t.problem }}</td></tr>
+<tbody>{% for t in unreadable %}<tr><td>{{ trip_link(t) }}{% if not t.get('parts') %} <code>{{ t.trip_key }}.{{ t.get('problem_file') or 'json' }}</code>{% if t.get('refused_file') == 'gpx' and t.get('problem_file') == 'json' %} (its GPX links outside the data folder){% endif %}{% endif %}</td><td>{{ t.problem }}</td></tr>
 {% else %}<tr><td colspan="2" class="muted">All trip files can be read.</td></tr>{% endfor %}</tbody>
 </table></div>
 </section>
