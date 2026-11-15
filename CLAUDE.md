@@ -647,15 +647,15 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
 - Power SX1262 LoRa without antenna (RF damage risk)
 - Commit to the frozen `tbeam-v1.2` branch, or port fixes back to it
 - Commit `secrets.h`, `.env`, `viewer.env`, or `monitor.env` to version control
-- Commit anything personal. The repo will go public, and that exposes
-  everything from its private period too, so docs, examples, tests,
+- Commit anything personal. The repo is public, including everything from
+  its private period, so docs, examples, tests,
   commit messages, issues and PRs use placeholders (`<user>`, `<host>`,
   `<username>`, `~\Documents\...`), never a real name, account path,
   email, SSID/MAC, real coordinates, or a photo with EXIF. Use the
   GitHub noreply email and commit with TZ=UTC. `tools/check_pii.py` enforces
   this in CI for files and commits (not issue or PR text); names come from
   the `PII_DENYLIST` secret or a gitignored `.pii-denylist`
-- Change the repo's visibility. The owner decides when it goes public
+- Change the repo's visibility. Only the owner changes it
 - Bring commits over from the private archive repo: no merge, cherry-pick,
   or adding it as a remote. Its history carries a personal email and
   account paths, which is why this repo started from a clean snapshot.
