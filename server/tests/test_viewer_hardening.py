@@ -679,6 +679,42 @@ class ViewerHardeningTests(unittest.TestCase):
         self.assertEqual(labels[0], "2026-01/ (conflicting saved data; trips counted)")
         self.assertEqual(types["2026-01/"], "folder_warning")
 
+    def warning_page(self, *, folder=False, file=False):
+        root = self.viewer.DATA_ROOT
+        if file:
+            (root / "2026-01/drive.json").write_text("{broken", encoding="utf-8")
+        if folder:
+            (root / "2026-02").mkdir()
+        original = self.viewer._month_trip_names
+
+        def listing(path):
+            if path.name == "2026-02":
+                raise PermissionError("synthetic folder denial")
+            return original(path)
+
+        self.signed_in("admin")
+        with patch.object(self.viewer, "_month_trip_names", side_effect=listing):
+            return self.client.get("/").get_data(as_text=True)
+
+    def test_folder_only_warning_omits_zero_files_and_summary_rebuild_advice(self):
+        text = self.warning_page(folder=True)
+        self.assertIn("1 month folder(s) can't be read", text)
+        self.assertNotIn("trip file(s) can't be read", text)
+        self.assertNotIn("To rebuild a damaged summary", text)
+        self.assertIn("owner and permissions", text)
+
+    def test_file_only_warning_omits_zero_folders_and_keeps_rebuild_advice(self):
+        text = self.warning_page(file=True)
+        self.assertIn("1 trip file(s) can't be read", text)
+        self.assertNotIn("month folder(s) can't be read", text)
+        self.assertIn("To rebuild a damaged summary", text)
+
+    def test_mixed_warning_shows_both_counts_and_summary_rebuild_advice(self):
+        text = self.warning_page(folder=True, file=True)
+        self.assertIn("1 trip file(s) can't be read", text)
+        self.assertIn("1 month folder(s) can't be read", text)
+        self.assertIn("To rebuild a damaged summary", text)
+
     def test_merged_trip_with_linked_month_part_keeps_undo(self):
         month = self.viewer.DATA_ROOT / "2026-01"
         target = self.db.parent / "outside-month"

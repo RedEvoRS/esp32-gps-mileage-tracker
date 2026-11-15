@@ -2407,10 +2407,12 @@ LIST_HTML = """
   {% if unreadable %}
   <div class="warn" role="alert">
     {% set missing = unreadable|select('missing_mileage')|list %}
-    {% if missing %}<b>{{ missing|rejectattr("folder")|list|length }} trip file(s) can't be read.{% set folders = missing|selectattr("folder")|list %}{% if folders %} {{ folders|length }} month folder(s) can't be read.{% endif %}</b>
-    Their miles can't be counted, so the totals below may be short. The
-    exports list these trips as unreadable, without miles. To rebuild a
-    damaged summary from its GPX, see DEPLOY_DEBIAN.md → Troubleshooting.
+    {% set files = missing|rejectattr("folder")|list %}
+    {% set folders = missing|selectattr("folder")|list %}
+    {% if missing %}<b>{% if files %}{{ files|length }} trip file(s) can't be read.{% endif %}{% if folders %} {{ folders|length }} month folder(s) can't be read.{% endif %}</b>
+    Their miles can't be counted, so the totals below may be short.
+    The exports list these entries as unreadable, without miles.
+    {% if files %}To rebuild a damaged summary from its GPX, see DEPLOY_DEBIAN.md → Troubleshooting.{% endif %}
     {% endif %}
     <ul>
       {% for u in unreadable %}
