@@ -15,6 +15,10 @@ from zoneinfo import ZoneInfo
 import test_viewer_roles as roles
 
 
+ADMIN_REFUSAL = ("This trip&#39;s files can&#39;t be opened: its summary, track or month folder links outside "
+                 "the data folder, so the viewer won&#39;t read them. The trip list and exports flag it. "
+                 "Replace the link with the real file to show the trip again.")
+
 BS = chr(92)
 
 
@@ -69,7 +73,6 @@ class ViewerHardeningTests(unittest.TestCase):
 
     def assert_unreadable_link(self, key, target):
         self.signed_in("admin")
-        not_found = self.client.get("/no/such/page").get_data(as_text=True)
         # Catch application summary stats/opens, including a cache hit after
         # replacing a regular summary with a symlink.
         with patch.object(self.viewer, "read_summary", side_effect=AssertionError("outside summary opened")), \
@@ -104,10 +107,64 @@ class ViewerHardeningTests(unittest.TestCase):
                     if route == "/export.csv":
                         self.assertIn("unreadable", text)
                     elif route == f"/trip/{key}":
-                        self.assertEqual(text, not_found)
+                        self.assertIn(ADMIN_REFUSAL, text)
+                        self.assertNotIn("the file could not be read", text)
                     elif not route.endswith(".xlsx"):
                         self.assertIn("the file could not be read", text)
                     response.close()
+
+        everyday = self.signed_in("editor", self.viewer.app.test_client())
+        unknown = everyday.get("/trip/2026-03/none")
+        refused = everyday.get(f"/trip/{key}")
+        self.assertEqual((refused.status_code, refused.data, refused.content_type),
+                         (unknown.status_code, unknown.data, unknown.content_type))
+
+    def test_refused_trip_links_hide_removal_and_stop_before_trip_reads(self):
+        everyday = self.signed_in("editor", self.viewer.app.test_client())
+        self.signed_in("admin")
+        unknown = everyday.get("/trip/2026-03/none")
+        outside = self.db.parent / "outside"
+        outside.mkdir()
+        for kind in ("summary", "gpx", "month"):
+            with self.subTest(kind=kind):
+                key = f"2026-02/{kind}"
+                month = self.viewer.DATA_ROOT / "2026-02"
+                if kind == "month":
+                    self.symlink(month, outside, directory=True)
+                    link = month
+                else:
+                    month.mkdir(exist_ok=True)
+                    link = month / (kind + (".json" if kind == "summary" else ".gpx"))
+                    target = outside / kind
+                    target.write_text("outside-file-sentinel", encoding="utf-8")
+                    self.symlink(link, target)
+                try:
+                    for removed in (False, True):
+                        if removed:
+                            with closing(sqlite3.connect(self.db)) as conn, conn:
+                                self.viewer.trip_log.add_removal(conn, key, "test reason", "driver")
+                        with patch.object(self.viewer, "read_summary", side_effect=AssertionError("trip read")), \
+                                patch.object(self.viewer, "_summary_stamp", side_effect=AssertionError("trip stat")), \
+                                patch.object(self.viewer.trip_log, "removal", side_effect=AssertionError("removal read")):
+                            response = everyday.get(f"/trip/{key}")
+                            self.assertEqual((response.status_code, response.data, response.content_type),
+                                             (unknown.status_code, unknown.data, unknown.content_type))
+                            admin = self.client.get(f"/trip/{key}")
+                            self.assertEqual(admin.status_code, 404)
+                            self.assertIn(ADMIN_REFUSAL, admin.get_data(as_text=True))
+                            for result in (response, admin):
+                                self.assertNotIn(b"outside-file-sentinel", result.data)
+                                self.assertNotIn(str(outside).encode(), result.data)
+                            for client in (everyday, self.client):
+                                plain = client.get("/no/such/page")
+                                for address in ("/trip/2026-x2/month", "/trip/2026-02/bad.key"):
+                                    malformed = client.get(address)
+                                    self.assertEqual((malformed.status_code, malformed.data, malformed.content_type),
+                                                     (plain.status_code, plain.data, plain.content_type))
+                finally:
+                    link.unlink()
+                    if kind != "month":
+                        month.rmdir()
 
     def test_summary_symlink_is_unreadable_in_lists_pages_exports_and_year_review(self):
         summary = self.viewer.DATA_ROOT / "2026-01/drive.json"
@@ -229,7 +286,10 @@ class ViewerHardeningTests(unittest.TestCase):
                         response = self.client.get(f"/{route}/2026-01/linked")
                         self.assertEqual(response.status_code, 404)
                         self.assertNotIn(b"private-file-sentinel", response.data)
-                        self.assertIn(b"The requested URL was not found on the server", response.data)
+                        if route == "trip":
+                            self.assertIn(ADMIN_REFUSAL, response.get_data(as_text=True))
+                        else:
+                            self.assertIn(b"The requested URL was not found on the server", response.data)
                         self.assertNotIn(b"the file could not be read", response.data)
                         response.close()
             finally:

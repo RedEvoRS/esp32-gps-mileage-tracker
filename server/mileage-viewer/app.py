@@ -694,7 +694,13 @@ def _csrf_protect():
 # ---------------------------------------------------------------------
 
 
-def _safe_trip_paths(ym, trip_id):
+TRIP_NOT_FOUND = (
+    "No trip at this address. It may have been removed from the "
+    "log; ask the admin if you expected to see it."
+)
+
+
+def _safe_trip_paths(ym, trip_id, *, refused_description=None):
     """Validate URL components and return (gpx_path, json_path) under DATA_ROOT.
 
     Aborts with 404 on anything that doesn't match the strict patterns or
@@ -705,7 +711,7 @@ def _safe_trip_paths(ym, trip_id):
     try:
         return next(trip_merges.source_file_pairs(DATA_ROOT, [f"{ym}/{trip_id}"]))
     except ValueError:
-        abort(404)
+        abort(404, description=refused_description)
 
 
 def _trip_file_exists(root, path):
@@ -3372,7 +3378,11 @@ def index():
 @app.route("/trip/<ym>/<trip_id>")
 def trip_view(ym, trip_id):
     year = selected_year()
-    _safe_trip_paths(ym, trip_id)
+    _safe_trip_paths(ym, trip_id, refused_description=(
+        "This trip's files can't be opened: its summary, track or month folder links outside "
+        "the data folder, so the viewer won't read them. The trip list and exports flag it. "
+        "Replace the link with the real file to show the trip again."
+    ) if g.role == "admin" else TRIP_NOT_FOUND)
     key = f"{ym}/{trip_id}"
     # Resolve the requested recording/alias and read only its own sources.
     # Removed trips and redirects need no full chronology. Live pages use it
@@ -3390,10 +3400,7 @@ def trip_view(ym, trip_id):
             # A removed trip (for an everyday login) and an address that
             # matches no trip get the same words, so the page does not say
             # which one it is. Neither has a damaged file to repair.
-            abort(404, description=(
-                "No trip at this address. It may have been removed from the "
-                "log; ask the admin if you expected to see it."
-            ))
+            abort(404, description=TRIP_NOT_FOUND)
         abort(404, description=(
             f"This trip's summary file can't be read ({problem}), so its "
             "miles can't be counted. The trip list and exports flag it. To "
