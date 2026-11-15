@@ -1517,10 +1517,6 @@ off-host destination. Each run:
   deletion by a compromised server needs retention or snapshots enforced on
   the backup host, or a restricted backup account. See
   [backup.conf.example](server/backup/backup.conf.example).
-  A tiny destination probe selects link storage: links normally stay as links;
-  link-less destinations retain their checksummed metadata for recovery in
-  restore scratch, with a warning and an `INFO` note. See
-  [off-host link storage](server/README.md#backup) for details.
 - gives up instead of hanging when the destination vanishes mid-copy: rsync
   stops after 10 minutes without data moving, an SSH connection after about
   two minutes of silence, and the systemd unit after 6 hours in all.
@@ -1533,7 +1529,7 @@ needs UID 1000 (Step 0).
 
 Anything you can rsync to: a network attached storage (NAS) device, another
 always-on machine, or a mounted share. Over SSH, the far end needs `rsync`,
-Bash, find, chmod and rm for probe cleanup and pruning, plus a login the backup
+Bash, find, chmod and rm for pruning, plus a login the backup
 can use without a password. In these examples, `<backup-user>` and
 `<backup-host>` are the login and host for that other machine, and
 `/<backup-path>` is the absolute destination directory there. On this server:

@@ -728,61 +728,6 @@ exec {real_rsync} "$@"
         result = self.run_script("restore.sh", "check", str(snap))
         self.assertIn("snapshot has no SYMLINKS; its symbolic links are not checked", result.stderr)
 
-    def assert_linkless_destination_uses_verified_metadata(self, converted):
-        self.read_only_data_folder()
-        self.symlink(self.data / "alias\nname", "2026-10")
-        real_rsync = shutil.which("rsync")
-        self.shim("rsync", f'''
-case "${{*: -1}}" in
-    "{self.remote}"/.link-probe-*/)
-        {real_rsync} "$@" --no-links --no-hard-links || exit $?
-        {'printf converted > "${@: -1}alias"' if converted else ':'}
-        exit {0 if converted else 23} ;;
-esac
-exec {real_rsync} "$@"
-''')
-        for _ in range(2):
-            result = self.run_script("backup.sh", "--verify")
-            self.assertIn("cannot preserve symbolic links", result.stderr)
-            self.assertIn("cannot preserve hard links", result.stderr)
-        self.assertEqual(len(self.snapshots()), 1)
-        snap = self.remote / "snapshots" / self.snapshots()[-1]
-        self.assertFalse((snap / "data/alias\nname").is_symlink())
-        self.assertIn("link_storage=manifest", (snap / "INFO").read_text())
-        self.assertEqual((snap / "SYMLINKS").read_bytes(), (self.backups / "latest/SYMLINKS").read_bytes())
-        self.assertFalse(list(self.remote.glob(".link-probe-*")))
-        result = self.run_script("restore.sh", "check")
-        self.assertIn("Recreating saved symbolic links in restore scratch", result.stderr)
-        self.run_script("restore.sh", "restore", "latest", "--yes")
-        self.assertEqual(os.readlink(self.data / "alias\nname"), "2026-10")
-        self.assertFalse((snap / "data/alias\nname").is_symlink(), "only scratch may be materialized")
-        old = self.remote / "snapshots/2020-01-01T030000Z"
-        shutil.copytree(snap, old)
-        self.run_script("backup.sh", "--verify")  # Remote-only portable representation.
-        self.symlink(old / "data/rogue", "2026-10")
-        result = self.run_script("backup.sh", "--verify", check=False)
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("Added link: data/rogue", result.stderr)
-
-    def test_linkless_remote_keeps_checksums_and_restores_links_from_metadata(self):
-        self.assert_linkless_destination_uses_verified_metadata(converted=False)
-
-    def test_link_converting_remote_uses_metadata_without_nightly_failure(self):
-        self.assert_linkless_destination_uses_verified_metadata(converted=True)
-
-    def test_failed_remote_capability_copy_cannot_advance_success(self):
-        self.run_script("backup.sh")
-        stamp = (self.backups / "last-success").read_bytes()
-        real_rsync = shutil.which("rsync")
-        self.shim("rsync", f'''
-case "${{*: -1}}" in "{self.remote}"/.link-probe-*/) exit 23 ;; esac
-exec {real_rsync} "$@"
-''')
-        result = self.run_script("backup.sh", check=False)
-        self.assertEqual(result.returncode, 1, result.stderr)
-        self.assertIn("could not copy and read back", result.stderr)
-        self.assertEqual((self.backups / "last-success").read_bytes(), stamp)
-
     def test_outside_links_reported_and_copied_without_targets(self):
         outside = self.tmp / "outside"
         outside.mkdir()
@@ -2652,6 +2597,29 @@ fi
         self.run_script("backup.sh", "--mark-target")
         self.run_script("backup.sh")
         self.assertEqual(len(self.snapshots(self.remote)), 1)
+
+    def assert_rsync_only_ssh_backup(self, prune):
+        fake = self.use_ssh_remote()
+        fake.write_text(fake.read_text().replace(
+            'exec bash -c "$*"',
+            '[[ $1 == rsync && $2 == --server ]] || exit 126\nexec bash -c "$*"'))
+        self.conf_append(f"REMOTE_PRUNE={prune}\nKEEP_RECENT=2\nKEEP_MONTHLY=0\n")
+        names = []
+        for index in range(3):
+            self.add_trip("2026-10/new", "new" * (index + 1))
+            self.run_script("backup.sh", "--verify")
+            names.append(self.snapshots()[-1])
+            self.assertEqual({p.name for p in self.remote.iterdir()}, {MARKER, "snapshots"})
+        self.assertEqual(self.snapshots(self.remote), names[1:] if prune == "yes" else names)
+        # Exercise a remote-only fetch and both restore paths through the same account.
+        if prune == "no":
+            self.run_script("backup.sh", "--verify")
+        self.run_script("restore.sh", "check")
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertEqual({p.name for p in self.remote.iterdir()}, {MARKER, "snapshots"})
+
+    def test_rsync_only_ssh_backup_without_remote_pruning(self):
+        self.assert_rsync_only_ssh_backup("no")
 
     def test_unit_file_limits_the_run_and_waits_for_mounts(self):
         unit = (BACKUP / "mileage-backup@.service").read_text()

@@ -462,11 +462,7 @@ dedupe, and excluded links do not affect comparison. Manifest-writing errors
 fail the run and withhold the heartbeat; inspect the log and rerun.
 
 Restore and deep checks compare saved links with `SYMLINKS`; older snapshots
-without it report that their links are not checked. Off-host destinations are
-probed for link support: an unsupported destination keeps the checksummed link
-metadata for recovery in restore scratch, with a warning and an `INFO` note.
-See [off-host link storage](server/README.md#backup) for that representation and
-the extra space needed without hard links.
+without it report that their links are not checked.
 
 After today's backup has completed and been copied, the same run periodically
 checks older snapshots. In `backup/backup.conf`, `BACKUP_VERIFY_DAYS=7` means

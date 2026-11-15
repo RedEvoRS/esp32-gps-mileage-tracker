@@ -282,25 +282,14 @@ rsync_remote() {
 # as local pruning. Rsync's deletion path chmods read-only regular files, even
 # when their parent is writable, changing every hard-linked snapshot's mode.
 remove_remote_snapshot() {
-    local name=$1
+    local name=$1 path ssh_cmd=${RSYNC_SSH:-ssh}
     [[ $name =~ $SNAPSHOT_RE ]] || return 1
-    remove_remote_tree "snapshots/$name"
-}
-
-# Also used for the private capability probe, never the destination root.
-remove_remote_tree() {
-    local relative=$1 path ssh_cmd=${RSYNC_SSH:-ssh}
-    if [[ $relative == snapshots/* ]]; then
-        [[ ${relative#snapshots/} =~ $SNAPSHOT_RE ]] || return 1
-    else
-        [[ $relative =~ ^\.link-probe-[a-zA-Z0-9-]+$ ]] || return 1
-    fi
     if [[ $REMOTE != *:* ]]; then
-        remove_backup_tree "${REMOTE%/}/$relative"
+        remove_backup_tree "${REMOTE%/}/snapshots/$name"
         return
     fi
     path=${REMOTE#*:}
-    path=${path%/}/$relative
+    path=${path%/}/snapshots/$name
     # Single-quote the path for the remote login shell, including literal '.
     path="'${path//\'/\'\\\'\'}'"
     [[ $ssh_cmd == *ServerAliveInterval* ]] || ssh_cmd="$ssh_cmd $SSH_KEEPALIVE"
@@ -309,38 +298,6 @@ remove_remote_tree() {
     # shellcheck disable=SC2016  # Expanded by the remote helper, not locally.
     { declare -f remove_backup_tree; printf 'remove_backup_tree "$1"\n'; } \
         | bash -c "exec $ssh_cmd \"\$@\"" bash "${REMOTE%%:*}" "bash -s -- $path"
-}
-
-# Test the actual destination through rsync, including a read-back. A mounted
-# share can refuse links or convert them into files. Never infer support from
-# a filesystem name (SMB with mfsymlinks behaves differently from plain SMB).
-probe_remote_links() {
-    local scratch=$1 name=.link-probe-${1##*-} status=0
-    mkdir "$scratch/transport" || return 1
-    printf x > "$scratch/transport/target" || return 1
-    ln -s target "$scratch/transport/alias" || return 1
-    ln "$scratch/transport/target" "$scratch/transport/hardlink" || return 1
-    rsync_remote -aH --numeric-ids "$scratch/transport/" "$REMOTE/$name/" \
-        > "$scratch/transport.log" 2>&1 || status=$?
-    if ! rsync_remote -aH --numeric-ids "$REMOTE/$name/" "$scratch/readback/" \
-            >> "$scratch/transport.log" 2>&1 \
-            || ! cmp -s "$scratch/transport/target" "$scratch/readback/target"; then
-        remove_remote_tree "$name" || true
-        log "ERROR: could not copy and read back the off-host link capability probe"
-        return 1
-    fi
-    REMOTE_LINKS=no REMOTE_HARDLINKS=no
-    if [[ -L $scratch/readback/alias ]] \
-            && [[ $(readlink "$scratch/readback/alias") == target ]]; then REMOTE_LINKS=yes; fi
-    if [[ -f $scratch/readback/hardlink ]] \
-            && [[ $(stat -c %i "$scratch/readback/target") == "$(stat -c %i "$scratch/readback/hardlink")" ]]; then
-        REMOTE_HARDLINKS=yes
-    fi
-    remove_remote_tree "$name" || return 1
-    if (( status != 0 )) && [[ $REMOTE_LINKS == yes && $REMOTE_HARDLINKS == yes ]]; then
-        log "ERROR: off-host capability probe failed despite preserving links; check destination permissions"
-        return 1
-    fi
 }
 
 write_symlink_manifest() (
@@ -353,20 +310,12 @@ write_symlink_manifest() (
         done
 )
 
-links_in_manifest_only() {
-    [[ -f $1/INFO ]] && grep -Fxq 'link_storage=manifest' "$1/INFO"
-}
-
 verify_snapshot_links() {
     local snap=$1 path target expected=$1/SYMLINKS
     local -A saved=() actual=()
     if [[ ! -f $expected ]]; then
         log "NOTE: snapshot has no SYMLINKS; its symbolic links are not checked"
         return 0
-    fi
-    if links_in_manifest_only "$snap"; then
-        expected=/dev/null
-        log "NOTE: off-host filesystem stores symbolic links in SYMLINKS only; checking saved link metadata"
     fi
     if write_symlink_manifest "$snap/data" | cmp -s -- "$expected" -; then return 0; fi
     log "snapshot symbolic links don't match SYMLINKS; this snapshot is damaged"
@@ -389,32 +338,6 @@ verify_snapshot_links() {
         if [[ -z ${saved[$path]+yes} ]]; then log "Added link: $(printf '%q' "data/${path#./}")"; fi
     done
     return 1
-}
-
-# Only after checksum/inventory verification, and only in private restore
-# scratch. The off-host copy still holds every link's checksummed text. Never
-# walk through a newly created link or replace an existing file/directory.
-materialize_snapshot_links() {
-    local snap=$1 path target dest parent mode
-    links_in_manifest_only "$snap" || return 0
-    [[ -f $snap/SYMLINKS ]] || die "metadata-only link storage has no SYMLINKS"
-    log "Recreating saved symbolic links in restore scratch"
-    while IFS= read -r -d '' path; do
-        IFS= read -r -d '' target || return 1
-        [[ $path == ./* && $path != *'/../'* && $path != */.. && $path != *'/./'* ]] || return 1
-        dest=$snap/data/${path#./}
-        parent=${dest%/*}
-        [[ -d $parent && ! -e $dest && ! -L $dest ]] || return 1
-        # realpath resolves parents only; the target text is never followed.
-        [[ $(realpath -m -- "$parent") == "$(realpath -m -- "$snap/data")" \
-            || $(realpath -m -- "$parent") == "$(realpath -m -- "$snap/data")/"* ]] || return 1
-        mode=$(stat -c %a "$parent") || return 1
-        chmod u+w "$parent" || return 1
-        if ! ln -s -- "$target" "$dest"; then chmod "$mode" "$parent"; return 1; fi
-        chmod "$mode" "$parent" || return 1
-    done < "$snap/SYMLINKS"
-    # Scratch now has the original representation; INFO is not checksummed.
-    sed -i '/^link_storage=manifest$/d' "$snap/INFO"
 }
 
 # A file at the top of the destination that says "this is the real backup

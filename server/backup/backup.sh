@@ -236,60 +236,16 @@ if ! target_marked; then
 fi
 
 log "Copying snapshots to $REMOTE"
-probe_remote_links "$link_scratch" || die "couldn't determine off-host link storage; backup has not completed"
-remote_copy=()
-remote_check=(-l)
-if [[ $REMOTE_HARDLINKS == no ]]; then
-    remote_copy+=(--no-hard-links)
-    log "WARNING: off-host filesystem cannot preserve hard links; snapshots will use more space"
-fi
-if [[ $REMOTE_LINKS == no ]]; then
-    remote_copy+=(--no-links --info=nonreg0)
-    remote_check=(--no-links --info=nonreg0 --exclude=/INFO)
-    log "WARNING: off-host filesystem cannot preserve symbolic links; storing their checksummed SYMLINKS metadata for recovery in restore scratch"
-fi
 # No --delete: pruning the off-host copy is done by name, below.
 # -H keeps the hard links between snapshots, so the remote copy is as
 # small as the local one.
-rsync_remote -aH "${remote_copy[@]}" --numeric-ids "$SNAPSHOTS/" "$REMOTE/snapshots/"
-
-portable_info() {
-    mkdir -p "$link_scratch/portable-info" || return 1
-    cat "$SNAPSHOTS/$1/INFO" > "$link_scratch/portable-info/INFO" || return 1
-    printf 'link_storage=manifest\n' >> "$link_scratch/portable-info/INFO" || return 1
-    touch -r "$SNAPSHOTS/$1/INFO" "$link_scratch/portable-info/INFO" || return 1
-    touch -r "$SNAPSHOTS/$1" "$link_scratch/portable-info"
-}
-if [[ $REMOTE_LINKS == no ]]; then
-    while read -r old; do
-        [[ -f $SNAPSHOTS/$old/INFO && -f $SNAPSHOTS/$old/SYMLINKS ]] || continue
-        portable_info "$old"
-        # Include the root directory time after replacing INFO.
-        rsync_remote -dct "$link_scratch/portable-info/" "$REMOTE/snapshots/$old/"
-    done < <(list_snapshots)
-fi
-
-compare_remote_snapshot() {
-    local old=$1 changes info_changes
-    local -a check=("${remote_check[@]}")
-    if [[ $REMOTE_LINKS == no && ! -f $SNAPSHOTS/$old/SYMLINKS ]]; then
-        check=(--no-links --info=nonreg0)
-    fi
-    changes=$(rsync_remote -anc "${check[@]}" --numeric-ids --delete --itemize-changes \
-        "$SNAPSHOTS/$old/" "$REMOTE/snapshots/$old/") || return 1
-    if [[ $REMOTE_LINKS == no && -f $SNAPSHOTS/$old/SYMLINKS ]]; then
-        portable_info "$old" || return 1
-        info_changes=$(rsync_remote -nct --itemize-changes "$link_scratch/portable-info/INFO" "$REMOTE/snapshots/$old/INFO") || return 1
-        changes+=${info_changes:+$'\n'$info_changes}
-    fi
-    [[ -z $changes ]] || { printf '%s\n' "$changes"; return 1; }
-}
+rsync_remote -aH --numeric-ids "$SNAPSHOTS/" "$REMOTE/snapshots/"
 
 log "Checking the off-host copy of $current"
-if ! diffs=$(compare_remote_snapshot "$current"); then
-    die "off-host copy of $current doesn't match:
+diffs=$(rsync_remote -anc --numeric-ids --delete --itemize-changes \
+    "$SNAPSHOTS/$current/" "$REMOTE/snapshots/$current/")
+[[ -z $diffs ]] || die "off-host copy of $current doesn't match:
 $diffs"
-fi
 
 # REMOTE_PRUNE=yes: apply the same retention rule to the off-host snapshots,
 # on their own list of names. Only the names the rule drops are deleted.
@@ -416,7 +372,8 @@ deep_verify() (
             continue
         fi
         log "Deep check remote $old against verified local copy"
-        if diffs=$(compare_remote_snapshot "$old"); then
+        if diffs=$(rsync_remote -anc --numeric-ids --delete --itemize-changes \
+                "$SNAPSHOTS/$old/" "$REMOTE/snapshots/$old/") && [[ -z $diffs ]]; then
             :
         else
             log "Deep check FAILED remote $old (differences/paths below)"

@@ -85,7 +85,6 @@ fetch_and_check() {
     local snap=$scratch/snapshot
     log "Verifying checksums"
     verify_snapshot "$snap" || die "$source failed snapshot verification"
-    materialize_snapshot_links "$snap" || die "could not recreate the snapshot's saved links in scratch"
 
     log "Checking the database"
     viewer_python "$PY_CHECK_RESTORE" annotations < "$snap/annotations.db" >&2 \
