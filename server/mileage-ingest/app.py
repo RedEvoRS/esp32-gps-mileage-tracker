@@ -41,6 +41,7 @@ raw GPX is kept byte-for-byte, so these rules can change and every
 summary be recomputed.
 """
 
+import errno
 import hashlib
 import hmac
 import io
@@ -320,6 +321,7 @@ def _stored_trip_directories(root, safe_id):
     for directory in root.iterdir():
         if not re.fullmatch(r"[0-9]{4}-[0-9]{2}", directory.name):
             continue
+        name = directory.name
         try:
             directory = _checked_trip_path(root, directory)
         except (ValueError, RuntimeError):
@@ -335,6 +337,12 @@ def _stored_trip_directories(root, safe_id):
                 path.stat()
             except (FileNotFoundError, NotADirectoryError):
                 continue
+            except OSError as exc:
+                # Python 3.13+ resolve() no longer raises on a link loop, so
+                # the loop shows up here instead; report it the same way.
+                if exc.errno == errno.ELOOP:
+                    raise LinkedMonthError(name) from None
+                raise
             # A month link to another month folder in the data folder is the
             # same folder, not a second copy of the trip (#725).
             if directory not in matches:
