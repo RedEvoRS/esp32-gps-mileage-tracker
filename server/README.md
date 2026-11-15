@@ -1469,9 +1469,10 @@ contents make the run exit non-zero and withhold `PING_URL`. Unraid status
 shows `last_backup_links_not_backed_up`; `install.sh --check` warns when it
 is above zero or `not checked`. Missing or unreadable backup information shows
 `unavailable` in status: check the backup disk/mount, `latest`, and `INFO` before
-assuming a link check failed. With a recent success, the installer warns when `latest/INFO` is unavailable,
-unless another backup/destination check already explains the problem. A first backup failing
-only for missing linked contents warns and install continues.
+assuming a link check failed. With a recent success, the installer warns when
+`latest/INFO` is unavailable, unless another backup/destination check already
+explains the problem. A first backup failing only for missing linked contents
+warns and install continues.
 
 Absolute links inside `data/` get a separate warning: the link
 itself will not be restored, but its target is saved under its real path
@@ -1533,15 +1534,29 @@ snapshot; unchanged links dedupe and excluded links do not affect comparison.
 Failure to write either manifest fails the run and withholds the heartbeat;
 inspect the log and rerun.
 
+Checks compare the links on disk with `SYMLINKS`, naming each added, removed or
+retargeted link. Older snapshots without that list still pass with a note that
+their links are not checked. Off-host copies normally preserve links too;
+each run tests the destination with a tiny copy and read-back. If it drops or
+converts symbolic links, the copy omits them and records `link_storage=manifest`
+in its `INFO`: checks verify the saved metadata and require no links on disk,
+then restore recreates them only in scratch before its usual safe-link checks.
+Regular files and `SYMLINKS` keep their original checksums. A destination without
+hard links uses separate file copies and warns about extra space. SMB support
+depends on mount options; this probe also handles link-less filesystems such as
+exFAT. Copy/read-back errors still fail the run. Back up an existing destination
+before changing its filesystem or link handling.
+
 To check files by hand with GNU coreutils, run `cd <snapshot>` then
 `sha256sum -c SHA256SUMS`. Every listed file must say `OK` and the command must
-exit 0. For the complete check, including unlisted files and databases, use
+exit 0. For the complete check, including unlisted files, links and databases, use
 `restore.sh check <snapshot>`.
 
 Cleanup and local/off-host pruning make only directories writable before
 removing them. Kept snapshots retain file modes, including files shared by hard
-links. Pruning an SSH destination also needs Bash, find, chmod and rm there;
-it removes only named snapshots and never mirrors or deletes the remote root.
+links. Probe cleanup and pruning on an SSH destination also need Bash, find,
+chmod and rm there; pruning removes only named snapshots and never mirrors or
+deletes the remote root.
 
 The nightly local trip copy compares contents with rsync `--checksum`, reading
 live files and their previous copies even when size and time match: a local

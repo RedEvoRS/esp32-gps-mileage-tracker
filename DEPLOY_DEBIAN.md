@@ -1456,8 +1456,8 @@ off-host destination. Each run:
   Links resolving outside `data/` are logged (up to 20 and a remainder count);
   their contents are missing from this and earlier snapshots made with the
   link. Working relative internal chains and `*.tmp` are fine. Move the contents
-  into `data/` and rerun the backup. The copy and deep check still run, but the run exits
-  non-zero and withholds the heartbeat.
+  into `data/` and rerun the backup. The copy and deep check still run, but the
+  run exits non-zero and withholds the heartbeat.
   Absolute links inside `data/` get a separate warning that their aliases will
   not be restored; their targets are saved at their real paths unless missing
   or excluded, which the warning explains. These warnings do not fail the run,
@@ -1493,12 +1493,13 @@ off-host destination. Each run:
   remain restorable. A copied link's add, removal, retarget or swap with a real
   folder also creates a snapshot; excluded links do not affect comparison.
   Manifest-writing errors fail the run and withhold the heartbeat.
+  Restore and deep checks compare saved links with `SYMLINKS`; older snapshots
+  without it report that their links are not checked.
   Unchanged files are hard links to the previous snapshot; an unchanged run
   adds no snapshot.
 - keeps the newest 14 snapshots plus the first of each month for 7 years.
   Pruning and scratch cleanup make only directories writable when removing them;
-  file modes in kept snapshots are preserved. SSH pruning also needs Bash, find,
-  chmod and rm on the destination.
+  file modes in kept snapshots are preserved.
 - rsyncs to the off-host copy, then reads the newest snapshot back from
   there and checks it matches byte for byte. It copies only if the
   destination holds a file named `.mileage-backup-target` (see 10a): a share
@@ -1516,6 +1517,10 @@ off-host destination. Each run:
   deletion by a compromised server needs retention or snapshots enforced on
   the backup host, or a restricted backup account. See
   [backup.conf.example](server/backup/backup.conf.example).
+  A tiny destination probe selects link storage: links normally stay as links;
+  link-less destinations retain their checksummed metadata for recovery in
+  restore scratch, with a warning and an `INFO` note. See
+  [off-host link storage](server/README.md#backup) for details.
 - gives up instead of hanging when the destination vanishes mid-copy: rsync
   stops after 10 minutes without data moving, an SSH connection after about
   two minutes of silence, and the systemd unit after 6 hours in all.
@@ -1527,8 +1532,8 @@ needs UID 1000 (Step 0).
 ### 10a — Pick the off-host destination
 
 Anything you can rsync to: a network attached storage (NAS) device, another
-always-on machine, or a mounted share. Over SSH, the far end needs `rsync`
-installed and a login the backup
+always-on machine, or a mounted share. Over SSH, the far end needs `rsync`,
+Bash, find, chmod and rm for probe cleanup and pruning, plus a login the backup
 can use without a password. In these examples, `<backup-user>` and
 `<backup-host>` are the login and host for that other machine, and
 `/<backup-path>` is the absolute destination directory there. On this server:

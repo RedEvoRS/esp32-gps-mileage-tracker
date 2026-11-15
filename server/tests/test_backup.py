@@ -381,7 +381,7 @@ class BackupScripts(unittest.TestCase):
 
     def refresh_manifest(self, snap):
         files = sorted(p for p in snap.rglob("*")
-                       if p.is_file() and p.name not in ("SHA256SUMS", "INFO"))
+                       if p.is_file() and not p.is_symlink() and p.name not in ("SHA256SUMS", "INFO"))
         (snap / "SHA256SUMS").write_text("".join(
             f"{hashlib.sha256(p.read_bytes()).hexdigest()}  ./{p.relative_to(snap)}\n"
             for p in files))
@@ -624,6 +624,165 @@ exec {real_sha} "$@"
         self.shim("find", f'exec {busybox} find "$@"\n')
         self.assert_filename_independent_count()
 
+    def mutate_snapshot_link(self, snap, action):
+        link = snap / "data/link\nname"
+        if action != "add":
+            link.unlink()
+        if action != "remove":
+            self.symlink(link, "./2026-10" if action == "change" else "2026-10")
+        return link
+
+    def test_restore_check_and_restore_reject_added_removed_and_changed_snapshot_links(self):
+        for action, label in (("add", "Added"), ("remove", "Removed"), ("change", "Changed")):
+            with self.subTest(action=action):
+                live = self.data / "link\nname"
+                if live.is_symlink():
+                    live.unlink()
+                if action != "add":
+                    self.symlink(live, "2026-10")
+                self.run_script("backup.sh")
+                snap = self.remote / "snapshots" / self.snapshots()[-1]
+                self.mutate_snapshot_link(snap, action)
+                for command in ("check", "restore"):
+                    self.compose_log.write_text("")
+                    args = ("latest", "--yes") if command == "restore" else ()
+                    result = self.run_script("restore.sh", command, *args, check=False)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn(f"{label} link: $'data/link\\nname'", result.stderr)
+                    self.assertEqual(result.stderr.count("data/link\\nname"), 1)
+                    self.assertNotIn("stop mileage-", self.compose_log.read_text())
+                    self.assertFalse(list(self.backups.glob("pre-restore-*")))
+                # Repair only this test's tampering before the next case.
+                link = snap / "data/link\nname"
+                if link.is_symlink():
+                    link.unlink()
+                if action != "add":
+                    self.symlink(link, "2026-10")
+
+    def assert_deep_check_rejects_link_changes(self, remote_only):
+        self.symlink(self.data / "link\nname", "2026-10")
+        self.run_script("backup.sh")
+        old = "2020-01-01T030000Z"
+        root = self.remote if remote_only else self.backups
+        snap = root / "snapshots" / old
+        shutil.copytree(self.backups / "latest", snap, symlinks=True)
+        self.conf_append("KEEP_RECENT=100\nBACKUP_VERIFY_DAYS=7\n")
+        for action, label in (("remove", "Removed"), ("change", "Changed"), ("add", "Added")):
+            with self.subTest(action=action):
+                link = snap / "data/link\nname"
+                if action == "add":
+                    link.unlink()
+                    # This case's manifest describes an initially absent link.
+                    (snap / "SYMLINKS").write_bytes(b"")
+                    self.refresh_manifest(snap)
+                self.mutate_snapshot_link(snap, action)
+                result = self.run_script("backup.sh", "--verify", check=False)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                kind = "remote-only" if remote_only else "local"
+                self.assertIn(f"Deep check FAILED {kind} {old}", result.stderr)
+                self.assertIn(f"{label} link: $'data/link\\nname'", result.stderr)
+                if link.is_symlink():
+                    link.unlink()
+                self.symlink(link, "2026-10")
+
+    def test_deep_local_check_rejects_link_inventory_changes(self):
+        self.assert_deep_check_rejects_link_changes(remote_only=False)
+
+    def test_deep_remote_only_check_rejects_link_inventory_changes(self):
+        self.assert_deep_check_rejects_link_changes(remote_only=True)
+
+    def test_remote_comparison_checks_links_after_the_copy(self):
+        self.symlink(self.data / "alias", "2026-10")
+        self.run_script("backup.sh")
+        names = self.seed_verification(2)
+        self.run_script("backup.sh", "--verify")
+        real_rsync = shutil.which("rsync")
+        self.shim("rsync", f'''
+if [[ $1 == --timeout=* && $4 == -aH && ${{*: -1}} == "{self.remote}/snapshots/" ]]; then exit 0; fi
+exec {real_rsync} "$@"
+''')
+        link = self.remote / "snapshots" / names[0] / "data/alias"
+        link.unlink()
+        self.symlink(link, "./2026-10")
+        result = self.run_script("backup.sh", "--verify", check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"Deep check FAILED remote {names[0]}", result.stderr)
+        self.assertIn("data/alias", result.stderr)
+
+    def test_latest_with_damaged_links_is_replaced_before_deep_check(self):
+        self.symlink(self.data / "alias", "2026-10")
+        self.run_script("backup.sh")
+        [old] = self.snapshots()
+        link = self.backups / "latest/data/alias"
+        link.unlink()
+        self.symlink(link, "./2026-10")
+        result = self.run_script("backup.sh", "--verify", check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(len(self.snapshots()), 2)
+        self.assertEqual(os.readlink(self.backups / "latest/data/alias"), "2026-10")
+        self.assertIn(f"Deep check FAILED local {old}", result.stderr)
+        self.assertIn("Changed link: data/alias", result.stderr)
+
+    def test_snapshot_without_symlinks_list_has_explicit_unchecked_note(self):
+        snap = self.legacy_link_snapshot()
+        result = self.run_script("restore.sh", "check", str(snap))
+        self.assertIn("snapshot has no SYMLINKS; its symbolic links are not checked", result.stderr)
+
+    def assert_linkless_destination_uses_verified_metadata(self, converted):
+        self.read_only_data_folder()
+        self.symlink(self.data / "alias\nname", "2026-10")
+        real_rsync = shutil.which("rsync")
+        self.shim("rsync", f'''
+case "${{*: -1}}" in
+    "{self.remote}"/.link-probe-*/)
+        {real_rsync} "$@" --no-links --no-hard-links || exit $?
+        {'printf converted > "${@: -1}alias"' if converted else ':'}
+        exit {0 if converted else 23} ;;
+esac
+exec {real_rsync} "$@"
+''')
+        for _ in range(2):
+            result = self.run_script("backup.sh", "--verify")
+            self.assertIn("cannot preserve symbolic links", result.stderr)
+            self.assertIn("cannot preserve hard links", result.stderr)
+        self.assertEqual(len(self.snapshots()), 1)
+        snap = self.remote / "snapshots" / self.snapshots()[-1]
+        self.assertFalse((snap / "data/alias\nname").is_symlink())
+        self.assertIn("link_storage=manifest", (snap / "INFO").read_text())
+        self.assertEqual((snap / "SYMLINKS").read_bytes(), (self.backups / "latest/SYMLINKS").read_bytes())
+        self.assertFalse(list(self.remote.glob(".link-probe-*")))
+        result = self.run_script("restore.sh", "check")
+        self.assertIn("Recreating saved symbolic links in restore scratch", result.stderr)
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+        self.assertEqual(os.readlink(self.data / "alias\nname"), "2026-10")
+        self.assertFalse((snap / "data/alias\nname").is_symlink(), "only scratch may be materialized")
+        old = self.remote / "snapshots/2020-01-01T030000Z"
+        shutil.copytree(snap, old)
+        self.run_script("backup.sh", "--verify")  # Remote-only portable representation.
+        self.symlink(old / "data/rogue", "2026-10")
+        result = self.run_script("backup.sh", "--verify", check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("Added link: data/rogue", result.stderr)
+
+    def test_linkless_remote_keeps_checksums_and_restores_links_from_metadata(self):
+        self.assert_linkless_destination_uses_verified_metadata(converted=False)
+
+    def test_link_converting_remote_uses_metadata_without_nightly_failure(self):
+        self.assert_linkless_destination_uses_verified_metadata(converted=True)
+
+    def test_failed_remote_capability_copy_cannot_advance_success(self):
+        self.run_script("backup.sh")
+        stamp = (self.backups / "last-success").read_bytes()
+        real_rsync = shutil.which("rsync")
+        self.shim("rsync", f'''
+case "${{*: -1}}" in "{self.remote}"/.link-probe-*/) exit 23 ;; esac
+exec {real_rsync} "$@"
+''')
+        result = self.run_script("backup.sh", check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("could not copy and read back", result.stderr)
+        self.assertEqual((self.backups / "last-success").read_bytes(), stamp)
+
     def test_outside_links_reported_and_copied_without_targets(self):
         outside = self.tmp / "outside"
         outside.mkdir()
@@ -745,6 +904,8 @@ exec {real_rsync} "$@"
     def test_restore_link_walk_limit_only_warns_for_check_and_restore(self):
         self.run_script("backup.sh")
         snap = self.backups / "latest"
+        (snap / "SYMLINKS").unlink()
+        self.refresh_manifest(snap)
         self.symlink(snap / "data/dot", ".")
         chain = "dot/" * 257 + "2026-10"
         self.symlink(snap / "data/long-chain", chain)
@@ -1414,6 +1575,8 @@ exec {real_readlink} "$@"
     def legacy_link_snapshot(self):
         self.run_script("backup.sh")
         snap = self.remote / "snapshots" / self.snapshots()[-1]
+        (snap / "SYMLINKS").unlink()
+        self.refresh_manifest(snap)
         # Old INFO has no coverage key; inspect the actual links.
         info = snap / "INFO"
         info.write_text("\n".join(line for line in info.read_text().splitlines()
@@ -1497,7 +1660,7 @@ exec {real_readlink} "$@"
         newest = self.backups / "snapshots" / self.snapshots()[-1]
         names = [f"2026-01-{day:02}T030000Z" for day in range(1, count + 1)]
         for name in names:
-            shutil.copytree(newest, newest.parent / name)
+            shutil.copytree(newest, newest.parent / name, symlinks=True)
         self.conf_append("KEEP_RECENT=100\nBACKUP_VERIFY_DAYS=7\n")
         return names
 

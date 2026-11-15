@@ -599,6 +599,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   probe rejects unreadable escaping without rehashing trips. Sorted NUL-delimited
   `SYMLINKS` records copied link paths/text; changes create snapshots and unchanged
   links dedupe. Only a previous snapshot without `SYMLINKS` forces one new copy.
+  Checks compare saved links with that list. An off-host capability probe selects
+  physical links or checksummed metadata-only storage (noted in remote `INFO`);
+  restore recreates the latter only in scratch before its usual safe-link copy.
   Missing diagnostics/monitor databases are normal and recorded in `INFO`.
   Monitor discovery uses Compose config's project name and Docker's Compose
   project/volume labels, without recent config flags or logging credentials.

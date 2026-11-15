@@ -309,7 +309,7 @@ Use this section for Unraid paths and scheduling.
 Mount the destinations first. Unassigned Devices commonly mounts local
 disks at `/mnt/disks/<name>` and network shares at `/mnt/remotes/<name>`.
 Enable the mount's automatic mounting if it should be available after boot.
-Choose a filesystem that supports the snapshot hard links and private file
+Choose a local snapshot filesystem that supports hard links and private file
 permissions. A separate share on this same Unraid box is **not off-host**.
 It cannot protect against losing the whole machine. The installer warns
 about a local `REMOTE`, and about destinations on the same filesystem as
@@ -403,8 +403,9 @@ log path, `last_deep_check`, `last_deep_check_result`, and
 zero). A failed link check records `unknown` in `INFO` and status shows
 `not checked`; inspect the backup log, fix the error and rerun the backup.
 Missing or unreadable backup information instead shows `unavailable`: check
-that the backup disk is mounted and `latest/INFO` can be read. With a recent success, the installer reports unavailable `latest/INFO` unless
-another backup/destination check already explains the problem.
+that the backup disk is mounted and `latest/INFO` can be read. With a recent
+success, the installer reports unavailable `latest/INFO` unless another
+backup/destination check already explains the problem.
 Empty values can mean
 it has never run. Status 0 means success;
 `running` has no final result yet. Reading status itself exits 0, so inspect
@@ -432,10 +433,11 @@ complete backup. A proven loop gets a warning naming the link and saying it
 loops and has nothing behind it to back up; remove or correct it. Loops do not
 withhold the heartbeat or increase `links_not_backed_up`. Other resolution errors
 (including more than 256 link steps without proving a loop) still fail the
-coverage check. If restore advice fails, backup, check and restore warn and continue; inspect
-the log and rerun for that advice. Scratch stays outside snapshots and the
-coverage result is preserved. Relative chains that pass rsync's text check but
-lead outside are recreated and warned about; their outside contents still fail backup,
+coverage check. If restore advice fails, backup, check and restore warn and
+continue; inspect the log and rerun for that advice. Scratch stays outside
+snapshots and the coverage result is preserved. Relative chains that pass rsync's
+text check but lead outside are recreated and warned about; their outside
+contents still fail backup,
 withhold the heartbeat and count in `links_not_backed_up`. Backup never follows
 links to copy their contents. Replace an alias you need with a working relative
 internal chain or a real folder or file, then make a fresh backup.
@@ -458,6 +460,13 @@ cause one extra snapshot and remain restorable. Link-only adds, removals,
 retargets and swaps with real folders also create snapshots; unchanged links
 dedupe, and excluded links do not affect comparison. Manifest-writing errors
 fail the run and withhold the heartbeat; inspect the log and rerun.
+
+Restore and deep checks compare saved links with `SYMLINKS`; older snapshots
+without it report that their links are not checked. Off-host destinations are
+probed for link support: an unsupported destination keeps the checksummed link
+metadata for recovery in restore scratch, with a warning and an `INFO` note.
+See [off-host link storage](server/README.md#backup) for that representation and
+the extra space needed without hard links.
 
 After today's backup has completed and been copied, the same run periodically
 checks older snapshots. In `backup/backup.conf`, `BACKUP_VERIFY_DAYS=7` means
