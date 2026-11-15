@@ -959,6 +959,14 @@ def _month_blocks_all_uploads(month, root):
     return stat.S_ISDIR(mode) and not os.access(target, os.R_OK | os.X_OK)
 
 
+def _month_refuses_new_uploads(month, root):
+    """Use ingest's final-target-name rule even when that target is absent."""
+    try:
+        return month.is_symlink() and trip_merges.checked_path(root, month).name != month.name
+    except (OSError, ValueError):
+        return False  # Unsafe/permission failures have their own global refusal.
+
+
 def _month_link_problem(month, root):
     # stat reports ELOOP consistently even where Path.resolve changed behavior.
     # This probes metadata only; no target is listed or opened here.
@@ -1215,7 +1223,8 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                                    "folder_reason": reason, "counted_as": counted_as,
                                    "saved_months": saved_months,
                                    "saved_counts": _saved_month_counts(conn, saved_months) if reason == "saved_keys" else {},
-                                   "uploads_refused": uploads_refused,
+                                   "uploads_refused": (uploads_refused or
+                                                       (reason == "dangling" and _month_refuses_new_uploads(DATA_ROOT / ym, root))),
                                    "all_uploads_refused": (_month_blocks_all_uploads(DATA_ROOT / ym, root)
                                                            if missing_mileage({"folder_reason": reason}) else False),
                                    "refused_file": "folder", "problem_file": "folder"})

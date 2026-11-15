@@ -67,6 +67,13 @@ GLOBAL_UPLOAD_LAYOUTS = {
     "nonmonth-outside": {"directories": ["../outside"], "links": [("archive", "../outside")], "blocked": False},
 }
 
+MONTH_PROBLEM_LAYOUTS = {
+    "missing-different-name": {"directories": [], "links": [("2026-02", "missing")],
+                               "reason": "dangling", "uploads": {"2026-02": 503, "2026-04": 200}},
+    "missing-same-name": {"directories": ["archive"], "links": [("2026-02", "archive/2026-02")],
+                          "reason": "dangling", "uploads": {"2026-02": 200, "2026-04": 200}},
+}
+
 
 def make_layout(root, layout, symlink):
     root.mkdir(parents=True, exist_ok=True)

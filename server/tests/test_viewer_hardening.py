@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from zoneinfo import ZoneInfo
 
 import test_viewer_roles as roles
-from month_link_layouts import (GLOBAL_UPLOAD_LAYOUTS, MONTH_LINK_LAYOUTS, PERMISSION_MONTH_LAYOUTS,
+from month_link_layouts import (GLOBAL_UPLOAD_LAYOUTS, MONTH_LINK_LAYOUTS, MONTH_PROBLEM_LAYOUTS, PERMISSION_MONTH_LAYOUTS,
                                 make_layout, restricted_layout)
 
 
@@ -549,7 +549,7 @@ class ViewerHardeningTests(unittest.TestCase):
             "unreadable": "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only.",
         }
         cases = [(reason, False, False) for reason in descriptions]
-        cases += [("saved_keys", True, False), ("duplicate", True, False)]
+        cases += [("saved_keys", True, False), ("duplicate", True, False), ("dangling", True, False)]
         cases += [(reason, False, True) for reason in ("outside", "dangling", "loop", "unreadable")]
         for number, (reason, refused, all_refused) in enumerate(cases, 1):
             entries.append({"folder": True, "ym": f"2026-{number:02}", "trip_key": f"2026-{number:02}/",
@@ -640,6 +640,28 @@ class ViewerHardeningTests(unittest.TestCase):
                         self.assertIn("2027-02/", text)
                 # Unrelated years do not gain missing mileage in their snapshot.
                 self.assertEqual(self.viewer.year_figures(*self.viewer.year_members(trips, entries, 2020))["unreadable"], 0)
+
+    def test_month_problems_match_ingest_layouts_and_every_surface(self):
+        self.signed_in("admin")
+        for label, layout in MONTH_PROBLEM_LAYOUTS.items():
+            root = self.viewer.DATA_ROOT / label
+            make_layout(root, layout, self.symlink)
+            with patch.object(self.viewer, "DATA_ROOT", root):
+                trips, entries = self.viewer.load_trips()
+                self.assertEqual(trips, [])
+                self.assertEqual(len(entries), 1)
+                entry = entries[0]
+                self.assertEqual(entry["folder_reason"], layout["reason"])
+                self.assertFalse(entry["all_uploads_refused"])
+                self.assertEqual(entry["uploads_refused"], layout["uploads"]["2026-02"] == 503)
+                for role in ("admin", "editor"):
+                    message = self.viewer.folder_message(entry, role)
+                    self.assertEqual("cannot upload new trips for this month" in message,
+                                     layout["uploads"]["2026-02"] == 503)
+                    if role == "admin":
+                        for path, texts in self.folder_surface_messages(self.client).items():
+                            self.assertTrue(any(message in text for text in texts), (label, path))
+                self.assertNotIn("Uploads are blocked.", self.client.get("/?year=2020").get_data(as_text=True))
 
     def test_month_resolution_permission_error_is_a_global_503(self):
         month = self.viewer.DATA_ROOT / "2026-03"

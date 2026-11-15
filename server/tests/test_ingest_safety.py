@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from month_link_layouts import (GLOBAL_UPLOAD_LAYOUTS, MONTH_LINK_LAYOUTS, PERMISSION_MONTH_LAYOUTS,
+from month_link_layouts import (GLOBAL_UPLOAD_LAYOUTS, MONTH_LINK_LAYOUTS, MONTH_PROBLEM_LAYOUTS, PERMISSION_MONTH_LAYOUTS,
                                 make_layout, restricted_layout)
 
 
@@ -248,6 +248,19 @@ class UploadSafety(unittest.TestCase):
                     for name, _ in layout["links"]:
                         (root / name).unlink()
                     self.assertEqual(ingest.app.test_client().post("/upload", data=body(), headers=HEADERS).status_code, 200)
+
+    def test_month_problems_match_shared_viewer_layouts(self):
+        for label, layout in MONTH_PROBLEM_LAYOUTS.items():
+            root = self.root / label
+            make_layout(root, layout, self.symlink)
+            ingest = load_ingest(root)
+            for month, status in layout["uploads"].items():
+                payload = body().replace(b"2026-04-14", (month + "-14").encode())
+                with self.subTest(layout=label, month=month):
+                    response = ingest.app.test_client().post("/upload", data=payload, headers=HEADERS)
+                    self.assertEqual(response.status_code, status, response.get_json())
+                    if status == 503:
+                        self.assertIn(f"month folder {month}", response.get_json()["error"])
 
     def test_month_resolution_permission_error_refuses_all_uploads(self):
         month = self.root / "2026-03"

@@ -2723,8 +2723,12 @@ folder containing the existing trips (recover them from actual storage or a
 backup), or mount the disk at that month path. Remove only the links, not their
 targets or trip files. Run `install.sh --check`, check the viewer totals, then
 allow the tracker to retry. These trips can't be removed one by one in the
-viewer. A missing target inside `data/` is unreadable, but does not cause this
-all-month 503. Disk I/O and other server faults still return 500.
+viewer. A missing target inside `data/` is unreadable. If its final target name
+differs from the month link name, ingest refuses new trips for that month with
+HTTP 503 and the tracker keeps them queued until the link is replaced with a
+real folder; other months still upload. A missing same-named target such as
+`2026-02` → `archive/2026-02` does not cause that refusal: ingest can create it
+on upload. Disk I/O and other server faults still return 500.
 
 One month folder the server cannot read or enter blocks **every trip upload
 for every month**, including retries, with HTTP 503 naming the folder. Both
