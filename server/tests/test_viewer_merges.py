@@ -82,6 +82,21 @@ class ViewerMerges(unittest.TestCase):
     def split(self, key):
         return self.client.post(f"/trip/{key}/split", data={"csrf_token": "test-csrf", "confirm": "yes"})
 
+    def test_nonmonth_link_upload_notice_does_not_block_merge(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        archive = self.data / "archive"
+        self.month.rename(archive)
+        try:
+            self.month.symlink_to(archive, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        trips, notices = self.viewer.load_trips()
+        self.assertEqual([t["folder_reason"] for t in notices], ["ingest_refused"])
+        first = next(t for t in trips if t["trip_key"] == a)
+        candidate, reason = self.viewer.trip_merges.next_trip(first, trips, notices)
+        self.assertEqual(candidate["trip_key"] if candidate else None, b, reason)
+        self.assertEqual(self.merge(a, b).status_code, 302)
+
     def test_duplicate_month_notice_does_not_block_merge(self):
         a, b = self.trip("a", 0), self.trip("b", 180, .01)
         try:

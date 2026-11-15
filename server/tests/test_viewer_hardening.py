@@ -404,14 +404,16 @@ class ViewerHardeningTests(unittest.TestCase):
         self.assertEqual([t["trip_key"] for t in unreadable], ["2026-01/"])
         self.assertEqual({t["trip_key"] for t in trips}, {"2026-02/drive"})
 
-    def assert_alias_counted_once(self, key, alias):
+    def assert_alias_counted_once(self, key, alias, ingest_notice=False):
         trips, unreadable = self.viewer.load_trips()
         self.assertEqual([t["trip_key"] for t in trips], [key])
         self.assertEqual(self.viewer.mileage_totals(trips)["all"], 1)
-        self.assertEqual([t["trip_key"] for t in unreadable], [alias + "/"])
-        self.assertTrue(unreadable[0]["folder"])
-        self.assertIn("already counted", unreadable[0]["problem"])
-        self.assertNotIn(str(self.viewer.DATA_ROOT), unreadable[0]["problem"])
+        duplicates = [t for t in unreadable if t["folder_reason"] == "duplicate"]
+        self.assertEqual([t["trip_key"] for t in duplicates], [alias + "/"])
+        self.assertEqual(len(unreadable), 2 if ingest_notice else 1)
+        self.assertTrue(duplicates[0]["folder"])
+        self.assertIn("already counted", duplicates[0]["problem"])
+        self.assertNotIn(str(self.viewer.DATA_ROOT), duplicates[0]["problem"])
         for role in ("admin", "editor"):
             client = self.signed_in(role, self.viewer.app.test_client())
             page = client.get("/").get_data(as_text=True)
@@ -427,13 +429,14 @@ class ViewerHardeningTests(unittest.TestCase):
             self.assertEqual(len([r for r in rows if r["row_type"] == "trip"]), 1)
             self.assertEqual([float(r["distance_miles"]) for r in rows
                               if r["row_type"] == "total" and r["category"] == "all"], [1])
-            self.assertEqual([r["trip_id"] for r in rows if r["row_type"] == "folder_notice"], [alias + "/"])
+            notices = {r["trip_id"] for r in rows if r["row_type"] == "folder_notice"}
+            self.assertEqual(notices, {alias + "/", key.split("/")[0] + "/"} if ingest_notice else {alias + "/"})
             book = load_workbook(io.BytesIO(client.get("/export.xlsx").data))
             self.assertEqual(book["Mileage"].max_row, 2)
             self.assertEqual([r[3] for r in book["Totals"].values if r[2] == "all"], [1])
-            self.assertEqual(book["Unreadable trips"].max_row, 2)
+            self.assertEqual(book["Unreadable trips"].max_row, 3 if ingest_notice else 2)
             self.assertIn("whose trips are counted there", str(list(book["Unreadable trips"].values)))
-            notice = next(r for r in rows if r["row_type"] == "folder_notice")
+            notice = next(r for r in rows if r["trip_id"] == alias + "/")
             self.assertIn("whose trips are counted there", notice["purpose_note"])
             self.assertNotIn("missing", notice["purpose_note"])
             self.assertIn(alias + "/", str(list(book["Unreadable trips"].values)))
@@ -460,7 +463,7 @@ class ViewerHardeningTests(unittest.TestCase):
         month.rename(target)
         self.symlink(self.viewer.DATA_ROOT / "2027-01", target, directory=True)
         self.symlink(month, target, directory=True)
-        self.assert_alias_counted_once("2026-01/drive", "2027-01")
+        self.assert_alias_counted_once("2026-01/drive", "2027-01", ingest_notice=True)
 
     def test_single_month_link_to_nonmonth_folder_scans_under_link_name(self):
         month = self.viewer.DATA_ROOT / "2026-01"
@@ -469,9 +472,26 @@ class ViewerHardeningTests(unittest.TestCase):
         self.symlink(month, target, directory=True)
         trips, unreadable = self.viewer.load_trips()
         self.assertEqual([t["trip_key"] for t in trips], ["2026-01/drive"])
-        self.assertEqual(unreadable, [])
+        self.assertEqual([t["folder_reason"] for t in unreadable], ["ingest_refused"])
         self.assertEqual(trips[0]["purpose_note"], "example")
         self.assertEqual(trips[0]["category"], "business")
+
+    def test_nonmonth_link_notice_explains_queued_uploads_without_missing_miles(self):
+        self.linked_archive("2026-01")
+        trips, notices = self.viewer.load_trips()
+        self.assertEqual(self.viewer.mileage_totals(trips)["all"], 1)
+        self.assertEqual(self.viewer.year_figures(trips, notices)["unreadable"], 0)
+        self.signed_in("admin")
+        for path in ("/", "/admin/year/2026", "/export.csv"):
+            text = self.client.get(path).get_data(as_text=True)
+            self.assertIn("trips are shown and counted", text)
+            self.assertIn("cannot upload new trips for this month", text)
+            self.assertIn("the tracker keeps them queued", text)
+            self.assertNotIn("totals below may be short", text)
+            self.assertNotIn("totals above may be short", text)
+            self.assertNotIn("none of its trips are shown or counted", text)
+        self.assertEqual(self.client.post("/admin/year/2026/close", data={
+            "csrf_token": "known-token", "confirm": "yes"}).status_code, 302)
 
     def linked_archive(self, name="2026-02"):
         root = self.viewer.DATA_ROOT

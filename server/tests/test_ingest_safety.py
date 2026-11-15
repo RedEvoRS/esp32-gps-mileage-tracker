@@ -212,6 +212,24 @@ class UploadSafety(unittest.TestCase):
             with self.assertLogs(self.ing.app.logger, "ERROR"):
                 self.assertEqual(self.upload().status_code, 503)
 
+    def test_new_trip_into_nonmonth_link_refuses_until_real_folder_restored(self):
+        archive = self.root / "archive"
+        archive.mkdir()
+        (archive / "existing.gpx").write_bytes(b"existing-trip-sentinel")
+        month = self.root / "2026-04"
+        self.symlink(month, archive, directory=True)
+        with self.assertLogs(self.ing.app.logger, "ERROR"):
+            response = self.upload()
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("2026-04", response.get_json()["error"])
+        self.assertEqual([p.name for p in archive.iterdir()], ["existing.gpx"])
+        self.assertEqual((archive / "existing.gpx").read_bytes(), b"existing-trip-sentinel")
+        month.unlink()
+        archive.rename(month)
+        response = self.upload()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue((month / "existing.gpx").exists())
+
     def test_looping_month_link_refuses_with_the_folder_named(self):
         # #724: a link loop raised RuntimeError from resolve() and gave a
         # generic 500 whose log didn't name the folder.

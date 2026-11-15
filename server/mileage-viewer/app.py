@@ -914,6 +914,7 @@ FOLDER_PROBLEMS = {
     "unreadable": "the folder could not be read",
     "duplicate": "the folder is a link to another folder that is already counted",
     "saved_keys": "several month names for this folder have saved trip data",
+    "ingest_refused": "trips are shown and counted, but the tracker cannot upload new trips for this month until the link is replaced by a real folder; the tracker keeps them queued",
 }
 
 
@@ -950,8 +951,11 @@ def _month_sort_key(month):
 def folder_description(entry):
     if entry["folder_reason"] == "saved_keys":
         names = ", ".join(name + "/" for name in entry["saved_months"])
-        return (f"Warning: saved trip data exists under {names}. Trips are shown and counted under "
+        text = (f"Warning: saved trip data exists under {names}. Trips are shown and counted under "
                 f"{entry['counted_as']}/; saved data under the other names is not applied")
+        if entry.get("uploads_refused"):
+            text += ". " + FOLDER_PROBLEMS["ingest_refused"]
+        return text
     if entry["folder_reason"] == "duplicate":
         return f"is a link to {entry['counted_as']}/, whose trips are counted there"
     return entry["problem"]
@@ -964,13 +968,15 @@ def folder_hint(entry, role):
         return "Remove the extra link."
     if entry["folder_reason"] == "saved_keys":
         return "Review the saved annotations, removals and merges under these names before removing links. Resolve this conflict before closing the year."
+    if entry["folder_reason"] == "ingest_refused":
+        return "Replace the link with a real folder containing these trips, or mount the disk there, so queued trips can upload."
     if entry["folder_reason"] == "unreadable":
         return "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only."
     return "Replace the link with the real folder, or mount the other disk at that path."
 
 
 def missing_mileage(entry):
-    return entry.get("folder_reason") not in ("duplicate", "saved_keys")
+    return entry.get("folder_reason") not in ("duplicate", "saved_keys", "ingest_refused")
 
 
 def _folder_row_type(entry):
@@ -1025,7 +1031,7 @@ def _month_choices(conn, root):
             problems.append((month.name, "outside", None, ()))
         except OSError:
             problems.append((month.name, "unreadable", None, ()))
-    for candidates in groups.values():
+    for target, candidates in groups.items():
         saved = []
         # Sorted real folders always win. Only competing links need DB work.
         if len(candidates) > 1 and candidates[0].is_symlink():
@@ -1036,7 +1042,9 @@ def _month_choices(conn, root):
             if month != chosen:
                 problems.append((month.name, "duplicate", chosen.name, ()))
         if len(saved) > 1:
-            problems.append((chosen.name, "saved_keys", chosen.name, saved))
+            problems.append((chosen.name, "saved_keys", chosen.name, saved, target.name != chosen.name))
+        elif chosen.is_symlink() and target.name != chosen.name:
+            problems.append((chosen.name, "ingest_refused", chosen.name, ()))
     return counted, problems
 
 
@@ -1091,9 +1099,9 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
         json_paths = []
         refused_months = set()
 
-        def refuse_month(ym, reason="outside", counted_as=None, saved_months=()):
+        def refuse_month(ym, reason="outside", counted_as=None, saved_months=(), uploads_refused=False):
             if ym not in refused_months:
-                if reason not in ("duplicate", "saved_keys"):
+                if missing_mileage({"folder_reason": reason}):
                     refused_months.add(ym)
                     unreadable[:] = [u for u in unreadable if u["ym"] != ym]
                 problem = FOLDER_PROBLEMS.get(reason)
@@ -1104,6 +1112,7 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                                    "has_gpx": False, "problem": problem,
                                    "folder_reason": reason, "counted_as": counted_as,
                                    "saved_months": saved_months,
+                                   "uploads_refused": uploads_refused,
                                    "refused_file": "folder", "problem_file": "folder"})
 
         counted, problems = _month_choices(conn, root)

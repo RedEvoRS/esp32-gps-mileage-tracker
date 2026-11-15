@@ -2723,6 +2723,11 @@ that has saved trip data. If several names have saved data, a warning names
 them; review their annotations, removals and merges before removing links.
 The viewer counts trips under the first saved name in sorted order, leaves the
 database rows in place, and refuses to close a year until the conflict is fixed.
+A link to a non-month folder inside `data/` shows existing trips and counts
+them, but a notice warns that ingest refuses new trips for that month with
+503. The tracker keeps those trips queued. Replace the link with a real folder
+containing the existing trips, or mount the disk there, to allow uploads.
+This upload notice does not block merges or closing a year.
 If the warning says a month folder can't be read, the
 viewer could not inspect or list it. Check that the folder (or its link's
 target) still exists and that its disk is available. To test access as the

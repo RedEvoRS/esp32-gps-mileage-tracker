@@ -569,7 +569,11 @@ for storage, Python fallback and service setup.
    `data/` or loops, every GPX upload gets HTTP 503 and the ingest log names
    the folder. A new trip whose own month folder is a link to a folder with a
    different name (say `2026-04` → `2026-03`) gets the same 503, because it
-   would otherwise be filed and shown under the other month. Replace it with a real folder or mount the disk there. The
+   would otherwise be filed and shown under the other month. A link to a
+   non-month folder (say `2026-04` → `archive`) also gets 503 for new trips:
+   ingest refuses that link even though the viewer shows existing trips under
+   `2026-04` and counts them. Replace the link with a real folder containing
+   those trips, or mount the disk there. The
    tracker keeps trips until HTTP 200 and retries after repair; Device health
    shows server errors. Diagnostics uploads are unaffected.
    Older third-party timed uploads named with a custom header keep their old
@@ -846,7 +850,12 @@ the directory handle. Keep `data/` writable only by the containers' user and
 root.
 
 A month link to a folder inside `data/` that no other month name uses (for
-example `2026-01` → `archive`) is read as that month, without a warning. If
+example `2026-01` → `archive`) is read as that month. A folder notice says that
+existing trips are shown and counted, but ingest refuses new trips for this
+month until the link is replaced with a real folder (or a disk mounted there).
+The tracker keeps new trips queued and retries after repair. This notice is
+`row_type=folder_notice` in CSV, does not mean miles are missing, and does not
+block merge suggestions or closing a year. If
 two month names reach the same folder, its trips count once, under the real
 month folder, and the other name
 gets a notice saying where they are counted (`row_type=folder_notice` in CSV).
@@ -990,7 +999,8 @@ The limit is the named `MERGE_MAX_GAP` constant in `trip_merges.py`. Older
 summaries without that timestamp use `end_time`, the last moving point, as
 a conservative fallback. Upload/receipt times are never used. Overlapping
 recordings, unknown device identities or unknown start times cannot be merged.
-A folder warning (not a duplicate-link notice) blocks merge suggestions with a
+A folder problem that leaves trips unreadable, or a conflict between saved
+month names, blocks merge suggestions with a
 folder-specific message until the folder is fixed. An unreadable summary blocks merging when its device is
 unknown, or when it
 belongs to this device and could fall between these recordings. Usable start
