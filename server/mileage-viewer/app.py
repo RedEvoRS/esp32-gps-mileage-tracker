@@ -3480,8 +3480,9 @@ def _year_list():
         saved_year = _trip_local_year(trip.get('saved_summary', {})) if trip.get('unused_merge') or trip.get('damaged_merge') else None
         years |= {saved_year} if saved_year else _folder_years(trip["ym"])
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
-        for row in _merge_history_rows(conn):
+        for row in _merge_history_rows(conn, trips=trips):
             years |= {row['saved_year']} if row['saved_year'] else _folder_years(row['trip_key'].split('/')[0])
+            years |= row['part_years']
     return [{"year": year, "closed": closed.get(year)} for year in sorted(years, reverse=True)]
 
 
@@ -3780,6 +3781,7 @@ def _merge_history_counted_parts(conn, rows, trips):
         except (TypeError, ValueError):
             stamps = None
         again, absent = [], []
+        part_years = set()
         for index, part in enumerate(details.get('parts', [])):
             month, name = part.split('/')
             alternate = counted.get(month, month) + '/' + name
@@ -3803,12 +3805,19 @@ def _merge_history_counted_parts(conn, rows, trips):
                     match = matches[0]
             if match is None:
                 absent.append(part)
+                part_years |= _folder_years(month)
                 continue
+            summary = current[match]
+            if summary.get('parts'):
+                summary, _ = read_summary(DATA_ROOT / (match + '.json'), root=DATA_ROOT.resolve())
+            part_year = _trip_local_year(summary or {})
+            part_years |= {part_year} if part_year else _folder_years(match.split('/')[0])
             label = part if match == part else f'{part} as {match}'
             if current[match].get('parts'):
                 label += f" (inside {current[match]['trip_key']})"
             again.append(label)
         row['counted_again'], row['not_counted'] = again, absent
+        row['part_years'] = part_years
 
 
 def merge_history_message(row):
@@ -3822,10 +3831,13 @@ def merge_history_message(row):
             f"trip date: {fmt_date(details.get('saved_summary', {}).get('start_time'))}. "
             f"Recorded at: {fmt_date(row['at'])}; login: {row['actor']}. ")
     if not row['counted_again']:
-        return text + "None of its trips are in the log; these saved miles are not in the totals."
-    text += "Now counted again: " + ', '.join(row['counted_again']) + "; do not add these saved miles by hand."
-    if row['not_counted']:
-        text += " Not currently counted: " + ', '.join(row['not_counted']) + "."
+        text += "None of its trips are in the log; these saved miles are not in the totals."
+    else:
+        text += "Now counted again: " + ', '.join(row['counted_again']) + "; do not add these saved miles by hand."
+        if row['not_counted']:
+            text += " Not currently counted: " + ', '.join(row['not_counted']) + "."
+    if row.get('review_year') and row.get('saved_year') and row['review_year'] != row['saved_year']:
+        text += f" The saved summary belongs to tax year {row['saved_year']}."
     return text
 
 
@@ -3848,15 +3860,18 @@ def _merge_history_rows(conn, year=None, trips=None):
             continue
         summary = details.get('saved_summary', {})
         saved_year = _trip_local_year(summary)
-        if year is not None and saved_year is not None and saved_year != year:
-            continue
         miles = summary.get('distance_miles')
-        row.update(parsed_details=details, saved_year=saved_year,
+        row.update(parsed_details=details, saved_year=saved_year, review_year=year,
+                   part_years=set().union(*(_folder_years(part.split('/')[0]) for part in details.get('parts', []))),
                    saved_miles=f'{miles:.3f} mi' if _is_number(miles) else 'unknown miles')
+        if (year is not None and saved_year is not None and saved_year != year and year not in row['part_years']
+                and not any(_trip_local_year(t) == year for t in trips or ())):
+            continue
         rows.append(row)
     if rows and trips is not None:
         _merge_history_counted_parts(conn, rows, trips)
-    return rows
+    return [row for row in rows if year is None or row['saved_year'] is None
+            or year == row['saved_year'] or year in row['part_years']]
 
 
 @app.route("/admin/year/<year>")
