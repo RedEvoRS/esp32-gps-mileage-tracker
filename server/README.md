@@ -1056,21 +1056,35 @@ turns up under another counted month name and its old trip address is absent,
 the viewer warns on the trip list, year review and exports, even if new uploads
 have recreated the old folder. Existing folder problems and alias conflicts keep
 their own warnings. Deleting a folder without moving its trips does not warn.
-Unresolved items block closing affected years. Unreadable trips use the same
-possible folder years as other unreadable trips; a readable trip with no date
+Unresolved items block closing every year that counts the current trip's miles:
+both years for a split drive, only the new year when all counted miles are after
+midnight, or the start year when the drive stays whole there. Unreadable trips
+use the same possible folder years as other unreadable trips; a readable trip with no date
 blocks every year. The admin year review lists each unresolved item for that
-year, linking its current trip and showing its old address and saved purpose,
-notes and destination, or removal reason, login and time. Everyday logins see
-only the folder warning; the trip list and exports keep the counts.
+year, linking its current trip when it can open and showing its old address and
+saved purpose, notes and destination, or removal reason, login and time.
+Everyday logins see the folder warning without saved-item details or counts;
+admins also see counts on the trip list and exports.
 Clear it by renaming the folder back (or moving those trips' files back into
-a folder with the old name), or by entering the purpose or notes and removing
-the trip again under its new name, as needed. For a moved part, save the purpose
-on its current merge or remove that merge. An unannotated merge still warns.
+a folder with the old name). For a plain trip, saving a purpose, notes or
+destination under its new name clears the purpose warning, even if those fields
+are cleared later. Saving all fields empty does not clear it unless an annotation
+was already saved there. For a moved part, save a nonempty purpose, notes or
+destination on its current merge; an unannotated merge still warns. To resolve an old removal,
+remove the current trip (or merge) again, or choose **Keep trip in log** beside
+the removal on the admin year review. That choice keeps the trip listed and
+counted, deletes the old removal and records who restored it, when and the
+removal's reason in history, then returns to the year review. Reopen the closed
+years named beside the removal before making that choice; these follow the same
+edit locks as the current trip and its merge parts. An undated readable trip is
+never locked by a closed year.
 A removed or unreadable trip needs no purpose; that warning returns if it is
 restored or becomes readable without an annotation. An old removal still warns
-for an unreadable trip until it is removed again. History stays saved.
+for an unreadable trip until it is removed again or the admin chooses to keep
+it; keeping it clears only the old removal, and its unreadable warning remains.
+History stays saved.
 After **Undo saved merge**, a former part's purpose or notes saved only under
-the old name also needs this repair before its year can close.
+the old name also needs this repair before any affected year can close.
 
 Moving or renaming a real month folder with file times kept also produces an
 unused-name merge when every recording matches under the new name.
@@ -1128,7 +1142,8 @@ year's own close and reopen history. The review includes edits made at or
 after local January 1 of the following year.
 
 A split drive belongs to both years and each year counts only its share;
-other trips use their local start or first recorded time. An unreadable trip
+a drive with all counted miles after midnight belongs only to the new year.
+Other trips use their local start or first recorded time. An unreadable trip
 is assigned by its storage folder; a January folder can be listed under the
 previous year. Folder entries follow the same rule, so a January folder
 appears under both candidate years. A trip with no usable time is not locked

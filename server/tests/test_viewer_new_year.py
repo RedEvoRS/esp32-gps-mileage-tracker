@@ -76,6 +76,107 @@ class NewYearTests(YearTestBase):
         with closing(load_workbook(io.BytesIO(response.data))) as workbook:
             return {s.title: list(s.values) for s in workbook}
 
+    def moved_saved_recordings(self, segments=None):
+        annotated = self.recording('annotated', segments=segments)
+        removed = self.recording('removed', segments=segments)
+        self.assertEqual(self.annotate(annotated, category='business', purpose_note='Example purpose').status_code, 302)
+        self.assertEqual(self.post(f'/trip/{removed}/remove', reason='Example duplicate').status_code, 302)
+        (self.data / '2027-01').rename(self.data / '2027-02')
+        return annotated, removed
+
+    def keep_moved(self, year=2026):
+        return self.post(f'/admin/year/{year}/moved-removal/2027-01/removed/restore', confirm='yes')
+
+    def check_moved_saved_years(self, shares):
+        old_annotation, old_removal = self.moved_saved_recordings(
+            segments=self.MOVED if len(shares) == 1 else None)
+        entry, = [e for e in self.viewer.load_trips()[1] if e.get('moved_saved')]
+        for trip in entry['affected_trips']:
+            self.assertEqual(trip['year_shares'], shares)
+        for item in entry['saved_items']:
+            self.assertEqual(item['trips'][0]['year_shares'], shares)
+        for year in (2026, 2027):
+            expected = 2 * shares.get(year, 0)
+            self.assertEqual(self.figures(year)['totals']['all'], expected)
+            self.assertEqual(self.figures(year)['totals']['unclassified'], expected)
+            review = self.review(year)
+            if year in shares:
+                details = review.split('<caption>Saved items')[1].split('</table>')[0]
+                for old_key in (old_annotation, old_removal):
+                    self.assertIn(f'<code>{old_key}</code>', details)
+                    self.assertIn(f'href="/trip/{old_key.replace("2027-01/", "2027-02/")}?year={year}"', details)
+                self.assertEqual(self.post(f'/admin/year/{year}/close', confirm='yes').status_code, 409)
+            else:
+                self.assertNotIn('<caption>Saved items', review)
+                self.close_year(year)
+        self.assertEqual(self.annotate('2027-02/annotated', category='business').status_code, 302)
+        before_keep = {year: self.figures(year) for year in (2026, 2027)}
+        self.assertEqual(self.keep_moved(max(shares)).status_code, 302)
+        self.assertFalse(any(e.get('moved_saved') for e in self.viewer.load_trips()[1]))
+        for year in (2026, 2027):
+            figures = self.figures(year)
+            self.assertEqual(figures, before_keep[year])
+            self.assertEqual(figures['totals']['all'], 2 * shares.get(year, 0))
+            self.assertEqual(figures['totals']['business'], shares.get(year, 0))
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertIsNone(self.viewer.trip_log.removal(conn, old_removal))
+
+    def test_moved_annotated_and_removed_split_drive_blocks_and_lists_both_years(self):
+        self.check_moved_saved_years({2026: 3.686, 2027: 6.144})
+
+    def test_moved_annotated_and_removed_whole_drive_affects_only_the_new_year(self):
+        self.check_moved_saved_years({2027: 9.83})
+
+    def test_keep_moved_split_and_old_restore_refuse_either_closed_counted_year(self):
+        _, old_removal = self.moved_saved_recordings()
+        before = {year: self.figures(year) for year in (2026, 2027)}
+        for closed_years in ((2026,), (2027,), (2026, 2027)):
+            with self.subTest(closed_years=closed_years):
+                with closing(sqlite3.connect(self.db)) as conn, conn:
+                    for year in closed_years:
+                        self.viewer.trip_log.close_year(conn, year, 'driver')
+                for review_year in (2026, 2027):
+                    self.assertEqual(self.keep_moved(review_year).status_code, 409)
+                    details = self.review(review_year).split('<caption>Saved items')[1].split('</table>')[0]
+                    self.assertNotIn('>Keep trip in log</button>', details)
+                    names = ' and '.join(str(y) for y in closed_years)
+                    self.assertIn(f'Reopen {names} to keep this trip in the log.', details)
+                self.assertEqual(self.post(f'/trip/{old_removal}/restore').status_code, 409)
+                with closing(sqlite3.connect(self.db)) as conn, conn:
+                    self.assertIsNotNone(self.viewer.trip_log.removal(conn, old_removal))
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM trip_history WHERE action='restore'").fetchone()[0], 0)
+                    for year in closed_years:
+                        self.viewer.trip_log.reopen_year(conn, year)
+        self.assertEqual(self.keep_moved().status_code, 302)
+        for year in (2026, 2027):
+            self.assertEqual(self.figures(year), before[year])
+
+    def test_old_restore_of_moved_whole_drive_locks_only_the_new_year(self):
+        _, old_removal = self.moved_saved_recordings(segments=self.MOVED)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            self.viewer.trip_log.close_year(conn, 2027, 'driver')
+        self.assertEqual(self.post(f'/trip/{old_removal}/restore').status_code, 409)
+        self.assertEqual(self.keep_moved(2027).status_code, 409)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            self.assertIsNotNone(self.viewer.trip_log.removal(conn, old_removal))
+            self.viewer.trip_log.reopen_year(conn, 2027)
+            self.viewer.trip_log.close_year(conn, 2026, 'driver')
+        self.assertEqual(self.post(f'/trip/{old_removal}/restore').status_code, 302)
+        self.assertEqual((self.figures(2026)['totals']['all'], self.figures(2027)['totals']['all']), (0, 19.66))
+
+    def test_moved_saved_drive_kept_whole_uses_its_start_year(self):
+        old = self.recording(timing_status='partial', start_time=None)
+        self.assertEqual(self.annotate(old, category='business').status_code, 302)
+        (self.data / '2027-01').rename(self.data / '2027-02')
+        trip = self.trip()
+        self.assertNotIn('year_shares', trip)
+        self.assertIn('kept whole in 2026', trip['year_split_note'])
+        self.assertEqual(self.post('/admin/year/2026/close', confirm='yes').status_code, 409)
+        self.assertIn('<caption>Saved items', self.review(2026))
+        self.assertNotIn('<caption>Saved items', self.review(2027))
+        self.close_year(2027)
+        self.assertEqual((self.figures(2026)['totals']['all'], self.figures(2027)['totals']['all']), (9.83, 0))
+
     def test_shares_totals_counts_categories_and_full_trip_are_consistent(self):
         key = self.recording()
         before_files = {p.name: p.read_bytes() for p in (self.data / "2027-01").iterdir()}

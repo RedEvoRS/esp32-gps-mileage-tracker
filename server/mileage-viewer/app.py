@@ -207,6 +207,7 @@ ENDPOINT_ROLES = {
     "reopen_year": {"admin"},
     "remove_trip": {"admin"},
     "restore_trip": {"admin"},
+    "restore_moved_removal": {"admin"},
     "account_password": {"admin", "editor"},
 }
 DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32))
@@ -1090,9 +1091,10 @@ def folder_hint(entry, role):
         return "Please ask the admin to fix it."
     if entry.get("moved_saved"):
         return (f"Rename the folder back to {entry['ym']}, or move those trips' files back into a folder named {entry['ym']}. "
-                "Or enter the purpose or notes again and remove the trip again under the new month name, as needed. "
-                "See the admin year review for the affected trips and what was saved. "
-                "Nothing is deleted from the database.")
+                "Or save purpose, notes or destination again, or remove the trip again, under the new month name, as needed. "
+                "To keep a trip with an old removal, use Keep trip in log on the admin year review; "
+                "it deletes the old removal and records the choice in history. "
+                "See that review for the affected trips and what was saved.")
     if entry["folder_reason"] == "duplicate":
         if entry.get("saved_months"):
             return "Follow the saved-name conflict steps before removing any link; choose which name's saved data to use."
@@ -1143,7 +1145,7 @@ def folder_message(entry, role):
             if entry.get("moved_saved"):
                 sentences.append(f"Saved purposes/notes no longer applied: {counts['annotations']}. "
                                  f"Saved removals no longer applied: {counts['removals']}. "
-                                 f"History entries saved under {name}/: {counts['history entries']}.")
+                                 f"History entries saved for these trips under {name}/: {counts['history entries']}.")
                 continue
             status = "in use" if name == entry["counted_as"] else "not applied"
             singulars = {"annotations": "annotation", "removals": "removal", "merges": "merge",
@@ -1269,11 +1271,13 @@ def _moved_saved_items(conn, annotations, removed, counted, originals, current):
         entry['items'].append({'old_key': key, 'kind': label, 'saved': saved, 'trips': list(matches.values())})
     if not moved:
         return []
-    inventory = _saved_month_counts(conn, sorted(moved))
+    old_keys = sorted({item['old_key'] for data in moved.values() for item in data['items']})
+    history = dict(conn.execute(f"""SELECT trip_key, COUNT(*) FROM trip_history
+        WHERE trip_key IN ({','.join('?' for _ in old_keys)}) GROUP BY trip_key""", old_keys))
     warnings = []
     for month, data in moved.items():
         counts = {label: data[label] for label in ('annotations', 'removals')}
-        counts['history entries'] = inventory[month]['history entries']
+        counts['history entries'] = sum(history.get(key, 0) for key in {item['old_key'] for item in data['items']})
         warnings.append({'folder': True, 'folder_reason': 'saved_keys', 'moved_saved': True,
                          'ym': month, 'id': '', 'trip_key': month + '/', 'has_gpx': False,
                          'problem': 'saved trip data under an old month name is not applied',
@@ -2225,7 +2229,8 @@ MOVED_SAVED_CLOSE_REFUSAL = ("Saved purposes, notes or removals under an old mon
                            "Resolve the folder warning on the trip list or year review before closing this year.")
 MOVED_SAVED_CLOSED_NOTICE = ("This year is closed. Saved purposes, notes or removals under an old month name no longer apply. "
                            "The saved-versus-current comparison on this page shows the difference. "
-                           "Reopen this year before entering a purpose or removing a trip again.")
+                           "Reopen any closed year that locks the current trip before saving an annotation, "
+                           "removing a trip again or choosing Keep trip in log.")
 
 
 UNUSED_MERGE_CLOSE_REFUSAL = ("A saved merge under an unused month name has miles and purpose outside the totals. "
@@ -2386,20 +2391,24 @@ def trip_years(trip):
     return years
 
 
+def locked_years(trip, closed):
+    """Closed years blocking an edit, including a saved merge's existing locks."""
+    hit = trip_years(trip) & closed.keys()
+    if trip.get("unused_merge") or trip.get("damaged_merge"):
+        hit |= {y for y in closed if _unused_merge_in_year(trip, y)}
+    return hit
+
+
 def locked_year(trip, closed):
     """The earliest closed year the trip belongs to, or None. closed: closed_years()."""
-    hit = trip_years(trip) & closed.keys()
+    hit = locked_years(trip, closed)
     return min(hit) if hit else None
 
 
 def _abort_if_year_closed(closed, *trips):
     """409 for an edit that touches a trip in a closed year."""
     for trip in trips:
-        if trip.get("unused_merge") or trip.get("damaged_merge"):
-            candidates = {y for y in closed if _unused_merge_in_year(trip, y)} | (trip_years(trip) & closed.keys())
-            year = min(candidates) if candidates else None
-        else:
-            year = locked_year(trip, closed)
+        year = locked_year(trip, closed)
         if year:
             abort(409, description=(
                 f"{year} is closed for edits. The admin can reopen it on the year review page."))
@@ -3722,7 +3731,8 @@ YEAR_HTML = """
 {% macro trip_link(t) %}{% if t.get('folder') %}<code>{{ t.trip_key }}</code> ({% if t.get('unused_merge') %}saved merge{% else %}month folder{% endif %}){% else %}<a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{% if t.problem %}{{ t.trip_key }}{% else %}{{ fmt_trip_date(t) }}{% endif %}</a>{% endif %}{% endmacro %}
 <h1>{{ year }} year review</h1>
 <p class="muted">Times shown in {{ timezone }}. A drive split at New Year counts in both years, with only each year's
-share of its miles. Other trips use their start (or, if partly timed, their first recorded time), the same as the trip list and exports.</p>
+share of its miles. A drive with all counted miles after midnight counts only in the new year.
+Other trips use their start (or, if partly timed, their first recorded time), the same as the trip list and exports.</p>
 <div class="toolbar">
   <a class="btn secondary" href="{{ url_for('index', year=year) }}">{{ year }} trips</a>
   <a class="btn" href="{{ url_for('export_csv', year=year) }}">Export CSV</a>
@@ -3739,13 +3749,23 @@ Folders: {% for entry in upload_blocks %}<code>{{ entry.trip_key }}</code>{% if 
 <div class="review-table"><table>
 <caption>Saved items under the old month name for {{ year }}</caption>
 <thead><tr><th>Current trip</th><th>Old address</th><th>Kind</th><th>What was saved</th></tr></thead>
-<tbody>{% for item in moved_saved_details[entry.trip_key] %}<tr>
-<td>{% for t in item.trips %}<a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{{ t.trip_key }}</a>{% if not loop.last %}, {% endif %}{% endfor %}</td>
+<tbody>{% for item in entry.details %}<tr>
+<td>{% for t in item.trips %}{% if 'problem' in t %}<code>{{ t.trip_key }}</code>
+({{ 'merge has missing or unreadable parts' if t.damaged_merge else 'trip is unreadable' }})
+{% else %}<a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{{ t.trip_key }}</a>{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}</td>
 <td><code>{{ item.old_key }}</code></td><td>{{ 'Purpose/notes' if item.kind == 'annotations' else 'Removal' }}</td>
 <td>{% if item.kind == 'annotations' %}Category: {{ item.saved.category or '—' }};
 purpose note: {{ item.saved.purpose_note or '—' }}; destination: {{ item.saved.destination or '—' }}
 {% else %}Reason: {{ item.saved.reason }}; removed by {{ item.saved.removed_by }}
-on {{ fmt_date(item.saved.removed_at) }} ({{ timezone }}){% endif %}</td>
+on {{ fmt_date(item.saved.removed_at) }} ({{ timezone }})
+{% if item.can_restore %}<form method="post" action="{{ url_for('restore_moved_removal', year=year, ym=entry.ym, saved_id=item.old_key.split('/')[1]) }}">
+<input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+<p>{% if item.has_unreadable %}Readable trips stay listed and counted; unreadable trips stay flagged until repaired.
+The old removal is deleted and the action is recorded in history.
+{% else %}The trip stays listed and counted; the old removal is deleted and the action is recorded in history.{% endif %}</p>
+<button class="btn secondary" type="submit" name="confirm" value="yes">Keep trip in log</button></form>
+{% elif item.reopen_years %}<p>Reopen {{ item.reopen_years|join(' and ') }} to keep this trip in the log.</p>{% endif %}
+{% endif %}</td>
 </tr>{% endfor %}</tbody></table></div>
 {% endif %}{% endfor %}
 {% if moved_saved_closed_notice %}<p class="warn" role="alert">{{ moved_saved_closed_notice }}</p>{% endif %}
@@ -4186,7 +4206,8 @@ def _merge_history_rows(conn, year=None, trips=None):
 def admin_year(year):
     year = valid_year(year)
     with _trip_read(include_removed=True) as (conn, trips, unreadable):
-        closed = trip_log.closed_years(conn).get(year)
+        closed_years = trip_log.closed_years(conn)
+        closed = closed_years.get(year)
         # Totals and the problem lists come from the same selection the list
         # and exports use, applied to the log without its removed trips.
         live = [t for t in trips if "removal" not in t]
@@ -4229,17 +4250,19 @@ def admin_year(year):
     new_year_trips = [t for t in live if t.get("year_shares") or t.get("year_split_note")
                       if year in _mileage_years(t) or
                       ((crossing := _crossing_years(t)) and min(crossing) <= year <= max(crossing))]
-    moved_saved_details = {}
     for entry in saved_conflicts:
         details = []
         for item in entry.get('saved_items', ()):
             affected = [t for t in item['trips'] if _moved_saved_in_year({'affected_trips': [t]}, year)]
             if affected:
-                details.append({**item, 'trips': affected})
-        moved_saved_details[entry['trip_key']] = details
+                reopen_years = sorted({y for t in item['trips'] for y in locked_years(t, closed_years)})
+                details.append({**item, 'trips': affected,
+                                'has_unreadable': any('problem' in t for t in item['trips']),
+                                'reopen_years': reopen_years,
+                                'can_restore': item['kind'] == 'removals' and not reopen_years})
+        entry['details'] = details
     return render_template_string(
         YEAR_HTML, year=year, closed=closed, saved_conflicts=saved_conflicts, upload_blocks=upload_blocks,
-        moved_saved_details=moved_saved_details,
         moved_saved_closed_notice=(MOVED_SAVED_CLOSED_NOTICE
                                    if closed and any(t.get('moved_saved') for t in saved_conflicts) else ''),
         unused_merges=unused_merges,
@@ -4371,7 +4394,13 @@ def restore_trip(ym, trip_id):
         # trips can already bridge this recording. Restoring it then counts
         # its stretch twice. A removed unreadable trip has no counted miles
         # and no reliable span, so it never blocks.
-        trips, _ = load_trips(conn, include_removed=True)
+        trips, entries = load_trips(conn, include_removed=True)
+        # An old address has no trip for _abort_if_key_in_closed_year to lock.
+        # Hand-made restore requests must respect the current trip's years too.
+        for entry in entries:
+            for item in entry.get('saved_items', ()):
+                if item['kind'] == 'removals' and item['old_key'] == key:
+                    _abort_if_year_closed(trip_log.closed_years(conn), *item['trips'])
         removed_trip = next((t for t in trips if t["trip_key"] == key), None)
         if removed_trip and trip_merges.covering_merge(removed_trip, trips):
             abort(409, description="A merged trip now covers this recording's time. "
@@ -4385,6 +4414,29 @@ def restore_trip(ym, trip_id):
     if removed_trip is None:
         return redirect(url_for("admin_removed", year=year or ""))
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
+
+
+@app.route('/admin/year/<year>/moved-removal/<ym>/<saved_id>/restore', methods=['POST'])
+def restore_moved_removal(year, ym, saved_id):
+    year = valid_year(year)
+    _validate_trip_address(ym, saved_id)
+    if request.form.get('confirm') != 'yes':
+        abort(400, description='Confirm keeping this trip in the log and deleting its old removal.')
+    key = f'{ym}/{saved_id}'
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute('BEGIN IMMEDIATE')
+        _, entries = _load_trips(conn, include_removed=True)
+        item = next((item for entry in entries if entry.get('moved_saved')
+                     for item in entry['saved_items'] if item['old_key'] == key and item['kind'] == 'removals'), None)
+        if item is None or not _moved_saved_in_year({'affected_trips': item['trips']}, year):
+            abort(409, description='This saved removal is no longer unresolved here. Reopen the year review.')
+        _abort_if_year_closed(trip_log.closed_years(conn), *item['trips'])
+        # The current trip (or merge) already counts. Deleting only this old
+        # removal cannot add a recording or duplicate a covering merge's miles.
+        trip_log.delete_removal(conn, key)
+        trip_log.record(conn, key, 'restore', {'reason': item['saved']['reason']}, actor=g.user, actor_role=g.role)
+    return redirect(url_for('admin_year', year=year))
 
 
 @app.route("/account/password", methods=["GET", "POST"])
