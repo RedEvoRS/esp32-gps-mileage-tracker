@@ -359,6 +359,9 @@ class ViewerMerges(unittest.TestCase):
                              'do not add these saved miles by hand.' if undo else
                              'Now counted again: 2026-12/a; do not add these saved miles by hand. '
                              'Not currently counted: 2027-01/b.')
+                effect = ('The trips stay counted under 2026-10/, 2027-02/ with only the annotations saved under those names. '
+                          'Annotations saved under 2026-12/, 2027-01/ are kept in the database but not applied. '
+                          "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review. ") if undo else ''
                 ViewerRolesTests.seed_editor(fixture)
                 for year in (2026, 2027):
                     suffix = ' The saved summary belongs to tax year 2026.' if year == 2027 else ''
@@ -366,6 +369,8 @@ class ViewerMerges(unittest.TestCase):
                     self.assertIn('Discarded or undone saved merges (1)', review)
                     self.assertIn(label + '.', review)
                     self.assertIn(statement + suffix, review)
+                    if undo:
+                        self.assertIn(effect + statement + suffix, review)
                     for role in ('admin', 'editor'):
                         if role == 'editor':
                             ViewerRolesTests.signed_in(fixture, role)
@@ -374,6 +379,7 @@ class ViewerMerges(unittest.TestCase):
                         self.assertEqual(record['row_type'], 'unreadable')
                         self.assertEqual(record['distance_miles'], '')
                         self.assertIn(statement + suffix, record['purpose_note'])
+                        self.assertIn(effect + statement + suffix, record['purpose_note'])
                         book = load_workbook(io.BytesIO(fixture.client.get(f'/export.xlsx?year={year}').data))
                         try:
                             self.assertEqual(book.sheetnames, ['Mileage', 'Totals', 'Unreadable trips'])
@@ -381,12 +387,13 @@ class ViewerMerges(unittest.TestCase):
                             record = next(dict(zip(header, r, strict=True)) for r in values if r[0] == key + ' (' + label.lower() + ')')
                             self.assertIsNone(record['distance_miles'])
                             self.assertIn(statement + suffix, record['purpose_note'])
+                            self.assertIn(effect + statement + suffix, record['purpose_note'])
                         finally:
                             book.close()
                         fixture.authenticate(fixture.client)
                 self.assertNotIn('Discarded or undone saved merges', fixture.client.get('/admin/year/2025').get_data(as_text=True))
 
-    def assert_discard_current_statement(self, statement, *, undone=False):
+    def assert_discard_current_statement(self, statement, *, undone=False, effect=''):
         with closing(sqlite3.connect(self.db)) as conn:
             rows = self.viewer._merge_history_rows(conn, 2026, self.viewer.load_trips()[0])
         self.assertEqual(len(rows), 1)
@@ -394,7 +401,7 @@ class ViewerMerges(unittest.TestCase):
         label = 'Unused-name merge undone' if undone else 'Damaged merge discarded'
         expected = (f"{label}. Saved miles: 0.732 mi; purpose: business; purpose note: merged note; "
                     f"trip date: 2026-04-14 12:00 UTC. Recorded at: {self.viewer.fmt_date(row['at'])}; login: driver. "
-                    + statement)
+                    + (effect + ' ' if effect else '') + statement)
         self.assertEqual(self.viewer.merge_history_message(row), expected)
         review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
         self.assertIn(expected, review)
@@ -744,7 +751,7 @@ class ViewerMerges(unittest.TestCase):
             self.assertEqual(details['saved_summary'], json.loads(summary))
             self.assertEqual(details['dropped']['purpose_note'], 'merged note')
             self.assertEqual(details['original_annotations']['2026-04/a']['category'], 'personal')
-            self.assertEqual(details['undo_effect'], effect)
+            self.assertNotIn('undo_effect', details)
             self.assertEqual(details['counted_part_keys'], {'2026-04/a': '2026-05/a', '2026-04/b': '2026-05/b'})
         review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
         self.assertIn('Unused-name merge undone. Saved miles: 0.732 mi; purpose: business; purpose note: merged note;', review)
@@ -756,6 +763,78 @@ class ViewerMerges(unittest.TestCase):
         self.assertIn('Unused-name merge undone. ' + effect, history)
         self.assertEqual(self.close_year().status_code, 302)
         self.assertIn('Unused-name merge undone.', self.client.get('/admin/year/2026').get_data(as_text=True))
+
+    def test_unused_undo_effect_follows_another_rename_on_every_history_surface(self):
+        key, _ = self.moved_merge()
+        self.assertEqual(self.undo_unused(key).status_code, 302)
+        # Simulate an already stored v1.17 row; rendering must not rewrite it.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            details = json.loads(conn.execute("SELECT details FROM trip_history WHERE action='split'").fetchone()[0])
+            details['undo_effect'] = ('The trips stay counted under 2026-05/ with only the annotations saved under that name. '
+                                      'Annotations saved under 2026-04/ are kept in the database but not applied. '
+                                      "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review.")
+            stored = json.dumps(details)
+            conn.execute("UPDATE trip_history SET details=? WHERE action='split'", (stored,))
+        (self.data / '2026-05').rename(self.data / '2026-06')
+        effect = ('The trips stay counted under 2026-06/ with only the annotations saved under that name. '
+                  'Annotations saved under 2026-04/ are kept in the database but not applied. '
+                  "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review.")
+        self.assertIn('Unused-name merge undone. ' + effect,
+                      html.unescape(self.client.get('/admin/history').get_data(as_text=True)))
+        with closing(sqlite3.connect(self.db)) as conn:
+            row = self.viewer._merge_history_rows(conn, 2026, self.viewer.load_trips()[0])[0]
+        expected = self.viewer.merge_history_message(row)
+        self.assertIn(effect, expected)
+        self.assertIn('Now counted again: 2026-04/a as 2026-06/a, 2026-04/b as 2026-06/b; '
+                      'do not add these saved miles by hand.', expected)
+        self.assert_history_exports(expected, 'unused-name merge undone')
+        for path in ('/admin/history', '/admin/year/2026', '/export.csv?year=2026'):
+            text = html.unescape(self.client.get(path).get_data(as_text=True))
+            self.assertIn(effect, text)
+            self.assertNotIn('2026-05/', text)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT details FROM trip_history WHERE action='split'").fetchone()[0], stored)
+
+    def test_unused_undo_effect_uses_current_count_when_parts_return_disappear_or_remerge(self):
+        key, _ = self.moved_merge()
+        self.assertEqual(self.undo_unused(key).status_code, 302)
+        (self.data / '2026-05').rename(self.month)
+        statement = 'Now counted again: 2026-04/a, 2026-04/b; do not add these saved miles by hand.'
+        for state in ('restored', 'merged', 'missing'):
+            with self.subTest(state=state):
+                if state == 'merged':
+                    merged = self.merged_key(self.merge('2026-04/a', '2026-04/b'))
+                    statement = (f'Now counted again: 2026-04/a (inside {merged}), 2026-04/b (inside {merged}); '
+                                 'do not add these saved miles by hand.')
+                elif state == 'missing':
+                    shutil.rmtree(self.month)
+                    statement = 'None of its trips are in the log; these saved miles are not in the totals.'
+                history = html.unescape(self.client.get('/admin/history').get_data(as_text=True))
+                self.assertIn('Unused-name merge undone. ' + statement, history)
+                self.assertNotIn('The trips stay counted under 2026-05/', history)
+                with closing(sqlite3.connect(self.db)) as conn:
+                    row = self.viewer._merge_history_rows(conn, 2026, self.viewer.load_trips()[0])[0]
+                message = self.viewer.merge_history_message(row)
+                self.assertIn(statement, message)
+                self.assertNotIn('The trips stay counted under', message)
+                self.assert_history_exports(message, 'unused-name merge undone')
+
+    def test_unused_undo_effect_falls_back_to_stored_text_without_part_evidence(self):
+        key, _ = self.moved_merge()
+        self.assertEqual(self.undo_unused(key).status_code, 302)
+        effect = 'Stored undo explanation from an older history row.'
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            details = json.loads(conn.execute("SELECT details FROM trip_history WHERE action='split'").fetchone()[0])
+            details.pop('parts')
+            details['undo_effect'] = effect
+            conn.execute("UPDATE trip_history SET details=? WHERE action='split'", (json.dumps(details),))
+        self.assertIn('Unused-name merge undone. ' + effect,
+                      html.unescape(self.client.get('/admin/history').get_data(as_text=True)))
+        for path in ('/admin/year/2026', '/export.csv?year=2026'):
+            self.assertIn(effect, self.client.get(path).get_data(as_text=True))
+        with closing(sqlite3.connect(self.db)) as conn:
+            row = self.viewer._merge_history_rows(conn, 2026, self.viewer.load_trips()[0])[0]
+        self.assert_history_exports(self.viewer.merge_history_message(row), 'unused-name merge undone')
 
     def test_unused_undo_history_rolls_back_if_deletion_fails(self):
         key, _ = self.moved_merge()
@@ -777,7 +856,9 @@ class ViewerMerges(unittest.TestCase):
         source.write_bytes(source.read_bytes() + b'\n')
         self.assert_discard_current_statement(
             'Now counted again: 2026-04/a as 2026-05/a, 2026-04/b as 2026-05/b; do not add these saved miles by hand.',
-            undone=True)
+            undone=True, effect=('The trips stay counted under 2026-05/ with only the annotations saved under that name. '
+                                 'Annotations saved under 2026-04/ are kept in the database but not applied. '
+                                 "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review."))
         folder = self.data / '2026-05'
         files = {p: (p.read_bytes(), p.stat()) for p in folder.glob('*.json')}
         (folder / 'b.json').unlink()
