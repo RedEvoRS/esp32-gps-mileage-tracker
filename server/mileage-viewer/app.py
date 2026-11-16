@@ -62,7 +62,7 @@ import json
 import math
 import unicodedata
 from threading import Lock
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote_from_bytes, unquote, urlsplit
 from xml.parsers import expat
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
@@ -192,6 +192,8 @@ ENDPOINT_ROLES = {
     "lookup_place": {"admin", "editor"},
     "merge_trip": {"admin", "editor"},
     "split_trip": {"admin", "editor"},
+    "undo_unused_merge": {"admin"},
+    "discard_damaged_merge": {"admin"},
     "export_csv": {"admin", "editor"},
     "export_xlsx": {"admin", "editor"},
     "device_health": {"admin", "editor"},
@@ -893,8 +895,37 @@ def load_trips(conn=None, include_removed=False):
         return trips, unreadable
 
 
+# Both services run as the same user. Cache process identity once, not per
+# folder; Windows development has no POSIX identity and uses the shipped UID.
+_MONTH_SERVICE_UID = getattr(os, 'geteuid', lambda: 1000)()
+_MONTH_SERVICE_GROUPS = frozenset([getattr(os, 'getegid', lambda: 1000)(),
+                                 *getattr(os, 'getgroups', lambda: [])()])
+
+
+def _month_mode_writable(metadata):
+    """Judge ingest's mode access without testing the viewer's read-only mount.
+
+    POSIX selects owner, group or other bits in that order; an owner's missing
+    write bit cannot be rescued by a group/other write bit. ACLs and the ingest
+    mount's actual flags are outside the metadata available to this viewer.
+    """
+    if _MONTH_SERVICE_UID == 0:
+        return True
+    if metadata.st_uid == _MONTH_SERVICE_UID:
+        return bool(metadata.st_mode & stat.S_IWUSR)
+    if metadata.st_gid in _MONTH_SERVICE_GROUPS:
+        return bool(metadata.st_mode & stat.S_IWGRP)
+    return bool(metadata.st_mode & stat.S_IWOTH)
+
+
 def _month_trip_names(checked_month):
     """List a checked directory without following a replacement final link."""
+    # Listing an empty directory can succeed without search permission. One
+    # metadata-class check per counted month catches that case without a walk.
+    # access() can also fail on a race or I/O error, not only permissions;
+    # conservative reporting is acceptable because the tracker keeps retrying.
+    if not os.access(checked_month, os.R_OK | os.X_OK):
+        raise PermissionError(errno.EACCES, "Month folder cannot be read or entered")
     if (os.scandir in os.supports_fd and hasattr(os, "O_DIRECTORY")
             and hasattr(os, "O_NOFOLLOW")):
         fd = os.open(checked_month, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -911,9 +942,60 @@ FOLDER_PROBLEMS = {
     "outside": "the folder links outside the data folder",
     "dangling": "the folder link target is missing",
     "loop": "the folder link forms a loop",
-    "unreadable": "the folder could not be read",
+    "unreadable": "the folder could not be read or entered",
     "duplicate": "the folder is a link to another folder that is already counted",
+    "saved_keys": "several month names for this folder have saved trip data",
+    "ingest_refused": "trips are shown and counted",
+    "link_not_folder": "the month name is a link to something other than a folder",
+    "not_folder": "the month name is a file, not a folder",
+    "unused_merge": "saved merge under an unused month name",
+    "unwritable": "trips are shown and counted, but the folder's owner or mode prevents the server writing to it",
 }
+
+MONTH_UPLOAD_REFUSAL = ("The tracker cannot upload new trips for this month until the link is {repair}; "
+                        "the tracker keeps them queued")
+ALL_UPLOADS_REFUSAL = ("All of the tracker's trip uploads are refused until the month folder problems below are fixed; "
+                      "the tracker keeps them queued.")
+
+
+def _month_blocks_all_uploads(month, root):
+    """Mirror ingest's _stored_trip_directories LinkedMonthError conditions.
+
+    Called only for a folder problem, never on an ordinary healthy scan.
+    A dangling inside link is not the same as a dangling outside link.
+    Permission failures refuse every upload too; I/O/resource faults stay 500.
+    """
+    try:
+        # Use ingest's resolution rule here. checked_path converts every
+        # resolve OSError to ValueError, which would overstate the 503 cases.
+        parent = os.path.realpath(month.parent)
+        normalized = os.path.abspath(os.path.join(parent, month.name))
+        if not normalized.startswith(os.path.join(str(root), "")):
+            return True
+        target = Path(normalized).resolve()
+    except RuntimeError:
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    if root not in target.parents:
+        return True
+    try:
+        mode = target.stat().st_mode
+    except PermissionError:
+        return True
+    except OSError as exc:
+        return exc.errno == errno.ELOOP
+    return stat.S_ISDIR(mode) and not os.access(target, os.R_OK | os.X_OK)
+
+
+def _month_refuses_new_uploads(month, root):
+    """Use ingest's final-target-name rule even when that target is absent."""
+    try:
+        return month.is_symlink() and trip_merges.checked_path(root, month).name != month.name
+    except (OSError, ValueError):
+        return False  # Unsafe/permission failures have their own global refusal.
 
 
 def _month_link_problem(month, root):
@@ -928,7 +1010,7 @@ def _month_link_problem(month, root):
     try:
         month.stat()
     except OSError as exc:
-        return {errno.ELOOP: "loop", errno.ENOENT: "dangling"}.get(exc.errno, "unreadable")
+        return {errno.ELOOP: "loop", errno.ENOENT: "dangling", errno.ENOTDIR: "link_not_folder"}.get(exc.errno, "unreadable")
     try:
         target = month.resolve()
     except (OSError, RuntimeError):
@@ -947,22 +1029,252 @@ def _month_sort_key(month):
 
 
 def folder_description(entry):
-    if entry["folder_reason"] == "duplicate":
-        return f"is a link to {entry['counted_as']}/, whose trips are counted there"
-    return entry["problem"]
+    if entry["folder_reason"] == "unused_merge":
+        names = ", ".join(name + "/" for name in entry["saved_months"])
+        miles = entry.get("saved_summary", {}).get("distance_miles")
+        distance = f"{miles:.3f} mi" if _is_number(miles) else "unknown"
+        text = (f"This merge is saved under a month name no longer in use ({names}). "
+                f"Saved miles: {distance}; purpose: {entry.get('category') or 'unclassified'}; "
+                f"purpose note: {entry.get('purpose_note') or 'none'}. "
+                "These saved miles and this purpose are not in the totals shown. "
+                "The trips it was made from are counted separately. "
+                "Its affected tax years cannot be closed until this saved merge is resolved")
+    elif entry["folder_reason"] == "saved_keys":
+        names = ", ".join(name + "/" for name in entry["saved_months"])
+        text = (f"Warning: saved trip data exists under {names}. Trips are shown and counted under "
+                f"{entry['counted_as']}/; saved data under the other names is not applied")
+        text += (". Years cannot be closed until this conflict is resolved. "
+                 "Healthy trips can still be merged under the name in use")
+    elif entry["folder_reason"] == "duplicate":
+        text = f"This is a link to {entry['counted_as']}/, whose trips are counted there"
+    else:
+        text = entry["problem"]
+    if entry.get("uploads_refused") or entry["folder_reason"] in ("ingest_refused", "unwritable"):
+        if entry["folder_reason"] == "unwritable":
+            text += (". The tracker cannot upload new trips for this month until the folder's owner or mode is fixed; "
+                     "the tracker keeps them queued")
+        elif entry["folder_reason"] == "not_folder":
+            text += ". The tracker cannot upload new trips for this month until this name is a folder; the tracker keeps them queued"
+        else:
+            repair = "removed" if entry["folder_reason"] in ("duplicate", "link_not_folder") else "replaced by a real folder"
+            text += ". " + MONTH_UPLOAD_REFUSAL.format(repair=repair)
+    if entry.get("all_uploads_refused"):
+        text += ". " + ALL_UPLOADS_REFUSAL.rstrip(".")
+    return text
+
+
+def unused_merge_undo_effect(entry):
+    names = entry.get('counted_months') or [entry.get('counted_as', '')]
+    counted = ', '.join(name + '/' for name in names)
+    unused = ', '.join(name + '/' for name in entry['saved_months'])
+    return (f"The trips stay counted under {counted} with only the annotations saved under "
+            f"{'that name' if len(names) == 1 else 'those names'}. "
+            f"Annotations saved under {unused} are kept in the database but not applied. "
+            "The merged trip's saved miles and purpose leave the totals and are kept in history and the year review.")
 
 
 def folder_hint(entry, role):
+    if entry["folder_reason"] == "unused_merge":
+        if role != "admin":
+            return ("Please ask the admin to restore the original month name, as a link or by renaming the folder back, "
+                    "or use Undo saved merge. " + unused_merge_undo_effect(entry))
+        return ("To use this merge again, restore the original month name, as a link or by renaming the folder back, "
+                "and leave that name in use. Or use Undo saved merge on the trip list. " + unused_merge_undo_effect(entry))
     if role != "admin":
         return "Please ask the admin to fix it."
     if entry["folder_reason"] == "duplicate":
+        if entry.get("saved_months"):
+            return "Follow the saved-name conflict steps before removing any link; choose which name's saved data to use."
         return "Remove the extra link."
+    if entry["folder_reason"] == "saved_keys":
+        return ("Choose which name's saved data to use and keep only that link. "
+                "Removing a link leaves its saved data unapplied; removing the name in use quietly orphans that data. "
+                "A new merge is saved under the name in use; choosing another name leaves that merge unapplied too. "
+                "Nothing is deleted from the database. Recreate the same link to get back; "
+                "competing saved names bring the conflict back. See DEPLOY_DEBIAN.md, Troubleshooting, for steps.")
+    if entry["folder_reason"] == "ingest_refused":
+        return "Replace the link with a real folder containing these trips, or mount the disk there, so queued trips can upload."
+    if entry["folder_reason"] == "link_not_folder":
+        return "Remove only the link, keeping its target; ingest can then create a real month folder for queued trips."
+    if entry["folder_reason"] == "not_folder":
+        return "Move the file to a safe place outside the month names; ingest can then create a real month folder for queued trips."
+    if entry["folder_reason"] == "unwritable":
+        return "Give the ingest service's user (UID 1000) write and search permission on the real month folder; check its owner and permissions."
     if entry["folder_reason"] == "unreadable":
         return "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only."
     return "Replace the link with the real folder, or mount the other disk at that path."
 
 
-app.jinja_env.globals.update(folder_hint=folder_hint, folder_description=folder_description)
+DAMAGED_MERGE_DISCARD_EFFECT = (
+    "Parts whose trip summaries can still be read return as separate trips with the annotations saved under their names. "
+    "Parts without readable summaries do not return. "
+    "The merged trip's saved miles and purpose leave the totals and are kept in history and the year review."
+)
+
+
+def folder_message(entry, role):
+    """Complete sentences shared by the list, year review and both exports."""
+    if entry.get("damaged_merge"):
+        miles = entry.get("saved_summary", {}).get("distance_miles")
+        distance = f"{miles:.3f} mi" if _is_number(miles) else "unknown miles"
+        text = (f"A merge part is missing or unreadable. Saved merge: {distance}; "
+                f"purpose: {entry.get('category') or 'unclassified'}. "
+                "Its saved miles are not in the totals. Restore missing or unreadable files from backups. ")
+        if role == "admin":
+            return text + "Or use Discard damaged merge. " + DAMAGED_MERGE_DISCARD_EFFECT
+        return text + "Please ask the admin to restore the files or discard this damaged merge. " + DAMAGED_MERGE_DISCARD_EFFECT
+    description = folder_description(entry)
+    sentences = [description[0].upper() + description[1:].rstrip(".") + "."]
+    if missing_mileage(entry):
+        sentences.append("None of its trips are shown or counted.")
+    if role == "admin":
+        for name, counts in entry.get("saved_counts", {}).items():
+            status = "in use" if name == entry["counted_as"] else "not applied"
+            singulars = {"annotations": "annotation", "removals": "removal", "merges": "merge",
+                         "merge parts": "merge part", "old merge addresses": "old merge address",
+                         "history entries": "history entry", "closed-year trip entries": "closed-year trip entry"}
+            amounts = ", ".join(f"{count} {singulars[label] if count == 1 else label}"
+                                for label, count in counts.items())
+            sentences.append(f"{name}/ ({status}): {amounts}.")
+    sentences.append(folder_hint(entry, role))
+    return " ".join(sentences)
+
+
+def missing_mileage(entry):
+    return entry.get("folder_reason") not in ("duplicate", "saved_keys", "ingest_refused", "unused_merge",
+                                             "not_folder", "link_not_folder", "unwritable")
+
+
+def _folder_row_type(entry):
+    if entry.get("folder_reason") == "saved_keys":
+        return "folder_warning"
+    return "unreadable_folder" if missing_mileage(entry) else "folder_notice"
+
+
+app.jinja_env.globals.update(folder_message=folder_message, all_uploads_refusal=ALL_UPLOADS_REFUSAL,
+                            missing_mileage=missing_mileage, damaged_merge_discard_effect=DAMAGED_MERGE_DISCARD_EFFECT,
+                            unused_merge_undo_effect=unused_merge_undo_effect)
+app.jinja_env.tests["missing_mileage"] = missing_mileage
+
+
+def _saved_month_names(conn, names):
+    """One query per link-only conflict, using existing trip-key indexes.
+
+    Closed-year snapshots also retain trip keys. They are small year records,
+    not an indexed trip table; inspect them only for these unusual conflicts.
+    """
+    indexed_keys = (("annotations", "trip_key"), ("trip_removals", "trip_key"),
+                    ("trip_history", "trip_key"), ("trip_merges", "trip_key"),
+                    ("trip_merge_parts", "part_key"), ("trip_merge_parts", "merge_key"),
+                    ("trip_merge_aliases", "alias_key"))
+    tests = [f"EXISTS (SELECT 1 FROM {table} WHERE {column} >= low AND {column} < high)"
+             for table, column in indexed_keys]
+    tests.append("""EXISTS (SELECT 1 FROM tax_years,
+            json_each(CASE WHEN json_valid(snapshot) THEN snapshot ELSE '{}' END, '$.trip_keys')
+            WHERE json_each.value >= low AND json_each.value < high)""")
+    values = ",".join("(?,?,?)" for _ in names)
+    params = [value for name in names for value in (name, name + "/", name + "0")]
+    query = f"WITH candidates(name, low, high) AS (VALUES {values}) SELECT name FROM candidates WHERE "
+    return sorted(row[0] for row in conn.execute(query + " OR ".join(tests), params))
+
+
+def _saved_month_counts(conn, names):
+    """Inventory only an actual saved-name conflict; ordinary scans do no work."""
+    counts = {
+        "annotations": "SELECT count(*) FROM annotations WHERE trip_key >= low AND trip_key < high",
+        "removals": "SELECT count(*) FROM trip_removals WHERE trip_key >= low AND trip_key < high",
+        "merges": "SELECT count(*) FROM trip_merges WHERE trip_key >= low AND trip_key < high",
+        "merge parts": """SELECT count(*) FROM trip_merge_parts WHERE
+            (part_key >= low AND part_key < high) OR (merge_key >= low AND merge_key < high)""",
+        "old merge addresses": "SELECT count(*) FROM trip_merge_aliases WHERE alias_key >= low AND alias_key < high",
+        "history entries": "SELECT count(*) FROM trip_history WHERE trip_key >= low AND trip_key < high",
+        "closed-year trip entries": """SELECT count(*) FROM tax_years,
+            json_each(CASE WHEN json_valid(snapshot) THEN snapshot ELSE '{}' END, '$.trip_keys')
+            WHERE json_each.value >= low AND json_each.value < high""",
+    }
+    values = ",".join("(?,?,?)" for _ in names)
+    params = [value for name in names for value in (name, name + "/", name + "0")]
+    query = f"WITH candidates(name, low, high) AS (VALUES {values}) SELECT name, "
+    query += ", ".join(f"({sql})" for sql in counts.values()) + " FROM candidates ORDER BY name"
+    return {row[0]: dict(zip(counts, row[1:], strict=True)) for row in conn.execute(query, params)}
+
+
+def _month_choices(conn, root):
+    """Resolve month identities without listing any month's trip files."""
+    try:
+        months = [p for p in DATA_ROOT.iterdir() if trip_merges.YM_RE.fullmatch(p.name)]
+    except OSError:
+        months = []
+    groups, problems, counted = {}, [], {}
+    for month in sorted(months, key=_month_sort_key):
+        cause = _month_link_problem(month, root)
+        if cause:
+            problems.append((month.name, cause, None, ()))
+            continue
+        try:
+            target = trip_merges.checked_path(root, month)
+            if stat.S_ISDIR(target.stat().st_mode):
+                groups.setdefault(target, []).append(month)
+            else:
+                reason = "link_not_folder" if month.is_symlink() else "not_folder"
+                problems.append((month.name, reason, None, (), True))
+        except ValueError as exc:
+            reason = "unreadable" if isinstance(exc.__cause__, PermissionError) else "outside"
+            problems.append((month.name, reason, None, ()))
+        except OSError:
+            problems.append((month.name, "unreadable", None, ()))
+    for target, candidates in groups.items():
+        saved = []
+        # Sorted real folders always win. Only competing links need DB work.
+        if len(candidates) > 1 and candidates[0].is_symlink():
+            saved = _saved_month_names(conn, [p.name for p in candidates])
+        chosen = next((p for p in candidates if saved and p.name == saved[0]), candidates[0])
+        for month in candidates:
+            counted[month.name] = chosen.name
+            # Same rule as ingest upload_trip for a new ID. The final target
+            # name matters, including chains and a same-named nested target.
+            uploads_refused = month.is_symlink() and target.name != month.name
+            if month != chosen:
+                problems.append((month.name, "duplicate", chosen.name, saved if len(saved) > 1 else (), uploads_refused))
+            else:
+                chosen_refused = uploads_refused
+        if len(saved) > 1:
+            problems.append((chosen.name, "saved_keys", chosen.name, saved, chosen_refused))
+        elif chosen_refused:
+            problems.append((chosen.name, "ingest_refused", chosen.name, (), True))
+    return counted, problems
+
+
+@app.before_request
+def _require_counted_month_address():
+    """Apply the list's month identity to every trip endpoint before it runs."""
+    address = request.view_args or {}
+    if "ym" not in address or "trip_id" not in address:
+        return None
+    ym, trip_id = address["ym"], address["trip_id"]
+    _validate_trip_address(ym, trip_id)
+    # Ordinary trip addresses need no folder scan or extra DB query.
+    if not (DATA_ROOT / ym).is_symlink():
+        return None
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+        counted, _ = _month_choices(conn, DATA_ROOT.resolve())
+        if (request.endpoint == 'trip_view' and request.method in ('GET', 'HEAD') and
+                conn.execute('SELECT 1 FROM trip_merges WHERE trip_key=?', (f'{ym}/{trip_id}',)).fetchone()):
+            return None  # Diagnose the saved merge itself, not a nonexistent alias address.
+    chosen = counted.get(ym, ym)
+    if chosen == ym:
+        return None
+    if request.method not in ("GET", "HEAD"):
+        message = "This month address is an extra link. Reopen the trip from the trip list before making changes."
+        if request.endpoint == "lookup_place":
+            return jsonify(error=message), 409
+        abort(409, description=message)
+    target = url_for(request.endpoint, **{**address, "ym": chosen})
+    if request.query_string:
+        # Keep existing escapes and delimiters; encode raw bytes without a
+        # latin-1 -> UTF-8 round trip. Location must be an ASCII URI.
+        target += "?" + quote_from_bytes(request.query_string, safe="!$&'()*+,-./:;=?@_%~")
+    return redirect(target)
 
 
 def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None):
@@ -992,48 +1304,54 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
         json_paths = []
         refused_months = set()
 
-        def refuse_month(ym, reason="outside", counted_as=None):
+        def refuse_month(ym, reason="outside", counted_as=None, saved_months=(), uploads_refused=False,
+                         all_uploads_refused=None):
             if ym not in refused_months:
-                refused_months.add(ym)
+                if missing_mileage({"folder_reason": reason}):
+                    refused_months.add(ym)
+                    unreadable[:] = [u for u in unreadable if u["ym"] != ym]
                 problem = FOLDER_PROBLEMS.get(reason)
                 if reason == "ancestor":
                     reason = "outside"
                     problem = "the folder link points at the data folder itself or above it"
+                if all_uploads_refused is None:
+                    all_uploads_refused = (missing_mileage({"folder_reason": reason}) and
+                                           _month_blocks_all_uploads(DATA_ROOT / ym, root))
                 unreadable.append({"folder": True, "ym": ym, "id": "", "trip_key": f"{ym}/",
                                    "has_gpx": False, "problem": problem,
                                    "folder_reason": reason, "counted_as": counted_as,
+                                   "saved_months": saved_months,
+                                   "saved_counts": _saved_month_counts(conn, saved_months) if reason == "saved_keys" else {},
+                                   "uploads_refused": (uploads_refused or
+                                                       reason in ("not_folder", "link_not_folder") or
+                                                       (reason == "dangling" and _month_refuses_new_uploads(DATA_ROOT / ym, root))),
+                                   "all_uploads_refused": all_uploads_refused,
                                    "refused_file": "folder", "problem_file": "folder"})
 
-        # Only month names are trip identities accepted by the routes. Ignore
-        # other names before checking or listing their targets.
-        try:
-            months = [path for path in DATA_ROOT.iterdir() if trip_merges.YM_RE.fullmatch(path.name)]
-        except OSError:
-            months = []
-        counted_directories = {}
-        # Prefer real month directories to preserve their annotation keys;
-        # link-only targets use the first month name in sorted order.
-        for month in sorted(months, key=_month_sort_key):
-            cause = _month_link_problem(month, root)
-            if cause:
-                refuse_month(month.name, cause)
+        counted, problems = _month_choices(conn, root)
+        for problem in problems:
+            refuse_month(*problem)
+        for name, chosen in counted.items():
+            if name != chosen:
                 continue
+            month = DATA_ROOT / name
             try:
                 checked_month = trip_merges.checked_path(root, month)
             except ValueError:
                 refuse_month(month.name)
                 continue
             try:
-                if not stat.S_ISDIR(checked_month.stat().st_mode):
-                    continue
-                if checked_month in counted_directories:
-                    refuse_month(month.name, "duplicate", counted_directories[checked_month])
+                month_stat = checked_month.stat()
+                if not stat.S_ISDIR(month_stat.st_mode):
                     continue
                 names = _month_trip_names(checked_month)
-            except OSError:
-                refuse_month(month.name, "unreadable")
+            except OSError as exc:
+                # A denied list/search already proves ingest must refuse. Do
+                # not repeat the access check to discover the same fact.
+                refuse_month(month.name, "unreadable", all_uploads_refused=True if isinstance(exc, PermissionError) else None)
                 continue
-            counted_directories[checked_month] = month.name
+            if not _month_mode_writable(month_stat):
+                refuse_month(month.name, 'unwritable', uploads_refused=True)
             for name in names:
                 path = Path(name)
                 if path.suffix in (".json", ".gpx"):
@@ -1045,7 +1363,15 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
                 del _summary_cache[path]
     else:
         trip_key = trip_merges.canonical_key(conn, trip_key)
-        keys = trip_merges.parts(conn, trip_key) or [trip_key]
+        merge_parts = trip_merges.parts(conn, trip_key)
+        keys = merge_parts or [trip_key]
+        part_months = {key.split('/')[0] for key in merge_parts if trip_merges.TRIP_KEY_RE.fullmatch(key)}
+        if part_months and any((DATA_ROOT / month).is_symlink() or
+                               not (DATA_ROOT / month).is_dir() for month in part_months):
+            # Only unusual merge addresses need the full counted-name evidence.
+            # Use exactly the list/undo classifier, retaining only this merge.
+            loaded = _load_trips(conn, include_removed=include_removed, refresh_merges=refresh_merges)
+            return tuple([t for t in entries if t['trip_key'] == trip_key] for entries in loaded)
         # Keep the lexical identity even for escaping/unreadable sources so
         # the trip can be reported. Never construct paths from invalid keys.
         json_paths = [DATA_ROOT / f"{key}.json" for key in keys if trip_merges.TRIP_KEY_RE.fullmatch(key)]
@@ -1131,7 +1457,8 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
         trips = [t for t in trips if t["ym"] not in refused_months]
         unreadable = [t for t in unreadable if t.get("folder") or t["ym"] not in refused_months]
     trips, unreadable = trip_merges.apply_merges(
-        conn, DATA_ROOT, trips, unreadable, refresh=refresh_merges, only_key=only_merge_key)
+        conn, DATA_ROOT, trips, unreadable, refresh=refresh_merges, only_key=only_merge_key,
+        counted_months=counted if only_merge_key is None else None)
     # Removal is keyed by the canonical key the list shows (a merged trip's
     # merge key, a part never), so filtering here, after the merges, hides a
     # merged trip as a whole. This is the only place that filters: the list,
@@ -1675,7 +2002,20 @@ def _trip_local_year(trip):
 def year_members(trips, unreadable, year):
     """The trips of one local year: the single rule behind list, exports and review."""
     return ([t for t in trips if _trip_local_year(t) == year],
-            [t for t in unreadable if _may_start_in(t["ym"], year)])
+            [t for t in unreadable if (_unused_merge_in_year(t, year) if t.get("unused_merge") or t.get("damaged_merge") else
+                                      any(_may_start_in(ym, year)
+                                          for ym in (t.get("saved_months") or [t["ym"]])))])
+
+
+def _unused_merge_in_year(trip, year):
+    saved_year = _trip_local_year(trip.get("saved_summary", {}))
+    return (saved_year is None or saved_year == year
+            or any(_trip_local_year(part) == year for part in trip.get('counted_parts', ())))
+
+
+UNUSED_MERGE_CLOSE_REFUSAL = ("A saved merge under an unused month name has miles and purpose outside the totals. "
+                              "Restore its original month name or use Undo saved merge before closing this year. "
+                              "See Saved merges under unused month names on the year review.")
 
 
 def trip_neighbours(trip_key, trips, year=None):
@@ -1706,16 +2046,18 @@ def _flag_trips_inside_merges(trips):
         by_key[key]["inside_merge"] = {"ym": cover["ym"], "id": cover["id"], "trip_key": cover["trip_key"]}
 
 
-def selected_trips(include_history=False):
+def selected_trips(include_history=False, loaded=None, include_merge_history=False):
     """Use local start year, or first recorded time for partly timed trips.
 
     Returns (trips, unreadable, year, years). Unreadable trips have no
     start time, so they're the exception: they go by folder.
     """
     year = selected_year()
-    trips, unreadable = load_trips()
+    trips, unreadable = load_trips() if loaded is None else loaded
     _flag_trips_inside_merges(trips)
     years = {y for y in map(_trip_local_year, trips) if y}
+    years |= {y for t in unreadable if t.get('unused_merge')
+              if (y := _trip_local_year(t.get('saved_summary', {}))) is not None}
     selected = trips
     if year:
         years.add(year)
@@ -1729,6 +2071,8 @@ def selected_trips(include_history=False):
                 _set_export_last_edited(lookup, trip)
             for trip in selected:
                 trip["received_after_close"] = "yes" if closed and late_in_closed_year(trip, closed) else ""
+            if include_merge_history:
+                unreadable += [{**row, 'merge_history': True} for row in _merge_history_rows(conn, year, trips)]
     return selected, unreadable, year, sorted(years, reverse=True)
 
 
@@ -1778,7 +2122,7 @@ def year_figures(members, unreadable):
     for trip in members:
         counts[trip.get("category") if trip.get("category") in CATEGORIES else "unclassified"] += 1
     # A duplicate alias loses no mileage, so it is not missing at year close.
-    return {"trips": len(members), "unreadable": sum(t.get("folder_reason") != "duplicate" for t in unreadable), "totals": totals, "counts": counts,
+    return {"trips": len(members), "unreadable": sum(missing_mileage(t) for t in unreadable), "totals": totals, "counts": counts,
             "trip_keys": sorted(t["trip_key"] for t in members)}
 
 
@@ -1833,7 +2177,11 @@ def locked_year(trip, closed):
 def _abort_if_year_closed(closed, *trips):
     """409 for an edit that touches a trip in a closed year."""
     for trip in trips:
-        year = locked_year(trip, closed)
+        if trip.get("unused_merge") or trip.get("damaged_merge"):
+            candidates = {y for y in closed if _unused_merge_in_year(trip, y)} | (trip_years(trip) & closed.keys())
+            year = min(candidates) if candidates else None
+        else:
+            year = locked_year(trip, closed)
         if year:
             abort(409, description=(
                 f"{year} is closed for edits. The admin can reopen it on the year review page."))
@@ -2303,28 +2651,44 @@ LIST_HTML = """
   </div>
 </header>
 <div class="wrap">
+  {% if upload_blocks %}
+  <div class="warn" role="alert"><b>Uploads are blocked.</b> {{ all_uploads_refusal }}
+    Folders: {% for entry in upload_blocks %}<code>{{ entry.trip_key }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+    {% if g.role == 'admin' %}<a href="{{ url_for('index') }}">Review the folder warnings in All years and follow their repair steps.</a>
+    {% else %}Please tell the admin about these folders.{% endif %}
+  </div>
+  {% endif %}
   {% if unreadable %}
   <div class="warn" role="alert">
-    {% set missing = unreadable|rejectattr('folder_reason', 'equalto', 'duplicate')|list %}
-    {% if missing %}<b>{{ missing|rejectattr("folder")|list|length }} trip file(s) can't be read.{% set folders = missing|selectattr("folder")|list %}{% if folders %} {{ folders|length }} month folder(s) can't be read.{% endif %}</b>
-    Their miles can't be counted, so the totals below may be short. The
-    exports list these trips as unreadable, without miles. To rebuild a
-    damaged summary from its GPX, see DEPLOY_DEBIAN.md → Troubleshooting.
+    {% set missing = unreadable|select('missing_mileage')|list %}
+    {% set files = missing|rejectattr("folder")|list %}
+    {% set folders = missing|selectattr("folder")|list %}
+    {% if missing %}<b>{% if files %}{{ files|length }} trip file(s) can't be read.{% endif %}{% if folders %} {{ folders|length }} month folder(s) can't be read.{% endif %}</b>
+    Their miles can't be counted, so the totals below may be short.
+    The exports list these entries as unreadable, without miles.
+    {% if files %}To rebuild a damaged summary from its GPX, see DEPLOY_DEBIAN.md → Troubleshooting.{% endif %}
     {% endif %}
     <ul>
       {% for u in unreadable %}
       {% if u.get('folder') %}
-      <li><code>{{ u.trip_key }}</code> (month folder): {{ folder_description(u) }}{% if u.folder_reason != 'duplicate' %}; none of its trips are shown or counted.{% endif %}
-        {{ folder_hint(u, g.role) }}
-      </li>
-      {% else %}
-      <li><code>{% if u.get('parts') %}{{ u.gpx_file }}{% else %}{{ u.trip_key }}.{{ u.get('problem_file') or 'json' }}{% endif %}</code>{% if not u.get('parts') and u.get('refused_file') == 'gpx' and u.get('problem_file') == 'json' %} (its GPX links outside the data folder){% elif not u.has_gpx and (u.get('parts') or not u.get('refused_file')) %} (no GPX either){% endif %}: {{ u.problem }}
-        {% if u.get('parts') %}
-        <form method="post" action="{{ url_for('split_trip', ym=u.ym, trip_id=u.id, year=year or '') }}">
+      <li><code>{{ u.trip_key }}</code> ({% if u.get('unused_merge') %}saved merge{% else %}month folder{% endif %}): {{ folder_message(u, g.role) }}
+        {% if u.get('unused_merge') and g.role == 'admin' %}
+        <form method="post" action="{{ url_for('undo_unused_merge', ym=u.ym, merge_id=u.id) }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <label><input type="checkbox" name="confirm" value="yes" required>
-            Restore original trips and annotations; remove the merged annotation.</label>
-          <button class="btn" type="submit">Undo merge (split back)</button>
+            Remove this unused merge and its merged annotation. {{ unused_merge_undo_effect(u) }}</label>
+          <button class="btn" type="submit">Undo saved merge</button>
+        </form>
+        {% endif %}
+      </li>
+      {% else %}
+      <li><code>{% if u.get('parts') %}{{ u.gpx_file }}{% else %}{{ u.trip_key }}.{{ u.get('problem_file') or 'json' }}{% endif %}</code>{% if not u.get('parts') and u.get('refused_file') == 'gpx' and u.get('problem_file') == 'json' %} (its GPX links outside the data folder){% elif not u.has_gpx and (u.get('parts') or not u.get('refused_file')) %} (no GPX either){% endif %}: {{ folder_message(u, g.role) if u.get('damaged_merge') else u.problem }}
+        {% if u.get('damaged_merge') and g.role == 'admin' %}
+        <form method="post" action="{{ url_for('discard_damaged_merge', ym=u.ym, merge_id=u.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <label><input type="checkbox" name="confirm" value="yes" required>
+            {{ damaged_merge_discard_effect }}</label>
+          <button class="btn" type="submit">Discard damaged merge</button>
         </form>
         {% endif %}
         {% if g.role == 'admin' %}
@@ -2989,6 +3353,8 @@ def _history_summary(row):
         source = details.get("annotation_from")
         return f"Merged {merged}; kept annotation from {source}."
     if action == "split":
+        if details.get('unused_name'):
+            return "Unused-name merge undone. " + details['undo_effect']
         text = "Restored original recordings: " + ", ".join(details.get("parts", ())) + "."
         # Older rows carry only the parts.
         if "dropped" in details:
@@ -2997,6 +3363,14 @@ def _history_summary(row):
             text += " Restored: " + "; ".join(
                 f"{part}: {_annotation_words(values)}" for part, values in details["restored"].items()) + "."
         return text
+    if action == "discard_damaged_merge":
+        summary = details.get('saved_summary', {})
+        miles = summary.get('distance_miles')
+        distance = f"{miles:.3f} mi" if _is_number(miles) else "unknown miles"
+        return (f"Discarded damaged merge with {distance}; saved annotation: {_annotation_words(details.get('dropped'))}. "
+                "Parts with readable trip summaries can be counted separately with the annotations saved under their names. "
+                "Missing or unreadable summaries need recovery from backups. "
+                "The merged trip's saved miles and purpose were removed from the totals and kept in this history record.")
     if action == "remove":
         return "Removed from the log: " + str(details.get("reason", ""))
     if action == "restore":
@@ -3023,6 +3397,7 @@ def _snapshot_words(snapshot, label):
 def _history_action_label(action):
     return {
         "annotate": "Annotation saved", "merge": "Merge", "split": "Undo merge",
+        "discard_damaged_merge": "Damaged merge discarded",
         "remove": "Removed from log", "restore": "Restored to log",
         "year_close": "Year closed", "year_reopen": "Year reopened",
     }.get(action, action.replace("_", " ").capitalize())
@@ -3102,7 +3477,11 @@ def _year_list():
         closed = trip_log.closed_years(conn)
     years = {y for y in map(_trip_local_year, trips) if y} | closed.keys()
     for trip in unreadable:
-        years |= _folder_years(trip["ym"])
+        saved_year = _trip_local_year(trip.get('saved_summary', {})) if trip.get('unused_merge') or trip.get('damaged_merge') else None
+        years |= {saved_year} if saved_year else _folder_years(trip["ym"])
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
+        for row in _merge_history_rows(conn):
+            years |= {row['saved_year']} if row['saved_year'] else _folder_years(row['trip_key'].split('/')[0])
     return [{"year": year, "closed": closed.get(year)} for year in sorted(years, reverse=True)]
 
 
@@ -3114,7 +3493,7 @@ YEAR_HTML = """
 .changed { font-weight: 700; }
 </style></head><body>
 """ + ACCOUNT_HEADER + """<main class="wrap">
-{% macro trip_link(t) %}{% if t.get('folder') %}<code>{{ t.trip_key }}</code> (month folder){% else %}<a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{% if t.problem %}{{ t.trip_key }}{% else %}{{ fmt_trip_date(t) }}{% endif %}</a>{% endif %}{% endmacro %}
+{% macro trip_link(t) %}{% if t.get('folder') %}<code>{{ t.trip_key }}</code> ({% if t.get('unused_merge') %}saved merge{% else %}month folder{% endif %}){% else %}<a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{% if t.problem %}{{ t.trip_key }}{% else %}{{ fmt_trip_date(t) }}{% endif %}</a>{% endif %}{% endmacro %}
 <h1>{{ year }} year review</h1>
 <p class="muted">Times shown in {{ timezone }}. A trip belongs to the year it starts in (or, if partly timed, its
 first recorded time), the same as the trip list and exports.</p>
@@ -3126,6 +3505,10 @@ first recorded time), the same as the trip list and exports.</p>
 
 <section aria-labelledby="status-heading">
 <h2 id="status-heading">Status</h2>
+{% if upload_blocks %}<p class="warn" role="alert"><b>Uploads are blocked.</b> {{ all_uploads_refusal }}
+Folders: {% for entry in upload_blocks %}<code>{{ entry.trip_key }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+<a href="{{ url_for('index') }}">Review the folder warnings in All years and follow their repair steps.</a></p>{% endif %}
+{% for entry in saved_conflicts %}<p class="warn" role="alert">{{ folder_message(entry, g.role) }}</p>{% endfor %}
 {% if closed %}
 <p><span class="tag other">Closed for edits</span> by {{ closed.closed_by }} on {{ fmt_date(closed.closed_at) }}.
 Nobody can annotate, merge, undo a merge, remove or restore a trip in {{ year }} until you reopen it.
@@ -3139,13 +3522,26 @@ marked in the exports. To categorize it, reopen the year and close it again: tha
 <button class="btn secondary" type="submit">Reopen {{ year }}</button></form>
 {% else %}
 <p>{{ year }} is open. Close it once its return is filed, so its trips can't change by accident.</p>
+{% if saved_conflicts or unused_merges %}
+<button class="btn" disabled>Close {{ year }}</button>
+{% else %}
 <form method="post" action="{{ url_for('close_year', year=year) }}">
 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 <p class="muted">Closing also saves this year's trip count and miles, so any later change to them shows on this page.</p>
 <label><input type="checkbox" name="confirm" value="yes" required> Confirm closing {{ year }} for edits</label>
 <button class="btn" type="submit">Close {{ year }}</button></form>
 {% endif %}
+{% endif %}
 </section>
+
+{% if unused_merges %}
+<section aria-labelledby="unused-merges-heading">
+<h2 id="unused-merges-heading">Saved merges under unused month names ({{ unused_merges|length }})</h2>
+<p class="warn" role="alert">{{ unused_merge_close_refusal }}</p>
+<ul>{% for t in unused_merges %}<li><code>{{ t.trip_key }}</code>: {{ folder_message(t, g.role) }}</li>{% endfor %}</ul>
+<p><a href="{{ url_for('index', year=year) }}">Review saved merges on the trip list</a></p>
+</section>
+{% endif %}
 
 <section aria-labelledby="totals-heading">
 <h2 id="totals-heading">Totals by category</h2>
@@ -3258,15 +3654,28 @@ gap that was uploaded after the merge is counted a second time. Open the merged 
 </section>
 
 <section aria-labelledby="unreadable-heading">
-{% set missing = unreadable|rejectattr('folder_reason', 'equalto', 'duplicate')|list %}
-<h2 id="unreadable-heading">Trips whose files can't be read ({{ missing|length }}) and folder notices</h2>
+{% set missing = unreadable|select('missing_mileage')|list %}
+<h2 id="unreadable-heading">Trips whose files can't be read ({{ missing|length }}){% if unreadable|selectattr('folder')|list %} and folder notices{% endif %}</h2>
 {% if missing %}<p class="muted">Their miles can't be counted, so the totals above may be short.</p>{% endif %}
 <div class="review-table"><table>
 <thead><tr><th>Trip</th><th>Problem</th></tr></thead>
-<tbody>{% for t in unreadable %}<tr><td>{{ trip_link(t) }}{% if not t.get('folder') and not t.get('parts') %} <code>{{ t.trip_key }}.{{ t.get('problem_file') or 'json' }}</code>{% if t.get('refused_file') == 'gpx' and t.get('problem_file') == 'json' %} (its GPX links outside the data folder){% endif %}{% endif %}</td><td>{% if t.get("folder") %}{{ folder_description(t) }}. {{ folder_hint(t, g.role) }}{% else %}{{ t.problem }}{% endif %}</td></tr>
+<tbody>{% for t in unreadable %}<tr><td>{{ trip_link(t) }}{% if not t.get('folder') and not t.get('parts') %} <code>{{ t.trip_key }}.{{ t.get('problem_file') or 'json' }}</code>{% if t.get('refused_file') == 'gpx' and t.get('problem_file') == 'json' %} (its GPX links outside the data folder){% endif %}{% endif %}</td><td>{% if t.get("folder") or t.get("damaged_merge") %}{{ folder_message(t, g.role) }}{% else %}{{ t.problem }}{% endif %}</td></tr>
 {% else %}<tr><td colspan="2" class="muted">All trip files can be read.</td></tr>{% endfor %}</tbody>
 </table></div>
 </section>
+
+{% if discarded_merges %}
+<section aria-labelledby="discarded-merges-heading">
+<h2 id="discarded-merges-heading">Discarded or undone saved merges ({{ discarded_merges|length }})</h2>
+<p class="warn">These saved merge records remain visible after the year is closed.
+Check each row before using saved miles: its trips may already be counted again.</p>
+<div class="review-table"><table>
+<thead><tr><th>Saved merge</th><th>History and current log</th></tr></thead>
+<tbody>{% for row in discarded_merges %}<tr><td><code>{{ row.trip_key }}</code><br>
+Parts: {{ row.parsed_details.parts|join(', ') }}</td><td>{{ merge_history_message(row) }}</td></tr>{% endfor %}</tbody>
+</table></div>
+</section>
+{% endif %}
 
 <section aria-labelledby="removed-heading">
 <h2 id="removed-heading">Removed trips ({{ removed|length }})</h2>
@@ -3353,6 +3762,103 @@ def _late_edit_rows(conn, year, trips):
     return result
 
 
+def _merge_history_counted_parts(conn, rows, trips):
+    """Only history-bearing reviews/exports inspect current part membership.
+
+    Count live summaries, including parts of current merges, never file presence
+    alone. Saved summary stamps also identify a part after a month rename.
+    """
+    current = {key: t for t in trips if not t.get('removal')
+               for key in (t.get('parts') or [t['trip_key']])}
+    counted, _ = _month_choices(conn, DATA_ROOT.resolve())
+    for row in rows:
+        details = row['parsed_details']
+        try:
+            stamps = json.loads(details.get('fingerprint', 'null'))
+            if stamps and isinstance(stamps[0], int):
+                stamps = stamps[1:]
+        except (TypeError, ValueError):
+            stamps = None
+        again, absent = [], []
+        for index, part in enumerate(details.get('parts', [])):
+            month, name = part.split('/')
+            alternate = counted.get(month, month) + '/' + name
+            recorded = details.get('counted_part_keys', {}).get(part, part)
+            match = next((key for key in (part, recorded, alternate) if key in current), None)
+            if match is None and isinstance(stamps, list) and len(stamps) > 2 * index + 1:
+                saved = json.dumps([stamps[2 * index + 1]])  # readable JSON suffices for ordinary totals
+                matches = []
+                for candidate in current:
+                    if candidate.split('/')[1] != name:
+                        continue
+                    try:
+                        source = trip_merges.checked_path(DATA_ROOT.resolve(), DATA_ROOT / (candidate + '.json'))
+                        metadata = source.stat()
+                        fresh = json.dumps([[source.name, metadata.st_mtime_ns, metadata.st_size]])
+                        if trip_merges.same_sources(fresh, saved):
+                            matches.append(candidate)
+                    except (OSError, ValueError):
+                        continue
+                if len(matches) == 1:
+                    match = matches[0]
+            if match is None:
+                absent.append(part)
+                continue
+            label = part if match == part else f'{part} as {match}'
+            if current[match].get('parts'):
+                label += f" (inside {current[match]['trip_key']})"
+            again.append(label)
+        row['counted_again'], row['not_counted'] = again, absent
+
+
+def merge_history_message(row):
+    """One saved record and current-count statement for review and exports."""
+    details = row['parsed_details']
+    annotation = details.get('dropped', {})
+    label = 'Unused-name merge undone' if details.get('unused_name') else 'Damaged merge discarded'
+    text = (f"{label}. Saved miles: {row['saved_miles']}; "
+            f"purpose: {annotation.get('category') or 'unclassified'}; "
+            f"purpose note: {annotation.get('purpose_note') or 'none'}; "
+            f"trip date: {fmt_date(details.get('saved_summary', {}).get('start_time'))}. "
+            f"Recorded at: {fmt_date(row['at'])}; login: {row['actor']}. ")
+    if not row['counted_again']:
+        return text + "None of its trips are in the log; these saved miles are not in the totals."
+    text += "Now counted again: " + ', '.join(row['counted_again']) + "; do not add these saved miles by hand."
+    if row['not_counted']:
+        text += " Not currently counted: " + ', '.join(row['not_counted']) + "."
+    return text
+
+
+app.jinja_env.globals['merge_history_message'] = merge_history_message
+
+
+def _merge_history_rows(conn, year=None, trips=None):
+    """Permanent loss records, even after every source and merge row is gone."""
+    rows = []
+    for raw in conn.execute(
+        "SELECT id, trip_key, actor, actor_role, at, action, details FROM trip_history "
+        "WHERE action IN ('discard_damaged_merge', 'split') ORDER BY at DESC, id DESC"
+    ):
+        row = _history_row_dict(raw)
+        try:
+            details = json.loads(row['details'])
+        except (TypeError, ValueError):
+            continue
+        if row['action'] == 'split' and not details.get('unused_name'):
+            continue
+        summary = details.get('saved_summary', {})
+        saved_year = _trip_local_year(summary)
+        if year is not None and saved_year is not None and saved_year != year:
+            continue
+        miles = summary.get('distance_miles')
+        row.update(parsed_details=details, saved_year=saved_year,
+                   saved_miles=f'{miles:.3f} mi' if _is_number(miles) else 'unknown miles')
+        rows.append(row)
+    if rows and trips is not None:
+        _merge_history_counted_parts(conn, rows, trips)
+    return rows
+
+
 @app.route("/admin/year/<year>")
 def admin_year(year):
     year = valid_year(year)
@@ -3362,10 +3868,14 @@ def admin_year(year):
         # and exports use, applied to the log without its removed trips.
         live = [t for t in trips if "removal" not in t]
         live_unreadable = [t for t in unreadable if "removal" not in t]
+        saved_conflicts = [t for t in live_unreadable if t.get("folder_reason") == "saved_keys"]
+        upload_blocks = [t for t in live_unreadable if t.get("all_uploads_refused")]
         members, broken = year_members(live, live_unreadable, year)
+        unused_merges = [t for t in broken if t.get("unused_merge")]
         gone, gone_unreadable = year_members(
             [t for t in trips if "removal" in t], [t for t in unreadable if "removal" in t], year)
         edits = _late_edit_rows(conn, year, members + broken + gone + gone_unreadable)
+        discarded_merges = _merge_history_rows(conn, year, trips)
     current = year_figures(members, broken)
     totals, counts = current["totals"], current["counts"]
     late, comparison, joined, left = [], None, [], []
@@ -3393,11 +3903,14 @@ def admin_year(year):
     covered = trip_merges.trips_inside_merges(live)
     inside_merge = [{"trip": t, "merge": covered[t["trip_key"]]} for t in members if t["trip_key"] in covered]
     return render_template_string(
-        YEAR_HTML, year=year, closed=closed, totals=totals, counts=counts, edits=edits,
+        YEAR_HTML, year=year, closed=closed, saved_conflicts=saved_conflicts, upload_blocks=upload_blocks,
+        unused_merges=unused_merges, unused_merge_close_refusal=UNUSED_MERGE_CLOSE_REFUSAL,
+        discarded_merges=discarded_merges,
+        totals=totals, counts=counts, edits=edits,
         inside_merge=inside_merge, late=late, late_miles=sum(t.get("distance_miles") or 0 for t in late),
         comparison=comparison, joined=joined, left=left, undated=undated, undated_miles=sum(t.get("distance_miles") or 0 for t in undated),
         uncategorized=[t for t in members if t.get("category") not in CATEGORIES],
-        incomplete=incomplete, unreadable=broken, removed=removed, timezone=DISPLAY_TZ_NAME,
+        incomplete=incomplete, unreadable=[t for t in broken if not t.get("unused_merge")], removed=removed, timezone=DISPLAY_TZ_NAME,
         year_end=f"{year + 1}-01-01 00:00",
     )
 
@@ -3441,7 +3954,12 @@ def _change_year(raw_year, closing_it):
         if closing_it:
             # Save the totals as they stand, so a later change can't go unseen.
             # The history row carries the figures; the key list stays in tax_years.
-            snapshot = year_figures(*_live_year_members(conn, year))
+            all_trips, all_unreadable = _load_trips(conn)
+            if any(t.get("unused_merge") and _unused_merge_in_year(t, year) for t in all_unreadable):
+                abort(409, description=UNUSED_MERGE_CLOSE_REFUSAL)
+            if any(t.get("folder_reason") == "saved_keys" for t in all_unreadable):
+                abort(409, description="Several month names for one folder have saved trip data. Resolve the folder warning on the trip list before closing a year.")
+            snapshot = year_figures(*year_members(all_trips, all_unreadable, year))
             trip_log.close_year(conn, year, g.user, snapshot)
             details = {"snapshot": {k: v for k, v in snapshot.items() if k != "trip_keys"}}
         else:
@@ -3566,11 +4084,13 @@ def logout():
 
 @app.route("/")
 def index():
-    trips, unreadable, year, years = selected_trips()
+    loaded = load_trips()
+    upload_blocks = [t for t in loaded[1] if t.get("all_uploads_refused")]
+    trips, unreadable, year, years = selected_trips(loaded=loaded)
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         year_closed = year in trip_log.closed_years(conn)
     return render_template_string(
-        LIST_HTML, trips=trips, unreadable=unreadable, year=year, years=years,
+        LIST_HTML, trips=trips, unreadable=unreadable, year=year, years=years, upload_blocks=upload_blocks,
         totals=mileage_totals(trips), timezone=DISPLAY_TZ_NAME, year_closed=year_closed,
     )
 
@@ -3596,7 +4116,11 @@ def trip_view(ym, trip_id):
     if t is None and g.role == "admin" and removed is not None:
         t = next((t for t in removed_trips + removed_unreadable if t["trip_key"] == key), None)
     if t is None:
-        problem = next((u["problem"] for u in unreadable if u["trip_key"] == key), None)
+        unused = next((u for u in unreadable if u['trip_key'] == key and u.get('unused_merge')), None)
+        if unused is not None:
+            abort(404, description=folder_message(unused, g.role))
+        problem = next((folder_message(u, g.role) if u.get('damaged_merge') else u['problem']
+                        for u in unreadable if u['trip_key'] == key), None)
         if problem is None:
             # A removed trip (for an everyday login) and an address that
             # matches no trip get the same words, so the page does not say
@@ -3829,6 +4353,90 @@ def merge_trip(ym, trip_id):
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
 
 
+def _undo_merge(conn, key, keys, *, damaged=False, unused=None):
+    """Database-only undo; caller holds BEGIN IMMEDIATE and checks edit locks."""
+    merged = conn.execute("SELECT * FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
+    dropped = {field: (merged[field] or "") if merged else ""
+               for field in trip_merges.ANNOTATION_FIELDS}
+    restored = {part: {field: "" for field in trip_merges.ANNOTATION_FIELDS} for part in keys}
+    for row in conn.execute(
+        f"SELECT * FROM annotations WHERE trip_key IN ({','.join('?' * len(keys))})", keys
+    ):
+        restored[row["trip_key"]] = {field: row[field] or "" for field in trip_merges.ANNOTATION_FIELDS}
+    if damaged or unused is not None:
+        details = {
+            'parts': keys, 'saved_summary': trip_merges.saved_summary(merged),
+            'saved_summary_raw': merged['summary'], 'dropped': dropped,
+            'fingerprint': merged['fingerprint'],
+            'original_annotations': restored,
+        }
+        if unused is not None:
+            details.update(unused_name=True, undo_effect=unused_merge_undo_effect(unused),
+                           counted_part_keys=dict(zip(keys, [t['trip_key'] for t in unused['counted_parts']], strict=True)))
+        trip_log.record(conn, key, 'discard_damaged_merge' if damaged else 'split', details,
+                        actor=g.user, actor_role=g.role)
+    else:
+        trip_log.record(conn, key, "split", {"parts": keys, "dropped": dropped, "restored": restored},
+                        actor=g.user, actor_role=g.role)
+    conn.execute("DELETE FROM trip_merge_aliases WHERE merge_key=?", (key,))
+    conn.execute("DELETE FROM trip_merge_parts WHERE merge_key=?", (key,))
+    conn.execute("DELETE FROM trip_merges WHERE trip_key=?", (key,))
+
+
+def _abort_if_saved_merge_closed(conn, key, keys):
+    """Saved dates and old snapshots survive the loss of a folder address."""
+    _abort_if_key_in_closed_year(conn, key)
+    row = conn.execute('SELECT summary FROM trip_merges WHERE trip_key=?', (key,)).fetchone()
+    saved_year = _trip_local_year(trip_merges.saved_summary(row))
+    for year, record in trip_log.closed_years(conn).items():
+        snapshot = record['snapshot'] or {}
+        if saved_year is None or saved_year == year or {key, *keys} & set(snapshot.get('trip_keys', [])):
+            abort(409, description=f'{year} is closed for edits. The admin can reopen it on the year review page.')
+
+
+@app.route('/admin/damaged-merge/<ym>/<merge_id>/discard', methods=['POST'])
+def discard_damaged_merge(ym, merge_id):
+    _validate_trip_address(ym, merge_id)
+    if request.form.get('confirm') != 'yes':
+        abort(400, description='Confirm discarding this damaged merge. ' + DAMAGED_MERGE_DISCARD_EFFECT)
+    key = f'{ym}/{merge_id}'
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute('BEGIN IMMEDIATE')
+        # Exact saved key only: never follow month aliases or touch trip files.
+        _, entries = _load_trips(conn, include_removed=True)
+        damaged = next((t for t in entries if t['trip_key'] == key and t.get('damaged_merge')), None)
+        if damaged is None:
+            abort(409, description='This is no longer a damaged merge. Reopen the trip list.')
+        _abort_if_removed(conn, key)
+        _abort_if_saved_merge_closed(conn, key, damaged['parts'])
+        _undo_merge(conn, key, damaged['parts'], damaged=True)
+    return redirect(url_for('index'))
+
+
+@app.route("/admin/unused-merge/<ym>/<merge_id>/undo", methods=["POST"])
+def undo_unused_merge(ym, merge_id):
+    _validate_trip_address(ym, merge_id)
+    key = f"{ym}/{merge_id}"
+    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        # Recheck the exact stored key. This route never follows a month alias
+        # or constructs a file path from the merge address.
+        trips, entries = _load_trips(conn, include_removed=True)
+        unused = next((entry for entry in entries if entry["trip_key"] == key and entry.get("unused_merge")), None)
+        if request.form.get('confirm') != 'yes':
+            effect = ' ' + unused_merge_undo_effect(unused) if unused is not None else ''
+            abort(400, description='Confirm removing this unused merge and its merged annotation.' + effect)
+        if unused is None:
+            abort(409, description="This saved merge is no longer under an unused month name. Reopen the trip list.")
+        _abort_if_removed(conn, key)
+        keys = unused["parts"]
+        _abort_if_saved_merge_closed(conn, key, keys)
+        _undo_merge(conn, key, keys, unused=unused)
+    return redirect(url_for("index"))
+
+
 @app.route("/trip/<ym>/<trip_id>/split", methods=["POST"])
 def split_trip(ym, trip_id):
     year = selected_year()
@@ -3843,21 +4451,13 @@ def split_trip(ym, trip_id):
         keys = trip_merges.parts(conn, key)
         if not keys:
             abort(409, description="This merge no longer exists. Reopen the trip list.")
+        trips, entries = _load_trips(conn, trip_key=key)
+        if entries or not any(t['trip_key'] == key for t in trips):
+            advice = ('Restore its files from backups or review the saved merge on the trip list.' if g.role == 'admin' else
+                      'Ask the admin to restore its files from backups or review the saved merge on the trip list.')
+            abort(409, description='This merge has missing or unreadable parts. ' + advice)
         _abort_if_key_in_closed_year(conn, key)
-        # What the undo throws away and brings back, kept in the history row.
-        merged = conn.execute("SELECT * FROM trip_merges WHERE trip_key=?", (key,)).fetchone()
-        dropped = {field: (merged[field] or "") if merged else ""
-                   for field in trip_merges.ANNOTATION_FIELDS}
-        restored = {part: {field: "" for field in trip_merges.ANNOTATION_FIELDS} for part in keys}
-        for row in conn.execute(
-            f"SELECT * FROM annotations WHERE trip_key IN ({','.join('?' * len(keys))})", keys
-        ):
-            restored[row["trip_key"]] = {field: row[field] or "" for field in trip_merges.ANNOTATION_FIELDS}
-        conn.execute("DELETE FROM trip_merge_aliases WHERE merge_key=?", (key,))
-        conn.execute("DELETE FROM trip_merge_parts WHERE merge_key=?", (key,))
-        conn.execute("DELETE FROM trip_merges WHERE trip_key=?", (key,))
-        trip_log.record(conn, key, "split", {"parts": keys, "dropped": dropped, "restored": restored},
-                        actor=g.user, actor_role=g.role)
+        _undo_merge(conn, key, keys)
     first_ym, first_id = keys[0].split("/")
     return redirect(url_for("trip_view", ym=first_ym, trip_id=first_id, year=year or ""))
 
@@ -4002,7 +4602,7 @@ def _xlsx_literal_text(row):
 
 UNREADABLE_COLUMNS = (
     "trip_id", "gpx_file", "category", "purpose_note", "destination",
-    "last_edited_by", "last_edited_at",
+    "last_edited_by", "last_edited_at", "distance_miles",
 )
 
 
@@ -4012,25 +4612,33 @@ def _unreadable_values(t):
     Just what identifies it and what was typed for it. Its miles are
     unknown, so they stay blank rather than reading as zero.
     """
+    if t.get('merge_history'):
+        values = dict.fromkeys(UNREADABLE_COLUMNS, '')
+        values.update(trip_id=t['trip_key'], purpose_note=merge_history_message(t))
+        return values
     if t.get("folder"):
         values = dict.fromkeys(UNREADABLE_COLUMNS, "")
         values["trip_id"] = t["trip_key"]
-        values["purpose_note"] = folder_description(t) + ". " + folder_hint(t, g.role)
+        values["purpose_note"] = folder_message(t, g.role)
+        if t.get("unused_merge"):
+            values["category"] = t.get("category", "")
         return values
     return {
         "trip_id": t.get("trip_id") or t["id"],
         "gpx_file": t.get("gpx_file") or (f"{t['id']}.gpx" if t["has_gpx"] else ""),
         "category": t["category"],
-        "purpose_note": t["purpose_note"],
+        "purpose_note": ((t['purpose_note'] + ' ' if t['purpose_note'] else '') + folder_message(t, g.role)
+                         if t.get('damaged_merge') else t['purpose_note']),
         "destination": t["destination"],
         "last_edited_by": t.get("last_edited_by", ""),
         "last_edited_at": t.get("last_edited_at", ""),
+        "distance_miles": "",
     }
 
 
 @app.route("/export.csv")
 def export_csv():
-    trips, unreadable, year, _ = selected_trips(include_history=True)
+    trips, unreadable, year, _ = selected_trips(include_history=True, include_merge_history=True)
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow([name for name, _ in EXPORT_COLUMNS] + ["row_type", LATE_COLUMN])
@@ -4040,7 +4648,7 @@ def export_csv():
     for t in unreadable:
         values = _unreadable_values(t)
         writer.writerow(
-            [_csv_safe(values.get(name, "")) for name, _ in EXPORT_COLUMNS] + ["folder_notice" if t.get("folder_reason") == "duplicate" else "unreadable_folder" if t.get("folder") else "unreadable", ""]
+            [_csv_safe(values.get(name, "")) for name, _ in EXPORT_COLUMNS] + [_folder_row_type(t) if t.get("folder") else "unreadable", ""]
         )
     for category, miles in mileage_totals(trips).items():
         # Keep the CSV rectangular and mark totals explicitly, so consumers
@@ -4058,7 +4666,7 @@ def export_csv():
 
 @app.route("/export.xlsx")
 def export_xlsx():
-    trips, unreadable, year, _ = selected_trips(include_history=True)
+    trips, unreadable, year, _ = selected_trips(include_history=True, include_merge_history=True)
     wb = Workbook()
     ws = wb.active
     ws.title = "Mileage"
@@ -4079,8 +4687,20 @@ def export_xlsx():
         sheet.append(list(UNREADABLE_COLUMNS))
         for t in unreadable:
             values = _unreadable_values(t)
+            if t.get('merge_history'):
+                values['trip_id'] += (' (unused-name merge undone)' if t['parsed_details'].get('unused_name')
+                                      else ' (damaged merge discarded)')
             if t.get("folder"):
-                values["trip_id"] += " (whole month folder)"
+                suffix = {
+                    "duplicate": " (extra link, trips counted elsewhere)",
+                    "ingest_refused": " (link blocks new uploads; existing trips counted)",
+                    "saved_keys": " (conflicting saved data; trips counted)",
+                    "unused_merge": " (saved merge under unused month name)",
+                    "not_folder": " (notice: month name is a file; new uploads refused)",
+                    "link_not_folder": " (notice: month link is not a folder; new uploads refused)",
+                    "unwritable": " (notice: folder not writable; existing trips counted)",
+                }.get(t["folder_reason"], " (whole month folder)")
+                values["trip_id"] += suffix
             sheet.append(_xlsx_clean([values[name] for name in UNREADABLE_COLUMNS]))
             _xlsx_literal_text(sheet[sheet.max_row])
     buf = io.BytesIO()

@@ -1,11 +1,15 @@
 """Viewer response headers and login redirect safety (2026-10-23 audit)."""
 
 import builtins
+import csv
 import errno
+import html
 import io
 import os
 import json
 import sqlite3
+import stat
+from types import SimpleNamespace
 from pathlib import Path
 import unittest
 from contextlib import closing, ExitStack
@@ -16,6 +20,8 @@ from openpyxl import load_workbook
 from zoneinfo import ZoneInfo
 
 import test_viewer_roles as roles
+from month_link_layouts import (GLOBAL_UPLOAD_LAYOUTS, MONTH_LINK_LAYOUTS, MONTH_PROBLEM_LAYOUTS, PERMISSION_MONTH_LAYOUTS,
+                                WRITABLE_MONTH_LAYOUTS, make_layout, restricted_layout)
 
 
 ADMIN_REFUSAL = ("This trip&#39;s files can&#39;t be opened: its summary, track or month folder is a link that leads "
@@ -183,12 +189,12 @@ class ViewerHardeningTests(unittest.TestCase):
                         self.assertTrue(all(not v for k, v in row.items() if k not in ("trip_id", "row_type", "purpose_note")))
                     elif route == "/" or route.startswith("/admin/year/"):
                         self.assertIn("2026-01/", text)
-                        self.assertIn(problem, text)
+                        self.assertIn(problem, text.lower())
                         self.assertNotIn("2026-01/drive", text)
                         self.assertNotIn('/trip/2026-01/', text)
                         if route == "/":
                             self.assertIn("1 month folder(s)", text)
-                            self.assertIn("none of its trips are shown or counted", text)
+                            self.assertIn("None of its trips are shown or counted.", text)
                             self.assertNotIn("Remove from log", text)
                             self.assertIn("mount the other disk" if role == "admin" else "ask the admin", text)
                     response.close()
@@ -257,7 +263,7 @@ class ViewerHardeningTests(unittest.TestCase):
                                 book.close()
                             else:
                                 text = response.get_data(as_text=True)
-                            self.assertIn(problem, text)
+                            self.assertIn(problem, text.lower())
                             self.assertIn("mount the other disk" if role == "admin" else "ask the admin", text)
                             response.close()
                 finally:
@@ -276,7 +282,7 @@ class ViewerHardeningTests(unittest.TestCase):
                 trips, unreadable = self.viewer.load_trips()
             self.assertEqual(trips, [])
             self.assertEqual(unreadable[0]["folder_reason"], "unreadable")
-            self.assertEqual(unreadable[0]["problem"], "the folder could not be read")
+            self.assertEqual(unreadable[0]["problem"], "the folder could not be read or entered")
 
     def test_vanished_month_is_reported_and_other_month_loads(self):
         month = self.viewer.DATA_ROOT / "2026-01"
@@ -295,7 +301,7 @@ class ViewerHardeningTests(unittest.TestCase):
             trips, unreadable = self.viewer.load_trips()
         self.assertEqual([t["trip_key"] for t in trips], ["2026-02/drive"])
         self.assertEqual([t["trip_key"] for t in unreadable], ["2026-01/"])
-        self.assertEqual(unreadable[0]["problem"], "the folder could not be read")
+        self.assertEqual(unreadable[0]["problem"], "the folder could not be read or entered")
 
     @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() != 0, "requires non-root POSIX permissions")
     def test_unlistable_month_is_reported_and_pages_still_load(self):
@@ -306,7 +312,7 @@ class ViewerHardeningTests(unittest.TestCase):
         trips, unreadable = self.viewer.load_trips()
         self.assertEqual([t["trip_key"] for t in trips], ["2026-01/drive"])
         self.assertEqual([t["trip_key"] for t in unreadable], ["2026-02/"])
-        self.assertEqual(unreadable[0]["problem"], "the folder could not be read")
+        self.assertEqual(unreadable[0]["problem"], "the folder could not be read or entered")
         self.assertEqual(unreadable[0]["folder_reason"], "unreadable")
         self.signed_in("admin")
         for route in ("/", "/export.csv", "/export.xlsx"):
@@ -404,14 +410,16 @@ class ViewerHardeningTests(unittest.TestCase):
         self.assertEqual([t["trip_key"] for t in unreadable], ["2026-01/"])
         self.assertEqual({t["trip_key"] for t in trips}, {"2026-02/drive"})
 
-    def assert_alias_counted_once(self, key, alias):
+    def assert_alias_counted_once(self, key, alias, ingest_notice=False):
         trips, unreadable = self.viewer.load_trips()
         self.assertEqual([t["trip_key"] for t in trips], [key])
         self.assertEqual(self.viewer.mileage_totals(trips)["all"], 1)
-        self.assertEqual([t["trip_key"] for t in unreadable], [alias + "/"])
-        self.assertTrue(unreadable[0]["folder"])
-        self.assertIn("already counted", unreadable[0]["problem"])
-        self.assertNotIn(str(self.viewer.DATA_ROOT), unreadable[0]["problem"])
+        duplicates = [t for t in unreadable if t["folder_reason"] == "duplicate"]
+        self.assertEqual([t["trip_key"] for t in duplicates], [alias + "/"])
+        self.assertEqual(len(unreadable), 2 if ingest_notice else 1)
+        self.assertTrue(duplicates[0]["folder"])
+        self.assertIn("already counted", duplicates[0]["problem"])
+        self.assertNotIn(str(self.viewer.DATA_ROOT), duplicates[0]["problem"])
         for role in ("admin", "editor"):
             client = self.signed_in(role, self.viewer.app.test_client())
             page = client.get("/").get_data(as_text=True)
@@ -427,13 +435,14 @@ class ViewerHardeningTests(unittest.TestCase):
             self.assertEqual(len([r for r in rows if r["row_type"] == "trip"]), 1)
             self.assertEqual([float(r["distance_miles"]) for r in rows
                               if r["row_type"] == "total" and r["category"] == "all"], [1])
-            self.assertEqual([r["trip_id"] for r in rows if r["row_type"] == "folder_notice"], [alias + "/"])
+            notices = {r["trip_id"] for r in rows if r["row_type"] == "folder_notice"}
+            self.assertEqual(notices, {alias + "/", key.split("/")[0] + "/"} if ingest_notice else {alias + "/"})
             book = load_workbook(io.BytesIO(client.get("/export.xlsx").data))
             self.assertEqual(book["Mileage"].max_row, 2)
             self.assertEqual([r[3] for r in book["Totals"].values if r[2] == "all"], [1])
-            self.assertEqual(book["Unreadable trips"].max_row, 2)
+            self.assertEqual(book["Unreadable trips"].max_row, 3 if ingest_notice else 2)
             self.assertIn("whose trips are counted there", str(list(book["Unreadable trips"].values)))
-            notice = next(r for r in rows if r["row_type"] == "folder_notice")
+            notice = next(r for r in rows if r["trip_id"] == alias + "/")
             self.assertIn("whose trips are counted there", notice["purpose_note"])
             self.assertNotIn("missing", notice["purpose_note"])
             self.assertIn(alias + "/", str(list(book["Unreadable trips"].values)))
@@ -460,7 +469,7 @@ class ViewerHardeningTests(unittest.TestCase):
         month.rename(target)
         self.symlink(self.viewer.DATA_ROOT / "2027-01", target, directory=True)
         self.symlink(month, target, directory=True)
-        self.assert_alias_counted_once("2026-01/drive", "2027-01")
+        self.assert_alias_counted_once("2026-01/drive", "2027-01", ingest_notice=True)
 
     def test_single_month_link_to_nonmonth_folder_scans_under_link_name(self):
         month = self.viewer.DATA_ROOT / "2026-01"
@@ -469,11 +478,734 @@ class ViewerHardeningTests(unittest.TestCase):
         self.symlink(month, target, directory=True)
         trips, unreadable = self.viewer.load_trips()
         self.assertEqual([t["trip_key"] for t in trips], ["2026-01/drive"])
-        self.assertEqual(unreadable, [])
+        self.assertEqual([t["folder_reason"] for t in unreadable], ["ingest_refused"])
         self.assertEqual(trips[0]["purpose_note"], "example")
         self.assertEqual(trips[0]["category"], "business")
 
-    def test_merged_trip_with_linked_month_part_keeps_undo(self):
+    def test_nonmonth_link_notice_explains_queued_uploads_without_missing_miles(self):
+        self.linked_archive("2026-01")
+        trips, notices = self.viewer.load_trips()
+        self.assertEqual(self.viewer.mileage_totals(trips)["all"], 1)
+        self.assertEqual(self.viewer.year_figures(trips, notices)["unreadable"], 0)
+        self.signed_in("admin")
+        for path in ("/", "/admin/year/2026", "/export.csv"):
+            text = self.client.get(path).get_data(as_text=True)
+            self.assertIn("Trips are shown and counted", text)
+            self.assertIn("cannot upload new trips for this month", text)
+            self.assertIn("the tracker keeps them queued", text)
+            self.assertNotIn("totals below may be short", text)
+            self.assertNotIn("totals above may be short", text)
+            self.assertNotIn("none of its trips are shown or counted", text)
+        self.assertEqual(self.client.post("/admin/year/2026/close", data={
+            "csrf_token": "known-token", "confirm": "yes"}).status_code, 302)
+
+    def linked_archive(self, name="2026-02"):
+        root = self.viewer.DATA_ROOT
+        (root / "2026-01").rename(root / "archive")
+        self.symlink(root / name, root / "archive", directory=True)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("UPDATE annotations SET trip_key=?", (name + "/drive",))
+        return root / "archive"
+
+    def folder_surface_messages(self, client, year=2026, include_review=True):
+        """Read actual HTML and export cells, without matching CSV quoting."""
+        result = {}
+        paths = ["/", "/export.csv", "/export.xlsx"]
+        if include_review:
+            paths.append(f"/admin/year/{year}")
+        for path in paths:
+            response = client.get(path)
+            self.assertEqual(response.status_code, 200)
+            try:
+                if path.endswith(".xlsx"):
+                    book = load_workbook(io.BytesIO(response.data))
+                    try:
+                        if "Unreadable trips" in book:
+                            rows = list(book["Unreadable trips"].values)
+                            result[path] = [r[rows[0].index("purpose_note")] for r in rows[1:]]
+                        else:
+                            result[path] = []
+                    finally:
+                        book.close()
+                elif path.endswith(".csv"):
+                    result[path] = [r["purpose_note"] for r in csv.DictReader(io.StringIO(response.get_data(as_text=True)))
+                                    if r["row_type"] in ('unreadable', 'unreadable_folder', 'folder_notice', 'folder_warning')]
+                else:
+                    result[path] = [html.unescape(response.get_data(as_text=True))]
+            finally:
+                response.close()
+        return result
+
+    def test_every_folder_reason_has_complete_sentences_on_every_surface(self):
+        entries, expected = [], []
+        descriptions = {
+            "outside": "The folder links outside the data folder.",
+            "dangling": "The folder link target is missing.",
+            "loop": "The folder link forms a loop.",
+            "unreadable": "The folder could not be read or entered.",
+            "duplicate": "This is a link to 2026-12/, whose trips are counted there.",
+            "ingest_refused": "Trips are shown and counted. The tracker cannot upload new trips for this month until the link is replaced by a real folder; the tracker keeps them queued.",
+            "saved_keys": "Warning: saved trip data exists under 2026-01/, 2026-12/. Trips are shown and counted under 2026-12/; saved data under the other names is not applied. Years cannot be closed until this conflict is resolved. Healthy trips can still be merged under the name in use.",
+            "link_not_folder": "The month name is a link to something other than a folder.",
+            "not_folder": "The month name is a file, not a folder.",
+            "unused_merge": "This merge is saved under a month name no longer in use (2026-01/, 2026-12/). Saved miles: unknown; purpose: unclassified; purpose note: none. These saved miles and this purpose are not in the totals shown. The trips it was made from are counted separately. Its affected tax years cannot be closed until this saved merge is resolved.",
+            "unwritable": "Trips are shown and counted, but the folder's owner or mode prevents the server writing to it. The tracker cannot upload new trips for this month until the folder's owner or mode is fixed; the tracker keeps them queued.",
+        }
+        hints = {
+            "duplicate": "Remove the extra link.",
+            "ingest_refused": "Replace the link with a real folder containing these trips, or mount the disk there, so queued trips can upload.",
+            "saved_keys": "Choose which name's saved data to use and keep only that link. Removing a link leaves its saved data unapplied; removing the name in use quietly orphans that data. A new merge is saved under the name in use; choosing another name leaves that merge unapplied too. Nothing is deleted from the database. Recreate the same link to get back; competing saved names bring the conflict back. See DEPLOY_DEBIAN.md, Troubleshooting, for steps.",
+            "unreadable": "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only.",
+            "link_not_folder": "Remove only the link, keeping its target; ingest can then create a real month folder for queued trips.",
+            "not_folder": "Move the file to a safe place outside the month names; ingest can then create a real month folder for queued trips.",
+            "unused_merge": "To use this merge again, restore the original month name, as a link or by renaming the folder back, and leave that name in use. Or use Undo saved merge on the trip list. The trips stay counted under 2026-12/ with only the annotations saved under that name. Annotations saved under 2026-01/, 2026-12/ are kept in the database but not applied. The merged trip's saved miles and purpose leave the totals and are kept in history and the year review.",
+            "unwritable": "Give the ingest service's user (UID 1000) write and search permission on the real month folder; check its owner and permissions.",
+        }
+        cases = [(reason, False, False) for reason in descriptions]
+        cases += [("saved_keys", True, False), ("duplicate", True, False), ("dangling", True, False)]
+        cases += [("link_not_folder", True, False), ("not_folder", True, False)]
+        cases += [(reason, False, True) for reason in ("outside", "dangling", "loop", "unreadable")]
+        for number, (reason, refused, all_refused) in enumerate(cases, 1):
+            entries.append({"folder": True, "ym": f"2026-{number:02}", "trip_key": f"2026-{number:02}/",
+                            "id": "", "folder_reason": reason, "problem": self.viewer.FOLDER_PROBLEMS[reason],
+                            "counted_as": "2026-12", "saved_months": [] if reason == "duplicate" else ["2026-01", "2026-12"],
+                            "uploads_refused": refused, "all_uploads_refused": all_refused, "has_gpx": False})
+            text = descriptions[reason]
+            if refused:
+                if reason == "not_folder":
+                    text += " The tracker cannot upload new trips for this month until this name is a folder; the tracker keeps them queued."
+                else:
+                    repair = "removed" if reason in ("duplicate", "link_not_folder") else "replaced by a real folder"
+                    text += f" The tracker cannot upload new trips for this month until the link is {repair}; the tracker keeps them queued."
+            if all_refused:
+                text += " All of the tracker's trip uploads are refused until the month folder problems below are fixed; the tracker keeps them queued."
+            if reason in ("outside", "dangling", "loop", "unreadable"):
+                text += " None of its trips are shown or counted."
+            text += " " + hints.get(reason, "Replace the link with the real folder, or mount the other disk at that path.")
+            expected.append(text)
+        nouns = (("annotations", "annotation"), ("removals", "removal"), ("merges", "merge"),
+                 ("merge parts", "merge part"), ("old merge addresses", "old merge address"),
+                 ("history entries", "history entry"), ("closed-year trip entries", "closed-year trip entry"))
+        for count in (0, 1, 2):
+            entries.append({**entries[6], "saved_counts": {"2026-12": dict.fromkeys(dict(nouns), count)}})
+            amounts = ", ".join(f"{count} {singular if count == 1 else plural}" for plural, singular in nouns)
+            expected.append(f"2026-12/ (in use): {amounts}.")
+        self.signed_in("admin")
+        with patch.object(self.viewer, "_load_trips", return_value=([], entries)):
+            for path, texts in self.folder_surface_messages(self.client).items():
+                for message in expected:
+                    with self.subTest(surface=path, message=message):
+                        self.assertTrue(any(message in text for text in texts))
+                for text in texts:
+                    self.assertNotIn(". trips are shown", text)
+                    self.assertNotIn("queued Replace", text)
+                    self.assertNotIn("there Remove", text)
+        self.signed_in("editor")
+        with patch.object(self.viewer, "_load_trips", return_value=([], entries)):
+            for path, texts in self.folder_surface_messages(self.client, include_review=False).items():
+                for entry in entries:
+                    message = self.viewer.folder_message(entry, "editor")
+                    self.assertIn("Please ask the admin", message)
+                    if entry['folder_reason'] == 'unused_merge':
+                        self.assertIn('restore the original month name, as a link or by renaming the folder back', message)
+                        self.assertIn('or use Undo saved merge. The trips stay counted under 2026-12/ with only the annotations saved under that name.', message)
+                    self.assertTrue(any(message in text for text in texts), path)
+
+    def test_damaged_merge_has_same_recovery_message_on_every_surface_for_both_roles(self):
+        entry = {'trip_key': '2026-01/merge-example', 'ym': '2026-01', 'id': 'merge-example',
+                 'parts': ['2026-01/a', '2026-01/b'], 'gpx_file': '2026-01/a.gpx; 2026-01/b.gpx',
+                 'has_gpx': False, 'damaged_merge': True, 'category': 'business',
+                 'purpose_note': 'example note', 'destination': '',
+                 'saved_summary': {'start_time': '2026-01-02T12:00:00Z', 'distance_miles': .732},
+                 'problem': self.viewer.trip_merges.DAMAGED_MERGE_PROBLEM}
+        for role in ('admin', 'editor'):
+            self.signed_in(role)
+            message = self.viewer.folder_message(entry, role)
+            self.assertIn('Saved merge: 0.732 mi; purpose: business.', message)
+            effect = ('Parts whose trip summaries can still be read return as separate trips with the annotations saved under their names. '
+                      'Parts without readable summaries do not return. '
+                      "The merged trip's saved miles and purpose leave the totals and are kept in history and the year review.")
+            self.assertEqual(message, 'A merge part is missing or unreadable. Saved merge: 0.732 mi; purpose: business. '
+                             'Its saved miles are not in the totals. Restore missing or unreadable files from backups. '
+                             + ('Or use Discard damaged merge. ' if role == 'admin' else
+                                'Please ask the admin to restore the files or discard this damaged merge. ') + effect)
+            with patch.object(self.viewer, '_load_trips', return_value=([], [entry])):
+                for path, texts in self.folder_surface_messages(self.client, include_review=role == 'admin').items():
+                    self.assertTrue(any(message in text for text in texts), (role, path))
+
+    def test_month_upload_notices_match_ingest_shared_link_layouts_on_every_surface(self):
+        summary = (self.viewer.DATA_ROOT / "2026-01/drive.json").read_bytes()
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("DELETE FROM annotations")
+        self.signed_in("admin")
+        for label, layout in MONTH_LINK_LAYOUTS.items():
+            root = self.viewer.DATA_ROOT / label
+            make_layout(root, layout, self.symlink)
+            (root / layout["counted"] / "drive.json").write_bytes(summary)
+            with patch.object(self.viewer, "DATA_ROOT", root):
+                trips, entries = self.viewer.load_trips()
+                self.assertEqual([t["trip_key"] for t in trips], [layout["counted"] + "/drive"])
+                self.assertEqual(self.viewer.year_figures(trips, entries)["unreadable"], 0)
+                self.assertEqual([e["ym"] for e in entries if e["folder_reason"] == "duplicate"], layout["duplicates"])
+                for entry in entries:
+                    expected = layout["uploads"][entry["ym"]] == 503
+                    self.assertEqual(entry["uploads_refused"], expected)
+                    message = self.viewer.folder_message(entry, "admin")
+                    if expected:
+                        repair = "removed" if entry["folder_reason"] == "duplicate" else "replaced by a real folder"
+                        self.assertIn(f"The tracker cannot upload new trips for this month until the link is {repair}; "
+                                      "the tracker keeps them queued.", message)
+                    else:
+                        self.assertNotIn("cannot upload", message)
+                    for path, texts in self.folder_surface_messages(self.client).items():
+                        with self.subTest(layout=label, month=entry["ym"], surface=path):
+                            self.assertTrue(any(message in text for text in texts))
+
+    def test_global_upload_warning_matches_ingest_layouts_on_every_surface_and_year(self):
+        summary = (self.viewer.DATA_ROOT / "2026-01/drive.json").read_bytes()
+        self.signed_in("admin")
+        expected = ("All of the tracker's trip uploads are refused until the month folder problems below are fixed; "
+                    "the tracker keeps them queued.")
+        for label, layout in GLOBAL_UPLOAD_LAYOUTS.items():
+            root = self.viewer.DATA_ROOT / label
+            make_layout(root, layout, self.symlink)
+            (root / "2026-01").mkdir()
+            (root / "2026-01/drive.json").write_bytes(summary)
+            with patch.object(self.viewer, "DATA_ROOT", root):
+                trips, entries = self.viewer.load_trips()
+                self.assertEqual([t["trip_key"] for t in trips], ["2026-01/drive"])
+                blocked = [e for e in entries if e["all_uploads_refused"]]
+                self.assertEqual(bool(blocked), layout["blocked"], label)
+                for path, texts in self.folder_surface_messages(self.client, year=2027).items():
+                    with self.subTest(layout=label, surface=path):
+                        self.assertEqual(any(expected in text for text in texts), layout["blocked"])
+                        for entry in blocked:
+                            self.assertTrue(any(self.viewer.folder_message(entry, "admin") in text for text in texts))
+                for path in ("/", "/?year=2020", "/admin/year/2020"):
+                    text = html.unescape(self.client.get(path).get_data(as_text=True))
+                    self.assertEqual(expected in text, layout["blocked"], (label, path))
+                    if layout["blocked"]:
+                        self.assertIn('role="alert"><b>Uploads are blocked.</b>', text)
+                        self.assertIn("2027-02/", text)
+                # Unrelated years do not gain missing mileage in their snapshot.
+                self.assertEqual(self.viewer.year_figures(*self.viewer.year_members(trips, entries, 2020))["unreadable"], 0)
+
+    def test_month_problems_match_ingest_layouts_and_every_surface(self):
+        self.signed_in("admin")
+        for label, layout in MONTH_PROBLEM_LAYOUTS.items():
+            root = self.viewer.DATA_ROOT / label
+            make_layout(root, layout, self.symlink)
+            with patch.object(self.viewer, "DATA_ROOT", root):
+                trips, entries = self.viewer.load_trips()
+                self.assertEqual(trips, [])
+                self.assertEqual(len(entries), 1)
+                entry = entries[0]
+                self.assertEqual(entry["folder_reason"], layout["reason"])
+                if layout['reason'] in ('not_folder', 'link_not_folder'):
+                    self.assertFalse(self.viewer.missing_mileage(entry))
+                    self.assertEqual(self.viewer.year_figures(*self.viewer.year_members(trips, entries, 2026))['unreadable'], 0)
+                    self.assertNotIn('None of its trips are shown or counted.', self.viewer.folder_message(entry, 'admin'))
+                    rows = list(csv.DictReader(io.StringIO(self.client.get('/export.csv').get_data(as_text=True))))
+                    self.assertEqual(rows[0]['row_type'], 'folder_notice')
+                    book = load_workbook(io.BytesIO(self.client.get('/export.xlsx').data))
+                    try:
+                        self.assertIn('notice:', str(list(book['Unreadable trips'].values)))
+                    finally:
+                        book.close()
+                self.assertFalse(entry["all_uploads_refused"])
+                self.assertEqual(entry["uploads_refused"], layout["uploads"]["2026-02"] == 503)
+                for role in ("admin", "editor"):
+                    message = self.viewer.folder_message(entry, role)
+                    self.assertEqual("cannot upload new trips for this month" in message,
+                                     layout["uploads"]["2026-02"] == 503)
+                    if role == "admin":
+                        for path, texts in self.folder_surface_messages(self.client).items():
+                            self.assertTrue(any(message in text for text in texts), (label, path))
+                self.assertNotIn("Uploads are blocked.", self.client.get("/?year=2020").get_data(as_text=True))
+
+    def test_month_resolution_permission_error_is_a_global_503(self):
+        month = self.viewer.DATA_ROOT / "2026-03"
+        month.mkdir()
+        original = Path.resolve
+
+        def denied(path, *args, **kwargs):
+            if path == month:
+                raise PermissionError("synthetic resolution denial")
+            return original(path, *args, **kwargs)
+
+        with patch.object(Path, "resolve", denied):
+            entries = self.viewer.load_trips()[1]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["folder_reason"], "unreadable")
+        self.assertTrue(entries[0]["all_uploads_refused"])
+
+    @unittest.skipIf(os.name == "nt" or getattr(os, "geteuid", lambda: 0)() == 0, "requires non-root POSIX permissions")
+    def test_permission_layouts_show_folder_warning_and_global_alert(self):
+        for label, layout in PERMISSION_MONTH_LAYOUTS.items():
+            root = self.viewer.DATA_ROOT / label
+            with restricted_layout(root, layout, self.symlink), patch.object(self.viewer, "DATA_ROOT", root):
+                with patch.object(self.viewer.os, "access", wraps=self.viewer.os.access) as access:
+                    trips, entries = self.viewer.load_trips()
+                self.assertLessEqual(access.call_count, 1, label)
+                self.assertEqual(trips, [])
+                self.assertEqual([(e["ym"], e["folder_reason"], e["all_uploads_refused"]) for e in entries],
+                                 [("2026-02", "unreadable", True)], label)
+                for role in ("admin", "editor"):
+                    self.signed_in(role)
+                    text = html.unescape(self.client.get("/?year=2020").get_data(as_text=True))
+                    self.assertIn("Uploads are blocked.", text)
+                    self.assertIn("2026-02/", text)
+                self.signed_in("admin")
+                message = self.viewer.folder_message(entries[0], "admin")
+                for path, texts in self.folder_surface_messages(self.client).items():
+                    self.assertTrue(any(message in text for text in texts), (label, path))
+            with patch.object(self.viewer, "DATA_ROOT", root):
+                self.assertEqual(self.viewer.load_trips(), ([], []))
+                self.assertNotIn("Uploads are blocked.", self.client.get("/").get_data(as_text=True))
+
+    def test_upload_alert_gives_role_specific_advice(self):
+        entry = {"folder": True, "ym": "2027-02", "trip_key": "2027-02/", "id": "",
+                 "folder_reason": "outside", "problem": self.viewer.FOLDER_PROBLEMS["outside"],
+                 "all_uploads_refused": True}
+        for role in ("admin", "editor"):
+            self.signed_in(role)
+            with patch.object(self.viewer, "_load_trips", return_value=([], [entry])):
+                page = html.unescape(self.client.get("/?year=2020").get_data(as_text=True))
+            alert = page.split('<b>Uploads are blocked.</b>', 1)[1].split('</div>', 1)[0]
+            expected = ("Review the folder warnings in All years and follow their repair steps." if role == "admin"
+                        else "Please tell the admin about these folders.")
+            self.assertIn(expected, alert)
+
+    def test_loop_blocks_all_uploads_when_resolve_leaves_it_unresolved(self):
+        month = self.viewer.DATA_ROOT / "2026-03"
+        self.symlink(month, month, directory=True)
+        original = Path.resolve
+
+        def unresolved(path, *args, **kwargs):
+            return path if path == month else original(path, *args, **kwargs)
+
+        with patch.object(Path, "resolve", unresolved):
+            entry = self.viewer.load_trips()[1][0]
+        self.assertEqual(entry["folder_reason"], "loop")
+        self.assertTrue(entry["all_uploads_refused"])
+
+    def test_top_upload_warning_uses_only_one_trip_scan(self):
+        self.signed_in("admin")
+        with patch.object(self.viewer, "load_trips", wraps=self.viewer.load_trips) as load, \
+                patch.object(self.viewer, "_month_blocks_all_uploads", side_effect=AssertionError("extra link check")):
+            self.assertEqual(self.client.get("/?year=2026").status_code, 200)
+            self.assertEqual(load.call_count, 1)
+
+    def test_healthy_month_checks_access_once_without_extra_upload_block_probe(self):
+        original = self.viewer.os.access
+        with patch.object(self.viewer.os, "access", wraps=original) as access, \
+                patch.object(self.viewer, "_month_blocks_all_uploads", side_effect=AssertionError("extra block probe")):
+            self.viewer.load_trips()
+        self.assertEqual(access.call_count, 1)
+        self.assertEqual(access.call_args.args, (self.viewer.DATA_ROOT / "2026-01", os.R_OK | os.X_OK))
+
+    @unittest.skipIf(os.name == 'nt' or getattr(os, 'geteuid', lambda: 0)() == 0, 'requires non-root POSIX permissions')
+    def test_unwritable_month_notice_matches_ingest_layout_and_every_surface(self):
+        summary = (self.viewer.DATA_ROOT / '2026-01/drive.json').read_bytes()
+        for label, layout in WRITABLE_MONTH_LAYOUTS.items():
+            root = self.viewer.DATA_ROOT / label
+            make_layout(root, layout, self.symlink)
+            (root / '2026-02/drive.json').write_bytes(summary)
+            with restricted_layout(root, layout, self.symlink), patch.object(self.viewer, 'DATA_ROOT', root):
+                trips, entries = self.viewer.load_trips()
+                self.assertEqual([t['trip_key'] for t in trips], ['2026-02/drive'])
+                self.assertEqual([e['folder_reason'] for e in entries], ['unwritable'])
+                self.assertFalse(entries[0]['all_uploads_refused'])
+                self.assertTrue(entries[0]['uploads_refused'])
+                self.assertEqual(self.viewer.year_figures(trips, entries)['unreadable'], 0)
+                for role in ('admin', 'editor'):
+                    self.signed_in(role)
+                    message = self.viewer.folder_message(entries[0], role)
+                    for path, texts in self.folder_surface_messages(self.client, include_review=role == 'admin').items():
+                        self.assertTrue(any(message in text for text in texts), (role, path))
+                    self.assertNotIn('Uploads are blocked.', self.client.get('/').get_data(as_text=True))
+                self.signed_in('admin')
+                rows = list(csv.DictReader(io.StringIO(self.client.get('/export.csv').get_data(as_text=True))))
+                self.assertEqual(next(row for row in rows if row['trip_id'] == '2026-02/')['row_type'], 'folder_notice')
+            with patch.object(self.viewer, 'DATA_ROOT', root):
+                self.assertEqual(self.viewer.load_trips()[1], [])
+
+    def test_month_write_modes_select_owner_group_or_other_without_filesystem_calls(self):
+        cases = ((1000, 1000, 0o700, True), (1000, 1000, 0o500, False), (1000, 1000, 0o577, False),
+                 (0, 0, 0o700, False), (0, 0, 0o755, False), (0, 1000, 0o770, True),
+                 (0, 2000, 0o770, True), (0, 1000, 0o757, False), (0, 3000, 0o777, True),
+                 (0, 3000, 0o775, False))
+        with patch.object(self.viewer, '_MONTH_SERVICE_UID', 1000), \
+                patch.object(self.viewer, '_MONTH_SERVICE_GROUPS', {1000, 2000}), \
+                patch.object(Path, 'stat', side_effect=AssertionError('extra metadata call')):
+            for uid, gid, mode, writable in cases:
+                metadata = SimpleNamespace(st_uid=uid, st_gid=gid, st_mode=stat.S_IFDIR | mode)
+                self.assertEqual(self.viewer._month_mode_writable(metadata), writable, (uid, gid, mode))
+
+    def test_read_only_viewer_mount_with_healthy_owner_and_mode_has_no_write_notice(self):
+        month = self.viewer.DATA_ROOT / '2026-01'
+        original_stat, original_access = Path.stat, self.viewer.os.access
+        def metadata(path, *args, **kwargs):
+            result = original_stat(path, *args, **kwargs)
+            if path == month:
+                fields = list(result)
+                fields[0:3] = [stat.S_IFDIR | 0o700, result.st_ino, result.st_dev]
+                fields[4:6] = [1000, 1000]
+                return os.stat_result(fields)
+            return result
+        def read_only_access(path, mode, *args, **kwargs):
+            if mode & os.W_OK:
+                return False  # Model the mount separately from its healthy owner/mode.
+            return original_access(path, mode, *args, **kwargs)
+        with patch.object(self.viewer, '_MONTH_SERVICE_UID', 1000), \
+                patch.object(self.viewer, '_MONTH_SERVICE_GROUPS', {1000}), \
+                patch.object(Path, 'stat', metadata), patch.object(self.viewer.os, 'access', side_effect=read_only_access) as access:
+            trips, entries = self.viewer.load_trips()
+        self.assertEqual(len(trips), 1)
+        self.assertEqual(entries, [])
+        self.assertFalse(any(call.args[1] & os.W_OK for call in access.call_args_list))
+
+    def test_earlier_link_keeps_saved_annotations_and_removal(self):
+        target = self.linked_archive()
+        self.signed_in("admin")
+        self.assertEqual(self.client.post("/trip/2026-02/drive/annotate", data={
+            "csrf_token": "known-token", "category": "business", "purpose_note": "kept note",
+        }).status_code, 302)
+        self.symlink(self.viewer.DATA_ROOT / "2026-01", target, directory=True)
+        trips, _ = self.viewer.load_trips()
+        self.assertEqual([(t["trip_key"], t["category"], t["purpose_note"]) for t in trips],
+                         [("2026-02/drive", "business", "kept note")])
+        self.assertEqual(self.client.post("/trip/2026-02/drive/remove", data={
+            "csrf_token": "known-token", "reason": "example removal",
+        }).status_code, 302)
+        self.assertEqual(self.viewer.load_trips()[0], [])
+        self.assertEqual(self.viewer.load_trips(include_removed=True)[0][0]["trip_key"], "2026-02/drive")
+
+    def test_link_choice_checks_each_persisted_trip_key_and_closed_snapshot(self):
+        target = self.linked_archive()
+        self.symlink(self.viewer.DATA_ROOT / "2026-01", target, directory=True)
+        statements = [
+            "INSERT INTO annotations (trip_key) VALUES ('2026-02/drive')",
+            "INSERT INTO trip_removals VALUES ('2026-02/drive', 'example', 'admin', '')",
+            "INSERT INTO trip_history (trip_key,actor,actor_role,at,action,details) VALUES ('2026-02/drive','admin','admin','','annotate','{}')",
+            "INSERT INTO trip_merges (trip_key,summary,fingerprint) VALUES ('2026-02/merge-example','{}','[]')",
+            "INSERT INTO trip_merge_parts VALUES ('2026-02/drive','2026-03/merge-example',0)",
+            "INSERT INTO trip_merge_parts VALUES ('2026-03/drive','2026-02/merge-example',0)",
+            "INSERT INTO trip_merge_aliases VALUES ('2026-02/merge-old','2026-03/merge-example')",
+            "INSERT INTO tax_years VALUES (2026,'admin','', '{\"trip_keys\":[\"2026-02/drive\"]}')",
+        ]
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            for statement in statements:
+                for table in ("annotations", "trip_removals", "trip_history", "trip_merges",
+                              "trip_merge_parts", "trip_merge_aliases", "tax_years"):
+                    conn.execute(f"DELETE FROM {table}")
+                conn.execute(statement)
+                with self.subTest(statement=statement):
+                    counted, problems = self.viewer._month_choices(conn, self.viewer.DATA_ROOT.resolve())
+                    self.assertEqual(counted["2026-01"], "2026-02")
+                    self.assertFalse(any(p[1] == "saved_keys" for p in problems))
+
+    def test_link_only_conflicts_use_one_query_and_no_rows_use_sorted_order(self):
+        target = self.linked_archive()
+        self.symlink(self.viewer.DATA_ROOT / "2026-01", target, directory=True)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("DELETE FROM annotations")
+            queries = []
+            conn.set_trace_callback(queries.append)
+            counted, _ = self.viewer._month_choices(conn, self.viewer.DATA_ROOT.resolve())
+            self.assertEqual(counted["2026-02"], "2026-01")
+            self.assertEqual(len(queries), 1)
+            self.assertIn("WITH candidates", queries[0])
+        # An ordinary folder plus an alias needs no saved-key query.
+        (self.viewer.DATA_ROOT / "2026-02").unlink()
+        (self.viewer.DATA_ROOT / "2026-01").unlink()
+        target.rename(self.viewer.DATA_ROOT / "2026-02")
+        self.symlink(self.viewer.DATA_ROOT / "2026-01", self.viewer.DATA_ROOT / "2026-02", directory=True)
+        with patch.object(self.viewer, "_saved_month_names", side_effect=AssertionError("extra DB query")):
+            self.assertEqual(self.viewer.load_trips()[0][0]["trip_key"], "2026-02/drive")
+
+    def test_conflicting_saved_names_warn_and_refuse_year_close(self):
+        target = self.linked_archive()
+        self.symlink(self.viewer.DATA_ROOT / "2026-01", target, directory=True)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO annotations (trip_key,category) VALUES ('2026-01/drive','personal')")
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual(trips[0]["trip_key"], "2026-01/drive")
+        warning = next(t for t in entries if t["folder_reason"] == "saved_keys")
+        self.assertEqual(warning["saved_months"], ["2026-01", "2026-02"])
+        duplicate = next(t for t in entries if t["folder_reason"] == "duplicate")
+        message = self.viewer.folder_message(duplicate, "admin")
+        self.assertIn("Follow the saved-name conflict steps before removing any link", message)
+        self.assertNotIn("Remove the extra link.", message)
+        self.signed_in("admin")
+        for path, texts in self.folder_surface_messages(self.client).items():
+            self.assertTrue(any(message in text for text in texts), path)
+        self.assertEqual(self.viewer.year_figures(trips, entries)["unreadable"], 0)
+        self.signed_in("admin")
+        for path in ("/", "/admin/year/2026", "/export.csv"):
+            page = self.client.get(path).get_data(as_text=True)
+            self.assertIn("Warning: saved trip data exists under 2026-01/, 2026-02/", page)
+            self.assertNotIn("totals below may be short", page)
+        response = self.client.post("/admin/year/2026/close", data={"csrf_token": "known-token", "confirm": "yes"})
+        self.assertEqual(response.status_code, 409)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM tax_years").fetchone()[0], 0)
+
+    def test_saved_conflict_warns_before_close_even_for_unrelated_and_closed_years(self):
+        target = self.linked_archive()
+        self.symlink(self.viewer.DATA_ROOT / "2026-01", target, directory=True)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO annotations (trip_key) VALUES ('2026-01/drive')")
+            conn.execute("INSERT INTO tax_years VALUES (2020, 'admin', '', '{}')")
+        self.signed_in("admin")
+        for path, texts in self.folder_surface_messages(self.client).items():
+            for name, status in (("2026-01", "in use"), ("2026-02", "not applied")):
+                self.assertTrue(any(f"{name}/ ({status}): 1 annotation, 0 removals, 0 merges, "
+                                    "0 merge parts, 0 old merge addresses, 0 history entries, "
+                                    "0 closed-year trip entries." in text for text in texts), path)
+        for year in (2020, 2026, 2030):
+            text = html.unescape(self.client.get(f"/admin/year/{year}").get_data(as_text=True))
+            self.assertIn("Years cannot be closed until this conflict is resolved.", text)
+            self.assertIn("2026-01/ (in use): 1 annotation, 0 removals, 0 merges", text)
+            self.assertIn("2026-02/ (not applied): 1 annotation, 0 removals, 0 merges", text)
+            self.assertIn("Nothing is deleted from the database.", text)
+            if year != 2020:
+                self.assertIn(f'<button class="btn" disabled>Close {year}</button>', text)
+                self.assertNotIn(f'action="/admin/year/{year}/close"', text)
+                self.assertEqual(self.client.post(f"/admin/year/{year}/close", data={
+                    "csrf_token": "known-token", "confirm": "yes"}).status_code, 409)
+            else:
+                self.assertIn('action="/admin/year/2020/reopen"', text)
+
+    def test_saved_conflict_counts_all_sources_and_only_exact_month_prefixes(self):
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO annotations (trip_key) VALUES ('2026-010/not-a-month')")
+            conn.execute("INSERT INTO trip_removals VALUES ('2026-02/gone', 'example', 'admin', '')")
+            conn.execute("INSERT INTO trip_merges (trip_key,summary,fingerprint) VALUES ('2026-02/merge-example','{}','[]')")
+            conn.execute("INSERT INTO trip_merge_parts VALUES ('2026-01/drive','2026-02/merge-example',0)")
+            conn.execute("INSERT INTO trip_merge_aliases VALUES ('2026-01/merge-old','2026-02/merge-example')")
+            conn.execute("INSERT INTO trip_history (trip_key,actor,actor_role,at,action,details) VALUES ('2026-02/gone','admin','admin','','remove','{}')")
+            conn.execute("INSERT INTO tax_years VALUES (2020,'admin','', ?)",
+                         (json.dumps({"trip_keys": ["2026-01/drive", "2026-02/gone", "2026-02/other"]}),))
+            conn.execute("INSERT INTO tax_years VALUES (2021,'admin','', 'broken')")
+            counts = self.viewer._saved_month_counts(conn, ["2026-01", "2026-02"])
+        self.assertEqual(counts, {
+            "2026-01": {"annotations": 1, "removals": 0, "merges": 0, "merge parts": 1,
+                        "old merge addresses": 1, "history entries": 0, "closed-year trip entries": 1},
+            "2026-02": {"annotations": 0, "removals": 1, "merges": 1, "merge parts": 1,
+                        "old merge addresses": 0, "history entries": 1, "closed-year trip entries": 2},
+        })
+
+    def test_removing_either_saved_link_and_recreating_it_preserves_database(self):
+        target = self.linked_archive()
+        first = self.viewer.DATA_ROOT / "2026-01"
+        second = self.viewer.DATA_ROOT / "2026-02"
+        self.symlink(first, target, directory=True)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO annotations (trip_key,category,purpose_note) VALUES ('2026-01/drive','personal','first name')")
+            before = list(conn.iterdump())
+        for removed, remaining in ((second, first), (first, second)):
+            removed.unlink()
+            trips, entries = self.viewer.load_trips()
+            self.assertEqual(trips[0]["trip_key"], remaining.name + "/drive")
+            self.assertEqual(trips[0]["purpose_note"], "first name" if remaining == first else "example")
+            self.assertFalse(any(e["folder_reason"] == "saved_keys" for e in entries))
+            self.symlink(removed, target, directory=True)
+            trips, entries = self.viewer.load_trips()
+            self.assertEqual(trips[0]["trip_key"], "2026-01/drive")
+            self.assertTrue(any(e["folder_reason"] == "saved_keys" for e in entries))
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(list(conn.iterdump()), before)
+
+    def test_no_link_install_does_no_saved_name_queries(self):
+        with patch.object(self.viewer, "_saved_month_names", side_effect=AssertionError("extra saved-name query")), \
+                patch.object(self.viewer, "_saved_month_counts", side_effect=AssertionError("extra inventory query")):
+            self.assertEqual(self.viewer.load_trips()[0][0]["trip_key"], "2026-01/drive")
+
+    def test_closed_year_snapshot_keeps_link_key_and_lock_without_annotation(self):
+        target = self.linked_archive()
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("DELETE FROM annotations")
+        self.signed_in("admin")
+        self.assertEqual(self.client.post("/admin/year/2026/close", data={
+            "csrf_token": "known-token", "confirm": "yes"}).status_code, 302)
+        self.symlink(self.viewer.DATA_ROOT / "2026-01", target, directory=True)
+        self.assertEqual(self.viewer.load_trips()[0][0]["trip_key"], "2026-02/drive")
+        self.assertEqual(self.client.post("/trip/2026-02/drive/annotate", data={
+            "csrf_token": "known-token", "category": "business"}).status_code, 409)
+
+    def test_earlier_link_keeps_live_merge_parts(self):
+        target = self.linked_archive()
+        (target / "drive.gpx").write_bytes((roles.SERVER / "sample.gpx").read_bytes())
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("DELETE FROM annotations")
+            conn.execute("INSERT INTO trip_merges (trip_key,summary,fingerprint) VALUES ('2026-02/merge-example','{}','[]')")
+            conn.execute("INSERT INTO trip_merge_parts VALUES ('2026-02/drive','2026-02/merge-example',0)")
+        self.symlink(self.viewer.DATA_ROOT / "2026-01", target, directory=True)
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual([t["trip_key"] for t in trips], ["2026-02/merge-example"])
+        self.assertFalse(any(t.get("parts") for t in entries))
+
+    def assert_alias_routes(self, alias, counted):
+        self.signed_in("admin")
+        rules = [rule for rule in self.viewer.app.url_map.iter_rules()
+                 if {"ym", "trip_id"} <= rule.arguments]
+        self.assertEqual(len(rules), 8)  # Two reads and six state-changing routes.
+        with closing(sqlite3.connect(self.db)) as conn:
+            before = list(conn.iterdump())
+        for rule in rules:
+            path = rule.rule.replace("<ym>", alias).replace("<trip_id>", "drive")
+            with self.subTest(endpoint=rule.endpoint):
+                with patch.object(self.viewer.GEOCODER, "lookup", side_effect=AssertionError("lookup")):
+                    if "GET" in rule.methods:
+                        for method in ("GET", "HEAD"):
+                            response = self.client.open(path + "?year=2026", method=method)
+                            self.assertEqual(response.status_code, 302)
+                            self.assertEqual(response.headers["Location"], path.replace(alias, counted) + "?year=2026")
+                            response.close()
+                    else:
+                        response = self.client.post(path, data={
+                            "csrf_token": "known-token", "category": "business", "purpose_note": "changed",
+                            "reason": "example", "confirm": "yes", "endpoint": "start",
+                            "next_trip": counted + "/drive",
+                        })
+                        self.assertEqual(response.status_code, 409)
+                        message = "This month address is an extra link. Reopen the trip from the trip list before making changes."
+                        if rule.endpoint == "lookup_place":
+                            self.assertEqual(response.mimetype, "application/json")
+                            self.assertEqual(response.get_json(), {"error": message})
+                        else:
+                            self.assertEqual(response.mimetype, "text/html")
+                            self.assertIn(message, response.get_data(as_text=True))
+                        response.close()
+                with closing(sqlite3.connect(self.db)) as conn:
+                    self.assertEqual(list(conn.iterdump()), before)
+
+    def test_all_alias_month_routes_redirect_reads_and_refuse_writes(self):
+        self.symlink(self.viewer.DATA_ROOT / "2026-12", self.viewer.DATA_ROOT / "2026-01", directory=True)
+        self.assert_alias_routes("2026-12", "2026-01")
+        self.assertEqual(self.client.get("/trip/2026-12/drive", follow_redirects=True).status_code, 200)
+        self.assertEqual(self.client.get("/gpx/2026-12/drive", follow_redirects=True).status_code, 200)
+
+    def test_link_only_alias_routes_use_saved_name(self):
+        target = self.linked_archive()
+        self.symlink(self.viewer.DATA_ROOT / "2026-01", target, directory=True)
+        self.assert_alias_routes("2026-01", "2026-02")
+
+    def test_alias_read_redirect_preserves_query_bytes_and_existing_escapes(self):
+        self.symlink(self.viewer.DATA_ROOT / "2026-12", self.viewer.DATA_ROOT / "2026-01", directory=True)
+        self.signed_in("admin")
+        cases = [(b"x=\xe9", "x=%E9"), (b"x=\xc3\xa9", "x=%C3%A9"),
+                 (b"x=%c3%a9&year=2026&x=one+two&flag&value=a/b?c=d%26e",
+                  "x=%c3%a9&year=2026&x=one+two&flag&value=a/b?c=d%26e"),
+                 (b"x=\r\n", "x=%0D%0A")]
+        for route in ("trip", "gpx"):
+            for method in ("GET", "HEAD"):
+                for raw, expected in cases:
+                    with self.subTest(route=route, method=method, raw=raw):
+                        response = self.client.open(f"/{route}/2026-12/drive", method=method,
+                                                    environ_overrides={"QUERY_STRING": raw.decode("latin-1")})
+                        self.assertEqual(response.status_code, 302)
+                        self.assertEqual(response.headers["Location"], f"/{route}/2026-01/drive?{expected}")
+                        response.close()
+
+    def test_ordinary_trip_route_needs_no_month_resolution_scan(self):
+        self.signed_in("admin")
+        with patch.object(self.viewer, "_month_choices", side_effect=AssertionError("extra month scan")):
+            self.assertEqual(self.client.get("/gpx/2026-01/drive").status_code, 200)
+
+    def test_folder_export_labels_separate_unreadable_notices_and_saved_conflicts(self):
+        import csv
+        target = self.linked_archive("2026-01")
+        self.symlink(self.viewer.DATA_ROOT / "2026-02", target, directory=True)
+        self.symlink(self.viewer.DATA_ROOT / "2026-03", self.viewer.DATA_ROOT / "missing", directory=True)
+        self.signed_in("admin")
+
+        def exported():
+            response = self.client.get("/export.xlsx")
+            book = load_workbook(io.BytesIO(response.data))
+            try:
+                rows = list(book["Unreadable trips"].values)
+                labels = [row[rows[0].index("trip_id")] for row in rows[1:]]
+            finally:
+                book.close()
+                response.close()
+            csv_rows = list(csv.DictReader(io.StringIO(self.client.get("/export.csv").get_data(as_text=True))))
+            return labels, {r["trip_id"]: r["row_type"] for r in csv_rows if r["trip_id"].endswith("/")}
+
+        labels, types = exported()
+        self.assertEqual(labels, ["2026-01/ (link blocks new uploads; existing trips counted)",
+                                  "2026-02/ (extra link, trips counted elsewhere)",
+                                  "2026-03/ (whole month folder)"])
+        self.assertEqual(types, {"2026-01/": "folder_notice", "2026-02/": "folder_notice",
+                                 "2026-03/": "unreadable_folder"})
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO annotations (trip_key) VALUES ('2026-02/drive')")
+        labels, types = exported()
+        self.assertEqual(labels[0], "2026-01/ (conflicting saved data; trips counted)")
+        self.assertEqual(types["2026-01/"], "folder_warning")
+
+    def warning_page(self, *, folder=False, file=False):
+        root = self.viewer.DATA_ROOT
+        if file:
+            (root / "2026-01/drive.json").write_text("{broken", encoding="utf-8")
+        if folder:
+            (root / "2026-02").mkdir()
+        original = self.viewer._month_trip_names
+
+        def listing(path):
+            if path.name == "2026-02":
+                raise PermissionError("synthetic folder denial")
+            return original(path)
+
+        self.signed_in("admin")
+        with patch.object(self.viewer, "_month_trip_names", side_effect=listing):
+            return self.client.get("/").get_data(as_text=True)
+
+    def test_folder_only_warning_omits_zero_files_and_summary_rebuild_advice(self):
+        text = self.warning_page(folder=True)
+        self.assertIn("1 month folder(s) can't be read", text)
+        self.assertNotIn("trip file(s) can't be read", text)
+        self.assertNotIn("To rebuild a damaged summary", text)
+        self.assertIn("owner and permissions", text)
+
+    def test_file_only_warning_omits_zero_folders_and_keeps_rebuild_advice(self):
+        text = self.warning_page(file=True)
+        self.assertIn("1 trip file(s) can't be read", text)
+        self.assertNotIn("month folder(s) can't be read", text)
+        self.assertIn("To rebuild a damaged summary", text)
+
+    def test_mixed_warning_shows_both_counts_and_summary_rebuild_advice(self):
+        text = self.warning_page(folder=True, file=True)
+        self.assertIn("1 trip file(s) can't be read", text)
+        self.assertIn("1 month folder(s) can't be read", text)
+        self.assertIn("To rebuild a damaged summary", text)
+
+    def test_year_heading_omits_folder_notices_without_folder_entries(self):
+        self.signed_in("admin")
+        page = self.client.get("/admin/year/2026").get_data(as_text=True)
+        self.assertIn('id="unreadable-heading">Trips whose files can\'t be read (0)</h2>', page)
+        self.assertNotIn("and folder notices", page)
+        (self.viewer.DATA_ROOT / "2026-01/drive.json").write_text("{broken", encoding="utf-8")
+        page = self.client.get("/admin/year/2026").get_data(as_text=True)
+        self.assertIn('id="unreadable-heading">Trips whose files can\'t be read (1)</h2>', page)
+        self.assertNotIn("and folder notices", page)
+
+    def test_year_heading_mentions_folders_only_for_years_with_folder_entries(self):
+        (self.viewer.DATA_ROOT / "2027-02").mkdir()
+        self.signed_in("admin")
+        original = self.viewer._month_trip_names
+
+        def listing(path):
+            if path.name == "2027-02":
+                raise PermissionError("synthetic folder denial")
+            return original(path)
+
+        with patch.object(self.viewer, "_month_trip_names", side_effect=listing):
+            self.assertIn("and folder notices</h2>", self.client.get("/admin/year/2027").get_data(as_text=True))
+            self.assertNotIn("and folder notices", self.client.get("/admin/year/2026").get_data(as_text=True))
+
+    def test_damaged_merge_with_linked_month_part_requires_admin_discard(self):
         month = self.viewer.DATA_ROOT / "2026-01"
         target = self.db.parent / "outside-month"
         month.rename(target)
@@ -489,7 +1221,10 @@ class ViewerHardeningTests(unittest.TestCase):
         self.signed_in("admin")
         page = self.client.get("/")
         self.assertEqual(page.status_code, 200)
-        self.assertIn(b"Undo merge (split back)", page.data)
+        self.assertNotIn(b'>Undo merge (split back)</button>', page.data)
+        self.assertIn(b'>Discard damaged merge</button>', page.data)
+        self.assertEqual(self.client.post('/trip/2026-02/merged/split', data={
+            'csrf_token': 'known-token', 'confirm': 'yes'}).status_code, 409)
 
     def test_dangling_month_is_reported_in_full_scan(self):
         month = self.viewer.DATA_ROOT / "2026-01"

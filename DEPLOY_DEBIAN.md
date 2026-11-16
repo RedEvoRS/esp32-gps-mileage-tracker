@@ -2776,11 +2776,155 @@ sudo find ~/mileage-tracker/data -type l -ls
 A month folder that is a link leading outside `data/`, a link whose target is
 missing, or a link that loops is shown once as a folder warning, and its trips
 aren't counted. A link that leads outside `data/` (even if its target is
-missing) or loops also makes ingest refuse GPX uploads with 503 until fixed.
-Replace it with a real folder or mount the disk there; its trips can't be
-removed one by one. A month link to a folder that another month name already
-uses is only a notice: its trips are counted once, under the other name, so
-delete the extra link. If the warning says a month folder can't be read, the
+missing), points at `data/` itself or above, or loops also makes ingest refuse
+**all trip uploads for all months** with HTTP 503, including retries. The tracker
+keeps them queued; diagnostics uploads are unaffected. A separate warning at
+the top of the trip list and on every year review names these links, including
+when an unrelated year is selected. Replace every such link with a real month
+folder containing the existing trips (recover them from actual storage or a
+backup), or mount the disk at that month path. Remove only the links, not their
+targets or trip files. Run `install.sh --check`, check the viewer totals, then
+allow the tracker to retry. These trips can't be removed one by one in the
+viewer. A missing target inside `data/` is unreadable. If its final target name
+differs from the month link name, ingest refuses new trips for that month with
+HTTP 503 and the tracker keeps them queued until the link is replaced with a
+real folder; other months still upload. A missing same-named target such as
+`2026-02` → `archive/2026-02` does not cause that refusal: ingest can create it
+on upload. Disk I/O and other server faults still return 500.
+
+One month folder the server cannot read or enter blocks **every trip upload
+for every month**, including retries, with HTTP 503 naming the folder. Both
+services run as UID 1000; the viewer's "Uploads are blocked" alert includes
+these folders. A hand copy or restore with `sudo` under a strict umask can
+leave root-owned mode-700 folders. From `~/mileage-tracker`, fix the
+real month folder named in the alert (replace this example month):
+
+```bash
+sudo chown -R 1000:1000 -- data/2026-02
+sudo find data/2026-02 -type d -exec chmod 700 {} +
+sudo find data/2026-02 -type f -exec chmod 600 {} +
+```
+
+If it is an internal link, inspect its target and parents with
+`namei -l data/2026-02` and fix the real target and any parent that UID 1000
+cannot search. Do not follow an outside link. Reload the viewer and let a
+queued upload retry after every blocking folder is usable. Diagnostics
+uploads are unaffected.
+
+A month folder that can be read and entered but not written to, such as
+mode 500 (or root-owned mode 755 without group/other write access), refuses
+only that month's new trips with a named HTTP 503 and one log line without
+a traceback. The tracker keeps those trips queued while other months upload.
+The viewer shows existing trips and a notice; nothing is counted as missing
+and merge suggestions continue. Apply the same owner-and-mode repair steps
+above to the real month folder, reload the viewer, and let a queued trip retry.
+The viewer uses existing owner/group/mode metadata, with no extra filesystem
+call per folder; it does not test write access on its normal read-only mount.
+Mode bits cannot describe ACLs or ingest's mount flags. A genuinely full disk
+or I/O error still gets 500.
+
+A month link to a folder that another month name already
+uses is normally a notice: its trips are counted once, under the other name.
+If the link's final target has a different name, ingest refuses new trips for
+the link's month with 503 and the tracker keeps them queued until the link is
+removed. This applies to `2026-12` → `2026-11`, both links in
+`2026-01` → `2026-02` → `archive`, and either month link to a non-month folder.
+A same-named final target, such as `2026-02` → `archive/2026-02`, does not refuse
+new trips for that reason. Remove only the extra link, not its target or files;
+ingest can create a real folder for the queued trips. For conflicting saved
+names, follow the steps below first. When only links reach a folder, the viewer keeps the name
+that has saved trip data. If several names have saved data, a warning names
+them. The admin warning gives each name's counts of annotations, removals,
+merges, merge parts, old merge addresses, history entries and closed-year trip
+entries, and marks the name in use. These are database counts, including entries
+whose trip files are gone, not additional miles.
+The viewer counts trips under the first saved name in sorted order, leaves the
+database rows in place, and refuses to close a year until the conflict is fixed.
+Every open year review shows the conflict beside a disabled Close button,
+including years unrelated to the linked folder.
+
+To resolve a saved-name conflict:
+
+1. Back up the trip files and `annotations.db` using the normal backup process.
+   Record each link's month name and target. Use the counts and the name marked
+   in use to choose which name's saved data to keep applying. The viewer does
+   not move or combine saved data between names.
+2. Keep that link and remove only the other links, not the target directory or
+   files. Removing a losing name leaves the current name's data applied.
+   Removing the name in use quietly orphans its saved data: the viewer chooses
+   a remaining name, whose annotations, removals and merges then apply instead.
+   The removed name's data is no longer applied; nothing is deleted from the
+   database. Check the list, Removed trips, merges and year totals afterwards.
+3. Recreate the same link name to the same target to get back. If several saved
+   names are restored, the conflict returns and the first saved name in sorted
+   order wins again. To inspect another name's saved data in the viewer,
+   temporarily leave only its link. Restore the recorded links to return to
+   the original selection. Avoid edits and year closes while comparing names;
+   existing closed-year snapshots remain in the database.
+4. Replace the final link with a real folder containing the existing trips,
+   or mount the disk at that path. Preserve the selected month name so its
+   saved-data keys still match. Check the viewer and `install.sh --check`;
+   queued tracker trips can then retry.
+
+A merge appears as saved data under an unused name only if every part is
+readable and counted under another name and both source files match their
+saved names, sizes and modification times. All parts from each old month
+must match one unambiguous counted folder. A surviving alias must reach that
+folder. If its link was removed, the file stamps are the remaining evidence;
+the database has no historical folder identity. A lost real month folder,
+partial matches, changed files or unreadable parts remain damaged merges,
+counted as missing in year review and close snapshots, with uncertain merge
+suggestions blocked and no **Undo saved merge**. Neither role can use ordinary
+**Undo merge (split back)** on damage. Only the admin can **Discard damaged
+merge**, after confirming that parts with readable summaries return separately with
+annotations saved under their names; parts without readable summaries do not.
+The merged trip's saved miles and purpose leave the totals and are kept in history. Before deletion, the same transaction saves the complete summary,
+annotation and part keys in history. **Discarded or undone saved merges** in the year
+review permanently shows saved miles, purpose, date and login, and which parts
+are now counted again, separately or in a current merge, even after closing.
+The deliberate discard confirmation and visible record allow closing without
+another acknowledgement; reopen any affected closed year before discarding.
+Healthy merge undo is unchanged for both roles.
+CSV retains discarded and undone merges as `unreadable` rows with blank miles;
+XLSX labels them on **Unreadable trips**. Their notes keep saved miles, purpose,
+trip date, action date and login, and say which parts are counted again. An unused-name notice adds
+no saved miles or merged annotation; it does not block healthy merge
+suggestions. Moving or renaming a real month folder with file times kept also
+produces an unused-name merge when every recording matches under the new name.
+To use it again, restore the original month name, as a link or by renaming the
+folder back, and keep that name in use, following the conflict steps above.
+Alternatively, the admin can select **Undo saved merge** on the trip list
+and confirm. The trips stay counted under the name in use with only annotations saved
+under that name. Annotations under the unused name stay in the database but
+are not applied. The merged trip's saved miles and purpose leave the totals;
+the undo preserves its complete summary in history before deletion, in the
+same transaction as discard, and appears in the year review with the same
+current-count statement. Source files stay intact. Reopen any affected closed year first. Everyday logins must ask
+the admin. The undo rechecks every replacement recording under its database
+write transaction; a stale form is refused if any evidence is gone or the
+merge's name is back in use.
+
+The year review lists each unused-name merge separately, with its saved miles,
+purpose and month name. These are excluded from totals; its parts count separately.
+Closing its saved-summary year and every year containing a part is refused
+until the name is restored or the admin uses **Undo saved merge**. An unknown saved year blocks every year;
+reopening stays possible. It adds no unreadable-file count.
+Saved removals under an unused name are not applied, like annotations under
+that name, so the parts of a formerly removed merge count again. Its saved
+removal still hides the unused-merge notice, so it does not block year closing. CSV shows a
+`folder_notice` row with its category and recovery advice. Saved miles appear
+only in the note; numeric miles cells stay blank in CSV and XLSX. XLSX shows
+the same on **Unreadable trips**, outside **Mileage** and **Totals**. Existing close snapshots remain
+unchanged; the review compares saved and current totals and names changed keys.
+Genuinely missing or unreadable parts under any name retain the
+existing damaged-merge warning and conservative merge-suggestion checks.
+
+A link to a non-month folder inside `data/` shows existing trips and counts
+them, but a notice warns that ingest refuses new trips for that month with
+503. The tracker keeps those trips queued. Replace the link with a real folder
+containing the existing trips, or mount the disk there, to allow uploads.
+This upload notice does not block merges or closing a year.
+If the warning says a month folder can't be read, the
 viewer could not inspect or list it. Check that the folder (or its link's
 target) still exists and that its disk is available. To test access as the
 viewer's user, run `sudo -u '#1000' ls -la ~/mileage-tracker/data/<month>/`.

@@ -48,6 +48,7 @@ import io
 import json
 import logging
 import os
+import stat
 import re
 import signal
 import sys
@@ -244,7 +245,12 @@ def _atomic_write_bytes(target, data):
     reader never sees a half-written file -- it sees either the old
     version or the complete new one.
     """
-    fd, name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=target.parent)
+    try:
+        fd, name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp", dir=target.parent)
+    except PermissionError:
+        # Creating the temporary file needs directory write permission. No
+        # file was created, and ENOSPC/EIO still reach the ordinary 500 path.
+        raise UnwritableMonthError(target.parent.name) from None
     temp = Path(name)
     try:
         with os.fdopen(fd, "wb") as f:
@@ -309,6 +315,18 @@ class LinkedMonthError(Exception):
     """A month folder cannot safely be searched for an existing trip."""
 
 
+class UnreadableMonthError(Exception):
+    """A month folder's permissions prevent a complete duplicate-ID search."""
+
+
+class NotDirectoryMonthError(Exception):
+    """The destination month name is occupied by something other than a folder."""
+
+
+class UnwritableMonthError(Exception):
+    """The destination month refuses creation of a trip's temporary file."""
+
+
 def _stored_trip_directories(root, safe_id):
     """Find either half of a stored pair; caller must hold _upload_lock.
 
@@ -328,16 +346,32 @@ def _stored_trip_directories(root, safe_id):
             # A skipped month could contain this trip, so refuse the upload.
             # RuntimeError is a symbolic link loop (Path.resolve on Python 3.12).
             raise LinkedMonthError(directory.name) from None
+        except PermissionError:
+            raise UnreadableMonthError(name) from None
         try:
-            directory.stat()
+            mode = directory.stat().st_mode
+            # access() also returns False on races or I/O errors. A conservative
+            # 503 is acceptable here: the tracker retains the trip and retries.
+            if stat.S_ISDIR(mode) and not os.access(directory, os.R_OK | os.X_OK):
+                raise UnreadableMonthError(name)
+        except PermissionError:
+            raise UnreadableMonthError(name) from None
         except OSError as exc:
             # Python 3.13+ resolve() no longer raises on a link loop, so a
-            # looping month folder shows up here; report it the same way. Other
-            # errors fall through to the per-file checks below, as before.
+            # looping month folder shows up here; report it the same way.
+            # Missing/non-directory entries cannot contain a stored pair;
+            # permission failures refuse by month, other faults remain 500.
             if exc.errno == errno.ELOOP:
                 raise LinkedMonthError(name) from None
+            if exc.errno in (errno.EACCES, errno.EPERM):
+                raise UnreadableMonthError(name) from None
+            if exc.errno not in (errno.ENOENT, errno.ENOTDIR):
+                raise  # I/O, stale handles and resource failures are server faults.
         # Check both files before any stat or read, even for a partial pair.
-        directory, gpx_file, json_file = _trip_paths(root, directory, safe_id)
+        try:
+            directory, gpx_file, json_file = _trip_paths(root, directory, safe_id)
+        except PermissionError:
+            raise UnreadableMonthError(name) from None
         for path in (gpx_file, json_file):
             try:
                 # stat() propagates permission/I/O errors: an unreadable
@@ -345,6 +379,8 @@ def _stored_trip_directories(root, safe_id):
                 path.stat()
             except (FileNotFoundError, NotADirectoryError):
                 continue
+            except PermissionError:
+                raise UnreadableMonthError(name) from None
             # A month link to another month folder in the data folder is the
             # same folder, not a second copy of the trip (#725).
             if directory not in matches:
@@ -656,7 +692,10 @@ def upload_trip():
                 # folder's month in the viewer (#727).
                 raise LinkedMonthError(target_dir.name)
             target_dir, gpx_file, json_file = _trip_paths(root, target_dir, safe_id)
-            target_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+            except (FileExistsError, NotADirectoryError):
+                raise NotDirectoryMonthError(year_month) from None
             _sync_directory(root)
             # An ID can be retried, but must never replace another trip's
             # immutable source (including sanitized-ID/device collisions).
@@ -683,6 +722,21 @@ def upload_trip():
             if not gpx_file.exists():
                 _atomic_write_bytes(gpx_file, raw)
             _atomic_write_json(json_file, record)
+    except UnwritableMonthError as e:
+        message = (f"month folder {e} cannot be written to; new trips for this month are refused "
+                   "until its owner and permissions are fixed")
+        app.logger.error(message)
+        return jsonify({"error": message}), 503
+    except NotDirectoryMonthError as e:
+        message = (f"month folder {e} is not a directory; new trips for this month are refused "
+                   "until that name is a real folder")
+        app.logger.error(message)
+        return jsonify({"error": message}), 503
+    except UnreadableMonthError as e:
+        message = (f"month folder {e} cannot be read or entered because its owner or mode stops the server reading it; "
+                   "all trip uploads are refused until its owner and permissions are fixed")
+        app.logger.error(message)
+        return jsonify({"error": message}), 503
     except LinkedMonthError as e:
         message = (f"month folder {e} is a symbolic link that can't be followed safely; "
                    "uploads are refused until it is replaced with a real folder")

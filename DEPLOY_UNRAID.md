@@ -74,6 +74,25 @@ See [diagnostics retention](DIAGNOSTICS.md#diagnostics-event-retention).
 The installer creates `data/` with that ownership and mode 700. On an existing
 folder, it checks the owner UID and permissions.
 
+A hand-set month folder that UID 1000 can read and enter but not write
+(for example mode 500, or root-owned mode 755 without group/other write
+access) refuses that month's new trips with HTTP 503; other months still
+upload and the tracker keeps the refused trips queued. The viewer shows a
+notice and counts existing trips, without blocking merges. From the install
+directory, repair the real month folder as root (replace the example month):
+
+```bash
+chown -R 1000:1000 -- data/2026-02
+find data/2026-02 -type d -exec chmod 700 {} +
+find data/2026-02 -type f -exec chmod 600 {} +
+```
+
+For an internal link, inspect its target and parents first; do not follow an
+outside link. Reload the viewer and let a queued upload retry. The viewer
+uses the folder's owner/group/mode, not a write-access probe on its normal
+read-only mount. An unreadable or unsearchable month instead blocks every
+trip upload until repaired; disk-full and I/O write failures remain 500.
+
 Allow space on both the install pool and Docker's storage. Setup checks
 them separately: a Docker image disk can fill while the pool still has
 space. Allow at least 10 GiB free for the first firmware build.
@@ -701,3 +720,21 @@ and shows how to apply the limit.
   policies. Editing `.env` alone does not recreate existing containers.
 - **Python container cannot start:** the first use may need an image pull.
   Check Docker download access and space. Installing host Python is optional.
+- **All trip uploads return 503 naming a month folder:** one month folder
+  that UID 1000 cannot read or enter blocks every upload, including retries
+  for other months. The viewer's "Uploads are blocked" alert names it.
+  Copying or restoring folders by hand as root under a strict umask (or with
+  `sudo` on another host) can leave root-owned mode-700 folders. For a real
+  month folder, run as root from the install directory containing `data/`, replacing
+  the example month:
+
+  ```bash
+  chown -R 1000:1000 -- data/2026-02
+  find data/2026-02 -type d -exec chmod 700 {} +
+  find data/2026-02 -type f -exec chmod 600 {} +
+  ```
+
+  For an internal link also inspect its real target and parent folders;
+  UID 1000 needs search permission on each parent. Do not follow an outside
+  link. Reload the viewer and let a queued upload retry once every blocking
+  folder is usable. Diagnostics uploads are unaffected.

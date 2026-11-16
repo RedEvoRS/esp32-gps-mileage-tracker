@@ -418,6 +418,10 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   GPX uploads with 503 naming the folder until repaired, and a new trip whose
   month folder links to a differently named folder gets the same 503 (it would
   be filed under the wrong month). Diagnostics are unaffected.
+  A month folder the services cannot read or enter refuses every trip upload
+  with a named 503; disk I/O and other server faults remain 500.
+  A readable/searchable month that denies temporary-file creation gets a named
+  503 for only that month's new trips; healthy uploads gain no extra probe.
   `install.sh --check` reports direct links in `data/` as problems; install
   warns and continues. If listing needs a new sudo prompt, check warns it skipped links.
   Ingest runs with umask 077; `install.sh` keeps `data/` at mode 700
@@ -471,7 +475,22 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   hint for that cause; their trips aren't listed or counted and merge
   suggestions wait. A month link to a folder another month name already counts
   is a notice (`row_type=folder_notice`): counted once, no merge block, not
-  unreadable in year-close snapshots. Closing a year
+  unreadable in year-close snapshots. Month links share one counted address
+  across routes; saved-name conflicts preserve saved keys and block year closing,
+  and folder messages share one formatter across the list, review and exports.
+  The upload alert names global folder refusals; unused-name merges are saved-data
+  notices excluded from miles and missing counts, with admin undo, only when
+  every part is counted under another name and both files match saved stamps.
+  A missing folder alone remains damage; direct trip loads and undo agree.
+  Unused-name merges block closing their saved-summary year and each part's
+  year (every year if the saved year is unknown). Notice miles stay in text,
+  outside numeric totals. Admin discard of damage and unused-name undo keep
+  the full summary in history before deletion in the same transaction; year
+  review and exports say which parts are currently counted again.
+  A file occupying a month name, or a folder whose owner/mode denies ingest
+  writing, is a notice with no missing count or merge block. Write notices
+  reuse scanned metadata, never W_OK on the viewer's read-only mount.
+  Closing a year
   saves its totals
   in `tax_years.snapshot`; the year review compares saved and current totals,
   and lists trips received after the close (ingest `_received_at` later than
