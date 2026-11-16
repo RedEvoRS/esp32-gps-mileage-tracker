@@ -484,6 +484,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   unreadable in year-close snapshots. Month links share one counted address
   across routes; saved-name conflicts preserve saved keys and block year closing,
   and folder messages share one formatter across the list, review and exports.
+  An annotation/removal under an absent month name warns only when its trip is
+  counted under another name; redoing that same kind of saved item there clears
+  it. Unresolved items block affected years (every year if unknown) from closing.
   The upload alert names global folder refusals; unused-name merges are saved-data
   notices excluded from miles and missing counts, with admin undo, only when
   every part is counted under another name and both files match saved stamps.

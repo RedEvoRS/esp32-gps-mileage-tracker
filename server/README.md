@@ -1050,6 +1050,18 @@ XLSX labels them on **Unreadable trips**. Their notes keep saved miles, purpose,
 trip date, action date and login, and say which parts are counted again.
 An unused-name notice adds no saved miles or
 merged annotation and does not block merge suggestions for healthy trips.
+
+Never rename a month folder. If a trip with saved purposes, notes or a removal
+turns up under another month name and its old folder name is absent, the viewer
+warns on the trip list, year review and exports, and blocks closing affected
+years. Deleting a folder without moving its trips does not cause this warning.
+Clear it by renaming the folder back (or moving those trips' files back into
+a folder with the old name), or by entering the purpose or notes and removing
+the trip again under its new name, as needed. Each saved item stops warning
+only when the same kind of item is saved under the new name; history stays saved.
+After **Undo saved merge**, a former part's purpose or notes saved only under
+the old name also needs this repair before its year can close.
+
 Moving or renaming a real month folder with file times kept also produces an
 unused-name merge when every recording matches under the new name.
 To use that merge again, restore the original month name, as a link or by

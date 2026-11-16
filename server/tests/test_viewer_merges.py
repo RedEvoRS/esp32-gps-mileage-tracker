@@ -842,6 +842,10 @@ class ViewerMerges(unittest.TestCase):
         finally:
             book.close()
         self.assertEqual(self.undo_unused(key).status_code, 302)
+        # Undo keeps the part's annotation under its old address. Once it is
+        # no longer a merge part, the ordinary saved-item warning applies.
+        self.assertEqual(self.close_year().status_code, 409)
+        self.assertEqual(self.annotate('2026-05/a', 'personal', 'original note').status_code, 302)
         self.assertEqual(self.close_year().status_code, 302)
 
     def test_moved_real_month_restored_by_renaming_allows_close_with_saved_purpose(self):
@@ -895,6 +899,8 @@ class ViewerMerges(unittest.TestCase):
         self.assert_history_exports(self.viewer.merge_history_message(row), 'unused-name merge undone')
         history = html.unescape(self.client.get('/admin/history').get_data(as_text=True))
         self.assertIn('Unused-name merge undone. ' + effect, history)
+        self.assertEqual(self.close_year().status_code, 409)
+        self.assertEqual(self.annotate('2026-05/a', 'personal', 'original note').status_code, 302)
         self.assertEqual(self.close_year().status_code, 302)
         self.assertIn('Unused-name merge undone.', self.client.get('/admin/year/2026').get_data(as_text=True))
 
