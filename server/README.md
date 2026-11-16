@@ -1051,38 +1051,57 @@ trip date, action date and login, and say which parts are counted again.
 An unused-name notice adds no saved miles or
 merged annotation and does not block merge suggestions for healthy trips.
 
-Never rename a month folder. If a trip with saved purposes, notes or a removal
-turns up under another counted month name and its old trip address is absent,
-the viewer warns on the trip list, year review and exports, even if new uploads
-have recreated the old folder. Existing folder problems and alias conflicts keep
-their own warnings. Deleting a folder without moving its trips does not warn.
-Unresolved items block closing every year that counts the current trip's miles:
-both years for a split drive, only the new year when all counted miles are after
-midnight, or the start year when the drive stays whole there. Unreadable trips
-use the same possible folder years as other unreadable trips; a readable trip with no date
-blocks every year. The admin year review lists each unresolved item for that
-year, linking its current trip when it can open and showing its old address and
-saved purpose, notes and destination, or removal reason, login and time.
-Everyday logins see the folder warning without saved-item details or counts;
-admins also see counts on the trip list and exports.
-Clear it by renaming the folder back (or moving those trips' files back into
-a folder with the old name). For a plain trip, saving a purpose, notes or
-destination under its new name clears the purpose warning, even if those fields
-are cleared later. Saving all fields empty does not clear it unless an annotation
-was already saved there. For a moved part, save a nonempty purpose, notes or
-destination on its current merge; an unannotated merge still warns. To resolve an old removal,
-remove the current trip (or merge) again, or choose **Keep trip in log** beside
-the removal on the admin year review. That choice keeps the trip listed and
-counted, deletes the old removal and records who restored it, when and the
-removal's reason in history, then returns to the year review. Reopen the closed
-years named beside the removal before making that choice; these follow the same
-edit locks as the current trip and its merge parts. An undated readable trip is
-never locked by a closed year.
-A removed or unreadable trip needs no purpose; that warning returns if it is
-restored or becomes readable without an annotation. An old removal still warns
-for an unreadable trip until it is removed again or the admin chooses to keep
-it; keeping it clears only the old removal, and its unreadable warning remains.
-History stays saved.
+**Never rename a month folder.** The viewer saves a trip's purpose, notes,
+destination and removal under its address, `<month folder>/<trip id>`, so a
+renamed folder leaves that saved data behind: a removed trip is listed and
+counted again, and purposes and notes no longer show.
+
+The viewer warns when a trip with a saved purpose, notes or removal turns up
+under another month name and nothing is left at its old address. The warning
+appears on the trip list, the year review and the exports, and it stays even if
+new uploads have recreated the old folder. Deleting a folder without moving its
+trips does not warn. Existing folder problems and alias conflicts keep their own
+warnings.
+
+While an item is unresolved, the years its trip counts in cannot be closed:
+
+- both years for a drive split at New Year;
+- only the new year when all of the drive's counted miles are after midnight;
+- the start year when the drive stays whole there;
+- for an unreadable trip, the same possible folder years as other unreadable
+  trips;
+- every year for a readable trip with no date.
+
+The admin year review lists each unresolved item for that year: the trip's
+current address (a link when the trip can open), its old address, and what was
+saved (purpose, notes and destination, or the removal's reason, login and
+time). Admins also see counts on the trip list and in the exports. Everyday
+logins see the warning without details or counts.
+
+To clear the warning, do one of these:
+
+- **Rename the folder back**, or move those trips' files back into a folder
+  with the old name. All the saved data applies again.
+- **Save the purpose again under the new name.** For a plain trip, saving a
+  purpose, notes or destination clears the purpose warning, even if those
+  fields are cleared later. Saving with every field empty does not clear it
+  unless an annotation was already saved there. For a trip that is now part of
+  a merge, save a nonempty purpose, notes or destination on the merge; an
+  unannotated merge still warns.
+- **Remove the trip (or its merge) again** to keep it out of the log.
+- **Choose Keep trip in log** beside the removal on the admin year review to
+  keep the trip listed and counted. This deletes the old removal, records in
+  history who restored it, when and the removal's reason, and returns to the
+  year review. If a closed year locks the trip, the review names the years to
+  reopen first; these are the same edit locks as for the current trip and its
+  merge parts. A readable trip with no date is never locked by a closed year.
+
+A removed or unreadable trip needs no purpose; that warning returns if the trip
+is restored or becomes readable without an annotation. An old removal still
+warns for an unreadable trip until the trip is removed again or the admin
+chooses to keep it. Keeping it clears only the old removal; the unreadable
+warning remains. History stays saved throughout.
+
 After **Undo saved merge**, a former part's purpose or notes saved only under
 the old name also needs this repair before any affected year can close.
 

@@ -488,7 +488,7 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   counted month, even if the old folder exists again; folder problems and aliases
   keep their own diagnostics. Current annotations/removals resolve their own kind,
   using the merge for a moved part; removed/unreadable trips need no annotation.
-  Unresolved items block each counted year; unreadable trips use folder years, only
+  Unresolved items block each counted year; unreadable trips use folder years,
   readable undated trips block every year. Admin year review lists saved details.
   Any current annotation row resolves a plain trip's purpose warning; a merge
   needs a nonempty purpose, note or destination. Admin Keep trip in log deletes

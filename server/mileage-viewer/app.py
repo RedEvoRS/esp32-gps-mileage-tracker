@@ -3764,7 +3764,7 @@ on {{ fmt_date(item.saved.removed_at) }} ({{ timezone }})
 The old removal is deleted and the action is recorded in history.
 {% else %}The trip stays listed and counted; the old removal is deleted and the action is recorded in history.{% endif %}</p>
 <button class="btn secondary" type="submit" name="confirm" value="yes">Keep trip in log</button></form>
-{% elif item.reopen_years %}<p>Reopen {{ item.reopen_years|join(' and ') }} to keep this trip in the log.</p>{% endif %}
+{% elif item.reopen_years %}<p>Reopen {{ item.reopen_years[:-1]|join(', ') }}{% if item.reopen_years|length > 1 %} and {% endif %}{{ item.reopen_years[-1] }} to keep this trip in the log.</p>{% endif %}
 {% endif %}</td>
 </tr>{% endfor %}</tbody></table></div>
 {% endif %}{% endfor %}
