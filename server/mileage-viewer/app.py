@@ -1077,7 +1077,7 @@ def folder_hint(entry, role):
     if entry["folder_reason"] == "unused_merge":
         if role != "admin":
             return ("Please ask the admin to restore the original month name, as a link or by renaming the folder back, "
-                    "or use Undo saved merge. " + unused_merge_undo_effect(entry))
+                    "or to undo the saved merge. " + unused_merge_undo_effect(entry))
         return ("To use this merge again, restore the original month name, as a link or by renaming the folder back, "
                 "and leave that name in use. Or use Undo saved merge on the trip list. " + unused_merge_undo_effect(entry))
     if role != "admin":
