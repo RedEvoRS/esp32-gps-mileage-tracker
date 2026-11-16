@@ -4249,7 +4249,7 @@ def admin_year(year):
         inside_merge=inside_merge, late=late, late_miles=sum(t.get("distance_miles") or 0 for t in late),
         comparison=comparison, joined=joined, left=left, undated=undated, undated_miles=sum(t.get("distance_miles") or 0 for t in undated),
         uncategorized=[t for t in members if t.get("category") not in CATEGORIES],
-        incomplete=incomplete, unreadable=[t for t in broken if not t.get("unused_merge") and not t.get("moved_saved")],
+        incomplete=incomplete, unreadable=[t for t in broken if not t.get("unused_merge") and t.get("folder_reason") != "saved_keys"],
         removed=removed, timezone=DISPLAY_TZ_NAME,
         year_end=f"{year + 1}-01-01 00:00",
     )

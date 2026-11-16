@@ -982,6 +982,41 @@ class ViewerHardeningTests(unittest.TestCase):
             else:
                 self.assertIn('action="/admin/year/2020/reopen"', text)
 
+    def test_alias_saved_conflict_appears_once_on_review_list_and_each_export(self):
+        target = self.linked_archive('2026-01')
+        self.symlink(self.viewer.DATA_ROOT / '2026-02', target, directory=True)
+        self.signed_in('admin')
+        before = self.viewer.year_figures(*self.viewer.year_members(*self.viewer.load_trips(), 2026))
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO annotations (trip_key,category) VALUES ('2026-02/drive','personal')")
+        trips, entries = self.viewer.load_trips()
+        warning, = [t for t in entries if t.get('folder_reason') == 'saved_keys']
+        self.assertFalse(warning.get('moved_saved'))
+        self.assertEqual(self.viewer.year_figures(*self.viewer.year_members(trips, entries, 2026)), before)
+        message = self.viewer.folder_message(warning, 'admin')
+        for path, texts in self.folder_surface_messages(self.client).items():
+            with self.subTest(path=path):
+                self.assertEqual(sum(text.count(message) for text in texts), 1)
+        for path in ('/?year=2026', '/export.csv?year=2026'):
+            self.assertEqual(html.unescape(self.client.get(path).get_data(as_text=True)).count(message), 1)
+        response = self.client.get('/export.xlsx?year=2026')
+        book = load_workbook(io.BytesIO(response.data))
+        try:
+            self.assertEqual(sum(str(cell).count(message) for row in book['Unreadable trips'].values for cell in row), 1)
+        finally:
+            book.close()
+            response.close()
+        # Presentation filtering must leave the saved snapshot and current counts alone.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            self.viewer.trip_log.close_year(conn, 2026, 'driver', before)
+            saved = conn.execute('SELECT snapshot FROM tax_years WHERE year=2026').fetchone()[0]
+        warning, = [t for t in self.viewer.load_trips()[1] if t.get('folder_reason') == 'saved_keys']
+        message = self.viewer.folder_message(warning, 'admin')
+        self.assertEqual(html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True)).count(message), 1)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute('SELECT snapshot FROM tax_years WHERE year=2026').fetchone()[0], saved)
+        self.assertEqual(self.viewer.year_figures(*self.viewer.year_members(*self.viewer.load_trips(), 2026)), before)
+
     def test_saved_conflict_counts_all_sources_and_only_exact_month_prefixes(self):
         with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute("INSERT INTO annotations (trip_key) VALUES ('2026-010/not-a-month')")
