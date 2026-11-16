@@ -2177,7 +2177,7 @@ def selected_trips(include_history=False, loaded=None, include_merge_history=Fal
             for trip in selected + unreadable:
                 _set_export_last_edited(lookup, trip)
             for trip in selected:
-                trip["received_after_close"] = "yes" if late_in_closed_year(
+                trip["received_after_close"] = "yes" if closed and late_in_closed_year(
                     trip, relevant_closed if trip.get("year_shares") else closed) else ""
             if include_merge_history:
                 unreadable += [{**row, 'merge_history': True} for row in _merge_history_rows(conn, year, trips)]

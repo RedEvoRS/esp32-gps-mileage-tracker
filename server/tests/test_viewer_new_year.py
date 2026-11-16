@@ -529,3 +529,16 @@ class NewYearTests(YearTestBase):
             row = next(r for r in self.csv_rows(query) if r["row_type"] == "trip")
             self.assertEqual(row["received_after_close"], "yes")
             self.assertEqual(self.sheet(query)["Mileage"][1][-2], "yes")
+
+    def test_unsplit_merge_exports_do_not_look_up_part_years_without_a_close(self):
+        first = self.recording("first", [[(-90, 0, 10, 1), (-60, 300, 10, 1)]])
+        second = self.recording("second", [[(-40, 400, 10, 1), (-20, 600, 10, 1)]])
+        response = self.post(f"/trip/{first}/merge", next_trip=second)
+        self.assertEqual(response.status_code, 302)
+        self.assertNotIn("year_shares", self.trip())
+        with patch.object(self.viewer, "_recording_years", side_effect=AssertionError("no closed years need part lookups")):
+            for query in ("?year=2026", ""):
+                row = next(r for r in self.csv_rows(query) if r["row_type"] == "trip")
+                self.assertEqual(row["received_after_close"], "")
+                header, row = self.sheet(query)["Mileage"][:2]
+                self.assertIsNone(dict(zip(header, row, strict=True))["received_after_close"])
