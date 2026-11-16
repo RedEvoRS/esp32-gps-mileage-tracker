@@ -3808,9 +3808,9 @@ def _merge_history_counted_parts(conn, rows, trips):
             alternate = counted.get(month, month) + '/' + name
             recorded = details.get('counted_part_keys', {}).get(part, part)
             match = next((key for key in (part, recorded, alternate) if key in current), None)
+            matches = []
             if match is None and isinstance(stamps, list) and len(stamps) > 2 * index + 1:
                 saved = json.dumps([stamps[2 * index + 1]])  # readable JSON suffices for ordinary totals
-                matches = []
                 for candidate in current:
                     if candidate.split('/')[1] != name:
                         continue
@@ -3830,7 +3830,7 @@ def _merge_history_counted_parts(conn, rows, trips):
                     absent.append(part)
                     part_years |= _merge_history_missing_years(details.get('saved_summary', {}), month)
                 for address in addresses:
-                    at_address.append(address)
+                    at_address.append((address, len(matches) > 1))
                     summary = current[address]
                     if summary.get('parts'):
                         summary, _ = read_summary(DATA_ROOT / (address + '.json'), root=DATA_ROOT.resolve())
@@ -3861,8 +3861,9 @@ def _merge_history_current_statement(row):
         return "None of its trips are in the log; these saved miles are not in the totals."
     text = ("Now counted again: " + ', '.join(row['counted_again']) + "; do not add these saved miles by hand."
             if row['counted_again'] else '')
-    for address in row['counted_at_address']:
-        text += (' ' if text else '') + f"A trip is counted at {address}, but its files differ from the ones this merge was made from."
+    for address, ambiguous in row['counted_at_address']:
+        text += (' ' if text else '') + f"A trip is counted at {address}"
+        text += "." if ambiguous else ", but its files differ from the ones this merge was made from."
     if not row['counted_again']:
         text += " Do not add these saved miles by hand."
     if row['not_counted']:

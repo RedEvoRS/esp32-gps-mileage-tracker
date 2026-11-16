@@ -1008,6 +1008,32 @@ class ViewerMerges(unittest.TestCase):
             f'Now counted again: 2026-04/a as 2026-05/a (inside {merged}), 2026-04/b as 2026-05/b (inside {merged}); '
             'do not add these saved miles by hand.', undone=True)
 
+    def test_ambiguous_matching_copies_report_only_counted_addresses(self):
+        key, _ = self.moved_merge()
+        self.assertEqual(self.undo_unused(key).status_code, 302)
+        source = self.data / '2026-05'
+        for month in ('2026-06', '2026-07'):
+            target = self.data / month
+            target.mkdir()
+            for suffix in ('.gpx', '.json'):
+                shutil.copy2(source / ('a' + suffix), target / ('a' + suffix))
+        shutil.rmtree(source)
+        statement = ('A trip is counted at 2026-06/a. A trip is counted at 2026-07/a. '
+                     'Do not add these saved miles by hand. Not currently counted: 2026-04/b.')
+        totals = dict(zip(('business', 'personal', 'other', 'unclassified', 'all'), (0, 0, 0, .082, .082), strict=True))
+        self.assert_record_year(key, 2026, totals, True)
+        self.assertEqual([r['year'] for r in self.viewer._year_list()], [2026])
+        with closing(sqlite3.connect(self.db)) as conn:
+            row = self.viewer._merge_history_rows(conn, 2026, self.viewer.load_trips()[0])[0]
+        self.assertEqual(row['counted_again'], [])
+        self.assertEqual(row['current_part_keys'], {})
+        self.assertEqual(self.viewer._merge_history_current_statement(row), statement)
+        message = self.viewer.merge_history_message(row)
+        self.assertIn(message, html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True)))
+        self.assert_history_exports(message, 'unused-name merge undone')
+        self.assertIn('Unused-name merge undone. ' + statement,
+                      html.unescape(self.client.get('/admin/history').get_data(as_text=True)))
+
     def test_restored_without_times_reports_counted_address_on_every_history_surface(self):
         for undo in (False, True):
             with self.subTest(undo=undo):
