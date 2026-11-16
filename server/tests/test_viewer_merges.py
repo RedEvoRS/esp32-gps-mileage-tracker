@@ -952,6 +952,78 @@ class ViewerMerges(unittest.TestCase):
             f'Now counted again: 2026-04/a as 2026-05/a (inside {merged}), 2026-04/b as 2026-05/b (inside {merged}); '
             'do not add these saved miles by hand.', undone=True)
 
+    def test_restored_without_times_reports_counted_address_on_every_history_surface(self):
+        for undo in (False, True):
+            with self.subTest(undo=undo):
+                fixture = ViewerMerges()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                if undo:
+                    key, _ = fixture.moved_merge()
+                    source = fixture.data / '2026-05'
+                    self.assertEqual(fixture.undo_unused(key).status_code, 302)
+                else:
+                    fixture.trip('a', 0)
+                    fixture.trip('b', 180, .01)
+                    key = fixture.merged_key(fixture.merge('2026-04/a', '2026-04/b'))
+                    source = fixture.month
+                backup = fixture.root / 'copies'
+                shutil.copytree(source, backup)
+                if not undo:
+                    (source / 'b.json').unlink()
+                    self.assertEqual(fixture.discard(key).status_code, 302)
+                shutil.rmtree(source)
+                restored = fixture.data / '2026-06'
+                restored.mkdir()
+                for suffix in ('.gpx', '.json'):
+                    saved = backup / ('a' + suffix)
+                    copied = restored / saved.name
+                    shutil.copyfile(saved, copied)
+                    # Ensure a different stamp even on coarse or fast filesystems.
+                    os.utime(copied, ns=(saved.stat().st_atime_ns, saved.stat().st_mtime_ns + 2_000_000_000))
+                statement = ('A trip is counted at 2026-06/a, but its files differ from the ones this merge was made from. '
+                             'Do not add these saved miles by hand. Not currently counted: 2026-04/b.')
+                totals = dict(zip(('business', 'personal', 'other', 'unclassified', 'all'), (0, 0, 0, .041, .041), strict=True))
+                fixture.assert_record_year(key, 2026, totals, True)
+                with closing(sqlite3.connect(fixture.db)) as conn:
+                    row = fixture.viewer._merge_history_rows(conn, 2026, fixture.viewer.load_trips()[0])[0]
+                self.assertEqual(fixture.viewer._merge_history_current_statement(row), statement)
+                message = fixture.viewer.merge_history_message(row)
+                self.assertIn(statement, message)
+                self.assertNotIn('None of its trips are in the log', message)
+                self.assertIn(message, html.unescape(fixture.client.get('/admin/year/2026').get_data(as_text=True)))
+                fixture.assert_history_exports(message, 'unused-name merge undone' if undo else 'damaged merge discarded')
+                if undo:
+                    history = html.unescape(fixture.client.get('/admin/history').get_data(as_text=True))
+                    self.assertIn('Unused-name merge undone. ' + statement, history)
+                # Both copied parts are counted, without claiming either stamp matches.
+                for suffix in ('.gpx', '.json'):
+                    saved = backup / ('b' + suffix)
+                    copied = restored / saved.name
+                    shutil.copyfile(saved, copied)
+                    os.utime(copied, ns=(saved.stat().st_atime_ns, saved.stat().st_mtime_ns + 2_000_000_000))
+                statement = ('A trip is counted at 2026-06/a, but its files differ from the ones this merge was made from. '
+                             'A trip is counted at 2026-06/b, but its files differ from the ones this merge was made from. '
+                             'Do not add these saved miles by hand.')
+                fixture.assert_record_year(key, 2026, {**totals, 'unclassified': .082, 'all': .082}, True)
+                with closing(sqlite3.connect(fixture.db)) as conn:
+                    row = fixture.viewer._merge_history_rows(conn, 2026, fixture.viewer.load_trips()[0])[0]
+                self.assertEqual(fixture.viewer._merge_history_current_statement(row), statement)
+                message = fixture.viewer.merge_history_message(row)
+                self.assertIn(message, html.unescape(fixture.client.get('/admin/year/2026').get_data(as_text=True)))
+                fixture.assert_history_exports(message, 'unused-name merge undone' if undo else 'damaged merge discarded')
+                if undo:
+                    self.assertIn('Unused-name merge undone. ' + statement,
+                                  html.unescape(fixture.client.get('/admin/history').get_data(as_text=True)))
+                # A readable file removed from the log must not trigger the warning.
+                for name in ('a', 'b'):
+                    self.assertEqual(fixture.client.post(f'/trip/2026-06/{name}/remove', data={
+                        'csrf_token': 'test-csrf', 'confirm': 'yes', 'reason': 'test removal'}).status_code, 302)
+                with closing(sqlite3.connect(fixture.db)) as conn:
+                    row = fixture.viewer._merge_history_rows(conn, 2026, fixture.viewer.load_trips(include_removed=True)[0])[0]
+                self.assertEqual(fixture.viewer._merge_history_current_statement(row),
+                                 'None of its trips are in the log; these saved miles are not in the totals.')
+
     def test_unused_merge_uses_saved_summary_year_and_unknown_year_blocks_every_close(self):
         key, _ = self.moved_merge()
         with closing(sqlite3.connect(self.db)) as conn, conn:

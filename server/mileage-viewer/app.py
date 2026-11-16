@@ -3797,7 +3797,7 @@ def _merge_history_counted_parts(conn, rows, trips):
                 stamps = stamps[1:]
         except (TypeError, ValueError):
             stamps = None
-        again, absent = [], []
+        again, at_address, absent = [], [], []
         current_keys, inside_merge = {}, False
         part_years = set()
         for index, part in enumerate(details.get('parts', [])):
@@ -3822,8 +3822,18 @@ def _merge_history_counted_parts(conn, rows, trips):
                 if len(matches) == 1:
                     match = matches[0]
             if match is None:
-                absent.append(part)
-                part_years |= _merge_history_missing_years(details.get('saved_summary', {}), month)
+                addresses = [key for key in current if key.split('/')[1] == name]
+                if not addresses:
+                    absent.append(part)
+                    part_years |= _merge_history_missing_years(details.get('saved_summary', {}), month)
+                for address in addresses:
+                    at_address.append(address)
+                    summary = current[address]
+                    if summary.get('parts'):
+                        summary, _ = read_summary(DATA_ROOT / (address + '.json'), root=DATA_ROOT.resolve())
+                    part_year = _trip_local_year(summary or {})
+                    part_years |= {part_year} if part_year else _merge_history_missing_years(
+                        details.get('saved_summary', {}), address.split('/')[0])
                 continue
             summary = current[match]
             current_keys[part] = match
@@ -3838,14 +3848,20 @@ def _merge_history_counted_parts(conn, rows, trips):
                 label += f" (inside {current[match]['trip_key']})"
             again.append(label)
         row['counted_again'], row['not_counted'] = again, absent
+        row['counted_at_address'] = at_address
         row['part_years'] = part_years
         row['current_part_keys'], row['parts_in_merge'] = current_keys, inside_merge
 
 
 def _merge_history_current_statement(row):
-    if not row['counted_again']:
+    if not row['counted_again'] and not row['counted_at_address']:
         return "None of its trips are in the log; these saved miles are not in the totals."
-    text = "Now counted again: " + ', '.join(row['counted_again']) + "; do not add these saved miles by hand."
+    text = ("Now counted again: " + ', '.join(row['counted_again']) + "; do not add these saved miles by hand."
+            if row['counted_again'] else '')
+    for address in row['counted_at_address']:
+        text += (' ' if text else '') + f"A trip is counted at {address}, but its files differ from the ones this merge was made from."
+    if not row['counted_again']:
+        text += " Do not add these saved miles by hand."
     if row['not_counted']:
         text += " Not currently counted: " + ', '.join(row['not_counted']) + "."
     return text
@@ -3856,7 +3872,8 @@ def _merge_history_undo_effect(row):
     if not details.get('parts') or 'current_part_keys' not in row:
         return details.get('undo_effect', '')  # Legacy text only when current evidence is unavailable.
     keys = row['current_part_keys']
-    if not row['not_counted'] and not row['parts_in_merge'] and all(part != key for part, key in keys.items()):
+    if (not row['not_counted'] and not row['counted_at_address'] and not row['parts_in_merge']
+            and all(part != key for part, key in keys.items())):
         return unused_merge_undo_effect({
             'counted_months': sorted({key.split('/')[0] for key in keys.values()}),
             'saved_months': sorted({key.split('/')[0] for key in details['parts']}),
