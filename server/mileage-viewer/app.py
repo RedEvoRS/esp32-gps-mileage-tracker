@@ -2016,6 +2016,9 @@ def _unused_merge_in_year(trip, year):
 UNUSED_MERGE_CLOSE_REFUSAL = ("A saved merge under an unused month name has miles and purpose outside the totals. "
                               "Restore its original month name or use Undo saved merge before closing this year. "
                               "See Saved merges under unused month names on the year review.")
+UNUSED_MERGE_CLOSED_NOTICE = ("This year is closed. A saved merge under an unused month name has miles and purpose outside the totals. "
+                            "The saved-versus-current comparison on this page shows the difference. "
+                            "Reopen this year before undoing the saved merge.")
 
 
 def trip_neighbours(trip_key, trips, year=None):
@@ -3951,7 +3954,8 @@ def admin_year(year):
     inside_merge = [{"trip": t, "merge": covered[t["trip_key"]]} for t in members if t["trip_key"] in covered]
     return render_template_string(
         YEAR_HTML, year=year, closed=closed, saved_conflicts=saved_conflicts, upload_blocks=upload_blocks,
-        unused_merges=unused_merges, unused_merge_close_refusal=UNUSED_MERGE_CLOSE_REFUSAL,
+        unused_merges=unused_merges,
+        unused_merge_close_refusal=UNUSED_MERGE_CLOSED_NOTICE if closed else UNUSED_MERGE_CLOSE_REFUSAL,
         discarded_merges=discarded_merges,
         totals=totals, counts=counts, edits=edits,
         inside_merge=inside_merge, late=late, late_miles=sum(t.get("distance_miles") or 0 for t in late),

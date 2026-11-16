@@ -665,6 +665,9 @@ class ViewerMerges(unittest.TestCase):
         self.assertIn(self.viewer.UNUSED_MERGE_CLOSE_REFUSAL, html.unescape(response.get_data(as_text=True)))
         review = html.unescape(self.client.get(f'/admin/year/{year}').get_data(as_text=True))
         section = review.split('<h2 id="unused-merges-heading">', 1)[1].split('</section>', 1)[0]
+        self.assertIn('A saved merge under an unused month name has miles and purpose outside the totals. '
+                      'Restore its original month name or use Undo saved merge before closing this year. '
+                      'See Saved merges under unused month names on the year review.', section)
         self.assertIn(key, section)
         self.assertIn('These saved miles and this purpose are not in the totals shown.', section)
         self.assertIn('The trips it was made from are counted separately.', section)
@@ -929,6 +932,11 @@ class ViewerMerges(unittest.TestCase):
         self.assertIn('No longer counted: ' + key, review)
         self.assertIn('Now counted:', review)
         self.assertIn('Reopen 2026', review)
+        self.assertIn('This year is closed. A saved merge under an unused month name has miles and purpose outside the totals. '
+                      'The saved-versus-current comparison on this page shows the difference. '
+                      'Reopen this year before undoing the saved merge.', review)
+        self.assertNotIn('before closing this year', review)
+        self.assertEqual(self.undo_unused(key).status_code, 409)
         with closing(sqlite3.connect(self.db)) as conn:
             self.assertEqual(conn.execute('SELECT snapshot FROM tax_years').fetchone()[0], snapshot)
         self.assertEqual(self.client.post('/admin/year/2026/reopen', data={
