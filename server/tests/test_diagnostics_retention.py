@@ -8,11 +8,12 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import test_viewer_roles as roles
 import test_ingest_diagnostics as ingest_tests
 from test_ingest_diagnostics import batch
+from time_helpers import time_stub
 
 
 class RetentionAdminTests(unittest.TestCase):
@@ -181,8 +182,9 @@ class RetentionIngestTests(unittest.TestCase):
         self.seed_old_events(350)
         store.settings_path = self.root / 'diagnostics.json'
         store.settings_path.write_text('{"events_retention_days":30}')
-        with patch('diag_store.time.monotonic', return_value=0) as clock, \
-                patch('diag_store.time.sleep') as pause, patch.object(store, 'prune', wraps=store.prune) as prune:
+        clock, pause = Mock(return_value=0), Mock()
+        with patch('diag_store.time', time_stub(monotonic=clock, sleep=pause)), \
+                patch.object(store, 'prune', wraps=store.prune) as prune:
             def yield_between_batches(seconds):
                 self.assertEqual(seconds, 0.01)
                 clock.return_value += 2  # Exhaust the budget without a real sleep.
@@ -218,8 +220,9 @@ class RetentionIngestTests(unittest.TestCase):
     def test_budget_expiry_after_exact_batch_keeps_newest_and_restores_throttle(self):
         store = self.ing.DIAGNOSTICS_STORE
         self.seed_old_events(251)
-        with patch('diag_store.time.monotonic', return_value=0) as clock, \
-                patch('diag_store.time.sleep') as pause, patch.object(store, 'prune', wraps=store.prune) as prune:
+        clock, pause = Mock(return_value=0), Mock()
+        with patch('diag_store.time', time_stub(monotonic=clock, sleep=pause)), \
+                patch.object(store, 'prune', wraps=store.prune) as prune:
             def yield_between_batches(_):
                 clock.return_value = 2
             pause.side_effect = yield_between_batches
@@ -234,7 +237,8 @@ class RetentionIngestTests(unittest.TestCase):
     def test_failed_continuation_preserves_ack_and_is_throttled(self):
         store = self.ing.DIAGNOSTICS_STORE
         self.seed_old_events(350)
-        with patch('diag_store.time.monotonic', return_value=0) as clock, patch('diag_store.time.sleep') as pause:
+        clock, pause = Mock(return_value=0), Mock()
+        with patch('diag_store.time', time_stub(monotonic=clock, sleep=pause)):
             def yield_between_batches(_):
                 clock.return_value = 2
             pause.side_effect = yield_between_batches
@@ -350,7 +354,7 @@ class RetentionIngestTests(unittest.TestCase):
     def test_hourly_throttle_includes_failed_attempts_and_rereads_setting(self):
         store = self.ing.DIAGNOSTICS_STORE
         store.settings_path = self.root / 'diagnostics.json'
-        with patch('diag_store.time.monotonic', side_effect=[0, 1, 3599, 3600, 3601, 7200]), \
+        with patch('diag_store.time', time_stub(monotonic=Mock(side_effect=[0, 1, 3599, 3600, 3601, 7200]))), \
                 patch.object(store, 'prune', side_effect=[None, OSError('synthetic'), None]) as prune:
             store.prune_if_due()
             store.prune_if_due()

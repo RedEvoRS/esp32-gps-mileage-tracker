@@ -569,7 +569,11 @@ for storage, Python fallback and service setup.
    `data/` or loops, every GPX upload gets HTTP 503 and the ingest log names
    the folder. A new trip whose own month folder is a link to a folder with a
    different name (say `2026-04` → `2026-03`) gets the same 503, because it
-   would otherwise be filed and shown under the other month. Replace it with a real folder or mount the disk there. The
+   would otherwise be filed and shown under the other month. A link to a
+   non-month folder (say `2026-04` → `archive`) also gets 503 for new trips:
+   ingest refuses that link even though the viewer shows existing trips under
+   `2026-04` and counts them. Replace the link with a real folder containing
+   those trips, or mount the disk there. The
    tracker keeps trips until HTTP 200 and retries after repair; Device health
    shows server errors. Diagnostics uploads are unaffected.
    Older third-party timed uploads named with a custom header keep their old
@@ -837,6 +841,71 @@ with the real folder or mount the other disk at that path; for a folder that
 can't be read, check that it still exists, that its disk is available, and
 that UID 1000 (the viewer reads `data/` read-only) may read it.
 
+If any month link leads outside `data/`, to `data/` itself or above, or loops,
+ingest refuses **every trip upload for every month** with HTTP 503, including
+retries of already stored trips. An outside target need not exist. The folder
+warning explains this, and a separate alert at the top of the list and in every
+year review names the blocking folders, even when a different year is selected.
+The tracker keeps the trips queued; Device health shows server errors.
+Diagnostics uploads are unaffected. Replace all of those links with real month
+folders (recovering existing files from their actual storage or a backup), or
+mount their disks at the month paths. Do not delete their targets or trip files.
+Then run `install.sh --check`, review the viewer totals and let the tracker retry.
+A missing target **inside** `data/` is unreadable in the viewer. If its final
+target name differs from the month link name, new trips for that month get
+HTTP 503 and stay queued on the tracker until the link is replaced with a
+real folder. Other months can still upload. A missing same-named target,
+such as `2026-02` → `archive/2026-02`, does not cause that refusal; ingest can
+create the target on upload. Disk I/O and other server faults still return 500.
+
+One month folder that the server cannot read or enter also blocks **every trip
+upload for every month**, including retries, with HTTP 503 naming that folder.
+This includes a mode-100 or mode-300 folder: entering it is not enough;
+both services must be able to list it to find every existing trip ID.
+The viewer includes it in the "Uploads are blocked" alert. Both services run
+as UID 1000. Copying or restoring folders by hand with `sudo` under a strict
+umask can leave a root-owned mode-700 folder that neither service can use.
+For a real month folder, run from the install directory containing `data/`:
+
+```bash
+sudo chown -R 1000:1000 -- data/2026-02
+sudo find data/2026-02 -type d -exec chmod 700 {} +
+sudo find data/2026-02 -type f -exec chmod 600 {} +
+```
+
+Use the folder named by the alert. For an internal link, inspect its real
+target and each parent (`namei -l data/2026-02`) and fix their owner and search
+permissions too; do not follow an outside link. On Unraid run these commands
+as root without `sudo`. Reload the viewer and let a queued upload retry;
+the alert clears and uploads resume once every blocking folder is usable.
+Diagnostics uploads are unaffected.
+
+A month folder that can be read and entered but cannot be written to (for
+example, mode 500) refuses only that month's new trips with a named HTTP 503
+and one log line, without a traceback. The tracker keeps them queued; other
+months keep uploading. Existing trips are shown and counted. The viewer
+shows a notice, with no missing-mileage count or merge block. Use the same
+owner-and-mode repair commands above for the real folder, then reload and
+let a queued trip retry. A root-owned mode-755 folder also needs repair unless
+the services' group or other bits grant write access. Disk-full and I/O
+write failures remain 500.
+
+The viewer judges write permission from the owner, group and mode metadata
+it already reads: owner bits take precedence, then the services' primary or
+supplementary groups, then other bits. This adds no filesystem call per folder
+and caches the services' identity once per worker. It never tests `W_OK` on
+its read-only `data/` mount, so that normal mount causes no notice. ACLs and
+the ingest mount's actual flags cannot be inferred from these mode bits;
+ingest's real file-creation result is authoritative.
+
+If a month name is a link to a file instead of a folder, remove only the
+link, keeping its target. If the month name is a plain file, move it somewhere
+safe outside the month names. The viewer reports either case as a folder
+notice: a file cannot hold trips, so it adds no missing mileage, no year-close
+unreadable count and no merge-suggestion block. New trips for that month get HTTP
+503 and stay queued. Other months still upload. Once that name is free,
+ingest can create a real month folder on retry.
+
 The viewer checks containment before it lists a folder or reads a file, and on
 Linux it lists each month through a directory handle that refuses a month
 folder swapped for a link at the last moment. These checks can't stop someone
@@ -846,11 +915,140 @@ the directory handle. Keep `data/` writable only by the containers' user and
 root.
 
 A month link to a folder inside `data/` that no other month name uses (for
-example `2026-01` → `archive`) is read as that month, without a warning. If
+example `2026-01` → `archive`) is read as that month. A folder notice says that
+existing trips are shown and counted, but ingest refuses new trips for this
+month until the link is replaced with a real folder (or a disk mounted there).
+The tracker keeps new trips queued and retries after repair. This notice is
+`row_type=folder_notice` in CSV, does not mean miles are missing, and does not
+block merge suggestions or closing a year. If
 two month names reach the same folder, its trips count once, under the real
-month folder (or else the first link name in sorted order), and the other name
+month folder, and the other name
 gets a notice saying where they are counted (`row_type=folder_notice` in CSV).
-A notice doesn't mean miles are missing; remove the extra link.
+A notice doesn't mean miles are missing. If the link's final target has a
+different name, its notice also says that the tracker cannot upload new trips
+for that link's month and keeps them queued until the link is removed (HTTP
+503). This includes `2026-12` → `2026-11`, both month links in
+`2026-01` → `2026-02` → `archive`, and the unused name when two links reach one
+non-month folder. The final target's name decides this, not which name the
+viewer counts; a link to `archive/2026-02` can still accept February trips
+under `2026-02`. Remove only the extra link, keeping the target and its files;
+ingest can then create a real month folder for queued trips. If saved names
+conflict, follow the steps below before removing links.
+Opening a trip or GPX through an extra month link redirects to the counted
+address, keeping the selected year. A change submitted to an extra-link address
+gets HTTP 409 and saves nothing; reopen the trip from the list before editing,
+removing, restoring, merging, splitting or looking up an address.
+
+When only links reach that folder, the viewer keeps the name with saved trip
+data: annotations, removals, edit history, merges and old merge addresses, or
+trip keys in a closed-year snapshot. If none has saved data, it uses the first
+name in sorted order. Adding an earlier link therefore keeps existing saved
+data and year locks attached to the same trips. A real month folder still wins.
+If several link names hold saved data, the viewer uses the first of those names
+in sorted order and shows a warning naming all of them (`row_type=folder_warning`
+in CSV). The trips are counted, but saved data under the other names is not
+applied. The admin sees counts per name of annotations, removals, merges, merge
+parts, old merge addresses, history entries and trip entries in closed-year
+snapshots, with the name in use marked. Counts describe saved database entries,
+including ones for files no longer present; they do not add miles. Every open
+year's review shows the conflict beside a disabled Close button, even if the
+folder belongs to another year. Closed-year reviews also show the conflict in
+their status section. Closing any year waits until this conflict is resolved;
+healthy trips under the name in use can still have merge suggestions. New
+merges are saved under that name, with the same file and adjacency checks as
+usual. If the admin keeps the other name, those new merges and merged
+annotations stay saved but unapplied. When all replacement files still match,
+they become unused-name notices under the rule below; otherwise they remain
+damaged merges. Restoring the name brings its saved merge back. Existing year locks remain in
+force; folder warnings are not counted as missing mileage in year snapshots.
+
+To resolve competing saved names:
+
+1. Make a normal backup of the trip files and `annotations.db`. Record each
+   link's name and target so you can recreate it. Read the counts and the name
+   in use in the admin warning. Choose which name's saved data you want to use;
+   the viewer cannot combine the names' annotations, removals or merges.
+2. Keep that name's link and remove only the other symbolic links, not their
+   target folder or trip files. Removing a name stops applying the saved data
+   under it. Removing a losing name leaves the current name's data in use.
+   Removing the name in use quietly orphans its saved data: another remaining
+   name is chosen and its annotations, removals and merges apply instead.
+   Nothing is deleted from the database. Check the trip list, Removed trips,
+   merges and year totals after changing the links.
+3. To undo, recreate the same link name to the same target. Its saved data can
+   be used again; if several saved names are present, the conflict returns and
+   sorted order decides which is in use. To inspect a losing name's saved data
+   in the viewer, temporarily leave only its link, then restore the recorded
+   links to return to the original selection. Avoid editing or closing years
+   while comparing names. Closed-year snapshots are left in place.
+4. Once the desired name is the only link, replace it with a real month folder
+   containing the existing trip files, or mount the disk at that month path.
+   Keep the month name to preserve its saved-data keys. Verify the viewer and
+   `install.sh --check`, then let the tracker retry queued uploads.
+
+A merge is listed as saved data under an unused name only when every part
+is readable and counted under another name, with both its GPX and summary
+matching the saved file names, sizes and modification times. All parts from
+one old month must match one unambiguous counted folder. A surviving alias
+must reach that folder; after its link is removed, the saved file stamps
+are the remaining evidence (the database stores no historical folder identity).
+A deleted real folder, partial matches, changed files or unreadable parts
+remain damaged merges: they count as missing mileage, appear in year review
+and close snapshots, block uncertain merge suggestions, and cannot be undone
+through **Undo saved merge**. Ordinary **Undo merge (split back)** is also
+refused for damage, for both roles. The admin can use **Discard damaged merge**
+after confirming that parts with readable summaries return separately with
+annotations saved under their names; parts without readable summaries do not.
+The merged trip's saved miles and purpose stay out of the totals and are kept in history.
+The same transaction preserves the complete saved summary, annotation and
+part keys in history before deleting the merge. The year review permanently
+lists the saved miles, purpose, date and login under **Discarded or undone saved merges**,
+including which parts are now counted again, on their own or in a current merge.
+This remains visible after closing. This deliberate confirmation and visible record are
+enough to allow closing; there is no second acknowledgement. Reopen a closed
+year before discarding. Healthy merge undo remains available to both roles.
+CSV retains discarded and undone merges as `unreadable` rows with blank miles;
+XLSX labels them on **Unreadable trips**. Their notes keep saved miles, purpose,
+trip date, action date and login, and say which parts are counted again.
+An unused-name notice adds no saved miles or
+merged annotation and does not block merge suggestions for healthy trips.
+Moving or renaming a real month folder with file times kept also produces an
+unused-name merge when every recording matches under the new name.
+To use that merge again, restore the original month name, as a link or by
+renaming the folder back, and keep that name in use
+(follow the conflict steps above before removing competing links). Or use
+**Undo saved merge** on the trip list as admin and confirm removing that
+merge and its merged annotation. The trips stay counted under the name in use with only annotations saved
+under that name. Annotations under the unused name stay in the database but
+are not applied. The merged trip's saved miles and purpose stay out of the totals;
+the undo preserves its complete summary in history before deletion, in the
+same transaction as discard, and appears in the year review with the same
+current-count statement. Source files stay intact. Closed-year locks still apply;
+reopen the affected year first. An everyday login must ask the admin.
+
+CSV lists an unused merge as `row_type=folder_notice`, with its saved key,
+category and recovery advice. Miles stay blank in CSV and XLSX numeric cells;
+saved miles appear only in the note. XLSX shows the notice in **Unreadable
+trips**, outside **Mileage** and **Totals**. The year review lists each merge
+in **Saved merges under unused month names**, with its saved miles, purpose
+and month name; its parts count separately. Closing its saved-summary year
+or any year containing one of its parts is refused until the name is restored
+or the admin uses **Undo saved merge**.
+If the saved year is unknown, every year is blocked. Reopening stays possible.
+Saved removals under an unused name are not applied, like annotations under
+that name, so the parts of a formerly removed merge count again. Its saved
+removal still hides the unused-merge notice, so it does not block year closing.
+An unused merge adds no unreadable-file count. Older snapshots stay unchanged;
+the review compares saved and current totals and names the former merged key
+leaving and the currently counted trips joining. The undo checks all replacement recordings
+again under its database write transaction; a stale form cannot discard a
+merge whose replacement parts have gone missing.
+
+The XLSX `Unreadable trips` sheet also lists folder notices and saved-data
+warnings. Their row labels say whether trips are counted elsewhere, a link
+blocks new uploads, or saved names conflict. Only a folder whose trips cannot
+be read is labeled "whole month folder"; the CSV row types distinguish these
+same cases.
 
 `install.sh --check` reports each symbolic link directly inside `data/` as
 a problem, with a hint to use a real folder or mount the other disk there.
@@ -973,7 +1171,8 @@ The limit is the named `MERGE_MAX_GAP` constant in `trip_merges.py`. Older
 summaries without that timestamp use `end_time`, the last moving point, as
 a conservative fallback. Upload/receipt times are never used. Overlapping
 recordings, unknown device identities or unknown start times cannot be merged.
-A folder warning (not a duplicate-link notice) blocks merge suggestions with a
+A folder problem that leaves trips unreadable, or a conflict between saved
+month names, blocks merge suggestions with a
 folder-specific message until the folder is fixed. An unreadable summary blocks merging when its device is
 unknown, or when it
 belongs to this device and could fall between these recordings. Usable start
@@ -1458,16 +1657,106 @@ Links anywhere under `data/` resolving outside it are logged as
 `WARNING: not backed up: data/<path> -> <target>` (first 20, then a count
 of the rest). Their contents are missing, including from earlier snapshots
 taken while the link existed. `INFO` records `links_not_backed_up=N` (missing
-means zero); a changed count makes a new snapshot. Internal links and `*.tmp`
-are not reported. Move the contents into `data/` and rerun the backup. The
+means zero in an older readable `INFO`). If the link check fails, the value is
+`unknown`: linked items were **not checked**, so inspect the backup log, fix
+the error and rerun the backup. Status and restore checks report this plainly;
+an unchecked run always makes a new snapshot. A changed count also makes a new
+snapshot. Working relative internal chains and `*.tmp` are not reported. Move the
+outside contents into `data/` and rerun the backup. The
 copy and deep check still run and `last-success` advances, but missing linked
 contents make the run exit non-zero and withhold `PING_URL`. Unraid status
 shows `last_backup_links_not_backed_up`; `install.sh --check` warns when it
-is above zero. A first backup failing only for this reason warns and install
-continues. Restore checks list outside links and can pass with a warning that
-their contents are missing; restore reports them too. Restore uses rsync
-`--safe-links`, skipping outside links and keeping existing real folders;
-relative links inside `data/` can be restored.
+is above zero or `not checked`. Missing or unreadable backup information shows
+`unavailable` in status: check the backup disk/mount, `latest`, and `INFO` before
+assuming a link check failed. With a recent success, the installer warns when
+`latest/INFO` is unavailable, unless another backup/destination check already
+explains the problem. A first backup failing only for missing linked contents
+warns and install continues.
+
+Absolute links inside `data/` get a separate warning: the link
+itself will not be restored, but its target is saved under its real path
+(or the warning says that path is missing or excluded). This warning does not
+fail the backup, withhold the heartbeat or increase `links_not_backed_up`.
+If restore advice cannot be checked, backup, check and restore log a warning
+and continue; inspect the log and rerun for that advice. Its scratch stays
+outside snapshots, and failure preserves the outside-link coverage result.
+
+Restore checks list links that will be skipped and can pass with a warning;
+restore reports them too. For an absolute link, a relocated snapshot cannot
+establish whether its original target is saved elsewhere in the backup or
+absent, so the warning explains that uncertainty.
+
+`INFO` also preserves the backup run's coverage result: if its count is positive,
+both check and restore state that the backup recorded that many linked items
+whose contents were not saved. Recover them from the original target or another
+backup, move them into `data/`, and make a fresh backup. `unknown` means the
+backup could not check; absent/unreadable `INFO` means that information is
+unavailable. Zero or an absent field in older readable `INFO` leaves the
+per-link warning neutral. A passing restore test verifies the saved copy;
+it does not recover omitted contents.
+
+Restore uses rsync
+`--safe-links`: it skips absolute links and relative paths rejected by its text
+check, keeping existing items at those paths. Too many leading `../` parts are
+rejected; current rsync also rejects `..` after a named path component. The report
+uses the installed rsync to decide which links survive. Rsync does not resolve other
+links when deciding which links to recreate. For example, `relative ->
+absolute/trip.gpx` is recreated even if `absolute` is an absolute link that is
+skipped. Backup and restore warn that `relative` depends on `data/absolute` and
+will dangle on an empty `data/`. Backup also reports whether the original target
+was saved at its real path; a relocated restore cannot establish that through
+an absolute link. Existing items may keep a chain usable on an existing install.
+Recreated links with target problems are counted separately from skipped links.
+
+Proven loops are named with a warning that the link loops and has nothing behind
+it to back up; remove or correct the link. They do not fail the run, withhold the
+heartbeat or increase `links_not_backed_up`. Check and restore give the same
+explanation for saved relative loops, which are recreated. An unresolved error
+or a walk exceeding 256 link steps without proving a loop still fails the
+coverage check. Restore does not follow an absolute link back to the original
+host to diagnose its target. A relative chain whose text passes rsync's check can
+still lead outside `data/`; it is recreated and warned about, while its outside contents
+still fail the backup run, withhold the heartbeat and count in
+`links_not_backed_up`. Backup never follows links to copy their contents.
+Replace an alias you need with a working relative internal chain or a real
+folder or file, then make a fresh backup.
+
+Snapshots contain standard GNU text `SHA256SUMS` checksums and a sorted,
+NUL-delimited `SYMLINKS` list of copied link paths/text. Spaces, line breaks,
+backslashes and leading dashes round-trip. GNU coreutils is required; Debian and
+Unraid ship it. A tiny startup probe reads a one-byte file twice to test checksum
+escaping; an incompatible tool fails any backup needing escaped names, without
+rehashing trip data. Older snapshots remain restorable. The first run after
+updating makes one extra snapshot only if the previous one lacks `SYMLINKS`.
+Copied link adds, removals, retargets or swaps with real folders also create a
+snapshot; unchanged links dedupe and excluded links do not affect comparison.
+Failure to write either manifest fails the run and withholds the heartbeat;
+inspect the log and rerun.
+
+Checks compare the links on disk with `SYMLINKS`, naming each added, removed or
+retargeted link. Older snapshots without that list still pass with a note that
+their links are not checked.
+
+To check files by hand with GNU coreutils, run `cd <snapshot>` then
+`sha256sum -c SHA256SUMS`. Every listed file must say `OK` and the command must
+exit 0. For the complete check, including unlisted files, links and databases, use
+`restore.sh check <snapshot>`.
+
+Local cleanup and pruning make only directories writable before removing them;
+kept local snapshots retain file modes. Remote pruning uses only rsync, limited
+to selected snapshot names, and never mirrors or deletes the remote root.
+A read-only file shared between snapshots may become owner-writable on the
+remote after pruning; contents and checksums are unaffected.
+
+The nightly local trip copy compares contents with rsync `--checksum`, reading
+live files and their previous copies even when size and time match: a local
+warm-cache test of 3,000 files (1 GB) took 0.46 s versus 0.14 s without it.
+A slow mounted destination reading 10–30 MB/s would need about 33–100 s per GB
+read; off-host copying keeps its metadata test, with the newest copy checked
+every run and older copies checked in the weekly rotation.
+The comparison holds the ingest upload lock while reading every live file
+(perhaps 15–30 s on a cold disk with years of trips), so an arriving upload may
+wait past the tracker's 10 s reply timeout and be retried later.
 
 Each SQLite snapshot is consistent individually; the databases and trip files
 are captured in sequence, rather than in one shared transaction.
@@ -1523,6 +1812,8 @@ replacement server, a saved monitor DB can populate its volume without enabling
 the monitor. Older snapshots still restore trips and annotations: missing new
 DB snapshots are reported and current databases are left unchanged. Any old
 live diagnostics copy under `data/` is excluded from restore too.
+After a restore run as root, files have mode 600 and folders mode 700; if the
+snapshot's modes differed, the next backup makes one new snapshot, as expected.
 
 If monitor discovery fails during restore, the script warns and restores trips,
 annotations and diagnostics, leaving the monitor service and its database alone.

@@ -4,6 +4,7 @@ import errno
 import json
 import os
 import re
+import stat
 import xml.etree.ElementTree as ET
 from xml.parsers import expat
 from datetime import datetime, timedelta, timezone
@@ -17,6 +18,10 @@ ANNOTATION_FIELDS = ("category", "purpose_note", "destination")
 YM_RE = re.compile(r"[0-9]{4}-[0-9]{2}")
 ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 TRIP_KEY_RE = re.compile(rf"({YM_RE.pattern})/({ID_RE.pattern})")
+_SOURCE_UID = getattr(os, 'geteuid', lambda: None)()
+_SOURCE_GROUPS = frozenset([getattr(os, 'getegid', lambda: None)(),
+                           *getattr(os, 'getgroups', lambda: [])()])
+DAMAGED_MERGE_PROBLEM = "A merge part is missing or unreadable."
 
 
 class MergeRefreshNeeded(Exception):
@@ -50,6 +55,15 @@ def canonical_key(conn, key):
         return row[0]
     row = conn.execute("SELECT merge_key FROM trip_merge_aliases WHERE alias_key=?", (key,)).fetchone()
     return row[0] if row else key
+
+
+def saved_summary(row):
+    """Read a saved merge summary without consulting its source files."""
+    try:
+        summary = json.loads(row["summary"])
+    except (TypeError, ValueError):
+        return {}
+    return summary if isinstance(summary, dict) else {}
 
 
 def checked_path(root, path, *, preserve_final=False):
@@ -113,6 +127,14 @@ def fingerprint(data_root, keys):
     for pair in source_file_pairs(data_root, keys):
         for source in pair:
             st = source.stat()
+            # Reuse the metadata already needed for the stamp. Losing read
+            # permission need not change size/mtime; never treat that cached
+            # merge as healthy. No extra file probes or reads on healthy scans.
+            if _SOURCE_UID not in (None, 0):
+                bit = (stat.S_IRUSR if st.st_uid == _SOURCE_UID else
+                       stat.S_IRGRP if st.st_gid in _SOURCE_GROUPS else stat.S_IROTH)
+                if not st.st_mode & bit:
+                    raise PermissionError("A merge source cannot be read")
             stamps.append((source.name, st.st_mtime_ns, st.st_size))
     return json.dumps(stamps)
 
@@ -186,7 +208,72 @@ def combined_gpx(data_root, keys):
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
-def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=None):
+def unused_merge_months(conn, data_root, keys, counted_months, originals, stored_stamp):
+    """Require all recordings under another counted name, never just absence.
+
+    A surviving alias must reach that same folder. After a link is removed,
+    the database retains no folder identity: require an unambiguous replacement
+    folder for each old month, with both files' saved names, sizes and mtimes.
+    IDs alone cannot distinguish a lost folder from unrelated recordings.
+    Only inactive merges pay for the replacement search and source checks.
+    """
+    if not keys or any(not TRIP_KEY_RE.fullmatch(key) for key in keys):
+        return []
+    months = sorted({key.split("/")[0] for key in keys})
+    if any(counted_months.get(month) == month for month in months):
+        return []  # Healthy merges need no path or replacement probes.
+    replacements = {}
+    root = data_root.resolve()
+    for month in months:
+        if month in counted_months:
+            try:
+                if checked_path(root, data_root / month) != checked_path(root, data_root / counted_months[month]):
+                    return []
+            except ValueError:
+                return []
+            replacements[month] = [counted_months[month]]
+        else:
+            try:
+                (data_root / month).lstat()
+            except FileNotFoundError:
+                replacements[month] = sorted({name for name, chosen in counted_months.items() if name == chosen})
+                continue
+            except OSError:
+                return []
+            return []
+    try:
+        stamps = json.loads(stored_stamp)
+        if not isinstance(stamps, list):
+            return []
+        if stamps and isinstance(stamps[0], int):
+            stamps = stamps[1:]  # Legacy summary-rule prefix.
+        if len(stamps) != 2 * len(keys):
+            return []
+        removed = trip_log.removals(conn)
+        in_use = {}
+        for month in months:
+            indices = [i for i, key in enumerate(keys) if key.split('/')[0] == month]
+            saved = json.dumps([stamp for i in indices for stamp in stamps[2 * i:2 * i + 2]])
+            matches = []
+            for candidate in replacements[month]:
+                alternate = [candidate + '/' + keys[i].split('/')[1] for i in indices]
+                if any(key not in originals or canonical_key(conn, key) in removed for key in alternate):
+                    continue
+                # A readable summary alone counts on ordinary pages, but this
+                # exception also needs every source GPX present and readable.
+                if not all(os.access(path, os.R_OK) for pair in source_file_pairs(data_root, alternate) for path in pair):
+                    continue
+                if same_sources(fingerprint(data_root, alternate), saved):
+                    matches.append(candidate)
+            if len(matches) != 1:
+                return []
+            in_use[month] = matches[0]
+    except (OSError, ValueError, TypeError, IndexError):
+        return []
+    return in_use
+
+
+def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=None, counted_months=None):
     """Use persisted summaries, reparsing only when a source stamp changes.
 
     A broken/missing part makes the whole merged trip unreadable, rather than
@@ -204,8 +291,19 @@ def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=N
         row = dict(row)
         key = row["trip_key"]
         keys = parts(conn, key)
-        hidden.update(keys)
         ym, trip_id = key.split("/")
+        unused = (unused_merge_months(conn, data_root, keys, counted_months, originals, row['fingerprint'])
+                  if counted_months is not None else [])
+        if unused:
+            broken.append({"folder": True, "folder_reason": "unused_merge", "unused_merge": True,
+                           "ym": ym, "id": trip_id, "trip_key": key, "parts": keys,
+                           "saved_summary": saved_summary(row),
+                           **{f: row[f] or "" for f in ANNOTATION_FIELDS},
+                           "saved_months": list(unused), "counted_months": sorted(set(unused.values())),
+                           "counted_parts": [originals[unused[k.split('/')[0]] + '/' + k.split('/')[1]] for k in keys],
+                           "has_gpx": False, "problem": "saved merge under an unused month name"})
+            continue
+        hidden.update(keys)
         t = {"ym": ym, "id": trip_id, "trip_key": key, "parts": keys,
              "has_gpx": True, **{f: row[f] or "" for f in ANNOTATION_FIELDS}}
         if keys:
@@ -241,7 +339,8 @@ def apply_merges(conn, data_root, trips, unreadable, *, refresh=True, only_key=N
                 t["received_at"] = received
             merged.append(t)
         except (OSError, ValueError):
-            broken.append({**t, "problem": "A merge part is missing or unreadable; restore it or undo the merge."})
+            broken.append({**t, "damaged_merge": True, "saved_summary": saved_summary(row),
+                           "problem": DAMAGED_MERGE_PROBLEM})
     return ([t for t in trips if t["trip_key"] not in hidden] + merged,
             [t for t in unreadable if t["trip_key"] not in hidden] + broken)
 
@@ -304,8 +403,9 @@ def next_trip(trip, trips, unreadable, removed=()):
             return None, REMOVED_BETWEEN
         current_start = _parse_iso(trip["start_time"])
         for damaged in unreadable:
-            if damaged.get("folder_reason") == "duplicate":
-                continue  # Its recordings are already present under the counted month.
+            if damaged.get("folder_reason") in ("duplicate", "ingest_refused", "saved_keys", "unused_merge",
+                                                "not_folder", "link_not_folder", "unwritable"):
+                continue  # No recordings are missing because of this notice.
             if damaged.get("folder"):
                 return None, f"Cannot establish the next trip: a month folder has a problem ({damaged['problem']}). Fix it before merging."
             damaged_device = damaged.get("device_id")

@@ -1,6 +1,7 @@
 """Monitor progress, safe unexpected-exception logs and the actual Compose probe."""
 
 import ast
+import builtins
 import os
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from test_monitor import monitor
+from time_helpers import time_stub
 
 
 class HeartbeatTests(unittest.TestCase):
@@ -115,13 +117,18 @@ class ComposeHeartbeatTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             heartbeat = Path(root) / "heartbeat"
             script = test[3].replace("/state/heartbeat", heartbeat.as_posix())
+            clock = time_stub(time=lambda: 1000)
+            def probe_import(name, *args, **kwargs):
+                return clock if name == "time" else __import__(name, *args, **kwargs)
+            # The actual probe imports time. Give only this exec its fake clock,
+            # leaving imports and clocks in other threads untouched.
+            namespace = {"__builtins__": {**vars(builtins), "__import__": probe_import}}
             for age, expected in ((None, 1), (0, 0), (60, 0), (180, 0), (181, 1), (-1, 1)):
                 if age is not None:
                     heartbeat.touch()
                     os.utime(heartbeat, (1000 - age, 1000 - age))
-                with self.subTest(age=age), mock.patch("time.time", return_value=1000), \
-                        self.assertRaises(SystemExit) as caught:
-                    exec(script, {})
+                with self.subTest(age=age), self.assertRaises(SystemExit) as caught:
+                    exec(script, namespace.copy())
                 self.assertEqual(caught.exception.code, expected)
 
 

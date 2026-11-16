@@ -2,6 +2,7 @@
 
 import builtins
 import csv
+import html
 import io
 import json
 import os
@@ -21,6 +22,7 @@ from openpyxl import load_workbook
 from werkzeug.security import generate_password_hash
 
 from test_round_trip import load_service, SERVER
+from month_link_layouts import MONTH_LINK_LAYOUTS, make_layout
 
 
 class ViewerMerges(unittest.TestCase):
@@ -45,6 +47,7 @@ class ViewerMerges(unittest.TestCase):
 
     def authenticate(self, client):
         with client.session_transaction() as session:
+            session.clear()
             session.update(user="driver", pw_tag=self.viewer._password_tag(), csrf="test-csrf")
 
     def trip(self, name, seconds, offset=0, device="test-device", legacy=False):
@@ -81,6 +84,939 @@ class ViewerMerges(unittest.TestCase):
 
     def split(self, key):
         return self.client.post(f"/trip/{key}/split", data={"csrf_token": "test-csrf", "confirm": "yes"})
+
+    def symlink(self, link, target, directory=False):
+        try:
+            link.symlink_to(target, target_is_directory=directory)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+
+    def unused_merge(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        self.annotate(a, "business", "original note")
+        key = self.merged_key(self.merge(a, b))
+        self.annotate(key, "business", "merged note")
+        self.month.rename(self.data / "archive")
+        make_layout(self.data, MONTH_LINK_LAYOUTS["merge-conflict"], self.symlink)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO annotations (trip_key,category) VALUES ('2026-03/a','personal')")
+        return key
+
+    def undo_unused(self, key, **data):
+        return self.client.post(f"/admin/unused-merge/{key}/undo", data={
+            "csrf_token": "test-csrf", "confirm": "yes", **data})
+
+    def discard(self, key, **data):
+        return self.client.post(f'/admin/damaged-merge/{key}/discard', data={
+            'csrf_token': 'test-csrf', 'confirm': 'yes', **data})
+
+    def damaged_merge(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        self.annotate(a, 'personal', 'original note', 'original stop')
+        key = self.merged_key(self.merge(a, b))
+        self.annotate(key, 'business', 'merged note', 'example stop')
+        with closing(sqlite3.connect(self.db)) as conn:
+            summary = conn.execute('SELECT summary FROM trip_merges').fetchone()[0]
+        shutil.rmtree(self.month)
+        return key, [a, b], summary
+
+    def test_damaged_merge_discard_is_admin_only_post_csrf_and_explicit_confirmation(self):
+        key, _, _ = self.damaged_merge()
+        from test_viewer_roles import ViewerRolesTests
+        ViewerRolesTests.seed_editor(self)
+        ViewerRolesTests.signed_in(self, 'editor')
+        with self.client.session_transaction() as session:
+            session['csrf'] = 'test-csrf'
+        page = html.unescape(self.client.get('/').get_data(as_text=True))
+        self.assertNotIn('>Undo merge (split back)</button>', page)
+        self.assertNotIn('>Discard damaged merge</button>', page)
+        self.assertIn('Please ask the admin to restore the files or discard this damaged merge.', page)
+        self.assertEqual(self.split(key).status_code, 409)
+        self.assertEqual(self.discard(key).status_code, 403)
+        self.assertEqual(self.client.get('/admin/year/2026').status_code, 403)
+        self.authenticate(self.client)
+        page = html.unescape(self.client.get('/').get_data(as_text=True))
+        self.assertNotIn('>Undo merge (split back)</button>', page)
+        self.assertIn('>Discard damaged merge</button>', page)
+        self.assertIn(self.viewer.DAMAGED_MERGE_DISCARD_EFFECT, page)
+        self.assertEqual(self.client.get(f'/admin/damaged-merge/{key}/discard').status_code, 405)
+        self.assertEqual(self.discard(key, csrf_token='bad').status_code, 400)
+        self.assertEqual(self.discard(key, confirm='no').status_code, 400)
+        anonymous = self.viewer.app.test_client()
+        self.assertEqual(anonymous.post(f'/admin/damaged-merge/{key}/discard').status_code, 401)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute('SELECT count(*) FROM trip_merges').fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT count(*) FROM trip_history WHERE action='discard_damaged_merge'").fetchone()[0], 0)
+
+    def test_discard_preserves_full_saved_record_before_deletion_and_in_year_review(self):
+        key, parts, summary = self.damaged_merge()
+        original_record = self.viewer.trip_log.record
+        def record(conn, record_key, action, details, **actor):
+            if action == 'discard_damaged_merge':
+                self.assertTrue(conn.in_transaction)
+                self.assertEqual(conn.execute('SELECT summary FROM trip_merges WHERE trip_key=?', (key,)).fetchone()[0], summary)
+            return original_record(conn, record_key, action, details, **actor)
+        with patch.object(self.viewer.trip_log, 'record', side_effect=record):
+            self.assertEqual(self.discard(key).status_code, 302)
+        self.assertEqual(self.discard(key).status_code, 409)
+        with closing(sqlite3.connect(self.db)) as conn:
+            rows = conn.execute("SELECT trip_key, actor, actor_role, at, details FROM trip_history WHERE action='discard_damaged_merge'").fetchall()
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row[:3], (key, 'driver', 'admin'))
+            self.assertIsNotNone(self.viewer.trip_log.parse_utc(row[3]))
+            details = json.loads(row[4])
+            self.assertEqual(details['parts'], parts)
+            self.assertEqual(details['saved_summary_raw'], summary)
+            self.assertEqual(details['saved_summary'], json.loads(summary))
+            for field in ('start_time', 'end_time', 'distance_miles'):
+                self.assertIsNotNone(details['saved_summary'][field])
+            self.assertEqual(details['dropped'], {'category': 'business', 'purpose_note': 'merged note', 'destination': 'example stop'})
+            self.assertEqual(details['original_annotations'][parts[0]],
+                             {'category': 'personal', 'purpose_note': 'original note', 'destination': 'original stop'})
+            for table in ('trip_merges', 'trip_merge_parts', 'trip_merge_aliases'):
+                self.assertEqual(conn.execute('SELECT count(*) FROM ' + table).fetchone()[0], 0)
+            self.assertEqual(conn.execute('SELECT purpose_note FROM annotations WHERE trip_key=?', (parts[0],)).fetchone()[0], 'original note')
+            self.assertEqual(conn.execute("SELECT count(*) FROM trip_history WHERE action='split'").fetchone()[0], 0)
+        review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
+        self.assertIn('Discarded or undone saved merges (1)', review)
+        self.assertIn(f"{json.loads(summary)['distance_miles']:.3f} mi", review)
+        self.assertIn('purpose: business; purpose note: merged note', review)
+        self.assertIn('driver', review)
+        self.assertIn(self.viewer.fmt_date(row[3]), review)
+        self.assertIn('None of its trips are in the log; these saved miles are not in the totals.', review)
+        self.assertNotIn('Discarded or undone saved merges', self.client.get('/admin/year/2025').get_data(as_text=True))
+        self.assertIn(2026, [r['year'] for r in self.viewer._year_list()])
+        self.assertEqual(self.close_year().status_code, 302)
+        self.assertIn('Discarded or undone saved merges (1)', self.client.get('/admin/year/2026').get_data(as_text=True))
+        history = self.client.get('/admin/history').get_data(as_text=True)
+        self.assertIn('Damaged merge discarded', history)
+        self.assertIn('Discarded damaged merge with 0.732 mi; saved annotation: business, example stop, merged note. '
+                      'Parts with readable trip summaries can be counted separately with the annotations saved under their names. '
+                      'Missing or unreadable summaries need recovery from backups. '
+                      "The merged trip's saved miles and purpose are not in the totals and are kept in this history record.",
+                      html.unescape(history))
+
+    def discard_with_readable_parts(self, missing_summaries=()):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        self.annotate(a, 'personal', 'original note')
+        key = self.merged_key(self.merge(a, b))
+        self.annotate(key, 'business', 'merged note')
+        (self.month / 'b.gpx').unlink()
+        for name in missing_summaries:
+            (self.month / (name + '.json')).unlink()
+        self.assert_damaged_messages_for_both_roles(key)
+        self.assertEqual(self.discard(key).status_code, 302)
+        return key
+
+    def assert_damaged_messages_for_both_roles(self, key):
+        from test_viewer_roles import ViewerRolesTests
+        ViewerRolesTests.seed_editor(self)
+        effect = ('Parts whose trip summaries can still be read return as separate trips with the annotations saved under their names. '
+                  'Parts without readable summaries do not return. '
+                  "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review.")
+        for role in ('admin', 'editor'):
+            if role == 'editor':
+                ViewerRolesTests.signed_in(self, role)
+            expected = ('A merge part is missing or unreadable. Saved merge: 0.732 mi; purpose: business. '
+                        'Its saved miles are not in the totals. Restore missing or unreadable files from backups. '
+                        + ('Or use Discard damaged merge. ' if role == 'admin' else
+                           'Please ask the admin to restore the files or discard this damaged merge. ') + effect)
+            for path in ('/', '/trip/' + key, '/export.csv?year=2026'):
+                self.assertIn(expected, html.unescape(self.client.get(path).get_data(as_text=True)), (role, path))
+            book = load_workbook(io.BytesIO(self.client.get('/export.xlsx?year=2026').data))
+            try:
+                self.assertIn(expected, str(list(book['Unreadable trips'].values)))
+            finally:
+                book.close()
+            if role == 'admin':
+                self.assertIn(expected, html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True)))
+                response = self.discard(key, confirm='no')
+                self.assertEqual(response.status_code, 400)
+                self.assertIn('Confirm discarding this damaged merge. ' + effect,
+                              html.unescape(response.get_data(as_text=True)))
+        self.authenticate(self.client)
+
+    def test_round_six_preserves_baseline_totals_on_all_four_surfaces(self):
+        # Captured from b60d550 using these exact synthetic scenarios. Notice
+        # and history rows must never change any of the four sets of totals.
+        for scenario, expected in (
+            ('healthy', (0, .041, 0, .041, .082)),
+            ('discard', (0, .041, 0, .041, .082)),
+            ('remerge', (.732, 0, 0, 0, .732)),
+            ('unused_undo', (0, 0, 0, .082, .082)),
+        ):
+            with self.subTest(scenario=scenario):
+                fixture = ViewerMerges()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                if scenario == 'unused_undo':
+                    key, _ = fixture.moved_merge()
+                    self.assertEqual(fixture.undo_unused(key).status_code, 302)
+                else:
+                    a, b = fixture.trip('a', 0), fixture.trip('b', 180, .01)
+                    fixture.annotate(a, 'personal', 'original note')
+                    if scenario != 'healthy':
+                        key = fixture.merged_key(fixture.merge(a, b))
+                        fixture.annotate(key, 'business', 'merged note')
+                        saved_gpx = (fixture.month / 'b.gpx').read_bytes()
+                        (fixture.month / 'b.gpx').unlink()
+                        self.assertEqual(fixture.discard(key).status_code, 302)
+                        if scenario == 'remerge':
+                            (fixture.month / 'b.gpx').write_bytes(saved_gpx)
+                            key = fixture.merged_key(fixture.merge(a, b))
+                            fixture.annotate(key, 'business', 'merged note')
+                totals = dict(zip(('business', 'personal', 'other', 'unclassified', 'all'), expected, strict=True))
+                trips, entries = fixture.viewer.load_trips()
+                self.assertEqual(fixture.viewer.mileage_totals(trips), totals)
+                page = fixture.client.get('/?year=2026').get_data(as_text=True)
+                self.assertIn(f'{totals["all"]:.3f} mi total', page)
+                review = fixture.client.get('/admin/year/2026').get_data(as_text=True)
+                section = review.split('<h2 id="totals-heading">', 1)[1].split('</section>', 1)[0]
+                self.assertEqual({name: float(miles) for name, miles in re.findall(
+                    r'<td>(business|personal|other|unclassified|all)</td><td>\d+</td><td>([\d.]+)</td>', section)}, totals)
+                rows = list(csv.DictReader(io.StringIO(fixture.client.get('/export.csv?year=2026').get_data(as_text=True))))
+                self.assertEqual({r['category']: float(r['distance_miles']) for r in rows if r['row_type'] == 'total'}, totals)
+                book = load_workbook(io.BytesIO(fixture.client.get('/export.xlsx?year=2026').data))
+                try:
+                    self.assertEqual({r[2]: r[3] for r in list(book['Totals'].values)[1:]}, totals)
+                finally:
+                    book.close()
+
+    def assert_discard_current_statement(self, statement, *, undone=False):
+        with closing(sqlite3.connect(self.db)) as conn:
+            rows = self.viewer._merge_history_rows(conn, 2026, self.viewer.load_trips()[0])
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        label = 'Unused-name merge undone' if undone else 'Damaged merge discarded'
+        expected = (f"{label}. Saved miles: 0.732 mi; purpose: business; purpose note: merged note; "
+                    f"trip date: 2026-04-14 12:00 UTC. Recorded at: {self.viewer.fmt_date(row['at'])}; login: driver. "
+                    + statement)
+        self.assertEqual(self.viewer.merge_history_message(row), expected)
+        review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
+        self.assertIn(expected, review)
+        self.assertNotIn('Saved miles (excluded)', review)
+        self.assert_history_exports(expected, label.lower())
+
+    def assert_history_exports(self, expected, label):
+        for suffix in ('?year=2026', ''):
+            rows = list(csv.DictReader(io.StringIO(self.client.get('/export.csv' + suffix).get_data(as_text=True))))
+            records = [r for r in rows if r['row_type'] == 'unreadable' and label.capitalize() in r['purpose_note']]
+            # The label begins a sentence in the shared formatter.
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]['distance_miles'], '')
+            self.assertEqual(records[0]['purpose_note'], expected)
+            book = load_workbook(io.BytesIO(self.client.get('/export.xlsx' + suffix).data))
+            try:
+                header, *values = list(book['Unreadable trips'].values)
+                records = [dict(zip(header, r, strict=True)) for r in values if expected == r[header.index('purpose_note')]]
+                self.assertEqual(len(records), 1)
+                self.assertTrue(records[0]['trip_id'].endswith(' (' + label + ')'))
+                self.assertIsNone(records[0]['distance_miles'])
+            finally:
+                book.close()
+        rows = list(csv.DictReader(io.StringIO(self.client.get('/export.csv?year=2025').get_data(as_text=True))))
+        self.assertFalse(any(label.capitalize() in r['purpose_note'] for r in rows))
+        from test_viewer_roles import ViewerRolesTests
+        if self.viewer.users.get_user(self.db, 'helper') is None:
+            ViewerRolesTests.seed_editor(self)
+        ViewerRolesTests.signed_in(self, 'editor')
+        rows = list(csv.DictReader(io.StringIO(self.client.get('/export.csv?year=2026').get_data(as_text=True))))
+        self.assertIn(expected, [r['purpose_note'] for r in rows if r['row_type'] == 'unreadable'])
+        book = load_workbook(io.BytesIO(self.client.get('/export.xlsx?year=2026').data))
+        try:
+            self.assertIn(expected, str(list(book['Unreadable trips'].values)))
+        finally:
+            book.close()
+        self.authenticate(self.client)
+
+    def test_discard_with_all_summaries_readable_reports_both_counted_again(self):
+        self.discard_with_readable_parts()
+        self.assert_discard_current_statement(
+            'Now counted again: 2026-04/a, 2026-04/b; do not add these saved miles by hand.')
+        trips, _ = self.viewer.load_trips()
+        self.assertEqual({t['trip_key']: t['category'] for t in trips}, {'2026-04/a': 'personal', '2026-04/b': ''})
+
+    def test_discard_with_one_summary_readable_reports_mixed_membership(self):
+        self.discard_with_readable_parts(('b',))
+        self.assert_discard_current_statement(
+            'Now counted again: 2026-04/a; do not add these saved miles by hand. Not currently counted: 2026-04/b.')
+
+    def test_discard_with_no_summaries_readable_reports_none_counted(self):
+        self.discard_with_readable_parts(('a', 'b'))
+        self.assert_discard_current_statement('None of its trips are in the log; these saved miles are not in the totals.')
+
+    def test_discard_then_restore_and_remerge_reports_parts_inside_current_merge(self):
+        key, parts, _ = self.damaged_merge()
+        self.assertEqual(self.discard(key).status_code, 302)
+        self.month.mkdir()
+        self.trip('a', 0)
+        self.trip('b', 180, .01)
+        merged = self.merged_key(self.merge(*parts))
+        self.annotate(merged, 'business', 'merged note')
+        self.assert_discard_current_statement(
+            f'Now counted again: 2026-04/a (inside {merged}), 2026-04/b (inside {merged}); '
+            'do not add these saved miles by hand.')
+        self.assertNotIn('Discard damaged merge', self.client.get('/').get_data(as_text=True))
+
+    def test_history_count_computation_is_absent_on_list_and_reviews_without_records(self):
+        self.trip('a', 0)
+        with patch.object(self.viewer, '_merge_history_counted_parts', side_effect=AssertionError('unexpected work')):
+            self.assertEqual(self.client.get('/').status_code, 200)
+            self.assertEqual(self.client.get('/admin/year/2026').status_code, 200)
+        self.discard_with_readable_parts()
+        with patch.object(self.viewer, '_merge_history_counted_parts', side_effect=AssertionError('unexpected work')):
+            self.assertEqual(self.client.get('/').status_code, 200)
+            self.assertEqual(self.client.get('/admin/year/2025').status_code, 200)
+
+    def test_discard_and_history_roll_back_together_if_deletion_fails(self):
+        key, parts, _ = self.damaged_merge()
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("CREATE TRIGGER refuse_delete BEFORE DELETE ON trip_merges BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END")
+        self.viewer.app.config['TESTING'] = True
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.discard(key)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute('SELECT count(*) FROM trip_merges').fetchone()[0], 1)
+            self.assertEqual(self.viewer.trip_merges.parts(conn, key), parts)
+            self.assertEqual(conn.execute("SELECT count(*) FROM trip_history WHERE action='discard_damaged_merge'").fetchone()[0], 0)
+
+    def test_damaged_split_refusal_addresses_each_role(self):
+        key, _, _ = self.damaged_merge()
+        from test_viewer_roles import ViewerRolesTests
+        ViewerRolesTests.seed_editor(self)
+        for role, advice in (
+            ('admin', 'Restore its files from backups or review the saved merge on the trip list.'),
+            ('editor', 'Ask the admin to restore its files from backups or review the saved merge on the trip list.'),
+        ):
+            if role == 'editor':
+                ViewerRolesTests.signed_in(self, role)
+                with self.client.session_transaction() as session:
+                    session['csrf'] = 'test-csrf'
+            response = self.split(key)
+            self.assertEqual(response.status_code, 409)
+            self.assertIn('This merge has missing or unreadable parts. ' + advice,
+                          html.unescape(response.get_data(as_text=True)))
+
+    def test_discard_refuses_healthy_unused_or_repaired_merges_and_preserves_files(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        files = {p: p.read_bytes() for p in self.month.iterdir()}
+        self.assertEqual(self.discard(key).status_code, 409)
+        (self.month / 'b.gpx').unlink()
+        self.assertIn('>Discard damaged merge</button>', self.client.get('/').get_data(as_text=True))
+        (self.month / 'b.gpx').write_bytes(files[self.month / 'b.gpx'])
+        self.assertEqual(self.discard(key).status_code, 409)
+        self.assertEqual({p: p.read_bytes() for p in self.month.iterdir()}, files)
+        self.viewer.load_trips()  # Commit the repaired source's refreshed stamp.
+        self.month.rename(self.data / '2026-05')
+        self.assertTrue(self.viewer.load_trips()[1][0]['unused_merge'])
+        self.assertEqual(self.discard(key).status_code, 409)
+
+    def test_discard_respects_closed_year_and_saved_snapshot_then_reopen_allows_it(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        self.assertEqual(self.close_year().status_code, 302)
+        shutil.rmtree(self.month)
+        self.assertEqual(self.discard(key).status_code, 409)
+        self.assertEqual(self.split(key).status_code, 409)
+        self.assertEqual(self.client.post('/admin/year/2026/reopen', data={
+            'csrf_token': 'test-csrf', 'confirm': 'yes'}).status_code, 302)
+        # Snapshot membership still locks it even if the saved date is another year.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('INSERT INTO tax_years VALUES (2025,\'driver\',\'\',?)', (json.dumps({'trip_keys': [key]}),))
+        self.assertEqual(self.discard(key).status_code, 409)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('DELETE FROM tax_years')
+        self.assertEqual(self.discard(key).status_code, 302)
+
+    def test_healthy_merge_undo_still_restores_original_annotations_for_both_roles(self):
+        from test_viewer_roles import ViewerRolesTests
+        ViewerRolesTests.seed_editor(self)
+        for index, role in enumerate(('admin', 'editor')):
+            a = self.trip(f'a{index}', index * 600)
+            b = self.trip(f'b{index}', index * 600 + 180, .01)
+            self.annotate(a, 'personal', 'original note')
+            key = self.merged_key(self.merge(a, b))
+            self.annotate(key, 'business', 'merged note')
+            if role == 'editor':
+                ViewerRolesTests.signed_in(self, role)
+                with self.client.session_transaction() as session:
+                    session['csrf'] = 'test-csrf'
+            page = self.client.get('/trip/' + key).get_data(as_text=True)
+            self.assertIn('>Undo merge (split back)</button>', page)
+            self.assertIn('Restore each original trip and annotation, removing the current merged annotation.', page)
+            self.assertEqual(self.split(key).status_code, 302)
+            trips = {t['trip_key']: t for t in self.viewer.load_trips()[0]}
+            self.assertEqual(trips[a]['purpose_note'], 'original note')
+            self.assertEqual(trips[a]['category'], 'personal')
+            self.assertEqual(trips[b]['purpose_note'], '')
+            self.authenticate(self.client)
+
+    def test_discard_uses_exact_damaged_saved_key_without_following_month_alias(self):
+        key = self.unused_merge()
+        (self.data / 'archive/b.gpx').unlink()
+        self.assertEqual(self.discard(key.replace('2026-04/', '2026-03/')).status_code, 409)
+        self.assertEqual(self.split(key).status_code, 409)
+        self.assertEqual(self.discard(key).status_code, 302)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT trip_key FROM trip_history WHERE action='discard_damaged_merge'").fetchone()[0], key)
+
+    @unittest.skipIf(os.name == 'nt' or getattr(os, 'geteuid', lambda: 0)() == 0, 'requires non-root POSIX permissions')
+    def test_unreadable_part_without_stamp_change_requires_admin_discard(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        source = self.month / 'b.gpx'
+        saved_stat = source.stat()
+        self.addCleanup(source.chmod, 0o600)
+        source.chmod(0o000)
+        self.assertEqual(source.stat().st_mtime_ns, saved_stat.st_mtime_ns)
+        self.assertEqual(source.stat().st_size, saved_stat.st_size)
+        broken = self.viewer.load_trips()[1][0]
+        self.assertTrue(broken['damaged_merge'])
+        self.assertEqual(self.split(key).status_code, 409)
+        self.assertEqual(self.discard(key).status_code, 302)
+
+    def assert_unused_merge(self, key, conflict):
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual({t["trip_key"] for t in trips}, {"2026-03/a", "2026-03/b"})
+        unused = next(e for e in entries if e.get("unused_merge"))
+        with self.viewer._trip_read(trip_key=key) as (_, targeted, problems):
+            self.assertEqual(targeted, [])
+            self.assertEqual(problems, [unused])
+        for role in ('admin', 'editor'):
+            if role == 'editor':
+                from test_viewer_roles import ViewerRolesTests
+                if self.viewer.users.get_user(self.db, 'helper') is None:
+                    ViewerRolesTests.seed_editor(self)
+                ViewerRolesTests.signed_in(self, 'editor')
+            response = self.client.get('/trip/' + key)
+            self.assertEqual(response.status_code, 404)
+            self.assertIn(self.viewer.folder_message(unused, role), html.unescape(response.get_data(as_text=True)))
+            self.authenticate(self.client)
+        self.assertEqual(unused["trip_key"], key)
+        self.assertFalse(self.viewer.missing_mileage(unused))
+        self.assertEqual(any(e.get("folder_reason") == "saved_keys" for e in entries), conflict)
+        first = next(t for t in trips if t["id"] == "a")
+        candidate, reason = self.viewer.trip_merges.next_trip(first, trips, entries)
+        self.assertEqual(candidate["trip_key"] if candidate else None, "2026-03/b", reason)
+        figures = self.viewer.year_figures(*self.viewer.year_members(trips, entries, 2026))
+        self.assertEqual(figures["unreadable"], 0)
+        self.assertNotIn(key, figures["trip_keys"])
+        for route in ("/", "/admin/year/2026", "/export.csv", "/export.xlsx"):
+            response = self.client.get(route)
+            self.assertEqual(response.status_code, 200)
+            message = self.viewer.folder_message(unused, "admin")
+            if route.endswith(".xlsx"):
+                book = load_workbook(io.BytesIO(response.data))
+                try:
+                    self.assertIn(message, str(list(book["Unreadable trips"].values)))
+                finally:
+                    book.close()
+            else:
+                self.assertIn(message, html.unescape(response.get_data(as_text=True)))
+                self.assertNotIn("A merge part is missing or unreadable", response.get_data(as_text=True))
+            response.close()
+        rows = list(csv.DictReader(io.StringIO(self.client.get("/export.csv").get_data(as_text=True))))
+        notice = next(r for r in rows if r["trip_id"] == key)
+        self.assertEqual(notice["row_type"], "folder_notice")
+        self.assertEqual(notice["distance_miles"], "")
+        self.assertEqual(notice["category"], "business")
+        self.assertEqual(sum(r["row_type"] == "trip" for r in rows), 2)
+        self.assert_unused_close_refused(key)
+        page = self.client.get("/").get_data(as_text=True)
+        self.assertIn(f'action="/admin/unused-merge/{key}/undo"', page)
+        part_page = self.client.get("/trip/2026-03/a").get_data(as_text=True)
+        self.assertIn('value="2026-03/b"', part_page)
+
+    def test_unused_merge_during_conflict_after_removal_and_after_original_name_restored(self):
+        key = self.unused_merge()
+        self.assert_unused_merge(key, conflict=True)
+        (self.data / "2026-04").unlink()
+        self.assert_unused_merge(key, conflict=False)
+        (self.data / "2026-03").unlink()
+        self.symlink(self.month, self.data / "archive", directory=True)
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual([t["trip_key"] for t in trips], [key])
+        self.assertFalse(any(e.get("unused_merge") for e in entries))
+        self.assertEqual(trips[0]["purpose_note"], "merged note")
+        self.assertEqual(self.close_year().status_code, 302)
+        with closing(sqlite3.connect(self.db)) as conn:
+            snapshot = json.loads(conn.execute("SELECT snapshot FROM tax_years").fetchone()[0])
+        self.assertEqual(snapshot['trip_keys'], [key])
+        self.assertEqual(snapshot['totals']['business'], round(trips[0]['distance_miles'], 3))
+
+    def close_year(self, year=2026):
+        return self.client.post(f'/admin/year/{year}/close', data={'csrf_token': 'test-csrf', 'confirm': 'yes'})
+
+    def assert_unused_close_refused(self, key, year=2026):
+        response = self.close_year(year)
+        self.assertEqual(response.status_code, 409)
+        self.assertIn(self.viewer.UNUSED_MERGE_CLOSE_REFUSAL, html.unescape(response.get_data(as_text=True)))
+        review = html.unescape(self.client.get(f'/admin/year/{year}').get_data(as_text=True))
+        section = review.split('<h2 id="unused-merges-heading">', 1)[1].split('</section>', 1)[0]
+        self.assertIn(key, section)
+        self.assertIn('These saved miles and this purpose are not in the totals shown.', section)
+        self.assertIn('The trips it was made from are counted separately.', section)
+        self.assertIn(f'<button class="btn" disabled>Close {year}</button>', review)
+
+    def moved_merge(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        self.annotate(a, 'personal', 'original note')
+        key = self.merged_key(self.merge(a, b))
+        self.annotate(key, 'business', 'merged note')
+        summary = self.viewer.load_trips()[0][0]
+        self.month.rename(self.data / '2026-05')
+        return key, summary
+
+    def test_moved_real_month_blocks_close_and_exports_saved_miles_without_counting_them(self):
+        key, saved = self.moved_merge()
+        self.assert_unused_close_refused(key)
+        trips, entries = self.viewer.load_trips()
+        figures = self.viewer.year_figures(*self.viewer.year_members(trips, entries, 2026))
+        self.assertEqual(figures['unreadable'], 0)
+        self.assertEqual(figures['totals']['business'], 0)
+        self.assertLess(figures['totals']['all'], saved['distance_miles'])
+        review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
+        self.assertIn(f"Saved miles: {saved['distance_miles']:.3f} mi; purpose: business; purpose note: merged note.", review)
+        rows = list(csv.DictReader(io.StringIO(self.client.get('/export.csv?year=2026').get_data(as_text=True))))
+        notice = next(r for r in rows if r['trip_id'] == key)
+        self.assertEqual(notice['distance_miles'], '')
+        self.assertEqual(notice['row_type'], 'folder_notice')
+        self.assertAlmostEqual(sum(float(r['distance_miles'] or 0) for r in rows if r['row_type'] != 'total'),
+                               sum(t['distance_miles'] for t in trips))
+        self.assertEqual(float(next(r for r in rows if r['row_type'] == 'total' and r['category'] == 'all')['distance_miles']),
+                         figures['totals']['all'])
+        book = load_workbook(io.BytesIO(self.client.get('/export.xlsx?year=2026').data))
+        try:
+            header, row = list(book['Unreadable trips'].values)
+            values = dict(zip(header, row, strict=True))
+            self.assertIsNone(values['distance_miles'])
+            self.assertIn('not in the totals shown', values['purpose_note'])
+            self.assertEqual(book['Mileage'].max_row, 3)
+            self.assertEqual(list(book['Totals'].values)[-1][-1], figures['totals']['all'])
+        finally:
+            book.close()
+        self.assertEqual(self.undo_unused(key).status_code, 302)
+        self.assertEqual(self.close_year().status_code, 302)
+
+    def test_moved_real_month_restored_by_renaming_allows_close_with_saved_purpose(self):
+        key, saved = self.moved_merge()
+        self.assert_unused_close_refused(key)
+        (self.data / '2026-05').rename(self.month)
+        self.assertEqual(self.close_year().status_code, 302)
+        with closing(sqlite3.connect(self.db)) as conn:
+            snapshot = json.loads(conn.execute('SELECT snapshot FROM tax_years').fetchone()[0])
+        self.assertEqual(snapshot['trip_keys'], [key])
+        self.assertEqual(snapshot['totals']['business'], round(saved['distance_miles'], 3))
+
+    def test_unused_undo_names_annotations_and_keeps_full_summary_before_deletion(self):
+        key, _ = self.moved_merge()
+        absent = self.undo_unused('2026-04/merge-absent', confirm='no')
+        self.assertEqual(absent.status_code, 400)
+        self.assertIn('Confirm removing this unused merge and its merged annotation.', absent.get_data(as_text=True))
+        effect = ('The trips stay counted under 2026-05/ with only the annotations saved under that name. '
+                  'Annotations saved under 2026-04/ are kept in the database but not applied. '
+                  "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review.")
+        page = html.unescape(self.client.get('/').get_data(as_text=True))
+        self.assertIn('Remove this unused merge and its merged annotation. ' + effect, page)
+        refusal = self.undo_unused(key, confirm='no')
+        self.assertEqual(refusal.status_code, 400)
+        self.assertIn('Confirm removing this unused merge and its merged annotation. ' + effect,
+                      html.unescape(refusal.get_data(as_text=True)))
+        with closing(sqlite3.connect(self.db)) as conn:
+            summary = conn.execute('SELECT summary FROM trip_merges').fetchone()[0]
+        original_record = self.viewer.trip_log.record
+        def record(conn, record_key, action, details, **actor):
+            self.assertTrue(conn.in_transaction)
+            self.assertEqual(conn.execute('SELECT summary FROM trip_merges WHERE trip_key=?', (key,)).fetchone()[0], summary)
+            return original_record(conn, record_key, action, details, **actor)
+        with patch.object(self.viewer.trip_log, 'record', side_effect=record):
+            self.assertEqual(self.undo_unused(key).status_code, 302)
+        trips, _ = self.viewer.load_trips()
+        self.assertEqual({t['trip_key']: t['category'] for t in trips}, {'2026-05/a': '', '2026-05/b': ''})
+        with closing(sqlite3.connect(self.db)) as conn:
+            details = json.loads(conn.execute("SELECT details FROM trip_history WHERE action='split'").fetchone()[0])
+            self.assertEqual(details['saved_summary_raw'], summary)
+            self.assertEqual(details['saved_summary'], json.loads(summary))
+            self.assertEqual(details['dropped']['purpose_note'], 'merged note')
+            self.assertEqual(details['original_annotations']['2026-04/a']['category'], 'personal')
+            self.assertEqual(details['undo_effect'], effect)
+            self.assertEqual(details['counted_part_keys'], {'2026-04/a': '2026-05/a', '2026-04/b': '2026-05/b'})
+        review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
+        self.assertIn('Unused-name merge undone. Saved miles: 0.732 mi; purpose: business; purpose note: merged note;', review)
+        self.assertIn('Now counted again: 2026-04/a as 2026-05/a, 2026-04/b as 2026-05/b; do not add these saved miles by hand.', review)
+        with closing(sqlite3.connect(self.db)) as conn:
+            row = self.viewer._merge_history_rows(conn, 2026, trips)[0]
+        self.assert_history_exports(self.viewer.merge_history_message(row), 'unused-name merge undone')
+        history = html.unescape(self.client.get('/admin/history').get_data(as_text=True))
+        self.assertIn('Unused-name merge undone. ' + effect, history)
+        self.assertEqual(self.close_year().status_code, 302)
+        self.assertIn('Unused-name merge undone.', self.client.get('/admin/year/2026').get_data(as_text=True))
+
+    def test_unused_undo_history_rolls_back_if_deletion_fails(self):
+        key, _ = self.moved_merge()
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("CREATE TRIGGER refuse_delete BEFORE DELETE ON trip_merges BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END")
+        self.viewer.app.config['TESTING'] = True
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.undo_unused(key)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute('SELECT count(*) FROM trip_merges').fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT count(*) FROM trip_history WHERE action='split'").fetchone()[0], 0)
+
+    def test_unused_undo_record_tracks_mixed_missing_and_remerged_parts(self):
+        key, _ = self.moved_merge()
+        self.assertEqual(self.undo_unused(key).status_code, 302)
+        # Once verified at undo time, the counted names remain evidence even
+        # if ingest subsequently rewrites a still-counted source summary.
+        source = self.data / '2026-05/a.json'
+        source.write_bytes(source.read_bytes() + b'\n')
+        self.assert_discard_current_statement(
+            'Now counted again: 2026-04/a as 2026-05/a, 2026-04/b as 2026-05/b; do not add these saved miles by hand.',
+            undone=True)
+        folder = self.data / '2026-05'
+        files = {p: (p.read_bytes(), p.stat()) for p in folder.glob('*.json')}
+        (folder / 'b.json').unlink()
+        self.assert_discard_current_statement(
+            'Now counted again: 2026-04/a as 2026-05/a; do not add these saved miles by hand. Not currently counted: 2026-04/b.',
+            undone=True)
+        (folder / 'a.json').unlink()
+        self.assert_discard_current_statement('None of its trips are in the log; these saved miles are not in the totals.', undone=True)
+        for path, (data, metadata) in files.items():
+            path.write_bytes(data)
+            os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+        merged = self.merged_key(self.merge('2026-05/a', '2026-05/b'))
+        self.assert_discard_current_statement(
+            f'Now counted again: 2026-04/a as 2026-05/a (inside {merged}), 2026-04/b as 2026-05/b (inside {merged}); '
+            'do not add these saved miles by hand.', undone=True)
+
+    def test_unused_merge_uses_saved_summary_year_and_unknown_year_blocks_every_close(self):
+        key, _ = self.moved_merge()
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            raw = conn.execute('SELECT summary FROM trip_merges').fetchone()[0]
+            summary = json.loads(raw)
+            summary['start_time'] = '2025-12-31T12:00:00Z'
+            conn.execute('UPDATE trip_merges SET summary=?', (json.dumps(summary),))
+        self.assert_unused_close_refused(key, 2025)
+        self.assertIn(2025, [r['year'] for r in self.viewer._year_list()])
+        self.assertEqual(self.close_year(2024).status_code, 302)
+        self.assert_unused_close_refused(key, 2026)  # Its parts still belong to this year.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('UPDATE trip_merges SET summary=?', (json.dumps({'distance_miles': .732}),))
+        for year in (2023, 2025, 2026):
+            self.assert_unused_close_refused(key, year)
+        # Unknown saved dates also cannot bypass an existing year lock.
+        self.assertEqual(self.undo_unused(key).status_code, 409)
+        self.assertEqual(self.client.post('/admin/year/2024/reopen', data={
+            'csrf_token': 'test-csrf', 'confirm': 'yes'}).status_code, 302)
+
+    def test_unused_merge_spanning_year_boundary_blocks_both_part_years(self):
+        self.base = datetime(2026, 12, 31, 23, 58, tzinfo=timezone.utc)
+        key, _ = self.moved_merge()
+        self.assert_unused_close_refused(key, 2026)
+        self.assert_unused_close_refused(key, 2027)
+        self.assertEqual(self.close_year(2025).status_code, 302)
+
+    def test_removal_under_unused_name_stays_saved_but_does_not_remove_renamed_parts(self):
+        key, _ = self.moved_merge()
+        (self.data / '2026-05').rename(self.month)
+        self.assertEqual(self.remove(key, 'example removal').status_code, 302)
+        self.assertEqual(self.viewer.load_trips()[0], [])
+        self.month.rename(self.data / '2026-05')
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual({t['trip_key'] for t in trips}, {'2026-05/a', '2026-05/b'})
+        self.assertFalse(any(t.get('unused_merge') for t in entries))
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertIsNotNone(self.viewer.trip_log.removal(conn, key))
+        self.assertEqual(self.close_year().status_code, 302)
+
+    def test_unused_merge_after_close_shows_saved_current_comparison_and_can_reopen(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        self.annotate(key, 'business', 'merged note')
+        self.assertEqual(self.close_year().status_code, 302)
+        with closing(sqlite3.connect(self.db)) as conn:
+            snapshot = conn.execute('SELECT snapshot FROM tax_years').fetchone()[0]
+        self.month.rename(self.data / '2026-05')
+        review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
+        self.assertIn('The totals now differ from the ones saved at the close.', review)
+        self.assertIn('Saved merges under unused month names (1)', review)
+        self.assertIn('No longer counted: ' + key, review)
+        self.assertIn('Now counted:', review)
+        self.assertIn('Reopen 2026', review)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute('SELECT snapshot FROM tax_years').fetchone()[0], snapshot)
+        self.assertEqual(self.client.post('/admin/year/2026/reopen', data={
+            'csrf_token': 'test-csrf', 'confirm': 'yes'}).status_code, 302)
+        self.assert_unused_close_refused(key)
+
+    def test_admin_can_undo_unused_merge_with_or_without_original_link(self):
+        key = self.unused_merge()
+        files = {p: p.read_bytes() for p in (self.data / "archive").iterdir()}
+        # A forged ordinary merge cannot be undone through this exceptional route.
+        self.assertEqual(self.undo_unused("2026-03/merge-absent").status_code, 409)
+        self.assertEqual(self.undo_unused(key, csrf_token="bad").status_code, 400)
+        self.assertEqual(self.undo_unused(key, confirm="no").status_code, 400)
+        # Test refusal with a closed year while the link exists, then successful
+        # undo without that link after reopening. Neither path resolves aliases.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO tax_years VALUES (2026,'driver','',?)", (json.dumps({"trip_keys": [key]}),))
+        self.assertEqual(self.undo_unused(key).status_code, 409)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("DELETE FROM tax_years")
+        (self.data / "2026-04").unlink()
+        self.assertEqual(self.undo_unused(key).status_code, 302)
+        self.assertEqual(self.undo_unused(key).status_code, 409)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM trip_merges").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT count(*) FROM trip_merge_parts").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT purpose_note FROM annotations WHERE trip_key='2026-04/a'").fetchone()[0],
+                             "original note")
+            history = json.loads(conn.execute("SELECT details FROM trip_history WHERE action='split'").fetchone()[0])
+            self.assertEqual(history["dropped"]["purpose_note"], "merged note")
+        self.assertEqual({p: p.read_bytes() for p in files}, files)
+        self.assertEqual(self.close_year().status_code, 302)
+
+    def test_undo_unused_merge_rechecks_selection_before_mutating(self):
+        key = self.unused_merge()
+        (self.data / "2026-03").unlink()  # April becomes the name in use again.
+        self.assertEqual(self.undo_unused(key).status_code, 409)
+        self.assertEqual(self.viewer.load_trips()[0][0]["trip_key"], key)
+
+    def test_admin_undo_uses_saved_key_while_it_is_an_alias(self):
+        key = self.unused_merge()
+        self.assertEqual(self.split(key).status_code, 409)  # Ordinary alias writes stay refused.
+        self.assertEqual(self.undo_unused(key).status_code, 302)
+        self.assertFalse(any(e.get("unused_merge") for e in self.viewer.load_trips()[1]))
+
+    def test_unused_merge_snapshot_lock_survives_missing_link_and_different_folder_year(self):
+        key = self.unused_merge()
+        (self.data / "2026-04").unlink()
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO tax_years VALUES (2025,'driver','',?)", (json.dumps({"trip_keys": [key]}),))
+        self.assertEqual(self.undo_unused(key).status_code, 409)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT count(*) FROM trip_merges").fetchone()[0], 1)
+
+    def test_empty_active_folder_is_damage_and_mixed_active_parts_are_not_unused(self):
+        key = self.unused_merge()
+        (self.data / "2026-04").unlink()
+        self.month.mkdir()  # An actual month in use, even though its files are gone.
+        trips, entries = self.viewer.load_trips()
+        broken = next(e for e in entries if e["trip_key"] == key)
+        self.assertNotIn("unused_merge", broken)
+        self.assertIn("A merge part is missing or unreadable", broken["problem"])
+        self.assertEqual(self.undo_unused(key).status_code, 409)
+        # One inactive part never hides damage under an active name.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("UPDATE trip_merge_parts SET part_key='2026-05/b' WHERE part_key='2026-04/b'")
+        self.assertFalse(any(e.get("unused_merge") for e in self.viewer.load_trips()[1]))
+
+    def test_genuinely_missing_part_under_active_name_still_blocks_suggestions(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        c = self.trip("c", 360, .02)
+        self.trip("d", 540, .03)
+        (self.month / "a.json").unlink()
+        trips, entries = self.viewer.load_trips()
+        broken = next(t for t in entries if t["trip_key"] == key)
+        self.assertNotIn("unused_merge", broken)
+        self.assertEqual(broken["problem"], self.viewer.trip_merges.DAMAGED_MERGE_PROBLEM)
+        first = next(t for t in trips if t["trip_key"] == c)
+        candidate, reason = self.viewer.trip_merges.next_trip(first, trips, entries)
+        self.assertIsNone(candidate)
+        self.assertIn("unknown device", reason)
+        self.assertEqual(self.viewer.year_figures(trips, entries)["unreadable"], 1)
+        self.assertEqual(self.undo_unused(key).status_code, 409)
+        self.assertEqual(self.split(key).status_code, 409)
+
+    def assert_damaged_saved_merge(self, key, first_key, missing=1):
+        trips, entries = self.viewer.load_trips()
+        broken = next(t for t in entries if t['trip_key'] == key)
+        self.assertNotIn('unused_merge', broken)
+        self.assertEqual(broken['problem'], self.viewer.trip_merges.DAMAGED_MERGE_PROBLEM)
+        page = self.client.get('/').get_data(as_text=True)
+        self.assertIn(broken['problem'], page)
+        self.assertNotIn('Undo saved merge', page)
+        self.assertNotIn('>Undo merge (split back)</button>', page)
+        self.assertIn('>Discard damaged merge</button>', page)
+        from test_viewer_roles import ViewerRolesTests
+        if self.viewer.users.get_user(self.db, 'helper') is None:
+            ViewerRolesTests.seed_editor(self)
+        ViewerRolesTests.signed_in(self, 'editor')
+        editor_page = self.client.get('/').get_data(as_text=True)
+        self.assertNotIn('>Undo merge (split back)</button>', editor_page)
+        self.assertNotIn('>Discard damaged merge</button>', editor_page)
+        self.authenticate(self.client)
+        self.assertEqual(self.split(key).status_code, 409)
+        first = next(t for t in trips if t['trip_key'] == first_key)
+        candidate, reason = self.viewer.trip_merges.next_trip(first, trips, entries)
+        self.assertIsNone(candidate)
+        self.assertIn('unknown device', reason)
+        self.assertEqual(self.viewer.year_figures(*self.viewer.year_members(trips, entries, 2026))['unreadable'], missing)
+        self.assertIn(broken['problem'], self.client.get('/admin/year/2026').get_data(as_text=True))
+        self.assertEqual(self.undo_unused(key).status_code, 409)
+        self.assertEqual(self.client.post('/admin/year/2026/close', data={
+            'csrf_token': 'test-csrf', 'confirm': 'yes'}).status_code, 302)
+        with closing(sqlite3.connect(self.db)) as conn:
+            snapshot = json.loads(conn.execute('SELECT snapshot FROM tax_years').fetchone()[0])
+            self.assertEqual(snapshot['unreadable'], missing)
+            self.assertEqual(conn.execute('SELECT count(*) FROM trip_merges').fetchone()[0], 1)
+
+    def test_deleted_real_month_remains_damage_in_list_close_suggestions_and_undo(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        self.trip('c', 360, .02)
+        self.trip('d', 540, .03)
+        other = self.data / '2026-05'
+        other.mkdir()
+        for name in ('c', 'd'):
+            for suffix in ('.json', '.gpx'):
+                (self.month / (name + suffix)).rename(other / (name + suffix))
+        shutil.rmtree(self.month)
+        self.assert_damaged_saved_merge(key, '2026-05/c')
+
+    def test_unused_name_requires_every_part_and_saved_source_stamps(self):
+        key = self.unused_merge()
+        self.trip('c', 360, .02)
+        self.trip('d', 540, .03)
+        archive = self.data / 'archive'
+        (self.data / '2026-04').unlink()
+        # One of two parts is missing under the counted name: no exceptional undo.
+        original = (archive / 'b.json').read_bytes()
+        saved_stat = (archive / 'b.json').stat()
+        (archive / 'b.json').unlink()
+        self.assert_damaged_saved_merge(key, '2026-03/c', missing=2)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('DELETE FROM tax_years')
+        (archive / 'b.json').write_bytes(original)
+        os.utime(archive / 'b.json', ns=(saved_stat.st_atime_ns, saved_stat.st_mtime_ns))
+        self.assertTrue(any(t.get('unused_merge') for t in self.viewer.load_trips()[1]))
+        # Same IDs in readable files are insufficient when either source changed.
+        with (archive / 'b.gpx').open('ab') as stream:
+            stream.write(b' ')
+        self.assert_damaged_saved_merge(key, '2026-03/c')
+
+    def test_undo_unused_merge_rechecks_replacement_parts_under_write_lock(self):
+        key = self.unused_merge()
+        self.assertIn('Undo saved merge', self.client.get('/').get_data(as_text=True))
+        (self.data / 'archive/b.gpx').unlink()
+        original = self.viewer._load_trips
+        def check_transaction(conn, **kwargs):
+            self.assertTrue(conn.in_transaction)
+            return original(conn, **kwargs)
+        with patch.object(self.viewer, '_load_trips', side_effect=check_transaction):
+            self.assertEqual(self.undo_unused(key).status_code, 409)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute('SELECT count(*) FROM trip_merges').fetchone()[0], 1)
+
+    def test_merge_during_saved_name_conflict_stays_under_chosen_name(self):
+        old = self.unused_merge()
+        new = self.merged_key(self.merge('2026-03/a', '2026-03/b'))
+        self.assertTrue(new.startswith('2026-03/'))
+        self.annotate(new, 'business', 'new merged note')
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual([t['trip_key'] for t in trips], [new])
+        self.assertTrue(any(t['trip_key'] == old and t.get('unused_merge') for t in entries))
+        distance = trips[0]['distance_miles']
+        (self.data / '2026-03').unlink()  # Resolve in favour of the original April name.
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual([t['trip_key'] for t in trips], [old])
+        self.assertEqual(trips[0]['purpose_note'], 'merged note')
+        self.assertEqual(trips[0]['distance_miles'], distance)
+        self.assertTrue(any(t['trip_key'] == new and t.get('unused_merge') for t in entries))
+        self.assertEqual(self.viewer.year_figures(trips, entries)['unreadable'], 0)
+        self.symlink(self.data / '2026-03', self.data / 'archive', directory=True)
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual([t['trip_key'] for t in trips], [new])
+        self.assertEqual(trips[0]['purpose_note'], 'new merged note')
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute('SELECT count(*) FROM trip_merges').fetchone()[0], 2)
+
+    def test_removed_month_requires_one_unambiguous_replacement_folder(self):
+        key = self.unused_merge()
+        (self.data / '2026-04').unlink()
+        # Matching stamps in two different counted folders cannot establish
+        # which one is the recording the stored merge refers to.
+        shutil.copytree(self.data / 'archive', self.data / '2026-05')
+        entries = self.viewer.load_trips()[1]
+        broken = next(t for t in entries if t['trip_key'] == key)
+        self.assertNotIn('unused_merge', broken)
+        self.assertEqual(self.undo_unused(key).status_code, 409)
+        # A malformed saved stamp is not evidence either, even with matching IDs.
+        for value in ({'invalid': 0}, 42, None):
+            with closing(sqlite3.connect(self.db)) as conn, conn:
+                conn.execute('UPDATE trip_merges SET fingerprint=? WHERE trip_key=?', (json.dumps(value), key))
+            broken = next(t for t in self.viewer.load_trips()[1] if t['trip_key'] == key)
+            self.assertNotIn('unused_merge', broken)
+
+    def test_matching_parts_split_between_folders_are_damage(self):
+        key = self.unused_merge()
+        (self.data / '2026-04').unlink()
+        other = self.data / '2026-05'
+        other.mkdir()
+        for suffix in ('.json', '.gpx'):
+            (self.data / ('archive/b' + suffix)).rename(other / ('b' + suffix))
+        entries = self.viewer.load_trips()[1]
+        broken = next(t for t in entries if t['trip_key'] == key)
+        self.assertNotIn('unused_merge', broken)
+        self.assertEqual(self.undo_unused(key).status_code, 409)
+
+    @unittest.skipIf(os.name == 'nt' or getattr(os, 'geteuid', lambda: 0)() == 0, 'requires non-root POSIX permissions')
+    def test_unreadable_replacement_track_is_damage_even_with_matching_stamps(self):
+        key = self.unused_merge()
+        (self.data / '2026-04').unlink()
+        source = self.data / 'archive/b.gpx'
+        self.addCleanup(source.chmod, 0o600)
+        source.chmod(0o000)
+        entries = self.viewer.load_trips()[1]
+        self.assertNotIn('unused_merge', next(t for t in entries if t['trip_key'] == key))
+        self.assertEqual(self.undo_unused(key).status_code, 409)
+
+    def test_nonmonth_link_upload_notice_does_not_block_merge(self):
+        a, b = self.trip("a", 0), self.trip("b", 180, .01)
+        archive = self.data / "archive"
+        self.month.rename(archive)
+        try:
+            self.month.symlink_to(archive, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        trips, notices = self.viewer.load_trips()
+        self.assertEqual([t["folder_reason"] for t in notices], ["ingest_refused"])
+        first = next(t for t in trips if t["trip_key"] == a)
+        candidate, reason = self.viewer.trip_merges.next_trip(first, trips, notices)
+        self.assertEqual(candidate["trip_key"] if candidate else None, b, reason)
+        self.assertEqual(self.merge(a, b).status_code, 302)
+
+    def test_plain_file_month_is_a_notice_and_does_not_block_healthy_merge(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        (self.data / '2025-02').write_text('synthetic non-folder', encoding='utf-8')
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual(entries[0]['folder_reason'], 'not_folder')
+        self.assertFalse(self.viewer.missing_mileage(entries[0]))
+        figures = self.viewer.year_figures(*self.viewer.year_members(trips, entries, 2025))
+        self.assertEqual(figures['unreadable'], 0)
+        first = next(t for t in trips if t['trip_key'] == a)
+        candidate, reason = self.viewer.trip_merges.next_trip(first, trips, entries)
+        self.assertEqual(candidate['trip_key'] if candidate else None, b, reason)
+        self.assertEqual(self.merge(a, b).status_code, 302)
+        self.assertEqual(self.client.post('/admin/year/2025/close', data={
+            'csrf_token': 'test-csrf', 'confirm': 'yes'}).status_code, 302)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(json.loads(conn.execute('SELECT snapshot FROM tax_years').fetchone()[0])['unreadable'], 0)
+
+    @unittest.skipIf(os.name == 'nt' or getattr(os, 'geteuid', lambda: 0)() == 0, 'requires non-root POSIX permissions')
+    def test_unwritable_month_notice_does_not_block_merge(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        self.addCleanup(self.month.chmod, 0o700)
+        self.month.chmod(0o500)
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual([entry['folder_reason'] for entry in entries], ['unwritable'])
+        first = next(t for t in trips if t['trip_key'] == a)
+        candidate, reason = self.viewer.trip_merges.next_trip(first, trips, entries)
+        self.assertEqual(candidate['trip_key'] if candidate else None, b, reason)
+        self.assertEqual(self.merge(a, b).status_code, 302)
 
     def test_duplicate_month_notice_does_not_block_merge(self):
         a, b = self.trip("a", 0), self.trip("b", 180, .01)
@@ -678,7 +1614,7 @@ class ViewerMerges(unittest.TestCase):
         self.assertEqual(self.client.post(f"/trip/{key}/split", data={"csrf_token": "test-csrf"}).status_code, 400)
         self.assertEqual(len(self.viewer.load_trips()[0]), 1)
 
-    def test_cache_invalidates_and_missing_part_is_unreadable_but_undo_works(self):
+    def test_cache_invalidates_and_missing_part_requires_deliberate_admin_discard(self):
         a, b = self.trip("a", 0), self.trip("b", 120, .001)
         key = self.merged_key(self.merge(a, b))
         helper = self.viewer.trip_merges
@@ -693,11 +1629,13 @@ class ViewerMerges(unittest.TestCase):
         self.assertEqual(trips, [])
         self.assertEqual([t["trip_key"] for t in unreadable], [key])
         page = self.client.get("/").get_data(as_text=True)
-        self.assertIn("Undo merge (split back)", page)
+        self.assertNotIn('>Undo merge (split back)</button>', page)
+        self.assertIn('>Discard damaged merge</button>', page)
         self.assertIn(f"{a}.gpx; {b}.gpx", page)
         self.assertNotIn(key + ".gpx", page)
         self.assert_export_sources("unreadable", "Unreadable trips", "a", f"{a}.gpx; {b}.gpx")
-        self.assertEqual(self.split(key).status_code, 302)
+        self.assertEqual(self.split(key).status_code, 409)
+        self.assertEqual(self.discard(key).status_code, 302)
 
     def test_old_schema_migrates_concurrently_preserving_rows(self):
         db = self.root / "old.db"

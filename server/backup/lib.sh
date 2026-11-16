@@ -18,6 +18,24 @@ die() {
     exit 1
 }
 
+# Only directories need write access for unlinking entries. Never chmod files:
+# unchanged files may be hard-linked into a kept snapshot. Default find does
+# not follow symlinks; apply chmod before descending, even for mode-000 dirs.
+remove_backup_tree() {
+    local path
+    for path in "$@"; do
+        [[ -e $path || -L $path ]] || continue
+        find "$path" -type d -exec chmod u+rwx -- {} \; || return 1
+        rm -rf -- "$path" || return 1
+    done
+}
+
+# Count terminators, never lines in names. GNU and BusyBox find both support
+# -print0; unlike -printf, this also works with BusyBox find.
+count_files() {
+    find "$@" -type f -print0 | tr -cd '\000' | wc -c
+}
+
 is_unraid() {
     case ${MILEAGE_PLATFORM:-} in
         unraid) return 0 ;;
@@ -223,7 +241,7 @@ salvage_raw_db() {
     mkdir -p "$dir"
     "$runner" "$PY_RAW_COPY" "$path" "$root" | tar -x -f - -C "$dir" --no-same-owner \
         || die "$path can't be read as a database, and its raw files couldn't be saved either; nothing more was restored"
-    count=$(find "$dir" -type f | wc -l)
+    count=$(count_files "$dir")
     [[ $count -gt 0 ]] || die "$path can't be read as a database, and no raw file was found to save; nothing more was restored"
     log "WARNING: the current $path can't be read as a database (it is damaged)."
     log "WARNING: its raw files ($count) are saved in $dir. The restore replaces it."
@@ -260,6 +278,46 @@ rsync_remote() {
     rsync --timeout="$RSYNC_TIMEOUT" -e "$ssh_cmd" "$@"
 }
 
+write_symlink_manifest() (
+    set -o pipefail
+    cd "$1" || return 1
+    find . -type l -print0 | LC_ALL=C sort -z \
+        | while IFS= read -r -d '' path; do
+            printf '%s\0' "$path"
+            readlink -z -- "$path" || exit 1
+        done
+)
+
+verify_snapshot_links() {
+    local snap=$1 path target expected=$1/SYMLINKS
+    local -A saved=() actual=()
+    if [[ ! -f $expected ]]; then
+        log "NOTE: snapshot has no SYMLINKS; its symbolic links are not checked"
+        return 0
+    fi
+    if write_symlink_manifest "$snap/data" | cmp -s -- "$expected" -; then return 0; fi
+    log "snapshot symbolic links don't match SYMLINKS; this snapshot is damaged"
+    while IFS= read -r -d '' path; do
+        IFS= read -r -d '' target || { log "invalid SYMLINKS record"; return 1; }
+        saved["$path"]=$target
+    done < "$expected"
+    while IFS= read -r -d '' path; do
+        IFS= read -r -d '' target || break
+        actual["$path"]=$target
+    done < <(write_symlink_manifest "$snap/data")
+    for path in "${!saved[@]}"; do
+        if [[ -z ${actual[$path]+yes} ]]; then
+            log "Removed link: $(printf '%q' "data/${path#./}")"
+        elif [[ ${saved[$path]} != "${actual[$path]}" ]]; then
+            log "Changed link: $(printf '%q' "data/${path#./}")"
+        fi
+    done
+    for path in "${!actual[@]}"; do
+        if [[ -z ${saved[$path]+yes} ]]; then log "Added link: $(printf '%q' "data/${path#./}")"; fi
+    done
+    return 1
+}
+
 # A file at the top of the destination that says "this is the real backup
 # target". backup.sh refuses to copy without it, so an unmounted share or
 # disk (an empty folder on this machine's own disk) can't be mistaken for
@@ -279,9 +337,16 @@ mark_target() {
 }
 
 list_snapshots() {
+    local listing line
     [[ -d $SNAPSHOTS ]] || return 0
-    find "$SNAPSHOTS" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
-        | grep -E "$SNAPSHOT_RE" | LC_ALL=C sort || true
+    listing=$(find "$SNAPSHOTS" -mindepth 1 -maxdepth 1 -type d -print) \
+        || die "couldn't list local snapshots in $SNAPSHOTS"
+    # grep -E, not awk: mawk before 2020-07 (Debian 12, Ubuntu 22.04) has no
+    # {n} intervals, so an awk match on SNAPSHOT_RE finds nothing there.
+    # No match is grep status 1 and a normal result; anything higher fails.
+    while IFS= read -r line; do
+        printf '%s\n' "${line##*/}"
+    done <<< "$listing" | { grep -E "$SNAPSHOT_RE" || (( $? == 1 )); } | LC_ALL=C sort
 }
 
 # The snapshot names on the off-host copy, oldest first. Fails if the
@@ -294,11 +359,56 @@ list_remote_snapshots() {
     awk '{ print $NF }' <<< "$listing" | grep -E "$SNAPSHOT_RE" | LC_ALL=C sort || true
 }
 
+# Keep the standard GNU text format, readable by sha256sum -c and v1.16.
+write_snapshot_manifest() (
+    set -o pipefail
+    cd "$1" || return 1
+    find . -type f ! -path ./SHA256SUMS ! -path ./INFO -print0 \
+        | LC_ALL=C sort -z | xargs -0 -r sha256sum
+)
+
+# Probe once outside the snapshot. Some non-GNU tools write escaped records
+# they cannot read. Two one-byte reads test that, without rehashing trip data.
+# Ordinary names still work with those tools; reject escaped manifests below.
+probe_checksum_escaping() (
+    local probe=$1/checksum-probe name=$'line\nbreak\\literal\\n\r'
+    mkdir "$probe" || return 1
+    cd "$probe" || return 1
+    printf x > "$name" || return 1
+    sha256sum -- "$name" > SHA256SUMS \
+        && sha256sum --quiet --strict -c SHA256SUMS > /dev/null 2>&1
+)
+
+# GNU checksum manifests escape backslash, newline and carriage return.
+# Decode only escaped records, keeping literal backslash+n distinct from LF.
+manifest_paths() {
+    local line path decoded char index
+    while IFS= read -r line || [[ -n $line ]]; do
+        path=${line:66}
+        if [[ $line == \\* ]]; then
+            path=${line:67} decoded=''
+            for ((index=0; index<${#path}; index++)); do
+                char=${path:index:1}
+                if [[ $char == \\ ]]; then
+                    index=$((index + 1))
+                    case ${path:index:1} in
+                        n) char=$'\n' ;; r) char=$'\r' ;; \\) char=\\ ;;
+                        *) return 1 ;;
+                    esac
+                fi
+                decoded+=$char
+            done
+            path=$decoded
+        fi
+        printf '%s\0' "$path"
+    done < "$1"
+}
+
 # Shared with restore: files not covered by the manifest are not verified.
 # INFO and SHA256SUMS itself are the only exceptions, at the snapshot root.
 # sha256sum reports failed paths, never file contents or expected hashes.
 verify_snapshot() {
-    local snap=$1 listed actual
+    local snap=$1 path
     [[ -f $snap/SHA256SUMS && -f $snap/annotations.db && -d $snap/data ]] || {
         log "snapshot doesn't look like a backup (SHA256SUMS, annotations.db or data missing)"
         return 1
@@ -307,13 +417,15 @@ verify_snapshot() {
         log "checksums don't match; this snapshot is damaged"
         return 1
     }
-    listed=$(sed -E 's/^[0-9a-f]{64} [ *]//' "$snap/SHA256SUMS" | LC_ALL=C sort) || return 1
-    actual=$(cd "$snap" && find . -type f ! -path ./SHA256SUMS ! -path ./INFO | LC_ALL=C sort) || return 1
-    if [[ $listed != "$actual" ]]; then
-        log "snapshot has files missing from or not in SHA256SUMS (paths below)"
-        LC_ALL=C comm -3 <(printf '%s\n' "$listed") <(printf '%s\n' "$actual") >&2
+    if ! cmp -s <(manifest_paths "$snap/SHA256SUMS" | LC_ALL=C sort -z) \
+            <(cd "$snap" && find . -type f ! -path ./SHA256SUMS ! -path ./INFO -print0 | LC_ALL=C sort -z); then
+        log "snapshot has files missing from or not in SHA256SUMS"
+        LC_ALL=C comm -z -3 <(manifest_paths "$snap/SHA256SUMS" | LC_ALL=C sort -z) \
+                <(cd "$snap" && find . -type f ! -path ./SHA256SUMS ! -path ./INFO -print0 | LC_ALL=C sort -z) \
+            | while IFS= read -r -d '' path; do log "Unlisted or missing file: $(printf '%q' "${path#$'\t'}")"; done || true
         return 1
     fi
+    verify_snapshot_links "$snap"
 }
 
 validate_verify_settings() {
@@ -351,11 +463,86 @@ read_verify_state() {
     return 0
 }
 
-# Resolve names only; never open a target or descend through a directory link.
+# Walk path names, never file contents or directory trees. In restore mode,
+# stop at the first link rsync skips, without consulting its original target.
+# Backup mode also resolves absolute/outside names for coverage accounting.
+# Resolve each link's text before its remaining suffix. A link encountered
+# again during its own expansion proves a loop; repeated completed expansions
+# (e.g. dot/dot/file with dot -> .) are valid. The hop bound is an error, not proof.
+trace_data_link() {
+    local root=$1 pending=$2 mode=$3 safe_root=${4:-} current=$1
+    local original=$2 part candidate target relative leaving frame hops=0
+    local -A active=()
+    local -a suffixes=() expanding=()
+    LINK_DEPENDENCY='' LINK_LOOP=no LINK_LIMIT=no LINK_ESCAPES=no LINK_RESOLVED=''
+    while [[ -n $pending || ${#expanding[@]} != 0 ]]; do
+        if [[ -z $pending ]]; then
+            frame=$((${#expanding[@]} - 1))
+            leaving=${expanding[frame]}
+            pending=${suffixes[frame]}
+            unset 'active[$leaving]' 'expanding[frame]' 'suffixes[frame]'
+            continue
+        fi
+        part=${pending%%/*}
+        if [[ $pending == */* ]]; then pending=${pending#*/}; else pending=; fi
+        case $part in
+            ''|.) continue ;;
+            ..)
+                current=${current%/*}
+                current=${current:-/}
+                if [[ $mode == restore && $current != "$root" && $current != "$root/"* ]]; then
+                    LINK_ESCAPES=yes
+                    break
+                fi
+                continue ;;
+        esac
+        candidate=${current%/}/$part
+        if [[ -L $candidate ]]; then
+            hops=$((hops + 1))
+            if [[ -n ${active[$candidate]+yes} ]]; then
+                LINK_LOOP=yes
+                break
+            fi
+            if (( hops > 256 )); then
+                LINK_LIMIT=yes
+                log "ERROR: could not resolve $(printf '%q' "data/$original"): more than 256 symbolic link steps without proving a loop"
+                return 1
+            fi
+            IFS= read -r -d '' target < <(readlink -z -- "$candidate") || return 1
+            if [[ -n $safe_root && $candidate == "$root/"* ]]; then
+                relative=${candidate#"$root/"}
+                if [[ ! -L $safe_root/$relative ]]; then
+                    [[ -n $LINK_DEPENDENCY ]] || LINK_DEPENDENCY=$relative
+                    [[ $mode != restore ]] || break
+                fi
+            fi
+            active["$candidate"]=yes
+            expanding+=("$candidate")
+            suffixes+=("$pending")
+            if [[ $target == /* ]]; then current=/; fi
+            pending=$target
+        else
+            current=$candidate
+        fi
+    done
+    LINK_RESOLVED=$current
+}
+
+# Coverage uses resolved targets, independently of restore eligibility.
 outside_links() {
-    local root path resolved
+    local root path resolved target
     root=$(realpath -m -- "$1") || return 1
-    find "$1" -name '*.tmp' -prune -o -type l -print0 | while IFS= read -r -d '' path; do
+    # The slash follows a linked start directory, without following links
+    # found below it. This also works with BusyBox find.
+    find "$1/" -name '*.tmp' -prune -o -type l -print0 | while IFS= read -r -d '' path; do
+        # Detect cycles before realpath: expanding loops can keep it busy
+        # indefinitely. Keep its established resolution for ordinary paths.
+        trace_data_link "$root" "${path#"$1/"}" backup || return 1
+        if [[ $LINK_LOOP == yes ]]; then
+            IFS= read -r -d '' target < <(readlink -z -- "$path") || return 1
+            log "WARNING: $(printf '%q' "data/${path#"$1/"}") -> $(printf '%q' "$target"): link loops and has nothing behind it to back up; remove or correct this link."
+            continue
+        fi
         IFS= read -r -d '' resolved < <(realpath -mz -- "$path") || return 1
         if [[ $resolved != "$root" && $resolved != "$root/"* ]]; then
             printf '%s\0' "$path"
@@ -365,32 +552,127 @@ outside_links() {
 
 # A bounded, escaped list keeps unusual filenames on one log line each.
 report_outside_links() {
-    local dir=$1 path target
-    LINKS_NOT_BACKED_UP=0
+    local dir=$1 path target count=0
     outside_links "$dir" > "$2" || return 1
     while IFS= read -r -d '' path; do
-        LINKS_NOT_BACKED_UP=$((LINKS_NOT_BACKED_UP + 1))
-        if (( LINKS_NOT_BACKED_UP <= 20 )); then
+        count=$((count + 1))
+        if (( count <= 20 )); then
             IFS= read -r -d '' target < <(readlink -z -- "$path") || return 1
             log "WARNING: not backed up: $(printf '%q' "data/${path#"$dir/"}") -> $(printf '%q' "$target")"
         fi
     done < "$2"
-    if (( LINKS_NOT_BACKED_UP > 20 )); then
-        log "WARNING: and $((LINKS_NOT_BACKED_UP - 20)) more linked items not backed up"
+    if (( count > 20 )); then
+        log "WARNING: and $((count - 20)) more linked items not backed up"
     fi
-    rm -f -- "$2"
+    rm -f -- "$2" || return 1
+    LINKS_NOT_BACKED_UP=$count
+}
+
+# Let the installed rsync decide eligibility, including version-specific rules
+# for embedded '..'. Copy only named links and their parent directories into an
+# empty private tree: no recursion, dereferencing, trip contents or --delete.
+make_link_restore_plan() {
+    local dir=$1 list=$2 plan=$3 path
+    find "$dir/" -name '*.tmp' -prune -o -type l -print0 > "$list" || return 1
+    mkdir -- "$plan" || return 1
+    while IFS= read -r -d '' path; do
+        printf '%s\0' "${path#"$dir/"}"
+    done < "$list" > "$plan/files" || return 1
+    # Only scratch directories: preserve eligibility while making cleanup possible.
+    rsync -l --dirs --chmod=Du+rwx --safe-links --from0 --files-from="$plan/files" "$dir/" "$plan/data/"
+}
+
+# Explain skipped internal aliases and links that rsync recreates but cannot
+# make usable. These warnings do not change outside-target coverage counts.
+report_link_restore_effects() {
+    local dir=$1 snapshot=$2 list=$3 mode=${4:-backup}
+    local root saved_root path relative target resolved saved message effect count=0 status=0
+    local plan=$list.plan
+    LINKS_RESTORED_WITH_WARNINGS=0 LINKS_NOT_RESTORED=0
+    root=$(realpath -m -- "$dir") || return 1
+    saved_root=$(realpath -m -- "$snapshot") || return 1
+    if ! make_link_restore_plan "$dir" "$list" "$plan"; then
+        remove_backup_tree "$plan"
+        rm -f -- "$list"
+        return 1
+    fi
+    while IFS= read -r -d '' path; do
+        IFS= read -r -d '' target < <(readlink -z -- "$path") || { status=1; break; }
+        relative=${path#"$dir/"}
+        effect=
+        if [[ -L $plan/data/$relative ]]; then
+            trace_data_link "$root" "$relative" "$mode" "$plan/data" || { status=1; break; }
+            if [[ -n $LINK_DEPENDENCY ]]; then
+                effect="will be restored as a link, but on an empty data/ it will dangle: it depends on $(printf '%q' "data/$LINK_DEPENDENCY"), which will not be restored as a link"
+            elif [[ $LINK_LOOP == yes ]]; then
+                effect='will be restored as a link, but the link loops and has nothing behind it to back up; remove or correct this link'
+            elif [[ $LINK_ESCAPES == yes || ( $LINK_RESOLVED != "$root" && $LINK_RESOLVED != "$root/"* ) ]]; then
+                effect='will be restored as a link, but its path leads outside data/; backup does not follow links to copy their contents'
+            fi
+            [[ -n $effect ]] || continue
+            LINKS_RESTORED_WITH_WARNINGS=$((LINKS_RESTORED_WITH_WARNINGS + 1))
+        else
+            trace_data_link "$root" "$relative" "$mode" "$plan/data" || { status=1; break; }
+            if [[ $mode == backup ]]; then
+                [[ $LINK_RESOLVED == "$root" || $LINK_RESOLVED == "$root/"* ]] || continue
+            else
+                LINKS_NOT_RESTORED=$((LINKS_NOT_RESTORED + 1))
+            fi
+            if [[ $target == /* ]]; then
+                effect='absolute link, will not be restored as a link'
+            else
+                effect='relative link rejected by rsync --safe-links, will not be restored as a link'
+            fi
+        fi
+        count=$((count + 1))
+        if (( count <= 20 )); then
+            message=
+            if [[ $mode == backup && $LINK_LOOP != yes ]]; then
+                resolved=$LINK_RESOLVED
+                if [[ $resolved == "$root" || $resolved == "$root/"* ]]; then
+                    relative=${resolved#"$root"}
+                    trace_data_link "$saved_root" "${relative#/}" restore "$plan/data" || { status=1; break; }
+                    saved=$LINK_RESOLVED
+                    message='; its target is not stored at its real path in this snapshot (it may be missing or excluded)'
+                    if [[ -z $LINK_DEPENDENCY && $LINK_ESCAPES == no && $LINK_LOOP == no && -e $saved ]]; then
+                        message="; its target is in the backup under its real path: $(printf '%q' "data$relative")"
+                    fi
+                fi
+            elif [[ $mode == restore && -n $LINK_DEPENDENCY ]]; then
+                message='; cannot determine from this snapshot whether its original target is saved elsewhere in the backup or absent'
+            fi
+            log "WARNING: $(printf '%q' "data/${path#"$dir/"}") -> $(printf '%q' "$target"): $effect$message"
+        fi
+    done < "$list"
+    if (( count > 20 )); then
+        log "WARNING: and $((count - 20)) more links with restore warnings"
+    fi
+    remove_backup_tree "$plan" || status=1
+    rm -f -- "$list" || status=1
+    return "$status"
 }
 
 read_coverage_count() {
     local count
-    count=$(grep '^links_not_backed_up=' "$1" 2>/dev/null) || count=links_not_backed_up=0
-    count=${count#links_not_backed_up=}
-    [[ $count =~ ^[0-9]+$ ]] || count=
+    [[ -f $1 && -r $1 ]] || { printf unavailable; return 0; }
+    # Only an older, readable INFO without this field means zero.
+    if count=$(grep '^links_not_backed_up=' "$1" 2>/dev/null); then
+        count=${count#links_not_backed_up=}
+    elif [[ $? == 1 ]]; then
+        count=0
+    else
+        printf unavailable
+        return 0
+    fi
+    [[ $count =~ ^[0-9]+$ ]] || count=unknown
     printf '%s' "$count"
 }
 
 print_coverage_status() {
-    printf 'last_backup_links_not_backed_up=%s\n' "$(read_coverage_count "$BACKUP_DIR/latest/INFO")"
+    local count
+    count=$(read_coverage_count "$BACKUP_DIR/latest/INFO")
+    [[ $count != unknown ]] || count='not checked'
+    printf 'last_backup_links_not_backed_up=%s\n' "$count"
 }
 
 print_verify_status() {

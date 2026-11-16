@@ -929,9 +929,13 @@ setup_data_dir() {
         ok "data/ is private (mode 700)"
     fi
 
-    # List only the directory entries, without following their targets.
+    check_data_links
+}
+
+check_data_links() {
+    # Follow only the start directory; never follow an entry's target.
     local links link quoted hint
-    local -a list_links=(find data -mindepth 1 -maxdepth 1 -type l -print0)
+    local -a list_links=(find data/ -mindepth 1 -maxdepth 1 -type l -print0)
     if [[ ! -r data || ! -x data ]]; then
         # Use sudo only where this run already has it (install mode, or a
         # --check that needed it earlier); never start a new prompt here.
@@ -2436,6 +2440,7 @@ unraid_backup_log() {
 
 verify_unraid_backups() {
     local status key value last='' attempt='' dir recorded
+    local backup_info_problem_reported=no
     if unraid_cron_current; then
         ok "Persistent backup cron file matches this install and both entries are loaded"
     else
@@ -2447,12 +2452,14 @@ verify_unraid_backups() {
         recorded=$(conf_get "${key}_MOUNT")
         if ! unraid_mount "$dir" || [[ -z $recorded || $recorded != "$UNRAID_MOUNT" ]]; then
             problem "$key destination mount is missing or differs from backup.conf" "Mount the recorded disk, or rerun install.sh to configure the destination."
+            backup_info_problem_reported=yes
         fi
     done
-    show_backup_deep_check
     if ! status=$(bash "$SCRIPT_DIR/backup/scheduled.sh" --status); then
         unraid_backup_log
         problem "Couldn't read scheduled backup status" "See the backup log above."
+        backup_info_problem_reported=yes
+        show_backup_deep_check
         return 0
     fi
     while IFS='=' read -r key value; do
@@ -2463,6 +2470,7 @@ verify_unraid_backups() {
     elif [[ $attempt != 0 ]]; then
         unraid_backup_log
         problem "The last scheduled backup failed or has never run (status: ${attempt:-missing})" "Run: bash $SCRIPT_DIR/backup/scheduled.sh"
+        backup_info_problem_reported=yes
     else
         ok "The last scheduled backup attempt succeeded"
     fi
@@ -2472,9 +2480,11 @@ verify_unraid_backups() {
     if [[ -z $last || $timestamp == 0 ]] || (( now - timestamp > 2 * 86400 )); then
         unraid_backup_log
         problem "No good backup within the last two days" "Run: bash $SCRIPT_DIR/backup/scheduled.sh"
+        backup_info_problem_reported=yes
     else
         ok "Last good backup: $last"
     fi
+    show_backup_deep_check
 }
 
 setup_unraid_backups() {
@@ -2795,6 +2805,15 @@ show_backup_deep_check() {
     done <<< "$status"
     if [[ $links =~ ^[0-9]+$ && $links == *[1-9]* ]]; then
         warn "$links linked item(s) are not in this backup; replace each link with the real folder or file (or delete a link with nothing behind it) and rerun the backup"
+    elif [[ $links == 'not checked' ]]; then
+        warn "Linked items in the last backup were not checked; inspect the backup log, fix the check error and rerun the backup"
+    elif [[ $links == unavailable && ${backup_info_problem_reported:-no} == no ]]; then
+        # Callers suppress this when a backup/destination check already explained it.
+        epoch=$(date -d "$last" +%s 2>/dev/null) || epoch=0
+        now=$(date +%s)
+        if [[ -n $last ]] && (( epoch > 0 && now - epoch <= 2 * 86400 )); then
+            warn "Latest backup information is unavailable; check the backup disk/mount, latest and INFO before relying on this backup"
+        fi
     fi
     # A fresh completed off-host copy distinguishes coverage from copy failure.
     if (( $# )); then
@@ -2814,7 +2833,7 @@ show_backup_deep_check() {
 
 verify_backups() {
     local unit backup_dir last age next
-    show_backup_deep_check
+    local backup_info_problem_reported=no
     unit=$(backup_unit)
     if ! timer_ok; then
         problem "The daily backup timer isn't running" "sudo systemctl enable --now $unit.timer"
@@ -2835,24 +2854,29 @@ verify_backups() {
         problem "The backup destination $(conf_get REMOTE) has no .mileage-backup-target file" \
             "Backups refuse to copy there until it's marked. If it is the right, mounted destination:" \
             "bash $SCRIPT_DIR/backup/backup.sh --mark-target"
+        backup_info_problem_reported=yes
     fi
     if systemctl is-failed --quiet "$unit.service" 2> /dev/null; then
         problem "The last backup failed" "To see why: journalctl -u $unit.service -n 30"
+        backup_info_problem_reported=yes
     fi
     backup_dir=$(conf_get BACKUP_DIR)
     backup_dir=${backup_dir:-$HOME/mileage-backups}
     last=$(cat "$backup_dir/last-success" 2> /dev/null) || last=
     if [[ -z $last ]]; then
         problem "No backup has finished yet" "Run one: bash $SCRIPT_DIR/backup/backup.sh"
+        backup_info_problem_reported=yes
     else
         age=$(($(date +%s) - $(date -d "$last" +%s 2> /dev/null || echo 0)))
         if (( age > 2 * 86400 )); then
             problem "The last good backup was $last, over two days ago" \
                 "To see why: journalctl -u $unit.service -n 30"
+            backup_info_problem_reported=yes
         else
             ok "Last good backup: $last"
         fi
     fi
+    show_backup_deep_check
 }
 
 ask_backups() {

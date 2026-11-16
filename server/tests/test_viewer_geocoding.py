@@ -10,6 +10,7 @@ import json
 import os
 import re
 from pathlib import Path
+import socket
 import sqlite3
 import subprocess
 import tempfile
@@ -22,6 +23,7 @@ from urllib.parse import parse_qs, urlsplit
 from openpyxl import load_workbook
 from werkzeug.security import generate_password_hash
 from test_round_trip import load_service
+from time_helpers import time_stub
 
 
 class EndpointPlaceTests(unittest.TestCase):
@@ -37,6 +39,7 @@ class EndpointPlaceTests(unittest.TestCase):
         cls.entered = threading.Event()
         cls.release = threading.Event()
         cls.release.set()
+        cls.handlers = []
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
@@ -93,10 +96,17 @@ class EndpointPlaceTests(unittest.TestCase):
             def log_message(self, *args):
                 pass
 
-        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
-        cls.thread.start()
-        cls.provider_url = f"http://127.0.0.1:{cls.server.server_port}/reverse"
+        class ProviderServer(ThreadingHTTPServer):
+            def process_request(self, request, client_address):
+                handler = threading.Thread(target=self.process_request_thread,
+                                           args=(request, client_address), daemon=True)
+                # Register on the accept side, even if the new thread has not
+                # reached Handler.setup() when the test body finishes.
+                cls.handlers.append((handler, cls.mode))
+                handler.start()
+
+        cls.server_class = ProviderServer
+        cls.handler_class = Handler
         with patch.dict(os.environ, {
             "INGEST_DATA_ROOT": str(cls.root / "data"),
             "VIEWER_DB_PATH": str(cls.root / "annotations.db"),
@@ -104,7 +114,8 @@ class EndpointPlaceTests(unittest.TestCase):
             "VIEWER_PASSWORD_HASH": generate_password_hash("pw", "pbkdf2:sha256:1000"),
             "VIEWER_SECRET_KEY": "endpoint-test-key-" * 4,
             "DISPLAY_TZ": "UTC",
-            "VIEWER_GEOCODER_URL": cls.provider_url,
+            # Each test supplies its own listening socket and URL in setUp.
+            "VIEWER_GEOCODER_URL": "http://127.0.0.1:1/reverse",
             "VIEWER_GEOCODER_USER_AGENT": "MileageTests/1.0",
             "VIEWER_GEOCODER_INTERVAL": "",
         }):
@@ -120,10 +131,6 @@ class EndpointPlaceTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.release.set()
-        cls.server.shutdown()
-        cls.server.server_close()
-        cls.thread.join()
         cls.temp.cleanup()
 
     def setUp(self):
@@ -147,6 +154,83 @@ class EndpointPlaceTests(unittest.TestCase):
         with self.client.session_transaction() as session:
             session.update(user="driver", pw_tag=self.viewer._password_tag(), csrf="test-csrf")
         self.route = "/trip/2026-10/sample/lookup-place"
+        self.server = cls.server_class(("127.0.0.1", 0), cls.handler_class)
+        self.provider_url = f"http://127.0.0.1:{self.server.server_port}/reverse"
+        self.viewer.GEOCODER.url = self.provider_url
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       kwargs={"poll_interval": .01}, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        # Unblock handlers before shutdown; shutdown stops only the accept loop.
+        self.release.set()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=3)
+        # A killed fetch child closes its socket, but a slow provider handler
+        # may notice only on its next write. Finish those handlers before the
+        # next test changes the provider's mode, response or clock. The accept
+        # loop has stopped, so the list cannot gain any more handlers.
+        try:
+            for handler, _mode in self.handlers:
+                handler.join(timeout=3)
+            stuck_modes = [mode for handler, mode in self.handlers if handler.is_alive()]
+            self.assertFalse(stuck_modes, f"Fake provider handlers did not finish; modes: {stuck_modes}")
+        finally:
+            # A stuck handler belongs to this test, not every subsequent test.
+            self.handlers.clear()
+
+    def test_late_provider_handler_is_tracked_and_joined(self):
+        started = threading.Event()
+        begin_handler = threading.Event()
+        process_request = self.server.process_request_thread
+
+        def delayed_handler(*args):
+            started.set()
+            if begin_handler.wait(3):
+                process_request(*args)
+
+        with patch.object(self.server, "process_request_thread", delayed_handler), \
+                socket.create_connection(self.server.server_address, timeout=3) as connection:
+            connection.sendall(b"GET /late-handler HTTP/1.0\r\n\r\n")
+            try:
+                self.assertTrue(started.wait(3))
+                self.assertFalse(self.entered.is_set())
+                self.assertEqual(len(self.handlers), 1)
+                handler, mode = self.handlers[0]
+                self.assertEqual(mode, "normal")
+                shutdown = self.server.shutdown
+
+                def stop_accepting():
+                    shutdown()
+                    # Force setup() to start only after the accept loop stops.
+                    begin_handler.set()
+
+                with patch.object(self.server, "shutdown", stop_accepting):
+                    self.tearDown()
+                self.assertFalse(handler.is_alive())
+                self.assertFalse(self.thread.is_alive())
+                self.assertEqual(self.handlers, [])
+                self.assertEqual([path for path, _headers in self.received], ["/late-handler"])
+            finally:
+                begin_handler.set()
+
+    def test_provider_teardown_releases_blocked_handler(self):
+        self.release.clear()
+        with socket.create_connection(self.server.server_address, timeout=3) as connection:
+            connection.sendall(b"GET /blocked-handler HTTP/1.0\r\n\r\n")
+            self.assertTrue(self.entered.wait(3))
+            handler, _mode = self.handlers[0]
+            shutdown = self.server.shutdown
+
+            def stop_accepting():
+                self.assertTrue(self.release.is_set())
+                shutdown()
+
+            with patch.object(self.server, "shutdown", stop_accepting):
+                self.tearDown()
+            self.assertFalse(handler.is_alive())
+            self.assertEqual(self.handlers, [])
 
     def post(self, endpoint="end", **extra):
         return self.client.post(self.route, data={"csrf_token": "test-csrf", "endpoint": endpoint, **extra})
@@ -173,7 +257,8 @@ class EndpointPlaceTests(unittest.TestCase):
 
     def test_long_success_gap_reports_retry_delay(self):
         geocoder = self.viewer.GEOCODER
-        with patch.object(geocoder, "interval", 5), patch("geocoding.time.time", return_value=time.time()), \
+        with patch.object(geocoder, "interval", 5), \
+             patch("geocoding.time", time_stub(time=Mock(return_value=time.time()))), \
              patch.object(geocoder, "_fetch", return_value="Example") as fetch:
             self.assertEqual(geocoder.lookup(1, 3), "Example")
             with self.assertRaises(self.viewer.GeocodeError) as error:
@@ -385,14 +470,14 @@ class EndpointPlaceTests(unittest.TestCase):
         self.assertEqual(len(self.received), 1)
         self.reset_gate()
         cls.status = 429
-        with patch("geocoding.time.time", return_value=10000):
+        with patch("geocoding.time", time_stub(time=Mock(return_value=10000))):
             with self.assertRaises(self.viewer.GeocodeError) as error:
                 self.viewer.GEOCODER.lookup(1, 3)
             self.assertEqual(error.exception.status, 503)
         with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn:
             self.assertEqual(conn.execute("SELECT next_allowed FROM geocode_gate").fetchone()[0], 13600)
         self.assertEqual(self.viewer.GEOCODER._retry_delay("bad"), 300)
-        with patch("geocoding.time.time", return_value=0):
+        with patch("geocoding.time", time_stub(time=Mock(return_value=0))):
             self.assertEqual(self.viewer.GEOCODER._retry_delay("Thu, 01 Jan 1970 01:00:00 GMT"), 3600)
 
     def test_default_interval_is_applied_to_success_gate(self):
@@ -404,7 +489,7 @@ class EndpointPlaceTests(unittest.TestCase):
                     os.environ["VIEWER_GEOCODER_INTERVAL"] = value
                 geocoder = self.viewer.Geocoder(self.viewer.DB_PATH)
                 self.reset_gate()
-                with patch("geocoding.time.time", return_value=10000):
+                with patch("geocoding.time", time_stub(time=Mock(return_value=10000))):
                     self.assertTrue(geocoder.lookup(i, i + 2))
                 with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn:
                     self.assertEqual(conn.execute("SELECT next_allowed FROM geocode_gate").fetchone()[0], 10000.1)
@@ -413,15 +498,15 @@ class EndpointPlaceTests(unittest.TestCase):
         with patch.dict(os.environ, {"VIEWER_GEOCODER_URL": self.provider_url, "VIEWER_GEOCODER_INTERVAL": "0.5"}):
             geocoder = self.viewer.Geocoder(self.viewer.DB_PATH)
             other_worker = self.viewer.Geocoder(self.viewer.DB_PATH)
-        with patch("geocoding.time.time", return_value=10000):
+        with patch("geocoding.time", time_stub(time=Mock(return_value=10000))):
             self.assertTrue(geocoder.lookup(1, 3))
         with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn:
             self.assertEqual(conn.execute("SELECT next_allowed FROM geocode_gate").fetchone()[0], 10000.5)
         clock = [10000.49]
         def sleep(delay):
             clock[0] += delay
-        with patch("geocoding.time.time", side_effect=lambda: clock[0]), \
-             patch("geocoding.time.sleep", side_effect=sleep) as waiting:
+        waiting = Mock(side_effect=sleep)
+        with patch("geocoding.time", time_stub(time=lambda: clock[0], sleep=waiting)):
             self.assertTrue(other_worker.lookup(2, 4))
         self.assertAlmostEqual(waiting.call_args.args[0], .01)
         self.assertEqual(len(self.received), 2)
@@ -429,6 +514,27 @@ class EndpointPlaceTests(unittest.TestCase):
     def set_gate(self, delay, token=""):
         with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn, conn:
             conn.execute("INSERT OR REPLACE INTO geocode_gate VALUES (1, ?, ?)", (10000 + delay, token))
+
+    def test_fake_clock_leaves_other_threads_on_real_time(self):
+        real_functions = (time.time, time.monotonic, time.sleep)
+        clock = [10000.0]
+        def sleep(delay):
+            clock[0] += delay
+        fake = time_stub(time=lambda: clock[0], monotonic=lambda: clock[0], sleep=Mock(side_effect=sleep))
+        def background_sleep():
+            functions = (time.time, time.monotonic, time.sleep)
+            time.sleep(.06)  # Same sleep as the slow fake-provider handler.
+            return functions
+        with patch("geocoding.time", fake), ThreadPoolExecutor(max_workers=1) as executor:
+            self.assertEqual(executor.submit(background_sleep).result(timeout=3), real_functions)
+            self.assertEqual(clock[0], 10000)
+            fake.sleep.assert_not_called()
+            # The geocoder still sees the fake clock and uses its sleep.
+            self.set_gate(.05)
+            with patch.object(self.viewer.GEOCODER, "_fetch", return_value="Example"):
+                self.assertEqual(self.viewer.GEOCODER.lookup(1, 3), "Example")
+            fake.sleep.assert_called_once()
+            self.assertAlmostEqual(clock[0], 10000.05)
 
     def test_short_gap_wait_releases_lock_and_checks_cache_first(self):
         self.set_gate(.05)
@@ -438,8 +544,8 @@ class EndpointPlaceTests(unittest.TestCase):
             # A separate connection can write while this request waits.
             self.viewer.upsert_annotation("2026-10/sample", "personal", "While waiting", "Manual")
             clock[0] += delay
-        with patch("geocoding.time.time", side_effect=lambda: clock[0]), \
-             patch("geocoding.time.sleep", side_effect=sleep) as waiting, \
+        waiting = Mock(side_effect=sleep)
+        with patch("geocoding.time", time_stub(time=lambda: clock[0], sleep=waiting)), \
              patch.object(self.viewer.GEOCODER, "_fetch", return_value="Example") as fetch:
             self.assertEqual(self.viewer.GEOCODER.lookup(1, 3), "Example")
             self.assertEqual(self.viewer.GEOCODER.lookup(1, 3), "Example")
@@ -452,9 +558,9 @@ class EndpointPlaceTests(unittest.TestCase):
         for delay, token in ((.05, "failed"), (300, "failed"), (3600, "failed"), (3, ""),
                              (self.viewer.GEOCODER.LEASE + 1, "older-random-token")):
             self.set_gate(delay, token)
+            waiting = Mock()
             with patch.object(self.viewer.GEOCODER, "interval", 60), \
-                 patch("geocoding.time.time", return_value=10000), \
-                 patch("geocoding.time.sleep") as waiting, \
+                 patch("geocoding.time", time_stub(time=lambda: 10000, sleep=waiting)), \
                  patch.object(self.viewer.GEOCODER, "_fetch") as fetch:
                 with self.assertRaises(self.viewer.GeocodeError) as error:
                     self.viewer.GEOCODER.lookup(1, 3)
@@ -474,9 +580,7 @@ class EndpointPlaceTests(unittest.TestCase):
                 with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn, conn:
                     conn.execute("UPDATE geocode_gate SET next_allowed = ?, token = '' "
                                  "WHERE token = 'active'", (10000.3 + self.viewer.GEOCODER.interval,))
-        with patch("geocoding.time.time", side_effect=lambda: clock[0]), \
-             patch("geocoding.time.monotonic", side_effect=lambda: clock[0]), \
-             patch("geocoding.time.sleep", side_effect=sleep), \
+        with patch("geocoding.time", time_stub(time=lambda: clock[0], monotonic=lambda: clock[0], sleep=sleep)), \
              patch.object(self.viewer.GEOCODER, "_fetch", return_value="Example") as fetch:
             self.assertEqual(self.viewer.GEOCODER.lookup(1, 3), "Example")
         fetch.assert_called_once()
@@ -494,9 +598,7 @@ class EndpointPlaceTests(unittest.TestCase):
         clock = [10000.0]
         def sleep(delay):
             clock[0] += delay
-        with patch("geocoding.time.time", side_effect=lambda: clock[0]), \
-             patch("geocoding.time.monotonic", side_effect=lambda: clock[0]), \
-             patch("geocoding.time.sleep", side_effect=sleep), \
+        with patch("geocoding.time", time_stub(time=lambda: clock[0], monotonic=lambda: clock[0], sleep=sleep)), \
              patch.object(self.viewer.GEOCODER, "_fetch") as fetch:
             with self.assertRaises(self.viewer.GeocodeError) as error:
                 self.viewer.GEOCODER.lookup(1, 3)
@@ -506,15 +608,15 @@ class EndpointPlaceTests(unittest.TestCase):
 
     def test_provider_failure_marks_gate_failed(self):
         failure = self.viewer.GeocodeError("The address provider is unavailable. Try again later.")
-        with patch("geocoding.time.time", return_value=10000), \
+        with patch("geocoding.time", time_stub(time=Mock(return_value=10000))), \
              patch.object(self.viewer.GEOCODER, "_fetch", side_effect=failure):
             with self.assertRaises(self.viewer.GeocodeError):
                 self.viewer.GEOCODER.lookup(1, 3)
         with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn:
             self.assertEqual(conn.execute("SELECT token, next_allowed FROM geocode_gate").fetchone(),
                              (self.viewer.GEOCODER.FAILED, 10300))
-        with patch("geocoding.time.time", return_value=10001), \
-             patch("geocoding.time.sleep") as waiting, \
+        waiting = Mock()
+        with patch("geocoding.time", time_stub(time=lambda: 10001, sleep=waiting)), \
              patch.object(self.viewer.GEOCODER, "_fetch") as fetch:
             with self.assertRaises(self.viewer.GeocodeError) as error:
                 self.viewer.GEOCODER.lookup(2, 4)
@@ -529,9 +631,7 @@ class EndpointPlaceTests(unittest.TestCase):
             clock[0] += delay
             with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn, conn:
                 conn.execute("UPDATE geocode_gate SET next_allowed = ?", (clock[0] + .1,))
-        with patch("geocoding.time.time", side_effect=lambda: clock[0]), \
-             patch("geocoding.time.monotonic", side_effect=lambda: clock[0]), \
-             patch("geocoding.time.sleep", side_effect=sleep), \
+        with patch("geocoding.time", time_stub(time=lambda: clock[0], monotonic=lambda: clock[0], sleep=sleep)), \
              patch.object(self.viewer.GEOCODER, "_fetch") as fetch:
             with self.assertRaises(self.viewer.GeocodeError):
                 self.viewer.GEOCODER.lookup(1, 3)
@@ -561,8 +661,7 @@ class EndpointPlaceTests(unittest.TestCase):
             # takes the polling path, not just on a slow machine.
             threading.Event().wait(.1)
             return "Example"
-        with patch("geocoding.time.time", side_effect=lambda: clock[0]), \
-             patch("geocoding.time.sleep", side_effect=sleep), \
+        with patch("geocoding.time", time_stub(time=lambda: clock[0], sleep=sleep)), \
              patch.object(self.viewer.GEOCODER, "_fetch", side_effect=slow_fetch) as fetch:
             def lookup():
                 try:
@@ -775,7 +874,7 @@ class EndpointPlaceTests(unittest.TestCase):
                 self.assertEqual(self.post().status_code, 429)
                 # Failure gate expires and a subsequent lookup can succeed.
                 type(self).mode = "normal"
-                with patch("geocoding.time.time", return_value=next_allowed + 1):
+                with patch("geocoding.time", time_stub(time=Mock(return_value=next_allowed + 1))):
                     self.assertTrue(geocoder.lookup(2, 4))
                 self.clear_cache()
 
@@ -848,7 +947,7 @@ class EndpointPlaceTests(unittest.TestCase):
             with self.subTest(abort=abort.__name__):
                 self.reset_gate()
                 with patch.object(self.viewer.GEOCODER, "_fetch", side_effect=abort), \
-                     patch("geocoding.time.time", return_value=10000):
+                     patch("geocoding.time", time_stub(time=Mock(return_value=10000))):
                     with self.assertRaises(abort):
                         self.viewer.GEOCODER.lookup(2, 4)
                 with closing(sqlite3.connect(self.viewer.DB_PATH)) as conn:

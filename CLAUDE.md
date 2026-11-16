@@ -418,6 +418,10 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   GPX uploads with 503 naming the folder until repaired, and a new trip whose
   month folder links to a differently named folder gets the same 503 (it would
   be filed under the wrong month). Diagnostics are unaffected.
+  A month folder the services cannot read or enter refuses every trip upload
+  with a named 503; disk I/O and other server faults remain 500.
+  A readable/searchable month that denies temporary-file creation gets a named
+  503 for only that month's new trips; healthy uploads gain no extra probe.
   `install.sh --check` reports direct links in `data/` as problems; install
   warns and continues. If listing needs a new sudo prompt, check warns it skipped links.
   Ingest runs with umask 077; `install.sh` keeps `data/` at mode 700
@@ -471,7 +475,22 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   hint for that cause; their trips aren't listed or counted and merge
   suggestions wait. A month link to a folder another month name already counts
   is a notice (`row_type=folder_notice`): counted once, no merge block, not
-  unreadable in year-close snapshots. Closing a year
+  unreadable in year-close snapshots. Month links share one counted address
+  across routes; saved-name conflicts preserve saved keys and block year closing,
+  and folder messages share one formatter across the list, review and exports.
+  The upload alert names global folder refusals; unused-name merges are saved-data
+  notices excluded from miles and missing counts, with admin undo, only when
+  every part is counted under another name and both files match saved stamps.
+  A missing folder alone remains damage; direct trip loads and undo agree.
+  Unused-name merges block closing their saved-summary year and each part's
+  year (every year if the saved year is unknown). Notice miles stay in text,
+  outside numeric totals. Admin discard of damage and unused-name undo keep
+  the full summary in history before deletion in the same transaction; year
+  review and exports say which parts are currently counted again.
+  A file occupying a month name, or a folder whose owner/mode denies ingest
+  writing, is a notice with no missing count or merge block. Write notices
+  reuse scanned metadata, never W_OK on the viewer's read-only mount.
+  Closing a year
   saves its totals
   in `tax_years.snapshot`; the year review compares saved and current totals,
   and lists trips received after the close (ingest `_received_at` later than
@@ -576,7 +595,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   Weekly deep checks rotate older local/REMOTE copies and record
   `BACKUP_DIR/verify-state`. `last-success` advances once today's backup has
   completed and been copied off-host, before the deep check. A deep failure
-  still exits non-zero (failed Debian unit / Unraid `last_attempt_status`,
+  or detected damage in the previous local snapshot still exits non-zero
+  (failed Debian unit / Unraid `last_attempt_status`,
   reported as a problem by `install.sh --check`) and withholds the `PING_URL`
   heartbeat. The next nightly run retries; Unraid's hourly overdue catch-up
   does nothing while `last-success` is fresh. A failed remote-only snapshot
@@ -585,8 +605,21 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   Outside links under `data/` are reported and counted in `INFO` as
   `links_not_backed_up`; their contents are absent. Copy and deep check still
   run and `last-success` advances, but the run exits non-zero without a
-  heartbeat. Restore reports these links and uses rsync `--safe-links` to
-  skip them; relative internal links can be restored.
+  heartbeat. A failed coverage check records `unknown` ("not checked"); missing
+  or unreadable backup information is `unavailable`, not a failed link check.
+  Absolute internal aliases get warning-only restore advice; their real targets
+  may be saved at their own paths. Failure of advice only warns in backup, check
+  and restore; scratch stays outside snapshots and coverage is preserved.
+  Restore uses the installed rsync `--safe-links`
+  to report skipped links and recreated chains that depend on them; it also
+  states any recorded missing-content count. Proven loops are named warnings,
+  with no missing-content count, failure or withheld heartbeat; other resolution
+  errors still fail coverage. Relative loops are recreated. Standard GNU text
+  `SHA256SUMS` preserves escaped names; GNU coreutils is required. A tiny tool
+  probe rejects unreadable escaping without rehashing trips. Sorted NUL-delimited
+  `SYMLINKS` records copied link paths/text; changes create snapshots and unchanged
+  links dedupe. Only a previous snapshot without `SYMLINKS` forces one new copy.
+  Checks compare saved links with that list.
   Missing diagnostics/monitor databases are normal and recorded in `INFO`.
   Monitor discovery uses Compose config's project name and Docker's Compose
   project/volume labels, without recent config flags or logging credentials.
@@ -604,9 +637,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   Optional ntfy state needs a separate backup. Runbook: DEPLOY_DEBIAN Step 10.
   The off-host copy goes only to a destination holding `.mileage-backup-target`
   (written by install.sh or `backup.sh --mark-target`; otherwise the unit fails).
-  `REMOTE_PRUNE=yes` never uses rsync `--delete`: it applies the retention rule
-  to the remote's own snapshot names and refuses, with a warning, when the
-  remote has snapshots newer than or missing from the local set. rsync has a
+  `REMOTE_PRUNE=yes` uses rsync deletion limited to selected snapshot names,
+  never the remote root, and refuses with a warning when the remote has snapshots
+  newer than or missing from the local set. rsync has a
   600 s I/O timeout, the unit 6 h. Restore saves a corrupt live DB's raw files
   in the pre-restore folder and continues; its scratch is under `$BACKUP_DIR`.
 - Port binding: `BIND_ADDR` in `.env` sets the host IP published ports bind
