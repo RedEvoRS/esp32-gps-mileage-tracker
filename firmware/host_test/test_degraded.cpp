@@ -70,6 +70,9 @@ static void restartOnLoop() {
     assert(g_restarts == before + 1);
 }
 static void bootMessagesAfterUsbWait() {
+    const std::vector<std::string> expectedCalls = {"buffer:4096", "begin:115200", "timeout:0"};
+    assert(Serial.calls == expectedCalls && Serial.txTimeoutMs == 0 && Serial.txBufferSize == 4096);
+    if (gDegraded.mode() == Mode::Normal) assert(GPSSerial.rxBufferSize == 4096);
     assert(!Serial.log.empty() && Serial.log.size() == Serial.logMs.size());
     assert(Serial.log.front() == "\n=== Stage 4: Trip Logger ===");
     assert(Serial.log[1] == std::string("Firmware: ") + firmware::kVersion + "\n");
@@ -179,6 +182,7 @@ int main() {
     // failed independent verification. A later real clear read can recover.
     world(); failNextRead(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
     setup();
+    bootMessagesAfterUsbWait();
     assert(!PMU.aldo3 && gDegraded.mode() == Mode::PmuUntrusted);
     onlyPmuCalls({"begin", "disableALDO3", "disableCellbatteryCharge", "readRegister"});
     assert(PMU.aldo1 && PMU.aldo1Mv == 1800);

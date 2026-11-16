@@ -130,11 +130,31 @@ struct SerialStub {
     std::vector<std::string> log;
     uint32_t beginMs = 0;
     std::vector<uint32_t> logMs;
-    void begin(int) { beginMs = millis(); }
-    void println(const char* m = "") { logMs.push_back(millis()); log.push_back(m); if (!quiet) puts(m); }
+    uint32_t txTimeoutMs = 100;
+    size_t txBufferSize = 256;
+    std::vector<std::string> calls, writes;
+    std::function<void(const std::string&)> onWrite;
+    void begin(int baud) { beginMs = millis(); calls.push_back("begin:" + std::to_string(baud)); }
+    size_t setTxBufferSize(size_t size) {
+        calls.push_back("buffer:" + std::to_string(size)); txBufferSize = size; return size;
+    }
+    void setTxTimeoutMs(uint32_t ms) {
+        calls.push_back("timeout:" + std::to_string(ms)); txTimeoutMs = ms;
+    }
+    size_t write(const char* data, size_t size) {
+        std::string bytes(data, size);
+        writes.push_back(bytes);
+        if (onWrite) onWrite(bytes);
+        return size;
+    }
+    void println(const char* m = "") {
+        logMs.push_back(millis()); log.push_back(m); if (!quiet) puts(m);
+        write(m, strlen(m)); write("\r\n", 2);
+    }
     void printf(const char* fmt, ...) {
         char b[512]; va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
         logMs.push_back(millis()); log.push_back(b); if (!quiet) fputs(b, stdout);
+        write(b, strlen(b));
     }
 };
 extern SerialStub Serial;
@@ -658,7 +678,8 @@ struct HardwareSerial {
     std::function<void(HardwareSerial&)> onWrite;
     HardwareSerial(int) {}
     int baud = 0, rxPin = -1, txPin = -1;
-    void setRxBufferSize(int) {}
+    int rxBufferSize = 256;
+    void setRxBufferSize(int size) { rxBufferSize = size; }
     void begin(int b, int, int rx, int tx) { baud = b; rxPin = rx; txPin = tx; }
     int available() {
         if (rxPos >= rx.size()) return 0;

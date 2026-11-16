@@ -278,7 +278,13 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   after >10s without NAV-PVT from config end or the last NAV-PVT, warn once
   and fall back to RMC-only speed
 - FreeRTOS: networking on core 0, GPS on core 1; normal loop pauses 5 ms
-  only with an empty UART. Firmware v1.04 watches startup at 120 s per stage
+  only with an empty UART. GPS RX and USB serial TX buffers are 4,096 bytes;
+  runtime serial writes have zero timeout after normal/degraded setup.
+  GPS sync prints once per boot unless debug is on. UART drain gaps over
+  1,500 ms have boot-local count/max and rate-limited debug output.
+  Segment gaps and ARMING resets use GPS UTC when both fixes have it,
+  otherwise monotonic time; processing delays alone do not split timed fixes.
+  Firmware v1.04 watches startup at 120 s per stage
   after bounded PMU recovery and radio-off safety setup, then switches to 60 s
   for the loop. Verified scan/repair progress feeds it; waits and locks do not.
   Two startup hangs skip a failing card for LittleFS, or use no-storage mode
