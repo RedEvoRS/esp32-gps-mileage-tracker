@@ -1070,7 +1070,7 @@ def unused_merge_undo_effect(entry):
     return (f"The trips stay counted under {counted} with only the annotations saved under "
             f"{'that name' if len(names) == 1 else 'those names'}. "
             f"Annotations saved under {unused} are kept in the database but not applied. "
-            "The merged trip's saved miles and purpose leave the totals and are kept in history and the year review.")
+            "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review.")
 
 
 def folder_hint(entry, role):
@@ -1108,7 +1108,7 @@ def folder_hint(entry, role):
 DAMAGED_MERGE_DISCARD_EFFECT = (
     "Parts whose trip summaries can still be read return as separate trips with the annotations saved under their names. "
     "Parts without readable summaries do not return. "
-    "The merged trip's saved miles and purpose leave the totals and are kept in history and the year review."
+    "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review."
 )
 
 
@@ -3370,7 +3370,7 @@ def _history_summary(row):
         return (f"Discarded damaged merge with {distance}; saved annotation: {_annotation_words(details.get('dropped'))}. "
                 "Parts with readable trip summaries can be counted separately with the annotations saved under their names. "
                 "Missing or unreadable summaries need recovery from backups. "
-                "The merged trip's saved miles and purpose were removed from the totals and kept in this history record.")
+                "The merged trip's saved miles and purpose are not in the totals and are kept in this history record.")
     if action == "remove":
         return "Removed from the log: " + str(details.get("reason", ""))
     if action == "restore":

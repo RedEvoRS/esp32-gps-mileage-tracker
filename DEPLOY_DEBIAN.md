@@ -2878,7 +2878,7 @@ suggestions blocked and no **Undo saved merge**. Neither role can use ordinary
 **Undo merge (split back)** on damage. Only the admin can **Discard damaged
 merge**, after confirming that parts with readable summaries return separately with
 annotations saved under their names; parts without readable summaries do not.
-The merged trip's saved miles and purpose leave the totals and are kept in history. Before deletion, the same transaction saves the complete summary,
+The merged trip's saved miles and purpose stay out of the totals and are kept in history. Before deletion, the same transaction saves the complete summary,
 annotation and part keys in history. **Discarded or undone saved merges** in the year
 review permanently shows saved miles, purpose, date and login, and which parts
 are now counted again, separately or in a current merge, even after closing.
@@ -2896,7 +2896,7 @@ folder back, and keep that name in use, following the conflict steps above.
 Alternatively, the admin can select **Undo saved merge** on the trip list
 and confirm. The trips stay counted under the name in use with only annotations saved
 under that name. Annotations under the unused name stay in the database but
-are not applied. The merged trip's saved miles and purpose leave the totals;
+are not applied. The merged trip's saved miles and purpose stay out of the totals;
 the undo preserves its complete summary in history before deletion, in the
 same transaction as discard, and appears in the year review with the same
 current-count statement. Source files stay intact. Reopen any affected closed year first. Everyday logins must ask

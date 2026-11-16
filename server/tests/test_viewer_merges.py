@@ -194,7 +194,7 @@ class ViewerMerges(unittest.TestCase):
         self.assertIn('Discarded damaged merge with 0.732 mi; saved annotation: business, example stop, merged note. '
                       'Parts with readable trip summaries can be counted separately with the annotations saved under their names. '
                       'Missing or unreadable summaries need recovery from backups. '
-                      "The merged trip's saved miles and purpose were removed from the totals and kept in this history record.",
+                      "The merged trip's saved miles and purpose are not in the totals and are kept in this history record.",
                       html.unescape(history))
 
     def discard_with_readable_parts(self, missing_summaries=()):
@@ -214,7 +214,7 @@ class ViewerMerges(unittest.TestCase):
         ViewerRolesTests.seed_editor(self)
         effect = ('Parts whose trip summaries can still be read return as separate trips with the annotations saved under their names. '
                   'Parts without readable summaries do not return. '
-                  "The merged trip's saved miles and purpose leave the totals and are kept in history and the year review.")
+                  "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review.")
         for role in ('admin', 'editor'):
             if role == 'editor':
                 ViewerRolesTests.signed_in(self, role)
@@ -617,7 +617,7 @@ class ViewerMerges(unittest.TestCase):
         self.assertIn('Confirm removing this unused merge and its merged annotation.', absent.get_data(as_text=True))
         effect = ('The trips stay counted under 2026-05/ with only the annotations saved under that name. '
                   'Annotations saved under 2026-04/ are kept in the database but not applied. '
-                  "The merged trip's saved miles and purpose leave the totals and are kept in history and the year review.")
+                  "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review.")
         page = html.unescape(self.client.get('/').get_data(as_text=True))
         self.assertIn('Remove this unused merge and its merged annotation. ' + effect, page)
         refusal = self.undo_unused(key, confirm='no')
