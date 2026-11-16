@@ -255,6 +255,24 @@ class InstallerBackupTimer(unittest.TestCase):
         self.assertIn("FAILURES=1", out)
         self.assertIn("--mark-target", out)
 
+    def test_check_reports_missing_latest_info_once_with_recent_success(self):
+        self.run_setup(self.a)
+        # Use the real status reader with a recent last-success and no latest/INFO.
+        for name in ("scheduled.sh", "lib.sh"):
+            shutil.copy(SERVER / "backup" / name, self.a / "backup" / name)
+        for latest_exists in (False, True):
+            if latest_exists:
+                (self.backups / "latest").mkdir()
+            code, out, _ = self.run_setup(self.a, mode="check")
+            self.assertEqual(code, 0, out)
+            self.assertEqual(out.count("Latest backup information is unavailable"), 1)
+            self.assertNotIn("not checked", out)
+        (self.state / "unmarked").touch()
+        code, out, _ = self.run_setup(self.a, mode="check")
+        self.assertEqual(code, 0, out)
+        self.assertIn("has no .mileage-backup-target", out)
+        self.assertNotIn("Latest backup information is unavailable", out)
+
     def test_a_similar_path_is_not_mistaken_for_this_one(self):
         # /srv/a/mileage-tracker must not match /srv/a/mileage-tracker-old.
         old = self.make_install("srv/a/mileage-tracker-old")

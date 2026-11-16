@@ -309,7 +309,7 @@ Use this section for Unraid paths and scheduling.
 Mount the destinations first. Unassigned Devices commonly mounts local
 disks at `/mnt/disks/<name>` and network shares at `/mnt/remotes/<name>`.
 Enable the mount's automatic mounting if it should be available after boot.
-Choose a filesystem that supports the snapshot hard links and private file
+Choose a local snapshot filesystem that supports hard links and private file
 permissions. A separate share on this same Unraid box is **not off-host**.
 It cannot protect against losing the whole machine. The installer warns
 about a local `REMOTE`, and about destinations on the same filesystem as
@@ -400,12 +400,69 @@ directories are mode 700. `--status` prints `last_attempt_start`,
 `last_attempt_end`, `last_attempt_status`, `last_success`, the absolute
 log path, `last_deep_check`, `last_deep_check_result`, and
 `last_backup_links_not_backed_up` (an older `INFO` without the count means
-zero). Empty values can mean
+zero). A failed link check records `unknown` in `INFO` and status shows
+`not checked`; inspect the backup log, fix the error and rerun the backup.
+Missing or unreadable backup information instead shows `unavailable`: check
+that the backup disk is mounted and `latest/INFO` can be read. With a recent
+success, the installer reports unavailable `latest/INFO` unless another
+backup/destination check already explains the problem.
+Empty values can mean
 it has never run. Status 0 means success;
 `running` has no final result yet. Reading status itself exits 0, so inspect
 the fields. `last_success` comes from `BACKUP_DIR/last-success` and may be
 empty when its disk is absent. A direct `backup.sh` run does not update
 the wrapper's last-attempt record or persistent log.
+
+Absolute links are never restored as links, even when their targets are inside
+`data/`. Backup warns separately about those internal aliases without failing
+the run or counting their targets as missing. Their real target files are saved
+unless missing or excluded. Restore warns that it cannot determine an absolute
+link's original target coverage from a relocated snapshot. rsync `--safe-links`
+also skips relative paths rejected by its text check: too many leading `../`
+parts, and (on current rsync) `..` after a named path component. The report uses
+the installed rsync to determine which links survive, leaving any existing item
+at a skipped path alone. It recreates other relative links without
+resolving the chain first. For example, `relative -> absolute/trip.gpx` is
+recreated when `absolute` is skipped. Backup and restore name `data/absolute` as
+the dependency and warn that `relative` will dangle on an empty `data/`; existing
+items may keep the chain usable. Recreated links with target problems are counted
+separately from skipped links. Backup reports the original target's saved real
+path when present; restore cannot establish that through a relocated absolute
+link. Relative loops are reported and recreated without failing an otherwise
+complete backup. A proven loop gets a warning naming the link and saying it
+loops and has nothing behind it to back up; remove or correct it. Loops do not
+withhold the heartbeat or increase `links_not_backed_up`. Other resolution errors
+(including more than 256 link steps without proving a loop) still fail the
+coverage check. If restore advice fails, backup, check and restore warn and
+continue; inspect the log and rerun for that advice. Scratch stays outside
+snapshots and the coverage result is preserved. Relative chains that pass rsync's
+text check but lead outside are recreated and warned about; their outside
+contents still fail backup,
+withhold the heartbeat and count in `links_not_backed_up`. Backup never follows
+links to copy their contents. Replace an alias you need with a working relative
+internal chain or a real folder or file, then make a fresh backup.
+
+Both check and restore state any positive `INFO` count plainly: the backup
+recorded that many linked items whose contents were not saved. Recover them
+from the original target or another backup, move them into `data/`, and make a
+fresh backup. `unknown` means the backup could not check; missing/unreadable
+`INFO` means the information is unavailable. Zero or an absent field in older
+readable `INFO` keeps per-link warnings neutral. A passing restore test checks
+the saved copy and cannot recover omitted contents. Saved relative loops get
+the same explanation as backup; restore does not follow absolute links to the
+original host to diagnose their targets.
+
+Snapshots use standard GNU text `SHA256SUMS` checksums and a sorted,
+NUL-delimited `SYMLINKS` list of copied link paths/text. GNU coreutils is required
+and ships with Unraid; a tiny startup probe rejects unsupported checksum escaping
+when needed, without hashing trips twice. Older snapshots without `SYMLINKS`
+cause one extra snapshot and remain restorable. Link-only adds, removals,
+retargets and swaps with real folders also create snapshots; unchanged links
+dedupe, and excluded links do not affect comparison. Manifest-writing errors
+fail the run and withhold the heartbeat; inspect the log and rerun.
+
+Restore and deep checks compare saved links with `SYMLINKS`; older snapshots
+without it report that their links are not checked.
 
 After today's backup has completed and been copied, the same run periodically
 checks older snapshots. In `backup/backup.conf`, `BACKUP_VERIFY_DAYS=7` means

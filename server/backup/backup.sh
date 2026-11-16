@@ -85,11 +85,20 @@ verify_pinned() {
 
 name=$(date -u +%Y-%m-%dT%H%M%SZ)
 work=$SNAPSHOTS/.partial-$name
-rm -rf "$SNAPSHOTS"/.partial-*        # left behind by a run that died
+remove_backup_tree "$SNAPSHOTS"/.partial-*        # left behind by a run that died
 # restore.sh's scratch folders, left behind if a restore test was killed
 find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -name '.restore-scratch-*' -mmin +1440 \
-    -exec rm -rf {} + 2> /dev/null || true
+    -print0 | while IFS= read -r -d '' stale; do
+        remove_backup_tree "$stale"
+    done 2> /dev/null || true
 prev=$(list_snapshots | tail -n 1)
+# Coverage lists and restore advice must never enter a snapshot or its manifest.
+remove_backup_tree "$BACKUP_DIR"/.link-scratch-* \
+    || log "WARNING: could not remove abandoned link advice scratch"
+link_scratch=$(mktemp -d "$BACKUP_DIR/.link-scratch-XXXXXX")
+trap 'remove_backup_tree "$link_scratch" || log "WARNING: could not remove link advice scratch: $link_scratch"' EXIT
+checksum_escapes=yes
+probe_checksum_escaping "$link_scratch" || checksum_escapes=no
 mkdir "$work"
 
 # --- 1. Annotations database -------------------------------------------
@@ -129,32 +138,71 @@ link=()
 # Ingest holds this lock for the whole write of a trip's GPX + JSON.
 open_upload_lock
 flock -w 300 7
-rsync -a --numeric-ids --exclude=/.upload.lock --exclude='/.upload-lock.*' --exclude='*.tmp' \
+# Compare bytes even when a manual replacement preserves size and mtime.
+# Record item codes only, so whitespace in filenames cannot affect dedupe.
+rsync -a --checksum --out-format='%i' --numeric-ids --exclude=/.upload.lock --exclude='/.upload-lock.*' --exclude='*.tmp' \
         --exclude=/diagnostics/events.db --exclude='/diagnostics/events.db-*' "${link[@]}" \
-        "$COMPOSE_DIR/data/" "$work/data/"
+        "$COMPOSE_DIR/data/" "$work/data/" > "$link_scratch/copy-changes"
 # A failed link check must not cost tonight's off-host copy: note it,
 # finish the backup, then fail the run below.
 coverage_error=0
-if ! report_outside_links "$COMPOSE_DIR/data" "$work/.outside-links"; then
+if ! report_outside_links "$COMPOSE_DIR/data" "$link_scratch/outside-links"; then
     log "ERROR: couldn't check data for links outside it; this run will fail after the copy"
-    rm -f -- "$work/.outside-links"
-    LINKS_NOT_BACKED_UP=0
+    rm -f -- "$link_scratch/outside-links"
+    LINKS_NOT_BACKED_UP=unknown
     coverage_error=1
 fi
+# Restore advice is warning-only. Failure here must not discard a valid
+# coverage count or turn a complete backup into a failed run.
+if ! report_link_restore_effects "$COMPOSE_DIR/data" "$work/data" "$link_scratch/link-effects"; then
+    log "WARNING: couldn't check how data links will restore; inspect the backup log and rerun backup.sh for restore warnings."
+fi
 exec 7<&-
-trips=$(find "$work/data" -type f -name '*.gpx' | wc -l)
+trips=$(count_files "$work/data" -name '*.gpx')
 
 # --- 3. Manifest, dedupe, prune ----------------------------------------
 
-(cd "$work" && find . -type f ! -name SHA256SUMS -print0 \
-    | LC_ALL=C sort -z | xargs -0 -r sha256sum) > "$work/SHA256SUMS"
+# Compare the links actually copied, so rsync's exclusions apply identically.
+# Sorted NUL-delimited path/text pairs preserve whitespace and target newlines.
+# Keep the copy on a manifest error, but fail afterwards and never dedupe it.
+link_manifest_error=0
+if ! write_symlink_manifest "$work/data" > "$work/SYMLINKS"; then
+    log "ERROR: couldn't record the copied symbolic links; this run will fail after the copy"
+    rm -f -- "$work/SYMLINKS"
+    link_manifest_error=1
+fi
+write_snapshot_manifest "$work" > "$work/SHA256SUMS" \
+    || die "couldn't write the snapshot checksum manifest; backup has not completed"
+if [[ $checksum_escapes == no ]] && grep -q "^\\\\" "$work/SHA256SUMS"; then
+    die "sha256sum cannot read back escaped filenames in SHA256SUMS; GNU coreutils is required. Backup has not completed."
+fi
+# Check the writer's filename inventory too, without rehashing file contents.
+if ! cmp -s <(manifest_paths "$work/SHA256SUMS" | LC_ALL=C sort -z) \
+        <(cd "$work" && find . -type f ! -path ./SHA256SUMS ! -path ./INFO -print0 | LC_ALL=C sort -z); then
+    die "sha256sum wrote an unreadable filename list in SHA256SUMS; GNU coreutils is required. Backup has not completed."
+fi
 
-# Preserve changes in discovery status even if the database/file bytes match.
-if [[ -n $prev ]] && cmp -s "$work/SHA256SUMS" "$SNAPSHOTS/$prev/SHA256SUMS" \
+# A copied/re-created file must survive even if the old manifest describes the
+# same good bytes. Only rehash the previous snapshot in this unusual case.
+failed=0
+if [[ -n $prev ]] && grep -Eq '^[<>ch.]f' "$link_scratch/copy-changes" \
+        && cmp -s "$work/SHA256SUMS" "$SNAPSHOTS/$prev/SHA256SUMS" \
+        && ! (cd "$SNAPSHOTS/$prev" && sha256sum --quiet --strict -c SHA256SUMS) >&2; then
+    log "ERROR: previous snapshot $prev differs from its own checksum list and is damaged; do not use it for a restore. The new snapshot is good; check the backup disk."
+    failed=1
+fi
+
+# Keep copied files and directory mode changes even when contents still match.
+# Directory times can change for excluded files, so they alone do not count.
+# Preserve changes in discovery status too.
+if [[ -n $prev && $LINKS_NOT_BACKED_UP =~ ^[0-9]+$ && $link_manifest_error == 0 ]] \
+        && ! grep -Eq '^[<>ch.]f|^.d...p' "$link_scratch/copy-changes" \
+        && cmp -s "$work/SHA256SUMS" "$SNAPSHOTS/$prev/SHA256SUMS" \
+        && { write_symlink_manifest "$SNAPSHOTS/$prev/data" | cmp -s "$work/SYMLINKS" -; } \
         && grep -Fxq "monitor=$monitor" "$SNAPSHOTS/$prev/INFO" \
         && [[ $(read_coverage_count "$SNAPSHOTS/$prev/INFO") == "$LINKS_NOT_BACKED_UP" ]]; then
     log "Nothing changed since $prev; keeping that snapshot"
-    rm -rf "$work"
+    remove_backup_tree "$work"
     current=$prev
 else
     # Names have one-second resolution; a second run within the same
@@ -186,7 +234,7 @@ ln -sfn "snapshots/$current" "$BACKUP_DIR/latest"
 list_snapshots | retention_drops | while read -r old; do
     if verify_pinned "$old"; then continue; fi
     log "Pruning local snapshot $old"
-    rm -rf "${SNAPSHOTS:?}/$old"
+    remove_backup_tree "${SNAPSHOTS:?}/$old"
 done
 
 # --- 4. Off-host copy --------------------------------------------------
@@ -219,7 +267,7 @@ $diffs"
 # starts with few or no local snapshots, and the history on the remote
 # must survive that.
 prune_remote() {
-    local names drops history_only newer empty old
+    local names drops history_only newer empty old local_names
     if ! names=$(list_remote_snapshots); then
         log "WARNING: couldn't list the snapshots on $REMOTE; not pruning it"
         return 0
@@ -235,7 +283,8 @@ prune_remote() {
     drops=$(retention_drops <<< "$names")
     # What the rule would keep that this server doesn't have: history that
     # exists only off-host, as after a rebuild or a changed BACKUP_DIR.
-    history_only=$(comm -23 <(comm -23 <(sort <<< "$names") <(sort <<< "$drops")) <(list_snapshots | sort))
+    local_names=$(list_snapshots) || return 1
+    history_only=$(comm -23 <(comm -23 <(sort <<< "$names") <(sort <<< "$drops")) <(sort <<< "$local_names"))
     if [[ -n $history_only ]]; then
         log "WARNING: not pruning $REMOTE: it holds $(wc -l <<< "$history_only") snapshot(s) that this server doesn't (first: $(head -n 1 <<< "$history_only"))."
         log "WARNING: That looks like a rebuilt server or a changed BACKUP_DIR. Nothing was deleted there."
@@ -283,7 +332,8 @@ deep_verify() (
         return 0
     fi
 
-    names=$(list_snapshots | grep -Fxv "$current" || true)
+    names=$(list_snapshots) || return 1
+    names=$(grep -Fxv "$current" <<< "$names" || true)
     oldest=$(head -n 1 <<< "$names")
     next_cursor=$VERIFY_CURSOR
     if [[ -n $oldest ]]; then selected=$oldest; fi
@@ -330,11 +380,11 @@ deep_verify() (
     write_verify_state || { log "Deep check FAILED: cannot write verify-state"; return 1; }
     # Run even with no older local snapshots: REMOTE may retain older history.
     # Scratch stays on the backup disk, outside snapshots and the copied tree.
-    trap '[[ -z $scratch ]] || rm -rf -- "$scratch"' EXIT
+    trap '[[ -z $scratch ]] || remove_backup_tree "$scratch"' EXIT
     trap 'exit 1' HUP INT TERM
     # Only this backup lock owns verification scratch. Even leftover cleanup
     # errors are deferred until after today's backup has been copied.
-    rm -rf "$BACKUP_DIR"/.verify-scratch-* || return 1
+    remove_backup_tree "$BACKUP_DIR"/.verify-scratch-* || return 1
     for old in $selected; do
         log "Deep check local $old"
         if ! verify_snapshot "$SNAPSHOTS/$old"; then
@@ -365,7 +415,7 @@ deep_verify() (
             failed=1
             failed_remote+="$old "
         fi
-        rm -rf -- "$scratch" || return 1
+        remove_backup_tree "$scratch" || return 1
         scratch=
     done
     VERIFY_RESULT=failed
@@ -377,14 +427,17 @@ deep_verify() (
     return "$failed"
 )
 
-failed=0
 deep_verify || { log "Deep check failed; today's backup was copied. Check the failed snapshots and rerun backup.sh."; failed=1; }
-if (( LINKS_NOT_BACKED_UP > 0 )); then
+if [[ $LINKS_NOT_BACKED_UP =~ ^[0-9]+$ ]] && (( LINKS_NOT_BACKED_UP > 0 )); then
     log "WARNING: $LINKS_NOT_BACKED_UP linked item(s) are not in this backup; replace each link with the real folder or file (or delete a link with nothing behind it) and rerun backup.sh."
     failed=1
 fi
 if (( coverage_error )); then
     log "ERROR: data wasn't checked for links outside it; fix the error above and rerun backup.sh."
+    failed=1
+fi
+if (( link_manifest_error )); then
+    log "ERROR: copied symbolic links weren't recorded for snapshot comparison; fix the error above and rerun backup.sh."
     failed=1
 fi
 (( failed == 0 )) || exit 1

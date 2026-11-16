@@ -576,7 +576,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   Weekly deep checks rotate older local/REMOTE copies and record
   `BACKUP_DIR/verify-state`. `last-success` advances once today's backup has
   completed and been copied off-host, before the deep check. A deep failure
-  still exits non-zero (failed Debian unit / Unraid `last_attempt_status`,
+  or detected damage in the previous local snapshot still exits non-zero
+  (failed Debian unit / Unraid `last_attempt_status`,
   reported as a problem by `install.sh --check`) and withholds the `PING_URL`
   heartbeat. The next nightly run retries; Unraid's hourly overdue catch-up
   does nothing while `last-success` is fresh. A failed remote-only snapshot
@@ -585,8 +586,21 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   Outside links under `data/` are reported and counted in `INFO` as
   `links_not_backed_up`; their contents are absent. Copy and deep check still
   run and `last-success` advances, but the run exits non-zero without a
-  heartbeat. Restore reports these links and uses rsync `--safe-links` to
-  skip them; relative internal links can be restored.
+  heartbeat. A failed coverage check records `unknown` ("not checked"); missing
+  or unreadable backup information is `unavailable`, not a failed link check.
+  Absolute internal aliases get warning-only restore advice; their real targets
+  may be saved at their own paths. Failure of advice only warns in backup, check
+  and restore; scratch stays outside snapshots and coverage is preserved.
+  Restore uses the installed rsync `--safe-links`
+  to report skipped links and recreated chains that depend on them; it also
+  states any recorded missing-content count. Proven loops are named warnings,
+  with no missing-content count, failure or withheld heartbeat; other resolution
+  errors still fail coverage. Relative loops are recreated. Standard GNU text
+  `SHA256SUMS` preserves escaped names; GNU coreutils is required. A tiny tool
+  probe rejects unreadable escaping without rehashing trips. Sorted NUL-delimited
+  `SYMLINKS` records copied link paths/text; changes create snapshots and unchanged
+  links dedupe. Only a previous snapshot without `SYMLINKS` forces one new copy.
+  Checks compare saved links with that list.
   Missing diagnostics/monitor databases are normal and recorded in `INFO`.
   Monitor discovery uses Compose config's project name and Docker's Compose
   project/volume labels, without recent config flags or logging credentials.
@@ -604,9 +618,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   Optional ntfy state needs a separate backup. Runbook: DEPLOY_DEBIAN Step 10.
   The off-host copy goes only to a destination holding `.mileage-backup-target`
   (written by install.sh or `backup.sh --mark-target`; otherwise the unit fails).
-  `REMOTE_PRUNE=yes` never uses rsync `--delete`: it applies the retention rule
-  to the remote's own snapshot names and refuses, with a warning, when the
-  remote has snapshots newer than or missing from the local set. rsync has a
+  `REMOTE_PRUNE=yes` uses rsync deletion limited to selected snapshot names,
+  never the remote root, and refuses with a warning when the remote has snapshots
+  newer than or missing from the local set. rsync has a
   600 s I/O timeout, the unit 6 h. Restore saves a corrupt live DB's raw files
   in the pre-restore folder and continues; its scratch is under `$BACKUP_DIR`.
 - Port binding: `BIND_ADDR` in `.env` sets the host IP published ports bind

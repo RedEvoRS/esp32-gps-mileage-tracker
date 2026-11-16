@@ -1455,19 +1455,51 @@ off-host destination. Each run:
   `diagnostics/events.db` and its SQLite sidecars are excluded from rsync.
   Links resolving outside `data/` are logged (up to 20 and a remainder count);
   their contents are missing from this and earlier snapshots made with the
-  link. Internal links and `*.tmp` are fine. Move the contents into `data/`
-  and rerun the backup. The copy and deep check still run, but the run exits
-  non-zero and withholds the heartbeat.
+  link. Working relative internal chains and `*.tmp` are fine. Move the contents
+  into `data/` and rerun the backup. The copy and deep check still run, but the
+  run exits non-zero and withholds the heartbeat.
+  Absolute links inside `data/` get a separate warning that their aliases will
+  not be restored; their targets are saved at their real paths unless missing
+  or excluded, which the warning explains. These warnings do not fail the run,
+  withhold the heartbeat or increase `links_not_backed_up`.
+  A relative link through a skipped link gets a separate warning naming that
+  dependency: it is recreated, but will dangle on an empty `data/`. Backup
+  reports the original target's real saved path when present. Proven loops
+  get a named warning that they loop and have nothing behind them to back up;
+  remove or correct those links. They do not fail the run, withhold the heartbeat
+  or increase `links_not_backed_up`; relative loops are recreated by restore.
+  Other resolution errors, including a walk exceeding 256 link steps without
+  proving a loop, still fail the coverage check. Failure of restore advice only
+  warns in backup, check and restore; inspect the log and rerun for that advice.
+  Scratch stays outside snapshots, and the coverage result is preserved.
 - stores `annotations.db`, optional `events.db` and optional `monitor.db`
   beside `data/`, all covered by `SHA256SUMS`. Human-readable `INFO` records
   annotation/event counts, monitor status and `links_not_backed_up` (missing
-  means zero). A changed link count makes a new snapshot. Restore checks report
-  database
-  integrity, event counts and monitor state tables.
-- writes a `SHA256SUMS` manifest. Unchanged files are hard links to the
-  previous snapshot, and a run where nothing changed doesn't add a
-  snapshot at all, so daily runs cost almost nothing.
+  means zero in an older readable `INFO`). `unknown` means linked items were
+  not checked: inspect the backup log, fix the check error and rerun the backup.
+  Status and restore checks show "not checked"; an unchecked run always makes a
+  new snapshot. Missing or unreadable backup information instead shows
+  `unavailable` in status: check the backup disk/mount, `latest` and `INFO`.
+  `install.sh --check` warns for a positive count or "not checked". With a
+  recent success, it also reports unavailable `latest/INFO` unless another
+  backup/destination check already explains the problem. A changed
+  link count also makes a new snapshot. Restore checks report database integrity,
+  event counts and monitor state tables.
+- writes standard GNU text `SHA256SUMS` checksums and a sorted, NUL-delimited
+  `SYMLINKS` list of copied link paths/text. GNU coreutils is required (Debian
+  and Unraid ship it); line breaks and backslashes round-trip. A tiny startup
+  probe rejects unsupported checksum escaping when needed, without hashing
+  trips twice. Older snapshots without `SYMLINKS` cause one extra snapshot and
+  remain restorable. A copied link's add, removal, retarget or swap with a real
+  folder also creates a snapshot; excluded links do not affect comparison.
+  Manifest-writing errors fail the run and withhold the heartbeat.
+  Restore and deep checks compare saved links with `SYMLINKS`; older snapshots
+  without it report that their links are not checked.
+  Unchanged files are hard links to the previous snapshot; an unchanged run
+  adds no snapshot.
 - keeps the newest 14 snapshots plus the first of each month for 7 years.
+  Local pruning and scratch cleanup make only directories writable when removing
+  them; file modes in kept local snapshots are preserved.
 - rsyncs to the off-host copy, then reads the newest snapshot back from
   there and checks it matches byte for byte. It copies only if the
   destination holds a file named `.mileage-backup-target` (see 10a): a share
@@ -1497,9 +1529,8 @@ needs UID 1000 (Step 0).
 
 Anything you can rsync to: a network attached storage (NAS) device, another
 always-on machine, or a mounted share. Over SSH, the far end needs `rsync`
-installed and a login the backup
-can use without a password. In these examples, `<backup-user>` and
-`<backup-host>` are the login and host for that other machine, and
+and a login the backup can use without a password. In these examples,
+`<backup-user>` and `<backup-host>` are the login and host for that other machine, and
 `/<backup-path>` is the absolute destination directory there. On this server:
 
 ```bash
@@ -1664,10 +1695,28 @@ Snapshot holds 1 trip GPX files and 1 summaries
 Restore test passed
 ```
 
-Outside links are listed; if any are found the check still exits 0 with
-`Restore test passed, but N linked item(s) are not in this backup`. Their
-contents are missing even if checksums pass. The counts should match what the
-viewer shows. The check changes nothing on the live system. Do this again before each filing.
+Check and restore first explain the saved `INFO` coverage result. A positive
+count says plainly `this backup recorded N linked item(s) whose contents were
+not saved`, even for absolute links. Recover the omitted contents from their
+original targets or another backup, move them into `data/`, and make a fresh
+backup. `unknown` says the backup run could not check; inspect its log, fix the
+error and rerun. Missing/unreadable `INFO` instead means coverage information is
+unavailable. With zero or an absent field in older readable `INFO`, per-link
+warnings stay neutral.
+
+Links that will not be restored as links are listed. The check still exits 0;
+its closing warning repeats any recorded missing-content count, otherwise
+`Restore test passed, but N linked item(s) will not be restored as links; see
+warnings above`. Links recreated with target problems have a
+separate warning and count, naming any skipped link they depend on. For an
+absolute link or a chain through one, the relocated snapshot cannot
+determine whether its original target is saved elsewhere in the backup or
+absent; the per-link warning explains this uncertainty while any recorded
+missing-content count remains explicit. Proven saved relative loops are named
+and described as having nothing behind them to back up. Restore does not follow
+absolute links to the original host to diagnose their targets.
+Check the real trip files and annotations against the viewer. The check changes
+nothing on the live system. Do this again before each filing.
 
 On a new install the first snapshot is empty (`0 annotations`, `0 trip
 GPX files`): the installer deletes its test trip before it gets to
@@ -1844,10 +1893,21 @@ backup API with their writers stopped: the ingest helper writes events.db;
 the viewer and monitor helpers write their own databases. It starts the default
 services again and restarts the monitor if it was running. A saved monitor DB
 can create the volume on a replacement server without enabling notifications.
-It never deletes trip files that aren't in the snapshot. Restore reports
-outside links before restoring and uses rsync `--safe-links`: outside links
-are skipped, existing real folders are kept, and relative links inside `data/`
-are restored. The outside links' contents were not backed up.
+It never deletes trip files that aren't in the snapshot. Restore reports link
+problems before restoring and uses rsync `--safe-links`: absolute links and
+relative paths rejected by its text check are skipped, leaving existing items
+there alone. Too many leading `../` parts are rejected; current rsync also
+rejects `..` after a named path component. The report uses the installed rsync
+to determine which links survive. Other relative links are recreated. This checks
+each link's text, so `relative -> absolute/trip.gpx` is recreated even when `absolute` is a
+skipped absolute link. The warning names `data/absolute` and explains that
+`relative` will dangle on an empty `data/`; an existing item there may keep it
+usable. The real target files can still be saved at their own paths. Relative
+chains that lead outside despite passing rsync's text check are also recreated
+and warned about. Their outside contents still fail backup, withhold its
+heartbeat and count in `links_not_backed_up`; backup never follows links to copy
+their contents. Replace an alias you need with a working relative internal
+chain or a real folder or file, then make a fresh backup.
 
 If monitor discovery fails, restore warns, skips `monitor.db`, and leaves the
 monitor service running or stopped as it was, while restoring trips, annotations
@@ -1878,6 +1938,8 @@ starts fresh when the owning service next creates it. The optional ntfy volume
 into `data/` (owned by UID 1000, mode 700): it fails after stopping the
 services, restarts them on exit, and nothing is restored. Restored files keep
 UID 1000 ownership, so no `chown` is needed afterwards.
+After a restore run as root, files have mode 600 and folders mode 700; if the
+snapshot's modes differed, the next backup makes one new snapshot, as expected.
 
 **A restore also brings back everyday logins as they were in that snapshot.**
 A password reset, account disable or removal made since then is undone. Open

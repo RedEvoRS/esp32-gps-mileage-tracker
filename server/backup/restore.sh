@@ -101,14 +101,31 @@ fetch_and_check() {
     done
 
     local gpx json
-    gpx=$(find "$snap/data" -type f -name '*.gpx' | wc -l)
-    json=$(find "$snap/data" -type f -name '*.json' | wc -l)
+    gpx=$(count_files "$snap/data" -name '*.gpx')
+    json=$(count_files "$snap/data" -name '*.json')
     log "Snapshot holds $gpx trip GPX files and $json summaries"
-    report_outside_links "$snap/data" "$scratch/outside-links"
-    if (( LINKS_NOT_BACKED_UP > 0 )); then
-        log "WARNING: the contents of $LINKS_NOT_BACKED_UP linked item(s) are not in this backup"
+    SNAPSHOT_LINKS_NOT_BACKED_UP=$(read_coverage_count "$snap/INFO")
+    if [[ $SNAPSHOT_LINKS_NOT_BACKED_UP == unknown ]]; then
+        log "WARNING: linked items were not checked when this backup was made; inspect the backup log, fix the check error and make a fresh backup. Checking the saved links below."
+    elif [[ $SNAPSHOT_LINKS_NOT_BACKED_UP == unavailable ]]; then
+        log "WARNING: no readable INFO in this snapshot; saved link coverage information is unavailable. Find a readable INFO or inspect the original backup log before relying on this backup. Checking the saved links below."
+    elif [[ $SNAPSHOT_LINKS_NOT_BACKED_UP =~ ^[0-9]+$ && $SNAPSHOT_LINKS_NOT_BACKED_UP == *[1-9]* ]]; then
+        log "WARNING: this backup recorded $SNAPSHOT_LINKS_NOT_BACKED_UP linked item(s) whose contents were not saved; recover those contents from the original target or another backup, move them into data/ and make a fresh backup."
     fi
-    [[ -f $snap/INFO ]] && log "Snapshot INFO: $(tr '\n' ' ' < "$snap/INFO")"
+    if ! report_link_restore_effects "$snap/data" "$snap/data" "$scratch/link-effects" restore; then
+        log "WARNING: couldn't check how data links will restore; inspect the log and rerun for restore warnings."
+    fi
+    if (( LINKS_NOT_RESTORED > 0 )); then
+        log "WARNING: $LINKS_NOT_RESTORED linked item(s) will not be restored as links; see warnings above for target coverage"
+    fi
+    if [[ -f $snap/INFO && -r $snap/INFO ]]; then
+        local info
+        if info=$(tr '\n' ' ' < "$snap/INFO"); then
+            log "Snapshot INFO: $info"
+        else
+            log "WARNING: couldn't display snapshot INFO; inspect the original backup log"
+        fi
+    fi
 }
 
 start_services() {
@@ -130,7 +147,7 @@ cleanup() {
         log "Restore did not finish; starting the services again"
         start_services || log "Could not start the services; check docker compose and the monitor profile"
     fi
-    rm -rf "${scratch:-}"
+    remove_backup_tree "${scratch:-}"
     exit "$status"
 }
 
@@ -147,7 +164,7 @@ for arg in "$@"; do
     esac
 done
 [[ $command == check || -n $snapshot_arg ]] || die "say which snapshot to restore (latest, a name, or a path)"
-require_commands rsync sha256sum
+require_commands rsync sha256sum cmp
 
 # The snapshot, trip files included, is copied here. Debian 13 keeps /tmp
 # in RAM, so by default this is next to the snapshots (same disk, mode 700).
@@ -165,8 +182,13 @@ show_verify_status
 fetch_and_check "$snapshot_arg"
 
 if [[ $command == check ]]; then
-    if (( LINKS_NOT_BACKED_UP > 0 )); then
-        log "Restore test passed, but $LINKS_NOT_BACKED_UP linked item(s) are not in this backup"
+    if (( LINKS_RESTORED_WITH_WARNINGS > 0 )); then
+        log "WARNING: $LINKS_RESTORED_WITH_WARNINGS linked item(s) will be restored as links with target problems; see warnings above"
+    fi
+    if [[ $SNAPSHOT_LINKS_NOT_BACKED_UP =~ ^[0-9]+$ && $SNAPSHOT_LINKS_NOT_BACKED_UP == *[1-9]* ]]; then
+        log "Restore test passed, but this backup recorded $SNAPSHOT_LINKS_NOT_BACKED_UP linked item(s) whose contents were not saved; see warnings above"
+    elif (( LINKS_NOT_RESTORED > 0 )); then
+        log "Restore test passed, but $LINKS_NOT_RESTORED linked item(s) will not be restored as links; see warnings above"
     else
         log "Restore test passed"
     fi
@@ -257,7 +279,8 @@ fi
 log "Restoring trip files (anything replaced goes to $pre/data)"
 # Old backups may contain the unsafe live diagnostics copy. Never replay it
 # (or its journal) through rsync; only restore the checked SQLite snapshot.
-# Outside links contain no saved trips; skip them so live folders survive.
+# Skip unsafe and absolute links, keeping existing real folders. Saved target
+# files are restored at their own paths, even when an alias cannot be restored.
 rsync -a --safe-links --numeric-ids "${trip_owner[@]}" --backup --backup-dir="$pre/data" --itemize-changes \
     --exclude=/.upload.lock --exclude='/.upload-lock.*' \
     --exclude=/diagnostics/events.db --exclude='/diagnostics/events.db-*' \
