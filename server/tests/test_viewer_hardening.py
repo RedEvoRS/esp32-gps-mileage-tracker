@@ -607,8 +607,9 @@ class ViewerHardeningTests(unittest.TestCase):
                     message = self.viewer.folder_message(entry, "editor")
                     self.assertIn("Please ask the admin", message)
                     if entry['folder_reason'] == 'unused_merge':
-                        self.assertIn('restore the original month name, as a link or by renaming the folder back', message)
-                        self.assertIn('or use Undo saved merge. The trips stay counted under 2026-12/ with only the annotations saved under that name.', message)
+                        self.assertIn('Please ask the admin to restore the original month name, as a link or by renaming the folder back, '
+                                      'or to undo the saved merge.', message)
+                        self.assertIn('The trips stay counted under 2026-12/ with only the annotations saved under that name.', message)
                     self.assertTrue(any(message in text for text in texts), path)
 
     def test_damaged_merge_has_same_recovery_message_on_every_surface_for_both_roles(self):

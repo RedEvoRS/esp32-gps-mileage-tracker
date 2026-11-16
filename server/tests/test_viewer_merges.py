@@ -283,7 +283,247 @@ class ViewerMerges(unittest.TestCase):
                 finally:
                     book.close()
 
-    def assert_discard_current_statement(self, statement, *, undone=False):
+    def cross_year_merge(self, *, undo):
+        self.base = datetime(2026, 12, 31, 23, 58, tzinfo=timezone.utc)
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        for old, month in ((a, '2026-12'), (b, '2027-01')):
+            target = self.data / month
+            target.mkdir()
+            name = old.split('/')[1]
+            for suffix in ('.json', '.gpx'):
+                (self.data / (old + suffix)).rename(target / (name + suffix))
+        a, b = '2026-12/a', '2027-01/b'
+        self.annotate(a, 'personal', 'original note')
+        key = self.merged_key(self.merge(a, b))
+        self.annotate(key, 'business', 'merged note')
+        if undo:
+            (self.data / '2026-12').rename(self.data / '2026-10')
+            (self.data / '2027-01').rename(self.data / '2027-02')
+            self.assertEqual(self.undo_unused(key).status_code, 302)
+        else:
+            (self.data / '2027-01/b.json').unlink()
+            self.assertEqual(self.discard(key).status_code, 302)
+        return key
+
+    def test_followup_preserves_123ab6e_totals_on_all_four_surfaces(self):
+        # These exact scenarios were also run against 123ab6e before the fix.
+        for scenario in ('healthy', 'cross_year_undo', 'cross_year_discard', 'closed_unused'):
+            with self.subTest(scenario=scenario):
+                fixture = ViewerMerges()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                if scenario.startswith('cross_year'):
+                    fixture.cross_year_merge(undo=scenario.endswith('undo'))
+                    expected = {2026: (0, 0 if scenario.endswith('undo') else .041, 0,
+                                       .041 if scenario.endswith('undo') else 0, .041),
+                                2027: (0, 0, 0, .041, .041) if scenario.endswith('undo') else (0, 0, 0, 0, 0)}
+                elif scenario == 'closed_unused':
+                    a, b = fixture.trip('a', 0), fixture.trip('b', 180, .01)
+                    fixture.merged_key(fixture.merge(a, b))
+                    self.assertEqual(fixture.close_year().status_code, 302)
+                    fixture.month.rename(fixture.data / '2026-05')
+                    expected = {2026: (0, 0, 0, .082, .082)}
+                else:
+                    fixture.trip('a', 0)
+                    b = fixture.trip('b', 180, .01)
+                    fixture.annotate(b, 'personal', 'example note')
+                    expected = {2026: (0, .041, 0, .041, .082)}
+                for year, values in expected.items():
+                    totals = dict(zip(('business', 'personal', 'other', 'unclassified', 'all'), values, strict=True))
+                    trips, entries = fixture.viewer.load_trips()
+                    self.assertEqual(fixture.viewer.year_figures(*fixture.viewer.year_members(trips, entries, year))['totals'], totals)
+                    page = fixture.client.get(f'/?year={year}').get_data(as_text=True)
+                    self.assertIn(f'{totals["all"]:.3f} mi total', page)
+                    review = fixture.client.get(f'/admin/year/{year}').get_data(as_text=True)
+                    section = review.split('<h2 id="totals-heading">', 1)[1].split('</section>', 1)[0]
+                    self.assertEqual({name: float(miles) for name, miles in re.findall(
+                        r'<td>(business|personal|other|unclassified|all)</td><td>\d+</td><td>([\d.]+)</td>', section)}, totals)
+                    rows = list(csv.DictReader(io.StringIO(fixture.client.get(f'/export.csv?year={year}').get_data(as_text=True))))
+                    self.assertEqual({r['category']: float(r['distance_miles']) for r in rows if r['row_type'] == 'total'}, totals)
+                    book = load_workbook(io.BytesIO(fixture.client.get(f'/export.xlsx?year={year}').data))
+                    try:
+                        self.assertEqual({r[2]: r[3] for r in list(book['Totals'].values)[1:]}, totals)
+                    finally:
+                        book.close()
+
+    def test_cross_year_undo_and_discard_records_on_both_reviews_and_exports(self):
+        from test_viewer_roles import ViewerRolesTests
+        for undo in (False, True):
+            with self.subTest(undo=undo):
+                fixture = ViewerMerges()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                key = fixture.cross_year_merge(undo=undo)
+                label = 'Unused-name merge undone' if undo else 'Damaged merge discarded'
+                statement = ('Now counted again: 2026-12/a as 2026-10/a, 2027-01/b as 2027-02/b; '
+                             'do not add these saved miles by hand.' if undo else
+                             'Now counted again: 2026-12/a; do not add these saved miles by hand. '
+                             'Not currently counted: 2027-01/b.')
+                effect = ('The trips stay counted under 2026-10/, 2027-02/ with only the annotations saved under those names. '
+                          'Annotations saved under 2026-12/, 2027-01/ are kept in the database but not applied. '
+                          "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review. ") if undo else ''
+                ViewerRolesTests.seed_editor(fixture)
+                for year in (2026, 2027):
+                    suffix = ' The saved summary belongs to tax year 2026.' if year == 2027 else ''
+                    review = html.unescape(fixture.client.get(f'/admin/year/{year}').get_data(as_text=True))
+                    self.assertIn('Discarded or undone saved merges (1)', review)
+                    self.assertIn(label + '.', review)
+                    self.assertIn(statement + suffix, review)
+                    if undo:
+                        self.assertIn(effect + statement + suffix, review)
+                    for role in ('admin', 'editor'):
+                        if role == 'editor':
+                            ViewerRolesTests.signed_in(fixture, role)
+                        rows = list(csv.DictReader(io.StringIO(fixture.client.get(f'/export.csv?year={year}').get_data(as_text=True))))
+                        record = next(r for r in rows if r['trip_id'] == key)
+                        self.assertEqual(record['row_type'], 'unreadable')
+                        self.assertEqual(record['distance_miles'], '')
+                        self.assertIn(statement + suffix, record['purpose_note'])
+                        self.assertIn(effect + statement + suffix, record['purpose_note'])
+                        book = load_workbook(io.BytesIO(fixture.client.get(f'/export.xlsx?year={year}').data))
+                        try:
+                            self.assertEqual(book.sheetnames, ['Mileage', 'Totals', 'Unreadable trips'])
+                            header, *values = list(book['Unreadable trips'].values)
+                            record = next(dict(zip(header, r, strict=True)) for r in values if r[0] == key + ' (' + label.lower() + ')')
+                            self.assertIsNone(record['distance_miles'])
+                            self.assertIn(statement + suffix, record['purpose_note'])
+                            self.assertIn(effect + statement + suffix, record['purpose_note'])
+                        finally:
+                            book.close()
+                        fixture.authenticate(fixture.client)
+                self.assertNotIn('Discarded or undone saved merges', fixture.client.get('/admin/year/2025').get_data(as_text=True))
+
+    def assert_record_year(self, key, year, totals, present):
+        from test_viewer_roles import ViewerRolesTests
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual(self.viewer.year_figures(*self.viewer.year_members(trips, entries, year))['totals'], totals)
+        review = self.client.get(f'/admin/year/{year}').get_data(as_text=True)
+        section = review.split('<h2 id="totals-heading">', 1)[1].split('</section>', 1)[0]
+        self.assertEqual({name: float(miles) for name, miles in re.findall(
+            r'<td>(business|personal|other|unclassified|all)</td><td>\d+</td><td>([\d.]+)</td>', section)}, totals)
+        self.assertEqual('Discarded or undone saved merges (1)' in review, present)
+        if self.viewer.users.get_user(self.db, 'helper') is None:
+            ViewerRolesTests.seed_editor(self)
+        for role in ('admin', 'editor'):
+            if role == 'editor':
+                ViewerRolesTests.signed_in(self, role)
+            page = self.client.get(f'/?year={year}').get_data(as_text=True)
+            self.assertIn(f'{totals["all"]:.3f} mi total', page)
+            rows = list(csv.DictReader(io.StringIO(self.client.get(f'/export.csv?year={year}').get_data(as_text=True))))
+            self.assertEqual({r['category']: float(r['distance_miles']) for r in rows if r['row_type'] == 'total'}, totals)
+            records = [r for r in rows if r['trip_id'] == key]
+            self.assertEqual(len(records), int(present))
+            if records:
+                self.assertEqual(records[0]['row_type'], 'unreadable')
+                self.assertEqual(records[0]['distance_miles'], '')
+            book = load_workbook(io.BytesIO(self.client.get(f'/export.xlsx?year={year}').data))
+            try:
+                self.assertEqual({r[2]: r[3] for r in list(book['Totals'].values)[1:]}, totals)
+                records = ([r for r in book['Unreadable trips'].values if str(r[0]).startswith(key + ' (')]
+                           if 'Unreadable trips' in book.sheetnames else [])
+                self.assertEqual(len(records), int(present))
+                if records:
+                    self.assertIsNone(records[0][list(book['Unreadable trips'].values)[0].index('distance_miles')])
+            finally:
+                book.close()
+            self.authenticate(self.client)
+
+    def test_missing_january_part_uses_saved_local_year_on_every_surface(self):
+        from zoneinfo import ZoneInfo
+        for zone, start in (('UTC', datetime(2027, 1, 15, 12, tzinfo=timezone.utc)),
+                            ('Asia/Tokyo', datetime(2026, 12, 31, 16, tzinfo=timezone.utc))):
+            with self.subTest(zone=zone):
+                fixture = ViewerMerges()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                fixture.viewer.DISPLAY_TZ = ZoneInfo(zone)
+                fixture.base = start
+                fixture.month.rename(fixture.data / '2027-01')
+                fixture.month = fixture.data / '2027-01'
+                fixture.trip('a', 0)
+                fixture.trip('b', 180, .01)
+                key = fixture.merged_key(fixture.merge('2027-01/a', '2027-01/b'))
+                (fixture.month / 'b.json').unlink()
+                self.assertEqual(fixture.discard(key).status_code, 302)
+                for year, miles in ((2027, .041), (2026, 0)):
+                    totals = dict(zip(('business', 'personal', 'other', 'unclassified', 'all'),
+                                      (0, 0, 0, miles, miles), strict=True))
+                    fixture.assert_record_year(key, year, totals, year == 2027)
+                # The remaining unreadable GPX already offers both folder years.
+                self.assertEqual([r['year'] for r in fixture.viewer._year_list()], [2027, 2026])
+                (fixture.month / 'b.gpx').unlink()
+                self.assertEqual([r['year'] for r in fixture.viewer._year_list()], [2027])
+                fixture.assert_record_year(key, 2026, dict.fromkeys(totals, 0), False)
+
+    def test_missing_part_years_without_usable_saved_times_keep_folder_fallback(self):
+        key = self.cross_year_merge(undo=False)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            details = json.loads(conn.execute("SELECT details FROM trip_history WHERE action='discard_damaged_merge'").fetchone()[0])
+            details['saved_summary'] = {'start_time': 'unusable', 'end_time': None, 'distance_miles': .732}
+            conn.execute("UPDATE trip_history SET details=? WHERE action='discard_damaged_merge'", (json.dumps(details),))
+        for year, miles in ((2026, .041), (2027, 0), (2025, 0)):
+            totals = dict(zip(('business', 'personal', 'other', 'unclassified', 'all'),
+                              (0, miles, 0, 0, miles), strict=True))
+            self.assert_record_year(key, year, totals, year in (2026, 2027))
+        self.assertEqual([r['year'] for r in self.viewer._year_list()], [2027, 2026])
+
+    def test_missing_part_years_respect_possible_start_years_on_every_surface(self):
+        from zoneinfo import ZoneInfo
+        cases = (
+            # End-time folders can cross midnight without crossing a tax year.
+            ('UTC', datetime(2026, 12, 31, 23, 50, tzinfo=timezone.utc), 590,
+             ('2026-12', '2027-01'), 'a', False, {2026}, {2026}),
+            ('America/Los_Angeles', datetime(2027, 1, 1, 3, tzinfo=timezone.utc), 180,
+             ('2026-12', '2026-12'), 'b', False, {2026}, {2026}),
+            ('America/Los_Angeles', datetime(2027, 1, 1, 3, tzinfo=timezone.utc), 180,
+             ('2027-01', '2027-01'), 'b', False, {2026}, {2026, 2027}),
+            ('UTC', datetime(2026, 12, 31, 23, 58, tzinfo=timezone.utc), 180,
+             ('2026-12', '2027-01'), 'a', False, {2026, 2027}, {2026, 2027}),
+            ('UTC', datetime(2026, 12, 31, 23, 58, tzinfo=timezone.utc), 180,
+             ('2026-12', '2027-01'), 'b', False, {2026, 2027}, {2026, 2027}),
+            ('UTC', datetime(2027, 1, 15, 12, tzinfo=timezone.utc), 180,
+             ('2027-01', '2027-01'), 'b', True, {2027}, {2026, 2027}),
+        )
+        for zone, start, gap, months, missing, start_only, record_years, offered in cases:
+            with self.subTest(zone=zone, months=months, missing=missing, start_only=start_only):
+                fixture = ViewerMerges()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                fixture.viewer.DISPLAY_TZ = ZoneInfo(zone)
+                fixture.base = start
+                fixture.trip('a', 0)
+                fixture.trip('b', gap, .01)
+                for name, month in zip(('a', 'b'), months, strict=True):
+                    target = fixture.data / month
+                    target.mkdir(exist_ok=True)
+                    for suffix in ('.json', '.gpx'):
+                        (fixture.month / (name + suffix)).rename(target / (name + suffix))
+                parts = [month + '/' + name for month, name in zip(months, ('a', 'b'), strict=True)]
+                key = fixture.merged_key(fixture.merge(*parts))
+                missing_key = parts[('a', 'b').index(missing)]
+                (fixture.data / (missing_key + '.json')).unlink()
+                self.assertEqual(fixture.discard(key).status_code, 302)
+                if start_only:
+                    with closing(sqlite3.connect(fixture.db)) as conn, conn:
+                        details = json.loads(conn.execute(
+                            "SELECT details FROM trip_history WHERE action='discard_damaged_merge'").fetchone()[0])
+                        details['saved_summary'].pop('end_time')
+                        conn.execute("UPDATE trip_history SET details=? WHERE action='discard_damaged_merge'",
+                                     (json.dumps(details),))
+                    # An incompatible folder still falls back to the saved start year.
+                    self.assertEqual(fixture.viewer._merge_history_missing_years(details['saved_summary'], '2028-06'), {2027})
+                remaining_year = fixture.viewer._trip_local_year(fixture.viewer.load_trips()[0][0])
+                for remove_gpx in (False, True):
+                    if remove_gpx:
+                        (fixture.data / (missing_key + '.gpx')).unlink()
+                    for year in (2025, 2026, 2027, 2028):
+                        miles = .041 if year == remaining_year else 0
+                        totals = dict(zip(('business', 'personal', 'other', 'unclassified', 'all'),
+                                          (0, 0, 0, miles, miles), strict=True))
+                        fixture.assert_record_year(key, year, totals, year in record_years)
+                    self.assertEqual({r['year'] for r in fixture.viewer._year_list()}, record_years if remove_gpx else offered)
+
+    def assert_discard_current_statement(self, statement, *, undone=False, effect=''):
         with closing(sqlite3.connect(self.db)) as conn:
             rows = self.viewer._merge_history_rows(conn, 2026, self.viewer.load_trips()[0])
         self.assertEqual(len(rows), 1)
@@ -291,7 +531,7 @@ class ViewerMerges(unittest.TestCase):
         label = 'Unused-name merge undone' if undone else 'Damaged merge discarded'
         expected = (f"{label}. Saved miles: 0.732 mi; purpose: business; purpose note: merged note; "
                     f"trip date: 2026-04-14 12:00 UTC. Recorded at: {self.viewer.fmt_date(row['at'])}; login: driver. "
-                    + statement)
+                    + (effect + ' ' if effect else '') + statement)
         self.assertEqual(self.viewer.merge_history_message(row), expected)
         review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
         self.assertIn(expected, review)
@@ -555,6 +795,9 @@ class ViewerMerges(unittest.TestCase):
         self.assertIn(self.viewer.UNUSED_MERGE_CLOSE_REFUSAL, html.unescape(response.get_data(as_text=True)))
         review = html.unescape(self.client.get(f'/admin/year/{year}').get_data(as_text=True))
         section = review.split('<h2 id="unused-merges-heading">', 1)[1].split('</section>', 1)[0]
+        self.assertIn('A saved merge under an unused month name has miles and purpose outside the totals. '
+                      'Restore its original month name or use Undo saved merge before closing this year. '
+                      'See Saved merges under unused month names on the year review.', section)
         self.assertIn(key, section)
         self.assertIn('These saved miles and this purpose are not in the totals shown.', section)
         self.assertIn('The trips it was made from are counted separately.', section)
@@ -641,7 +884,7 @@ class ViewerMerges(unittest.TestCase):
             self.assertEqual(details['saved_summary'], json.loads(summary))
             self.assertEqual(details['dropped']['purpose_note'], 'merged note')
             self.assertEqual(details['original_annotations']['2026-04/a']['category'], 'personal')
-            self.assertEqual(details['undo_effect'], effect)
+            self.assertNotIn('undo_effect', details)
             self.assertEqual(details['counted_part_keys'], {'2026-04/a': '2026-05/a', '2026-04/b': '2026-05/b'})
         review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
         self.assertIn('Unused-name merge undone. Saved miles: 0.732 mi; purpose: business; purpose note: merged note;', review)
@@ -653,6 +896,78 @@ class ViewerMerges(unittest.TestCase):
         self.assertIn('Unused-name merge undone. ' + effect, history)
         self.assertEqual(self.close_year().status_code, 302)
         self.assertIn('Unused-name merge undone.', self.client.get('/admin/year/2026').get_data(as_text=True))
+
+    def test_unused_undo_effect_follows_another_rename_on_every_history_surface(self):
+        key, _ = self.moved_merge()
+        self.assertEqual(self.undo_unused(key).status_code, 302)
+        # Simulate an already stored v1.17 row; rendering must not rewrite it.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            details = json.loads(conn.execute("SELECT details FROM trip_history WHERE action='split'").fetchone()[0])
+            details['undo_effect'] = ('The trips stay counted under 2026-05/ with only the annotations saved under that name. '
+                                      'Annotations saved under 2026-04/ are kept in the database but not applied. '
+                                      "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review.")
+            stored = json.dumps(details)
+            conn.execute("UPDATE trip_history SET details=? WHERE action='split'", (stored,))
+        (self.data / '2026-05').rename(self.data / '2026-06')
+        effect = ('The trips stay counted under 2026-06/ with only the annotations saved under that name. '
+                  'Annotations saved under 2026-04/ are kept in the database but not applied. '
+                  "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review.")
+        self.assertIn('Unused-name merge undone. ' + effect,
+                      html.unescape(self.client.get('/admin/history').get_data(as_text=True)))
+        with closing(sqlite3.connect(self.db)) as conn:
+            row = self.viewer._merge_history_rows(conn, 2026, self.viewer.load_trips()[0])[0]
+        expected = self.viewer.merge_history_message(row)
+        self.assertIn(effect, expected)
+        self.assertIn('Now counted again: 2026-04/a as 2026-06/a, 2026-04/b as 2026-06/b; '
+                      'do not add these saved miles by hand.', expected)
+        self.assert_history_exports(expected, 'unused-name merge undone')
+        for path in ('/admin/history', '/admin/year/2026', '/export.csv?year=2026'):
+            text = html.unescape(self.client.get(path).get_data(as_text=True))
+            self.assertIn(effect, text)
+            self.assertNotIn('2026-05/', text)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT details FROM trip_history WHERE action='split'").fetchone()[0], stored)
+
+    def test_unused_undo_effect_uses_current_count_when_parts_return_disappear_or_remerge(self):
+        key, _ = self.moved_merge()
+        self.assertEqual(self.undo_unused(key).status_code, 302)
+        (self.data / '2026-05').rename(self.month)
+        statement = 'Now counted again: 2026-04/a, 2026-04/b; do not add these saved miles by hand.'
+        for state in ('restored', 'merged', 'missing'):
+            with self.subTest(state=state):
+                if state == 'merged':
+                    merged = self.merged_key(self.merge('2026-04/a', '2026-04/b'))
+                    statement = (f'Now counted again: 2026-04/a (inside {merged}), 2026-04/b (inside {merged}); '
+                                 'do not add these saved miles by hand.')
+                elif state == 'missing':
+                    shutil.rmtree(self.month)
+                    statement = 'None of its trips are in the log; these saved miles are not in the totals.'
+                history = html.unescape(self.client.get('/admin/history').get_data(as_text=True))
+                self.assertIn('Unused-name merge undone. ' + statement, history)
+                self.assertNotIn('The trips stay counted under 2026-05/', history)
+                with closing(sqlite3.connect(self.db)) as conn:
+                    row = self.viewer._merge_history_rows(conn, 2026, self.viewer.load_trips()[0])[0]
+                message = self.viewer.merge_history_message(row)
+                self.assertIn(statement, message)
+                self.assertNotIn('The trips stay counted under', message)
+                self.assert_history_exports(message, 'unused-name merge undone')
+
+    def test_unused_undo_effect_falls_back_to_stored_text_without_part_evidence(self):
+        key, _ = self.moved_merge()
+        self.assertEqual(self.undo_unused(key).status_code, 302)
+        effect = 'Stored undo explanation from an older history row.'
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            details = json.loads(conn.execute("SELECT details FROM trip_history WHERE action='split'").fetchone()[0])
+            details.pop('parts')
+            details['undo_effect'] = effect
+            conn.execute("UPDATE trip_history SET details=? WHERE action='split'", (json.dumps(details),))
+        self.assertIn('Unused-name merge undone. ' + effect,
+                      html.unescape(self.client.get('/admin/history').get_data(as_text=True)))
+        for path in ('/admin/year/2026', '/export.csv?year=2026'):
+            self.assertIn(effect, self.client.get(path).get_data(as_text=True))
+        with closing(sqlite3.connect(self.db)) as conn:
+            row = self.viewer._merge_history_rows(conn, 2026, self.viewer.load_trips()[0])[0]
+        self.assert_history_exports(self.viewer.merge_history_message(row), 'unused-name merge undone')
 
     def test_unused_undo_history_rolls_back_if_deletion_fails(self):
         key, _ = self.moved_merge()
@@ -674,7 +989,9 @@ class ViewerMerges(unittest.TestCase):
         source.write_bytes(source.read_bytes() + b'\n')
         self.assert_discard_current_statement(
             'Now counted again: 2026-04/a as 2026-05/a, 2026-04/b as 2026-05/b; do not add these saved miles by hand.',
-            undone=True)
+            undone=True, effect=('The trips stay counted under 2026-05/ with only the annotations saved under that name. '
+                                 'Annotations saved under 2026-04/ are kept in the database but not applied. '
+                                 "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review."))
         folder = self.data / '2026-05'
         files = {p: (p.read_bytes(), p.stat()) for p in folder.glob('*.json')}
         (folder / 'b.json').unlink()
@@ -690,6 +1007,104 @@ class ViewerMerges(unittest.TestCase):
         self.assert_discard_current_statement(
             f'Now counted again: 2026-04/a as 2026-05/a (inside {merged}), 2026-04/b as 2026-05/b (inside {merged}); '
             'do not add these saved miles by hand.', undone=True)
+
+    def test_ambiguous_matching_copies_report_only_counted_addresses(self):
+        key, _ = self.moved_merge()
+        self.assertEqual(self.undo_unused(key).status_code, 302)
+        source = self.data / '2026-05'
+        for month in ('2026-06', '2026-07'):
+            target = self.data / month
+            target.mkdir()
+            for suffix in ('.gpx', '.json'):
+                shutil.copy2(source / ('a' + suffix), target / ('a' + suffix))
+        shutil.rmtree(source)
+        statement = ('A trip is counted at 2026-06/a. A trip is counted at 2026-07/a. '
+                     'Do not add these saved miles by hand. Not currently counted: 2026-04/b.')
+        totals = dict(zip(('business', 'personal', 'other', 'unclassified', 'all'), (0, 0, 0, .082, .082), strict=True))
+        self.assert_record_year(key, 2026, totals, True)
+        self.assertEqual([r['year'] for r in self.viewer._year_list()], [2026])
+        with closing(sqlite3.connect(self.db)) as conn:
+            row = self.viewer._merge_history_rows(conn, 2026, self.viewer.load_trips()[0])[0]
+        self.assertEqual(row['counted_again'], [])
+        self.assertEqual(row['current_part_keys'], {})
+        self.assertEqual(self.viewer._merge_history_current_statement(row), statement)
+        message = self.viewer.merge_history_message(row)
+        self.assertIn(message, html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True)))
+        self.assert_history_exports(message, 'unused-name merge undone')
+        self.assertIn('Unused-name merge undone. ' + statement,
+                      html.unescape(self.client.get('/admin/history').get_data(as_text=True)))
+
+    def test_restored_without_times_reports_counted_address_on_every_history_surface(self):
+        for undo in (False, True):
+            with self.subTest(undo=undo):
+                fixture = ViewerMerges()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                if undo:
+                    key, _ = fixture.moved_merge()
+                    source = fixture.data / '2026-05'
+                    self.assertEqual(fixture.undo_unused(key).status_code, 302)
+                else:
+                    fixture.trip('a', 0)
+                    fixture.trip('b', 180, .01)
+                    key = fixture.merged_key(fixture.merge('2026-04/a', '2026-04/b'))
+                    source = fixture.month
+                backup = fixture.root / 'copies'
+                shutil.copytree(source, backup)
+                if not undo:
+                    (source / 'b.json').unlink()
+                    self.assertEqual(fixture.discard(key).status_code, 302)
+                shutil.rmtree(source)
+                restored = fixture.data / '2026-06'
+                restored.mkdir()
+                for suffix in ('.gpx', '.json'):
+                    saved = backup / ('a' + suffix)
+                    copied = restored / saved.name
+                    shutil.copyfile(saved, copied)
+                    # Ensure a different stamp even on coarse or fast filesystems.
+                    os.utime(copied, ns=(saved.stat().st_atime_ns, saved.stat().st_mtime_ns + 2_000_000_000))
+                statement = ('A trip is counted at 2026-06/a, but its files differ from the ones this merge was made from. '
+                             'Do not add these saved miles by hand. Not currently counted: 2026-04/b.')
+                totals = dict(zip(('business', 'personal', 'other', 'unclassified', 'all'), (0, 0, 0, .041, .041), strict=True))
+                fixture.assert_record_year(key, 2026, totals, True)
+                with closing(sqlite3.connect(fixture.db)) as conn:
+                    row = fixture.viewer._merge_history_rows(conn, 2026, fixture.viewer.load_trips()[0])[0]
+                self.assertEqual(fixture.viewer._merge_history_current_statement(row), statement)
+                message = fixture.viewer.merge_history_message(row)
+                self.assertIn(statement, message)
+                self.assertNotIn('None of its trips are in the log', message)
+                self.assertIn(message, html.unescape(fixture.client.get('/admin/year/2026').get_data(as_text=True)))
+                fixture.assert_history_exports(message, 'unused-name merge undone' if undo else 'damaged merge discarded')
+                if undo:
+                    history = html.unescape(fixture.client.get('/admin/history').get_data(as_text=True))
+                    self.assertIn('Unused-name merge undone. ' + statement, history)
+                # Both copied parts are counted, without claiming either stamp matches.
+                for suffix in ('.gpx', '.json'):
+                    saved = backup / ('b' + suffix)
+                    copied = restored / saved.name
+                    shutil.copyfile(saved, copied)
+                    os.utime(copied, ns=(saved.stat().st_atime_ns, saved.stat().st_mtime_ns + 2_000_000_000))
+                statement = ('A trip is counted at 2026-06/a, but its files differ from the ones this merge was made from. '
+                             'A trip is counted at 2026-06/b, but its files differ from the ones this merge was made from. '
+                             'Do not add these saved miles by hand.')
+                fixture.assert_record_year(key, 2026, {**totals, 'unclassified': .082, 'all': .082}, True)
+                with closing(sqlite3.connect(fixture.db)) as conn:
+                    row = fixture.viewer._merge_history_rows(conn, 2026, fixture.viewer.load_trips()[0])[0]
+                self.assertEqual(fixture.viewer._merge_history_current_statement(row), statement)
+                message = fixture.viewer.merge_history_message(row)
+                self.assertIn(message, html.unescape(fixture.client.get('/admin/year/2026').get_data(as_text=True)))
+                fixture.assert_history_exports(message, 'unused-name merge undone' if undo else 'damaged merge discarded')
+                if undo:
+                    self.assertIn('Unused-name merge undone. ' + statement,
+                                  html.unescape(fixture.client.get('/admin/history').get_data(as_text=True)))
+                # A readable file removed from the log must not trigger the warning.
+                for name in ('a', 'b'):
+                    self.assertEqual(fixture.client.post(f'/trip/2026-06/{name}/remove', data={
+                        'csrf_token': 'test-csrf', 'confirm': 'yes', 'reason': 'test removal'}).status_code, 302)
+                with closing(sqlite3.connect(fixture.db)) as conn:
+                    row = fixture.viewer._merge_history_rows(conn, 2026, fixture.viewer.load_trips(include_removed=True)[0])[0]
+                self.assertEqual(fixture.viewer._merge_history_current_statement(row),
+                                 'None of its trips are in the log; these saved miles are not in the totals.')
 
     def test_unused_merge_uses_saved_summary_year_and_unknown_year_blocks_every_close(self):
         key, _ = self.moved_merge()
@@ -745,6 +1160,11 @@ class ViewerMerges(unittest.TestCase):
         self.assertIn('No longer counted: ' + key, review)
         self.assertIn('Now counted:', review)
         self.assertIn('Reopen 2026', review)
+        self.assertIn('This year is closed. A saved merge under an unused month name has miles and purpose outside the totals. '
+                      'The saved-versus-current comparison on this page shows the difference. '
+                      'Reopen this year before undoing the saved merge.', review)
+        self.assertNotIn('before closing this year', review)
+        self.assertEqual(self.undo_unused(key).status_code, 409)
         with closing(sqlite3.connect(self.db)) as conn:
             self.assertEqual(conn.execute('SELECT snapshot FROM tax_years').fetchone()[0], snapshot)
         self.assertEqual(self.client.post('/admin/year/2026/reopen', data={
