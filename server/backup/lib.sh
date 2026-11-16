@@ -31,7 +31,7 @@ remove_backup_tree() {
 }
 
 # Count terminators, never lines in names. GNU and BusyBox find both support
-# -print0; unlike -printf, this also works with Unraid's BusyBox find.
+# -print0; unlike -printf, this also works with BusyBox find.
 count_files() {
     find "$@" -type f -print0 | tr -cd '\000' | wc -c
 }
@@ -337,11 +337,16 @@ mark_target() {
 }
 
 list_snapshots() {
-    local listing
+    local listing line
     [[ -d $SNAPSHOTS ]] || return 0
     listing=$(find "$SNAPSHOTS" -mindepth 1 -maxdepth 1 -type d -print) \
         || die "couldn't list local snapshots in $SNAPSHOTS"
-    awk -F / -v pattern="$SNAPSHOT_RE" '$NF ~ pattern { print $NF }' <<< "$listing" | LC_ALL=C sort
+    # grep -E, not awk: mawk before 2020-07 (Debian 12, Ubuntu 22.04) has no
+    # {n} intervals, so an awk match on SNAPSHOT_RE finds nothing there.
+    # No match is grep status 1 and a normal result; anything higher fails.
+    while IFS= read -r line; do
+        printf '%s\n' "${line##*/}"
+    done <<< "$listing" | { grep -E "$SNAPSHOT_RE" || (( $? == 1 )); } | LC_ALL=C sort
 }
 
 # The snapshot names on the off-host copy, oldest first. Fails if the

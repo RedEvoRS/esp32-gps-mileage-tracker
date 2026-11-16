@@ -725,6 +725,17 @@ exec {real_sha} "$@"
         self.shim("find", f'exec {busybox} find "$@"\n')
         self.assert_remote_prune_applies_the_retention_rule()
 
+    def test_snapshot_listing_does_not_rely_on_awk_regex_intervals(self):
+        # mawk 1.3.4 20200120 (Debian 12, Ubuntu 22.04) matches nothing for a
+        # pattern with {n} intervals. Stand in for it: any awk call that is
+        # handed a pattern variable prints nothing and succeeds.
+        real = shutil.which("awk")
+        self.shim("awk", 'for arg in "$@"; do case $arg in pattern=*) exit 0;; esac; done\n'
+                         f'exec {real} "$@"\n')
+        self.run_script("backup.sh")
+        self.assertIn("Nothing changed", self.run_script("backup.sh").stderr)
+        self.assertEqual(len(self.snapshots()), 1)
+
     def test_snapshot_listing_names_and_order_match_gnu_find(self):
         folder = self.backups / "snapshots"
         names = ["2026-07-03T030000Z", "2025-12-01T030000Z", "2026-07-01T030000Z"]
