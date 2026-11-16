@@ -393,6 +393,80 @@ class ViewerMerges(unittest.TestCase):
                         fixture.authenticate(fixture.client)
                 self.assertNotIn('Discarded or undone saved merges', fixture.client.get('/admin/year/2025').get_data(as_text=True))
 
+    def assert_record_year(self, key, year, totals, present):
+        from test_viewer_roles import ViewerRolesTests
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual(self.viewer.year_figures(*self.viewer.year_members(trips, entries, year))['totals'], totals)
+        review = self.client.get(f'/admin/year/{year}').get_data(as_text=True)
+        section = review.split('<h2 id="totals-heading">', 1)[1].split('</section>', 1)[0]
+        self.assertEqual({name: float(miles) for name, miles in re.findall(
+            r'<td>(business|personal|other|unclassified|all)</td><td>\d+</td><td>([\d.]+)</td>', section)}, totals)
+        self.assertEqual('Discarded or undone saved merges (1)' in review, present)
+        if self.viewer.users.get_user(self.db, 'helper') is None:
+            ViewerRolesTests.seed_editor(self)
+        for role in ('admin', 'editor'):
+            if role == 'editor':
+                ViewerRolesTests.signed_in(self, role)
+            page = self.client.get(f'/?year={year}').get_data(as_text=True)
+            self.assertIn(f'{totals["all"]:.3f} mi total', page)
+            rows = list(csv.DictReader(io.StringIO(self.client.get(f'/export.csv?year={year}').get_data(as_text=True))))
+            self.assertEqual({r['category']: float(r['distance_miles']) for r in rows if r['row_type'] == 'total'}, totals)
+            records = [r for r in rows if r['trip_id'] == key]
+            self.assertEqual(len(records), int(present))
+            if records:
+                self.assertEqual(records[0]['row_type'], 'unreadable')
+                self.assertEqual(records[0]['distance_miles'], '')
+            book = load_workbook(io.BytesIO(self.client.get(f'/export.xlsx?year={year}').data))
+            try:
+                self.assertEqual({r[2]: r[3] for r in list(book['Totals'].values)[1:]}, totals)
+                records = ([r for r in book['Unreadable trips'].values if str(r[0]).startswith(key + ' (')]
+                           if 'Unreadable trips' in book.sheetnames else [])
+                self.assertEqual(len(records), int(present))
+                if records:
+                    self.assertIsNone(records[0][list(book['Unreadable trips'].values)[0].index('distance_miles')])
+            finally:
+                book.close()
+            self.authenticate(self.client)
+
+    def test_missing_january_part_uses_saved_local_year_on_every_surface(self):
+        from zoneinfo import ZoneInfo
+        for zone, start in (('UTC', datetime(2027, 1, 15, 12, tzinfo=timezone.utc)),
+                            ('Asia/Tokyo', datetime(2026, 12, 31, 16, tzinfo=timezone.utc))):
+            with self.subTest(zone=zone):
+                fixture = ViewerMerges()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                fixture.viewer.DISPLAY_TZ = ZoneInfo(zone)
+                fixture.base = start
+                fixture.month.rename(fixture.data / '2027-01')
+                fixture.month = fixture.data / '2027-01'
+                fixture.trip('a', 0)
+                fixture.trip('b', 180, .01)
+                key = fixture.merged_key(fixture.merge('2027-01/a', '2027-01/b'))
+                (fixture.month / 'b.json').unlink()
+                self.assertEqual(fixture.discard(key).status_code, 302)
+                for year, miles in ((2027, .041), (2026, 0)):
+                    totals = dict(zip(('business', 'personal', 'other', 'unclassified', 'all'),
+                                      (0, 0, 0, miles, miles), strict=True))
+                    fixture.assert_record_year(key, year, totals, year == 2027)
+                # The remaining unreadable GPX already offers both folder years.
+                self.assertEqual([r['year'] for r in fixture.viewer._year_list()], [2027, 2026])
+                (fixture.month / 'b.gpx').unlink()
+                self.assertEqual([r['year'] for r in fixture.viewer._year_list()], [2027])
+                fixture.assert_record_year(key, 2026, dict.fromkeys(totals, 0), False)
+
+    def test_missing_part_years_without_usable_saved_times_keep_folder_fallback(self):
+        key = self.cross_year_merge(undo=False)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            details = json.loads(conn.execute("SELECT details FROM trip_history WHERE action='discard_damaged_merge'").fetchone()[0])
+            details['saved_summary'] = {'start_time': 'unusable', 'end_time': None, 'distance_miles': .732}
+            conn.execute("UPDATE trip_history SET details=? WHERE action='discard_damaged_merge'", (json.dumps(details),))
+        for year, miles in ((2026, .041), (2027, 0), (2025, 0)):
+            totals = dict(zip(('business', 'personal', 'other', 'unclassified', 'all'),
+                              (0, miles, 0, 0, miles), strict=True))
+            self.assert_record_year(key, year, totals, year in (2026, 2027))
+        self.assertEqual([r['year'] for r in self.viewer._year_list()], [2027, 2026])
+
     def assert_discard_current_statement(self, statement, *, undone=False, effect=''):
         with closing(sqlite3.connect(self.db)) as conn:
             rows = self.viewer._merge_history_rows(conn, 2026, self.viewer.load_trips()[0])

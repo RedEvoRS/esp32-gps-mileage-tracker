@@ -3487,7 +3487,8 @@ def _year_list():
         years |= {saved_year} if saved_year else _folder_years(trip["ym"])
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         for row in _merge_history_rows(conn, trips=trips):
-            years |= {row['saved_year']} if row['saved_year'] else _folder_years(row['trip_key'].split('/')[0])
+            if row['saved_year']:
+                years.add(row['saved_year'])
             years |= row['part_years']
     return [{"year": year, "closed": closed.get(year)} for year in sorted(years, reverse=True)]
 
@@ -3772,6 +3773,13 @@ def _late_edit_rows(conn, year, trips, *, current_trips=None):
     return result
 
 
+def _merge_history_missing_years(summary, month):
+    """A missing part is bounded by the saved merge's local start and end."""
+    times = [_to_local(_parse(summary.get(field))) for field in ('start_time', 'end_time')]
+    years = [time.year for time in times if time is not None]
+    return set(range(min(years), max(years) + 1)) if years else _folder_years(month)
+
+
 def _merge_history_counted_parts(conn, rows, trips):
     """Only history-bearing reviews/exports inspect current part membership.
 
@@ -3815,7 +3823,7 @@ def _merge_history_counted_parts(conn, rows, trips):
                     match = matches[0]
             if match is None:
                 absent.append(part)
-                part_years |= _folder_years(month)
+                part_years |= _merge_history_missing_years(details.get('saved_summary', {}), month)
                 continue
             summary = current[match]
             current_keys[part] = match
@@ -3823,7 +3831,8 @@ def _merge_history_counted_parts(conn, rows, trips):
                 inside_merge = True
                 summary, _ = read_summary(DATA_ROOT / (match + '.json'), root=DATA_ROOT.resolve())
             part_year = _trip_local_year(summary or {})
-            part_years |= {part_year} if part_year else _folder_years(match.split('/')[0])
+            part_years |= {part_year} if part_year else _merge_history_missing_years(
+                details.get('saved_summary', {}), match.split('/')[0])
             label = part if match == part else f'{part} as {match}'
             if current[match].get('parts'):
                 label += f" (inside {current[match]['trip_key']})"
@@ -3897,7 +3906,8 @@ def _merge_history_rows(conn, year=None, trips=None):
         saved_year = _trip_local_year(summary)
         miles = summary.get('distance_miles')
         row.update(parsed_details=details, saved_year=saved_year, review_year=year,
-                   part_years=set().union(*(_folder_years(part.split('/')[0]) for part in details.get('parts', []))),
+                   part_years=set().union(*(_merge_history_missing_years(summary, part.split('/')[0])
+                                           for part in details.get('parts', []))),
                    saved_miles=f'{miles:.3f} mi' if _is_number(miles) else 'unknown miles')
         if (year is not None and saved_year is not None and saved_year != year and year not in row['part_years']
                 and not any(_trip_local_year(t) == year for t in trips or ())):
@@ -3905,8 +3915,7 @@ def _merge_history_rows(conn, year=None, trips=None):
         rows.append(row)
     if rows and trips is not None:
         _merge_history_counted_parts(conn, rows, trips)
-    return [row for row in rows if year is None or row['saved_year'] is None
-            or year == row['saved_year'] or year in row['part_years']]
+    return [row for row in rows if year is None or year == row['saved_year'] or year in row['part_years']]
 
 
 @app.route("/admin/year/<year>")
