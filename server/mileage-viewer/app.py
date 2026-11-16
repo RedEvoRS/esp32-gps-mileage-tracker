@@ -1415,16 +1415,13 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
         except ValueError:
             refused_file = "gpx"
             # A missing summary is normal during ingest; keep any real summary error.
-            keep_crossing_summary = not problem and _crossing_years(summary)
-            if not keep_crossing_summary and (not problem or problem == "the file is missing"):
+            if not problem or problem == "the file is missing":
                 problem_file = "gpx"
                 problem = "the file could not be read"
             # A refused track makes the recording unreadable; a missing one
-            # still lets its summary count. A crossing drive keeps its safe
-            # summary whole, with a New Year refusal note; never read the link.
-            if not keep_crossing_summary:
-                summary = {field: summary[field] for field in ("device_id", "start_time")
-                           if summary and isinstance(summary.get(field), str)}
+            # still lets its summary count. Keep only usable identity.
+            summary = {field: summary[field] for field in ("device_id", "start_time")
+                       if summary and isinstance(summary.get(field), str)}
             has_gpx = False
         else:
             try:
@@ -2047,10 +2044,10 @@ def _year_distances(keys, cut):
 
 def _year_allocation(trip):
     """Viewer-only shares of the saved total; ordinary reads need no GPX."""
+    if trip.get("timing_status") == "untimed":
+        return {}
     crossing = _crossing_years(trip)
     if not crossing:
-        if trip.get("timing_status") == "untimed":
-            return {"year_split_note": "New Year shares are unknown: this trip has no recorded times. It stays whole under All years."}
         return {}
     old_year, new_year = crossing
 
@@ -2180,7 +2177,8 @@ def selected_trips(include_history=False, loaded=None, include_merge_history=Fal
             for trip in selected + unreadable:
                 _set_export_last_edited(lookup, trip)
             for trip in selected:
-                trip["received_after_close"] = "yes" if late_in_closed_year(trip, relevant_closed) else ""
+                trip["received_after_close"] = "yes" if late_in_closed_year(
+                    trip, relevant_closed if trip.get("year_shares") else closed) else ""
             if include_merge_history:
                 unreadable += [{**row, 'merge_history': True} for row in _merge_history_rows(conn, year, trips)]
     return selected, unreadable, year, sorted(years, reverse=True)
@@ -2816,7 +2814,7 @@ LIST_HTML = """
   {% endif %}
   <div class="toolbar">
     <form method="get">
-      <label for="year">Year (miles in {{ timezone }})</label>
+      <label for="year">Year (local time in {{ timezone }})</label>
       <select name="year" id="year">
         <option value="">All years</option>
         {% for y in years %}<option value="{{ y }}" {% if year == y %}selected{% endif %}>{{ y }}</option>{% endfor %}
@@ -2910,8 +2908,8 @@ TRIP_HTML = """
     <div class="stat"><b>{{ t.num_points or 0 }}</b><span>points</span></div>
   </div>
 
-  </div></div>
   {% if year_distance_note(t) %}<p class="muted">{{ year_distance_note(t) }}</p>{% endif %}
+  </div></div>
   {% if year_lock %}
   <div class="warn" role="status">{{ year_lock.year }} is closed for edits (closed by {{ year_lock.closed_by }} on {{ fmt_day(year_lock.closed_at) }}).
     Nobody can change, merge, remove or restore this trip until the admin reopens {{ year_lock.year }} on the year review page.</div>
@@ -3741,7 +3739,7 @@ before you file.</p>
 <div class="review-table"><table>
 <thead><tr><th>Trip</th><th>Distance</th><th>Category</th></tr></thead>
 <tbody>{% for t in undated %}<tr><td><a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{{ t.trip_key }}</a></td>
-<td>{{ "%.2f"|format(t.distance_miles or 0) }} mi{% if year_distance_note(t) %}<br>{{ year_distance_note(t) }}{% endif %}</td><td>{{ t.category or "—" }}</td></tr>
+<td>{{ "%.2f"|format(t.distance_miles or 0) }} mi</td><td>{{ t.category or "—" }}</td></tr>
 {% else %}<tr><td colspan="3" class="muted">Every trip has a date.</td></tr>{% endfor %}</tbody>
 </table></div>
 </section>
@@ -3909,6 +3907,16 @@ def _merge_history_counted_parts(conn, rows, trips):
     """
     current = {key: t for t in trips if not t.get('removal')
                for key in (t.get('parts') or [t['trip_key']])}
+
+    def counted_years(address, saved_summary):
+        summary = current[address]
+        if summary.get('parts'):
+            summary, _ = read_summary(DATA_ROOT / (address + '.json'), root=DATA_ROOT.resolve())
+        part_year = _trip_local_year(summary or {})
+        shares = _year_allocation({**summary, 'trip_key': address}).get('year_shares') if summary else None
+        return (set(shares) if shares else {part_year} if part_year else
+                _merge_history_missing_years(saved_summary, address.split('/')[0]))
+
     counted, _ = _month_choices(conn, DATA_ROOT.resolve())
     for row in rows:
         details = row['parsed_details']
@@ -3949,14 +3957,12 @@ def _merge_history_counted_parts(conn, rows, trips):
                     part_years |= _merge_history_missing_years(details.get('saved_summary', {}), month)
                 for address in addresses:
                     at_address.append((address, len(matches) > 1))
-                    part_years |= _recording_years(address) or _merge_history_missing_years(
-                        details.get('saved_summary', {}), address.split('/')[0])
+                    part_years |= counted_years(address, details.get('saved_summary', {}))
                 continue
             current_keys[part] = match
             if current[match].get('parts'):
                 inside_merge = True
-            part_years |= _recording_years(match) or _merge_history_missing_years(
-                details.get('saved_summary', {}), match.split('/')[0])
+            part_years |= counted_years(match, details.get('saved_summary', {}))
             label = part if match == part else f'{part} as {match}'
             if current[match].get('parts'):
                 label += f" (inside {current[match]['trip_key']})"
@@ -4237,10 +4243,6 @@ def restore_trip(ym, trip_id):
     # successful restore land where the admin can see it worked (#716, #722).
     if removed_trip is None:
         return redirect(url_for("admin_removed", year=year or ""))
-    try:
-        next(trip_merges.source_file_pairs(DATA_ROOT, [key]))
-    except ValueError:
-        return redirect(url_for("index", year=year or ""))
     return redirect(url_for("trip_view", ym=ym, trip_id=trip_id, year=year or ""))
 
 

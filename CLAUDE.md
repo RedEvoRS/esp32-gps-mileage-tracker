@@ -472,9 +472,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   Everyday logins get one "No
   trip at this address" 404 for a removed, unknown or link-refused trip page,
   and lookups answer removed like unknown; the admin gets a link diagnostic.
-  A summary or GPX linking outside `./data` makes the trip unreadable, except
-  that a crossing drive's safely read summary keeps its miles whole with a
-  refusal note (a merely missing GPX still counts). Only first-level `YYYY-MM` folders hold
+  A summary or GPX linking outside `./data` makes the trip unreadable
+  (a merely missing GPX still counts). Only first-level `YYYY-MM` folders hold
   trips; other folders are ignored. A month folder link that leads outside
   `./data` (or to it or above), dangles or loops, and a month folder the viewer
   can't read, each show once as a folder (`row_type=unreadable_folder`) with a

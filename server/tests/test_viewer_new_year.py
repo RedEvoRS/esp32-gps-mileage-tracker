@@ -9,6 +9,7 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from html.parser import HTMLParser
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -117,6 +118,43 @@ class NewYearTests(YearTestBase):
         self.assertIn(f'href="/trip/{key}?year=2027"', self.admin.get(f"/trip/{newer}?year=2027").get_data(as_text=True))
         self.assertEqual({r["year"] for r in self.viewer._year_list()}, {2026, 2027})
 
+    def test_year_picker_describes_local_time(self):
+        page = self.admin.get("/").get_data(as_text=True)
+        self.assertIn('Year (local time in America/Los_Angeles)</label>', page)
+
+    def test_year_note_is_with_trip_facts_outside_the_form_map_grid(self):
+        class Structure(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.stack, self.note_parents, self.grid_children = [], [], []
+
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                classes = attrs.get("class", "").split()
+                if self.stack and "trip-layout" in self.stack[-1][1]:
+                    self.grid_children.append(classes)
+                if tag not in ("area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"):
+                    self.stack.append((tag, classes))
+
+            def handle_endtag(self, tag):
+                for index in range(len(self.stack) - 1, -1, -1):
+                    if self.stack[index][0] == tag:
+                        del self.stack[index:]
+                        break
+
+            def handle_data(self, text):
+                if "2026: 3.686 mi; 2027: 6.144 mi" in text:
+                    self.note_parents.append([c for _, classes in self.stack for c in classes])
+
+        key = self.recording()
+        for client in (self.admin, self.editor):
+            parsed = Structure()
+            parsed.feed(client.get(f"/trip/{key}").get_data(as_text=True))
+            self.assertEqual(len(parsed.note_parents), 1)
+            self.assertIn("trip-info", parsed.note_parents[0])
+            self.assertNotIn("trip-layout", parsed.note_parents[0])
+            self.assertEqual(parsed.grid_children, [["annotation-panel"], ["trip-map"]])
+
     def test_before_after_and_stationary_cooldown_stay_whole(self):
         before = self.recording("before", [[(-90, 0, 10, 1), (-60, 300, 10, 1)]])
         after = self.recording("after", [[(10, 0, 10, 1), (40, 300, 10, 1)]])
@@ -201,7 +239,7 @@ class NewYearTests(YearTestBase):
         self.assertIn("invalid", self.trip(key).get("year_split_note", ""))
 
     def test_incomplete_summary_timing_stays_whole_with_a_note(self):
-        for status in ("partial", "untimed", None):
+        for status in ("partial", None):
             with self.subTest(status=status):
                 fields = {"start_time": None} if status == "partial" else {}
                 key = self.recording(str(status), timing_status=status, **fields)
@@ -226,8 +264,24 @@ class NewYearTests(YearTestBase):
         path.write_text(json.dumps(data))
         self.assertEqual(self.figures(2026)["trips"], 0)
         self.assertEqual(self.figures(2027)["trips"], 0)
-        self.assertIn("shares are unknown", self.admin.get(f"/trip/{key}").get_data(as_text=True))
-        self.assertIn("shares are unknown", self.review(2026))
+        trip = self.trip(key)
+        self.assertNotIn("year_split_note", trip)
+        self.assertNotIn("year_shares", trip)
+        self.assertEqual(trip["distance_miles"], 9.83)
+        self.assertEqual(self.viewer.trip_years(trip), set())
+        self.assertEqual(self.viewer.year_distance_note(trip), "")
+        for page in (self.admin.get("/").get_data(as_text=True),
+                     self.admin.get(f"/trip/{key}").get_data(as_text=True), self.review(2026)):
+            self.assertNotIn("shares are unknown", page)
+            self.assertNotIn('id="new-year-heading"', page)
+        undated = self.review(2026).split('id="undated-heading"')[1].split("</section>")[0]
+        self.assertIn(key, undated)
+        self.assertEqual([r["trip_id"] for r in self.csv_rows() if r["row_type"] == "trip"], ["crossing"])
+
+    def test_untimed_status_never_adds_a_new_year_note_even_with_stale_dates(self):
+        key = self.recording(timing_status="untimed")
+        self.assertNotIn("year_split_note", self.trip(key))
+        self.assertNotIn('id="new-year-heading"', self.review(2026))
 
     def test_missing_invalid_or_unreadable_gpx_stays_whole_with_a_note(self):
         for name, raw in (("missing", None), ("invalid", b"<broken"), ("empty", b"<gpx/>"),
@@ -276,29 +330,76 @@ class NewYearTests(YearTestBase):
         path.unlink()
         self.assertIn("missing", self.trip(key).get("year_split_note", ""))
 
-    def test_refused_gpx_does_not_reuse_cached_shares_or_read_outside(self):
-        key = self.recording()
-        self.assertIn("year_shares", self.trip(key))
-        path = self.data / (key + ".gpx")
+    def test_refused_gpx_crossing_and_ordinary_trips_are_unreadable_without_miles(self):
+        crossing = self.recording()
+        ordinary = self.recording("ordinary", [[(10, 0, 10, 1), (40, 300, 10, 1)]])
+        self.assertIn("year_shares", self.trip(crossing))
+        paths = {self.data / (key + ".gpx") for key in (crossing, ordinary)}
         checked_path = self.viewer.trip_merges.checked_path
 
         def refuse_gpx(root, candidate, **kwargs):
-            if candidate == path:
+            if candidate in paths:
                 raise ValueError("Invalid trip path")
             return checked_path(root, candidate, **kwargs)
 
         with patch.object(self.viewer.trip_merges, "checked_path", side_effect=refuse_gpx), \
                 patch.object(self.viewer.trip_merges, "parsed_parts", side_effect=AssertionError("must refuse before reading")):
-            trip = self.trip(key)
-            self.assertNotIn("year_shares", trip)
-            self.assertIn("cannot be opened safely", trip.get("year_split_note", ""))
-            self.assertEqual(self.figures(2026)["totals"]["all"], 9.83)
-            removed = self.post(f"/trip/{key}/remove", reason="Duplicate")
-            self.assertEqual(removed.status_code, 302)
-            self.assertEqual(removed.headers["Location"], "/?year=")
-            restored = self.post(f"/trip/{key}/restore")
-            self.assertEqual(restored.status_code, 302)
-            self.assertEqual(restored.headers["Location"], "/?year=")
+            trips, unreadable = self.viewer.load_trips()
+            self.assertEqual(trips, [])
+            self.assertEqual({t["trip_key"] for t in unreadable}, {crossing, ordinary})
+            for trip in unreadable:
+                self.assertEqual((trip["problem"], trip["problem_file"], trip["refused_file"]),
+                                 ("the file could not be read", "gpx", "gpx"))
+                self.assertNotIn("distance_miles", trip)
+                self.assertNotIn("year_shares", trip)
+                self.assertNotIn("year_split_note", trip)
+            for year in (2026, 2027):
+                self.assertEqual(self.figures(year)["totals"]["all"], 0)
+                self.assertEqual(self.figures(year)["unreadable"], 2)
+                self.assertNotIn('id="new-year-heading"', self.review(year))
+            rows = self.csv_rows()
+            self.assertEqual({r["trip_id"] for r in rows if r["row_type"] == "unreadable"},
+                             {"crossing", "ordinary"})
+            self.assertFalse(any(r["row_type"] == "trip" for r in rows))
+            for key in (crossing, ordinary):
+                self.assertEqual(self.editor.get(f"/trip/{key}").status_code, 404)
+                removed = self.post(f"/trip/{key}/remove", reason="Duplicate")
+                self.assertEqual((removed.status_code, removed.headers["Location"]), (302, "/?year="))
+                restored = self.post(f"/trip/{key}/restore")
+                self.assertEqual((restored.status_code, restored.headers["Location"]), (302, "/admin/removed?year="))
+
+    def test_merge_history_unreadable_january_part_keeps_saved_year_narrowing(self):
+        key = self.add_broken("part", "2027-01")
+        saved = {"start_time": "2027-01-15T12:00:00Z", "end_time": "2027-01-15T12:05:00Z"}
+        # A loaded merge still counts while a subsequent part read fails.
+        current = [{"trip_key": "2027-01/merged", "parts": [key], **saved}]
+        for recorded in (key, "2026-12/part"):
+            with self.subTest(recorded=recorded), closing(sqlite3.connect(self.db)) as conn:
+                row = {"parsed_details": {"parts": [recorded], "saved_summary": saved}}
+                with self.assertLogs(self.viewer.app.logger, "WARNING"):
+                    self.viewer._merge_history_counted_parts(conn, [row], current)
+                self.assertEqual(row["part_years"], {2027})
+
+    def test_merge_history_uses_loaded_ordinary_part_when_summary_has_no_year(self):
+        for status in ("unreadable", "undated"):
+            with self.subTest(status=status):
+                key = self.add_broken(status, "2027-01") if status == "unreadable" else self.add_trip(
+                    status, "2027-01-15T12:00:00Z", start_time=None, timing_status="untimed")
+                saved = {"start_time": "2027-01-15T12:00:00Z", "end_time": "2027-01-15T12:05:00Z"}
+                for loaded, expected in (({"start_time": "2026-12-31T12:00:00Z"}, {2026}), ({}, {2027})):
+                    row = {"parsed_details": {"parts": [key], "saved_summary": saved}}
+                    with closing(sqlite3.connect(self.db)) as conn:
+                        self.viewer._merge_history_counted_parts(conn, [row], [{"trip_key": key, **loaded}])
+                    self.assertEqual(row["part_years"], expected)
+
+    def test_merge_history_includes_both_years_only_for_a_split_part(self):
+        key = self.recording()
+        saved = {"start_time": "2027-02-01T12:00:00Z", "end_time": "2027-02-01T12:05:00Z"}
+        for current in ([self.trip(key)], [{"trip_key": "2027-02/merged", "parts": [key]}]):
+            row = {"parsed_details": {"parts": [key], "saved_summary": saved}}
+            with closing(sqlite3.connect(self.db)) as conn:
+                self.viewer._merge_history_counted_parts(conn, [row], current)
+            self.assertEqual(row["part_years"], {2026, 2027})
 
     def test_merged_track_uses_saved_total_and_part_that_itself_crosses_locks(self):
         first = self.recording()
@@ -408,3 +509,23 @@ class NewYearTests(YearTestBase):
                 self.reopen_year(closed_year)
                 for suffix in (".json", ".gpx"):
                     (self.data / (key + suffix)).unlink()
+
+    def test_unsplit_merge_keeps_late_flag_from_any_closed_part_year(self):
+        first = self.recording("first", [[(-40, 0, 10, 1), (-20, 200, 10, 1)]],
+                               _received_at="2030-01-01T12:00:00+00:00")
+        second = self.recording("second", [[(20, 600, 10, 1), (40, 800, 10, 1)]])
+        response = self.post(f"/trip/{first}/merge", next_trip=second)
+        self.assertEqual(response.status_code, 302)
+        merged = response.headers["Location"].split("/trip/")[1].split("?")[0]
+        # Emulate an older saved total too small to yield two positive shares.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            saved = json.loads(conn.execute("SELECT summary FROM trip_merges WHERE trip_key=?", (merged,)).fetchone()[0])
+            saved["distance_miles"] = .001
+            conn.execute("UPDATE trip_merges SET summary=? WHERE trip_key=?", (json.dumps(saved), merged))
+        self.assertNotIn("year_shares", self.trip(merged))
+        self.close_year(2027)
+        self.assertEqual(self.viewer.trip_years(self.trip(merged)), {2026, 2027})
+        for query in ("?year=2026", ""):
+            row = next(r for r in self.csv_rows(query) if r["row_type"] == "trip")
+            self.assertEqual(row["received_after_close"], "yes")
+            self.assertEqual(self.sheet(query)["Mileage"][1][-2], "yes")

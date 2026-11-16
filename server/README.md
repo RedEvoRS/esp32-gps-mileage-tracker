@@ -785,10 +785,11 @@ split a drive whose movement ended before midnight.
 Splitting requires complete timing, a readable valid GPX, exactly one year end
 and two positive shares after rounding. Otherwise the drive stays whole in
 its start year (or the first recorded year for partial timing), with a short
-note explaining why it could not be split. A crossing drive with a safely read
-summary but a refused GPX link keeps that summary's miles whole; the viewer
-never reads the refused link. Wholly undated trips stay under All years; the
-viewer cannot guess whether they crossed New Year. The year review lists
+note explaining why it could not be split. This applies only to trips the
+viewer can already read: a summary or GPX link refused by its safety checks
+still makes the trip unreadable with no miles counted. Wholly undated trips
+stay under All years without a New Year note; the viewer cannot guess whether
+they crossed New Year. The year review lists
 crossing drives with both shares or the reason they stayed whole. A year closed
 before this change keeps its saved totals: its review compares them with the
 current shares and names the drive. Reopen and close it again only when you
@@ -855,9 +856,7 @@ summary from its GPX.
 A trip whose summary or track (GPX) is a link pointing outside
 the data folder is treated the same way: the viewer never opens it, and the
 trip is listed as unreadable ("the file could not be read") with no miles
-counted. The New Year exception above applies when only the GPX is refused
-and a safely read summary shows the drive crosses New Year: its miles stay
-whole with a refusal note. A track that is simply missing is different: the trip still counts
+counted. A track that is simply missing is different: the trip still counts
 and just has no map. The admin's page for a trip with such a link says a file
 is a link that leads outside the data folder or can't be followed safely;
 replace the link with the real file. To an
@@ -1141,8 +1140,8 @@ nothing is hidden, but it is not silent either:
 - The CSV and XLSX exports have a column, `received_after_close`, set to
   `yes` for those trips and blank for the rest. In the CSV it comes after
   `row_type`; `trip_distance_miles` follows it. With a year selected, the flag
-  refers only to that year's close. In All years, a split drive is flagged if
-  it arrived after either affected year was closed. Closing either year locks
+  refers only to that year's close for a split drive. In All years, a split drive
+  is flagged if it arrived after either affected year was closed. Closing either year locks
   the whole drive even when the other year is open.
 - **Saved totals** on the review page shows the totals saved at the close next
   to today's, with a difference column. Rows that differ are in bold, and a
