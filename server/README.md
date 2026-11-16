@@ -1052,13 +1052,23 @@ An unused-name notice adds no saved miles or
 merged annotation and does not block merge suggestions for healthy trips.
 
 Never rename a month folder. If a trip with saved purposes, notes or a removal
-turns up under another month name and its old folder name is absent, the viewer
-warns on the trip list, year review and exports, and blocks closing affected
-years. Deleting a folder without moving its trips does not cause this warning.
+turns up under another counted month name and its old trip address is absent,
+the viewer warns on the trip list, year review and exports, even if new uploads
+have recreated the old folder. Existing folder problems and alias conflicts keep
+their own warnings. Deleting a folder without moving its trips does not warn.
+Unresolved items block closing affected years. Unreadable trips use the same
+possible folder years as other unreadable trips; a readable trip with no date
+blocks every year. The admin year review lists each unresolved item for that
+year, linking its current trip and showing its old address and saved purpose,
+notes and destination, or removal reason, login and time. Everyday logins see
+only the folder warning; the trip list and exports keep the counts.
 Clear it by renaming the folder back (or moving those trips' files back into
 a folder with the old name), or by entering the purpose or notes and removing
-the trip again under its new name, as needed. Each saved item stops warning
-only when the same kind of item is saved under the new name; history stays saved.
+the trip again under its new name, as needed. For a moved part, save the purpose
+on its current merge or remove that merge. An unannotated merge still warns.
+A removed or unreadable trip needs no purpose; that warning returns if it is
+restored or becomes readable without an annotation. An old removal still warns
+for an unreadable trip until it is removed again. History stays saved.
 After **Undo saved merge**, a former part's purpose or notes saved only under
 the old name also needs this repair before its year can close.
 

@@ -102,6 +102,36 @@ class ViewerMerges(unittest.TestCase):
             conn.execute("INSERT INTO annotations (trip_key,category) VALUES ('2026-03/a','personal')")
         return key
 
+    def test_moved_saved_part_resolves_against_current_merge(self):
+        a = self.trip('a', 0)
+        self.trip('b', 180, .01)
+        self.annotate(a, 'business', 'old part purpose', 'old stop')
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            self.viewer.trip_log.add_removal(conn, a, 'duplicate upload', 'driver')
+        self.month.rename(self.data / '2026-05')
+        key = self.merged_key(self.merge('2026-05/a', '2026-05/b'))
+        def warning():
+            return [t for t in self.viewer.load_trips()[1] if t.get('moved_saved')]
+        entry, = warning()
+        self.assertEqual(entry['saved_counts']['2026-04']['annotations'], 1)
+        self.assertEqual(entry['saved_counts']['2026-04']['removals'], 1)
+        self.assertEqual(self.close_year().status_code, 409)
+        self.assertEqual(self.annotate('2026-05/a', 'business', 'redone').status_code, 409)
+        # Creation sets updated_at even when the merge has never been annotated.
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertTrue(conn.execute('SELECT updated_at FROM trip_merges').fetchone()[0])
+        self.assertEqual(self.annotate(key, 'business', 'new merged purpose').status_code, 302)
+        entry, = warning()
+        self.assertEqual(entry['saved_counts']['2026-04']['annotations'], 0)
+        self.assertEqual(entry['saved_counts']['2026-04']['removals'], 1)
+        review = self.client.get('/admin/year/2026').get_data(as_text=True)
+        self.assertNotIn('old part purpose', review)
+        self.assertIn(f'href="/trip/{key}?year=2026"', review)
+        self.assertEqual(self.client.post(f'/trip/{key}/remove', data={
+            'csrf_token': 'test-csrf', 'confirm': 'yes', 'reason': 'duplicate upload'}).status_code, 302)
+        self.assertEqual(warning(), [])
+        self.assertEqual(self.close_year().status_code, 302)
+
     def undo_unused(self, key, **data):
         return self.client.post(f"/admin/unused-merge/{key}/undo", data={
             "csrf_token": "test-csrf", "confirm": "yes", **data})
@@ -361,6 +391,7 @@ class ViewerMerges(unittest.TestCase):
                              'Not currently counted: 2027-01/b.')
                 effect = ('The trips stay counted under 2026-10/, 2027-02/ with only the annotations saved under those names. '
                           'Annotations saved under 2026-12/, 2027-01/ are kept in the database but not applied. '
+                          "The former parts' purposes saved under the old name will need entering again before their year can close. "
                           "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review. ") if undo else ''
                 ViewerRolesTests.seed_editor(fixture)
                 for year in (2026, 2027):
@@ -865,6 +896,7 @@ class ViewerMerges(unittest.TestCase):
         self.assertIn('Confirm removing this unused merge and its merged annotation.', absent.get_data(as_text=True))
         effect = ('The trips stay counted under 2026-05/ with only the annotations saved under that name. '
                   'Annotations saved under 2026-04/ are kept in the database but not applied. '
+                  "The former parts' purposes saved under the old name will need entering again before their year can close. "
                   "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review.")
         page = html.unescape(self.client.get('/').get_data(as_text=True))
         self.assertIn('Remove this unused merge and its merged annotation. ' + effect, page)
@@ -918,6 +950,7 @@ class ViewerMerges(unittest.TestCase):
         (self.data / '2026-05').rename(self.data / '2026-06')
         effect = ('The trips stay counted under 2026-06/ with only the annotations saved under that name. '
                   'Annotations saved under 2026-04/ are kept in the database but not applied. '
+                  "The former parts' purposes saved under the old name will need entering again before their year can close. "
                   "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review.")
         self.assertIn('Unused-name merge undone. ' + effect,
                       html.unescape(self.client.get('/admin/history').get_data(as_text=True)))
@@ -998,6 +1031,7 @@ class ViewerMerges(unittest.TestCase):
             'Now counted again: 2026-04/a as 2026-05/a, 2026-04/b as 2026-05/b; do not add these saved miles by hand.',
             undone=True, effect=('The trips stay counted under 2026-05/ with only the annotations saved under that name. '
                                  'Annotations saved under 2026-04/ are kept in the database but not applied. '
+                                 "The former parts' purposes saved under the old name will need entering again before their year can close. "
                                  "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review."))
         folder = self.data / '2026-05'
         files = {p: (p.read_bytes(), p.stat()) for p in folder.glob('*.json')}
