@@ -50,6 +50,7 @@ class ViewerHardeningTests(unittest.TestCase):
         routes = [("GET", "/trip/{key}"), ("GET", "/gpx/{key}")]
         routes += [("POST", "/trip/{key}/" + action) for action in
                    ("annotate", "remove", "restore", "lookup-place", "merge", "split")]
+        routes.append(('POST', '/admin/year/2026/moved-removal/{key}/restore'))
         tables = ("annotations", "trip_removals", "trip_history", "trip_merges", "trip_merge_parts")
         with closing(sqlite3.connect(self.db)) as conn:
             before = {table: conn.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
@@ -558,7 +559,7 @@ class ViewerHardeningTests(unittest.TestCase):
             "unreadable": "Check the folder's owner and permissions; the viewer container runs as UID 1000 and reads data/ read-only.",
             "link_not_folder": "Remove only the link, keeping its target; ingest can then create a real month folder for queued trips.",
             "not_folder": "Move the file to a safe place outside the month names; ingest can then create a real month folder for queued trips.",
-            "unused_merge": "To use this merge again, restore the original month name, as a link or by renaming the folder back, and leave that name in use. Or use Undo saved merge on the trip list. The trips stay counted under 2026-12/ with only the annotations saved under that name. Annotations saved under 2026-01/, 2026-12/ are kept in the database but not applied. The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review.",
+            "unused_merge": "To use this merge again, restore the original month name, as a link or by renaming the folder back, and leave that name in use. Or use Undo saved merge on the trip list. The trips stay counted under 2026-12/ with only the annotations saved under that name. Annotations saved under 2026-01/, 2026-12/ are kept in the database but not applied. The former parts' purposes saved under the old name will need entering again before their year can close. The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review.",
             "unwritable": "Give the ingest service's user (UID 1000) write and search permission on the real month folder; check its owner and permissions.",
         }
         cases = [(reason, False, False) for reason in descriptions]
@@ -808,6 +809,10 @@ class ViewerHardeningTests(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt' or getattr(os, 'geteuid', lambda: 0)() == 0, 'requires non-root POSIX permissions')
     def test_unwritable_month_notice_matches_ingest_layout_and_every_surface(self):
         summary = (self.viewer.DATA_ROOT / '2026-01/drive.json').read_bytes()
+        # This independent root tests write permissions, not moved saved data.
+        # Leaving the fixture's old drive annotation would legitimately warn.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('DELETE FROM annotations')
         for label, layout in WRITABLE_MONTH_LAYOUTS.items():
             root = self.viewer.DATA_ROOT / label
             make_layout(root, layout, self.symlink)
@@ -978,6 +983,41 @@ class ViewerHardeningTests(unittest.TestCase):
             else:
                 self.assertIn('action="/admin/year/2020/reopen"', text)
 
+    def test_alias_saved_conflict_appears_once_on_review_list_and_each_export(self):
+        target = self.linked_archive('2026-01')
+        self.symlink(self.viewer.DATA_ROOT / '2026-02', target, directory=True)
+        self.signed_in('admin')
+        before = self.viewer.year_figures(*self.viewer.year_members(*self.viewer.load_trips(), 2026))
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO annotations (trip_key,category) VALUES ('2026-02/drive','personal')")
+        trips, entries = self.viewer.load_trips()
+        warning, = [t for t in entries if t.get('folder_reason') == 'saved_keys']
+        self.assertFalse(warning.get('moved_saved'))
+        self.assertEqual(self.viewer.year_figures(*self.viewer.year_members(trips, entries, 2026)), before)
+        message = self.viewer.folder_message(warning, 'admin')
+        for path, texts in self.folder_surface_messages(self.client).items():
+            with self.subTest(path=path):
+                self.assertEqual(sum(text.count(message) for text in texts), 1)
+        for path in ('/?year=2026', '/export.csv?year=2026'):
+            self.assertEqual(html.unescape(self.client.get(path).get_data(as_text=True)).count(message), 1)
+        response = self.client.get('/export.xlsx?year=2026')
+        book = load_workbook(io.BytesIO(response.data))
+        try:
+            self.assertEqual(sum(str(cell).count(message) for row in book['Unreadable trips'].values for cell in row), 1)
+        finally:
+            book.close()
+            response.close()
+        # Presentation filtering must leave the saved snapshot and current counts alone.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            self.viewer.trip_log.close_year(conn, 2026, 'driver', before)
+            saved = conn.execute('SELECT snapshot FROM tax_years WHERE year=2026').fetchone()[0]
+        warning, = [t for t in self.viewer.load_trips()[1] if t.get('folder_reason') == 'saved_keys']
+        message = self.viewer.folder_message(warning, 'admin')
+        self.assertEqual(html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True)).count(message), 1)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute('SELECT snapshot FROM tax_years WHERE year=2026').fetchone()[0], saved)
+        self.assertEqual(self.viewer.year_figures(*self.viewer.year_members(*self.viewer.load_trips(), 2026)), before)
+
     def test_saved_conflict_counts_all_sources_and_only_exact_month_prefixes(self):
         with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute("INSERT INTO annotations (trip_key) VALUES ('2026-010/not-a-month')")
@@ -1022,6 +1062,585 @@ class ViewerHardeningTests(unittest.TestCase):
         with patch.object(self.viewer, "_saved_month_names", side_effect=AssertionError("extra saved-name query")), \
                 patch.object(self.viewer, "_saved_month_counts", side_effect=AssertionError("extra inventory query")):
             self.assertEqual(self.viewer.load_trips()[0][0]["trip_key"], "2026-01/drive")
+
+    def moved_saved_fixture(self, rename=True):
+        self.signed_in("admin")
+        month = self.viewer.DATA_ROOT / "2026-01"
+        for suffix in ("json", "gpx"):
+            (month / f"removed.{suffix}").write_bytes((month / f"drive.{suffix}").read_bytes())
+        self.assertEqual(self.client.post("/trip/2026-01/removed/remove", data={
+            "csrf_token": "known-token", "confirm": "yes", "reason": "test upload"}).status_code, 302)
+        # Unrelated history must not contribute to the moved trips' count.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            self.viewer.trip_log.record(conn, "2026-01/absent", "annotate", {}, actor="driver", actor_role="admin")
+        target = self.viewer.DATA_ROOT / "2026-02"
+        if rename:
+            month.rename(target)
+        return target
+
+    def moved_saved_warnings(self):
+        return [e for e in self.viewer.load_trips()[1] if e.get("moved_saved")]
+
+    def close_moved_year(self, year=2026):
+        return self.client.post(f"/admin/year/{year}/close", data={"csrf_token": "known-token", "confirm": "yes"})
+
+    def test_renamed_saved_month_warns_on_all_surfaces_and_blocks_only_affected_year(self):
+        self.moved_saved_fixture()
+        trips, entries = self.viewer.load_trips()
+        warning, = self.moved_saved_warnings()
+        self.assertEqual(warning["folder_reason"], "saved_keys")
+        self.assertEqual(warning["saved_counts"], {"2026-01": {"annotations": 1, "removals": 1, "history entries": 1}})
+        self.assertEqual(warning["counted_months"], ["2026-02"])
+        self.assertEqual(self.viewer._folder_row_type(warning), "folder_warning")
+        self.assertEqual(self.viewer.year_figures(trips, entries)["unreadable"], 0)
+        self.assertEqual(self.viewer.mileage_totals(trips)["all"], 2)
+        self.assertEqual(self.viewer.mileage_totals(trips)["unclassified"], 2)
+        message = self.viewer.folder_message(warning, "admin")
+        self.assertIn("Saved purposes/notes no longer applied: 1.", message)
+        self.assertIn("Saved removals no longer applied: 1.", message)
+        self.assertIn("History entries saved for these trips under 2026-01/: 1.", message)
+        for path, texts in self.folder_surface_messages(self.client).items():
+            self.assertTrue(any(message in text for text in texts), path)
+        rows = list(csv.DictReader(io.StringIO(self.client.get("/export.csv?year=2026").get_data(as_text=True))))
+        self.assertEqual(sum(r["row_type"] == "folder_warning" for r in rows), 1)
+        review = html.unescape(self.client.get("/admin/year/2026").get_data(as_text=True))
+        self.assertEqual(review.count(message), 1)
+        response = self.client.get('/export.xlsx?year=2026')
+        book = load_workbook(io.BytesIO(response.data))
+        try:
+            labels = [r[0] for r in list(book['Unreadable trips'].values)[1:]]
+            self.assertEqual(labels, ['2026-01/ (saved data under an old month name no longer applied)'])
+        finally:
+            book.close()
+            response.close()
+        refusal = self.close_moved_year()
+        self.assertEqual(refusal.status_code, 409)
+        self.assertIn(self.viewer.MOVED_SAVED_CLOSE_REFUSAL, refusal.get_data(as_text=True))
+        self.assertNotIn("saved trip data under 2026-01/", self.client.get("/admin/year/2025").get_data(as_text=True))
+        self.assertEqual(self.close_moved_year(2025).status_code, 302)
+
+    def test_renamed_saved_month_restoring_name_restores_annotations_and_removal(self):
+        target = self.moved_saved_fixture()
+        self.assertEqual(len(self.moved_saved_warnings()), 1)
+        target.rename(self.viewer.DATA_ROOT / "2026-01")
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual(entries, [])
+        self.assertEqual([t["trip_key"] for t in trips], ["2026-01/drive"])
+        self.assertEqual(trips[0]["category"], "business")
+        self.assertEqual(trips[0]["purpose_note"], "example")
+        self.assertEqual(self.close_moved_year().status_code, 302)
+
+    def test_deleted_saved_month_and_history_alone_stay_quiet(self):
+        target = self.moved_saved_fixture()
+        for path in target.iterdir():
+            path.unlink()
+        target.rmdir()
+        self.assertEqual(self.viewer.load_trips(), ([], []))
+        self.assertEqual(self.close_moved_year().status_code, 302)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("DELETE FROM annotations")
+            conn.execute("DELETE FROM trip_removals")
+        target.mkdir()
+        (target / "absent.json").write_text('{}', encoding="utf-8")
+        self.assertEqual(self.moved_saved_warnings(), [])
+
+    def test_renamed_saved_items_clear_only_when_same_kind_is_redone(self):
+        self.moved_saved_fixture()
+        # A new annotation on one trip cannot supersede another's saved removal.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO annotations (trip_key) VALUES ('2026-02/removed')")
+        warning, = self.moved_saved_warnings()
+        self.assertEqual(warning["saved_counts"]["2026-01"]["annotations"], 1)
+        self.assertEqual(warning["saved_counts"]["2026-01"]["removals"], 1)
+        self.assertEqual(self.client.post("/trip/2026-02/drive/annotate", data={
+            "csrf_token": "known-token", "category": "business", "purpose_note": "new note"}).status_code, 302)
+        warning, = self.moved_saved_warnings()
+        self.assertEqual(warning["saved_counts"]["2026-01"], {"annotations": 0, "removals": 1, "history entries": 1})
+        self.assertEqual(self.close_moved_year().status_code, 409)
+        self.assertEqual(self.client.post("/trip/2026-02/removed/remove", data={
+            "csrf_token": "known-token", "confirm": "yes", "reason": "test upload"}).status_code, 302)
+        self.assertEqual(self.moved_saved_warnings(), [])
+        self.assertEqual(self.close_moved_year().status_code, 302)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT category FROM annotations WHERE trip_key='2026-01/drive'").fetchone()[0], "business")
+            self.assertIsNotNone(self.viewer.trip_log.removal(conn, "2026-01/removed"))
+
+    def test_renamed_saved_month_uses_trip_years_and_unreadable_folder_years(self):
+        target = self.moved_saved_fixture()
+        # The new folder's year is not the trip's local tax year.
+        target.rename(self.viewer.DATA_ROOT / "2028-02")
+        self.assertEqual(self.close_moved_year().status_code, 409)
+        self.assertEqual(self.close_moved_year(2028).status_code, 302)
+        target = self.viewer.DATA_ROOT / "2028-02"
+        # The orphan removal still warns for an unreadable moved recording.
+        (target / "removed.json").unlink()
+        self.assertEqual(len(self.moved_saved_warnings()), 1)
+        self.assertEqual(self.close_moved_year(2019).status_code, 302)
+        self.assertNotIn("saved trip data under 2026-01/", self.client.get("/admin/year/2019").get_data(as_text=True))
+        self.assertIn("saved trip data under 2026-01/", self.client.get("/admin/year/2028").get_data(as_text=True))
+        self.assertEqual(self.close_moved_year(2028).status_code, 409)
+        # January has the same two possible years as ordinary unreadable trips.
+        target.rename(self.viewer.DATA_ROOT / '2029-01')
+        for year in (2028, 2029):
+            self.assertEqual(self.close_moved_year(year).status_code, 409)
+
+    def keep_moved_trip(self, year=2026, key='2026-01/removed', **data):
+        return self.client.post(f'/admin/year/{year}/moved-removal/{key}/restore', data={
+            'csrf_token': 'known-token', 'confirm': 'yes', **data})
+
+    def test_admin_can_keep_moved_removed_trip_and_close_year_with_restore_history(self):
+        self.moved_saved_fixture()
+        for name in ('drive', 'removed'):
+            self.assertEqual(self.client.post(f'/trip/2026-02/{name}/annotate', data={
+                'csrf_token': 'known-token', 'destination': 'Example stop'}).status_code, 302)
+        self.assertEqual(self.close_moved_year().status_code, 409)
+        review = self.client.get('/admin/year/2026').get_data(as_text=True)
+        self.assertIn('action="/admin/year/2026/moved-removal/2026-01/removed/restore"', review)
+        self.assertIn('name="csrf_token" value="known-token"', review)
+        self.assertIn('>Keep trip in log</button>', review)
+        self.assertIn('The trip stays listed and counted; the old removal is deleted and the action is recorded in history.', review)
+        before = self.viewer.year_figures(*self.viewer.year_members(*self.viewer.load_trips(), 2026))
+        at = '2026-03-04T12:00:00+00:00'
+        with patch.object(self.viewer.trip_log, 'now_utc', return_value=at):
+            response = self.keep_moved_trip()
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers['Location'], '/admin/year/2026')
+        self.assertNotIn('Saved items under the old month name', self.client.get(response.headers['Location']).get_data(as_text=True))
+        self.assertEqual(self.moved_saved_warnings(), [])
+        self.assertEqual(self.viewer.year_figures(*self.viewer.year_members(*self.viewer.load_trips(), 2026)), before)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertIsNone(self.viewer.trip_log.removal(conn, '2026-01/removed'))
+            row, = conn.execute("SELECT trip_key, actor, actor_role, at, details FROM trip_history WHERE action='restore'")
+            self.assertEqual(row[:4], ('2026-01/removed', 'driver', 'admin', at))
+            self.assertEqual(json.loads(row[4]), {'reason': 'test upload'})
+        self.assertEqual(self.close_moved_year().status_code, 302)
+
+    def test_keep_moved_trip_requires_admin_post_csrf_confirmation_and_current_warning(self):
+        self.moved_saved_fixture()
+        path = '/admin/year/2026/moved-removal/2026-01/removed/restore'
+        self.assertEqual(self.client.get(path).status_code, 405)
+        self.assertEqual(self.keep_moved_trip(csrf_token='wrong').status_code, 400)
+        self.assertEqual(self.keep_moved_trip(confirm='').status_code, 400)
+        self.assertEqual(self.keep_moved_trip(year=2025).status_code, 409)
+        self.assertEqual(self.keep_moved_trip(key='2026-01/drive').status_code, 409)
+        self.signed_in('editor')
+        self.assertEqual(self.keep_moved_trip().status_code, 403)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertIsNotNone(self.viewer.trip_log.removal(conn, '2026-01/removed'))
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM trip_history WHERE action='restore'").fetchone()[0], 0)
+        self.signed_in('admin')
+        self.assertEqual(self.keep_moved_trip().status_code, 302)
+        self.assertEqual(self.keep_moved_trip().status_code, 409)
+
+    def test_keep_moved_trip_locks_current_local_year_not_old_or_current_folder_year(self):
+        target = self.moved_saved_fixture()
+        target.rename(self.viewer.DATA_ROOT / '2028-02')
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("UPDATE trip_removals SET trip_key='2024-06/removed'")
+            self.viewer.trip_log.close_year(conn, 2026, 'driver')
+        review = self.client.get('/admin/year/2026').get_data(as_text=True)
+        self.assertIn(self.viewer.MOVED_SAVED_CLOSED_NOTICE, review)
+        self.assertNotIn('>Keep trip in log</button>', review)
+        self.assertEqual(self.keep_moved_trip(key='2024-06/removed').status_code, 409)
+        self.assertEqual(self.client.post('/trip/2024-06/removed/restore', data={
+            'csrf_token': 'known-token'}).status_code, 409)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            self.assertIsNotNone(self.viewer.trip_log.removal(conn, '2024-06/removed'))
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM trip_history WHERE action='restore'").fetchone()[0], 0)
+            self.viewer.trip_log.reopen_year(conn, 2026)
+            for year in (2024, 2028):
+                self.viewer.trip_log.close_year(conn, year, 'driver')
+        self.assertIn('>Keep trip in log</button>', self.client.get('/admin/year/2026').get_data(as_text=True))
+        self.assertEqual(self.keep_moved_trip(key='2024-06/removed').status_code, 302)
+
+    def test_keep_unreadable_moved_trip_locks_both_current_january_years_and_keeps_damage(self):
+        target = self.moved_saved_fixture()
+        (target / 'removed.json').unlink()
+        target.rename(self.viewer.DATA_ROOT / '2029-01')
+        for closed_years, review_year in (((2028,), 2029), ((2029,), 2028), ((2028, 2029), 2029)):
+            with self.subTest(closed_years=closed_years):
+                with closing(sqlite3.connect(self.db)) as conn, conn:
+                    for closed_year in closed_years:
+                        self.viewer.trip_log.close_year(conn, closed_year, 'driver')
+                review = self.client.get(f'/admin/year/{review_year}').get_data(as_text=True)
+                details = review.split('<caption>Saved items')[1].split('</table>')[0]
+                self.assertIn('<code>2029-01/removed</code>', review)
+                self.assertIn('(trip is unreadable)', review)
+                self.assertNotIn('href="/trip/2029-01/removed', details)
+                self.assertNotIn('>Keep trip in log</button>', review)
+                names = ' and '.join(str(year) for year in closed_years)
+                self.assertIn(f'Reopen {names} to keep this trip in the log.', details)
+                self.assertEqual(self.keep_moved_trip(year=review_year).status_code, 409)
+                self.assertEqual(self.client.post('/trip/2026-01/removed/restore', data={
+                    'csrf_token': 'known-token'}).status_code, 409)
+                with closing(sqlite3.connect(self.db)) as conn, conn:
+                    self.assertIsNotNone(self.viewer.trip_log.removal(conn, '2026-01/removed'))
+                    for closed_year in closed_years:
+                        self.viewer.trip_log.reopen_year(conn, closed_year)
+        review = self.client.get('/admin/year/2029').get_data(as_text=True)
+        self.assertIn('>Keep trip in log</button>', review)
+        self.assertIn('unreadable trips stay flagged until repaired.', review)
+        self.assertEqual(self.keep_moved_trip(year=2029).status_code, 302)
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual([t['trip_key'] for t in trips], ['2029-01/drive'])
+        self.assertEqual([t['trip_key'] for t in entries if not t.get('folder')], ['2029-01/removed'])
+        self.assertEqual([t for t in entries if t.get('moved_saved') and
+                          t['saved_counts']['2026-01']['removals']], [])
+
+    def test_keep_moved_undated_readable_trip_uses_ordinary_edit_locks(self):
+        target = self.moved_saved_fixture()
+        path = target / 'removed.json'
+        summary = json.loads(path.read_text(encoding='utf-8'))
+        for field in ('start_time', 'end_time', 'timed_from', 'recorded_until'):
+            summary.pop(field, None)
+        summary['timing_status'] = 'untimed'
+        path.write_text(json.dumps(summary), encoding='utf-8')
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            for year in (2026, 2028):
+                self.viewer.trip_log.close_year(conn, year, 'driver')
+        self.assertEqual(self.close_moved_year(2019).status_code, 409)
+        review = self.client.get('/admin/year/2028').get_data(as_text=True)
+        self.assertIn('>Keep trip in log</button>', review)
+        self.assertNotIn('Reopen 2028 to keep this trip in the log.', review)
+        self.assertEqual(self.client.post('/trip/2026-02/removed/annotate', data={
+            'csrf_token': 'known-token', 'destination': 'Example stop'}).status_code, 302)
+        self.assertEqual(self.client.post('/trip/2026-02/removed/remove', data={
+            'csrf_token': 'known-token', 'reason': 'Example duplicate'}).status_code, 302)
+        self.assertEqual(self.client.post('/trip/2026-02/removed/restore', data={
+            'csrf_token': 'known-token'}).status_code, 302)
+        self.assertEqual(self.keep_moved_trip(year=2028).status_code, 302)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            self.viewer.trip_log.add_removal(conn, '2026-01/removed', 'Example duplicate', 'driver')
+        self.assertEqual(self.client.post('/trip/2026-01/removed/restore', data={
+            'csrf_token': 'known-token'}).status_code, 302)
+
+    def test_keep_moved_route_refuses_live_removal_of_trip_still_in_place(self):
+        self.moved_saved_fixture(rename=False)
+        with closing(sqlite3.connect(self.db)) as conn:
+            before = self.viewer.trip_log.removal(conn, '2026-01/removed')
+        self.assertEqual(self.keep_moved_trip().status_code, 409)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(self.viewer.trip_log.removal(conn, '2026-01/removed'), before)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM trip_history WHERE action='restore'").fetchone()[0], 0)
+
+    def test_destination_only_save_clears_plain_moved_purpose_for_admin_and_everyday_login(self):
+        self.signed_in('admin')
+        (self.viewer.DATA_ROOT / '2026-01').rename(self.viewer.DATA_ROOT / '2026-02')
+        for role in ('admin', 'editor'):
+            with self.subTest(role=role):
+                with closing(sqlite3.connect(self.db)) as conn, conn:
+                    conn.execute("DELETE FROM annotations WHERE trip_key='2026-02/drive'")
+                self.assertEqual(len(self.moved_saved_warnings()), 1)
+                self.signed_in(role)
+                self.assertEqual(self.client.post('/trip/2026-02/drive/annotate', data={
+                    'csrf_token': 'known-token', 'destination': 'Example stop'}).status_code, 302)
+                self.assertEqual(self.moved_saved_warnings(), [])
+
+    def test_plain_moved_purpose_needs_a_saved_annotation_row_even_when_fields_are_cleared(self):
+        self.signed_in('admin')
+        (self.viewer.DATA_ROOT / '2026-01').rename(self.viewer.DATA_ROOT / '2026-02')
+        path = '/trip/2026-02/drive/annotate'
+        self.assertEqual(self.client.post(path, data={'csrf_token': 'known-token'}).status_code, 302)
+        self.assertEqual(len(self.moved_saved_warnings()), 1)
+        self.assertEqual(self.client.post(path, data={
+            'csrf_token': 'known-token', 'destination': 'Example stop'}).status_code, 302)
+        self.assertEqual(self.moved_saved_warnings(), [])
+        self.assertEqual(self.client.post(path, data={'csrf_token': 'known-token'}).status_code, 302)
+        self.assertEqual(self.moved_saved_warnings(), [])
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT category, purpose_note, destination FROM annotations "
+                                          "WHERE trip_key='2026-02/drive'").fetchone(), ('', '', ''))
+
+    def test_moved_history_counts_only_unresolved_old_addresses_once(self):
+        target = self.moved_saved_fixture()
+        old = self.viewer.DATA_ROOT / '2026-01'
+        old.mkdir()
+        for suffix in ('json', 'gpx'):
+            (old / f'new-trip.{suffix}').write_bytes((target / f'drive.{suffix}').read_bytes())
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            for key in ('2026-01/new-trip', '2026-01/drive', '2026-01/drive'):
+                self.viewer.trip_log.record(conn, key, 'annotate', {}, actor='driver', actor_role='admin')
+            # The same old address can have two kinds: its history counts once.
+            self.viewer.trip_log.add_removal(conn, '2026-01/drive', 'example', 'driver')
+        warning, = self.moved_saved_warnings()
+        self.assertEqual(warning['saved_counts']['2026-01']['history entries'], 3)
+        self.assertEqual(self.keep_moved_trip(key='2026-01/drive').status_code, 302)
+        self.assertEqual(self.client.post('/trip/2026-02/drive/annotate', data={
+            'csrf_token': 'known-token', 'destination': 'Example stop'}).status_code, 302)
+        warning, = self.moved_saved_warnings()
+        self.assertEqual(warning['saved_counts']['2026-01']['history entries'], 1)
+
+    def test_alias_conflict_and_moved_details_with_same_month_address_do_not_collide(self):
+        self.moved_saved_fixture()
+        # A real month wins outright; saved-name conflicts need competing links.
+        old = self.viewer.DATA_ROOT / 'archive'
+        old.mkdir()
+        self.symlink(self.viewer.DATA_ROOT / '2026-01', old, directory=True)
+        self.symlink(self.viewer.DATA_ROOT / '2026-03', old, directory=True)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            for month in ('2026-01', '2026-03'):
+                conn.execute('INSERT INTO annotations (trip_key, category) VALUES (?, ?)', (month + '/other', 'personal'))
+        entries = [t for t in self.viewer.load_trips()[1] if t.get('folder_reason') == 'saved_keys']
+        self.assertEqual([t['trip_key'] for t in entries], ['2026-01/', '2026-01/'])
+        self.assertEqual(sum(bool(t.get('moved_saved')) for t in entries), 1)
+        review = html.unescape(self.client.get('/admin/year/2026').get_data(as_text=True))
+        self.assertIn('<code>2026-01/removed</code>', review)
+        self.assertIn('<code>2026-01/drive</code>', review)
+        for entry in entries:
+            self.assertEqual(review.count(self.viewer.folder_message(entry, 'admin')), 1)
+
+    def test_renamed_readable_saved_trip_without_a_date_blocks_every_year(self):
+        target = self.moved_saved_fixture()
+        summary = json.loads((target / 'drive.json').read_text(encoding='utf-8'))
+        for field in ('start_time', 'end_time'):
+            summary.pop(field)
+        summary['timing_status'] = 'untimed'
+        (target / 'drive.json').write_text(json.dumps(summary), encoding='utf-8')
+        self.assertEqual(self.close_moved_year(2019).status_code, 409)
+        self.assertIn('saved trip data under 2026-01/', self.client.get('/admin/year/2019').get_data(as_text=True))
+
+    def test_renamed_saved_month_already_closed_shows_notice_and_keeps_close(self):
+        target = self.moved_saved_fixture(rename=False)
+        self.assertEqual(self.close_moved_year().status_code, 302)
+        (self.viewer.DATA_ROOT / "2026-01").rename(target)
+        review = self.client.get("/admin/year/2026").get_data(as_text=True)
+        self.assertIn(self.viewer.MOVED_SAVED_CLOSED_NOTICE, review)
+        self.assertIn('action="/admin/year/2026/reopen"', review)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertIn(2026, self.viewer.trip_log.closed_years(conn))
+
+    def test_renamed_saved_month_names_all_current_folders_and_counts_each_saved_item_once(self):
+        target = self.moved_saved_fixture()
+        other = self.viewer.DATA_ROOT / "2027-03"
+        other.mkdir()
+        for suffix in ("json", "gpx"):
+            (target / f"removed.{suffix}").rename(other / f"removed.{suffix}")
+        summary_path = other / "removed.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary["start_time"] = "2027-03-02T12:00:00Z"
+        summary["end_time"] = "2027-03-02T12:05:00Z"
+        summary_path.write_text(json.dumps(summary), encoding="utf-8")
+        warning, = self.moved_saved_warnings()
+        self.assertEqual(warning["counted_months"], ["2026-02", "2027-03"])
+        self.assertIn("now under 2026-02/, 2027-03/", self.viewer.folder_message(warning, "admin"))
+        self.assertEqual(self.close_moved_year(2026).status_code, 409)
+        self.assertEqual(self.close_moved_year(2027).status_code, 409)
+
+    def test_existing_old_month_file_or_folder_keeps_existing_diagnostic(self):
+        self.moved_saved_fixture()
+        old = self.viewer.DATA_ROOT / "2026-01"
+        old.write_text("placeholder", encoding="utf-8")
+        entries = self.viewer.load_trips()[1]
+        self.assertEqual([e["folder_reason"] for e in entries], ["not_folder"])
+        self.assertEqual(self.moved_saved_warnings(), [])
+        old.unlink()
+        old.mkdir()
+        self.assertEqual(len(self.moved_saved_warnings()), 1)
+        self.assertEqual(self.close_moved_year().status_code, 409)
+        with patch.object(self.viewer, '_month_trip_names', side_effect=lambda path:
+                          (_ for _ in ()).throw(PermissionError()) if path == old else ['drive.json', 'removed.json']):
+            entries = self.viewer.load_trips()[1]
+        self.assertEqual([e['folder_reason'] for e in entries], ['unreadable'])
+
+    def test_recreated_old_month_keeps_moved_saved_warning_and_close_block(self):
+        target = self.moved_saved_fixture()
+        old = self.viewer.DATA_ROOT / '2026-01'
+        old.mkdir()
+        for suffix in ('json', 'gpx'):
+            (old / f'new-trip.{suffix}').write_bytes((target / f'drive.{suffix}').read_bytes())
+        warning, = self.moved_saved_warnings()
+        self.assertEqual(warning['saved_counts']['2026-01']['annotations'], 1)
+        self.assertEqual(self.close_moved_year().status_code, 409)
+        # A notice on an otherwise scanned old month also must not hide it.
+        with patch.object(self.viewer, '_month_mode_writable', return_value=False):
+            entries = self.viewer.load_trips()[1]
+        self.assertEqual(sum(bool(t.get('moved_saved')) for t in entries), 1)
+        self.assertEqual(sum(t.get('folder_reason') == 'unwritable' for t in entries), 2)
+
+    def test_renamed_annotated_removed_trip_clears_on_removal_and_warns_on_restore(self):
+        self.signed_in('admin')
+        def remove(key):
+            return self.client.post(f'/trip/{key}/remove', data={
+                'csrf_token': 'known-token', 'confirm': 'yes', 'reason': 'duplicate upload'})
+        self.assertEqual(remove('2026-01/drive').status_code, 302)
+        (self.viewer.DATA_ROOT / '2026-01').rename(self.viewer.DATA_ROOT / '2026-02')
+        warning, = self.moved_saved_warnings()
+        self.assertEqual(warning['saved_counts']['2026-01']['annotations'], 1)
+        self.assertEqual(warning['saved_counts']['2026-01']['removals'], 1)
+        self.assertEqual(remove('2026-02/drive').status_code, 302)
+        self.assertEqual(self.client.post('/trip/2026-02/drive/annotate', data={
+            'csrf_token': 'known-token', 'category': 'business'}).status_code, 409)
+        self.assertEqual(self.moved_saved_warnings(), [])
+        self.assertEqual(self.close_moved_year().status_code, 302)
+        self.assertEqual(self.client.post('/admin/year/2026/reopen', data={
+            'csrf_token': 'known-token', 'confirm': 'yes'}).status_code, 302)
+        self.assertEqual(self.client.post('/trip/2026-02/drive/restore', data={
+            'csrf_token': 'known-token', 'confirm': 'yes'}).status_code, 302)
+        warning, = self.moved_saved_warnings()
+        self.assertEqual(warning['saved_counts']['2026-01']['annotations'], 1)
+        self.assertEqual(warning['saved_counts']['2026-01']['removals'], 1)
+        self.assertEqual(self.close_moved_year().status_code, 409)
+
+    def test_unreadable_moved_annotation_waits_for_readable_summary_but_removal_still_warns(self):
+        self.signed_in('admin')
+        old = self.viewer.DATA_ROOT / '2026-01'
+        target = self.viewer.DATA_ROOT / '2026-02'
+        old.rename(target)
+        summary = (target / 'drive.json').read_bytes()
+        (target / 'drive.json').unlink()
+        self.assertEqual(self.client.post('/trip/2026-02/drive/annotate', data={
+            'csrf_token': 'known-token', 'category': 'business'}).status_code, 404)
+        self.assertEqual(self.moved_saved_warnings(), [])
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            self.viewer.trip_log.add_removal(conn, '2026-01/drive', 'test upload', 'driver')
+        warning, = self.moved_saved_warnings()
+        self.assertEqual(warning['saved_counts']['2026-01']['annotations'], 0)
+        self.assertEqual(warning['saved_counts']['2026-01']['removals'], 1)
+        self.assertEqual(self.client.post('/trip/2026-02/drive/remove', data={
+            'csrf_token': 'known-token', 'confirm': 'yes', 'reason': 'test upload'}).status_code, 302)
+        self.assertEqual(self.moved_saved_warnings(), [])
+        self.assertEqual(self.client.post('/trip/2026-02/drive/restore', data={
+            'csrf_token': 'known-token', 'confirm': 'yes'}).status_code, 302)
+        # Leave only the old annotation to isolate the readability transition.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            self.viewer.trip_log.delete_removal(conn, '2026-01/drive')
+        self.assertEqual(self.moved_saved_warnings(), [])
+        (target / 'drive.json').write_bytes(summary)
+        warning, = self.moved_saved_warnings()
+        self.assertEqual(warning['saved_counts']['2026-01']['annotations'], 1)
+        self.assertEqual(self.close_moved_year().status_code, 409)
+
+    def test_moved_saved_review_lists_only_unresolved_year_items_and_escapes_saved_text(self):
+        target = self.moved_saved_fixture()
+        note, destination = '<script>saved note</script>', '<b>saved stop</b>'
+        reason, actor = '<img src=x onerror=alert(1)>', '<i>example admin</i>'
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute('UPDATE annotations SET purpose_note=?, destination=?', (note, destination))
+            conn.execute("UPDATE trip_removals SET reason=?, removed_by=?, removed_at='2026-01-03T12:00:00+00:00'",
+                         (reason, actor))
+        # Put the removal in a different local year: one detail row per review.
+        summary = json.loads((target / 'removed.json').read_text(encoding='utf-8'))
+        summary.update(start_time='2027-02-02T12:00:00Z', end_time='2027-02-02T12:05:00Z')
+        (target / 'removed.json').write_text(json.dumps(summary), encoding='utf-8')
+        review = self.client.get('/admin/year/2026').get_data(as_text=True)
+        self.assertIn('href="/trip/2026-02/drive?year=2026"', review)
+        self.assertIn('<code>2026-01/drive</code>', review)
+        self.assertIn('Purpose/notes', review)
+        self.assertIn('Category: business;', review)
+        for text in (note, destination):
+            self.assertIn(html.escape(text), review)
+            self.assertNotIn(text, review)
+        self.assertNotIn('<code>2026-01/removed</code>', review)
+        review = self.client.get('/admin/year/2027').get_data(as_text=True)
+        self.assertIn('href="/trip/2026-02/removed?year=2027"', review)
+        self.assertIn('<code>2026-01/removed</code>', review)
+        self.assertIn('Removal', review)
+        self.assertIn('2026-01-03 04:00', review)
+        for text in (reason, actor):
+            self.assertIn(html.escape(text), review)
+            self.assertNotIn(text, review)
+        self.assertNotIn('<code>2026-01/drive</code>', review)
+        self.assertEqual(self.client.post('/trip/2026-02/drive/annotate', data={
+            'csrf_token': 'known-token', 'category': 'personal', 'purpose_note': 'redone'}).status_code, 302)
+        review = self.client.get('/admin/year/2026').get_data(as_text=True)
+        self.assertNotIn('Saved items under the old month name', review)
+        for path, texts in self.folder_surface_messages(self.client, include_review=False).items():
+            for text in texts:
+                self.assertNotIn(note, text, path)
+                self.assertNotIn(reason, text, path)
+        self.signed_in('editor')
+        for path, texts in self.folder_surface_messages(self.client, include_review=False).items():
+            for text in texts:
+                self.assertNotIn('What was saved', text, path)
+                self.assertNotIn(reason, text, path)
+                self.assertNotIn(actor, text, path)
+
+    def test_renamed_saved_month_everyday_role_uses_existing_warning_split(self):
+        self.moved_saved_fixture()
+        warning, = self.moved_saved_warnings()
+        self.signed_in("editor")
+        message = self.viewer.folder_message(warning, "editor")
+        self.assertIn("2026-01/", message)
+        self.assertIn("2026-02/", message)
+        self.assertTrue(message.endswith("Please ask the admin to fix it."))
+        self.assertNotIn("History entries", message)
+        self.assertNotIn("Rename the folder", message)
+        for path, texts in self.folder_surface_messages(self.client, include_review=False).items():
+            self.assertTrue(any(message in text for text in texts), path)
+        self.assertEqual(self.client.get("/admin/year/2026").status_code, 403)
+
+    def test_saved_month_detection_adds_no_healthy_or_targeted_queries(self):
+        detect = self.viewer._moved_saved_items
+        def no_filesystem(*args):
+            with ExitStack() as stack:
+                for name in ('stat', 'lstat', 'exists', 'is_dir', 'resolve', 'iterdir', 'open'):
+                    stack.enter_context(patch.object(Path, name, side_effect=AssertionError('extra filesystem call')))
+                stack.enter_context(patch.object(self.viewer.os, 'access', side_effect=AssertionError('extra access')))
+                return detect(*args)
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.row_factory = sqlite3.Row
+            queries = []
+            conn.set_trace_callback(queries.append)
+            with patch.object(self.viewer.os.path, "lexists", side_effect=AssertionError("extra presence check")), \
+                    patch.object(self.viewer, "_saved_month_counts", side_effect=AssertionError("extra counts")), \
+                    patch.object(self.viewer, '_moved_saved_items', side_effect=no_filesystem):
+                self.viewer._load_trips(conn)
+            self.assertEqual(queries, ["SELECT * FROM annotations", "SELECT * FROM trip_merges",
+                                      "SELECT trip_key, reason, removed_by, removed_at FROM trip_removals"])
+        target = self.moved_saved_fixture()
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.row_factory = sqlite3.Row
+            queries = []
+            conn.set_trace_callback(queries.append)
+            with patch.object(self.viewer, "_saved_month_counts", side_effect=AssertionError("targeted counts")):
+                self.viewer._load_trips(conn, trip_key="2026-02/drive")
+            self.assertEqual(len(queries), 6)
+            self.assertFalse(any("UNION" in q or "WITH candidates" in q for q in queries))
+        for path in target.iterdir():
+            path.unlink()
+        target.rmdir()
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.row_factory = sqlite3.Row
+            queries = []
+            conn.set_trace_callback(queries.append)
+            with patch.object(self.viewer.os.path, 'lexists', side_effect=AssertionError('extra presence check')), \
+                    patch.object(self.viewer, '_saved_month_counts', side_effect=AssertionError('extra counts')), \
+                    patch.object(self.viewer, '_moved_saved_items', side_effect=no_filesystem):
+                self.assertEqual(self.viewer._load_trips(conn), ([], []))
+            self.assertEqual(queries, ['SELECT * FROM annotations', 'SELECT * FROM trip_merges',
+                                      'SELECT trip_key, reason, removed_by, removed_at FROM trip_removals'])
+
+    def test_renamed_month_keeps_merge_notice_separate_from_ordinary_saved_items(self):
+        from test_viewer_merges import ViewerMerges
+        fixture = ViewerMerges()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        a, b = fixture.trip("a", 0), fixture.trip("b", 180, .01)
+        fixture.annotate(a, "business", "part note")
+        key = fixture.merged_key(fixture.merge(a, b))
+        ordinary = fixture.trip("ordinary", 600, .02)
+        fixture.annotate(ordinary, "personal", "ordinary note")
+        with closing(sqlite3.connect(fixture.db)) as conn, conn:
+            fixture.viewer.trip_log.add_removal(conn, key, "test", "driver")
+        fixture.month.rename(fixture.data / "2026-05")
+        with closing(sqlite3.connect(fixture.db)) as conn:
+            conn.row_factory = sqlite3.Row
+            with patch.object(fixture.viewer, "_moved_saved_items", side_effect=AssertionError("targeted full fallback")):
+                fixture.viewer._load_trips(conn, trip_key=key, include_removed=True)
+        # Removed merges retain their existing behavior; their parts' saved
+        # annotations and merge-key removal must not inflate the new warning.
+        trips, entries = fixture.viewer.load_trips(include_removed=True)
+        unused, = [e for e in entries if e.get("unused_merge")]
+        warning, = [e for e in entries if e.get("moved_saved")]
+        self.assertIn("removal", unused)
+        self.assertEqual(warning["saved_counts"]["2026-04"]["annotations"], 1)
+        self.assertEqual(warning["saved_counts"]["2026-04"]["removals"], 0)
+        self.assertEqual(len(trips), 3)
+        with closing(sqlite3.connect(fixture.db)) as conn, conn:
+            fixture.viewer.trip_log.delete_removal(conn, key)
+        entries = fixture.viewer.load_trips()[1]
+        self.assertEqual(sum(bool(e.get("unused_merge")) for e in entries), 1)
+        self.assertEqual(sum(bool(e.get("moved_saved")) for e in entries), 1)
 
     def test_closed_year_snapshot_keeps_link_key_and_lock_without_annotation(self):
         target = self.linked_archive()

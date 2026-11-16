@@ -1050,6 +1050,61 @@ XLSX labels them on **Unreadable trips**. Their notes keep saved miles, purpose,
 trip date, action date and login, and say which parts are counted again.
 An unused-name notice adds no saved miles or
 merged annotation and does not block merge suggestions for healthy trips.
+
+**Never rename a month folder.** The viewer saves a trip's purpose, notes,
+destination and removal under its address, `<month folder>/<trip id>`, so a
+renamed folder leaves that saved data behind: a removed trip is listed and
+counted again, and purposes and notes no longer show.
+
+The viewer warns when a trip with a saved purpose, notes or removal turns up
+under another month name and nothing is left at its old address. The warning
+appears on the trip list, the year review and the exports, and it stays even if
+new uploads have recreated the old folder. Deleting a folder without moving its
+trips does not warn. Existing folder problems and alias conflicts keep their own
+warnings.
+
+While an item is unresolved, the years its trip counts in cannot be closed:
+
+- both years for a drive split at New Year;
+- only the new year when all of the drive's counted miles are after midnight;
+- the start year when the drive stays whole there;
+- for an unreadable trip, the same possible folder years as other unreadable
+  trips;
+- every year for a readable trip with no date.
+
+The admin year review lists each unresolved item for that year: the trip's
+current address (a link when the trip can open), its old address, and what was
+saved (purpose, notes and destination, or the removal's reason, login and
+time). Admins also see counts on the trip list and in the exports. Everyday
+logins see the warning without details or counts.
+
+To clear the warning, do one of these:
+
+- **Rename the folder back**, or move those trips' files back into a folder
+  with the old name. All the saved data applies again.
+- **Save the purpose again under the new name.** For a plain trip, saving a
+  purpose, notes or destination clears the purpose warning, even if those
+  fields are cleared later. Saving with every field empty does not clear it
+  unless an annotation was already saved there. For a trip that is now part of
+  a merge, save a nonempty purpose, notes or destination on the merge; an
+  unannotated merge still warns.
+- **Remove the trip (or its merge) again** to keep it out of the log.
+- **Choose Keep trip in log** beside the removal on the admin year review to
+  keep the trip listed and counted. This deletes the old removal, records in
+  history who restored it, when and the removal's reason, and returns to the
+  year review. If a closed year locks the trip, the review names the years to
+  reopen first; these are the same edit locks as for the current trip and its
+  merge parts. A readable trip with no date is never locked by a closed year.
+
+A removed or unreadable trip needs no purpose; that warning returns if the trip
+is restored or becomes readable without an annotation. An old removal still
+warns for an unreadable trip until the trip is removed again or the admin
+chooses to keep it. Keeping it clears only the old removal; the unreadable
+warning remains. History stays saved throughout.
+
+After **Undo saved merge**, a former part's purpose or notes saved only under
+the old name also needs this repair before any affected year can close.
+
 Moving or renaming a real month folder with file times kept also produces an
 unused-name merge when every recording matches under the new name.
 To use that merge again, restore the original month name, as a link or by
@@ -1106,7 +1161,8 @@ year's own close and reopen history. The review includes edits made at or
 after local January 1 of the following year.
 
 A split drive belongs to both years and each year counts only its share;
-other trips use their local start or first recorded time. An unreadable trip
+a drive with all counted miles after midnight belongs only to the new year.
+Other trips use their local start or first recorded time. An unreadable trip
 is assigned by its storage folder; a January folder can be listed under the
 previous year. Folder entries follow the same rule, so a January folder
 appears under both candidate years. A trip with no usable time is not locked

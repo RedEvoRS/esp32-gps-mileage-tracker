@@ -484,6 +484,16 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   unreadable in year-close snapshots. Month links share one counted address
   across routes; saved-name conflicts preserve saved keys and block year closing,
   and folder messages share one formatter across the list, review and exports.
+  Orphan annotations/removals warn when the same trip ID is scanned under another
+  counted month, even if the old folder exists again; folder problems and aliases
+  keep their own diagnostics. Current annotations/removals resolve their own kind,
+  using the merge for a moved part; removed/unreadable trips need no annotation.
+  Unresolved items block each counted year; unreadable trips use folder years,
+  readable undated trips block every year. Admin year review lists saved details.
+  Any current annotation row resolves a plain trip's purpose warning; a merge
+  needs a nonempty purpose, note or destination. Admin Keep trip in log deletes
+  an old removal with restore history and the ordinary trip edit locks; the review
+  names closed years to reopen. Readable undated trips remain editable.
   The upload alert names global folder refusals; unused-name merges are saved-data
   notices excluded from miles and missing counts, with admin undo, only when
   every part is counted under another name and both files match saved stamps.
