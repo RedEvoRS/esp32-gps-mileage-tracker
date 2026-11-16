@@ -3777,7 +3777,10 @@ def _merge_history_missing_years(summary, month):
     """A missing part is bounded by the saved merge's local start and end."""
     times = [_to_local(_parse(summary.get(field))) for field in ('start_time', 'end_time')]
     years = [time.year for time in times if time is not None]
-    return set(range(min(years), max(years) + 1)) if years else _folder_years(month)
+    if not years:
+        return _folder_years(month)
+    saved_years = set(range(min(years), max(years) + 1))
+    return saved_years & _folder_years(month) or saved_years
 
 
 def _merge_history_counted_parts(conn, rows, trips):

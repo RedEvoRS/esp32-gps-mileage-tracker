@@ -467,6 +467,62 @@ class ViewerMerges(unittest.TestCase):
             self.assert_record_year(key, year, totals, year in (2026, 2027))
         self.assertEqual([r['year'] for r in self.viewer._year_list()], [2027, 2026])
 
+    def test_missing_part_years_respect_possible_start_years_on_every_surface(self):
+        from zoneinfo import ZoneInfo
+        cases = (
+            # End-time folders can cross midnight without crossing a tax year.
+            ('UTC', datetime(2026, 12, 31, 23, 50, tzinfo=timezone.utc), 590,
+             ('2026-12', '2027-01'), 'a', False, {2026}, {2026}),
+            ('America/Los_Angeles', datetime(2027, 1, 1, 3, tzinfo=timezone.utc), 180,
+             ('2026-12', '2026-12'), 'b', False, {2026}, {2026}),
+            ('America/Los_Angeles', datetime(2027, 1, 1, 3, tzinfo=timezone.utc), 180,
+             ('2027-01', '2027-01'), 'b', False, {2026}, {2026, 2027}),
+            ('UTC', datetime(2026, 12, 31, 23, 58, tzinfo=timezone.utc), 180,
+             ('2026-12', '2027-01'), 'a', False, {2026, 2027}, {2026, 2027}),
+            ('UTC', datetime(2026, 12, 31, 23, 58, tzinfo=timezone.utc), 180,
+             ('2026-12', '2027-01'), 'b', False, {2026, 2027}, {2026, 2027}),
+            ('UTC', datetime(2027, 1, 15, 12, tzinfo=timezone.utc), 180,
+             ('2027-01', '2027-01'), 'b', True, {2027}, {2026, 2027}),
+        )
+        for zone, start, gap, months, missing, start_only, record_years, offered in cases:
+            with self.subTest(zone=zone, months=months, missing=missing, start_only=start_only):
+                fixture = ViewerMerges()
+                fixture.setUp()
+                self.addCleanup(fixture.doCleanups)
+                fixture.viewer.DISPLAY_TZ = ZoneInfo(zone)
+                fixture.base = start
+                fixture.trip('a', 0)
+                fixture.trip('b', gap, .01)
+                for name, month in zip(('a', 'b'), months, strict=True):
+                    target = fixture.data / month
+                    target.mkdir(exist_ok=True)
+                    for suffix in ('.json', '.gpx'):
+                        (fixture.month / (name + suffix)).rename(target / (name + suffix))
+                parts = [month + '/' + name for month, name in zip(months, ('a', 'b'), strict=True)]
+                key = fixture.merged_key(fixture.merge(*parts))
+                missing_key = parts[('a', 'b').index(missing)]
+                (fixture.data / (missing_key + '.json')).unlink()
+                self.assertEqual(fixture.discard(key).status_code, 302)
+                if start_only:
+                    with closing(sqlite3.connect(fixture.db)) as conn, conn:
+                        details = json.loads(conn.execute(
+                            "SELECT details FROM trip_history WHERE action='discard_damaged_merge'").fetchone()[0])
+                        details['saved_summary'].pop('end_time')
+                        conn.execute("UPDATE trip_history SET details=? WHERE action='discard_damaged_merge'",
+                                     (json.dumps(details),))
+                    # An incompatible folder still falls back to the saved start year.
+                    self.assertEqual(fixture.viewer._merge_history_missing_years(details['saved_summary'], '2028-06'), {2027})
+                remaining_year = fixture.viewer._trip_local_year(fixture.viewer.load_trips()[0][0])
+                for remove_gpx in (False, True):
+                    if remove_gpx:
+                        (fixture.data / (missing_key + '.gpx')).unlink()
+                    for year in (2025, 2026, 2027, 2028):
+                        miles = .041 if year == remaining_year else 0
+                        totals = dict(zip(('business', 'personal', 'other', 'unclassified', 'all'),
+                                          (0, 0, 0, miles, miles), strict=True))
+                        fixture.assert_record_year(key, year, totals, year in record_years)
+                    self.assertEqual({r['year'] for r in fixture.viewer._year_list()}, record_years if remove_gpx else offered)
+
     def assert_discard_current_statement(self, statement, *, undone=False, effect=''):
         with closing(sqlite3.connect(self.db)) as conn:
             rows = self.viewer._merge_history_rows(conn, 2026, self.viewer.load_trips()[0])
