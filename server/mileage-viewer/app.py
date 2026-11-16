@@ -2036,6 +2036,8 @@ def _year_distances(keys, cut):
         segments = [seg for parsed in trip_merges.parsed_parts(DATA_ROOT, keys) for seg in parsed["segments"]]
         sides = distance_sides({"segments": segments}, cut)
         if stamps() == stamp:
+            if len(_year_distance_cache) >= 256:
+                _year_distance_cache.clear()  # Entries for deleted trips never match again.
             _year_distance_cache[cache_key] = (stamp, sides)
         else:
             _year_distance_cache.pop(cache_key, None)
@@ -2069,13 +2071,16 @@ def _year_allocation(trip):
         return whole("the GPX is missing, unreadable, invalid or cannot be opened safely")
     if not after:
         return {}  # Only stationary cooldown recording passed midnight.
-    if not before:
-        return whole("there are no counted miles before midnight")
     total = trip.get("trip_distance_miles", trip["distance_miles"])
     old = round(total * before / (before + after), 3)
     new = round(total - old, 3)
-    if old <= 0 or new <= 0:
-        return whole("one share rounds to zero miles")
+    if new <= 0:
+        return {}  # Nothing after midnight survives rounding: all of it is the start year's.
+    if old <= 0:
+        # Every counted mile is after midnight, so the new year owns the whole
+        # drive. It is moved, not split: the full-miles export column stays blank.
+        return {"year_shares": {new_year: total},
+                "year_split_note": f"Starts in {old_year}; all of its counted miles are in {new_year}."}
     return {"year_shares": {old_year: old, new_year: new}, "trip_distance_miles": total}
 
 
@@ -2089,7 +2094,7 @@ def year_distance_note(trip):
     if trip.get("other_year"):
         return (f"{trip['distance_miles']:.2f} of {trip['trip_distance_miles']:.2f} mi, "
                 f"rest in {trip['other_year']}")
-    if trip.get("year_shares"):
+    if len(trip.get("year_shares") or ()) > 1:
         return "; ".join(f"{year}: {miles:.3f} mi" for year, miles in trip["year_shares"].items())
     return trip.get("year_split_note", "")
 
@@ -2100,8 +2105,8 @@ def year_members(trips, unreadable, year):
     for trip in trips:
         shares = trip.get("year_shares", {})
         if year in shares:
-            members.append({**trip, "distance_miles": shares[year],
-                            "other_year": next(y for y in shares if y != year)})
+            other = next((y for y in shares if y != year), None)
+            members.append({**trip, "distance_miles": shares[year], **({"other_year": other} if other else {})})
         elif not shares and _trip_local_year(trip) == year:
             members.append(trip)
     return (members,

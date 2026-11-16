@@ -298,12 +298,51 @@ class NewYearTests(YearTestBase):
         with patch.object(self.viewer.trip_merges, "parsed_parts", side_effect=PermissionError):
             self.assertIn("unreadable", self.trip(key).get("year_split_note", ""))
 
-    def test_more_than_one_year_end_and_a_rounded_zero_share_stay_whole(self):
+    def test_more_than_one_year_end_stays_whole(self):
         key = self.recording("long", recorded_until="2028-01-01T08:00:30+00:00")
         self.assertIn("more than one year end", self.trip(key).get("year_split_note", ""))
-        key = self.recording("tiny", miles=0.001)
-        self.assertIn("rounds to zero", self.trip(key).get("year_split_note", ""))
         self.assertEqual(self.figures(2027)["trips"], 0)
+
+    def test_a_share_that_rounds_to_zero_leaves_the_drive_whole_in_the_other_year(self):
+        # 300 m before and 500 m after: 0.001 mi cannot be divided, and the larger side keeps it.
+        late = self.recording("tiny-late", miles=0.001)
+        self.assertEqual(self.trip(late)["year_shares"], {2027: 0.001})
+        # 295 m before and 5 m after: the start year keeps it, exactly as an ordinary trip.
+        early = self.recording("tiny-early", miles=0.001, segments=[[(-30, 0, 10, 1), (-1, 290, 10, 1), (1, 300, 10, 1)]])
+        trip = self.trip(early)
+        self.assertNotIn("year_shares", trip)
+        self.assertNotIn("year_split_note", trip)
+        self.assertEqual([t["trip_key"] for t in self.viewer.year_members(*self.viewer.load_trips(), 2026)[0]], [early])
+        self.assertEqual([t["trip_key"] for t in self.viewer.year_members(*self.viewer.load_trips(), 2027)[0]], [late])
+
+    def test_drive_with_every_counted_mile_after_midnight_counts_in_the_new_year(self):
+        # Both fixes before midnight are above the HDOP limit, so the only counted step is after it.
+        key = self.recording("late", miles=0.186,
+                             segments=[[(-30, 0, 10, 6), (-10, 100, 10, 6), (10, 400, 10, 1), (40, 700, 10, 1)]])
+        trip = self.trip(key)
+        self.assertEqual(trip["year_shares"], {2027: 0.186})
+        self.assertNotIn("trip_distance_miles", trip)  # moved whole, not split
+        self.assertEqual(trip["year_split_note"], "Starts in 2026; all of its counted miles are in 2027.")
+        self.assertEqual(self.figures(2026)["trips"], 0)
+        self.assertEqual((self.figures(2027)["trips"], self.figures(2027)["totals"]["all"]), (1, 0.186))
+        self.assertEqual(self.viewer.mileage_totals([trip])["all"], 0.186)
+        member = self.viewer.year_members([trip], [], 2027)[0][0]
+        self.assertNotIn("other_year", member)
+        self.assertEqual(self.viewer.year_distance_note(member), trip["year_split_note"])
+        page = self.admin.get("/").get_data(as_text=True)
+        self.assertIn('<option value="2027"', page)
+        self.assertNotIn('<option value="2026"', page)
+        for year in (2026, 2027):  # the old year's review explains where the 31 December drive went
+            self.assertIn(trip["year_split_note"], self.review(year))
+        rows = list(csv.reader(io.StringIO(self.admin.get("/export.csv?year=2027").get_data(as_text=True))))
+        row = next(r for r in rows if r[1] == "late")
+        self.assertEqual((float(row[3]), row[-1]), (0.186, ""))
+        # The lock follows the year that holds the miles.
+        self.close_year(2026)
+        self.assertEqual(self.annotate(key, category="business").status_code, 302)
+        self.reopen_year(2026)
+        self.close_year(2027)
+        self.assertEqual(self.annotate(key, category="personal").status_code, 409)
 
     def test_cache_rechecks_sources_and_uses_current_total(self):
         key = self.recording()

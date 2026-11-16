@@ -782,10 +782,14 @@ the saved total even for older summaries and merged drives. Nothing is written
 to the trip files or database. A stationary cooldown past midnight does not
 split a drive whose movement ended before midnight.
 
-Splitting requires complete timing, a readable valid GPX, exactly one year end
-and two positive shares after rounding. Otherwise the drive stays whole in
-its start year (or the first recorded year for partial timing), with a short
-note explaining why it could not be split. This applies only to trips the
+Splitting requires complete timing, a readable valid GPX and exactly one year
+end. Otherwise the drive stays whole in its start year (or the first recorded
+year for partial timing), with a short note explaining why it could not be
+split. If one share rounds to zero, the drive is not split and the year with
+the miles counts all of it. That can be the new year: a drive that starts
+just before midnight with no counted miles until after it shows its December
+31 date but counts, and locks, only in the new year, with a note saying so.
+Its `trip_distance_miles` stays blank because it is not split. This applies only to trips the
 viewer can already read: a summary or GPX link refused by its safety checks
 still makes the trip unreadable with no miles counted. Wholly undated trips
 stay under All years without a New Year note; the viewer cannot guess whether
