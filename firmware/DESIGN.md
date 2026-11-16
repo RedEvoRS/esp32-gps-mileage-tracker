@@ -22,14 +22,14 @@ also serviced incrementally by `serviceGpsConfiguration()`, without an
 acknowledgment wait that blocks reception.
 
 `setup()` sets the universal asynchronous receiver/transmitter (UART)
-receive buffer to 2,048 bytes **before** `GPSSerial.begin()`. At 9,600 baud
-that is only about two seconds of incoming data, so buffering supplements
+receive buffer to 4,096 bytes **before** `GPSSerial.begin()`. At 9,600 baud
+that is about four seconds of incoming data at full line rate, so buffering supplements
 the core split rather than making long stalls safe.
 
 At the end of a normal pass, `loop()` checks the UART again and calls
 `vTaskDelay` for 5 ms only if it is empty. Bytes arriving during display or
 power work suppress that pause. At 9,600 baud, about five bytes can arrive
-during 5 ms, compared with the 2,048-byte buffer. This lets core 1 idle
+during 5 ms, compared with the 4,096-byte buffer. This lets core 1 idle
 between bursts. The 40 ms BOOT debounce and latched PMU IRQ still run each
 pass; the debug page keeps its one-second redraw, and the BME280 conversion
 can finish on a later pass after its 5 ms wait. The RTC still waits for the
@@ -39,6 +39,26 @@ these with time advancing through the pause. The degraded loop keeps its
 20 ms delay. A 22-minute bench run on 2026-11-10 (UTC) showed normal GPS,
 clock and temperature sampling with the pause; battery savings have not
 been measured.
+
+Stage 4 sets the USB serial TX ring to 4,096 bytes before each `Serial.begin()`.
+Boot messages retain the core's default timeout. After the setup messages
+(including degraded startup), `Serial.setTxTimeoutMs(0)` makes writes on both
+cores non-blocking: a host that stops reading can lose serial output, never
+hold up GPS reception. Shutdown messages and debug dumps are best-effort too;
+no control path relies on their delivery. Do not call `Serial.flush()` with
+this timeout: core 3.3.11 discards queued output in that case. The GPS clock
+sync message uses one write and appears only on the first successful GPS sync
+of a boot or while debug is on; clock correction still runs every minute.
+
+`gps_drain_monitor.h` measures the unsigned `millis()` interval between UART
+drain starts in `loop()`, including passes with no bytes. It records every gap
+over 1,500 ms and the maximum gap since the first drain, even with debug off.
+Debug reports a stall immediately after draining, at most once per minute;
+the count and maximum alternate with the storage row every four seconds after
+a stall. Screen values cap at 999 stalls and 999,999 ms; serial retains the
+full counters. These are boot-local observations, with no new diagnostics
+catalog code. The first sample excludes setup; a long drain itself is seen
+at the next pass. Unsigned subtraction handles one timer rollover.
 
 The cores have distinct owners and narrow sharing points:
 
@@ -304,8 +324,13 @@ An append failure ends the trip and attempts repair rather than appending
 after a possibly truncated point.
 
 `receiveGpsNmea()` marks a new `<trkseg>` after a gap greater than five
-seconds from the last accepted fix. Segment markers travel with the fix,
-including through buffers. A gap during ARMING resets the arming window.
+seconds from the last accepted fix. If both fixes have valid UTC, the gap
+uses their GPS epochs; otherwise it uses unsigned monotonic elapsed time.
+A backwards UTC correction also breaks continuity rather than bridging it.
+Segment markers travel with the fix, including through buffers. The same
+rule resets ARMING on missing GPS coverage, but preserves the window when
+contiguous fixes were merely processed late. The no-next-fix ARMING timeout
+and other lifecycle deadlines still use monotonic time.
 This lets consumers recognize missing coverage instead of drawing one
 continuous segment across it.
 

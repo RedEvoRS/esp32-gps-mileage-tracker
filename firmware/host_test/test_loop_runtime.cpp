@@ -83,5 +83,21 @@ int main() {
     loop(); assert(gDebugDrawMs == start + 1000);
     assert(pauses == 201);
     g_taskDelayHook = nullptr;
+    // Observe drain cadence even on an empty UART, with debug off. Enabling
+    // debug reports only new stalls; suppressed reports still count.
+    idleWorld(); g_taskDelayHook = nullptr; Serial.setTxTimeoutMs(0);
+    loop();
+    g_millis += 1501; loop();
+    assert(gGpsDrainMonitor.count() == 1 && logCount("GPS UART drain gap:") == 0);
+    gDebugMode = true;
+    g_millis += 1600; GPSSerial.rx += navPvt(0, 100); loop();
+    assert(gGpsDrainMonitor.count() == 2 && logCount("GPS UART drain gap:") == 1);
+    assert(GPSSerial.available() == 0 && gNavPvt.seen);
+    g_millis += 1600; loop();
+    assert(gGpsDrainMonitor.count() == 3 && logCount("GPS UART drain gap:") == 1);
+    g_millis += 60000; loop();
+    assert(gGpsDrainMonitor.count() == 4 && logCount("GPS UART drain gap:") == 2);
+    assert(gGpsDrainMonitor.maximumMs() == 60000 + LOOP_IDLE_MS);
     std::puts("Loop runtime: UART drain/recheck, 5 ms idle, IRQ, debounce, ACK, NAV-PVT and redraw passed");
+    std::puts("Loop stalls: quiet counting, debug reporting, rate limit and continued UART drain passed");
 }

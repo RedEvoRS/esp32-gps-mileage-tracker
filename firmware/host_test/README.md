@@ -78,7 +78,7 @@ Real TinyGPSPlus headers and implementation are system includes; project
 sources and stubs remain warning-checked. U8g2's real font source is read by
 Python for the glyph check, while renderer tests use project-owned stubs.
 
-`run.sh` builds **32 C++ test sources in 42 build variants**, plus six Python
+`run.sh` builds **33 C++ test sources in 43 build variants**, plus six Python
 checks. Extra builds cover stamped/fallback versions, a second display-card
 duration, both watchdog bench hooks and three sketch copies of bus recovery.
 Many integration binaries also run with runtime debug off and on.
@@ -95,6 +95,7 @@ Many integration binaries also run with runtime debug off and on.
 
 - `test_gps` **[TinyGPSPlus]**: real GPS sentence parsing through the sketch's loop, one point per second, receiver configuration/replies, fix-quality gates, gaps, UTC (universal time) timestamps/clock corrections and debug-mode GPX parity.
 - `test_loop_runtime` **[TinyGPSPlus]**: real 5 ms idle cadence, UART drain and late arrivals, latched IRQs, BOOT debounce, ACK deadlines, NAV-PVT freshness and one-second debug redraw. RTC and temperature runtime suites also exercise alignment/conversion through the pause.
+- `test_gps_drain_monitor`: 1,500 ms stall threshold, count/maximum, first sample, reporting limit and timer rollover. The loop suite checks counting with debug off and rate-limited debug reports; the GPS suite simulates two minutes of serial backpressure and checks UTC-based segment/ARMING gaps. Degraded startup tests check serial buffer/begin/timeout ordering on normal and all degraded paths.
 - `test_watchdog` **[TinyGPSPlus]**: early startup enrollment, slow progressing boot scans/repairs, the 120-to-60-second hand-over without re-enrollment, retained card/non-card hang sequences, LittleFS recording with E1003/E4001, no-storage mode without recovery probes, degraded startups, runtime repair progress, shutdown bounds, blocked locks, core-0 exclusion and enrollment failures. Two extra builds exercise the loop and startup bench flags. Fake-time expiry does not prove real timer expiry, RTC retention or board reset.
 - `test_startup_watchdog`: pure retained-record policy, every stage classification, consecutive hangs, escalation after card fallback, completed/loop/software resets, power-on clearing and corrupt records.
 - `test_gps_antenna`: antenna-warning evidence, hold times, missing/stale observations, recovery and timer wraparound.

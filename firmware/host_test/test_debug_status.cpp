@@ -104,6 +104,14 @@ int main() {
     assert(!strcmp(lines[3], "Speed 42.3? mph"));
     bounded(s);
     bounded(DebugStatus{});
+    DebugStatus stalls;
+    stalls.stallCount = stalls.drainMaxMs = UINT32_MAX;
+    stalls.now = 4000;
+    formatDebugStatus(stalls, lines);
+    assert(!strcmp(lines[5], "Stall 999 M999999ms")); bounded(stalls);
+    stalls.now = 8000;
+    formatDebugStatus(stalls, lines);
+    assert(!strcmp(lines[5], "Store NONE Q:--")); bounded(stalls);
     DebugStatus version;
     auto topRow = [&](const char* expected) {
         formatDebugStatus(version, lines);

@@ -123,7 +123,7 @@ static void resetWorld() {
     LittleFS.dirs.clear();
     LittleFS.mkdir(TRIP_DIR);
     prefs.kv.clear();
-    Serial.log.clear();
+    Serial = SerialStub();
     gps = TinyGPSPlus();                      // fresh parser, empty listener list
     gRmcStatusGN.begin(gps, "GNRMC", 2);      // re-register in place
     gRmcStatusGP.begin(gps, "GPRMC", 2);
@@ -132,6 +132,7 @@ static void resetWorld() {
     gRmcTimeGP.begin(gps, "GPRMC", 1);
     gRmcDateGP.begin(gps, "GPRMC", 9);
     gGpsAntenna = GpsAntenna(); gAntennaRf = DebugRf(); gAntennaSignal = DebugSignal();
+    gGpsDrainMonitor = GpsDrainMonitor();
     gDebugGsv = DebugGsv();
     gDebugRf = DebugRf(); gDebugRfPollMs = 0; gDebugRfStarted = false;
     gDebugRmcValid = false;
@@ -273,6 +274,82 @@ static int logCount(const char* fragment) {
 
 int main(int argc, char** argv) {
     g_outDir = argc > 1 ? argv[1] : ".";
+
+    printf("G37 runtime serial backpressure over two GPS clock-sync intervals\n");
+    for (bool debug : {false, true}) {
+        resetWorld(); setup();
+        gDebugMode = debug;
+        // USB keeps sending SOF but the host stops reading after one minute.
+        // A full HWCDC ring costs 20 * 100 ms per write at the boot timeout;
+        // Print::println() does two writes. Zero timeout must remove the wait.
+        unsigned blockedWrites = 0;
+        Serial.onWrite = [&](const std::string&) {
+            if (millis() >= 60000 && Serial.txTimeoutMs) {
+                ++blockedWrites;
+                g_millis += 2000;
+            }
+        };
+        run(15, 125, true, false, 100);
+        Serial.onWrite = nullptr;
+        CHECK(blockedWrites == 0, "runtime writes never wait for a non-reading host");
+        CHECK(logCount("System clock set from GPS UTC.") == (debug ? 3 : 1),
+              "GPS sync prints once per boot unless debug is enabled");
+        CHECK(std::count(Serial.writes.begin(), Serial.writes.end(),
+                         "System clock set from GPS UTC.\n") == (debug ? 3 : 1),
+              "each GPS sync message is one write including its newline");
+        endTrip(false);
+        auto files = tripFiles();
+        CHECK(files.size() == 1, "serial backpressure drive produces one trip");
+        if (files.size() == 1) {
+            const auto& data = g_disk.files[files[0]];
+            auto points = trkpts(data);
+            CHECK(points.size() == 125, "all 125 one-second fixes survive clock synchronization");
+            CHECK(data.find("<trkseg>") == data.rfind("<trkseg>"),
+                  "serial backpressure never splits continuous GPS coverage");
+            bool epochsIntact = true;
+            for (size_t i = 0; i < points.size(); ++i) {
+                char expected[32];
+                isoFromEpochMs(1776177000000ULL + i * 1000, expected, sizeof expected);
+                epochsIntact &= field(points[i], "time") == expected;
+            }
+            CHECK(epochsIntact, "drive retains each synthetic UTC epoch");
+        }
+    }
+
+    printf("G38 coverage gaps use GPS UTC, with monotonic fallback for untimed fixes\n");
+    for (bool oldTimed : {false, true}) for (bool newTimed : {false, true}) {
+        for (unsigned utcGap : {1u, 5u, 6u}) {
+            resetWorld(); run(15, 20, true, false, 100);
+            gLastFix.hasUtc = oldTimed;
+            g_millis += 6000;
+            unsigned epoch = 19 + utcGap;
+            GPSSerial.rx += navPvt(epoch * 1000, 100) + (newTimed ?
+                sentences({int(epoch), gLat, gLon, 15, true})[0] : rmc("", "140426"));
+            loop(); endTrip(false);
+            auto files = tripFiles();
+            CHECK(files.size() == 1, "gap test retains its synthetic trip");
+            if (files.size() == 1) {
+                const auto& data = g_disk.files[files[0]];
+                bool split = data.find("<trkseg>") != data.rfind("<trkseg>");
+                CHECK(split == (!oldTimed || !newTimed || utcGap > 5),
+                      "segments follow UTC coverage or monotonic elapsed time when either UTC is missing");
+            }
+        }
+    }
+    for (bool timed : {false, true}) for (unsigned utcGap : {1u, 6u}) {
+        resetWorld(); run(15, 3, true, false, 100);
+        uint32_t armStart = gArmT0;
+        gLastFix.hasUtc = timed;
+        g_millis += 6000;
+        unsigned epoch = 2 + utcGap;
+        GPSSerial.rx += navPvt(epoch * 1000, 100) +
+            sentences({int(epoch), gLat, gLon, 15, true})[0];
+        loop();
+        bool reset = !timed || utcGap > 5;
+        CHECK(gState == ARMING && gArmCount == (reset ? 1u : 4u) &&
+              (gArmT0 == armStart) == !reset,
+              "ARMING applies the same coverage-gap rule as active segments");
+    }
 
     printf("G1 UBX config frames + ACKs\n");
     {

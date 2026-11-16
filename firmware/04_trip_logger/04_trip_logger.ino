@@ -112,6 +112,8 @@ static bool gDisplayUsbPowerRequest = false; // core-1 power handler -> renderer
 #include "debug_gsv.h"
 #include "debug_rf.h"
 #include "gps_antenna.h"
+#include "gps_drain_monitor.h"
+static GpsDrainMonitor gGpsDrainMonitor; // core 1 only, since first runtime drain
 
 // -----------------------------------------------------------------
 // LilyGO T-Beam Supreme (ESP32-S3 + MAX-M10S), measured 2026-10-18
@@ -870,9 +872,10 @@ static void setClockFromGps(uint64_t* rmcUtcMs = nullptr) {
     if (settimeofday(&tv, nullptr) != 0) return;
     gDiagnosticClock.trusted(diagnostics::EventTimeSource::Gps, now);
     gClockSet.store(true);
+    bool firstSync = !gGpsClockSet;
     gGpsClockSet = true;
     gLastGpsSyncMs = now;
-    Serial.println("System clock set from GPS UTC.");
+    if (firstSync || debugMode()) Serial.printf("System clock set from GPS UTC.\n");
 }
 
 static double haversineM(double la1, double lo1, double la2, double lo2) {
@@ -2681,7 +2684,12 @@ static void receiveGpsNmea(uint8_t c) {
             if (gJournalReady) {
                 gLoopFaults.event(diagnostics::Code::GPS_TRIP_FIX_LOST, fx.monoMs).integer("elapsed_ms", 0).condition(false);
             }
-            if (gHaveLastFix && (fx.monoMs - gLastFix.monoMs) > SEG_GAP_MS) {
+            // GPS coverage, not processing latency. Untimed fixes retain the
+            // wrap-safe monotonic rule. Unsigned UTC subtraction also breaks
+            // continuity on a backwards receiver-clock correction.
+            uint64_t fixGapMs = fx.hasUtc && gLastFix.hasUtc ?
+                fx.utcMs - gLastFix.utcMs : uint32_t(fx.monoMs - gLastFix.monoMs);
+            if (gHaveLastFix && fixGapMs > SEG_GAP_MS) {
                 if (gState == ACTIVE || gState == COOLDOWN) {
                     fx.newSegment = true;
                 } else if (gState == ARMING) {
@@ -3064,6 +3072,8 @@ static void serviceDebugDisplay() {
     s.tripMs = now - gTripT0;
     s.tripMiles = gTripMeters / 1609.344;
     s.store = tripStoreAvailable(*gTripFS) ? (gTripFS == &SD ? "SD" : "FLASH") : "NONE";
+    s.stallCount = gGpsDrainMonitor.count();
+    s.drainMaxMs = gGpsDrainMonitor.maximumMs();
     portENTER_CRITICAL(&gDebugNetMux);
     s.net = gDebugNet;
     portEXIT_CRITICAL(&gDebugNetMux);
@@ -3240,6 +3250,7 @@ static void enterDegraded(startup::Mode mode) {
             "DEGRADED: power chip state untrusted -- not recording; no further charge or rail control. Retrying in 60 s.");
     }
     finishStartupWatchdog(); // degraded boots have a loop task too
+    Serial.setTxTimeoutMs(0); // all runtime output is best-effort on both cores
 }
 
 static void degradedLoop() {
@@ -3336,6 +3347,7 @@ void setup() {
     gBootButton.sample(millis(), digitalRead(DEBUG_BOOT_PIN) == LOW);
     startup::Mode powerMode = startup::selectMode(pmuReady, radioOff, true);
     if (powerMode != startup::Mode::Normal) {
+        Serial.setTxBufferSize(4096); // HWCDC permits allocation before begin()
         Serial.begin(115200);
         delay(1000); // Allow native USB to become ready before boot messages.
         Serial.println("\n=== Stage 4: Trip Logger ===");
@@ -3356,6 +3368,7 @@ void setup() {
     // before disabling them.
     // Never touch DCDC1 (ESP32).
 
+    Serial.setTxBufferSize(4096);
     Serial.begin(115200);
     if (!gStartupWatchdog.noStorage()) gRtc.begin(Wire1, gDiagnosticClock);
     delay(1000);
@@ -3410,8 +3423,9 @@ void setup() {
         return;
     }
     startupStage(startup_watchdog::Stage::Services);
-    // --- GPS UART. setRxBufferSize MUST precede begin(). ---
-    GPSSerial.setRxBufferSize(2048);
+    // --- GPS UART: ~4 s at full 9600-baud line rate, not a stall guarantee.
+    // setRxBufferSize MUST precede begin(). ---
+    GPSSerial.setRxBufferSize(4096);
     GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
     prefs.begin("mileage", false);
@@ -3447,6 +3461,9 @@ void setup() {
 
     Serial.println("Setup complete. Logging trips.");
     finishStartupWatchdog();
+    // HWCDC's default can wait ~2 s per write on a full ring. Never flush
+    // with timeout 0: core 3.3.11 discards pending bytes in that case.
+    Serial.setTxTimeoutMs(0);
 }
 
 void loop() {
@@ -3466,8 +3483,15 @@ void loop() {
     // Core 1: one UART reader routes NMEA/fixes and checksum-checked UBX
     // ACKs. Configuration deadlines never block receive or trip processing.
     serviceGpsSpeedFallback();
+    bool gpsStalled = gGpsDrainMonitor.observe(millis());
     while (GPSSerial.available() > 0) {
         receiveGpsByte((uint8_t)GPSSerial.read());
+    }
+    if (gpsStalled && debugMode() && gGpsDrainMonitor.reportDue(millis())) {
+        Serial.printf("GPS UART drain gap: %lu ms; stalls %lu, max %lu ms.\n",
+            (unsigned long)gGpsDrainMonitor.lastGapMs(),
+            (unsigned long)gGpsDrainMonitor.count(),
+            (unsigned long)gGpsDrainMonitor.maximumMs());
     }
     serviceGpsConfiguration();
     serviceDebugRf();

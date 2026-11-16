@@ -26,6 +26,7 @@ struct DebugStatus {
     uint32_t tripMs = 0;
     double tripMiles = 0;
     const char* store = "NONE";
+    uint32_t stallCount = 0, drainMaxMs = 0;
     DebugNetwork net;
     int batteryPct = -1;
     float batteryV = 0;
@@ -86,6 +87,9 @@ static inline void formatDebugStatus(const DebugStatus& s, char lines[8][22]) {
     char pending[4];
     debugCount(s.net.pending, pending, sizeof pending);
     snprintf(lines[5], 22, "Store %.5s Q:%s", s.store, pending);
+    if (s.stallCount && (s.now / 4000) % 2)
+        snprintf(lines[5], 22, "Stall %u M%ums", debugBound(s.stallCount, 999),
+                 debugBound(s.drainMaxMs, 999999));
     const char* wifi = s.net.wifi == DebugWifi::Scan ? "SCAN" :
                        s.net.wifi == DebugWifi::Join ? "JOIN" :
                        s.net.wifi == DebugWifi::On ? "ON" : "OFF";

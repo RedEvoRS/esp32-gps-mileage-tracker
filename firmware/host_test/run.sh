@@ -80,6 +80,11 @@ echo "== test_gps_antenna"
     "$here/test_gps_antenna.cpp" -o "$build/test_gps_antenna.exe"
 "$build/test_gps_antenna.exe" || status=1
 
+echo "== test_gps_drain_monitor"
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -Werror -pedantic \
+    -I"$here/../04_trip_logger" "$here/test_gps_drain_monitor.cpp" -o "$build/test_gps_drain_monitor.exe"
+"$build/test_gps_drain_monitor.exe" || status=1
+
 echo "== test_debug_display (bus fault injection)"
 "${cxx[@]}" "${flags[@]}" -I"$here/display_stubs" -I"$here/../04_trip_logger" \
     "$here/test_debug_display.cpp" -o "$build/test_debug_display.exe"
