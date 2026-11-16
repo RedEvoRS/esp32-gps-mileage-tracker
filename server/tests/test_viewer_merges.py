@@ -102,9 +102,124 @@ class ViewerMerges(unittest.TestCase):
             conn.execute("INSERT INTO annotations (trip_key,category) VALUES ('2026-03/a','personal')")
         return key
 
+    def test_moved_saved_part_resolves_against_current_merge(self):
+        a = self.trip('a', 0)
+        self.trip('b', 180, .01)
+        self.annotate(a, 'business', 'old part purpose', 'old stop')
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            self.viewer.trip_log.add_removal(conn, a, 'duplicate upload', 'driver')
+        self.month.rename(self.data / '2026-05')
+        key = self.merged_key(self.merge('2026-05/a', '2026-05/b'))
+        def warning():
+            return [t for t in self.viewer.load_trips()[1] if t.get('moved_saved')]
+        entry, = warning()
+        self.assertEqual(entry['saved_counts']['2026-04']['annotations'], 1)
+        self.assertEqual(entry['saved_counts']['2026-04']['removals'], 1)
+        self.assertEqual(self.close_year().status_code, 409)
+        self.assertEqual(self.annotate('2026-05/a', 'business', 'redone').status_code, 409)
+        # Creation sets updated_at even when the merge has never been annotated.
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertTrue(conn.execute('SELECT updated_at FROM trip_merges').fetchone()[0])
+        self.assertEqual(self.annotate(key, 'business', 'new merged purpose').status_code, 302)
+        entry, = warning()
+        self.assertEqual(entry['saved_counts']['2026-04']['annotations'], 0)
+        self.assertEqual(entry['saved_counts']['2026-04']['removals'], 1)
+        review = self.client.get('/admin/year/2026').get_data(as_text=True)
+        self.assertNotIn('old part purpose', review)
+        self.assertIn(f'href="/trip/{key}?year=2026"', review)
+        self.assertEqual(self.client.post(f'/trip/{key}/remove', data={
+            'csrf_token': 'test-csrf', 'confirm': 'yes', 'reason': 'duplicate upload'}).status_code, 302)
+        self.assertEqual(warning(), [])
+        self.assertEqual(self.close_year().status_code, 302)
+
     def undo_unused(self, key, **data):
         return self.client.post(f"/admin/unused-merge/{key}/undo", data={
             "csrf_token": "test-csrf", "confirm": "yes", **data})
+
+    def test_destination_only_save_clears_moved_part_purpose_on_current_merge(self):
+        a = self.trip('a', 0)
+        self.trip('b', 180, .01)
+        self.annotate(a, 'business', 'old purpose')
+        self.month.rename(self.data / '2026-05')
+        key = self.merged_key(self.merge('2026-05/a', '2026-05/b'))
+        self.assertTrue(any(t.get('moved_saved') for t in self.viewer.load_trips()[1]))
+        self.assertEqual(self.annotate(key, destination='Example stop').status_code, 302)
+        self.assertFalse(any(t.get('moved_saved') for t in self.viewer.load_trips()[1]))
+        trip, = self.viewer.load_trips()[0]
+        self.assertEqual((trip['category'], trip['purpose_note'], trip['destination']), ('', '', 'Example stop'))
+        self.assertEqual(self.close_year().status_code, 302)
+
+    def moved_removal_merge(self):
+        a = self.trip('a', 0)
+        self.trip('b', 180, .01)
+        self.assertEqual(self.client.post(f'/trip/{a}/remove', data={
+            'csrf_token': 'test-csrf', 'reason': 'example removal'}).status_code, 302)
+        self.month.rename(self.data / '2026-05')
+        return self.merged_key(self.merge('2026-05/a', '2026-05/b'))
+
+    def keep_moved_part(self):
+        return self.client.post('/admin/year/2026/moved-removal/2026-04/a/restore', data={
+            'csrf_token': 'test-csrf', 'confirm': 'yes'})
+
+    def test_keep_moved_merge_part_does_not_restore_a_second_copy_or_change_merge(self):
+        key = self.moved_removal_merge()
+        before = self.viewer.year_figures(*self.viewer.year_members(*self.viewer.load_trips(), 2026))
+        review = self.client.get('/admin/year/2026').get_data(as_text=True)
+        self.assertIn(f'href="/trip/{key}?year=2026"', review)
+        self.assertIn('>Keep trip in log</button>', review)
+        self.assertEqual(self.keep_moved_part().status_code, 302)
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual(entries, [])
+        self.assertEqual([t['trip_key'] for t in trips], [key])
+        self.assertEqual(trips[0]['parts'], ['2026-05/a', '2026-05/b'])
+        self.assertEqual(self.viewer.year_figures(*self.viewer.year_members(trips, entries, 2026)), before)
+        self.assertEqual(self.close_year().status_code, 302)
+
+    def test_keep_moved_part_refuses_closed_year_of_another_current_merge_part(self):
+        self.base = datetime(2026, 12, 31, 23, 57, tzinfo=timezone.utc)
+        self.moved_removal_merge()
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            self.viewer.trip_log.close_year(conn, 2027, 'driver')
+        review = self.client.get('/admin/year/2026').get_data(as_text=True)
+        self.assertNotIn('>Keep trip in log</button>', review)
+        self.assertIn('Reopen 2027 to keep this trip in the log.', review)
+        response = self.keep_moved_part()
+        self.assertEqual(response.status_code, 409)
+        self.assertIn('2027 is closed for edits', response.get_data(as_text=True))
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertIsNotNone(self.viewer.trip_log.removal(conn, '2026-04/a'))
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM trip_history WHERE action='restore'").fetchone()[0], 0)
+
+    def test_keep_moved_route_refuses_removal_keyed_by_a_merge_address(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        self.assertEqual(self.client.post(f'/trip/{key}/remove', data={
+            'csrf_token': 'test-csrf', 'reason': 'Example duplicate'}).status_code, 302)
+        self.month.rename(self.data / '2026-05')
+        with closing(sqlite3.connect(self.db)) as conn:
+            before = self.viewer.trip_log.removal(conn, key)
+        response = self.client.post(f'/admin/year/2026/moved-removal/{key}/restore', data={
+            'csrf_token': 'test-csrf', 'confirm': 'yes'})
+        self.assertEqual(response.status_code, 409)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(self.viewer.trip_log.removal(conn, key), before)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM trip_history WHERE action='restore'").fetchone()[0], 0)
+
+    def test_keep_moved_removal_on_damaged_merge_preserves_damage_and_has_no_dead_link(self):
+        key = self.moved_removal_merge()
+        (self.data / '2026-05/b.gpx').unlink()
+        review = self.client.get('/admin/year/2026').get_data(as_text=True)
+        details = review.split('<caption>Saved items')[1].split('</table>')[0]
+        self.assertIn(f'<code>{key}</code>', review)
+        self.assertIn('(merge has missing or unreadable parts)', review)
+        self.assertNotIn(f'href="/trip/{key}', details)
+        self.assertIn('>Keep trip in log</button>', review)
+        self.assertEqual(self.keep_moved_part().status_code, 302)
+        trips, entries = self.viewer.load_trips()
+        self.assertEqual(trips, [])
+        self.assertEqual([t['trip_key'] for t in entries], [key])
+        self.assertTrue(entries[0]['damaged_merge'])
+        self.assertEqual(self.client.get(f'/trip/{key}').status_code, 404)
 
     def discard(self, key, **data):
         return self.client.post(f'/admin/damaged-merge/{key}/discard', data={
@@ -119,6 +234,35 @@ class ViewerMerges(unittest.TestCase):
             summary = conn.execute('SELECT summary FROM trip_merges').fetchone()[0]
         shutil.rmtree(self.month)
         return key, [a, b], summary
+
+    def test_removed_damaged_merge_page_and_restore_lock_saved_summary_year(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        self.assertEqual(self.client.post(f'/trip/{key}/remove', data={
+            'csrf_token': 'test-csrf', 'reason': 'Example duplicate'}).status_code, 302)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            saved = json.loads(conn.execute('SELECT summary FROM trip_merges WHERE trip_key=?', (key,)).fetchone()[0])
+            for field in ('start_time', 'end_time', 'timed_from', 'recorded_until'):
+                saved[field] = '2024-06-15T12:00:00+00:00'
+            conn.execute('UPDATE trip_merges SET summary=? WHERE trip_key=?', (json.dumps(saved), key))
+            self.viewer.trip_log.close_year(conn, 2024, 'driver')
+            removal = self.viewer.trip_log.removal(conn, key)
+        (self.month / 'b.gpx').unlink()
+        response = self.client.get(f'/trip/{key}')
+        self.assertEqual(response.status_code, 200)
+        page = response.get_data(as_text=True)
+        self.assertIn('2024 is closed for edits', page)
+        self.assertNotIn('>Restore to the log</button>', page)
+        response = self.client.post(f'/trip/{key}/restore', data={'csrf_token': 'test-csrf'})
+        self.assertEqual(response.status_code, 409)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(self.viewer.trip_log.removal(conn, key), removal)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM trip_history WHERE action='restore'").fetchone()[0], 0)
+        # Reopening the saved-summary year restores the page action and route.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            self.viewer.trip_log.reopen_year(conn, 2024)
+        self.assertIn('>Restore to the log</button>', self.client.get(f'/trip/{key}').get_data(as_text=True))
+        self.assertEqual(self.client.post(f'/trip/{key}/restore', data={'csrf_token': 'test-csrf'}).status_code, 302)
 
     def test_damaged_merge_discard_is_admin_only_post_csrf_and_explicit_confirmation(self):
         key, _, _ = self.damaged_merge()
@@ -361,6 +505,7 @@ class ViewerMerges(unittest.TestCase):
                              'Not currently counted: 2027-01/b.')
                 effect = ('The trips stay counted under 2026-10/, 2027-02/ with only the annotations saved under those names. '
                           'Annotations saved under 2026-12/, 2027-01/ are kept in the database but not applied. '
+                          "The former parts' purposes saved under the old name will need entering again before their year can close. "
                           "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review. ") if undo else ''
                 ViewerRolesTests.seed_editor(fixture)
                 for year in (2026, 2027):
@@ -470,9 +615,9 @@ class ViewerMerges(unittest.TestCase):
     def test_missing_part_years_respect_possible_start_years_on_every_surface(self):
         from zoneinfo import ZoneInfo
         cases = (
-            # End-time folders can cross midnight without crossing a tax year.
+            # The second recording itself crosses New Year: 10 of its 60 seconds before midnight.
             ('UTC', datetime(2026, 12, 31, 23, 50, tzinfo=timezone.utc), 590,
-             ('2026-12', '2027-01'), 'a', False, {2026}, {2026}),
+             ('2026-12', '2027-01'), 'a', False, {2026, 2027}, {2026, 2027}),
             ('America/Los_Angeles', datetime(2027, 1, 1, 3, tzinfo=timezone.utc), 180,
              ('2026-12', '2026-12'), 'b', False, {2026}, {2026}),
             ('America/Los_Angeles', datetime(2027, 1, 1, 3, tzinfo=timezone.utc), 180,
@@ -513,11 +658,12 @@ class ViewerMerges(unittest.TestCase):
                     # An incompatible folder still falls back to the saved start year.
                     self.assertEqual(fixture.viewer._merge_history_missing_years(details['saved_summary'], '2028-06'), {2027})
                 remaining_year = fixture.viewer._trip_local_year(fixture.viewer.load_trips()[0][0])
+                remaining_miles = {2026: .007, 2027: .034} if gap == 590 else {remaining_year: .041}
                 for remove_gpx in (False, True):
                     if remove_gpx:
                         (fixture.data / (missing_key + '.gpx')).unlink()
                     for year in (2025, 2026, 2027, 2028):
-                        miles = .041 if year == remaining_year else 0
+                        miles = remaining_miles.get(year, 0)
                         totals = dict(zip(('business', 'personal', 'other', 'unclassified', 'all'),
                                           (0, 0, 0, miles, miles), strict=True))
                         fixture.assert_record_year(key, year, totals, year in record_years)
@@ -841,6 +987,10 @@ class ViewerMerges(unittest.TestCase):
         finally:
             book.close()
         self.assertEqual(self.undo_unused(key).status_code, 302)
+        # Undo keeps the part's annotation under its old address. Once it is
+        # no longer a merge part, the ordinary saved-item warning applies.
+        self.assertEqual(self.close_year().status_code, 409)
+        self.assertEqual(self.annotate('2026-05/a', 'personal', 'original note').status_code, 302)
         self.assertEqual(self.close_year().status_code, 302)
 
     def test_moved_real_month_restored_by_renaming_allows_close_with_saved_purpose(self):
@@ -860,6 +1010,7 @@ class ViewerMerges(unittest.TestCase):
         self.assertIn('Confirm removing this unused merge and its merged annotation.', absent.get_data(as_text=True))
         effect = ('The trips stay counted under 2026-05/ with only the annotations saved under that name. '
                   'Annotations saved under 2026-04/ are kept in the database but not applied. '
+                  "The former parts' purposes saved under the old name will need entering again before their year can close. "
                   "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review.")
         page = html.unescape(self.client.get('/').get_data(as_text=True))
         self.assertIn('Remove this unused merge and its merged annotation. ' + effect, page)
@@ -894,6 +1045,8 @@ class ViewerMerges(unittest.TestCase):
         self.assert_history_exports(self.viewer.merge_history_message(row), 'unused-name merge undone')
         history = html.unescape(self.client.get('/admin/history').get_data(as_text=True))
         self.assertIn('Unused-name merge undone. ' + effect, history)
+        self.assertEqual(self.close_year().status_code, 409)
+        self.assertEqual(self.annotate('2026-05/a', 'personal', 'original note').status_code, 302)
         self.assertEqual(self.close_year().status_code, 302)
         self.assertIn('Unused-name merge undone.', self.client.get('/admin/year/2026').get_data(as_text=True))
 
@@ -911,6 +1064,7 @@ class ViewerMerges(unittest.TestCase):
         (self.data / '2026-05').rename(self.data / '2026-06')
         effect = ('The trips stay counted under 2026-06/ with only the annotations saved under that name. '
                   'Annotations saved under 2026-04/ are kept in the database but not applied. '
+                  "The former parts' purposes saved under the old name will need entering again before their year can close. "
                   "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review.")
         self.assertIn('Unused-name merge undone. ' + effect,
                       html.unescape(self.client.get('/admin/history').get_data(as_text=True)))
@@ -991,6 +1145,7 @@ class ViewerMerges(unittest.TestCase):
             'Now counted again: 2026-04/a as 2026-05/a, 2026-04/b as 2026-05/b; do not add these saved miles by hand.',
             undone=True, effect=('The trips stay counted under 2026-05/ with only the annotations saved under that name. '
                                  'Annotations saved under 2026-04/ are kept in the database but not applied. '
+                                 "The former parts' purposes saved under the old name will need entering again before their year can close. "
                                  "The merged trip's saved miles and purpose stay out of the totals and are kept in history and the year review."))
         folder = self.data / '2026-05'
         files = {p: (p.read_bytes(), p.stat()) for p in folder.glob('*.json')}

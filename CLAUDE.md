@@ -470,7 +470,13 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   the source setting; restore restarts viewer and rebuilds the unbacked-up mirror.
 - Viewer port: 8091, admin/everyday session logins (LAN-only), reads `./data`
   read-only, owns `annotations.db` (SQLite) in `viewer-db`. Removal only marks
-  a trip in that DB; it never touches `./data`. Everyday logins get one "No
+  a trip in that DB; it never touches `./data`. At local New Year in `DISPLAY_TZ`,
+  a fully timed drive's saved miles are divided by counted GPX distance between
+  the two years; All years keeps one full trip, and closing either year locks it.
+  A drive that cannot be split stays whole with a reason; one whose counted miles
+  are all after midnight counts and locks only in the new year. Exports append a split drive's
+  full miles as `trip_distance_miles` after `received_after_close`.
+  Everyday logins get one "No
   trip at this address" 404 for a removed, unknown or link-refused trip page,
   and lookups answer removed like unknown; the admin gets a link diagnostic.
   A summary or GPX linking outside `./data` makes the trip unreadable
@@ -484,6 +490,16 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   unreadable in year-close snapshots. Month links share one counted address
   across routes; saved-name conflicts preserve saved keys and block year closing,
   and folder messages share one formatter across the list, review and exports.
+  Orphan annotations/removals warn when the same trip ID is scanned under another
+  counted month, even if the old folder exists again; folder problems and aliases
+  keep their own diagnostics. Current annotations/removals resolve their own kind,
+  using the merge for a moved part; removed/unreadable trips need no annotation.
+  Unresolved items block each counted year; unreadable trips use folder years,
+  readable undated trips block every year. Admin year review lists saved details.
+  Any current annotation row resolves a plain trip's purpose warning; a merge
+  needs a nonempty purpose, note or destination. Admin Keep trip in log deletes
+  an old removal with restore history and the ordinary trip edit locks; the review
+  names closed years to reopen. Readable undated trips remain editable.
   The upload alert names global folder refusals; unused-name merges are saved-data
   notices excluded from miles and missing counts, with admin undo, only when
   every part is counted under another name and both files match saved stamps.
@@ -501,7 +517,7 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   in `tax_years.snapshot`; the year review compares saved and current totals,
   and lists trips received after the close (ingest `_received_at` later than
   `closed_at`), undated trips and trips inside a merge. Exports mark late trips
-  in a last `received_after_close` column; late trips still count and stay
+  in `received_after_close`; late trips still count and stay
   un-annotatable (409) until the year is reopened. Every response sends
   `frame-ancestors 'none'`, `X-Frame-Options: DENY` and `nosniff`. Notes and
   destinations are limited to 2,000 characters without XML-illegal control
