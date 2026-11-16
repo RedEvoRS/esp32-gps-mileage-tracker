@@ -344,6 +344,50 @@ class NewYearTests(YearTestBase):
         self.close_year(2027)
         self.assertEqual(self.annotate(key, category="personal").status_code, 409)
 
+    # Both fixes before midnight are above the HDOP limit: every counted metre is after it.
+    MOVED = [[(-30, 0, 10, 6), (-10, 100, 10, 6), (10, 400, 10, 1), (40, 700, 10, 1)]]
+
+    def test_moved_drive_in_xlsx_late_flag_navigation_and_trip_page(self):
+        key = self.recording("late", miles=0.186, segments=self.MOVED, _received_at="2030-01-01T12:00:00+00:00")
+        newer = self.add_trip("later", "2027-01-02T12:00:00Z")
+        row = next(r for r in self.sheet("?year=2027")["Mileage"][1:] if r[1] == "late")
+        self.assertEqual((row[3], row[-1]), (0.186, None))
+        self.assertFalse(any(r[1] == "late" for r in self.sheet("?year=2026")["Mileage"][1:]))
+        self.assertIn(f'href="/trip/{key}?year=2027"', self.admin.get(f"/trip/{newer}?year=2027").get_data(as_text=True))
+        self.assertIn("all of its counted miles are in 2027", self.admin.get(f"/trip/{key}").get_data(as_text=True))
+        # It is late only for the year that counts it.
+        self.close_year(2026)
+        self.assertEqual(next(r for r in self.csv_rows() if r["trip_id"] == "late")["received_after_close"], "")
+        self.reopen_year(2026)
+        self.close_year(2027)
+        for query in ("", "?year=2027"):
+            self.assertEqual(next(r for r in self.csv_rows(query) if r["trip_id"] == "late")["received_after_close"], "yes")
+
+    def test_merged_drive_with_every_counted_mile_after_midnight_counts_in_the_new_year(self):
+        first = self.recording("first", [[(-40, 0, 10, 6), (-20, 200, 10, 6)]])
+        second = self.recording("second", [[(20, 600, 10, 1), (40, 800, 10, 1)]])
+        self.assertEqual(self.post(f"/trip/{first}/merge", next_trip=second).status_code, 302)
+        trip = self.trip()
+        self.assertEqual(trip["parts"], [first, second])
+        self.assertGreater(trip["distance_miles"], 0)
+        self.assertEqual(trip["year_shares"], {2027: trip["distance_miles"]})
+        self.assertEqual((self.figures(2026)["trips"], self.figures(2026)["totals"]["all"]), (0, 0))
+        self.assertEqual((self.figures(2027)["trips"], self.figures(2027)["totals"]["all"]), (1, trip["distance_miles"]))
+
+    def test_zero_saved_total_stays_an_ordinary_start_year_trip(self):
+        trip = self.trip(self.recording("zero", miles=0))
+        self.assertNotIn("year_shares", trip)
+        self.assertNotIn("year_split_note", trip)
+        self.assertEqual((self.figures(2026)["trips"], self.figures(2027)["trips"]), (1, 0))
+
+    def test_year_distance_cache_is_bounded(self):
+        key = self.recording()
+        cache = self.viewer._year_distance_cache
+        cache.clear()
+        cache.update({("filler", number): None for number in range(256)})
+        self.assertEqual(self.trip(key)["year_shares"], {2026: 3.686, 2027: 6.144})
+        self.assertEqual(len(cache), 1)
+
     def test_cache_rechecks_sources_and_uses_current_total(self):
         key = self.recording()
         with patch.object(self.viewer.trip_merges, "parsed_parts", wraps=self.viewer.trip_merges.parsed_parts) as read:
