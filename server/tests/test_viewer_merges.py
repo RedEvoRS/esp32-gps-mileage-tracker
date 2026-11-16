@@ -235,6 +235,35 @@ class ViewerMerges(unittest.TestCase):
         shutil.rmtree(self.month)
         return key, [a, b], summary
 
+    def test_removed_damaged_merge_page_and_restore_lock_saved_summary_year(self):
+        a, b = self.trip('a', 0), self.trip('b', 180, .01)
+        key = self.merged_key(self.merge(a, b))
+        self.assertEqual(self.client.post(f'/trip/{key}/remove', data={
+            'csrf_token': 'test-csrf', 'reason': 'Example duplicate'}).status_code, 302)
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            saved = json.loads(conn.execute('SELECT summary FROM trip_merges WHERE trip_key=?', (key,)).fetchone()[0])
+            for field in ('start_time', 'end_time', 'timed_from', 'recorded_until'):
+                saved[field] = '2024-06-15T12:00:00+00:00'
+            conn.execute('UPDATE trip_merges SET summary=? WHERE trip_key=?', (json.dumps(saved), key))
+            self.viewer.trip_log.close_year(conn, 2024, 'driver')
+            removal = self.viewer.trip_log.removal(conn, key)
+        (self.month / 'b.gpx').unlink()
+        response = self.client.get(f'/trip/{key}')
+        self.assertEqual(response.status_code, 200)
+        page = response.get_data(as_text=True)
+        self.assertIn('2024 is closed for edits', page)
+        self.assertNotIn('>Restore to the log</button>', page)
+        response = self.client.post(f'/trip/{key}/restore', data={'csrf_token': 'test-csrf'})
+        self.assertEqual(response.status_code, 409)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(self.viewer.trip_log.removal(conn, key), removal)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM trip_history WHERE action='restore'").fetchone()[0], 0)
+        # Reopening the saved-summary year restores the page action and route.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            self.viewer.trip_log.reopen_year(conn, 2024)
+        self.assertIn('>Restore to the log</button>', self.client.get(f'/trip/{key}').get_data(as_text=True))
+        self.assertEqual(self.client.post(f'/trip/{key}/restore', data={'csrf_token': 'test-csrf'}).status_code, 302)
+
     def test_damaged_merge_discard_is_admin_only_post_csrf_and_explicit_confirmation(self):
         key, _, _ = self.damaged_merge()
         from test_viewer_roles import ViewerRolesTests

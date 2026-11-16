@@ -6,7 +6,7 @@ import json
 import math
 import os
 import sqlite3
-from contextlib import closing
+from contextlib import closing, nullcontext
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from html.parser import HTMLParser
@@ -76,9 +76,9 @@ class NewYearTests(YearTestBase):
         with closing(load_workbook(io.BytesIO(response.data))) as workbook:
             return {s.title: list(s.values) for s in workbook}
 
-    def moved_saved_recordings(self, segments=None):
-        annotated = self.recording('annotated', segments=segments)
-        removed = self.recording('removed', segments=segments)
+    def moved_saved_recordings(self, segments=None, **overrides):
+        annotated = self.recording('annotated', segments=segments, **overrides)
+        removed = self.recording('removed', segments=segments, **overrides)
         self.assertEqual(self.annotate(annotated, category='business', purpose_note='Example purpose').status_code, 302)
         self.assertEqual(self.post(f'/trip/{removed}/remove', reason='Example duplicate').status_code, 302)
         (self.data / '2027-01').rename(self.data / '2027-02')
@@ -164,18 +164,118 @@ class NewYearTests(YearTestBase):
         self.assertEqual(self.post(f'/trip/{old_removal}/restore').status_code, 302)
         self.assertEqual((self.figures(2026)['totals']['all'], self.figures(2027)['totals']['all']), (0, 19.66))
 
-    def test_moved_saved_drive_kept_whole_uses_its_start_year(self):
-        old = self.recording(timing_status='partial', start_time=None)
-        self.assertEqual(self.annotate(old, category='business').status_code, 302)
-        (self.data / '2027-01').rename(self.data / '2027-02')
-        trip = self.trip()
-        self.assertNotIn('year_shares', trip)
-        self.assertIn('kept whole in 2026', trip['year_split_note'])
-        self.assertEqual(self.post('/admin/year/2026/close', confirm='yes').status_code, 409)
-        self.assertIn('<caption>Saved items', self.review(2026))
-        self.assertNotIn('<caption>Saved items', self.review(2027))
-        self.close_year(2027)
-        self.assertEqual((self.figures(2026)['totals']['all'], self.figures(2027)['totals']['all']), (9.83, 0))
+    def test_moved_saved_whole_drive_years_agree_across_lists_reviews_and_locks(self):
+        cases = (
+            ('multiple year ends', None, {'recorded_until': '2028-01-01T09:00:00+00:00'}, None),
+            ('missing GPX', None, {}, 'missing'),
+            ('unreadable GPX', None, {}, 'unreadable'),
+            ('cooldown only', None, {'end_time': (self.CUT - timedelta(seconds=5)).isoformat()}, None),
+            ('stationary after midnight', [[(-30, 0, 10, 1), (-10, 400, 10, 1),
+                                            (10, 400, 0, 1), (30, 400, 0, 1)]], {}, None),
+            ('incomplete timing', None, {'timing_status': 'partial', 'start_time': None}, None),
+        )
+        for name, segments, overrides, damage in cases:
+            with self.subTest(outcome=name):
+                # Each outcome needs untouched saved records and its own year locks.
+                fixture = NewYearTests()
+                try:
+                    fixture.setUp()
+                    fixture.check_moved_whole_years(segments, overrides, damage)
+                finally:
+                    fixture.doCleanups()
+
+    def check_moved_whole_years(self, segments, overrides, damage):
+        old_keys = self.moved_saved_recordings(segments=segments, **overrides)
+        current_keys = {key.replace('2027-01/', '2027-02/') for key in old_keys}
+        if damage == 'missing':
+            for key in current_keys:
+                (self.data / (key + '.gpx')).unlink()
+        # Model a GPX read failure on both platforms without relying on chmod
+        # (which is ineffective on Windows and for privileged Linux users).
+        original_read = type(self.data).read_bytes
+
+        def read_bytes(path):
+            if path in {self.data / (key + '.gpx') for key in current_keys}:
+                raise PermissionError('Synthetic unreadable GPX')
+            return original_read(path)
+
+        guard = patch.object(type(self.data), 'read_bytes', read_bytes) if damage == 'unreadable' else nullcontext()
+        with guard:
+            for key in current_keys:
+                trip = self.trip(key)
+                self.assertNotIn('year_shares', trip)
+                if damage or overrides.get('timing_status') == 'partial' or 'recorded_until' in overrides:
+                    self.assertIn('kept whole in 2026', trip['year_split_note'])
+            for year in (2025, 2026, 2027, 2028):
+                with self.subTest(year=year):
+                    expected_keys = current_keys if year == 2026 else set()
+                    figures = self.figures(year)
+                    self.assertEqual(set(figures['trip_keys']), expected_keys)
+                    self.assertEqual(figures['totals']['all'], 19.66 if year == 2026 else 0)
+                    rows = [r for r in self.csv_rows(f'?year={year}') if r['row_type'] == 'trip']
+                    self.assertEqual({r['trip_id'] for r in rows}, {'annotated', 'removed'} if year == 2026 else set())
+                    review = self.review(year)
+                    if year == 2026:
+                        details = review.split('<caption>Saved items')[1].split('</table>')[0]
+                        for key in old_keys:
+                            self.assertIn(f'<code>{key}</code>', details)
+                        for key in current_keys:
+                            self.assertIn(f'href="/trip/{key}?year={year}"', details)
+                    else:
+                        self.assertNotIn('<caption>Saved items', review)
+                    close = self.post(f'/admin/year/{year}/close', confirm='yes')
+                    self.assertEqual(close.status_code, 409 if year == 2026 else 302)
+                    if year != 2026:
+                        self.reopen_year(year)
+
+                    # Snapshot the DB so successful edit/keep probes cannot remove
+                    # the warning needed by subsequent closed-year probes.
+                    with closing(sqlite3.connect(':memory:')) as snapshot:
+                        with closing(sqlite3.connect(self.db)) as conn:
+                            conn.backup(snapshot)
+                        with closing(sqlite3.connect(self.db)) as conn, conn:
+                            self.viewer.trip_log.close_year(conn, year, 'driver')
+                        details = self.review(2026).split('<caption>Saved items')[1].split('</table>')[0]
+                        sentence = f'Reopen {year} to keep this trip in the log.'
+                        if year == 2026:
+                            self.assertIn(sentence, details)
+                            self.assertNotIn('>Keep trip in log</button>', details)
+                        else:
+                            self.assertNotIn('Reopen ', details)
+                            self.assertIn('>Keep trip in log</button>', details)
+                        for key in current_keys:
+                            self.assertEqual(self.annotate(key, category='personal').status_code,
+                                             409 if year == 2026 else 302)
+                        self.assertEqual(self.keep_moved().status_code, 409 if year == 2026 else 302)
+                        with closing(sqlite3.connect(self.db)) as conn:
+                            snapshot.backup(conn)
+
+    def test_keep_moved_split_drive_preserves_each_year_csv_rows_warning_and_totals(self):
+        _, old_removal = self.moved_saved_recordings()
+        before = {year: self.csv_rows(f'?year={year}') for year in (2026, 2027)}
+        for year, share in ((2026, '3.686'), (2027, '6.144')):
+            rows = before[year]
+            trips = [r for r in rows if r['row_type'] == 'trip']
+            self.assertEqual({r['trip_id'] for r in trips}, {'annotated', 'removed'})
+            self.assertEqual([r['distance_miles'] for r in trips], [share, share])
+            self.assertTrue(all(r['trip_distance_miles'] == '9.83' for r in trips))
+            self.assertEqual(len([r for r in rows if r['row_type'] == 'folder_warning']), 1)
+            self.assertEqual(self.figures(year)['totals']['all'], 2 * float(share))
+        self.assertEqual(self.keep_moved().status_code, 302)
+        for year in (2026, 2027):
+            expected = before[year]
+            warning, = [r for r in expected if r['row_type'] == 'folder_warning']
+            self.assertIn('Saved removals no longer applied: 1.', warning['purpose_note'])
+            self.assertIn('History entries saved for these trips under 2027-01/: 2.', warning['purpose_note'])
+            # The warning still describes the old annotation. Its counts now
+            # exclude the cleared removal and that removal's original history.
+            warning['purpose_note'] = warning['purpose_note'].replace(
+                'Saved removals no longer applied: 1.', 'Saved removals no longer applied: 0.').replace(
+                'History entries saved for these trips under 2027-01/: 2.',
+                'History entries saved for these trips under 2027-01/: 1.')
+            self.assertEqual(self.csv_rows(f'?year={year}'), expected)
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertIsNone(self.viewer.trip_log.removal(conn, old_removal))
 
     def test_shares_totals_counts_categories_and_full_trip_are_consistent(self):
         key = self.recording()

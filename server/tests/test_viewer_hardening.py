@@ -1257,23 +1257,26 @@ class ViewerHardeningTests(unittest.TestCase):
         target = self.moved_saved_fixture()
         (target / 'removed.json').unlink()
         target.rename(self.viewer.DATA_ROOT / '2029-01')
-        for closed_year, review_year in ((2028, 2029), (2029, 2028)):
-            with self.subTest(closed_year=closed_year):
+        for closed_years, review_year in (((2028,), 2029), ((2029,), 2028), ((2028, 2029), 2029)):
+            with self.subTest(closed_years=closed_years):
                 with closing(sqlite3.connect(self.db)) as conn, conn:
-                    self.viewer.trip_log.close_year(conn, closed_year, 'driver')
+                    for closed_year in closed_years:
+                        self.viewer.trip_log.close_year(conn, closed_year, 'driver')
                 review = self.client.get(f'/admin/year/{review_year}').get_data(as_text=True)
                 details = review.split('<caption>Saved items')[1].split('</table>')[0]
                 self.assertIn('<code>2029-01/removed</code>', review)
                 self.assertIn('(trip is unreadable)', review)
                 self.assertNotIn('href="/trip/2029-01/removed', details)
                 self.assertNotIn('>Keep trip in log</button>', review)
-                self.assertIn(f'Reopen {closed_year} to keep this trip in the log.', details)
+                names = ' and '.join(str(year) for year in closed_years)
+                self.assertIn(f'Reopen {names} to keep this trip in the log.', details)
                 self.assertEqual(self.keep_moved_trip(year=review_year).status_code, 409)
                 self.assertEqual(self.client.post('/trip/2026-01/removed/restore', data={
                     'csrf_token': 'known-token'}).status_code, 409)
                 with closing(sqlite3.connect(self.db)) as conn, conn:
                     self.assertIsNotNone(self.viewer.trip_log.removal(conn, '2026-01/removed'))
-                    self.viewer.trip_log.reopen_year(conn, closed_year)
+                    for closed_year in closed_years:
+                        self.viewer.trip_log.reopen_year(conn, closed_year)
         review = self.client.get('/admin/year/2029').get_data(as_text=True)
         self.assertIn('>Keep trip in log</button>', review)
         self.assertIn('unreadable trips stay flagged until repaired.', review)
