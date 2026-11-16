@@ -41,7 +41,7 @@ contact services outside it:
 
 ## Where it's at
 
-**Current versions:** firmware **v1.06** · server **v1.18**
+**Current versions:** firmware **v1.06** · server **v1.19**
 
 The tracker and server have been in daily use since **v1.00**. The firmware side is mostly completed and most of the work now is going into the server side of things. Later fixes
 are listed on the
@@ -486,11 +486,14 @@ local timezone everywhere a person reads them, so a 6pm drive shows up as
 timezone and saves it as `DISPLAY_TZ` in the server's `.env`. There's no
 default, and both services refuse to start without it.
 
-Trips are dated and counted by their local start time, but filed in the
+Trips are dated by their local start time, but filed in the
 folder for the local month they end. That only matters for a drive across
 midnight at the end of a month: one that starts at 11:50pm on December 31,
-2026 shows as December 31 and counts toward 2026, but its files are in
-`2027-01/` (see "Years are based on trip start" in
+2026 shows as December 31, but its files are in `2027-01/`. When complete
+timing and the GPX allow it, the viewer divides its miles at local New Year:
+2026 counts the miles before midnight and 2027 the rest. It stays one trip
+and annotation; All years shows its full miles once. A drive that cannot be
+split stays whole in its start year with an explanation (see the New Year rule in
 [server/README.md](server/README.md#viewer--export-ui)).
 
 ## Security

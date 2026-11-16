@@ -93,6 +93,7 @@ for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resol
 
 from common.version import server_version
 from common.settings import boolean, map_tiles, trusted_proxies, viewer_cookie_secure
+from common.trip_summary import distance_sides
 
 from common.diagnostics import CatalogError, load_catalog
 from geocoding import Geocoder, GeocodeError
@@ -1475,6 +1476,7 @@ def _load_trips(conn, include_removed=False, refresh_merges=True, trip_key=None)
     else:
         trips = [t for t in trips if t["trip_key"] not in removed]
         unreadable = [t for t in unreadable if t["trip_key"] not in removed]
+    trips = [{**t, **_year_allocation(t)} for t in trips]
     trips.sort(key=lambda t: _trip_date_anchor(t) or "", reverse=True)
     unreadable.sort(key=lambda t: t["trip_key"])
     return trips, unreadable
@@ -1994,14 +1996,120 @@ def _folder_years(ym):
 
 
 def _trip_local_year(trip):
-    """The year the list and exports file a readable trip under, or None."""
+    """The local year of a trip's date anchor, or None (not its year shares)."""
     local = _to_local(_parse(_trip_date_anchor(trip)))
     return local.year if local else None
 
 
+_year_distance_cache = {}
+_year_distance_cache_lock = Lock()
+
+
+def _crossing_years(trip):
+    start = _trip_local_year(trip)
+    until = _to_local(_parse(trip.get("recorded_until")))
+    return (start, until.year) if start and until and start != until.year else None
+
+
+def _year_distances(keys, cut):
+    """Cache track distances only, never summaries, annotations or year locks.
+
+    Recheck containment before every lookup, and stamps after parsing, just
+    like _cached_summary. Failed reads are retried on the next request.
+    """
+    def stamps():
+        result = []
+        for pair in trip_merges.source_file_pairs(DATA_ROOT, keys):
+            for path in pair:
+                stamp = _summary_stamp(path)
+                if not os.access(path, os.R_OK):
+                    raise PermissionError("Trip source cannot be read")
+                result.append((path, stamp))
+        return tuple(result)
+
+    cache_key = (DATA_ROOT.resolve(), tuple(keys), cut)
+    with _year_distance_cache_lock:
+        stamp = stamps()
+        cached = _year_distance_cache.get(cache_key)
+        if cached and cached[0] == stamp:
+            return cached[1]
+        segments = [seg for parsed in trip_merges.parsed_parts(DATA_ROOT, keys) for seg in parsed["segments"]]
+        sides = distance_sides({"segments": segments}, cut)
+        if stamps() == stamp:
+            if len(_year_distance_cache) >= 256:
+                _year_distance_cache.clear()  # Entries for deleted trips never match again.
+            _year_distance_cache[cache_key] = (stamp, sides)
+        else:
+            _year_distance_cache.pop(cache_key, None)
+        return sides
+
+
+def _year_allocation(trip):
+    """Viewer-only shares of the saved total; ordinary reads need no GPX."""
+    if trip.get("timing_status") == "untimed":
+        return {}
+    crossing = _crossing_years(trip)
+    if not crossing:
+        return {}
+    old_year, new_year = crossing
+
+    def whole(reason):
+        return {"year_split_note": f"Crosses New Year; kept whole in {old_year}: {reason}."}
+
+    if trip.get("timing_status") != "complete":
+        return whole("the summary does not have complete timing")
+    if new_year != old_year + 1:
+        return whole("the recording spans more than one year end")
+    cut = datetime(new_year, 1, 1, tzinfo=DISPLAY_TZ).astimezone(timezone.utc)
+    end = _to_local(_parse(trip.get("end_time")))
+    if end and end < cut:
+        return {}  # Movement ended before midnight; only cooldown crossed.
+    keys = trip.get("parts") or [trip["trip_key"]]
+    try:
+        before, after = _year_distances(keys, cut)
+    except (OSError, ValueError):
+        return whole("the GPX is missing, unreadable, invalid or cannot be opened safely")
+    if not after:
+        return {}  # Only stationary cooldown recording passed midnight.
+    total = trip.get("trip_distance_miles", trip["distance_miles"])
+    old = round(total * before / (before + after), 3)
+    new = round(total - old, 3)
+    if new <= 0:
+        return {}  # Nothing after midnight survives rounding: all of it is the start year's.
+    if old <= 0:
+        # Every counted mile is after midnight, so the new year owns the whole
+        # drive. It is moved, not split: the full-miles export column stays blank.
+        return {"year_shares": {new_year: total},
+                "year_split_note": f"Starts in {old_year}; all of its counted miles are in {new_year}."}
+    return {"year_shares": {old_year: old, new_year: new}, "trip_distance_miles": total}
+
+
+def _mileage_years(trip):
+    """Years with counted miles, falling back to the existing date anchor."""
+    year = _trip_local_year(trip)
+    return set(trip.get("year_shares") or ({year} if year else ()))
+
+
+def year_distance_note(trip):
+    if trip.get("other_year"):
+        return (f"{trip['distance_miles']:.2f} of {trip['trip_distance_miles']:.2f} mi, "
+                f"rest in {trip['other_year']}")
+    if len(trip.get("year_shares") or ()) > 1:
+        return "; ".join(f"{year}: {miles:.3f} mi" for year, miles in trip["year_shares"].items())
+    return trip.get("year_split_note", "")
+
+
 def year_members(trips, unreadable, year):
     """The trips of one local year: the single rule behind list, exports and review."""
-    return ([t for t in trips if _trip_local_year(t) == year],
+    members = []
+    for trip in trips:
+        shares = trip.get("year_shares", {})
+        if year in shares:
+            other = next((y for y in shares if y != year), None)
+            members.append({**trip, "distance_miles": shares[year], **({"other_year": other} if other else {})})
+        elif not shares and _trip_local_year(trip) == year:
+            members.append(trip)
+    return (members,
             [t for t in unreadable if (_unused_merge_in_year(t, year) if t.get("unused_merge") or t.get("damaged_merge") else
                                       any(_may_start_in(ym, year)
                                           for ym in (t.get("saved_months") or [t["ym"]])))])
@@ -2050,7 +2158,7 @@ def _flag_trips_inside_merges(trips):
 
 
 def selected_trips(include_history=False, loaded=None, include_merge_history=False):
-    """Use local start year, or first recorded time for partly timed trips.
+    """Use local year shares, or the date anchor when a trip cannot be split.
 
     Returns (trips, unreadable, year, years). Unreadable trips have no
     start time, so they're the exception: they go by folder.
@@ -2058,7 +2166,7 @@ def selected_trips(include_history=False, loaded=None, include_merge_history=Fal
     year = selected_year()
     trips, unreadable = load_trips() if loaded is None else loaded
     _flag_trips_inside_merges(trips)
-    years = {y for y in map(_trip_local_year, trips) if y}
+    years = {y for t in trips for y in _mileage_years(t)}
     years |= {y for t in unreadable if t.get('unused_merge')
               if (y := _trip_local_year(t.get('saved_summary', {}))) is not None}
     selected = trips
@@ -2070,10 +2178,12 @@ def selected_trips(include_history=False, loaded=None, include_merge_history=Fal
             conn.row_factory = sqlite3.Row
             lookup = _last_edited_lookup(conn)
             closed = trip_log.closed_years(conn)
+            relevant_closed = closed if year is None else {year: closed[year]} if year in closed else {}
             for trip in selected + unreadable:
                 _set_export_last_edited(lookup, trip)
             for trip in selected:
-                trip["received_after_close"] = "yes" if closed and late_in_closed_year(trip, closed) else ""
+                trip["received_after_close"] = "yes" if closed and late_in_closed_year(
+                    trip, relevant_closed if trip.get("year_shares") else closed) else ""
             if include_merge_history:
                 unreadable += [{**row, 'merge_history': True} for row in _merge_history_rows(conn, year, trips)]
     return selected, unreadable, year, sorted(years, reverse=True)
@@ -2147,15 +2257,14 @@ def _recording_years(key):
     summary, problem = _cached_summary(DATA_ROOT / f"{key}.json")
     if problem:
         return _folder_years(key.split("/")[0])
-    year = _trip_local_year(summary)
-    return {year} if year else set()
+    return _mileage_years({**summary, **_year_allocation({**summary, "trip_key": key})})
 
 
 def trip_years(trip):
     """Every year a trip counts as belonging to, for the closed-year lock.
 
-    A readable trip belongs to exactly the year the list and exports file it
-    under. An unreadable one goes by its folder: either candidate year counts.
+    A readable trip belongs to each year with a share of its miles (or its
+    date anchor when unsplit). An unreadable one goes by its folder.
     A merged trip also counts as belonging to the year of each of its parts,
     so a merge can't be used to edit a trip in a closed year. A trip with no
     date anchor has no year here, so it is never locked: the list and the
@@ -2164,8 +2273,7 @@ def trip_years(trip):
     if "problem" in trip:
         years = _folder_years(trip["ym"])
     else:
-        year = _trip_local_year(trip)
-        years = {year} if year else set()
+        years = _mileage_years(trip)
     for part in trip.get("parts", ()):
         years |= _recording_years(part)
     return years
@@ -2210,6 +2318,7 @@ app.jinja_env.globals.update(
     fmt_speed=fmt_speed, csrf_token=_csrf_token, annotation_max=ANNOTATION_MAX_CHARS,
     fmt_uptime=fmt_uptime, storage_label=storage_label, split_version=split_version,
     snapshot_counters=snapshot_counters,
+    year_distance_note=year_distance_note,
 )
 
 
@@ -2710,7 +2819,7 @@ LIST_HTML = """
   {% endif %}
   <div class="toolbar">
     <form method="get">
-      <label for="year">Year (trip start or first recorded time in {{ timezone }})</label>
+      <label for="year">Year (local time in {{ timezone }})</label>
       <select name="year" id="year">
         <option value="">All years</option>
         {% for y in years %}<option value="{{ y }}" {% if year == y %}selected{% endif %}>{{ y }}</option>{% endfor %}
@@ -2729,13 +2838,14 @@ LIST_HTML = """
     {% endif %}{% endfor %}
   </div>
   <p class="muted">Totals cover recorded trips in this selection. Partly timed trips use their first recorded timestamp
-    for year selection; their actual start can be in an earlier year. Trips with no usable date appear only under All years.</p>
+    for year selection; their actual start can be in an earlier year. Trips with no usable date appear only under All years.
+    A drive split at New Year counts once in each year, with only that year's miles; All years counts it once in full.</p>
   <div class="trip-table"><table>
     <tr class="trip-head"><th>Date</th><th>Distance</th><th>Duration</th><th>Avg mph</th>
         <th>Purpose</th><th>Destination</th><th>Note</th><th></th></tr>
     {% for t in trips %}
     <tr class="trip-row">
-      <td class="c-date">{{ fmt_trip_date(t) }}{% if t.get('timing_status') == 'partial' %}<br><span class="muted">Partial timing</span>{% endif %}{% if t.get('inside_merge') %}<br><span class="tag other">Inside a merged trip</span> <a href="{{ url_for('trip_view', ym=t.inside_merge.ym, trip_id=t.inside_merge.id, year=year or '') }}">counted twice: undo that merge</a>{% endif %}{% if t.get('parts') %}<br><code>{{ t.gpx_file }}</code>{% endif %}</td>
+      <td class="c-date">{{ fmt_trip_date(t) }}{% if t.get('timing_status') == 'partial' %}<br><span class="muted">Partial timing</span>{% endif %}{% if t.get('inside_merge') %}<br><span class="tag other">Inside a merged trip</span> <a href="{{ url_for('trip_view', ym=t.inside_merge.ym, trip_id=t.inside_merge.id, year=year or '') }}">counted twice: undo that merge</a>{% endif %}{% if t.get('parts') %}<br><code>{{ t.gpx_file }}</code>{% endif %}{% if year_distance_note(t) %}<br><span class="muted">{{ year_distance_note(t) }}</span>{% endif %}</td>
       <td class="c-dist">{{ "%.2f"|format(t.distance_miles or 0) }} mi</td>
       <td class="c-dur">{{ fmt_duration(t.duration_seconds) }}</td>
       <td class="c-avg">{{ fmt_speed(t.get('avg_speed_mph')) }}</td>
@@ -2803,6 +2913,7 @@ TRIP_HTML = """
     <div class="stat"><b>{{ t.num_points or 0 }}</b><span>points</span></div>
   </div>
 
+  {% if year_distance_note(t) %}<p class="muted">{{ year_distance_note(t) }}</p>{% endif %}
   </div></div>
   {% if year_lock %}
   <div class="warn" role="status">{{ year_lock.year }} is closed for edits (closed by {{ year_lock.closed_by }} on {{ fmt_day(year_lock.closed_at) }}).
@@ -3481,7 +3592,7 @@ def _year_list():
     trips, unreadable = load_trips(include_removed=True)
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         closed = trip_log.closed_years(conn)
-    years = {y for y in map(_trip_local_year, trips) if y} | closed.keys()
+    years = {y for t in trips for y in _mileage_years(t)} | closed.keys()
     for trip in unreadable:
         saved_year = _trip_local_year(trip.get('saved_summary', {})) if trip.get('unused_merge') or trip.get('damaged_merge') else None
         years |= {saved_year} if saved_year else _folder_years(trip["ym"])
@@ -3503,8 +3614,8 @@ YEAR_HTML = """
 """ + ACCOUNT_HEADER + """<main class="wrap">
 {% macro trip_link(t) %}{% if t.get('folder') %}<code>{{ t.trip_key }}</code> ({% if t.get('unused_merge') %}saved merge{% else %}month folder{% endif %}){% else %}<a href="{{ url_for('trip_view', ym=t.ym, trip_id=t.id, year=year) }}">{% if t.problem %}{{ t.trip_key }}{% else %}{{ fmt_trip_date(t) }}{% endif %}</a>{% endif %}{% endmacro %}
 <h1>{{ year }} year review</h1>
-<p class="muted">Times shown in {{ timezone }}. A trip belongs to the year it starts in (or, if partly timed, its
-first recorded time), the same as the trip list and exports.</p>
+<p class="muted">Times shown in {{ timezone }}. A drive split at New Year counts in both years, with only each year's
+share of its miles. Other trips use their start (or, if partly timed, their first recorded time), the same as the trip list and exports.</p>
 <div class="toolbar">
   <a class="btn secondary" href="{{ url_for('index', year=year) }}">{{ year }} trips</a>
   <a class="btn" href="{{ url_for('export_csv', year=year) }}">Export CSV</a>
@@ -3561,6 +3672,16 @@ marked in the exports. To categorize it, reopen the year and close it again: tha
 </table></div>
 </section>
 
+{% if new_year_trips %}
+<section aria-labelledby="new-year-heading">
+<h2 id="new-year-heading">Drives crossing New Year ({{ new_year_trips|length }})</h2>
+<p class="muted">The cut is the start of 1 January in {{ timezone }}. Both shares add up to the drive's full miles.
+    The recording and purpose stay together; closing either year of a split drive locks the whole drive. These drives can explain a
+difference from totals saved before the viewer divided miles at New Year.</p>
+<ul>{% for t in new_year_trips %}<li>{{ trip_link(t) }} (<code>{{ t.trip_key }}</code>): {{ year_distance_note(t) }}</li>{% endfor %}</ul>
+</section>
+{% endif %}
+
 {% if closed %}
 <section aria-labelledby="snapshot-heading">
 <h2 id="snapshot-heading">Saved totals (taken when {{ year }} was closed)</h2>
@@ -3602,13 +3723,13 @@ other way round. This happens when the display time zone was changed (which can 
 
 <section aria-labelledby="after-close-heading">
 <h2 id="after-close-heading">Received after this year was closed ({{ late|length }}, {{ "%.3f"|format(late_miles) }} mi)</h2>
-<p class="muted">Trips that start in {{ year }} but reached the server after {{ fmt_date(closed.closed_at) }}, the close.
+<p class="muted">Trips with miles in {{ year }} that reached the server after {{ fmt_date(closed.closed_at) }}, the close.
 They are in the totals above and marked <code>received_after_close</code> in the CSV and XLSX exports. They can't be
 categorized until you reopen {{ year }}; close it again afterwards to save fresh totals.</p>
 <div class="review-table"><table>
 <thead><tr><th>Trip</th><th>Received ({{ timezone }})</th><th>Distance</th><th>Category</th></tr></thead>
 <tbody>{% for t in late %}<tr><td>{{ trip_link(t) }}</td><td>{{ fmt_date(t.received_at) }}</td>
-<td>{{ "%.2f"|format(t.distance_miles or 0) }} mi</td><td>{{ t.category or "—" }}</td></tr>
+<td>{{ "%.2f"|format(t.distance_miles or 0) }} mi{% if year_distance_note(t) %}<br>{{ year_distance_note(t) }}{% endif %}</td><td>{{ t.category or "—" }}</td></tr>
 {% else %}<tr><td colspan="4" class="muted">No trip arrived after the close.</td></tr>{% endfor %}</tbody>
 </table></div>
 </section>
@@ -3791,6 +3912,16 @@ def _merge_history_counted_parts(conn, rows, trips):
     """
     current = {key: t for t in trips if not t.get('removal')
                for key in (t.get('parts') or [t['trip_key']])}
+
+    def counted_years(address, saved_summary):
+        summary = current[address]
+        if summary.get('parts'):
+            summary, _ = read_summary(DATA_ROOT / (address + '.json'), root=DATA_ROOT.resolve())
+        part_year = _trip_local_year(summary or {})
+        shares = _year_allocation({**summary, 'trip_key': address}).get('year_shares') if summary else None
+        return (set(shares) if shares else {part_year} if part_year else
+                _merge_history_missing_years(saved_summary, address.split('/')[0]))
+
     counted, _ = _month_choices(conn, DATA_ROOT.resolve())
     for row in rows:
         details = row['parsed_details']
@@ -3831,21 +3962,12 @@ def _merge_history_counted_parts(conn, rows, trips):
                     part_years |= _merge_history_missing_years(details.get('saved_summary', {}), month)
                 for address in addresses:
                     at_address.append((address, len(matches) > 1))
-                    summary = current[address]
-                    if summary.get('parts'):
-                        summary, _ = read_summary(DATA_ROOT / (address + '.json'), root=DATA_ROOT.resolve())
-                    part_year = _trip_local_year(summary or {})
-                    part_years |= {part_year} if part_year else _merge_history_missing_years(
-                        details.get('saved_summary', {}), address.split('/')[0])
+                    part_years |= counted_years(address, details.get('saved_summary', {}))
                 continue
-            summary = current[match]
             current_keys[part] = match
-            if summary.get('parts'):
+            if current[match].get('parts'):
                 inside_merge = True
-                summary, _ = read_summary(DATA_ROOT / (match + '.json'), root=DATA_ROOT.resolve())
-            part_year = _trip_local_year(summary or {})
-            part_years |= {part_year} if part_year else _merge_history_missing_years(
-                details.get('saved_summary', {}), match.split('/')[0])
+            part_years |= counted_years(match, details.get('saved_summary', {}))
             label = part if match == part else f'{part} as {match}'
             if current[match].get('parts'):
                 label += f" (inside {current[match]['trip_key']})"
@@ -3931,7 +4053,7 @@ def _merge_history_rows(conn, year=None, trips=None):
                                            for part in details.get('parts', []))),
                    saved_miles=f'{miles:.3f} mi' if _is_number(miles) else 'unknown miles')
         if (year is not None and saved_year is not None and saved_year != year and year not in row['part_years']
-                and not any(_trip_local_year(t) == year for t in trips or ())):
+                and not any(year in _mileage_years(t) for t in trips or ())):
             continue
         rows.append(row)
     if rows and trips is not None:
@@ -3982,12 +4104,15 @@ def admin_year(year):
     undated = [t for t in trips if "removal" not in t and _trip_local_year(t) is None]
     covered = trip_merges.trips_inside_merges(live)
     inside_merge = [{"trip": t, "merge": covered[t["trip_key"]]} for t in members if t["trip_key"] in covered]
+    new_year_trips = [t for t in live if t.get("year_shares") or t.get("year_split_note")
+                      if year in _mileage_years(t) or
+                      ((crossing := _crossing_years(t)) and min(crossing) <= year <= max(crossing))]
     return render_template_string(
         YEAR_HTML, year=year, closed=closed, saved_conflicts=saved_conflicts, upload_blocks=upload_blocks,
         unused_merges=unused_merges,
         unused_merge_close_refusal=UNUSED_MERGE_CLOSED_NOTICE if closed else UNUSED_MERGE_CLOSE_REFUSAL,
         discarded_merges=discarded_merges,
-        totals=totals, counts=counts, edits=edits,
+        totals=totals, counts=counts, edits=edits, new_year_trips=new_year_trips,
         inside_merge=inside_merge, late=late, late_miles=sum(t.get("distance_miles") or 0 for t in late),
         comparison=comparison, joined=joined, left=left, undated=undated, undated_miles=sum(t.get("distance_miles") or 0 for t in undated),
         uncategorized=[t for t in members if t.get("category") not in CATEGORIES],
@@ -4578,6 +4703,7 @@ EXPORT_COLUMNS = [
 # Appended after every other column (after row_type in the CSV) so existing
 # spreadsheets that read columns by position keep working.
 LATE_COLUMN = "received_after_close"
+TRIP_DISTANCE_COLUMN = "trip_distance_miles"
 
 
 def track_endpoints(trip):
@@ -4722,20 +4848,21 @@ def export_csv():
     trips, unreadable, year, _ = selected_trips(include_history=True, include_merge_history=True)
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow([name for name, _ in EXPORT_COLUMNS] + ["row_type", LATE_COLUMN])
+    writer.writerow([name for name, _ in EXPORT_COLUMNS] + ["row_type", LATE_COLUMN, TRIP_DISTANCE_COLUMN])
     for t in trips:
         t = {**t, **track_endpoints(t)}
-        writer.writerow([_csv_safe(fn(t)) for _, fn in EXPORT_COLUMNS] + ["trip", t["received_after_close"]])
+        writer.writerow([_csv_safe(fn(t)) for _, fn in EXPORT_COLUMNS]
+                        + ["trip", t["received_after_close"], t.get("trip_distance_miles", "")])
     for t in unreadable:
         values = _unreadable_values(t)
         writer.writerow(
-            [_csv_safe(values.get(name, "")) for name, _ in EXPORT_COLUMNS] + [_folder_row_type(t) if t.get("folder") else "unreadable", ""]
+            [_csv_safe(values.get(name, "")) for name, _ in EXPORT_COLUMNS] + [_folder_row_type(t) if t.get("folder") else "unreadable", "", ""]
         )
     for category, miles in mileage_totals(trips).items():
         # Keep the CSV rectangular and mark totals explicitly, so consumers
         # can select row_type=trip without double-counting summary rows.
         values = {"category": category, "distance_miles": miles}
-        writer.writerow([values.get(name, "") for name, _ in EXPORT_COLUMNS] + ["total", ""])
+        writer.writerow([values.get(name, "") for name, _ in EXPORT_COLUMNS] + ["total", "", ""])
     data = buf.getvalue().encode("utf-8")
     return send_file(
         io.BytesIO(data),
@@ -4751,10 +4878,11 @@ def export_xlsx():
     wb = Workbook()
     ws = wb.active
     ws.title = "Mileage"
-    ws.append([name for name, _ in EXPORT_COLUMNS] + [LATE_COLUMN])
+    ws.append([name for name, _ in EXPORT_COLUMNS] + [LATE_COLUMN, TRIP_DISTANCE_COLUMN])
     for t in trips:
         t = {**t, **track_endpoints(t)}
-        ws.append(_xlsx_clean([fn(t) for _, fn in EXPORT_COLUMNS] + [t["received_after_close"]]))
+        ws.append(_xlsx_clean([fn(t) for _, fn in EXPORT_COLUMNS]
+                              + [t["received_after_close"], t.get("trip_distance_miles", "")]))
         _xlsx_literal_text(ws[ws.max_row])
     totals = wb.create_sheet("Totals")
     totals.append(["year", "timezone", "category", "distance_miles"])

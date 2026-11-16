@@ -765,10 +765,42 @@ What it does:
   fix the volume and save again or restart the viewer. A missing or invalid
   mirror makes ingest use 365 days. [Retention details](../DIAGNOSTICS.md#diagnostics-event-retention).
 
-Years are based on **trip start in `DISPLAY_TZ`**, including at the New Year
-boundary. A trip crossing midnight belongs entirely to its start year; it
-is not split. The storage folder is not used for filtering, except for
-unreadable summaries (below). The viewer labels partly timed trips with
+**Each year counts the miles driven in that year, in `DISPLAY_TZ`.** A drive
+under way at the start of 1 January appears in both years, with only each
+year's share of its miles. It stays one recording, map and annotation. Under
+All years it appears once with its full miles. It counts as one trip in each
+year, so adding yearly trip counts can exceed the All years count; the miles
+still add up exactly. Closing either year locks the whole drive, so set its
+purpose before closing the old year.
+
+The viewer divides the saved trip total in proportion to counted GPX distance
+on each side of local midnight. It uses the same distance rules as ingest,
+including straight-line estimates across GPS gaps; a step crossing midnight
+is divided by time. The old-year share is rounded to three decimals and the
+new-year share is the remainder, rounded to three decimals. This preserves
+the saved total even for older summaries and merged drives. Nothing is written
+to the trip files or database. A stationary cooldown past midnight does not
+split a drive whose movement ended before midnight.
+
+Splitting requires complete timing, a readable valid GPX and exactly one year
+end. Otherwise the drive stays whole in its start year (or the first recorded
+year for partial timing), with a short note explaining why it could not be
+split. If one share rounds to zero, the drive is not split and the year with
+the miles counts all of it. That can be the new year: a drive that starts
+just before midnight with no counted miles until after it shows its December
+31 date but counts, and locks, only in the new year, with a note saying so.
+Its `trip_distance_miles` stays blank because it is not split. This applies only to trips the
+viewer can already read: a summary or GPX link refused by its safety checks
+still makes the trip unreadable with no miles counted. Wholly undated trips
+stay under All years without a New Year note; the viewer cannot guess whether
+they crossed New Year. The year review lists
+crossing drives with both shares or the reason they stayed whole. A year closed
+before this change keeps its saved totals: its review compares them with the
+current shares and names the drive. Reopen and close it again only when you
+want to replace that saved snapshot with the current figures.
+
+The storage folder is not used for filtering, except for unreadable summaries
+(below). The viewer labels partly timed trips with
 **Partial timing** and leaves
 unknown duration and average speed blank. CSV/XLSX include `timing_status`,
 `timed_from`, and `recorded_until`; older summaries without a status export
@@ -791,6 +823,12 @@ the totals as trips.** XLSX keeps one trip per row on the `Mileage` sheet
 and puts year, display timezone, and totals on a separate `Totals` sheet.
 Totals are summed before rounding to three decimal places, matching stored
 distance precision. Unclassified totals include trips without a category.
+CSV and the XLSX `Mileage` sheet append one last column, `trip_distance_miles`,
+after `received_after_close`. It holds the drive's full miles when split,
+including in All years; it is blank for other trips and other CSV row types.
+With a year selected, `distance_miles` holds only that year's share. All older
+columns keep their positions. Dates and `year_basis` still describe the trip's
+date anchor, even when some miles count in the following year.
 
 Each viewer worker keeps parsed summaries in memory, shared safely by its
 threads. It checks file identity, size and nanosecond modification time on
@@ -1067,7 +1105,8 @@ trips and their reasons, and edits made after the year ended. It also shows that
 year's own close and reopen history. The review includes edits made at or
 after local January 1 of the following year.
 
-A trip belongs to the year shown by its local start time. An unreadable trip
+A split drive belongs to both years and each year counts only its share;
+other trips use their local start or first recorded time. An unreadable trip
 is assigned by its storage folder; a January folder can be listed under the
 previous year. Folder entries follow the same rule, so a January folder
 appears under both candidate years. A trip with no usable time is not locked
@@ -1102,9 +1141,12 @@ nothing is hidden, but it is not silent either:
   a link. A trip counts as late when ingest stored it after the moment the year
   was closed. A trip whose summary has no received time (stored by an older
   ingest) is never listed as late.
-- The CSV and XLSX exports gain a last column, `received_after_close`, set to
+- The CSV and XLSX exports have a column, `received_after_close`, set to
   `yes` for those trips and blank for the rest. In the CSV it comes after
-  `row_type`, so existing columns keep their positions and names.
+  `row_type`; `trip_distance_miles` follows it. With a year selected, the flag
+  refers only to that year's close for a split drive. In All years, a split drive
+  is flagged if it arrived after either affected year was closed. Closing either year locks
+  the whole drive even when the other year is open.
 - **Saved totals** on the review page shows the totals saved at the close next
   to today's, with a difference column. Rows that differ are in bold, and a
   warning appears when anything differs. A difference is not always a late
@@ -1191,8 +1233,8 @@ visible break at unrecorded gaps. Mileage is recomputed over all points with
 the same parser and `summarize()` rules as ingest, including straight-line
 gap estimates and fix/movement filters; it is not the sum of the old rounded
 distances. Duration runs from the first part's start to the last moving point
-of the last part and includes the stop between recordings. Local calendar-year
-selection follows the merged start in `DISPLAY_TZ`.
+of the last part and includes the stop between recordings. The same New Year
+rule divides the merged drive's saved total between years in `DISPLAY_TZ`.
 
 A merged trip has one saved purpose, note and destination. If only one trip
 has an annotation, that annotation is kept. If both do, merging is blocked:
@@ -1532,11 +1574,11 @@ There is no default zone. `install.sh` asks for one and writes it to
 `docker-compose.yml` passes that one value to **both** services. The viewer
 uses it to render times; the ingest service uses it to decide which
 `data/YYYY-MM/` folder a trip is filed under. A trip is filed under the
-local month in which the drive **ends**, but dated and counted by its local
-**start** (see "Years are based on trip start" in the viewer section), so a
-drive that starts on December 31 and ends after midnight sits in the January
-folder and shows as December 31. `install.sh --check` confirms both running
-containers have the value `.env` holds.
+local month in which the drive **ends**, and dated by its local **start**.
+A drive that starts on December 31 and ends after midnight sits in the January
+folder and shows as December 31, but each year counts only its share of the
+miles (see the New Year rule in the viewer section). `install.sh --check`
+confirms both running containers have the value `.env` holds.
 
 Use a named IANA zone (`America/Denver`, `Europe/London`), never a fixed
 offset like `-08:00`: in zones with daylight saving time (DST), a fixed offset
@@ -1549,9 +1591,10 @@ old value). Trips already filed stay in the month folder they were filed
 under, but the zone decides more than how times read:
 
 - Displayed and exported times change.
-- **Which year a trip belongs to follows `DISPLAY_TZ` too.** A trip's year is
-  its local start date, worked out on every page load, so after a zone change
-  the trips near New Year can move to the neighbouring year. That includes a
+- **Which year counts the miles follows `DISPLAY_TZ` too.** Local dates and
+  New Year shares are worked out at read time. After a zone change, a drive
+  near New Year can move to the neighbouring year, gain or lose a split, or
+  have different shares. That includes a
   year you already closed: its live totals and exports change. Saved totals
   from the close stay unchanged; the admin year review compares them with the
   current figures and lists trips that joined or left the year. The timezone

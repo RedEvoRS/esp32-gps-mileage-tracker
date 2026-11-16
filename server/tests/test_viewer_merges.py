@@ -470,9 +470,9 @@ class ViewerMerges(unittest.TestCase):
     def test_missing_part_years_respect_possible_start_years_on_every_surface(self):
         from zoneinfo import ZoneInfo
         cases = (
-            # End-time folders can cross midnight without crossing a tax year.
+            # The second recording itself crosses New Year: 10 of its 60 seconds before midnight.
             ('UTC', datetime(2026, 12, 31, 23, 50, tzinfo=timezone.utc), 590,
-             ('2026-12', '2027-01'), 'a', False, {2026}, {2026}),
+             ('2026-12', '2027-01'), 'a', False, {2026, 2027}, {2026, 2027}),
             ('America/Los_Angeles', datetime(2027, 1, 1, 3, tzinfo=timezone.utc), 180,
              ('2026-12', '2026-12'), 'b', False, {2026}, {2026}),
             ('America/Los_Angeles', datetime(2027, 1, 1, 3, tzinfo=timezone.utc), 180,
@@ -513,11 +513,12 @@ class ViewerMerges(unittest.TestCase):
                     # An incompatible folder still falls back to the saved start year.
                     self.assertEqual(fixture.viewer._merge_history_missing_years(details['saved_summary'], '2028-06'), {2027})
                 remaining_year = fixture.viewer._trip_local_year(fixture.viewer.load_trips()[0][0])
+                remaining_miles = {2026: .007, 2027: .034} if gap == 590 else {remaining_year: .041}
                 for remove_gpx in (False, True):
                     if remove_gpx:
                         (fixture.data / (missing_key + '.gpx')).unlink()
                     for year in (2025, 2026, 2027, 2028):
-                        miles = .041 if year == remaining_year else 0
+                        miles = remaining_miles.get(year, 0)
                         totals = dict(zip(('business', 'personal', 'other', 'unclassified', 'all'),
                                           (0, 0, 0, miles, miles), strict=True))
                         fixture.assert_record_year(key, year, totals, year in record_years)

@@ -223,6 +223,47 @@ def _step(a, b, require_time=False):
     return (d if moving else 0.0), derived
 
 
+def _counted_steps(parsed):
+    """Usable fixes and their counted steps, carrying the baseline across gaps."""
+    last_good = None
+    for seg in parsed["segments"]:
+        first_in_seg = True
+        for p in seg:
+            if p["hdop"] is not None and p["hdop"] > MAX_HDOP:
+                continue
+            d, derived = (_step(last_good, p, require_time=first_in_seg)
+                          if last_good is not None else (0.0, None))
+            yield last_good, p, d, derived
+            last_good = p
+            first_in_seg = False
+
+
+def distance_sides(parsed, cut):
+    """Count meters before/after an instant using the summary's exact steps.
+
+    A step crossing the cut is divided by elapsed time. Complete GPX timing is
+    required even when a saved summary claims it; never infer missing times.
+    """
+    if any(p["time"] is None for seg in parsed["segments"] for p in seg):
+        raise ValueError("GPX does not have complete timing")
+    before = after = 0.0
+    for a, b, d, _ in _counted_steps(parsed):
+        if not d:
+            continue
+        if b["time"] <= a["time"]:
+            raise ValueError("Counted GPX steps must have increasing times")
+        if b["time"] <= cut:
+            before += d
+        elif a["time"] >= cut:
+            after += d
+        else:
+            old = d * ((cut - a["time"]).total_seconds()
+                       / (b["time"] - a["time"]).total_seconds())
+            before += old
+            after += d - old
+    return before, after
+
+
 def summarize(parsed):
     """Compute the trip summary fields from a parse_gpx() result.
 
@@ -263,26 +304,16 @@ def summarize(parsed):
 
     distance_m = 0.0
     max_speed_mps = 0.0
-    lats, lons = [], []
-
-    last_good = None  # last usable fix, carried across segment breaks
-    for seg in parsed["segments"]:
-        first_in_seg = True
-        for p in seg:
-            lats.append(p["lat"])
-            lons.append(p["lon"])
-            if p["hdop"] is not None and p["hdop"] > MAX_HDOP:
-                continue
-            if p["speed_mps"] is not None:
-                max_speed_mps = max(max_speed_mps, p["speed_mps"])
-            if last_good is not None:
-                d, derived = _step(last_good, p, require_time=first_in_seg)
-                distance_m += d
-                # Derive speed only if the device didn't report one.
-                if d and p["speed_mps"] is None and derived is not None:
-                    max_speed_mps = max(max_speed_mps, derived)
-            last_good = p
-            first_in_seg = False
+    lats = [p["lat"] for p in all_points]
+    lons = [p["lon"] for p in all_points]
+    for a, p, d, derived in _counted_steps(parsed):
+        if p["speed_mps"] is not None:
+            max_speed_mps = max(max_speed_mps, p["speed_mps"])
+        if a is not None:
+            distance_m += d
+            # Derive speed only if the device didn't report one.
+            if d and p["speed_mps"] is None and derived is not None:
+                max_speed_mps = max(max_speed_mps, derived)
 
     distance_miles = distance_m / METERS_PER_MILE
     if duration_seconds and duration_seconds > 0:
