@@ -616,13 +616,13 @@ class YearReviewTests(YearTestBase):
         for year in rows:
             self.assertIn(f'href="/admin/year/{year}"', admin)
 
-    def test_merge_across_the_new_year_is_filed_under_its_first_part(self):
+    def test_merge_across_the_new_year_is_filed_under_both_years(self):
         first = self.add_trip("first", "2027-01-01T07:59:00Z", ym="2027-01")
         second = self.add_trip("second", "2027-01-01T08:00:30Z", ym="2027-01")
         merged = self.post(f"/trip/{first}/merge", next_trip=second).headers["Location"]
         merged = merged.split("/trip/")[1].split("?")[0]
         self.assertIn(f'href="/trip/{merged}?year=2026"', self.section(self.review(2026), "uncategorized"))
-        self.assertIn("Every trip has a category.", self.section(self.review(2027), "uncategorized"))
+        self.assertIn(f'href="/trip/{merged}?year=2027"', self.section(self.review(2027), "uncategorized"))
 
     def test_review_and_closing_do_not_change_the_exports(self):
         self.add_trip("drive", "2026-03-01T12:00:00Z")
@@ -707,8 +707,8 @@ class YearReviewTests(YearTestBase):
         self.assertEqual(float(next(r for r in csv_rows if r["row_type"] == "total"
                                     and r["category"] == "all")["distance_miles"]), 5.75)
         values = self.sheet_values("/export.xlsx?year=2026")["Mileage"]
-        self.assertEqual(values[0][-1], "received_after_close")
-        self.assertEqual({row[1]: row[-1] for row in values[1:]}, {"b1": None, "b2": None, "late": "yes"})
+        self.assertEqual(values[0][-2:], ["received_after_close", "trip_distance_miles"])
+        self.assertEqual({row[1]: row[-2] for row in values[1:]}, {"b1": None, "b2": None, "late": "yes"})
         # All years marks it too, judged against its own year's close.
         self.add_trip("open-year", "2025-03-01T12:00:00Z", _received_at=self.AFTER)
         marks = {r["trip_id"]: r["received_after_close"] for r in self.csv_rows() if r["row_type"] == "trip"}
@@ -720,7 +720,7 @@ class YearReviewTests(YearTestBase):
         self.closed_year_with_two_trips()
         text = self.admin.get("/export.csv?year=2026").data.decode("utf-8")
         header = next(csv.reader(io.StringIO(text)))
-        self.assertEqual(header[-4:], ["last_edited_by", "last_edited_at", "row_type", "received_after_close"])
+        self.assertEqual(header[-5:], ["last_edited_by", "last_edited_at", "row_type", "received_after_close", "trip_distance_miles"])
         self.assertEqual(header[:3], ["date", "trip_id", "device_id"])
         self.assertTrue(all(len(row) == len(header) for row in csv.reader(io.StringIO(text))))
 
