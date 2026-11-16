@@ -1077,7 +1077,7 @@ def folder_hint(entry, role):
     if entry["folder_reason"] == "unused_merge":
         if role != "admin":
             return ("Please ask the admin to restore the original month name, as a link or by renaming the folder back, "
-                    "or use Undo saved merge. " + unused_merge_undo_effect(entry))
+                    "or to undo the saved merge. " + unused_merge_undo_effect(entry))
         return ("To use this merge again, restore the original month name, as a link or by renaming the folder back, "
                 "and leave that name in use. Or use Undo saved merge on the trip list. " + unused_merge_undo_effect(entry))
     if role != "admin":
@@ -2016,6 +2016,9 @@ def _unused_merge_in_year(trip, year):
 UNUSED_MERGE_CLOSE_REFUSAL = ("A saved merge under an unused month name has miles and purpose outside the totals. "
                               "Restore its original month name or use Undo saved merge before closing this year. "
                               "See Saved merges under unused month names on the year review.")
+UNUSED_MERGE_CLOSED_NOTICE = ("This year is closed. A saved merge under an unused month name has miles and purpose outside the totals. "
+                            "The saved-versus-current comparison on this page shows the difference. "
+                            "Reopen this year before undoing the saved merge.")
 
 
 def trip_neighbours(trip_key, trips, year=None):
@@ -3354,7 +3357,7 @@ def _history_summary(row):
         return f"Merged {merged}; kept annotation from {source}."
     if action == "split":
         if details.get('unused_name'):
-            return "Unused-name merge undone. " + details['undo_effect']
+            return "Unused-name merge undone. " + _merge_history_undo_effect(row)
         text = "Restored original recordings: " + ", ".join(details.get("parts", ())) + "."
         # Older rows carry only the parts.
         if "dropped" in details:
@@ -3459,6 +3462,9 @@ def admin_history():
                     row["parsed_details"] = json.loads(row["details"])
                 except (TypeError, ValueError):
                     row["parsed_details"] = {}
+        unused_rows = [row for row in history_rows if row['parsed_details'].get('unused_name')]
+        if unused_rows:
+            _merge_history_counted_parts(conn, unused_rows, load_trips(include_removed=True)[0])
         for row in history_rows:
             row["action_label"] = _history_action_label(row["action"])
             row["summary"] = _history_summary(row)
@@ -3480,8 +3486,10 @@ def _year_list():
         saved_year = _trip_local_year(trip.get('saved_summary', {})) if trip.get('unused_merge') or trip.get('damaged_merge') else None
         years |= {saved_year} if saved_year else _folder_years(trip["ym"])
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
-        for row in _merge_history_rows(conn):
-            years |= {row['saved_year']} if row['saved_year'] else _folder_years(row['trip_key'].split('/')[0])
+        for row in _merge_history_rows(conn, trips=trips):
+            if row['saved_year']:
+                years.add(row['saved_year'])
+            years |= row['part_years']
     return [{"year": year, "closed": closed.get(year)} for year in sorted(years, reverse=True)]
 
 
@@ -3703,7 +3711,7 @@ every time {{ year }} was closed or reopened.</p>
 """
 
 
-def _late_edit_rows(conn, year, trips):
+def _late_edit_rows(conn, year, trips, *, current_trips=None):
     """History rows that touch one of trips on or after local Jan 1 00:00 of year + 1.
 
     trips are every trip of the year (removed ones too). A trip is touched
@@ -3755,11 +3763,24 @@ def _late_edit_rows(conn, year, trips):
             row["parsed_details"] = {}
         rows[row["id"]] = row
     result = sorted(rows.values(), key=lambda r: (_history_order(r["at"]), r["id"]), reverse=True)
+    unused_rows = [row for row in result if row['parsed_details'].get('unused_name')]
+    if unused_rows:
+        _merge_history_counted_parts(conn, unused_rows, current_trips if current_trips is not None else trips)
     for row in result:
         row["action_label"] = _history_action_label(row["action"])
         row["summary"] = _history_summary(row)
         row["trip_url"], row["trip_label"] = _history_trip_link(conn, row)
     return result
+
+
+def _merge_history_missing_years(summary, month):
+    """A missing part is bounded by the saved merge's local start and end."""
+    times = [_to_local(_parse(summary.get(field))) for field in ('start_time', 'end_time')]
+    years = [time.year for time in times if time is not None]
+    if not years:
+        return _folder_years(month)
+    saved_years = set(range(min(years), max(years) + 1))
+    return saved_years & _folder_years(month) or saved_years
 
 
 def _merge_history_counted_parts(conn, rows, trips):
@@ -3779,15 +3800,17 @@ def _merge_history_counted_parts(conn, rows, trips):
                 stamps = stamps[1:]
         except (TypeError, ValueError):
             stamps = None
-        again, absent = [], []
+        again, at_address, absent = [], [], []
+        current_keys, inside_merge = {}, False
+        part_years = set()
         for index, part in enumerate(details.get('parts', [])):
             month, name = part.split('/')
             alternate = counted.get(month, month) + '/' + name
             recorded = details.get('counted_part_keys', {}).get(part, part)
             match = next((key for key in (part, recorded, alternate) if key in current), None)
+            matches = []
             if match is None and isinstance(stamps, list) and len(stamps) > 2 * index + 1:
                 saved = json.dumps([stamps[2 * index + 1]])  # readable JSON suffices for ordinary totals
-                matches = []
                 for candidate in current:
                     if candidate.split('/')[1] != name:
                         continue
@@ -3802,13 +3825,64 @@ def _merge_history_counted_parts(conn, rows, trips):
                 if len(matches) == 1:
                     match = matches[0]
             if match is None:
-                absent.append(part)
+                addresses = [key for key in current if key.split('/')[1] == name]
+                if not addresses:
+                    absent.append(part)
+                    part_years |= _merge_history_missing_years(details.get('saved_summary', {}), month)
+                for address in addresses:
+                    at_address.append((address, len(matches) > 1))
+                    summary = current[address]
+                    if summary.get('parts'):
+                        summary, _ = read_summary(DATA_ROOT / (address + '.json'), root=DATA_ROOT.resolve())
+                    part_year = _trip_local_year(summary or {})
+                    part_years |= {part_year} if part_year else _merge_history_missing_years(
+                        details.get('saved_summary', {}), address.split('/')[0])
                 continue
+            summary = current[match]
+            current_keys[part] = match
+            if summary.get('parts'):
+                inside_merge = True
+                summary, _ = read_summary(DATA_ROOT / (match + '.json'), root=DATA_ROOT.resolve())
+            part_year = _trip_local_year(summary or {})
+            part_years |= {part_year} if part_year else _merge_history_missing_years(
+                details.get('saved_summary', {}), match.split('/')[0])
             label = part if match == part else f'{part} as {match}'
             if current[match].get('parts'):
                 label += f" (inside {current[match]['trip_key']})"
             again.append(label)
         row['counted_again'], row['not_counted'] = again, absent
+        row['counted_at_address'] = at_address
+        row['part_years'] = part_years
+        row['current_part_keys'], row['parts_in_merge'] = current_keys, inside_merge
+
+
+def _merge_history_current_statement(row):
+    if not row['counted_again'] and not row['counted_at_address']:
+        return "None of its trips are in the log; these saved miles are not in the totals."
+    text = ("Now counted again: " + ', '.join(row['counted_again']) + "; do not add these saved miles by hand."
+            if row['counted_again'] else '')
+    for address, ambiguous in row['counted_at_address']:
+        text += (' ' if text else '') + f"A trip is counted at {address}"
+        text += "." if ambiguous else ", but its files differ from the ones this merge was made from."
+    if not row['counted_again']:
+        text += " Do not add these saved miles by hand."
+    if row['not_counted']:
+        text += " Not currently counted: " + ', '.join(row['not_counted']) + "."
+    return text
+
+
+def _merge_history_undo_effect(row):
+    details = row['parsed_details']
+    if not details.get('parts') or 'current_part_keys' not in row:
+        return details.get('undo_effect', '')  # Legacy text only when current evidence is unavailable.
+    keys = row['current_part_keys']
+    if (not row['not_counted'] and not row['counted_at_address'] and not row['parts_in_merge']
+            and all(part != key for part, key in keys.items())):
+        return unused_merge_undo_effect({
+            'counted_months': sorted({key.split('/')[0] for key in keys.values()}),
+            'saved_months': sorted({key.split('/')[0] for key in details['parts']}),
+        })
+    return _merge_history_current_statement(row)
 
 
 def merge_history_message(row):
@@ -3821,11 +3895,14 @@ def merge_history_message(row):
             f"purpose note: {annotation.get('purpose_note') or 'none'}; "
             f"trip date: {fmt_date(details.get('saved_summary', {}).get('start_time'))}. "
             f"Recorded at: {fmt_date(row['at'])}; login: {row['actor']}. ")
-    if not row['counted_again']:
-        return text + "None of its trips are in the log; these saved miles are not in the totals."
-    text += "Now counted again: " + ', '.join(row['counted_again']) + "; do not add these saved miles by hand."
-    if row['not_counted']:
-        text += " Not currently counted: " + ', '.join(row['not_counted']) + "."
+    current = _merge_history_current_statement(row)
+    if details.get('unused_name'):
+        effect = _merge_history_undo_effect(row)
+        if effect and effect != current:
+            text += effect + ' '
+    text += current
+    if row.get('review_year') and row.get('saved_year') and row['review_year'] != row['saved_year']:
+        text += f" The saved summary belongs to tax year {row['saved_year']}."
     return text
 
 
@@ -3848,15 +3925,18 @@ def _merge_history_rows(conn, year=None, trips=None):
             continue
         summary = details.get('saved_summary', {})
         saved_year = _trip_local_year(summary)
-        if year is not None and saved_year is not None and saved_year != year:
-            continue
         miles = summary.get('distance_miles')
-        row.update(parsed_details=details, saved_year=saved_year,
+        row.update(parsed_details=details, saved_year=saved_year, review_year=year,
+                   part_years=set().union(*(_merge_history_missing_years(summary, part.split('/')[0])
+                                           for part in details.get('parts', []))),
                    saved_miles=f'{miles:.3f} mi' if _is_number(miles) else 'unknown miles')
+        if (year is not None and saved_year is not None and saved_year != year and year not in row['part_years']
+                and not any(_trip_local_year(t) == year for t in trips or ())):
+            continue
         rows.append(row)
     if rows and trips is not None:
         _merge_history_counted_parts(conn, rows, trips)
-    return rows
+    return [row for row in rows if year is None or year == row['saved_year'] or year in row['part_years']]
 
 
 @app.route("/admin/year/<year>")
@@ -3874,7 +3954,7 @@ def admin_year(year):
         unused_merges = [t for t in broken if t.get("unused_merge")]
         gone, gone_unreadable = year_members(
             [t for t in trips if "removal" in t], [t for t in unreadable if "removal" in t], year)
-        edits = _late_edit_rows(conn, year, members + broken + gone + gone_unreadable)
+        edits = _late_edit_rows(conn, year, members + broken + gone + gone_unreadable, current_trips=trips)
         discarded_merges = _merge_history_rows(conn, year, trips)
     current = year_figures(members, broken)
     totals, counts = current["totals"], current["counts"]
@@ -3904,7 +3984,8 @@ def admin_year(year):
     inside_merge = [{"trip": t, "merge": covered[t["trip_key"]]} for t in members if t["trip_key"] in covered]
     return render_template_string(
         YEAR_HTML, year=year, closed=closed, saved_conflicts=saved_conflicts, upload_blocks=upload_blocks,
-        unused_merges=unused_merges, unused_merge_close_refusal=UNUSED_MERGE_CLOSE_REFUSAL,
+        unused_merges=unused_merges,
+        unused_merge_close_refusal=UNUSED_MERGE_CLOSED_NOTICE if closed else UNUSED_MERGE_CLOSE_REFUSAL,
         discarded_merges=discarded_merges,
         totals=totals, counts=counts, edits=edits,
         inside_merge=inside_merge, late=late, late_miles=sum(t.get("distance_miles") or 0 for t in late),
@@ -4371,7 +4452,7 @@ def _undo_merge(conn, key, keys, *, damaged=False, unused=None):
             'original_annotations': restored,
         }
         if unused is not None:
-            details.update(unused_name=True, undo_effect=unused_merge_undo_effect(unused),
+            details.update(unused_name=True,
                            counted_part_keys=dict(zip(keys, [t['trip_key'] for t in unused['counted_parts']], strict=True)))
         trip_log.record(conn, key, 'discard_damaged_merge' if damaged else 'split', details,
                         actor=g.user, actor_role=g.role)
