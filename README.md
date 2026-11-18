@@ -47,8 +47,7 @@ The tracker and server have been in daily use since **v1.00**. The firmware side
 are listed on the
 [releases page](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/releases).
 
-Still unproven on the Supreme: trips that end in a parking garage, and
-distance accuracy against the car's odometer. Open work is tracked in
+Still unproven on the Supreme: trips that end in a parking garage. Open work is tracked in
 [GitHub issues](https://github.com/RedEvoRS/esp32-gps-mileage-tracker/issues).
 
 **Have the older T-Beam V1.2?** This project started on the LilyGO TTGO
