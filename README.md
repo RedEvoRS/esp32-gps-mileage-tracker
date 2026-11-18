@@ -148,11 +148,16 @@ merging split drives, removing trips and closing a tax year, is in
 
 ## What you need
 
-- **LilyGO T-Beam Supreme with u-blox MAX-M10S GPS** (not L76K), a
-  protected **18650 cell** (match its polarity to the holder), and a
+- **LilyGO T-Beam Supreme with u-blox MAX-M10S GPS** (not L76K) and a
   **microSD card formatted FAT32**. A SanDisk 32 GB Max Endurance is the
   tested card; exFAT is unsupported. See
   [microSD card](firmware/README.md#microsd-card).
+- **A protected 18650 lithium-ion battery** for the board's onboard
+  holder. Match its + end to the + marking on the holder. Keep it fitted:
+  when the car switches off, the battery keeps the board running long
+  enough to close the trip, upload it over WiFi and switch off cleanly. It
+  also lets the GPS start faster on the next drive.
+  See the hot-climates warning below.
 - **An external GPS antenna (recommended).** The small GPS antenna that
   comes with the board has a short cable and sits inside the case, where it
   won't have a clear view of the sky from inside a car. Use an external
@@ -162,7 +167,16 @@ merging split drives, removing trips and closing a tax year, is in
   Tested with a Geekstory active GPS+GLONASS antenna (3–5 V, SMA male, 3 m
   cable, magnetic base); any antenna with those specs should work.
 - **The board's 915 MHz LoRa antenna**, fitted before the board first gets
-  power; see the warning below.
+  power.
+
+> [!CAUTION]
+> **Attach the 915 MHz LoRa antenna before the board gets any power:**
+> before inserting the battery and before plugging in USB. The board ships
+> with factory firmware that can transmit, and transmitting without an
+> antenna can permanently damage the LoRa radio. This project doesn't use
+> LoRa, but the antenna must stay on until this project's firmware is
+> flashed (Step 2).
+
 - **A car USB port that switches off with the ignition.** The board uses
   that power cut to end the trip and, later, the power coming back to
   switch on.
@@ -185,14 +199,6 @@ merging split drives, removing trips and closing a tax year, is in
   tar and jq; see [flashing prerequisites](firmware/README.md#flash-from-the-server-build).
 - **Visible 2.4 GHz home WiFi** reaching your parking spot; 5 GHz and hidden
   networks do not work.
-
-> [!CAUTION]
-> **Attach the 915 MHz LoRa antenna before the board gets any power:**
-> before inserting the battery and before plugging in USB. The board ships
-> with factory firmware that can transmit, and transmitting without an
-> antenna can permanently damage the LoRa radio. This project doesn't use
-> LoRa, but the antenna must stay on until this project's firmware is
-> flashed (Step 2).
 
 > [!CAUTION]
 > **Hot climates: the 18650 battery can overheat in a parked car.** A car
