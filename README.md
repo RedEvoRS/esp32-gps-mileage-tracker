@@ -245,8 +245,11 @@ the case SMA socket.
 > board off cleanly, move the pigtail back to **LORA**, and attach the LoRa
 > antenna to the SMA socket.
 
-1. After flashing the tracker, check that the startup serial log at 115200
-   baud shows `LoRa rail (ALDO3) verified off`.
+1. After flashing the tracker, open a serial monitor at 115200 baud and
+   briefly press **RESET** so you see startup from the beginning. Check
+   that it shows `LoRa rail (ALDO3) verified off`. If it shows
+   `DEGRADED: LoRa rail (ALDO3) could not be verified off` instead, leave
+   the pigtail on **LORA**.
 2. Switch the board off cleanly before moving the pigtail. Unplug USB, hold
    **POWER** for 1–2 seconds on battery, then release. Watch for `Switching off`,
    then a dark screen, and wait a few seconds for shutdown to finish.
@@ -405,11 +408,11 @@ mode, press RESET with BOOT released. See the
 
 **After the first install, you can remove the LoRa antenna.** This
 project's firmware switches the LoRa radio's power off at startup and checks
-that it's off. The flash scripts show the LoRa antenna reminder on every
-run. For tracker updates, you can keep either GPS antenna setup. If you want
-to [use the case SMA socket for GPS](#use-the-case-sma-socket-for-gps), follow
-the steps above. Restore the LoRa wiring and antenna before flashing any
-other firmware.
+that it's off. The flash scripts still remind you to keep the LoRa antenna
+attached on every run, but tracker updates are fine with either GPS antenna
+setup. To [use the case SMA socket for GPS](#use-the-case-sma-socket-for-gps),
+follow the steps above. Restore the LoRa wiring and antenna before flashing
+any other firmware.
 
 <a id="4-check-it-works"></a>
 <a id="5-put-it-in-the-car"></a>
