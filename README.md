@@ -259,12 +259,6 @@ the case SMA socket.
 4. Screw the active GPS antenna onto the SMA socket. The LoRa antenna can
    stay off during normal tracker use.
 
-On the indoor bench (v1.03, 2026-11-07 UTC), this setup held a fix with 12
-satellites, HDOP of 0.5–0.6, and AGC of 18–24% with antenna status OK. It
-worked at least as well as the adapter cable indoors. On the road (v1.06,
-2026-11-15 to 2026-11-22 UTC), all 20 drives recorded and uploaded in full
-with normal distances and no GPS antenna fault in Device health.
-
 ## Setting it up
 
 The setup scripts download from GitHub: the scripts and source bundle come
