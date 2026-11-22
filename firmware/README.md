@@ -256,8 +256,12 @@ runs on the Supreme and has recorded real drives on the microSD card.
   which sits next to the one marked **LORA**. Press it on until it clicks.
   A loose GPS cable looks exactly like a dead antenna: no satellites at
   all, even outdoors.
-- The board powers an **active** GPS antenna, so an external active antenna
-  on an SMA cable works (through an adapter cable to the GPS socket).
+- The board powers an **active** GPS antenna. The default setup for an
+  external active antenna with an SMA plug uses an adapter cable to the
+  **GPS** socket. After flashing the trip logger (Stage 4), you can
+  [use the case SMA socket for GPS](../README.md#use-the-case-sma-socket-for-gps)
+  by moving the short cable inside the case. Follow the warning and steps
+  in that section.
 - **18650:** use a protected cell and match the + marking on the holder.
   Unplugging USB does not switch the board off while a cell is fitted. It
   powers the upload window and clean storage shutdown after the car turns off.
@@ -269,9 +273,11 @@ The tested case is the
 printed in PETG. It is a remix of Alley Cat's
 [Alley Chat TS2 NEW TBeam SUPREME Case](https://makerworld.com/models/574656-alley-chat-ts2-new-tbeam-supreme-case-by-alley-cat);
 both are licensed CC BY-SA. The original case leaves too little room for
-the GPS antenna's push-on plug: closing it knocked the plug off, and the
-tracker then logs no positions while still looking alive. The remix adds a
-window at the GPS connector so nothing presses on the plug.
+the push-on plug at the **GPS** socket. Closing the case knocked the plug
+off, and the tracker then logged no positions while still looking alive.
+The remix adds a window at the **GPS** socket so nothing presses on the
+plug. If you moved the case SMA cable to **GPS**, the window gives its
+plug the same clearance.
 
 - **Seat the GPS plug first** (it clicks), then fit the board. A small
   piece of Kapton tape over the plug helps it stay put. These plugs are

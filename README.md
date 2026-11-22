@@ -161,9 +161,12 @@ merging split drives, removing trips and closing a tax year, is in
 - **An external GPS antenna (recommended).** The small GPS antenna that
   comes with the board has a short cable and sits inside the case, where it
   won't have a clear view of the sky from inside a car. Use an external
-  active GPS antenna that works at 3.3 V, with an SMA plug, plus a short
-  IPEX (u.FL) to SMA adapter cable for the board's **GPS** socket. Mount the
-  antenna where it can see the sky, such as the dashboard or rear shelf.
+  active GPS antenna that works at 3.3 V and has an SMA plug. The default
+  setup uses a short IPEX (u.FL) to SMA adapter cable for the board's **GPS**
+  socket. After flashing the tracker, you can also
+  [use the case SMA socket for GPS](#use-the-case-sma-socket-for-gps) without
+  an adapter cable. Mount the antenna where it can see the sky, such as the
+  dashboard or rear shelf.
   Tested with a Geekstory active GPS+GLONASS antenna (3–5 V, SMA male, 3 m
   cable, magnetic base); any antenna with those specs should work.
 - **The board's 915 MHz LoRa antenna**, fitted before the board first gets
@@ -223,6 +226,41 @@ merging split drives, removing trips and closing a tax year, is in
 > from the hardware, the battery or the software. See [License](#license):
 > it comes with no warranty. More on the battery in
 > [Put it in the car](firmware/README.md#put-it-in-the-car).
+
+### Use the case SMA socket for GPS
+
+A short IPEX (u.FL) cable, called a pigtail, connects the case SMA socket
+to **LORA** on the board. Once the tracker firmware is running, you can
+move that cable to **GPS** and plug the active GPS antenna straight into
+the case SMA socket.
+
+> [!WARNING]
+> **Move the pigtail only after flashing this project's tracker firmware.**
+> The tracker switches off the LoRa power rail (ALDO3) at startup and
+> verifies that it is off. Factory Meshtastic firmware can transmit, and
+> transmitting without an antenna can permanently damage the LoRa radio.
+>
+> **With the pigtail on GPS, the LoRa radio has no antenna at all.** Before
+> flashing the factory backup, Meshtastic or any other firmware, switch the
+> board off cleanly, move the pigtail back to **LORA**, and attach the LoRa
+> antenna to the SMA socket.
+
+1. After flashing the tracker, check that the startup serial log at 115200
+   baud shows `LoRa rail (ALDO3) verified off`.
+2. Switch the board off cleanly before moving the pigtail. Unplug USB, hold
+   **POWER** for 1–2 seconds on battery, then release. Watch for `Switching off`,
+   then a dark screen, and wait a few seconds for shutdown to finish.
+3. Move the pigtail from **LORA** to **GPS**. Press the plug on until it
+   clicks. These plugs are rated for about 30 connections. Each move uses
+   one cycle on both sockets.
+4. Screw the active GPS antenna onto the SMA socket. The LoRa antenna can
+   stay off during normal tracker use.
+
+On the indoor bench (v1.03, 2026-11-07 UTC), this setup held a fix with 12
+satellites, HDOP of 0.5–0.6, and AGC of 18–24% with antenna status OK. It
+worked at least as well as the adapter cable indoors. On the road (v1.06,
+2026-11-15 to 2026-11-22 UTC), all 20 drives recorded and uploaded in full
+with normal distances and no GPS antenna fault in Device health.
 
 ## Setting it up
 
@@ -367,8 +405,11 @@ mode, press RESET with BOOT released. See the
 
 **After the first install, you can remove the LoRa antenna.** This
 project's firmware switches the LoRa radio's power off at startup and checks
-that it's off. Put the antenna back before flashing anything else onto the
-board, such as the factory backup or Meshtastic.
+that it's off. The flash scripts show the LoRa antenna reminder on every
+run. For tracker updates, you can keep either GPS antenna setup. If you want
+to [use the case SMA socket for GPS](#use-the-case-sma-socket-for-gps), follow
+the steps above. Restore the LoRa wiring and antenna before flashing any
+other firmware.
 
 <a id="4-check-it-works"></a>
 <a id="5-put-it-in-the-car"></a>
