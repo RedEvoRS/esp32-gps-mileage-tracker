@@ -889,7 +889,7 @@ static const char* GPX_PROLOGUE =
     " xmlns=\"http://www.topografix.com/GPX/1/0\">\n"
     "<trk><name>Trip</name><trkseg>\n";
 
-static const char* GPX_EPILOGUE = "</trkseg></trk></gpx>\n";
+static const char GPX_EPILOGUE[] = "</trkseg></trk></gpx>\n";
 
 // Choose a unique local filename for a new trip using a persistent
 // counter. The server renames trips by their GPX timestamps on receipt,
@@ -1495,25 +1495,27 @@ static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result, 
     if (!f) return false;
     size_t sz = f.size();
 
-    // Already complete? Look for </gpx> in the tail.
-    bool complete = false;
+    // Boot accepts the closing tag. Runtime repair follows a failed commit,
+    // so verify the exact epilogue before rewriting it at the same offset.
+    constexpr size_t epilogueSize = sizeof(GPX_EPILOGUE) - 1;
+    bool rewrite = false;
     if (sz >= 6) {
-        size_t back = sz > 16 ? 16 : sz;
+        size_t back = min(sz, bounded ? epilogueSize : size_t(16));
         if (!f.seek(sz - back)) { f.close(); return false; }
-        char tail[17];
+        char tail[sizeof(GPX_EPILOGUE)];
         int n = f.read((uint8_t*)tail, back);
         if (n != (int)back) { f.close(); return false; }
         tail[n] = 0;
-        if (strstr(tail, "</gpx>")) complete = true;
+        if (!bounded && strstr(tail, "</gpx>")) { f.close(); return true; }
+        rewrite = bounded && back == epilogueSize &&
+                  memcmp(tail, GPX_EPILOGUE, epilogueSize) == 0;
     }
-    // Runtime repair follows a failed commit. A visible closing tag is not
-    // proof of sync, so repair that tail through the checked write path too.
-    if (complete && !bounded) { f.close(); return true; }
 
-    long end = findLastTrkptEndBackwards(f, bounded ? TRIP_REPAIR_SCAN_BYTES : SIZE_MAX);
+    long end = rewrite ? static_cast<long>(sz - epilogueSize)
+                       : findLastTrkptEndBackwards(f, bounded ? TRIP_REPAIR_SCAN_BYTES : SIZE_MAX);
     if (end == -2) { f.close(); return false; }
     if (end == -3) { f.close(); result.reason = "parse"; return false; }
-    if (end <= 0) {
+    if (!rewrite && end <= 0) {
         f.close();
         result.reason = "write";
         if (!storage.remove(path)) return false;
@@ -1523,9 +1525,14 @@ static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result, 
 
     f.close();
     result.reason = "write";
-    const String suffix = String("\n") + GPX_EPILOGUE;
-    if (!repairTripInPlace(tripMount(storage), path,
-                           static_cast<size_t>(end), suffix.c_str())) {
+    bool ok;
+    if (rewrite) {
+        ok = rewriteTripEpilogue(tripMount(storage), path, end, GPX_EPILOGUE, epilogueSize);
+    } else {
+        const String suffix = String("\n") + GPX_EPILOGUE;
+        ok = repairTripInPlace(tripMount(storage), path, static_cast<size_t>(end), suffix.c_str());
+    }
+    if (!ok) {
         Serial.printf("fsck: could not repair %s (write failed)\n", path);
         return false;
     }

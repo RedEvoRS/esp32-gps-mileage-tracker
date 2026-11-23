@@ -281,7 +281,7 @@ int main(int argc, char** argv) {
         dump("T5");
     }
 
-    printf("T6 epilogue write doesn't land\n");
+    printf("T6 complete epilogue fails to sync\n");
     {
         resetWorld();
         drive(15, 40); drive(0, kCooldownSeconds);
@@ -2143,14 +2143,18 @@ int main(int argc, char** argv) {
         g_disk.files[path] = prefix + "<trkpt";
         strcpy(gTripPath, path.c_str()); gTripWriteFailed = true; gState = ACTIVE;
         endTrip(false);
-        CHECK(g_disk.readCalls == 2 && g_disk.readBytes == 272 && g_disk.files[path] == prefix + "\n" + GPX_EPILOGUE,
-              "small and near-8-MiB endTrip repairs each read only 16 plus 256 bytes");
+        CHECK(g_disk.readCalls == 2 && g_disk.readBytes == strlen(GPX_EPILOGUE) + 256 &&
+              g_disk.files[path] == prefix + "\n" + GPX_EPILOGUE,
+              "small and near-8-MiB endTrip repairs each read only one epilogue plus 256 bytes");
+        CHECK(g_disk.repairOperations == std::vector<std::string>({"open", "truncate", "sync", "seek", "write", "sync", "close"}),
+              "torn tails still use checked truncate and append");
         g_disk.files[path] = prefix + std::string(TRIP_REPAIR_SCAN_BYTES * 2, '\0');
         const std::string damaged = g_disk.files[path];
         g_disk.readBytes = g_disk.readCalls = 0; g_disk.repairOperations.clear();
         strcpy(gTripPath, path.c_str()); gTripWriteFailed = true; gState = ACTIVE;
         endTrip(false);
-        CHECK(g_disk.readBytes == TRIP_REPAIR_SCAN_BYTES + 16 && g_disk.files[path] == damaged && g_disk.repairOperations.empty(),
+        CHECK(g_disk.readBytes == TRIP_REPAIR_SCAN_BYTES + strlen(GPX_EPILOGUE) &&
+              g_disk.files[path] == damaged && g_disk.repairOperations.empty(),
               "excess damage stops at 4 KiB without cutting or removing complete points");
         fsckAllTrips(LittleFS);
         CHECK(g_disk.files[path] == prefix + "\n" + GPX_EPILOGUE, "boot repairs a tail longer than the runtime budget");

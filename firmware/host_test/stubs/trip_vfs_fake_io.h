@@ -6,7 +6,7 @@
 // Writes immediately change the visible file size. Sync and close can still
 // fail, as on a real filesystem with dirty data or metadata.
 namespace trip_vfs_io {
-struct Handle { FakeDisk* disk; std::string path; size_t offset; bool batch; };
+struct Handle { FakeDisk* disk; std::string path; size_t offset; bool batch; bool append; };
 inline std::map<int, Handle> handles;
 inline int nextFd = 100;
 inline bool failed(FakeDisk& disk, const char* op, bool batch = false) {
@@ -22,24 +22,28 @@ inline bool failed(FakeDisk& disk, const char* op, bool batch = false) {
     errno = EIO;
     return true;
 }
-inline int open(const char* full, int flags, int = 0) {
+inline int openHandle(const char* full, int flags, bool batch) {
     FakeDisk* disk = nullptr;
     const char* relative = nullptr;
     if (!std::strncmp(full, "/sd/", 4)) { disk = &g_sdDisk; relative = full + 3; }
     if (!std::strncmp(full, "/littlefs/", 10)) { disk = &g_disk; relative = full + 9; }
     if (!disk || !disk->mounted || disk->writesFail || relative == disk->failOpenPath) return -1;
     const bool create = flags == (O_WRONLY | O_CREAT | O_EXCL);
-    const bool batch = create || flags == (O_WRONLY | O_APPEND);
-    if (!batch && flags != O_WRONLY) return -1;
+    const bool append = flags == (O_WRONLY | O_APPEND);
+    if (!create && !append && flags != O_WRONLY) return -1;
     if (batch && disk->failNextOpens > 0) { --disk->failNextOpens; return -1; }
     const bool exists = disk->files.count(relative) != 0;
-    if ((create ? exists : !exists) || failed(*disk, "open", batch)) return -1;
+    // FatFs maps O_APPEND to FA_OPEN_ALWAYS, even without O_CREAT.
+    const bool canCreate = create || (append && disk == &g_sdDisk);
+    if ((create && exists) || (!exists && !canCreate) || failed(*disk, "open", batch)) return -1;
     if (!batch && disk->openHandles) { std::fprintf(stderr, "repair reader still open\n"); std::abort(); }
-    if (create) { disk->mutatedDirectory(); disk->files.emplace(relative, ""); }
+    if (!exists) { disk->mutatedDirectory(); disk->files.emplace(relative, ""); }
     int fd = nextFd++;
-    handles.emplace(fd, Handle{disk, relative, 0, batch}); ++disk->openHandles;
+    handles.emplace(fd, Handle{disk, relative, 0, batch, append}); ++disk->openHandles;
     return fd;
 }
+inline int open(const char* full, int flags) { return openHandle(full, flags, false); }
+inline int openBatch(const char* full, int flags, int = 0) { return openHandle(full, flags, true); }
 inline int ftruncate(int fd, off_t cut) {
     auto& h = handles.at(fd);
     if (failed(*h.disk, "truncate") || cut < 0 || static_cast<size_t>(cut) > h.disk->files.at(h.path).size()) return -1;
@@ -64,12 +68,18 @@ inline off_t lseek(int fd, off_t offset, int whence) {
 inline ssize_t write(int fd, const void* bytes, size_t size) {
     auto& h = handles.at(fd);
     if (!h.batch && failed(*h.disk, "write")) return -1;
-    // The batch writer and repair both append without overwriting points.
-    if (h.offset != h.disk->files.at(h.path).size()) { std::fprintf(stderr, "append at wrong offset\n"); std::abort(); }
+    auto& file = h.disk->files.at(h.path);
+    if (h.append) h.offset = file.size();
+    if (h.offset > file.size() || (h.batch && h.offset != file.size())) {
+        std::fprintf(stderr, "write at wrong offset\n");
+        std::abort();
+    }
+    size_t overwrite = file.size() - h.offset;
     size_t room = h.disk->capacity > h.disk->used() ? h.disk->capacity - h.disk->used() : 0;
-    size_t n = std::min(size, h.batch ? room : std::min(room, h.disk->repairWriteLimit));
+    size_t n = std::min(size, room + overwrite);
+    if (!h.batch) n = std::min(n, h.disk->repairWriteLimit);
     ++h.disk->writeCalls;
-    h.disk->files.at(h.path).append(static_cast<const char*>(bytes), n);
+    file.replace(h.offset, std::min(n, overwrite), static_cast<const char*>(bytes), n);
     h.offset += n;
     // A write can modify bytes before the driver returns an error.
     if (h.batch && failed(*h.disk, "write", true)) return -1;

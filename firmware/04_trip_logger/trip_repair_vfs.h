@@ -25,3 +25,19 @@ inline bool repairTripInPlace(const char* mount, const char* relative,
     if (trip_vfs_io::close(fd) != 0) ok = false;
     return ok;
 }
+
+// Rewriting an intact epilogue marks the FAT handle dirty for fsync while
+// preserving the closing tags, even if only part of the rewrite succeeds.
+inline bool rewriteTripEpilogue(const char* mount, const char* relative,
+                                off_t offset, const char* epilogue, size_t size) {
+    char path[96];
+    int n = std::snprintf(path, sizeof(path), "%s%s", mount, relative);
+    if (n <= 0 || static_cast<size_t>(n) >= sizeof(path)) return false;
+    int fd = trip_vfs_io::open(path, O_WRONLY);
+    if (fd < 0) return false;
+    bool ok = trip_vfs_io::lseek(fd, offset, SEEK_SET) == offset;
+    if (ok) ok = trip_vfs_io::write(fd, epilogue, size) == static_cast<ssize_t>(size);
+    if (ok) ok = trip_vfs_io::fsync(fd) == 0;
+    if (trip_vfs_io::close(fd) != 0) ok = false;
+    return ok;
+}

@@ -16,8 +16,10 @@ public:
         char path[96];
         int n = std::snprintf(path, sizeof(path), "%s%s", mount, relative);
         if (n <= 0 || static_cast<size_t>(n) >= sizeof(path)) return;
-        fd = create ? trip_vfs_io::open(path, O_WRONLY | O_CREAT | O_EXCL, 0666)
-                    : trip_vfs_io::open(path, O_WRONLY | O_APPEND);
+        // FAT treats O_APPEND as create-if-missing. Open the existing file
+        // and seek to its end while the caller holds FS_LOCK.
+        fd = create ? trip_vfs_io::openBatch(path, O_WRONLY | O_CREAT | O_EXCL, 0666)
+                    : trip_vfs_io::openBatch(path, O_WRONLY);
         // A trip must already have bytes on disk before appending points.
         ok = fd >= 0 && (create || trip_vfs_io::lseek(fd, 0, SEEK_END) > 0);
     }

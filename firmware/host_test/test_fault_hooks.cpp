@@ -474,12 +474,68 @@ int main(int argc, char** argv) {
             if (!healthy) { assert(writeOrBufferTrkpt(fx)); one(4006, "clear"); }
         }
     }
-    faultWorld(); assert(beginTrip(fx)); assert(writeOrBufferTrkpt(fx));
-    g_sdDisk.tripFailOperation = "sync";
-    endTrip(false); auto finalize = codeRows(take(), 4006);
-    assert(finalize.size() == 2);
-    has(finalize[0], "\"transition\":\"raise\""); has(finalize[0], "\"operation\":\"close\"");
-    has(finalize[1], "\"transition\":\"clear\"");
+    for (bool sd : {false, true}) {
+        auto& disk = sd ? g_sdDisk : g_disk;
+        const char* backend = sd ? "\"backend\":\"sd\"" : "\"backend\":\"littlefs\"";
+        const auto writeFaultActive = [] {
+            for (const auto& condition : gLoopConditions) {
+                if (condition.code == 4006) return condition.desired && condition.episode != 0;
+            }
+            return false;
+        };
+        for (bool lostBeforePoint : {false, true}) {
+            faultWorld();
+            if (!sd) gTripFS = &LittleFS;
+            assert(beginTrip(fx)); assert(writeOrBufferTrkpt(fx));
+            const std::string path = gTripPath;
+            assert(gTripFS->remove(path.c_str()));
+            const auto directoryRevision = disk.directoryRevision;
+            if (lostBeforePoint) assert(!writeOrBufferTrkpt(fx));
+            endTrip(false);
+            assert(disk.directoryRevision == directoryRevision && !disk.files.count(path));
+            const auto rows = take();
+            const auto writes = codeRows(rows, 4006);
+            const auto repairs = codeRows(rows, 4007);
+            assert(writes.size() == 1 && repairs.size() == 1 && writeFaultActive());
+            has(writes[0], "\"transition\":\"raise\"");
+            has(writes[0], backend);
+            has(writes[0], lostBeforePoint ? "\"operation\":\"open\"" : "\"operation\":\"close\"");
+            has(repairs[0], "\"reason\":\"read\"");
+        }
+        for (const char* fault : {"", "write", "short write", "sync"}) {
+            faultWorld();
+            if (!sd) gTripFS = &LittleFS;
+            assert(beginTrip(fx)); assert(writeOrBufferTrkpt(fx));
+            const std::string path = gTripPath;
+            const std::string complete = disk.files.at(path) + GPX_EPILOGUE;
+            disk.tripFailOperation = "sync";
+            const bool shortWrite = !std::strcmp(fault, "short write");
+            if (shortWrite) disk.repairWriteLimit = 3;
+            else disk.repairFailOperation = fault;
+            endTrip(false);
+            const auto rows = take();
+            const auto finalize = codeRows(rows, 4006);
+            const bool repaired = !*fault;
+            assert(finalize.size() == (repaired ? 2u : 1u));
+            assert(writeFaultActive() == !repaired);
+            has(finalize[0], "\"transition\":\"raise\""); has(finalize[0], "\"operation\":\"close\"");
+            has(finalize[0], backend);
+            if (repaired) {
+                has(finalize[1], "\"transition\":\"clear\"");
+                assert(episode(finalize[0]) == episode(finalize[1]));
+                assert(codeRows(rows, 4010).size() == 1);
+            } else {
+                const auto failed = codeRows(rows, 4007);
+                assert(failed.size() == 1);
+                has(failed[0], "\"reason\":\"write\"");
+            }
+            std::vector<std::string> operations = {"open", "seek", "write"};
+            if (!shortWrite && std::strcmp(fault, "write")) operations.push_back("sync");
+            operations.push_back("close");
+            assert(disk.repairOperations == operations);
+            assert(disk.files.at(path) == complete && disk.openHandles == 0);
+        }
+    }
 
     // Five-minute finalization must not manufacture a fix recovery.
     faultWorld(); run(15, 40); assert(gState == ACTIVE); take();

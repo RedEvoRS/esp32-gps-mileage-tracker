@@ -1536,7 +1536,11 @@ This runtime switch has host-test coverage; removal during a real trip, upload
 timing, and recovery of the removed card still need a board check.
 These hooks do not modify EventLog's revision/failure rules. GPX commits check
 write, sync and close results on both stores. E4006 `close` reports a
-failure during trip finalization.
+failure during trip finalization. Appending requires an existing trip file,
+and a missing file keeps E4006 active through finalization. After a failed
+commit, runtime repair rewrites and syncs an intact GPX epilogue at its
+existing offset. A torn tail is cut back to the last complete point before
+the closing tags are appended.
 HTTP error classes stay active across different errors and clear only on 200.
 Existing quarantine/retry behavior is unchanged; intentional network aborts do
 not generate transport/join faults.
