@@ -349,6 +349,7 @@ exists, not that every occurrence is guaranteed durable or already road-tested.
 | E4008 | `EVENT_WRITE_FAILED` | error | `transitions` | Yes |
 | E4009 | `EVENTS_DROPPED` | warning | `per_occurrence` | Yes |
 | E4010 | `TRIP_RECOVERED` | info | `per_occurrence` | Yes |
+| E4011 | `SD_FILESYSTEM_DAMAGED` | error | `transitions` | Yes |
 | E5001 | `HOME_AP_ABSENT` | info | `counter` | Counter only; snapshot, no journal event |
 | E5002 | `WIFI_JOIN_FAILED` | warning | `transitions` | Yes |
 | E5003 | `UPLOAD_TRANSPORT_FAILED` | warning | `transitions` | Yes |
@@ -386,6 +387,7 @@ second metric reference.
 | An old fault is in history, or a condition says unknown | History is not current health. A reboot or omitted/unobserved condition is unknown, not measured recovery. Use the current snapshot and receipt age. |
 | The screen is dark | Production normally sleeps between cards. Try POWER while running. E6001 means display failure disabled both display paths for this boot; missing pixels alone cannot diagnose the cause. |
 | Serial prints `DEGRADED:` | No trips are being recorded and no diagnostics uploads run in that boot. Address the reported power/storage startup failure; bounded retries restart the board after recovery. See [degraded startup service](#degraded-startup-service-126). |
+| E4011 or `SD card damaged` | The tracker is using internal flash if available. Check the reason in Device health or the serial warning, then [power off and preserve the card's files](firmware/README.md#if-the-trip-storage-wont-mount-later). |
 | Viewer says Diagnostics unavailable (503) | The database read, schema or lock failed; inspect the viewer warning and server storage/service state. This is unavailable evidence, not an empty healthy result. |
 
 Successful diagnostics requests do not print a serial success line. Confirm
@@ -655,13 +657,17 @@ The catalog OLED text fits the usual limits; INFO history never produces a
 production fault card or notification. Existing Device health history and
 monitor exports render the new catalog fields without a new viewer interface.
 
-**Upgrade the server before installing this firmware.** A v6 server accepts
-older firmware, including BOOT without battery fields. An older server rejects
-the new BOOT keys and context-bearing E2009, even though protocol/schema v1 is
-unchanged. Rejected batches can enter the firmware's existing bounded isolation
-path; those readings are not guaranteed to be delivered later. Update/restart
-ingest, viewer and monitor together so all load catalog v6. No database migration
-or new service dependency is needed.
+Catalog v7 defines **4011 SD_FILESYSTEM_DAMAGED**, an error with
+`notify=true` and `journal=transitions`. It carries a `reason` enum when a
+mounted card fails the read-only check.
+
+**Upgrade the server before installing this firmware.** Update/restart
+ingest, viewer and monitor together so all load catalog v7. Protocol/schema
+v1 is unchanged, and the new catalog accepts records from older firmware.
+A server with an older catalog rejects the `reason` context on E4011.
+Rejected batches can enter the firmware's bounded isolation path,
+so affected records may be lost. The upgrade requires no database
+migration or new service dependency.
 
 ### Protocol v1 (#117 contract, #118 and #125 integration)
 
@@ -1418,6 +1424,7 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E4007 | Boot fsck directory/read, ambiguous repair, write or publish fails; also runtime repair failure, including a trip-end tail longer than 4 KiB left for boot repair (`parse`) | Per-occurrence notice; no clear | `backend`, `reason=read\|parse\|write\|rename` (`rename` only for older firmware's `.fix` copies) |
 | E4008 | Journal preparation, event append, sealing or metadata persistence fails | All failed stores must later append an event or durably ack an event batch; 15-minute repeats, no recursive submission | `backend`, `operation=open\|write\|close\|rename\|ack` |
 | E4010 | Actual repaired trip (cut in place since firmware v1.06), published verified repair or recovered orphan | Per-occurrence notice; complete untouched files and garbage cleanup stay silent | `backend`; `points` only when an older firmware's `.fix` copy was recovered (in-place repairs don't count points) |
+| E4011 | SD mounts but the read-only FAT check fails before the first filesystem write | A later passing check makes the condition inactive in Device health; a boot that never reaches the check leaves it unobserved | `reason` on raise/repeat |
 | E5001 | Completed successful scan does not see the configured AP | **Counter only**, boot-local, saturates at 2^63-1; failed/aborted scans do not increment | none; future check-in counter |
 | E5002 | Completed 15 s WiFi join attempt fails | Next successful join; AP absence is not recovery | `attempts` (saturates at 255, resets on join) |
 | E5003 | Trip HTTP result <=0 | Next HTTP 200 trip upload | `attempts` (transport failures since success, saturates at 255), `target=trip` |
@@ -1483,6 +1490,24 @@ Before a healthy sample or a completed suspect hold, E3009 is not observed in
 snapshots and produces no journal event. Once raised it stays active through
 missing evidence, with normal 15-minute repeats; only measured recovery clears.
 
+E4011 leaves the card untouched and sends new trips and diagnostics to
+internal flash if it is available. E4001 continues to report that SD is
+unavailable, including when E4011 explains why. E4008 reports a journal
+operation that failed on a store it was using. A card rejected at mount
+never becomes a journal store. The E4011 reasons are `read_error` (a sector
+could not be read), `invalid_bpb` (invalid volume layout), `fat_reserved`
+(invalid FAT header entries), and `root_chain`, `trips_chain`, or
+`diag_chain` (invalid directory allocation). The check reads at most 96
+sectors. Reaching that limit alone lets startup proceed.
+
+When the OLED says `SD card damaged` / `Check card on PC`, power off
+before pulling the card. Find the reason in the serial warning or Device
+health, then copy anything you need on a PC, including unuploaded files
+in `trips/`. Reformat as FAT32 only after copying what you need, then
+reinsert the card with the tracker off. The tracker never formats it.
+See the [card recovery instructions](firmware/README.md#if-the-trip-storage-wont-mount-later)
+for the shutdown procedure and Windows format command.
+
 Storage space is checked at boot, on admission, during trips and every 30 s while
 idle so uploads can produce observed recovery on core 1. LittleFS free space
 already excludes the unused journal reserve. Below 64 KiB a new trip is refused;
@@ -1498,8 +1523,8 @@ If internal flash was mounted at boot, new trips use its queue after the current
 SD trip ends. The current trip stays on SD and ends through E4006 on its next
 attempted write; it is left for repair on a later boot with a working card.
 Uploads and diagnostics skip the known failed SD, keeping its files untouched.
-No card is remounted or formatted at runtime. Reinserting it does not resume SD
-use: power off, check/reseat or replace the card, then restart. With no mounted
+A runtime SD failure stays latched until reboot. Power off, check the card
+or replace it, then restart to resume SD use. With no mounted
 flash fallback, new trips are refused as storage unavailable. Flash still needs
 the same free-space reserves; if it fills, E4004/E4005 name `littlefs`.
 This runtime switch has host-test coverage; removal during a real trip, upload
@@ -1909,6 +1934,8 @@ and on the bench**, not pin changes for the existing T-Beam V1.2 sketch:
 - SH1106 OLED, 128x64, on Wire SDA17/SCL18, address 0x3C (bench-confirmed with the debug adapter).
 - PCF8563 RTC, address 0x51 on the PMU bus Wire1 SDA42/SCL41.
 - SD MOSI35/SCK36/MISO37/CS47, powered by BLDO1; hold IMU CS34 high.
+  At startup the tracker deselects both SPI devices and waits 500 ms before
+  switching off BLDO1 if it may still be powering the card after a reset.
 - Supreme ALDO3 is LoRa, ALDO4 is GPS. This differs from the V1.2's measured
   GPS rail; copying these assignments into that sketch would be wrong.
 

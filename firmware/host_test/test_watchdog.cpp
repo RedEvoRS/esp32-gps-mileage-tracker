@@ -224,12 +224,12 @@ static void handoverNearDeadline() {
 static void boundedShutdownAndBlockedLock() {
     watchdogWorld(); setup(); checkArmed();
     // Both handoffs consume their full budget, then the failed PMU shutdown
-    // returns after both one-second holds. Never feed inside either wait.
+    // returns after both one-second holds and the SD settle. No feeds inside either wait.
     PMU.vbusIn = false; PMU.failShutdown = true;
     gNetBusy = true; gJournalReady = true;
     unsigned baseline = g_watchdog.feeds;
     unsigned slices = 0;
-    g_taskDelayHook = [](uint32_t ms) { assert(ms == 20 || ms == 1000); };
+    g_taskDelayHook = [](uint32_t ms) { assert(ms == 20 || ms == 1000 || ms == SD_POWER_OFF_SETTLE_MS); };
     // Observe feeds only between stages; the first two feeds follow the two
     // full 15-second waits, never their 20 ms polling slices.
     uint32_t start = millis();
@@ -240,7 +240,7 @@ static void boundedShutdownAndBlockedLock() {
         if (slices == 2) assert(elapsed == 2 * NET_ABORT_MS);
     };
     try { powerOffForVbus("user_long_press"); assert(false); } catch (const Restarted&) {}
-    assert(uint32_t(millis() - start) == 2 * NET_ABORT_MS + 2000);
+    assert(uint32_t(millis() - start) == 2 * NET_ABORT_MS + 2000 + SD_POWER_OFF_SETTLE_MS);
     assert(g_watchdog.feeds > baseline && g_restarts == 1);
     g_watchdog.onFeed = nullptr; g_taskDelayHook = nullptr;
     g_lockDepth = 0; gFsDemand = 0;

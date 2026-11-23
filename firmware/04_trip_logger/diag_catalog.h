@@ -5,8 +5,8 @@
 #include <cstdint>
 
 namespace diagnostics {
-constexpr std::uint16_t kCatalogVersion = 6;
-constexpr char kCatalogDigest[] = "5f442ea44577763d8852e48e185a25564e98ae1b3a578ab5292fc1296874b4f0";
+constexpr std::uint16_t kCatalogVersion = 7;
+constexpr char kCatalogDigest[] = "c53e213710d8854284be41a623ebe9f460c492f39ccfb7e910d48969add2921a";
 enum class Severity : std::uint8_t { Info, Warning, Error, Critical };
 enum class Journal : std::uint8_t { PerOccurrence, Transitions, Counter };
 enum class Code : std::uint16_t {
@@ -46,6 +46,7 @@ enum class Code : std::uint16_t {
     EVENT_WRITE_FAILED = 4008,
     EVENTS_DROPPED = 4009,
     TRIP_RECOVERED = 4010,
+    SD_FILESYSTEM_DAMAGED = 4011,
     HOME_AP_ABSENT = 5001,
     WIFI_JOIN_FAILED = 5002,
     UPLOAD_TRANSPORT_FAILED = 5003,
@@ -106,6 +107,7 @@ constexpr CatalogEntry kCatalog[] = {
     {Code::EVENT_WRITE_FAILED, "EVENT_WRITE_FAILED", Severity::Error, {"Event write failed", "", ""}, 1, "Diagnostic journal write failed", true, Journal::Transitions},
     {Code::EVENTS_DROPPED, "EVENTS_DROPPED", Severity::Warning, {"Diagnostics lost", "", ""}, 1, "Diagnostic events were dropped", true, Journal::PerOccurrence},
     {Code::TRIP_RECOVERED, "TRIP_RECOVERED", Severity::Info, {"Trip recovered", "", ""}, 1, "Incomplete trip recovered", false, Journal::PerOccurrence},
+    {Code::SD_FILESYSTEM_DAMAGED, "SD_FILESYSTEM_DAMAGED", Severity::Error, {"SD card damaged", "Check card on PC", ""}, 2, "microSD filesystem check failed", true, Journal::Transitions},
     {Code::HOME_AP_ABSENT, "HOME_AP_ABSENT", Severity::Info, {"Home WiFi absent", "", ""}, 1, "Home access point not seen", false, Journal::Counter},
     {Code::WIFI_JOIN_FAILED, "WIFI_JOIN_FAILED", Severity::Warning, {"WiFi join failed", "", ""}, 1, "WiFi association failed", true, Journal::Transitions},
     {Code::UPLOAD_TRANSPORT_FAILED, "UPLOAD_TRANSPORT_FAILED", Severity::Warning, {"Upload link failed", "", ""}, 1, "Upload transport failed", true, Journal::Transitions},
@@ -142,6 +144,7 @@ constexpr const char* kValues_EVENT_WRITE_FAILED_backend[] = {"sd", "littlefs", 
 constexpr const char* kValues_EVENT_WRITE_FAILED_operation[] = {"open", "write", "close", "rename", "ack"};
 constexpr const char* kValues_EVENTS_DROPPED_backend[] = {"sd", "littlefs", "ram", "none"};
 constexpr const char* kValues_TRIP_RECOVERED_backend[] = {"sd", "littlefs", "ram", "none"};
+constexpr const char* kValues_SD_FILESYSTEM_DAMAGED_reason[] = {"read_error", "invalid_bpb", "fat_reserved", "root_chain", "trips_chain", "diag_chain"};
 constexpr const char* kValues_UPLOAD_TRANSPORT_FAILED_target[] = {"trip", "events"};
 constexpr const char* kValues_UPLOAD_AUTH_FAILED_target[] = {"trip", "events"};
 constexpr const char* kValues_UPLOAD_TOO_LARGE_target[] = {"trip", "events"};
@@ -192,6 +195,7 @@ constexpr ContextField kContextFields[] = {
     {Code::EVENTS_DROPPED, "count", ContextType::Integer, 0LL, 2147483647LL, nullptr, 0},
     {Code::TRIP_RECOVERED, "backend", ContextType::Enum, 0LL, 0LL, kValues_TRIP_RECOVERED_backend, 4},
     {Code::TRIP_RECOVERED, "points", ContextType::Integer, 0LL, 2147483647LL, nullptr, 0},
+    {Code::SD_FILESYSTEM_DAMAGED, "reason", ContextType::Enum, 0LL, 0LL, kValues_SD_FILESYSTEM_DAMAGED_reason, 6},
     {Code::WIFI_JOIN_FAILED, "attempts", ContextType::Integer, 0LL, 255LL, nullptr, 0},
     {Code::UPLOAD_TRANSPORT_FAILED, "attempts", ContextType::Integer, 0LL, 255LL, nullptr, 0},
     {Code::UPLOAD_TRANSPORT_FAILED, "target", ContextType::Enum, 0LL, 0LL, kValues_UPLOAD_TRANSPORT_FAILED_target, 2},

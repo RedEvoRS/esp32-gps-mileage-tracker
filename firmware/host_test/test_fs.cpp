@@ -45,6 +45,7 @@ static void resetWorld() {
     g_disk = FakeDisk();
     g_sdDisk = FakeDisk(); g_sdDisk.mounted = false; g_sdDisk.renameOverwrites = false;
     SD.dirs.clear(); SD.cardPresent = false; SD.begins = SD.ends = 0;
+    SD.corruptFat = false; gSdFatChecked = false;
     gTripFS = &LittleFS; gSdMounted = false; gFlashMounted = true;
     g_powerEvents.clear();
     g_partition = PartitionStub();
@@ -1688,8 +1689,8 @@ int main(int argc, char** argv) {
               "queue scans and uploads close all file and directory handles");
     }
 
-    printf("T54 SD is closed and unmounted before PMU shutdown (#109)\n");
-    {
+    printf("T54 SD is closed and settled before PMU shutdown (#109)\n");
+    for (const char* reason : {"idle_battery", "battery_critical", "user_long_press"}) {
         resetWorld(); SD.cardPresent = true; setup(); drive(15, 40); PMU.vbusIn = false;
         PMU.onShutdown = [] {
             CHECK(g_sdDisk.openHandles == 0 && g_disk.openHandles == 0 &&
@@ -1699,10 +1700,19 @@ int main(int argc, char** argv) {
                   "SD trip finalized before shutdown cuts power");
             CHECK(PMU.bldo1, "BLDO1 stays enabled until PMU shutdown cuts the rails");
         };
-        try { powerOffForVbus(); } catch (const PoweredOff&) {}
+        g_taskDelayHook = [](uint32_t ms) {
+            if (ms == SD_POWER_OFF_SETTLE_MS) {
+                CHECK(!g_sdDisk.mounted && PMU.bldo1 && !PMU.shutdownCalls && g_lockDepth == 1,
+                      "settle holds the powered card idle under the filesystem mutex");
+                g_powerEvents.push_back("SD.settle");
+            }
+        };
+        try { powerOffForVbus(reason); } catch (const PoweredOff&) {}
         auto ended = std::find(g_powerEvents.begin(), g_powerEvents.end(), "SD.end");
+        auto settle = std::find(g_powerEvents.begin(), g_powerEvents.end(), "SD.settle");
         auto shutdown = std::find(g_powerEvents.begin(), g_powerEvents.end(), "PMU.shutdown");
-        CHECK(ended < shutdown && PMU.shutdownCalls == 1, "SD.end precedes PMU.shutdown");
+        CHECK(ended < settle && settle < shutdown && PMU.shutdownCalls == 1,
+              "SD unmount precedes settle, which precedes PMU.shutdown");
     }
 
     printf("T55 cancelled/failed SD shutdown remounts the same stores (#109)\n");
@@ -1727,15 +1737,24 @@ int main(int argc, char** argv) {
             CHECK(g_sdDisk.files.size() == 2 && g_sdDisk.openHandles == 0,
                   "the next trip still records to SD after recovery");
         }
-        for (bool failFlash : {false, true}) {
+        for (int failure = 0; failure < 3; ++failure) {
             resetWorld(); SD.cardPresent = true; setup(); drive(15, 40); PMU.vbusIn = false;
             g_sdDisk.onUnmount = [] { PMU.vbusIn = true; };
-            if (failFlash) g_disk.failMount = true;
-            else SD.cardPresent = false;
+            if (failure == 0) g_disk.failMount = true;
+            else if (failure == 1) SD.cardPresent = false;
+            else {
+                endTrip(false);
+                SD.corruptFat = true;
+            }
+            const unsigned mkdirs = g_sdDisk.mkdirCalls, writes = g_sdDisk.writeCalls;
             try { powerOffForVbus(); } catch (const Restarted&) {}
             CHECK(g_restarts == 1 && g_lockDepth == 1 && gNetHold && gTripFS == &SD &&
                   !g_sdDisk.formatRequested && !g_disk.formatRequested,
                   "failed remount restarts with mutex held and never switches stores underneath logging");
+            if (SD.corruptFat)
+                CHECK(gSdFatCheck == diagnostics::SdFatCheck::ReservedEntries &&
+                      g_sdDisk.mkdirCalls == mkdirs && g_sdDisk.writeCalls == writes && !PMU.bldo1,
+                      "damaged SD on remount is powered off untouched before restart");
         }
     }
 

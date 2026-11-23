@@ -72,7 +72,7 @@
 #include "revision_nvs.h"
 #include "degraded_policy.h"
 #include "startup_watchdog.h"
-#include "journal_sd_geometry.h"
+#include "sd_fat_check.h"
 #include "diag_upload.h"
 #include "journal_platform.h"
 #include "trip_repair_vfs.h"
@@ -130,6 +130,7 @@ static GpsDrainMonitor gGpsDrainMonitor; // core 1 only, since first runtime dra
 static constexpr int SD_MOSI = 35, SD_SCK = 36, SD_MISO = 37, SD_CS = 47, IMU_CS = 34;
 static constexpr uint32_t SD_SPI_HZ = 4000000; // core default; ample for ~119 B/s GPX
 static constexpr uint32_t SD_SETTLE_MS = 250;
+static constexpr uint32_t SD_POWER_OFF_SETTLE_MS = 500;
 
 // -----------------------------------------------------------------
 // Trip state machine thresholds and timing
@@ -261,6 +262,8 @@ fs::FS*           gTripFS = &LittleFS;
 // Mount membership stays fixed for shutdown. A failed SD is latched out until
 // reboot; core 1 may select the mounted flash queue only between trips.
 bool              gSdMounted = false, gFlashMounted = false;
+static bool gSdFatChecked = false;
+static diagnostics::SdFatCheck gSdFatCheck = diagnostics::SdFatCheck::Passed;
 static std::atomic<bool> gSdUnavailable{false};
 volatile bool     gVbusLost   = false;
 volatile bool     gPmuIrqFlag = false;
@@ -379,6 +382,7 @@ static diagnostics::RuntimeFaults::Condition gLoopConditions[] = {
     {diagnostics::Code::RTC_TIME_INVALID},
     {diagnostics::Code::GPS_ANTENNA_SUSPECT},
     {diagnostics::Code::SD_UNAVAILABLE},
+    {diagnostics::Code::SD_FILESYSTEM_DAMAGED},
     {diagnostics::Code::LITTLEFS_UNAVAILABLE},
     {diagnostics::Code::NO_RECORDING_STORAGE},
     {diagnostics::Code::STORAGE_LOW},
@@ -615,6 +619,14 @@ static void batteryCondition(diagnostics::Code code, bool active, uint32_t now) 
     unsigned mv = PMU.getBattVoltage();
     if (mv <= 6000) gLoopFaults.integer("battery_mv", mv);
     gLoopFaults.condition(active);
+}
+
+static void sdFatCondition(uint32_t now) {
+    if (!gJournalReady || !gSdFatChecked) return;
+    bool failed = gSdFatCheck != diagnostics::SdFatCheck::Passed;
+    gLoopFaults.event(diagnostics::Code::SD_FILESYSTEM_DAMAGED, now);
+    if (failed) gLoopFaults.enumeration("reason", diagnostics::sdFatReason(gSdFatCheck));
+    gLoopFaults.condition(failed);
 }
 
 static void storageConditions(uint64_t freeB, uint32_t now) {
@@ -1776,6 +1788,12 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
     if (gSdMounted) SD.end();
     if (gFlashMounted) LittleFS.end();
     feedLoopWatchdogProgress(); // unmount returned; no feed while acquiring lock
+    if (gSdMounted) {
+        // Give the powered card controller time after the last SPI command.
+        // The filesystem lock keeps the bus idle while BLDO1 stays enabled.
+        vTaskDelay(pdMS_TO_TICKS(SD_POWER_OFF_SETTLE_MS));
+        feedLoopWatchdogProgress();
+    }
     // Only the current owner sleeps the shared panel, before the final VBUS
     // read. A latched failure must not retry via the other adapter.
     display::DisplayModel::Input displayOff; displayOff.shutdown = true;
@@ -2737,6 +2755,7 @@ static void serviceRuntimeDiagnostics() {
         gLoopFaults.condition(gGpsAntenna.active());
     }
     gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, now).condition(!gSdMounted || gSdUnavailable.load());
+    sdFatCondition(now);
     // Check idle storage too, so a successful core-0 upload can be observed as
     // recovery on core 1 without sharing producer state across tasks.
     if (uint32_t(now - gStorageDiagMs) >= FS_CHECK_MS) {
@@ -2890,13 +2909,21 @@ static bool mountSdStorage() {
     delay(SD_SETTLE_MS);
     bool busReady = gSdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
     if (busReady && SD.begin(SD_CS, gSdSpi, SD_SPI_HZ, "/sd", 10, false) && SD.cardType() != CARD_NONE) {
-        if (SD.exists(TRIP_DIR) || SD.mkdir(TRIP_DIR)) {
-            File dir = SD.open(TRIP_DIR);
-            bool ready = dir && dir.isDirectory();
-            dir.close();
-            if (ready) return true;
+        gSdFatCheck = diagnostics::checkSdFat(SD);
+        gSdFatChecked = true;
+        if (gSdFatCheck != diagnostics::SdFatCheck::Passed) {
+            Serial.printf("WARNING: microSD filesystem check failed (%s) -- card not used. "
+                          "Check it on a PC and copy any needed files before reformatting as FAT32. "
+                          "The tracker never formats it.\n", diagnostics::sdFatReason(gSdFatCheck));
+        } else {
+            if (SD.exists(TRIP_DIR) || SD.mkdir(TRIP_DIR)) {
+                File dir = SD.open(TRIP_DIR);
+                bool ready = dir && dir.isDirectory();
+                dir.close();
+                if (ready) return true;
+            }
+            Serial.println("WARNING: microSD trip directory unavailable; card preserved.");
         }
-        Serial.println("WARNING: microSD trip directory unavailable; card preserved.");
     } else {
         // SD.begin discards card type on failure; there is no card-detect
         // pin. Be explicit that absence and bus/format faults look alike.
@@ -3200,6 +3227,7 @@ static void beginJournal() {
     gJournalReady = gJournal.begin(gJournalBoot.id, gJournalBoot.counter, firmware::kVersion);
     gJournal.setTimeProvider(stampDiagnosticTime);
     if (gJournalReady) diagnostics::submitJournalBoot(gJournal, esp_reset_reason(), gPmuStartup, millis(), gBootBattery);
+    sdFatCondition(millis());
 }
 
 static bool createFsMutex() {
@@ -3267,6 +3295,7 @@ static void degradedLoop() {
         gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, millis()).condition(true);
         gLoopFaults.event(diagnostics::Code::LITTLEFS_UNAVAILABLE, millis()).condition(true);
         gLoopFaults.event(diagnostics::Code::NO_RECORDING_STORAGE, millis()).condition(true);
+        sdFatCondition(millis());
     } else {
         gLoopFaults.event(diagnostics::Code::PMU_INIT_FAILED, millis()).condition(true);
     }
@@ -3357,8 +3386,21 @@ void setup() {
         enterDegraded(powerMode);
         return;
     }
-    // BLDO1 powers the SD slot but starts ON at 1.8 V. Disable it early;
-    // mountSdStorage sets 3.3 V before enabling it, after safety setup.
+    // An ESP32 reset can leave the card powered and finishing a write.
+    pinMode(SD_CS, OUTPUT);
+    digitalWrite(SD_CS, HIGH);
+    pinMode(IMU_CS, OUTPUT);
+    digitalWrite(IMU_CS, HIGH);
+    // Raw reads keep the I2C failure sentinel. BLDO1 enable is bit 4 of
+    // 0x90; 0x96 bits 0..4 encode 500 mV + 100 mV per step.
+    const int sdRailControl = PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
+    if (sdRailControl < 0 || (sdRailControl & (1 << 4))) {
+        const int voltage = PMU.readRegister(XPOWERS_AXP2101_LDO_VOL4_CTRL);
+        // Skip the pause only when the rail is off or at its 1.8 V default.
+        // Allow up to 500 ms of SDXC write-busy time before cutting power.
+        if (sdRailControl < 0 || voltage < 0 || 500 + (voltage & 0x1f) * 100 != 1800)
+            delay(SD_POWER_OFF_SETTLE_MS);
+    }
     PMU.disableBLDO1();
     // Supreme GPS backup RAM comes straight from the 18650. LilyGO also
     // disables VBACKUP; a 60 s ALDO4-off test hot-started in 2.0 s with it off.

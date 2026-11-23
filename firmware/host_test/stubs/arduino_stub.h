@@ -177,6 +177,7 @@ public:
 // committed size. Faults: failNextOpens, failFlushes (flash error), and a
 // byte capacity (full filesystem).
 struct FakeDisk {
+    unsigned mkdirCalls = 0, writeCalls = 0;
     std::map<std::string, std::string> files;
     size_t capacity = 1 << 22;
     int failNextOpens = 0;
@@ -278,6 +279,7 @@ public:
     size_t write(uint8_t c) override { return write(&c, 1); }
     size_t write(const uint8_t* b, size_t n) {
         if (!p || !p->writable) return 0;
+        ++p->disk->writeCalls;
         p->pending.append((const char*)b, n);
         if (p->pending.size() > 4096) p->commitPending();   // stdio auto-flush
         return n;                                            // fwrite into buffer "succeeds"
@@ -310,7 +312,7 @@ struct FS {
         for (auto& kv : g_disk.files) if (kv.first.rfind(pre, 0) == 0) return true;
         return dirs.count(path) > 0;
     }
-    bool mkdir(const char* p) { dirs.insert(p); return true; }
+    bool mkdir(const char* p) { ++g_disk.mkdirCalls; dirs.insert(p); return true; }
     File open(const char* path, const char* mode = "r") {
         if (path == g_disk.failOpenPath) return File();
         if (g_disk.failNextOpens > 0) { g_disk.failNextOpens--; return File(); }
@@ -378,6 +380,7 @@ struct LittleFSStub : fs::FS {
 extern LittleFSStub LittleFS;
 
 // Separate SD media, including FAT's refusal to rename over a destination.
+#include "fake_sd_fat.h"
 #define HSPI 1
 struct SPIClass {
     int host, sck = -1, miso = -1, mosi = -1, cs = -1;
@@ -392,7 +395,7 @@ constexpr uint8_t CARD_NONE = 0, CARD_SD = 2, CARD_SDHC = 3;
 inline FakeDisk g_sdDisk;
 inline std::vector<std::string> g_powerEvents;
 struct SDStub : fs::FS {
-    bool cardPresent = false;
+    bool cardPresent = false, corruptFat = false;
     int begins = 0, ends = 0;
     int capacityQueries = 0;
     std::function<void()> onCapacity;
@@ -421,9 +424,11 @@ struct SDStub : fs::FS {
     }
     uint64_t usedBytes() { return cardPresent && !g_disk.readsFail ? g_disk.used() : 0; }
     bool readRAW(uint8_t* data, uint32_t sector) {
-        if (sector || !g_disk.mounted) return false;
-        memset(data, 0, 512); data[11] = 0; data[12] = 2; data[13] = 64;
-        data[14] = 32; data[16] = 2; data[510] = 0x55; data[511] = 0xaa;
+        if (!cardPresent || !g_disk.mounted || g_disk.readsFail) return false;
+        fake_sd_fat::sector(data, sector);
+        if (corruptFat && (sector == fake_sd_fat::kFatStart ||
+                           sector == fake_sd_fat::kFatStart + fake_sd_fat::kFatSectors))
+            fake_sd_fat::incidentFat(data);
         return true;
     }
 };
@@ -530,6 +535,7 @@ constexpr uint8_t XPOWERS_AXP2101_STATUS1 = 0x00;
 constexpr uint8_t XPOWERS_AXP2101_STATUS2 = 0x01;
 constexpr uint8_t XPOWERS_AXP2101_LDO_ONOFF_CTRL0 = 0x90;
 constexpr uint8_t XPOWERS_AXP2101_LDO_VOL0_CTRL = 0x92;
+constexpr uint8_t XPOWERS_AXP2101_LDO_VOL4_CTRL = 0x96;
 constexpr uint8_t XPOWERS_AXP2101_INTSTS1 = 0x48;
 constexpr uint8_t XPOWERS_AXP2101_INTSTS2 = 0x49;
 constexpr uint8_t XPOWERS_AXP2101_INTSTS3 = 0x4A;
@@ -563,8 +569,10 @@ struct XPowersAXP2101 {
         if (reg == 0x35) return batteryMv & 0xff;
         if (reg == XPOWERS_AXP2101_STATUS1) return (vbusIn ? 0x20 : 0) | (batteryConnected ? 0x08 : 0);
         if (reg == XPOWERS_AXP2101_STATUS2) return vbusNotIn ? 0x08 : 0;
-        if (reg == XPOWERS_AXP2101_LDO_ONOFF_CTRL0) return (aldo3 ? 0x04 : 0) | (aldo1 ? 0x01 : 0);
+        if (reg == XPOWERS_AXP2101_LDO_ONOFF_CTRL0)
+            return (bldo1 ? 0x10 : 0) | (aldo3 ? 0x04 : 0) | (aldo1 ? 0x01 : 0);
         if (reg == XPOWERS_AXP2101_LDO_VOL0_CTRL) return (aldo1Mv - 500) / 100;
+        if (reg == XPOWERS_AXP2101_LDO_VOL4_CTRL) return (bldo1Mv - 500) / 100;
         if (reg == XPOWERS_AXP2101_INTSTS1) return (lowIrq ? 0x40 : 0) | (criticalIrq ? 0x80 : 0);
         if (reg == XPOWERS_AXP2101_INTSTS2) return (removeIrq ? 0x40 : 0) | (insertIrq ? 0x80 : 0) |
             (longPressIrq ? 0x04 : 0) | (shortPressIrq ? 0x08 : 0);

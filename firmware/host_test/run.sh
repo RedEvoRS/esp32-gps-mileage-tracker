@@ -133,6 +133,11 @@ echo "== test_fs"
 "${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_fs.cpp" "$here/../04_trip_logger/event_log.cpp" -o "$build/test_fs.exe"
 run_modes "$build/test_fs.exe" "$build/out"
 
+echo "== test_sd_fat (read-only mount guard)"
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -Werror -pedantic \
+    "$here/test_sd_fat.cpp" -o "$build/test_sd_fat.exe"
+"$build/test_sd_fat.exe" || status=1
+
 echo "== test_sd_runtime (removed SD classification and between-trip fallback)"
 "${cxx[@]}" "${flags[@]}" "${incs[@]}" "$here/test_sd_runtime.cpp" \
     "$here/../04_trip_logger/event_log.cpp" -o "$build/test_sd_runtime.exe"

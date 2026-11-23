@@ -405,7 +405,8 @@ a card. Stage 4 has since recorded two real drives on the card.
   3. Watch for `Switching off`, then a dark screen. Wait a few seconds for
      shutdown to finish before touching the card. The message appears for
      about one second after trip closure and journal sealing, before storage
-     is unmounted and power is cut. A failed display or degraded startup
+     is unmounted. If SD was mounted, it stays powered for another half
+     second after unmount before power is cut. A failed display or degraded startup
      skips the message. A dark screen by itself does not mean off: the
      running board normally sleeps its screen between cards.
   4. Pull the card **without pressing anything**. Any POWER press, even a
@@ -422,8 +423,19 @@ a card. Stage 4 has since recorded two real drives on the card.
   shutdown, so this fallback requires working power control. In degraded
   startup with no storage, confirmed USB absence still starts the 10-minute
   timer; untrusted PMU startup does not run this power-off path.
-- **The firmware never formats the card.** A card that won't mount is left
-  untouched, and trips go to internal flash instead.
+  During shutdown the tracker leaves a mounted card powered for 500 ms after
+  unmounting it. At startup it deselects the card and waits the same amount
+  before cutting card power if the card may still be finishing a write after
+  a reset.
+- **The firmware never formats the card.** After mounting, the tracker
+  reads key FAT32 structures before it creates directories or writes files.
+  Within a fixed read budget, it checks the file allocation table and the
+  cluster chains for the root, `trips/` and `diag/` directories. On failure
+  it powers the card back off
+  and uses internal flash for new trips and diagnostics if available. The
+  OLED shows E4011, `SD card damaged` / `Check card on PC`. Device health
+  reports E4011 with the check result and E4001 for the unavailable card.
+  See [how to recover the card](#if-the-trip-storage-wont-mount-later).
 - **At boot** the log says which storage it chose:
   - `Trip storage: microSD (29.72 GiB free); internal flash queue mounted.`
     Trips go to the card.
@@ -432,6 +444,9 @@ a card. Stage 4 has since recorded two real drives on the card.
     `WARNING: microSD unavailable -- using internal flash (2.30 MiB free).`
     No usable card: trips go to the internal partition, which holds about
     5–6 hours of driving.
+  - `WARNING: microSD filesystem check failed (<reason>) -- card not used.`
+    The card mounted but failed the read-only check. The rest of the
+    message explains how to preserve files before reformatting on a PC.
 - **Upload behaviour in the code:** the logger attempts finished trips from
   both the card and internal flash, including trips left by a boot without
   a card. It deletes each only after an accepted server response. On
@@ -969,9 +984,21 @@ the board off cleanly. Watch for `Switching off`, then a dark screen, and
 wait a few seconds. Pull the card **without pressing anything**; any POWER
 press, even a tap, switches an off board on. If in doubt, use the 10-minute
 battery idle fallback and its conditions in the [card precautions](#microsd-card).
-Then read or copy the card on a PC.
-Check its seating and FAT32 format before trying it again; the firmware
-never formats it. Preserve its data before any repair or reformat.
+On a PC, check that the card is readable and copy anything you want to
+keep. Trips still awaiting upload are in `trips/` on the card. If the
+tracker reports E4011 and the card needs reformatting, back it up first.
+Formatting erases the card. In a Windows command prompt, replace `X:` with
+the card's drive letter and **double-check the drive letter** before running
+
+```bat
+format X: /FS:FAT32 /A:32K /Q
+```
+
+A FAT32 formatter on another operating system works too. Reinsert the card
+with the tracker switched off, then start it and check that it selects
+microSD again. The tracker never formats the card itself. Until the card
+passes the check, new trips go to internal flash if available. Flash holds
+about 5 to 6 hours of driving, so give it regular opportunities to upload.
 
 For internal flash on a board that's been working, `LittleFS mount failed`
 doesn't mean the trips are gone. Keep format-on-mount-failure disabled. Check that you

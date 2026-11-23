@@ -6,7 +6,7 @@
 using namespace diagnostics;
 static EventLog::Batch sdRuntimeBatch;
 
-static void sdWorld(bool flash = true) {
+static void sdWorld(bool flash = true, bool corruptFat = false) {
     resetWorld();
     gSdUnavailable = false;
     SD.capacityQueries = 0;
@@ -22,8 +22,10 @@ static void sdWorld(bool flash = true) {
     gContactTick = 0; gContactUptime = gLastContact = 0; gContactKnown = false;
     g_millis = 1000; SD.cardPresent = true;
     g_disk.failMount = !flash;
+    SD.corruptFat = corruptFat;
     setup();
-    assert(gTripFS == &SD && gSdMounted && gFlashMounted == flash);
+    assert(gFlashMounted == flash && gSdMounted == !corruptFat);
+    assert(gTripFS == (corruptFat ? static_cast<fs::FS*>(&LittleFS) : static_cast<fs::FS*>(&SD)));
     serviceJournal();
 }
 
@@ -51,6 +53,35 @@ static void checkStorage() {
 }
 
 int main() {
+    sdWorld(true, true);
+    for (unsigned i = 0; i < kEventQueueSize && gJournal.stats().queued; ++i) serviceJournal();
+    assert(!gJournal.stats().queued);
+    auto rejected = events();
+    auto damage = codeRows(rejected, 4011);
+    assert(damage.size() == 1 && damage[0].find("\"reason\":\"fat_reserved\"") != std::string::npos);
+    assert(damage[0].find("\"transition\":\"raise\"") != std::string::npos);
+    assert(codeRows(rejected, 4001).size() == 1 && codeRows(rejected, 4008).empty());
+    assert(gJournal.stats().backend == EventLog::Backend::LittleFs);
+    assert(SD.ends == 1 && !gSdSpi.started && !PMU.bldo1);
+    assert(logHas("microSD filesystem check failed (fat_reserved)"));
+    assert(!g_sdDisk.mkdirCalls && !g_sdDisk.writeCalls && g_sdDisk.files.empty() && SD.dirs.empty());
+
+    sdWorld();
+    for (unsigned i = 0; i < kEventQueueSize && gJournal.stats().queued; ++i) serviceJournal();
+    assert(!gJournal.stats().queued);
+    auto healthy = events();
+    assert(codeRows(healthy, 4011).empty() && codeRows(healthy, 4001).empty());
+    assert(gJournal.stats().backend == EventLog::Backend::Sd);
+    assert(g_sdDisk.mkdirCalls > 0);
+    RuntimeFaults::Observation observations[64];
+    size_t count = 0;
+    assert(gLoopFaults.snapshot(observations, 64, count));
+    const auto* verified = std::find_if(observations, observations + count, [](const auto& entry) {
+        return entry.code == static_cast<uint16_t>(Code::SD_FILESYSTEM_DAMAGED);
+    });
+    assert(verified != observations + count && verified->observed && !verified->episode);
+    std::puts("PASS SD mount guard: rejected card untouched, fallback events on flash, healthy SD selected");
+
     // Nonzero total with zero free means genuinely full, even at SD sizes
     // beyond ESP32 size_t. A failed capacity query means unavailable instead.
     sdWorld(false); events();

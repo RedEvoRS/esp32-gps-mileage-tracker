@@ -241,6 +241,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   E4001 and is latched out until reboot; new trips then go to LittleFS, never
   mid-trip), never formats the card, falls back to LittleFS,
   attempts uploads from both stores, and unmounts both before `PMU.shutdown()`.
+  A read-only FAT32 check before the first write rejects damaged cards with
+  E4011 and keeps trips and diagnostics on LittleFS if available.
   SD uploads were verified on 2026-10-21 (UTC), LittleFS uploads on 2026-11-03 (UTC)
 - Build: `esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled`
   (8 MB flash, 8 MB QSPI PSRAM, native USB). Download mode, the factory

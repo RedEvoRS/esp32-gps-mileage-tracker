@@ -78,7 +78,7 @@ Real TinyGPSPlus headers and implementation are system includes; project
 sources and stubs remain warning-checked. U8g2's real font source is read by
 Python for the glyph check, while renderer tests use project-owned stubs.
 
-`run.sh` builds **33 C++ test sources in 43 build variants**, plus six Python
+`run.sh` builds **34 C++ test sources in 44 build variants**, plus six Python
 checks. Extra builds cover stamped/fallback versions, a second display-card
 duration, both watchdog bench hooks and three sketch copies of bus recovery.
 Many integration binaries also run with runtime debug off and on.
@@ -87,7 +87,8 @@ Many integration binaries also run with runtime debug off and on.
 **Storage and trip lifecycle**
 
 - `test_fs`: GPX (GPS track) file writing, trip states, buffered gaps/untimed points, write/full-store failures, safe first-use formatting, upload queues/retries, boot/shutdown recovery, microSD selection/flash fallback, FAT (card filesystem) interrupted-repair recovery and trip splitting at the size limit.
-- `test_sd_runtime`: removed/unresponsive SD classification, E4001 repeats, real full-card warnings, between-trip internal-flash fallback, retained SD uploads skipped, active-trip E4006, flash capacity guards and diagnostics delivered through the existing revision allocator.
+- `test_sd_fat`: synthetic FAT32 boot sectors and directory chains, the damaged FAT signature, primary MBR partitions, legacy FAT passthrough and the read budget.
+- `test_sd_runtime`: rejection before any writes, E4011 context and LittleFS fallback, removed/unresponsive SD classification, E4001 repeats, real full-card warnings, between-trip internal-flash fallback, retained SD uploads skipped, active-trip E4006, flash capacity guards and diagnostics delivered through the existing revision allocator.
 - `test_journal`: diagnostic journal integration with SD, LittleFS (internal-flash filesystem) and RAM fallback, quotas, trip priority, lock contention, shutdown sealing and remount recovery.
 - `test_journal_vfs`: production filesystem adapter using temporary host files, including sync/close/list errors and path isolation.
 

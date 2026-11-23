@@ -1,5 +1,5 @@
 {
-  "catalog_version": 6,
+  "catalog_version": 7,
   "codes": [
     {
       "code": 1000,
@@ -790,6 +790,33 @@
       },
       "notify": false,
       "journal": "per_occurrence"
+    },
+    {
+      "code": 4011,
+      "symbol": "SD_FILESYSTEM_DAMAGED",
+      "severity": "error",
+      "oled": [
+        "SD card damaged",
+        "Check card on PC"
+      ],
+      "title": "microSD filesystem check failed",
+      "explanation": "The tracker could not verify the FAT32 structures it needs. It left the card untouched and uses internal flash when available.",
+      "recovery": "Power off before removing the card. Copy any needed files on a PC before reformatting as FAT32.",
+      "context": {
+        "reason": {
+          "type": "enum",
+          "values": [
+            "read_error",
+            "invalid_bpb",
+            "fat_reserved",
+            "root_chain",
+            "trips_chain",
+            "diag_chain"
+          ]
+        }
+      },
+      "notify": true,
+      "journal": "transitions"
     },
     {
       "code": 5001,

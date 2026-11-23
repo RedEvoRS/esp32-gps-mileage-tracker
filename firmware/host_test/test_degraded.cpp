@@ -150,6 +150,43 @@ int main() {
         bootMessagesAfterUsbWait(); ++cases;
     }
 
+    // A reset can leave BLDO1 at 3.3 V. Both SPI chip selects must be
+    // driven high before the settle window, with the rail still powered.
+    struct SdRailBoot {
+        bool enabled;
+        int millivolts;
+        bool controlReadFails, voltageReadFails, waits;
+    };
+    for (const SdRailBoot boot : {
+             SdRailBoot{true, 3300, false, false, true},
+             SdRailBoot{true, 1800, false, false, false},
+             SdRailBoot{false, 3300, false, false, false},
+             SdRailBoot{true, 1800, true, false, true},
+             SdRailBoot{true, 1800, false, true, true}}) {
+        world();
+        PMU.bldo1 = boot.enabled;
+        PMU.bldo1Mv = boot.millivolts;
+        if (boot.controlReadFails) failNextRead(XPOWERS_AXP2101_LDO_ONOFF_CTRL0, 4);
+        if (boot.voltageReadFails) failNextRead(XPOWERS_AXP2101_LDO_VOL4_CTRL);
+        g_delayHook = [](uint32_t ms) {
+            bootDelays.push_back(ms);
+            if (ms == SD_POWER_OFF_SETTLE_MS) {
+                assert(PMU.bldo1);
+                assert(g_pinModes.at(SD_CS) == OUTPUT && g_pinLevels.at(SD_CS) == HIGH);
+                assert(g_pinModes.at(IMU_CS) == OUTPUT && g_pinLevels.at(IMU_CS) == HIGH);
+                g_powerEvents.push_back("SD.boot_settle");
+            }
+            g_millis += ms;
+        };
+        setup();
+        const auto off = std::find(g_powerEvents.begin(), g_powerEvents.end(), "BLDO1.off");
+        const auto settle = std::find(g_powerEvents.begin(), g_powerEvents.end(), "SD.boot_settle");
+        assert(off != g_powerEvents.end());
+        assert(boot.waits ? settle < off : settle == g_powerEvents.end());
+        assert(std::count(bootDelays.begin(), bootDelays.end(), SD_POWER_OFF_SETTLE_MS) == boot.waits);
+        ++cases;
+    }
+
     // Failed writes, lying writes and either unreadable verification must
     // warn once after USB is ready, but still start the display and logger.
     for (unsigned failure = 0; failure < 6; ++failure) {
