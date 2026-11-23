@@ -58,12 +58,14 @@ static std::string largeOpenTrip() {
     std::string data = GPX_PROLOGUE;
     // Generate wholly synthetic points with the production serializer rather
     // than storing coordinate literals in this recovery-only test source.
-    File pointFile = SD.open("/synthetic-point", FILE_WRITE);
-    FileWriter writer(pointFile);
+    const bool mounted = g_sdDisk.mounted;
+    g_sdDisk.mounted = true; // the serializer fixture can run before startup
+    FileWriter writer("/sd", "/synthetic-point", /*create=*/true);
     Fix zero{}; zero.speedMps = 1; zero.hdop = 1;
-    appendTrkpt(writer, zero); assert(writer.commit()); pointFile.close();
+    appendTrkpt(writer, zero); assert(writer.commit());
     const std::string point = g_sdDisk.files.at("/synthetic-point");
     SD.remove("/synthetic-point");
+    g_sdDisk.mounted = mounted;
     while (data.size() + point.size() + 10 < TRIP_SPLIT_BYTES) data += point;
     return data + "<trkpt";
 }

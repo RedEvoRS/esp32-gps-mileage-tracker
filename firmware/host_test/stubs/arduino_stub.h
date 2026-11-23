@@ -191,6 +191,8 @@ struct FakeDisk {
     size_t failReadAfter = 0;
     size_t readBytes = 0, readCalls = 0;
     bool failSeek = false;
+    std::string tripFailOperation;
+    unsigned tripFailuresToSkip = 0;
     // Direct VFS repair faults are separate from Arduino buffered flushes.
     std::string repairFailOperation;
     unsigned repairFailuresToSkip = 0;

@@ -1534,8 +1534,9 @@ flash fallback, new trips are refused as storage unavailable. Flash still needs
 the same free-space reserves; if it fills, E4004/E4005 name `littlefs`.
 This runtime switch has host-test coverage; removal during a real trip, upload
 timing, and recovery of the removed card still need a board check.
-These hooks do not modify EventLog's revision/failure rules. Arduino's void close cannot independently
-report close errors; E4006 `close` means the verified finalization commit failed.
+These hooks do not modify EventLog's revision/failure rules. GPX commits check
+write, sync and close results on both stores. E4006 `close` reports a
+failure during trip finalization.
 HTTP error classes stay active across different errors and clear only on 200.
 Existing quarantine/retry behavior is unchanged; intentional network aborts do
 not generate transport/join faults.

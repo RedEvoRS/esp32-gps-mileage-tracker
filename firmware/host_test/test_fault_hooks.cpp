@@ -435,7 +435,7 @@ int main(int argc, char** argv) {
         }
         fsckAllTrips(SD); auto failed = one(4007, "notice");
         has(failed, std::string("\"reason\":\"") + reason + "\"");
-        g_sdDisk.failNextOpens = g_sdDisk.failFlushes = g_sdDisk.failRenames = 0;
+        g_sdDisk.failNextOpens = g_sdDisk.failRenames = 0;
         g_sdDisk.repairFailOperation.clear();
         fsckAllTrips(SD); one(4010, "notice");
         fsckAllTrips(SD); assert(take().empty());
@@ -447,12 +447,35 @@ int main(int argc, char** argv) {
     faultWorld(); g_sdDisk.files["/trips/ambiguous.gpx.fix"] = "unrecognized repair";
     fsckAllTrips(SD); has(one(4007, "notice"), "\"reason\":\"parse\"");
 
-    // Write and finalize failures reach E4006 as well as failed creates.
-    faultWorld(); Fix fx = {}; fx.hasUtc = true; assert(beginTrip(fx)); assert(take().empty());
-    g_sdDisk.failFlushes = 1; assert(!writeOrBufferTrkpt(fx));
-    has(one(4006, "raise"), "\"operation\":\"write\"");
-    assert(writeOrBufferTrkpt(fx)); one(4006, "clear");
-    faultWorld(); assert(beginTrip(fx)); g_sdDisk.failFlushes = 1;
+    // Visible size can already match even when the write, sync or close fails.
+    Fix fx = {}; fx.hasUtc = true;
+    for (bool sd : {false, true}) {
+        size_t pointBytes = 0;
+        for (const char* fault : {"", "write", "sync", "close"}) {
+            faultWorld();
+            if (!sd) gTripFS = &LittleFS;
+            auto& disk = sd ? g_sdDisk : g_disk;
+            assert(beginTrip(fx)); assert(take().empty());
+            const size_t before = gTripBytes;
+            const bool healthy = !*fault;
+            disk.tripFailOperation = fault;
+            assert(writeOrBufferTrkpt(fx) == healthy);
+            assert(gTripWriteFailed == !healthy && disk.openHandles == 0 && g_lockDepth == 0);
+            if (healthy) {
+                pointBytes = gTripBytes - before;
+                assert(pointBytes > 0 && take().empty());
+            } else {
+                const auto raised = one(4006, "raise");
+                has(raised, "\"operation\":\"write\"");
+                has(raised, sd ? "\"backend\":\"sd\"" : "\"backend\":\"littlefs\"");
+                assert(gTripBytes == before);
+            }
+            assert(disk.files.at(gTripPath).size() == before + pointBytes);
+            if (!healthy) { assert(writeOrBufferTrkpt(fx)); one(4006, "clear"); }
+        }
+    }
+    faultWorld(); assert(beginTrip(fx)); assert(writeOrBufferTrkpt(fx));
+    g_sdDisk.tripFailOperation = "sync";
     endTrip(false); auto finalize = codeRows(take(), 4006);
     assert(finalize.size() == 2);
     has(finalize[0], "\"transition\":\"raise\""); has(finalize[0], "\"operation\":\"close\"");

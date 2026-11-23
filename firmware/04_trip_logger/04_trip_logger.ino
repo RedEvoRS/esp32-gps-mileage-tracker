@@ -9,7 +9,7 @@
 //      and end (<2 mph for 5 min), with hysteresis so stop-and-go
 //      traffic doesn't split one drive into many.
 //   2. GPX logging to microSD (LittleFS fallback) -- one line per timed fix,
-//      file.close() after every write to limit power-cut data loss.
+//      Sync and close each GPX write batch to limit power-cut data loss.
 //      The latest 90 untimed points are buffered in RAM; older ones spill
 //      to the selected trip store without times. Boot-time "fsck" attempts
 //      repair; a maximum loss bound still needs hardware validation.
@@ -76,6 +76,7 @@
 #include "diag_upload.h"
 #include "journal_platform.h"
 #include "trip_repair_vfs.h"
+#include "trip_write_vfs.h"
 #include "runtime_faults.h"
 #include "rtc_runtime.h"
 
@@ -444,35 +445,6 @@ struct Fix {
     uint32_t monoMs;
 };
 
-// Batches writes to one open file and confirms they actually reached flash.
-// File::write() only copies into a 4 KB stdio buffer, so it reports success
-// even when the flash write later fails -- and close() swallows that error.
-// commit() flushes (fflush + fsync) and checks the on-disk size grew by
-// exactly the bytes queued, the only reliable signal the Arduino FS API
-// offers. One commit per batch keeps it to a single sync per point.
-// (Defined up here, above every function, because the Arduino builder
-// inserts its generated prototypes before the first function.)
-struct FileWriter {
-    File&  f;
-    size_t start;
-    size_t queued = 0;
-    bool   ok = true;
-
-    explicit FileWriter(File& file) : f(file), start(file.size()) {}
-
-    void put(const char* s, size_t n) {
-        if (!ok) return;
-        if (f.write((const uint8_t*)s, n) == n) queued += n;
-        else ok = false;
-    }
-    void put(const char* s) { put(s, strlen(s)); }
-
-    bool commit() {
-        f.flush();
-        return ok && f.size() == start + queued;
-    }
-};
-
 // Ring buffer of fixes captured before UTC was available. One fix per
 // 1 Hz epoch (see loop()), so this covers ~90 s -- a cold start. Once
 // full, spill the oldest fix to flash without a time before adding more.
@@ -607,6 +579,7 @@ static bool heartbeatDue() {
 }
 
 static const char* tripBackend(fs::FS& storage) { return &storage == &SD ? "sd" : "littlefs"; }
+static const char* tripMount(fs::FS& storage) { return &storage == &SD ? "/sd" : "/littlefs"; }
 
 static bool tripStoreAvailable(fs::FS& storage) {
     return &storage == &SD ? gSdMounted && !gSdUnavailable.load() : gFlashMounted;
@@ -925,7 +898,7 @@ static void makeTripPath(char* out, size_t n) {
     fs::FS& storage = *gTripFS;
     uint32_t c = prefs.getUInt("tripno", 0);
     // NVS may be reset independently of LittleFS, or its last counter write
-    // may have failed. Never let FILE_WRITE truncate a queued trip. The
+    // may have failed. Never reuse a queued trip's path. The
     // caller holds the FS mutex while selecting and creating this path.
     do {
         ++c;
@@ -1058,9 +1031,7 @@ static bool tripStorageLow(uint32_t now) {
 }
 
 // Returns false -- and leaves no file and no active trip behind -- if the
-// trip file can't be created and written. The caller must then stay IDLE:
-// carrying on as ACTIVE would let FILE_APPEND create a file with no
-// prologue, which uploads as invalid GPX and is rejected forever.
+// trip file can't be created and written. The caller must then stay IDLE.
 static bool beginTrip(const Fix& fx, bool continuation = false) {
     gTripContinuation = false;
     fs::FS& storage = *gTripFS;
@@ -1073,10 +1044,9 @@ static bool beginTrip(const Fix& fx, bool continuation = false) {
     FS_LOCK();
     makeTripPath(gTripPath, sizeof(gTripPath));
     bool ok = false;
-    File f = storage.open(gTripPath, FILE_WRITE);
-    const char* operation = f ? "write" : "open";
-    if (f) {
-        FileWriter w(f);
+    FileWriter w(tripMount(storage), gTripPath, /*create=*/true);
+    const char* operation = w ? "write" : "open";
+    if (w) {
         w.put(GPX_PROLOGUE);
         // Write the fixes captured during ARMING (includes the current
         // fix, pushed by the FSM before calling us) so the first ~10 s
@@ -1095,7 +1065,6 @@ static bool beginTrip(const Fix& fx, bool continuation = false) {
         }
         ok = w.commit();
         if (ok) gTripBytes = w.queued;
-        f.close();
         if (!ok) storage.remove(gTripPath);
     }
     if (!ok) {
@@ -1144,23 +1113,23 @@ static bool writeOrBufferTrkpt(const Fix& fx) {
     }
     FS_LOCK();
     bool ok = false;
-    File f = tripStoreAvailable(storage) ? storage.open(gTripPath, FILE_APPEND) : File();
-    const char* operation = f ? "write" : "open";
-    // FILE_APPEND creates a missing file. A real trip file always holds at
-    // least the prologue, so an empty one means ours is gone -- never write
-    // points into a file with no <gpx> header.
-    if (f && f.size() > 0) {
-        FileWriter w(f);
-        if (!fx.hasUtc) {
-            appendTrkpt(w, gPend[gPendHead]);
-        } else {
-            if (gPendCount > 0) flushPending(w);
-            appendTrkpt(w, fx);
+    const char* operation = "open";
+    if (tripStoreAvailable(storage)) {
+        FileWriter w(tripMount(storage), gTripPath, /*create=*/false);
+        if (w) {
+            operation = "write";
+            if (w.ok) {
+                if (!fx.hasUtc) {
+                    appendTrkpt(w, gPend[gPendHead]);
+                } else {
+                    if (gPendCount > 0) flushPending(w);
+                    appendTrkpt(w, fx);
+                }
+            }
+            ok = w.commit();
+            if (ok) gTripBytes += w.queued;
         }
-        ok = w.commit();
-        if (ok) gTripBytes += w.queued;
     }
-    if (f) f.close();   // close() as well as the commit's fsync
     FS_UNLOCK();
 
     tripWriteResult(storage, ok, operation);
@@ -1204,19 +1173,15 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
     } else {
         bool ok = false;
         if (!gTripWriteFailed && tripStoreAvailable(storage)) {
-            File f = storage.open(gTripPath, FILE_APPEND);
-            // Same guard as writeOrBufferTrkpt: never turn a missing trip
-            // file into one holding only the epilogue.
-            if (f && f.size() > 0) {
-                FileWriter w(f);
+            FileWriter w(tripMount(storage), gTripPath, /*create=*/false);
+            if (w.ok) {
                 // Flush any still-buffered (never-got-UTC) points before
                 // closing, so a trip that never got UTC isn't lost. They're
                 // written without times regardless of the system clock.
                 if (gPendCount > 0) flushPending(w);
                 w.put(GPX_EPILOGUE);
-                ok = w.commit();
             }
-            if (f) f.close();
+            ok = w.commit();
             tripWriteResult(storage, ok, "close");
         }
         // A failed write may have left a partial line at the tail. Don't
@@ -1541,7 +1506,9 @@ static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result, 
         tail[n] = 0;
         if (strstr(tail, "</gpx>")) complete = true;
     }
-    if (complete) { f.close(); return true; }
+    // Runtime repair follows a failed commit. A visible closing tag is not
+    // proof of sync, so repair that tail through the checked write path too.
+    if (complete && !bounded) { f.close(); return true; }
 
     long end = findLastTrkptEndBackwards(f, bounded ? TRIP_REPAIR_SCAN_BYTES : SIZE_MAX);
     if (end == -2) { f.close(); return false; }
@@ -1557,7 +1524,7 @@ static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result, 
     f.close();
     result.reason = "write";
     const String suffix = String("\n") + GPX_EPILOGUE;
-    if (!repairTripInPlace(&storage == &SD ? "/sd" : "/littlefs", path,
+    if (!repairTripInPlace(tripMount(storage), path,
                            static_cast<size_t>(end), suffix.c_str())) {
         Serial.printf("fsck: could not repair %s (write failed)\n", path);
         return false;
