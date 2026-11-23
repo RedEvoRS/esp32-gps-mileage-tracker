@@ -429,12 +429,17 @@ a card. Stage 4 has since recorded two real drives on the card.
   a reset.
 - **The firmware never formats the card.** After mounting, the tracker
   reads key FAT32 structures before it creates directories or writes files.
-  Within a fixed read budget, it checks the file allocation table and the
-  cluster chains for the root, `trips/` and `diag/` directories. On failure
-  it powers the card back off
-  and uses internal flash for new trips and diagnostics if available. The
-  OLED shows E4011, `SD card damaged` / `Check card on PC`. Device health
-  reports E4011 with the check result and E4001 for the unavailable card.
+  Within a fixed read and time budget, it checks the file allocation table
+  and the cluster chains for the root, `trips/` and `diag/` directories. If
+  the budget runs out first, the card is used as normal. On failure it
+  powers the card back off and uses internal flash for new trips and
+  diagnostics if available. The serial log always prints the warning below.
+  When internal flash works, the OLED also shows E4011, `SD card damaged` /
+  `Check card on PC`, and after the next upload Device health reports E4011
+  with the check result and E4001 for the unavailable card. If internal
+  flash fails too, the tracker starts in a limited mode with no trip
+  recording, no uploads and a dark screen, so the serial log is the only
+  place to see the reason.
   See [how to recover the card](#if-the-trip-storage-wont-mount-later).
 - **At boot** the log says which storage it chose:
   - `Trip storage: microSD (29.72 GiB free); internal flash queue mounted.`

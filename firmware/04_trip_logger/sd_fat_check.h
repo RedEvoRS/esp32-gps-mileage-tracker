@@ -22,6 +22,7 @@ inline const char* sdFatReason(SdFatCheck result) {
 namespace sd_fat {
 // A boot guard, not a full filesystem scan. Bound I/O independently of the
 // directory chain limit so an unusually large root cannot stall startup.
+// Running out of either budget ends the check as passed, never as damage.
 constexpr unsigned kReadLimit = 96;
 constexpr uint32_t kFatMask = 0x0fffffff;
 constexpr uint32_t kEndOfChain = 0x0ffffff8;
@@ -30,7 +31,11 @@ constexpr uint32_t kDirectorySectors = (65536 * 32) / kSectorBytes;
 
 template<class Card> class Checker {
 public:
-    explicit Checker(Card& card) : card_(card) {}
+    // now/budgetMs optionally bound elapsed time too: one raw read can retry
+    // for over a second on a marginal card, and the cancelled-shutdown
+    // remount runs under the 60 s loop watchdog.
+    explicit Checker(Card& card, uint32_t (*now)() = nullptr, uint32_t budgetMs = 0)
+        : card_(card), now_(now), budgetMs_(budgetMs), started_(now ? now() : 0) {}
 
     SdFatCheck check() {
         uint32_t start;
@@ -60,17 +65,22 @@ public:
         if (clusters <= 0xfff5 || clusters > 0x0ffffff5 ||
             uint64_t(fatSize) * entriesPerSector < uint64_t(clusters) + 2 || !validCluster(root))
             return SdFatCheck::InvalidBpb;
+        // FatFs ignores ExtFlags: it reads and writes the first FAT and
+        // mirrors every change to the second. A volume with mirroring
+        // disabled (bit 7) and another copy active would be written through
+        // its stale copy, so refuse it as an unsupported layout.
+        const uint32_t extFlags = le16(data_ + 40);
+        if ((extFlags & 0x80) && (extFlags & 0x0f) != 0) return SdFatCheck::InvalidBpb;
 
-        // FatFs uses the first FAT, even if ExtFlags selects another copy.
-        // The incident damaged both copies, so checking equality adds no
+        // The incident damaged both copies, so checking FAT equality adds no
         // protection here. FSInfo is only a hint and is deliberately ignored.
         fatStart_ = start + reserved;
         dataStart_ = start + uint32_t(dataOffset);
         const uint32_t mediaEntry = 0x0fffff00 | data_[21];
         uint32_t entry;
-        if (!fatEntry(0, entry)) return SdFatCheck::ReadError;
+        if (!fatEntry(0, entry)) return fatReadSkipped_ ? SdFatCheck::Passed : SdFatCheck::ReadError;
         if (entry != mediaEntry) return SdFatCheck::ReservedEntries;
-        if (!fatEntry(1, entry)) return SdFatCheck::ReadError;
+        if (!fatEntry(1, entry)) return fatReadSkipped_ ? SdFatCheck::Passed : SdFatCheck::ReadError;
         // FAT[1] can carry the clean-shutdown and hard-error flag bits.
         if ((entry | 0x0c000000) < kEndOfChain) return SdFatCheck::ReservedEntries;
 
@@ -83,6 +93,10 @@ public:
     }
 
 private:
+    bool budgetLeft() const {
+        return reads_ < kReadLimit && (!now_ || uint32_t(now_() - started_) < budgetMs_);
+    }
+
     bool read(uint8_t* out, uint32_t lba) {
         ++reads_;
         return card_.readRAW(out, lba);
@@ -96,7 +110,7 @@ private:
         const uint32_t byte = cluster * 4;
         const uint32_t lba = fatStart_ + byte / kSectorBytes;
         if (lba != fatSector_) {
-            if (reads_ == kReadLimit) {
+            if (!budgetLeft()) {
                 fatReadSkipped_ = true;
                 return false;
             }
@@ -109,7 +123,7 @@ private:
 
     bool scanRootCluster(uint32_t cluster) {
         const uint32_t start = dataStart_ + (cluster - 2) * sectorsPerCluster_;
-        for (uint32_t i = 0; i < sectorsPerCluster_ && !rootScanned_ && reads_ < kReadLimit; ++i) {
+        for (uint32_t i = 0; i < sectorsPerCluster_ && !rootScanned_ && budgetLeft(); ++i) {
             if (!read(data_, start + i)) return false;
             for (uint32_t offset = 0; offset < kSectorBytes; offset += 32) {
                 const uint8_t* entry = data_ + offset;
@@ -147,7 +161,7 @@ private:
                 return fatReadSkipped_ ? SdFatCheck::Passed : SdFatCheck::ReadError;
             if (next < kEndOfChain && !validCluster(next)) return badChain;
             if (badChain == SdFatCheck::RootChain && !rootScanned_ &&
-                reads_ < kReadLimit && !scanRootCluster(cluster))
+                budgetLeft() && !scanRootCluster(cluster))
                 return SdFatCheck::ReadError;
             if (next >= kEndOfChain) return SdFatCheck::Passed;
             cluster = next;
@@ -156,6 +170,9 @@ private:
     }
 
     Card& card_;
+    uint32_t (*now_)();
+    uint32_t budgetMs_;
+    uint32_t started_;
     uint8_t data_[kSectorBytes], fat_[kSectorBytes];
     uint32_t fatSector_ = UINT32_MAX;
     uint32_t fatStart_, dataStart_, sectorsPerCluster_, lastCluster_;
@@ -166,7 +183,8 @@ private:
 };
 } // namespace sd_fat
 
-template<class Card> SdFatCheck checkSdFat(Card& card) {
-    return sd_fat::Checker<Card>(card).check();
+template<class Card>
+SdFatCheck checkSdFat(Card& card, uint32_t (*now)() = nullptr, uint32_t budgetMs = 0) {
+    return sd_fat::Checker<Card>(card, now, budgetMs).check();
 }
 } // namespace diagnostics

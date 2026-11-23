@@ -131,6 +131,9 @@ static constexpr int SD_MOSI = 35, SD_SCK = 36, SD_MISO = 37, SD_CS = 47, IMU_CS
 static constexpr uint32_t SD_SPI_HZ = 4000000; // core default; ample for ~119 B/s GPX
 static constexpr uint32_t SD_SETTLE_MS = 250;
 static constexpr uint32_t SD_POWER_OFF_SETTLE_MS = 500;
+// Leaves headroom under the 60 s loop watchdog for the cancelled-shutdown
+// remount, even with one slow raw read still in flight when it expires.
+static constexpr uint32_t SD_FAT_CHECK_BUDGET_MS = 20000;
 
 // -----------------------------------------------------------------
 // Trip state machine thresholds and timing
@@ -2909,7 +2912,8 @@ static bool mountSdStorage() {
     delay(SD_SETTLE_MS);
     bool busReady = gSdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
     if (busReady && SD.begin(SD_CS, gSdSpi, SD_SPI_HZ, "/sd", 10, false) && SD.cardType() != CARD_NONE) {
-        gSdFatCheck = diagnostics::checkSdFat(SD);
+        gSdFatCheck = diagnostics::checkSdFat(
+            SD, []() -> uint32_t { return millis(); }, SD_FAT_CHECK_BUDGET_MS);
         gSdFatChecked = true;
         if (gSdFatCheck != diagnostics::SdFatCheck::Passed) {
             Serial.printf("WARNING: microSD filesystem check failed (%s) -- card not used. "

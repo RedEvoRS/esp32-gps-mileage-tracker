@@ -46,17 +46,19 @@ BootSector findBootSector(Read read, uint8_t* sector, uint32_t& start) {
     // every nonzero start LBA, regardless of the MBR's type byte (even 0x07).
     uint32_t starts[4];
     for (unsigned i = 0; i < 4; ++i) starts[i] = le32(sector + 454 + 16 * i);
+    // FatFs find_volume() also moves on after a disk error on one entry, so
+    // a stale or unreadable earlier entry must not condemn the volume it
+    // actually mounted. Report a read error only when nothing was found.
+    bool readFailed = false;
     for (uint32_t partition : starts) {
         if (!partition) continue;
-        // An I/O error could hide the volume FatFs mounted. Do not verify
-        // a later partition in its place.
-        if (!read(sector, partition)) return BootSector::ReadError;
+        if (!read(sector, partition)) { readFailed = true; continue; }
         if (fatBootSector(sector)) {
             start = partition;
             return BootSector::Found;
         }
     }
-    return BootSector::Missing;
+    return readFailed ? BootSector::ReadError : BootSector::Missing;
 }
 } // namespace sd_fat
 

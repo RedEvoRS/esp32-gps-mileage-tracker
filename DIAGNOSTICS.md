@@ -1497,8 +1497,13 @@ operation that failed on a store it was using. A card rejected at mount
 never becomes a journal store. The E4011 reasons are `read_error` (a sector
 could not be read), `invalid_bpb` (invalid volume layout), `fat_reserved`
 (invalid FAT header entries), and `root_chain`, `trips_chain`, or
-`diag_chain` (invalid directory allocation). The check reads at most 96
-sectors. Reaching that limit alone lets startup proceed.
+`diag_chain` (invalid directory allocation; `invalid_bpb` also covers a
+volume whose FAT mirroring is disabled with the second copy active, which
+FatFs would write through the stale first copy). The check reads at most 96
+sectors within 20 s; running out of either budget alone lets startup
+proceed. If internal flash also fails, degraded startup keeps E4011 in the
+bounded RAM queue with the display asleep and no uploads, so only the
+serial warning shows it.
 
 When the OLED says `SD card damaged` / `Check card on PC`, power off
 before pulling the card. Find the reason in the serial warning or Device

@@ -9,6 +9,10 @@ using namespace fake_sd_fat;
 using diagnostics::SdFatCheck;
 using diagnostics::checkSdFat;
 
+// Fake elapsed time: every raw read costs gReadCostMs.
+static uint32_t gClockMs = 0, gReadCostMs = 0;
+static uint32_t fakeNow() { return gClockMs; }
+
 struct Card {
     std::map<uint32_t, std::array<uint8_t, 512>> overrides;
     uint32_t partition = 0;
@@ -17,6 +21,7 @@ struct Card {
 
     bool readRAW(uint8_t* out, uint32_t lba) {
         ++reads;
+        gClockMs += gReadCostMs;
         if (lba == unreadable) return false;
         auto it = overrides.find(lba);
         if (it != overrides.end()) std::memcpy(out, it->second.data(), 512);
@@ -156,8 +161,15 @@ int main() {
     put32(table + 454 + 16, mbr.partition);
     assert(checkSdFat(mbr) == SdFatCheck::Passed);
     assert(diagnostics::journalSdCluster(mbr) == 32768);
+    // Like FatFs find_volume(), an unreadable earlier entry is skipped and
+    // the volume FatFs actually mounts is the one checked.
     mbr.unreadable = 63;
-    assert(checkSdFat(mbr) == SdFatCheck::ReadError);
+    assert(checkSdFat(mbr) == SdFatCheck::Passed);
+    mbr.fat(2, 1);
+    assert(checkSdFat(mbr) == SdFatCheck::RootChain);
+    mbr.fat(2, 0x0fffffff);
+    mbr.unreadable = mbr.partition;
+    assert(checkSdFat(mbr) == SdFatCheck::ReadError); // nothing readable found
     mbr.unreadable = UINT32_MAX;
     mbr.fat(2, 1);
     assert(checkSdFat(mbr) == SdFatCheck::RootChain);
@@ -184,5 +196,31 @@ int main() {
         readFailure.unreadable = lba;
         assert(checkSdFat(readFailure) == SdFatCheck::ReadError);
     }
-    std::puts("PASS SD FAT guard: formats, exact incident, chains, MBR, limits and I/O errors");
+    // ExtFlags: FatFs always writes the first FAT and mirrors it. Refuse a
+    // non-mirrored volume whose active copy is another FAT.
+    for (uint16_t flags : {uint16_t(0x0000), uint16_t(0x0080), uint16_t(0x0001)}) {
+        Card mirrored;
+        put16(mirrored.edit(0) + 40, flags);
+        assert(checkSdFat(mirrored) == SdFatCheck::Passed);
+    }
+    Card secondActive;
+    put16(secondActive.edit(0) + 40, 0x0081);
+    assert(checkSdFat(secondActive) == SdFatCheck::InvalidBpb);
+
+    // Elapsed-time budget: a slow but healthy card passes once time runs
+    // out; damage seen before then is still reported.
+    gClockMs = 0; gReadCostMs = 1500;
+    Card slow = laterRoot; // needs dozens of reads
+    slow.reads = 0;
+    assert(checkSdFat(slow, fakeNow, 20000) == SdFatCheck::Passed);
+    assert(slow.reads < diagnostics::sd_fat::kReadLimit && gClockMs < 20000 + 2 * 1500);
+    Card slowIncident;
+    incidentFat(slowIncident.edit(kFatStart));
+    assert(checkSdFat(slowIncident, fakeNow, 20000) == SdFatCheck::ReservedEntries);
+    Card expired; // budget gone before the FAT read: unverified, not damaged
+    incidentFat(expired.edit(kFatStart));
+    gReadCostMs = 30000;
+    assert(checkSdFat(expired, fakeNow, 20000) == SdFatCheck::Passed);
+    gReadCostMs = 0;
+    std::puts("PASS SD FAT guard: formats, exact incident, chains, MBR, ExtFlags, read/time limits and I/O errors");
 }
