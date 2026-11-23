@@ -368,7 +368,9 @@ card has physically persisted. A failed sync/close may leave the complete
 document on disk; it is still reported as failure on that attempt.
 
 `endTrip()` runs on the GPS-reading core with the filesystem lock held. Its
-repair reads at most the 16-byte completeness tail plus 4 KiB backwards.
+repair checks for the exact GPX epilogue and rewrites it at the same offset
+to sync intact closing tags. Otherwise it scans up to 4 KiB backwards
+after reading the epilogue-sized tail.
 Normally only one 256-byte block is needed, regardless of trip length. If
 the damage is longer, it leaves the file untouched for boot recovery rather
 than blocking GPS on a whole-file pass. Driver truncate/sync/close latency

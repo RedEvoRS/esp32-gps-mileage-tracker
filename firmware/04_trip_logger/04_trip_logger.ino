@@ -9,7 +9,7 @@
 //      and end (<2 mph for 5 min), with hysteresis so stop-and-go
 //      traffic doesn't split one drive into many.
 //   2. GPX logging to microSD (LittleFS fallback) -- one line per timed fix,
-//      file.close() after every write to limit power-cut data loss.
+//      Sync and close each GPX write batch to limit power-cut data loss.
 //      The latest 90 untimed points are buffered in RAM; older ones spill
 //      to the selected trip store without times. Boot-time "fsck" attempts
 //      repair; a maximum loss bound still needs hardware validation.
@@ -72,10 +72,11 @@
 #include "revision_nvs.h"
 #include "degraded_policy.h"
 #include "startup_watchdog.h"
-#include "journal_sd_geometry.h"
+#include "sd_fat_check.h"
 #include "diag_upload.h"
 #include "journal_platform.h"
 #include "trip_repair_vfs.h"
+#include "trip_write_vfs.h"
 #include "runtime_faults.h"
 #include "rtc_runtime.h"
 
@@ -130,6 +131,10 @@ static GpsDrainMonitor gGpsDrainMonitor; // core 1 only, since first runtime dra
 static constexpr int SD_MOSI = 35, SD_SCK = 36, SD_MISO = 37, SD_CS = 47, IMU_CS = 34;
 static constexpr uint32_t SD_SPI_HZ = 4000000; // core default; ample for ~119 B/s GPX
 static constexpr uint32_t SD_SETTLE_MS = 250;
+static constexpr uint32_t SD_POWER_OFF_SETTLE_MS = 500;
+// Leaves headroom under the 60 s loop watchdog for the cancelled-shutdown
+// remount, even with one slow raw read still in flight when it expires.
+static constexpr uint32_t SD_FAT_CHECK_BUDGET_MS = 20000;
 
 // -----------------------------------------------------------------
 // Trip state machine thresholds and timing
@@ -261,6 +266,8 @@ fs::FS*           gTripFS = &LittleFS;
 // Mount membership stays fixed for shutdown. A failed SD is latched out until
 // reboot; core 1 may select the mounted flash queue only between trips.
 bool              gSdMounted = false, gFlashMounted = false;
+static bool gSdFatChecked = false;
+static diagnostics::SdFatCheck gSdFatCheck = diagnostics::SdFatCheck::Passed;
 static std::atomic<bool> gSdUnavailable{false};
 volatile bool     gVbusLost   = false;
 volatile bool     gPmuIrqFlag = false;
@@ -379,6 +386,7 @@ static diagnostics::RuntimeFaults::Condition gLoopConditions[] = {
     {diagnostics::Code::RTC_TIME_INVALID},
     {diagnostics::Code::GPS_ANTENNA_SUSPECT},
     {diagnostics::Code::SD_UNAVAILABLE},
+    {diagnostics::Code::SD_FILESYSTEM_DAMAGED},
     {diagnostics::Code::LITTLEFS_UNAVAILABLE},
     {diagnostics::Code::NO_RECORDING_STORAGE},
     {diagnostics::Code::STORAGE_LOW},
@@ -435,35 +443,6 @@ struct Fix {
     bool     speedTrusted = true;
     uint64_t utcMs;
     uint32_t monoMs;
-};
-
-// Batches writes to one open file and confirms they actually reached flash.
-// File::write() only copies into a 4 KB stdio buffer, so it reports success
-// even when the flash write later fails -- and close() swallows that error.
-// commit() flushes (fflush + fsync) and checks the on-disk size grew by
-// exactly the bytes queued, the only reliable signal the Arduino FS API
-// offers. One commit per batch keeps it to a single sync per point.
-// (Defined up here, above every function, because the Arduino builder
-// inserts its generated prototypes before the first function.)
-struct FileWriter {
-    File&  f;
-    size_t start;
-    size_t queued = 0;
-    bool   ok = true;
-
-    explicit FileWriter(File& file) : f(file), start(file.size()) {}
-
-    void put(const char* s, size_t n) {
-        if (!ok) return;
-        if (f.write((const uint8_t*)s, n) == n) queued += n;
-        else ok = false;
-    }
-    void put(const char* s) { put(s, strlen(s)); }
-
-    bool commit() {
-        f.flush();
-        return ok && f.size() == start + queued;
-    }
 };
 
 // Ring buffer of fixes captured before UTC was available. One fix per
@@ -600,6 +579,7 @@ static bool heartbeatDue() {
 }
 
 static const char* tripBackend(fs::FS& storage) { return &storage == &SD ? "sd" : "littlefs"; }
+static const char* tripMount(fs::FS& storage) { return &storage == &SD ? "/sd" : "/littlefs"; }
 
 static bool tripStoreAvailable(fs::FS& storage) {
     return &storage == &SD ? gSdMounted && !gSdUnavailable.load() : gFlashMounted;
@@ -615,6 +595,14 @@ static void batteryCondition(diagnostics::Code code, bool active, uint32_t now) 
     unsigned mv = PMU.getBattVoltage();
     if (mv <= 6000) gLoopFaults.integer("battery_mv", mv);
     gLoopFaults.condition(active);
+}
+
+static void sdFatCondition(uint32_t now) {
+    if (!gJournalReady || !gSdFatChecked) return;
+    bool failed = gSdFatCheck != diagnostics::SdFatCheck::Passed;
+    gLoopFaults.event(diagnostics::Code::SD_FILESYSTEM_DAMAGED, now);
+    if (failed) gLoopFaults.enumeration("reason", diagnostics::sdFatReason(gSdFatCheck));
+    gLoopFaults.condition(failed);
 }
 
 static void storageConditions(uint64_t freeB, uint32_t now) {
@@ -901,7 +889,7 @@ static const char* GPX_PROLOGUE =
     " xmlns=\"http://www.topografix.com/GPX/1/0\">\n"
     "<trk><name>Trip</name><trkseg>\n";
 
-static const char* GPX_EPILOGUE = "</trkseg></trk></gpx>\n";
+static const char GPX_EPILOGUE[] = "</trkseg></trk></gpx>\n";
 
 // Choose a unique local filename for a new trip using a persistent
 // counter. The server renames trips by their GPX timestamps on receipt,
@@ -910,7 +898,7 @@ static void makeTripPath(char* out, size_t n) {
     fs::FS& storage = *gTripFS;
     uint32_t c = prefs.getUInt("tripno", 0);
     // NVS may be reset independently of LittleFS, or its last counter write
-    // may have failed. Never let FILE_WRITE truncate a queued trip. The
+    // may have failed. Never reuse a queued trip's path. The
     // caller holds the FS mutex while selecting and creating this path.
     do {
         ++c;
@@ -1043,9 +1031,7 @@ static bool tripStorageLow(uint32_t now) {
 }
 
 // Returns false -- and leaves no file and no active trip behind -- if the
-// trip file can't be created and written. The caller must then stay IDLE:
-// carrying on as ACTIVE would let FILE_APPEND create a file with no
-// prologue, which uploads as invalid GPX and is rejected forever.
+// trip file can't be created and written. The caller must then stay IDLE.
 static bool beginTrip(const Fix& fx, bool continuation = false) {
     gTripContinuation = false;
     fs::FS& storage = *gTripFS;
@@ -1058,10 +1044,9 @@ static bool beginTrip(const Fix& fx, bool continuation = false) {
     FS_LOCK();
     makeTripPath(gTripPath, sizeof(gTripPath));
     bool ok = false;
-    File f = storage.open(gTripPath, FILE_WRITE);
-    const char* operation = f ? "write" : "open";
-    if (f) {
-        FileWriter w(f);
+    FileWriter w(tripMount(storage), gTripPath, /*create=*/true);
+    const char* operation = w ? "write" : "open";
+    if (w) {
         w.put(GPX_PROLOGUE);
         // Write the fixes captured during ARMING (includes the current
         // fix, pushed by the FSM before calling us) so the first ~10 s
@@ -1080,7 +1065,6 @@ static bool beginTrip(const Fix& fx, bool continuation = false) {
         }
         ok = w.commit();
         if (ok) gTripBytes = w.queued;
-        f.close();
         if (!ok) storage.remove(gTripPath);
     }
     if (!ok) {
@@ -1129,23 +1113,23 @@ static bool writeOrBufferTrkpt(const Fix& fx) {
     }
     FS_LOCK();
     bool ok = false;
-    File f = tripStoreAvailable(storage) ? storage.open(gTripPath, FILE_APPEND) : File();
-    const char* operation = f ? "write" : "open";
-    // FILE_APPEND creates a missing file. A real trip file always holds at
-    // least the prologue, so an empty one means ours is gone -- never write
-    // points into a file with no <gpx> header.
-    if (f && f.size() > 0) {
-        FileWriter w(f);
-        if (!fx.hasUtc) {
-            appendTrkpt(w, gPend[gPendHead]);
-        } else {
-            if (gPendCount > 0) flushPending(w);
-            appendTrkpt(w, fx);
+    const char* operation = "open";
+    if (tripStoreAvailable(storage)) {
+        FileWriter w(tripMount(storage), gTripPath, /*create=*/false);
+        if (w) {
+            operation = "write";
+            if (w.ok) {
+                if (!fx.hasUtc) {
+                    appendTrkpt(w, gPend[gPendHead]);
+                } else {
+                    if (gPendCount > 0) flushPending(w);
+                    appendTrkpt(w, fx);
+                }
+            }
+            ok = w.commit();
+            if (ok) gTripBytes += w.queued;
         }
-        ok = w.commit();
-        if (ok) gTripBytes += w.queued;
     }
-    if (f) f.close();   // close() as well as the commit's fsync
     FS_UNLOCK();
 
     tripWriteResult(storage, ok, operation);
@@ -1189,19 +1173,15 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
     } else {
         bool ok = false;
         if (!gTripWriteFailed && tripStoreAvailable(storage)) {
-            File f = storage.open(gTripPath, FILE_APPEND);
-            // Same guard as writeOrBufferTrkpt: never turn a missing trip
-            // file into one holding only the epilogue.
-            if (f && f.size() > 0) {
-                FileWriter w(f);
+            FileWriter w(tripMount(storage), gTripPath, /*create=*/false);
+            if (w.ok) {
                 // Flush any still-buffered (never-got-UTC) points before
                 // closing, so a trip that never got UTC isn't lost. They're
                 // written without times regardless of the system clock.
                 if (gPendCount > 0) flushPending(w);
                 w.put(GPX_EPILOGUE);
-                ok = w.commit();
             }
-            if (f) f.close();
+            ok = w.commit();
             tripWriteResult(storage, ok, "close");
         }
         // A failed write may have left a partial line at the tail. Don't
@@ -1515,23 +1495,27 @@ static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result, 
     if (!f) return false;
     size_t sz = f.size();
 
-    // Already complete? Look for </gpx> in the tail.
-    bool complete = false;
+    // Boot accepts the closing tag. Runtime repair follows a failed commit,
+    // so verify the exact epilogue before rewriting it at the same offset.
+    constexpr size_t epilogueSize = sizeof(GPX_EPILOGUE) - 1;
+    bool rewrite = false;
     if (sz >= 6) {
-        size_t back = sz > 16 ? 16 : sz;
+        size_t back = min(sz, bounded ? epilogueSize : size_t(16));
         if (!f.seek(sz - back)) { f.close(); return false; }
-        char tail[17];
+        char tail[sizeof(GPX_EPILOGUE)];
         int n = f.read((uint8_t*)tail, back);
         if (n != (int)back) { f.close(); return false; }
         tail[n] = 0;
-        if (strstr(tail, "</gpx>")) complete = true;
+        if (!bounded && strstr(tail, "</gpx>")) { f.close(); return true; }
+        rewrite = bounded && back == epilogueSize &&
+                  memcmp(tail, GPX_EPILOGUE, epilogueSize) == 0;
     }
-    if (complete) { f.close(); return true; }
 
-    long end = findLastTrkptEndBackwards(f, bounded ? TRIP_REPAIR_SCAN_BYTES : SIZE_MAX);
+    long end = rewrite ? static_cast<long>(sz - epilogueSize)
+                       : findLastTrkptEndBackwards(f, bounded ? TRIP_REPAIR_SCAN_BYTES : SIZE_MAX);
     if (end == -2) { f.close(); return false; }
     if (end == -3) { f.close(); result.reason = "parse"; return false; }
-    if (end <= 0) {
+    if (!rewrite && end <= 0) {
         f.close();
         result.reason = "write";
         if (!storage.remove(path)) return false;
@@ -1541,9 +1525,14 @@ static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result, 
 
     f.close();
     result.reason = "write";
-    const String suffix = String("\n") + GPX_EPILOGUE;
-    if (!repairTripInPlace(&storage == &SD ? "/sd" : "/littlefs", path,
-                           static_cast<size_t>(end), suffix.c_str())) {
+    bool ok;
+    if (rewrite) {
+        ok = rewriteTripEpilogue(tripMount(storage), path, end, GPX_EPILOGUE, epilogueSize);
+    } else {
+        const String suffix = String("\n") + GPX_EPILOGUE;
+        ok = repairTripInPlace(tripMount(storage), path, static_cast<size_t>(end), suffix.c_str());
+    }
+    if (!ok) {
         Serial.printf("fsck: could not repair %s (write failed)\n", path);
         return false;
     }
@@ -1776,6 +1765,12 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
     if (gSdMounted) SD.end();
     if (gFlashMounted) LittleFS.end();
     feedLoopWatchdogProgress(); // unmount returned; no feed while acquiring lock
+    if (gSdMounted) {
+        // Give the powered card controller time after the last SPI command.
+        // The filesystem lock keeps the bus idle while BLDO1 stays enabled.
+        vTaskDelay(pdMS_TO_TICKS(SD_POWER_OFF_SETTLE_MS));
+        feedLoopWatchdogProgress();
+    }
     // Only the current owner sleeps the shared panel, before the final VBUS
     // read. A latched failure must not retry via the other adapter.
     display::DisplayModel::Input displayOff; displayOff.shutdown = true;
@@ -2737,6 +2732,7 @@ static void serviceRuntimeDiagnostics() {
         gLoopFaults.condition(gGpsAntenna.active());
     }
     gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, now).condition(!gSdMounted || gSdUnavailable.load());
+    sdFatCondition(now);
     // Check idle storage too, so a successful core-0 upload can be observed as
     // recovery on core 1 without sharing producer state across tasks.
     if (uint32_t(now - gStorageDiagMs) >= FS_CHECK_MS) {
@@ -2890,13 +2886,22 @@ static bool mountSdStorage() {
     delay(SD_SETTLE_MS);
     bool busReady = gSdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
     if (busReady && SD.begin(SD_CS, gSdSpi, SD_SPI_HZ, "/sd", 10, false) && SD.cardType() != CARD_NONE) {
-        if (SD.exists(TRIP_DIR) || SD.mkdir(TRIP_DIR)) {
-            File dir = SD.open(TRIP_DIR);
-            bool ready = dir && dir.isDirectory();
-            dir.close();
-            if (ready) return true;
+        gSdFatCheck = diagnostics::checkSdFat(
+            SD, []() -> uint32_t { return millis(); }, SD_FAT_CHECK_BUDGET_MS);
+        gSdFatChecked = true;
+        if (gSdFatCheck != diagnostics::SdFatCheck::Passed) {
+            Serial.printf("WARNING: microSD filesystem check failed (%s) -- card not used. "
+                          "Check it on a PC and copy any needed files before reformatting as FAT32. "
+                          "The tracker never formats it.\n", diagnostics::sdFatReason(gSdFatCheck));
+        } else {
+            if (SD.exists(TRIP_DIR) || SD.mkdir(TRIP_DIR)) {
+                File dir = SD.open(TRIP_DIR);
+                bool ready = dir && dir.isDirectory();
+                dir.close();
+                if (ready) return true;
+            }
+            Serial.println("WARNING: microSD trip directory unavailable; card preserved.");
         }
-        Serial.println("WARNING: microSD trip directory unavailable; card preserved.");
     } else {
         // SD.begin discards card type on failure; there is no card-detect
         // pin. Be explicit that absence and bus/format faults look alike.
@@ -3200,6 +3205,7 @@ static void beginJournal() {
     gJournalReady = gJournal.begin(gJournalBoot.id, gJournalBoot.counter, firmware::kVersion);
     gJournal.setTimeProvider(stampDiagnosticTime);
     if (gJournalReady) diagnostics::submitJournalBoot(gJournal, esp_reset_reason(), gPmuStartup, millis(), gBootBattery);
+    sdFatCondition(millis());
 }
 
 static bool createFsMutex() {
@@ -3267,6 +3273,7 @@ static void degradedLoop() {
         gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, millis()).condition(true);
         gLoopFaults.event(diagnostics::Code::LITTLEFS_UNAVAILABLE, millis()).condition(true);
         gLoopFaults.event(diagnostics::Code::NO_RECORDING_STORAGE, millis()).condition(true);
+        sdFatCondition(millis());
     } else {
         gLoopFaults.event(diagnostics::Code::PMU_INIT_FAILED, millis()).condition(true);
     }
@@ -3357,8 +3364,21 @@ void setup() {
         enterDegraded(powerMode);
         return;
     }
-    // BLDO1 powers the SD slot but starts ON at 1.8 V. Disable it early;
-    // mountSdStorage sets 3.3 V before enabling it, after safety setup.
+    // An ESP32 reset can leave the card powered and finishing a write.
+    pinMode(SD_CS, OUTPUT);
+    digitalWrite(SD_CS, HIGH);
+    pinMode(IMU_CS, OUTPUT);
+    digitalWrite(IMU_CS, HIGH);
+    // Raw reads keep the I2C failure sentinel. BLDO1 enable is bit 4 of
+    // 0x90; 0x96 bits 0..4 encode 500 mV + 100 mV per step.
+    const int sdRailControl = PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
+    if (sdRailControl < 0 || (sdRailControl & (1 << 4))) {
+        const int voltage = PMU.readRegister(XPOWERS_AXP2101_LDO_VOL4_CTRL);
+        // Skip the pause only when the rail is off or at its 1.8 V default.
+        // Allow up to 500 ms of SDXC write-busy time before cutting power.
+        if (sdRailControl < 0 || voltage < 0 || 500 + (voltage & 0x1f) * 100 != 1800)
+            delay(SD_POWER_OFF_SETTLE_MS);
+    }
     PMU.disableBLDO1();
     // Supreme GPS backup RAM comes straight from the 18650. LilyGO also
     // disables VBACKUP; a 60 s ALDO4-off test hot-started in 2.0 s with it off.

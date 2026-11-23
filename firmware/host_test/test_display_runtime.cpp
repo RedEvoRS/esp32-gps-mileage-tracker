@@ -42,7 +42,7 @@ static void switchingOffRegressions() {
             catch (const PoweredOff&) {}
             assert(PMU.shutdownCalls == 1);
             assert(switchingOffHolds == (scenario == 0 ? 1u : 0u));
-            assert(uint32_t(millis() - start) == (scenario == 0 ? 1000u : 0u));
+            assert(uint32_t(millis() - start) == SD_POWER_OFF_SETTLE_MS + (scenario == 0 ? 1000u : 0u));
             g_taskDelayHook = nullptr; TwoWire::transaction = nullptr;
             g_lockDepth = 0; // successful simulated power-off deliberately retains it
             ++cases;

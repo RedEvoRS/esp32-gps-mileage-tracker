@@ -45,6 +45,7 @@ static void resetWorld() {
     g_disk = FakeDisk();
     g_sdDisk = FakeDisk(); g_sdDisk.mounted = false; g_sdDisk.renameOverwrites = false;
     SD.dirs.clear(); SD.cardPresent = false; SD.begins = SD.ends = 0;
+    SD.corruptFat = false; gSdFatChecked = false;
     gTripFS = &LittleFS; gSdMounted = false; gFlashMounted = true;
     g_powerEvents.clear();
     g_partition = PartitionStub();
@@ -180,29 +181,28 @@ int main(int argc, char** argv) {
         const std::string pt = "<trkpt lat=\"-33.868820\" lon=\"151.209296\">"
             "<time>2026-04-14T14:30:00Z</time><speed>27.12</speed><hdop>12.3</hdop></trkpt>\n";
         for (int seg = 0; seg < 2; ++seg) {
-            g_disk.files["/t.gpx"] = "";
-            File f = LittleFS.open("/t.gpx", FILE_APPEND);
-            FileWriter w(f); fx.newSegment = seg; appendTrkpt(w, fx);
+            g_disk.files.erase("/t.gpx");
+            FileWriter w("/littlefs", "/t.gpx", /*create=*/true);
+            fx.newSegment = seg; appendTrkpt(w, fx);
             CHECK(w.commit(), "commit ok");
-            f.close();
             CHECK(g_disk.files["/t.gpx"] == (seg ? "</trkseg><trkseg>\n" + pt : pt),
                   seg ? "exact line (with segment break)" : "exact line");
         }
         // A typical point, against the F1 budget.
         fx.newSegment = false;
         fx.lat = 37.123456; fx.lon = -122.123456; fx.speedMps = 15; fx.hdop = 0.9f;
-        g_disk.files["/t.gpx"] = "";
-        File f = LittleFS.open("/t.gpx", FILE_APPEND); FileWriter w(f); appendTrkpt(w, fx); w.commit(); f.close();
-        size_t n = g_disk.files["/t.gpx"].size();
+        FileWriter w("/littlefs", "/typical.gpx", /*create=*/true);
+        appendTrkpt(w, fx);
+        CHECK(w.commit(), "typical point commits");
+        size_t n = g_disk.files["/typical.gpx"].size();
         printf("  (typical point: %zu bytes, was 281)\n", n);
         CHECK(n <= 120, "typical point fits the ~118 B budget");
         // A garbage speed value must not overflow the line buffer and be
         // mistaken for a write failure (which would end the trip).
         fx.speedMps = 1e30f;
-        g_disk.files["/t.gpx"] = "";
-        f = LittleFS.open("/t.gpx", FILE_APPEND); FileWriter w2(f); appendTrkpt(w2, fx);
+        FileWriter w2("/littlefs", "/absurd.gpx", /*create=*/true);
+        appendTrkpt(w2, fx);
         CHECK(w2.commit(), "absurd speed value still writes");
-        f.close();
     }
 
     printf("T1 normal trip\n");
@@ -233,13 +233,13 @@ int main(int argc, char** argv) {
         dump("T2");
     }
 
-    printf("T3 prologue write doesn't land\n");
-    {
+    printf("T3 prologue batch fails\n");
+    for (const char* fault : {"write", "sync", "close"}) {
         resetWorld();
-        g_disk.failFlushes = 1;
+        g_disk.tripFailOperation = fault;
         drive(15, 11);
         CHECK(gState != ACTIVE && gTripPath[0] == 0, "stays out of ACTIVE");
-        CHECK(tripFiles().empty(), "half-written file removed");
+        CHECK(tripFiles().empty() && g_disk.openHandles == 0, "failed file removed and descriptor released");
     }
 
     printf("T4 flash write error mid-trip (F4)\n");
@@ -247,7 +247,7 @@ int main(int argc, char** argv) {
         resetWorld();
         drive(15, 40);
         CHECK(gState == ACTIVE, "trip running");
-        g_disk.failFlushes = 1;
+        g_disk.tripFailOperation = "sync";
         drive(15, 1);
         CHECK(gState == IDLE && gTripPath[0] == 0, "trip ended on the failed write");
         CHECK(logHas("write to /trips/t000001.gpx failed"), "logged loudly");
@@ -281,17 +281,18 @@ int main(int argc, char** argv) {
         dump("T5");
     }
 
-    printf("T6 epilogue write doesn't land\n");
+    printf("T6 complete epilogue fails to sync\n");
     {
         resetWorld();
         drive(15, 40); drive(0, kCooldownSeconds);
         CHECK(gState == COOLDOWN, "about to finalize");
-        g_disk.flushesBeforeFail = 1;            // the last point lands...
-        g_disk.failFlushes = 1;                  // ...the epilogue doesn't
+        g_disk.tripFailuresToSkip = 1;           // the last point syncs...
+        g_disk.tripFailOperation = "sync";       // ...the visible epilogue doesn't
         drive(0, 1);
         auto v = tripFiles();
         CHECK(gState == IDLE && v.size() == 1, "finalized");
         CHECK(v.size() == 1 && wellFormedShape(g_disk.files[v[0]]), "repaired to a valid file");
+        CHECK(logHas("fsck: repaired"), "visible closing tag does not bypass checked repair");
         dump("T6");
     }
 
@@ -1274,14 +1275,16 @@ int main(int argc, char** argv) {
             resetWorld();
             gClockSet = false;
             drive(15, 100);
+            const std::string prefix = g_disk.files.at(gTripPath);
             if (failOpen) g_disk.failNextOpens = 1;
-            else g_disk.failFlushes = 2;  // both commit() and close() fail
+            else g_disk.tripFailOperation = "sync";
             drive(15, 1);
             CHECK(gState == IDLE && !gTripPath[0] && logHas("write to /trips/t000001.gpx failed"),
                   "an untimed spill reports storage failure and ends the trip");
             CHECK(tripFiles().size() == 1 && wellFormedShape(g_disk.files.begin()->second) &&
-                  count(g_disk.files.begin()->second, "<trkpt ") == 10,
-                  "repair preserves the previously committed untimed prefix");
+                  g_disk.files.begin()->second.starts_with(prefix) &&
+                  count(g_disk.files.begin()->second, "<trkpt ") == (failOpen ? 10 : 11),
+                  "repair preserves the prefix and any complete spill visible after failed sync");
         }
     }
 
@@ -1688,8 +1691,8 @@ int main(int argc, char** argv) {
               "queue scans and uploads close all file and directory handles");
     }
 
-    printf("T54 SD is closed and unmounted before PMU shutdown (#109)\n");
-    {
+    printf("T54 SD is closed and settled before PMU shutdown (#109)\n");
+    for (const char* reason : {"idle_battery", "battery_critical", "user_long_press"}) {
         resetWorld(); SD.cardPresent = true; setup(); drive(15, 40); PMU.vbusIn = false;
         PMU.onShutdown = [] {
             CHECK(g_sdDisk.openHandles == 0 && g_disk.openHandles == 0 &&
@@ -1699,10 +1702,19 @@ int main(int argc, char** argv) {
                   "SD trip finalized before shutdown cuts power");
             CHECK(PMU.bldo1, "BLDO1 stays enabled until PMU shutdown cuts the rails");
         };
-        try { powerOffForVbus(); } catch (const PoweredOff&) {}
+        g_taskDelayHook = [](uint32_t ms) {
+            if (ms == SD_POWER_OFF_SETTLE_MS) {
+                CHECK(!g_sdDisk.mounted && PMU.bldo1 && !PMU.shutdownCalls && g_lockDepth == 1,
+                      "settle holds the powered card idle under the filesystem mutex");
+                g_powerEvents.push_back("SD.settle");
+            }
+        };
+        try { powerOffForVbus(reason); } catch (const PoweredOff&) {}
         auto ended = std::find(g_powerEvents.begin(), g_powerEvents.end(), "SD.end");
+        auto settle = std::find(g_powerEvents.begin(), g_powerEvents.end(), "SD.settle");
         auto shutdown = std::find(g_powerEvents.begin(), g_powerEvents.end(), "PMU.shutdown");
-        CHECK(ended < shutdown && PMU.shutdownCalls == 1, "SD.end precedes PMU.shutdown");
+        CHECK(ended < settle && settle < shutdown && PMU.shutdownCalls == 1,
+              "SD unmount precedes settle, which precedes PMU.shutdown");
     }
 
     printf("T55 cancelled/failed SD shutdown remounts the same stores (#109)\n");
@@ -1727,15 +1739,24 @@ int main(int argc, char** argv) {
             CHECK(g_sdDisk.files.size() == 2 && g_sdDisk.openHandles == 0,
                   "the next trip still records to SD after recovery");
         }
-        for (bool failFlash : {false, true}) {
+        for (int failure = 0; failure < 3; ++failure) {
             resetWorld(); SD.cardPresent = true; setup(); drive(15, 40); PMU.vbusIn = false;
             g_sdDisk.onUnmount = [] { PMU.vbusIn = true; };
-            if (failFlash) g_disk.failMount = true;
-            else SD.cardPresent = false;
+            if (failure == 0) g_disk.failMount = true;
+            else if (failure == 1) SD.cardPresent = false;
+            else {
+                endTrip(false);
+                SD.corruptFat = true;
+            }
+            const unsigned mkdirs = g_sdDisk.mkdirCalls, writes = g_sdDisk.writeCalls;
             try { powerOffForVbus(); } catch (const Restarted&) {}
             CHECK(g_restarts == 1 && g_lockDepth == 1 && gNetHold && gTripFS == &SD &&
                   !g_sdDisk.formatRequested && !g_disk.formatRequested,
                   "failed remount restarts with mutex held and never switches stores underneath logging");
+            if (SD.corruptFat)
+                CHECK(gSdFatCheck == diagnostics::SdFatCheck::ReservedEntries &&
+                      g_sdDisk.mkdirCalls == mkdirs && g_sdDisk.writeCalls == writes && !PMU.bldo1,
+                      "damaged SD on remount is powered off untouched before restart");
         }
     }
 
@@ -1852,7 +1873,7 @@ int main(int argc, char** argv) {
             padTripTo(TRIP_SPLIT_BYTES - (TRKPT_LINE_BYTES - 1) - strlen(GPX_EPILOGUE) - 1);
             if (fault == 0) g_sdDisk.capacity = g_sdDisk.used() + FS_START_FREE - 1;
             if (fault == 1) g_sdDisk.failOpenPath = "/trips/t000002.gpx";
-            if (fault == 2) { g_sdDisk.flushesBeforeFail = 2; g_sdDisk.failFlushes = 1; }
+            if (fault == 2) { g_sdDisk.tripFailuresToSkip = 2; g_sdDisk.tripFailOperation = "sync"; }
             drive(15, 1);
             CHECK(gState == IDLE && gTripPath[0] == 0 && gPendCount == 0 && gArmCount == 0 &&
                   g_sdDisk.files.size() == 1 && wellFormedShape(g_sdDisk.files.at(first)) &&
@@ -2061,11 +2082,11 @@ int main(int argc, char** argv) {
             FakeDisk& disk = sd ? g_sdDisk : g_disk;
             disk.files[path] = prefix + "torn point";
             std::string full = std::string(sd ? "/sd" : "/littlefs") + path;
-            int fd = trip_repair_io::open(full.c_str(), O_WRONLY);
-            CHECK(fd >= 0 && trip_repair_io::ftruncate(fd, prefix.size()) == 0 && trip_repair_io::fsync(fd) == 0,
+            int fd = trip_vfs_io::open(full.c_str(), O_WRONLY);
+            CHECK(fd >= 0 && trip_vfs_io::ftruncate(fd, prefix.size()) == 0 && trip_vfs_io::fsync(fd) == 0,
                   "simulate durable cut before power loss");
-            CHECK(trip_repair_io::lseek(fd, prefix.size(), SEEK_SET) == static_cast<off_t>(prefix.size()) &&
-                  trip_repair_io::write(fd, suffix.data(), written) == static_cast<ssize_t>(written) && trip_repair_io::close(fd) == 0,
+            CHECK(trip_vfs_io::lseek(fd, prefix.size(), SEEK_SET) == static_cast<off_t>(prefix.size()) &&
+                  trip_vfs_io::write(fd, suffix.data(), written) == static_cast<ssize_t>(written) && trip_vfs_io::close(fd) == 0,
                   "simulate any persisted prefix of the closing tags");
             // Power can fail after the complete closing marker but before its
             // final newline. Those bytes already contain the full document.
@@ -2122,14 +2143,18 @@ int main(int argc, char** argv) {
         g_disk.files[path] = prefix + "<trkpt";
         strcpy(gTripPath, path.c_str()); gTripWriteFailed = true; gState = ACTIVE;
         endTrip(false);
-        CHECK(g_disk.readCalls == 2 && g_disk.readBytes == 272 && g_disk.files[path] == prefix + "\n" + GPX_EPILOGUE,
-              "small and near-8-MiB endTrip repairs each read only 16 plus 256 bytes");
+        CHECK(g_disk.readCalls == 2 && g_disk.readBytes == strlen(GPX_EPILOGUE) + 256 &&
+              g_disk.files[path] == prefix + "\n" + GPX_EPILOGUE,
+              "small and near-8-MiB endTrip repairs each read only one epilogue plus 256 bytes");
+        CHECK(g_disk.repairOperations == std::vector<std::string>({"open", "truncate", "sync", "seek", "write", "sync", "close"}),
+              "torn tails still use checked truncate and append");
         g_disk.files[path] = prefix + std::string(TRIP_REPAIR_SCAN_BYTES * 2, '\0');
         const std::string damaged = g_disk.files[path];
         g_disk.readBytes = g_disk.readCalls = 0; g_disk.repairOperations.clear();
         strcpy(gTripPath, path.c_str()); gTripWriteFailed = true; gState = ACTIVE;
         endTrip(false);
-        CHECK(g_disk.readBytes == TRIP_REPAIR_SCAN_BYTES + 16 && g_disk.files[path] == damaged && g_disk.repairOperations.empty(),
+        CHECK(g_disk.readBytes == TRIP_REPAIR_SCAN_BYTES + strlen(GPX_EPILOGUE) &&
+              g_disk.files[path] == damaged && g_disk.repairOperations.empty(),
               "excess damage stops at 4 KiB without cutting or removing complete points");
         fsckAllTrips(LittleFS);
         CHECK(g_disk.files[path] == prefix + "\n" + GPX_EPILOGUE, "boot repairs a tail longer than the runtime budget");
