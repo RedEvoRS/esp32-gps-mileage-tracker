@@ -1811,10 +1811,11 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
             if (!gProductionDisplayFailed) vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
-    // An expired abort deadline allows PMU power-off, but no filesystem
-    // operation may race the old upload handle.
+    // Keep core 0 out of storage while the PMU cuts power. On a forced
+    // shutdown the uploader may still own an open file, so leave both
+    // stores mounted with the lock held through power-off or restart.
+    FS_LOCK();
     if (cleanShutdown) {
-        FS_LOCK();
         if (gSdMounted) SD.end();
         if (gFlashMounted) LittleFS.end();
         feedLoopWatchdogProgress(); // unmount returned; no feed while acquiring lock
@@ -1852,9 +1853,10 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
         // the logger alive with storage unmounted if power stays on.
         vTaskDelay(pdMS_TO_TICKS(1000));
         feedLoopWatchdogProgress(); // shutdown returned after the bounded hold
-        Serial.println(gDegraded.mode() == startup::Mode::Normal ?
-            "ERROR: PMU.shutdown() did not power off -- resuming logging." :
-            "ERROR: PMU.shutdown() did not power off -- resuming degraded service.");
+        if (cleanShutdown)
+            Serial.println(gDegraded.mode() == startup::Mode::Normal ?
+                "ERROR: PMU.shutdown() did not power off -- resuming logging." :
+                "ERROR: PMU.shutdown() did not power off -- resuming degraded service.");
     } else {
         Serial.println(finalVbus == VbusState::Unknown ? VBUS_UNREADABLE :
                        "VBUS returned -- PMU power-off cancelled.");
