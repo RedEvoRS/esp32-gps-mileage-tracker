@@ -10,8 +10,8 @@
 #
 #   restore.sh restore SNAPSHOT [--yes]
 #       Puts a snapshot back. Runs the same checks first, stops the database-writing
-#       services, saves the current databases and any trip files it would
-#       replace under BACKUP_DIR/pre-restore-<time>/, restores, and starts
+#       services, saves the databases and trip files it would replace
+#       under BACKUP_DIR/pre-restore-<time>-<suffix>/, restores, and starts
 #       the services again. Trip files that aren't in the snapshot are
 #       left alone; nothing is deleted.
 #
@@ -165,6 +165,10 @@ for arg in "$@"; do
 done
 [[ $command == check || -n $snapshot_arg ]] || die "say which snapshot to restore (latest, a name, or a path)"
 require_commands rsync sha256sum cmp
+if [[ $command == restore ]]; then
+    require_commands flock
+    lock_backup_dir
+fi
 
 # The snapshot, trip files included, is copied here. Debian 13 keeps /tmp
 # in RAM, so by default this is next to the snapshots (same disk, mode 700).
@@ -206,11 +210,11 @@ fi
 # directory. Each writing/deleting helper also repeats its own preflight.
 check_restore_target ingest_python /data/diagnostics/events.db
 
-pre=$BACKUP_DIR/pre-restore-$(date -u +%Y-%m-%dT%H%M%SZ)
 [[ ! -L $COMPOSE_DIR/data ]] || die "trip data directory must not be a symlink"
 data_owner=1000:1000
 [[ ! -d $COMPOSE_DIR/data ]] || data_owner=$(stat -c %u:%g "$COMPOSE_DIR/data")
-mkdir -p "$pre" "$COMPOSE_DIR/data"
+pre=$(mktemp -d "$BACKUP_DIR/pre-restore-$(date -u +%Y-%m-%dT%H%M%SZ)-XXXXXX")
+mkdir -p "$COMPOSE_DIR/data"
 trip_owner=()
 if (( EUID == 0 )); then
     chown "$data_owner" "$COMPOSE_DIR/data"
@@ -237,7 +241,7 @@ if [[ $MONITOR_PRESENT == yes ]]; then
     compose --profile monitor stop mileage-monitor >&2
 fi
 
-# Save every current database before replacing any of them. The stopped
+# Save all databases this snapshot will replace before replacing any. The stopped
 # ingest helper has /data writable; the viewer's /data is read-only.
 # A current database that SQLite can't read (damaged: a main reason to
 # restore) can't be snapshotted; its raw files are saved instead, and it
@@ -258,22 +262,25 @@ restore_db() {
     "$runner" "$PY_CHECK_RESTORE" "$kind" "$path" "$(db_containment_root "$path")" < "$file" >&2
 }
 save_current_db viewer_python /db/annotations.db "$pre/annotations.db"
-save_current_db ingest_python /data/diagnostics/events.db "$pre/events.db"
-if [[ $MONITOR_PRESENT == yes ]]; then
+snap=$scratch/snapshot
+if [[ -f $snap/events.db ]]; then
+    save_current_db ingest_python /data/diagnostics/events.db "$pre/events.db"
+fi
+if [[ $MONITOR_PRESENT == yes && -f $snap/monitor.db ]]; then
     save_current_db monitor_python /state/monitor.db "$pre/monitor.db"
 fi
 
 log "Restoring the annotations database"
-restore_db viewer_python annotations /db/annotations.db "$scratch/snapshot/annotations.db"
-if [[ -f $scratch/snapshot/events.db ]]; then
+restore_db viewer_python annotations /db/annotations.db "$snap/annotations.db"
+if [[ -f $snap/events.db ]]; then
     log "Restoring the diagnostics database"
-    restore_db ingest_python events /data/diagnostics/events.db "$scratch/snapshot/events.db"
+    restore_db ingest_python events /data/diagnostics/events.db "$snap/events.db"
 fi
-if [[ $MONITOR_PRESENT != unknown && -f $scratch/snapshot/monitor.db ]]; then
+if [[ $MONITOR_PRESENT != unknown && -f $snap/monitor.db ]]; then
     # This may create the volume on a replacement server, without starting
     # the monitor or enabling notifications. Its image supplies UID ownership.
     log "Restoring the monitor database"
-    restore_db monitor_python monitor /state/monitor.db "$scratch/snapshot/monitor.db"
+    restore_db monitor_python monitor /state/monitor.db "$snap/monitor.db"
 fi
 
 log "Restoring trip files (anything replaced goes to $pre/data)"
@@ -281,10 +288,11 @@ log "Restoring trip files (anything replaced goes to $pre/data)"
 # (or its journal) through rsync; only restore the checked SQLite snapshot.
 # Skip unsafe and absolute links, keeping existing real folders. Saved target
 # files are restored at their own paths, even when an alias cannot be restored.
-rsync -a --safe-links --numeric-ids "${trip_owner[@]}" --backup --backup-dir="$pre/data" --itemize-changes \
+# Compare contents so damage with the original size and mtime is replaced.
+rsync -a --checksum --safe-links --numeric-ids "${trip_owner[@]}" --backup --backup-dir="$pre/data" --itemize-changes \
     --exclude=/.upload.lock --exclude='/.upload-lock.*' \
     --exclude=/diagnostics/events.db --exclude='/diagnostics/events.db-*' \
-    "$scratch/snapshot/data/" "$COMPOSE_DIR/data/" >&2
+    "$snap/data/" "$COMPOSE_DIR/data/" >&2
 
 log "Starting the services again"
 start_services

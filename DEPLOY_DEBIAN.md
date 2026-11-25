@@ -1886,9 +1886,13 @@ bash ~/mileage-tracker/backup/restore.sh restore latest
 `latest` means the newest snapshot on the off-host copy that holds trips. You
 can also name one (`2026-10-06T103000Z`) or give a path. It runs the same checks as
 `restore.sh check`, asks you to type `RESTORE`, and stops ingest, viewer and
-any installed monitor. It saves all current databases before replacing any,
-and saves trip files it would overwrite under
-`~/mileage-backups/pre-restore-<time>/`. It restores databases through SQLite's
+any installed monitor. Backup and restore share a lock in `BACKUP_DIR`, and
+restore holds it until services have restarted. If either is already running,
+wait for it to finish before retrying. Each restore creates its own
+`~/mileage-backups/pre-restore-<time>-<suffix>/` and saves the current copies
+of the databases and trip files it will replace. It compares trip file contents
+so it can replace and save a damaged file even if its size and timestamp match.
+It restores databases through SQLite's
 backup API with their writers stopped: the ingest helper writes events.db;
 the viewer and monitor helpers write their own databases. It starts the default
 services again and restarts the monitor if it was running. A saved monitor DB

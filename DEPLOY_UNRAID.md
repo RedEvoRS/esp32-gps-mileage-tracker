@@ -660,9 +660,11 @@ to confirm uploads and a fresh Device health snapshot.
    ```
 
    The restore checks every file and each saved database before asking you
-   to type `RESTORE`. It stops database writers, saves current databases and
-   any replaced trip files under `BACKUP_DIR/pre-restore-...`, restores, then
-   starts services again. It leaves trips absent from the snapshot alone.
+   to type `RESTORE`. It stops database writers, saves the databases and trip
+   files it will replace in a new `pre-restore-...` folder under `BACKUP_DIR`,
+   restores, then starts services again. It compares trip file contents and
+   leaves trips absent from the snapshot alone. If another backup or restore
+   is running, wait for it to finish before retrying.
    Missing optional databases are reported and left unchanged. On an install
    prepared by the installer, `data/` must report **1000:1000 700**; root
    restore uses that directory's owner for restored trip files, with
