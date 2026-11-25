@@ -91,7 +91,7 @@ int main() {
     for (int code : {2010, 4001, 4002, 4003}) {
         auto warning = codeRows(noStorageRows, code);
         assert(warning.size() == 1);
-        has(warning[0], ""transition":"raise"");
+        has(warning[0], R"("transition":"raise")");
     }
     ++cases;
 
