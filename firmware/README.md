@@ -382,6 +382,11 @@ The card's pins come from LilyGO's source. Stage 2's `d` key checked them
 on the bench on 2026-10-18, and it's the first check to run when you fit
 a card. Stage 4 has since recorded two real drives on the card.
 
+- **Card power.** Before mounting, Stage 4 turns BLDO1 off, sets it to
+  3.3 V and confirms the voltage before enabling it. It then verifies
+  both settings. If any check fails, it retries the sequence up to a total
+  of three attempts. If it still cannot verify the rail, it skips the
+  mount (E4001), tries to switch BLDO1 off and prints a serial warning.
 - **Format: FAT32.** The firmware can't read exFAT, which is what most
   cards of 64 GB and up ship with. Use a microSDHC card of 32 GB or less;
   this project uses a SanDisk 32 GB Max Endurance. These come formatted
@@ -428,9 +433,11 @@ a card. Stage 4 has since recorded two real drives on the card.
   startup with no storage, confirmed USB absence still starts the 10-minute
   timer; untrusted PMU startup does not run this power-off path.
   During shutdown the tracker leaves a mounted card powered for 500 ms after
-  unmounting it. At startup it deselects the card and waits the same amount
-  before cutting card power if the card may still be finishing a write after
-  a reset.
+  unmounting it. The same wait applies when a mounted card fails the
+  filesystem or trip-directory check, or is unmounted on entry to no-storage
+  degraded mode or during a storage retry. At startup the tracker also deselects
+  the card and waits before cutting power if the card may still be finishing
+  a write after a reset.
 - **The firmware never formats the card.** After mounting, the tracker
   reads key FAT32 structures before it creates directories or writes files.
   Within a fixed read and time budget, it checks the file allocation table
@@ -446,7 +453,7 @@ a card. Stage 4 has since recorded two real drives on the card.
   place to see the reason.
   See [how to recover the card](#if-the-trip-storage-wont-mount-later).
 - **At boot** the log says which storage it chose:
-  - `Trip storage: microSD (29.72 GiB free); internal flash queue mounted.`
+  - `Trip storage: microSD (29.72 GiB free); internal flash queue ready.`
     Trips go to the card.
   - `WARNING: no microSD card or mount failed -- check power/wiring and FAT32 (exFAT unsupported); card never formatted.`
     followed by
@@ -832,8 +839,8 @@ for all four trips, and stored each as `data/YYYY-MM/<trip>.gpx` plus
 11.40 mi on the board and 11.41 mi on the server.
 
 At boot it uses the [Supreme pins and rails](#supreme-pin-and-power-reference):
-it verifies LoRa power off first, switches SD power and VBACKUP off, and
-enables the GPS rail. Storage setup then powers and mounts the card. It
+it verifies LoRa power off first, checks that SD power and VBACKUP are off,
+and enables the GPS rail. Storage setup then powers and mounts the card. It
 selects SD first and attempts uploads from both mounted stores. If SD later
 stops responding, it can select the mounted internal flash queue between trips;
 see the card-failure notes under normal operation.
@@ -1640,14 +1647,20 @@ during a fix loss on the next drive. These checks still need the board.
 
 #### Expected boot log
 
+If startup cannot verify battery detection, battery voltage measurement or
+the PMU's TS pin setup, it names the setting in a serial warning and reports
+E2010. XPowersLib's existing `PMU.begin()` sets TS to fixed input with its ADC
+off a few I2C transactions before the charger pause. The firmware verifies
+and repairs that setting only after confirming the pause.
+
 Illustrative; free space, attempt count and timing vary:
 
 ```text
 === Stage 4: Trip Logger ===
-LoRa rail (ALDO3) verified off; SD rail (BLDO1) off; VBACKUP off.
+LoRa rail (ALDO3) verified off; SD rail (BLDO1) verified off; VBACKUP verified off.
 PMU power-on source 0x04, power-off source 0x02.
-PMU ready, MAX-M10S GPS rail (ALDO4) on at 3.3 V, charge to 4.1 V. VBUS present.
-Trip storage: microSD (29.72 GiB free); internal flash queue mounted.
+PMU ready, MAX-M10S GPS rail (ALDO4) verified on at 3.3 V, charge to 4.1 V. VBUS present.
+Trip storage: microSD (29.72 GiB free); internal flash queue ready.
 GPS: waiting for checksum-valid NMEA (up to 3 s).
 Setup complete. Logging trips.
 GPS ready: checksum-valid NMEA received.
@@ -1871,7 +1884,7 @@ Serial Monitor can itself restart the board, so messages may show twice.
 Do this before a test drive, not during a trip.
 
 1. After flashing, look for these lines:
-   - `Trip storage: microSD (... GiB free); internal flash queue mounted.`
+   - `Trip storage: microSD (... GiB free); internal flash queue ready.`
      Trips go to the card (the free-space figure depends on your card). If it says `WARNING: microSD unavailable -- using
      internal flash`, the card didn't mount: unplug USB and switch off using
      the [card precautions](#microsd-card), check it's FAT32 and seated, and

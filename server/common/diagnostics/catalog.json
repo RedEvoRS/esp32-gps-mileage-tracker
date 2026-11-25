@@ -1,5 +1,5 @@
 {
-  "catalog_version": 7,
+  "catalog_version": 8,
   "codes": [
     {
       "code": 1000,
@@ -338,6 +338,20 @@
       },
       "notify": false,
       "journal": "per_occurrence"
+    },
+    {
+      "code": 2010,
+      "symbol": "PMU_PERIPHERAL_SETUP_FAILED",
+      "severity": "warning",
+      "oled": [
+        "PMU setup unverified"
+      ],
+      "title": "GPS power or PMU settings unverified",
+      "explanation": "At startup, the power chip did not confirm the GPS rail, battery detection, the TS pin fixed-input mode, or the battery voltage, temperature, USB voltage, and system voltage measurement settings. The tracker continues starting up.",
+      "recovery": "Restart the tracker and check its serial startup messages. If the warning returns, inspect the power chip and its I2C connection.",
+      "context": {},
+      "notify": true,
+      "journal": "transitions"
     },
     {
       "code": 3001,

@@ -400,6 +400,7 @@ inline std::vector<std::string> g_powerEvents;
 struct SDStub : fs::FS {
     bool cardPresent = false, corruptFat = false;
     int begins = 0, ends = 0;
+    uint32_t endedAtMs = 0;
     int capacityQueries = 0;
     std::function<void()> onCapacity;
     int cs = -1, maxFiles = 0;
@@ -416,6 +417,7 @@ struct SDStub : fs::FS {
     }
     void end() {
         ends++; g_powerEvents.push_back("SD.end"); g_disk.mounted = false;
+        endedAtMs = millis();
         if (g_disk.onUnmount) g_disk.onUnmount();
     }
     uint8_t cardType() { return g_disk.mounted ? CARD_SDHC : CARD_NONE; }
@@ -537,8 +539,12 @@ struct PoweredOff {};
 constexpr uint8_t XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL = 0x18;
 constexpr uint8_t XPOWERS_AXP2101_STATUS1 = 0x00;
 constexpr uint8_t XPOWERS_AXP2101_STATUS2 = 0x01;
+constexpr uint8_t XPOWERS_AXP2101_ADC_CHANNEL_CTRL = 0x30;
+constexpr uint8_t XPOWERS_AXP2101_TS_PIN_CTRL = 0x50;
+constexpr uint8_t XPOWERS_AXP2101_BAT_DET_CTRL = 0x68;
 constexpr uint8_t XPOWERS_AXP2101_LDO_ONOFF_CTRL0 = 0x90;
 constexpr uint8_t XPOWERS_AXP2101_LDO_VOL0_CTRL = 0x92;
+constexpr uint8_t XPOWERS_AXP2101_LDO_VOL3_CTRL = 0x95;
 constexpr uint8_t XPOWERS_AXP2101_LDO_VOL4_CTRL = 0x96;
 constexpr uint8_t XPOWERS_AXP2101_INTSTS1 = 0x48;
 constexpr uint8_t XPOWERS_AXP2101_INTSTS2 = 0x49;
@@ -586,8 +592,9 @@ struct XPowersAXP2101 {
                 registerReadOverride[reg] &= ~value;
             return 0;
         }
-        assert(reg == 0x50 || reg == 0x30); // debug TS setup only
-        registerReadOverride[reg] = value;
+        assert(reg == XPOWERS_AXP2101_TS_PIN_CTRL || reg == XPOWERS_AXP2101_ADC_CHANNEL_CTRL);
+        if (reg == XPOWERS_AXP2101_TS_PIN_CTRL) tsControl = value;
+        else adcChannels = value;
         return 0;
     }
     int readRegister(uint8_t reg) {
@@ -596,8 +603,9 @@ struct XPowersAXP2101 {
         if (onRegisterRead) onRegisterRead(reg);
         if (failRegisterReadAt.count(reg) && failRegisterReadAt[reg] == call) return -1;
         if (registerReadOverride.count(reg)) return registerReadOverride[reg];
-        if (reg == 0x50) return 0x10; // XPowersLib init: external TS, bias off
-        if (reg == 0x30) return 0x1d; // existing non-TS ADC channels
+        if (reg == XPOWERS_AXP2101_TS_PIN_CTRL) return tsControl;
+        if (reg == XPOWERS_AXP2101_ADC_CHANNEL_CTRL) return adcChannels;
+        if (reg == XPOWERS_AXP2101_BAT_DET_CTRL) return batteryDetection;
         if (reg == 0x36) return 0x04;
         if (reg == 0x37) return 0x00;
         if (reg == 0xa4) return batteryPercent;
@@ -606,8 +614,9 @@ struct XPowersAXP2101 {
         if (reg == XPOWERS_AXP2101_STATUS1) return (vbusIn ? 0x20 : 0) | (batteryConnected ? 0x08 : 0);
         if (reg == XPOWERS_AXP2101_STATUS2) return vbusNotIn ? 0x08 : 0;
         if (reg == XPOWERS_AXP2101_LDO_ONOFF_CTRL0)
-            return (bldo1 ? 0x10 : 0) | (aldo3 ? 0x04 : 0) | (aldo1 ? 0x01 : 0);
+            return (bldo1 ? 0x10 : 0) | (aldo4 ? 0x08 : 0) | (aldo3 ? 0x04 : 0) | (aldo1 ? 0x01 : 0);
         if (reg == XPOWERS_AXP2101_LDO_VOL0_CTRL) return (aldo1Mv - 500) / 100;
+        if (reg == XPOWERS_AXP2101_LDO_VOL3_CTRL) return (aldo4Mv - 500) / 100;
         if (reg == XPOWERS_AXP2101_LDO_VOL4_CTRL) return (bldo1Mv - 500) / 100;
         if (reg == XPOWERS_AXP2101_INTSTS1) return (lowIrq ? 0x40 : 0) | (criticalIrq ? 0x80 : 0);
         if (reg == XPOWERS_AXP2101_INTSTS2) return (removeIrq ? 0x40 : 0) | (insertIrq ? 0x80 : 0) |
@@ -616,7 +625,8 @@ struct XPowersAXP2101 {
         if (reg == XPOWERS_AXP2101_LOW_BAT_WARN_SET) return (lowWarnNibble << 4) | criticalPercent;
         if (reg == XPOWERS_AXP2101_CV_CHG_VOL_SET) return failChargeTargetRead ? -1 : chgVol;
         assert(reg == XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL);
-        return failChargeRead ? -1 : chargeEnabled ? 0x02 : 0;
+        if (failChargeRead) return -1;
+        return (chargeEnabled ? 0x02 : 0) | (vbackup ? 0x04 : 0);
     }
     bool vbusIn = true, removeIrq = false, insertIrq = false;
     bool longPressIrq = false, shortPressIrq = false, criticalIrq = false, lowIrq = false;
@@ -628,20 +638,36 @@ struct XPowersAXP2101 {
     int shutdownCalls = 0;
     void (*onShutdown)() = nullptr;
     bool aldo3 = true, aldo4 = false, bldo1 = true, vbackup = true;
+    unsigned failVbackupDisableWrites = 0;
     bool aldo1 = true, failAldo1Voltage = false, failAldo1Enable = false;
     bool aldo1VoltageStuck = false, aldo1EnableStuck = false;
     int aldo1Mv = 1800;
     bool failRadioDisable = false, radioStuckOn = false;
-    int aldo4Mv = 0, bldo1Mv = 1800;
+    int aldo4Mv = 1800, bldo1Mv = 1800;
+    unsigned failAldo4VoltageWrites = 0;
+    bool failPeripheralAdcWrites = false;
+    uint8_t adcChannels = 0x1d; // existing non-TS ADC channels
+    uint8_t tsControl = 0x10; // normal XPowersLib init: external TS, bias off
+    bool batteryDetection = true;
+    unsigned failBatteryDetectionWrites = 0, failBatteryVoltageWrites = 0;
     bool failSdVoltage = false, failSdEnable = false, failSdDisable = false;
+    uint32_t bldo1OffMs = 0;
     TwoWire* bus = nullptr;
     std::vector<std::string> operations;
     int beginCalls = 0, failBegins = 0;
+    size_t beginRegisterWriteCount = 0;
     std::function<void()> onBegin;
     bool begin(TwoWire& wire, int, int, int) {
         bus = &wire; operations.push_back("begin"); beginCalls++;
         if (onBegin) onBegin();
         if (failBegins) { failBegins--; return false; }
+        // XPowersLib 0.3.3 initImpl() ignores the TS setup result.
+        const size_t writesBefore = registerWrites.size();
+        const uint8_t ts = readRegister(XPOWERS_AXP2101_TS_PIN_CTRL);
+        writeRegister(XPOWERS_AXP2101_TS_PIN_CTRL, (ts & 0xF0) | 0x10);
+        const int adc = readRegister(XPOWERS_AXP2101_ADC_CHANNEL_CTRL);
+        if (adc >= 0) writeRegister(XPOWERS_AXP2101_ADC_CHANNEL_CTRL, adc & ~0x02);
+        beginRegisterWriteCount += registerWrites.size() - writesBefore;
         return true;
     }
     bool disableALDO3() {
@@ -662,12 +688,21 @@ struct XPowersAXP2101 {
         if (!aldo1EnableStuck) aldo1 = true;
         return true;
     }
-    void setALDO4Voltage(int mv) { operations.push_back("setALDO4Voltage"); aldo4Mv = mv; }
-    void enableALDO4() { operations.push_back("enableALDO4"); aldo4 = true; } void disableALDO4() { operations.push_back("disableALDO4"); aldo4 = false; }
+    bool setALDO4Voltage(int mv) {
+        operations.push_back("setALDO4Voltage");
+        if (failAldo4VoltageWrites) {
+            --failAldo4VoltageWrites;
+            return false;
+        }
+        aldo4Mv = mv;
+        return true;
+    }
+    bool enableALDO4() { operations.push_back("enableALDO4"); aldo4 = true; return true; }
+    void disableALDO4() { operations.push_back("disableALDO4"); aldo4 = false; }
     bool disableBLDO1() { operations.push_back("disableBLDO1");
         g_powerEvents.push_back("BLDO1.off");
         if (failSdDisable) return false;
-        bldo1 = false; return true;
+        bldo1 = false; bldo1OffMs = millis(); return true;
     }
     bool setBLDO1Voltage(int mv) { operations.push_back("setBLDO1Voltage");
         g_powerEvents.push_back("BLDO1.voltage");
@@ -679,7 +714,15 @@ struct XPowersAXP2101 {
         if (failSdEnable) return false;
         bldo1 = true; return true;
     }
-    void disableButtonBatteryCharge() { operations.push_back("disableButtonBatteryCharge"); vbackup = false; }
+    bool disableButtonBatteryCharge() {
+        operations.push_back("disableButtonBatteryCharge");
+        if (failVbackupDisableWrites) {
+            --failVbackupDisableWrites;
+            return false;
+        }
+        vbackup = false;
+        return true;
+    }
     uint8_t getPowerOnSource() { operations.push_back("getPowerOnSource"); return 0x04; }
     uint8_t getPowerOffSource() { operations.push_back("getPowerOffSource"); return 0x02; }
     uint8_t chgVol = 3;
@@ -691,12 +734,45 @@ struct XPowersAXP2101 {
     }
     uint8_t getChargeTargetVoltage() { operations.push_back("getChargeTargetVoltage"); return chgVol; }
     float dieC = 30.0f; bool chargeEnabled = true;   // tests set dieC
-    void enableTemperatureMeasure() { operations.push_back("enableTemperatureMeasure");}
+    bool enableTemperatureMeasure() {
+        operations.push_back("enableTemperatureMeasure");
+        if (failPeripheralAdcWrites) return false;
+        adcChannels |= 0x10;
+        return true;
+    }
     float getTemperature(uint16_t* = nullptr) { operations.push_back("getTemperature"); return dieC; }
     void enableCellbatteryCharge() { operations.push_back("enableCellbatteryCharge"); if (!failChargeEnable) chargeEnabled = true; }
     void disableCellbatteryCharge() { operations.push_back("disableCellbatteryCharge"); if (!failChargeDisable) chargeEnabled = false; }
-    void enableBattDetection() { operations.push_back("enableBattDetection");} void enableBattVoltageMeasure() { operations.push_back("enableBattVoltageMeasure");}
-    void enableVbusVoltageMeasure() { operations.push_back("enableVbusVoltageMeasure");} void enableSystemVoltageMeasure() { operations.push_back("enableSystemVoltageMeasure");}
+    bool enableBattDetection() {
+        operations.push_back("enableBattDetection");
+        if (failBatteryDetectionWrites) {
+            --failBatteryDetectionWrites;
+            return false;
+        }
+        batteryDetection = true;
+        return true;
+    }
+    bool enableBattVoltageMeasure() {
+        operations.push_back("enableBattVoltageMeasure");
+        if (failBatteryVoltageWrites) {
+            --failBatteryVoltageWrites;
+            return false;
+        }
+        adcChannels |= 0x01;
+        return true;
+    }
+    bool enableVbusVoltageMeasure() {
+        operations.push_back("enableVbusVoltageMeasure");
+        if (failPeripheralAdcWrites) return false;
+        adcChannels |= 0x04;
+        return true;
+    }
+    bool enableSystemVoltageMeasure() {
+        operations.push_back("enableSystemVoltageMeasure");
+        if (failPeripheralAdcWrites) return false;
+        adcChannels |= 0x08;
+        return true;
+    }
     uint32_t enabledIrqs = 0;
     bool disableIRQ(uint32_t) { operations.push_back("disableIRQ"); return true; }
     bool enableIRQ(uint32_t mask) {

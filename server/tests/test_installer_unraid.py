@@ -89,7 +89,7 @@ class InstallerUnraid(unittest.TestCase):
 
     def run_step(self, step, ok=True, **env):
         result = subprocess.run(["bash", "-c", HARNESS], text=True, capture_output=True,
-                                env=dict(self.env, STEP=step, **env), timeout=30)
+                                env=dict(self.env, STEP=step, **env), stdin=subprocess.DEVNULL, timeout=30)
         self.assertFalse((self.work / "forbidden").exists(), result.stdout + result.stderr)
         if ok:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

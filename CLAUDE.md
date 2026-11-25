@@ -208,6 +208,13 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   ALDO1 = OLED/BME280/magnetometer (Stage 4 sets 3.3 V). Never
   run V1.2 rail code on the Supreme. **ALDO3 comes up ON after a USB-power
   power-on**, so firmware switches it off first thing after `PMU.begin()`
+- Stage 4 checks ALDO4 enable and 3.3 V selection, battery detection, and the
+  battery voltage, temperature, VBUS voltage and system voltage measurement
+  enables. XPowersLib's existing `PMU.begin()` sets TS to fixed input with
+  its ADC off a few I2C transactions before the charger pause. The firmware
+  verifies and repairs TS only after confirming that pause. It tries each
+  setting up to three times, reports E2010 for unverified settings and
+  continues startup.
 - PMU (0x34) and PCF8563 RTC (0x51) share `Wire1`, SDA 42 / SCL 41. OLED and
   BME280 are on `Wire`, SDA 17 / SCL 18
 - RTC: read at boot to anchor diagnostic timestamps only, never GPX;
@@ -236,8 +243,10 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   recorded real drives on the card): FAT32 only (exFAT unsupported),
   powered from BLDO1, SPI MOSI 35 / SCK 36 / MISO 37, CS 47, IMU CS 34
   held high. BLDO1 powers up
-  ON at 1.8 V: switch it off, set 3.3 V, then enable. Stage 4 picks its
-  trip store at boot, never formats the card, and falls back to LittleFS
+  ON at 1.8 V. Stage 4 reads back the boot-time power-off. Before mounting,
+  it sets the rail to 3.3 V, enables it, and reads back both settings.
+  Stage 4 picks its trip store at boot, never formats the card, and falls
+  back to LittleFS
   for new trips after a failed capacity query or two failed GPX pieces
   without a clean close between them. E4001 reports the fallback, and
   E4006 reports GPX write failures. A card that still answers capacity
@@ -247,6 +256,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   or restart.
   A read-only FAT32 check before the first write rejects damaged cards with
   E4011 and keeps trips and diagnostics on LittleFS if available.
+  A mounted card rejected during setup gets 500 ms after unmount before
+  power is cut. Both trip stores require a readable `/trips` directory.
+  LittleFS can still hold the diagnostic journal if its trip directory fails.
   SD uploads were verified on 2026-10-21 (UTC), LittleFS uploads on 2026-11-03 (UTC)
 - Build: `esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=8M,PSRAM=enabled`
   (8 MB flash, 8 MB QSPI PSRAM, native USB). Download mode, the factory

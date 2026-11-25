@@ -46,7 +46,7 @@ static void tick() {
 }
 int main() {
     prepare();
-    REQUIRE(gDebugTempTs.ready && PMU.registerReadOverride[0x50] == 0x16 && PMU.registerReadOverride[0x30] == 0x1f);
+    REQUIRE(gDebugTempTs.ready && PMU.tsControl == 0x16 && PMU.adcChannels == 0x1f);
     REQUIRE(Wire.timeout == 10 && Wire.sda == 17 && Wire.scl == 18);
     auto operations = PMU.operations.size();
     for (unsigned i=0; i<100; ++i) serviceDebugTemperature();

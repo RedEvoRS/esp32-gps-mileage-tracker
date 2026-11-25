@@ -6,7 +6,8 @@
 using namespace diagnostics;
 static EventLog::Batch sdRuntimeBatch;
 
-static void sdWorld(bool flash = true, bool corruptFat = false) {
+static void sdWorld(bool flash = true, bool corruptFat = false, bool flashTripsFile = false,
+                    bool cardPresent = true) {
     resetWorld();
     gSdUnavailable = false;
     SD.capacityQueries = 0;
@@ -20,12 +21,16 @@ static void sdWorld(bool flash = true, bool corruptFat = false) {
     gEventRetry = {}; gEventRevisionBlocked = gHaveEventSnapshot = false;
     gEnrollmentChecked = false;
     gContactTick = 0; gContactUptime = gLastContact = 0; gContactKnown = false;
-    g_millis = 1000; SD.cardPresent = true;
+    g_millis = 1000; SD.cardPresent = cardPresent;
     g_disk.failMount = !flash;
+    if (flashTripsFile) {
+        LittleFS.dirs.erase(TRIP_DIR);
+        g_disk.files[TRIP_DIR] = "preserved flash file";
+    }
     SD.corruptFat = corruptFat;
     setup();
-    assert(gFlashMounted == flash && gSdMounted == !corruptFat);
-    assert(gTripFS == (corruptFat ? static_cast<fs::FS*>(&LittleFS) : static_cast<fs::FS*>(&SD)));
+    assert(gFlashMounted == flash && gSdMounted == (cardPresent && !corruptFat));
+    assert(gTripFS == (gSdMounted ? static_cast<fs::FS*>(&SD) : static_cast<fs::FS*>(&LittleFS)));
     serviceJournal();
 }
 
@@ -53,6 +58,60 @@ static void checkStorage() {
 }
 
 int main() {
+    // Command success alone cannot justify starting the card's SPI bus.
+    for (auto [reg, value] : std::initializer_list<std::pair<uint8_t, int>>{
+            {XPOWERS_AXP2101_LDO_ONOFF_CTRL0, 0x09},
+            {XPOWERS_AXP2101_LDO_VOL4_CTRL, 13},
+            {XPOWERS_AXP2101_LDO_ONOFF_CTRL0, -1},
+            {XPOWERS_AXP2101_LDO_VOL4_CTRL, -1}}) {
+        resetWorld();
+        SD.cardPresent = true;
+        PMU.registerReadOverride[reg] = value;
+        assert(!mountSdStorage());
+        assert(SD.begins == 0 && !gSdSpi.started && !PMU.bldo1);
+        const unsigned readsPerAttempt = reg == XPOWERS_AXP2101_LDO_VOL4_CTRL ? 1 : 2;
+        assert(PMU.registerReadCalls[XPOWERS_AXP2101_LDO_VOL4_CTRL] ==
+               readsPerAttempt * PMU_PERIPHERAL_ATTEMPTS);
+        std::vector<std::string> expectedPowerEvents;
+        for (unsigned attempt = 0; attempt < PMU_PERIPHERAL_ATTEMPTS; ++attempt) {
+            expectedPowerEvents.insert(expectedPowerEvents.end(), {"BLDO1.off", "BLDO1.voltage"});
+            if (reg == XPOWERS_AXP2101_LDO_ONOFF_CTRL0) expectedPowerEvents.emplace_back("BLDO1.on");
+        }
+        const bool unreadableControl = reg == XPOWERS_AXP2101_LDO_ONOFF_CTRL0 && value < 0;
+        expectedPowerEvents.insert(expectedPowerEvents.end(),
+                                   unreadableControl ? PMU_PERIPHERAL_ATTEMPTS : 1u, "BLDO1.off");
+        assert(g_powerEvents == expectedPowerEvents);
+        assert(logHas("microSD card power rail (BLDO1) could not be verified"));
+        assert(logHas("power-off unconfirmed") == unreadableControl);
+    }
+    resetWorld();
+    SD.cardPresent = true;
+    assert(mountSdStorage() && SD.begins == 1 && PMU.bldo1 && PMU.bldo1Mv == 3300);
+    SD.end();
+    gSdSpi.end();
+    std::puts("PASS BLDO1 read-back: four persistent fault scenarios prevent mounting; healthy card mounts");
+
+    // A successful begin requires a powered settle after end, even when
+    // rejecting FAT or a directory the card reports missing after mkdir.
+    for (int scenario = 0; scenario < 3; ++scenario) {
+        resetWorld();
+        SD.cardPresent = scenario != 0;
+        SD.corruptFat = scenario == 1;
+        if (scenario == 2) g_sdDisk.failOpenPath = TRIP_DIR;
+        g_delayHook = [](uint32_t ms) { g_millis += ms; };
+        g_taskDelayHook = [](uint32_t ms) {
+            assert(ms == SD_POWER_OFF_SETTLE_MS);
+            assert(SD.ends == 1 && !g_sdDisk.mounted && PMU.bldo1);
+        };
+        const uint32_t startedAt = millis();
+        assert(!mountSdStorage());
+        assert(SD.ends == 1 && !PMU.bldo1);
+        assert(SD.endedAtMs == startedAt + SD_SETTLE_MS);
+        assert(PMU.bldo1OffMs - SD.endedAtMs == (scenario == 0 ? 0 : SD_POWER_OFF_SETTLE_MS));
+        assert(g_sdDisk.mkdirCalls == (scenario == 2 ? 1 : 0));
+    }
+    std::puts("SD runtime: mounted FAT and directory rejections settle 500 ms; never-mounted cut stays immediate");
+
     sdWorld(true, true);
     for (unsigned i = 0; i < kEventQueueSize && gJournal.stats().queued; ++i) serviceJournal();
     assert(!gJournal.stats().queued);
@@ -172,6 +231,44 @@ int main() {
     noSpaceFaults(flashRows); assert(codeRows(flashRows, 4003).empty());
     std::puts("SD runtime: active SD trip kept on SD, E4006 finalization, next trip on flash, no E4003 passed");
 
+    sdWorld(true, false, true);
+    assert(gFlashMounted && !tripStoreAvailable(LittleFS));
+    assert(!hasPending(LittleFS) && !uploadPending(LittleFS));
+    events(); drive(15, 40); events();
+    assert(gState == ACTIVE && gTripFS == &SD);
+    SD.cardPresent = false;
+    checkStorage();
+    auto blocked = events();
+    auto sdLost = std::find_if(blocked.begin(), blocked.end(), [](const std::string& row) {
+        return row.find("\"code\":4001,") != std::string::npos;
+    });
+    auto noRecording = std::find_if(sdLost, blocked.end(), [](const std::string& row) {
+        return row.find("\"code\":4003,") != std::string::npos;
+    });
+    assert(sdLost != blocked.end() && noRecording != blocked.end());
+    assert(noRecording->find("\"transition\":\"raise\"") != std::string::npos);
+    gClockSet = false; drive(15, 1);
+    assert(gState == IDLE && !gTripPath[0] && gTripFS == &SD);
+    assert(!roomForNewTrip(millis()) && gTripFS == &SD);
+    serviceJournal();
+    assert(gFlashMounted && gJournal.stats().backend == EventLog::Backend::LittleFs);
+    assert(g_disk.files.at(TRIP_DIR) == "preserved flash file" && !LittleFS.dirs.count(TRIP_DIR));
+    for (const auto& file : g_disk.files) assert(file.first.rfind("/trips/", 0) != 0);
+    std::puts("SD runtime: flash /trips file preserved, E4001 then E4003 mid-trip, diagnostics remain on flash");
+
+    sdWorld(true, false, true, false);
+    assert(gDegraded.mode() == startup::Mode::NoStorage && !tripStoreAvailable(LittleFS));
+    assert(gJournal.stats().backend == EventLog::Backend::LittleFs);
+    const int absentEnds = SD.ends;
+    g_millis += gDegraded.waitMs();
+    loop();
+    assert(g_restarts == 0 && gDegraded.waitMs() == 120000);
+    assert(SD.ends == absentEnds + 1 && !gSdMounted && !gSdSpi.started && !PMU.bldo1);
+    assert(PMU.bldo1OffMs == SD.endedAtMs); // failed mount has no power-off settle
+    assert(gFlashMounted && g_disk.mounted && !tripStoreAvailable(LittleFS));
+    assert(g_disk.files.at(TRIP_DIR) == "preserved flash file");
+    std::puts("SD runtime: degraded trip-store retry preserves a diagnostic-only flash mount");
+
     sdWorld(); events(); drive(15, 12); events();
     activePath = gTripPath;
     SD.cardPresent = false;
@@ -215,9 +312,9 @@ int main() {
     assert(gJournal.stats().queued == 0 && g_sdDisk.files == journalSd && g_lockDepth == 0);
     std::puts("SD runtime: E4001 uploaded through LittleFS, cached SD authority gated, NVS SD stale bit persisted passed");
 
-    // Issue #812: boot-time SD capacity failure with LittleFS unavailable must enter
-    // NoStorage degraded mode, leave SD mounted/powered with gSdUnavailable latched
-    // (no immediate BLDO1 cut without settle), raise E4003, and skip fsck on SD.
+    // A boot-time SD capacity failure with LittleFS unavailable enters NoStorage
+    // with SD unmounted and powered off after settling. The journal is RAM-only
+    // and reports the storage failures while leaving the SD trip untouched.
     {
         resetWorld();
         gSdUnavailable = false;
@@ -231,9 +328,19 @@ int main() {
         g_sdDisk.files["/trips/torn.gpx"] = torn;
         g_sdDisk.onMount = [] { g_sdDisk.readsFail = false; };
         SD.onCapacity = [] { g_sdDisk.readsFail = true; };
+        static unsigned settleCount = 0;
+        g_taskDelayHook = [](uint32_t ms) {
+            if (ms != SD_POWER_OFF_SETTLE_MS) return;
+            ++settleCount;
+            assert(!g_sdDisk.mounted && !gSdSpi.started && PMU.bldo1);
+            assert(g_watchdog.config.timeout_ms == startup_watchdog::STARTUP_WDT_TIMEOUT_MS);
+            assert(gStartupWatchdogRecord.stage == uint32_t(startup_watchdog::Stage::CardMount));
+        };
         setup();
         assert(gDegraded.mode() == startup::Mode::NoStorage);
-        assert(gSdMounted && !gFlashMounted && PMU.bldo1 && SD.ends == 0 && gSdUnavailable);
+        assert(!gSdMounted && !gFlashMounted && !PMU.bldo1 && SD.ends == 1 && gSdUnavailable);
+        assert(settleCount == 1 && PMU.bldo1OffMs - SD.endedAtMs == SD_POWER_OFF_SETTLE_MS);
+        assert(g_watchdog.config.timeout_ms == LOOP_WDT_TIMEOUT_MS);
         assert(g_sdDisk.files["/trips/torn.gpx"] == torn); // fsck did not touch failed SD
         for (unsigned i = 0; i < kEventQueueSize && gJournal.stats().queued; ++i) serviceJournal();
         auto rows = events();
@@ -241,6 +348,7 @@ int main() {
         assert(e4003.size() == 1 && e4003[0].find("\"transition\":\"raise\"") != std::string::npos);
         assert(codeRows(rows, 4001).size() == 1 && codeRows(rows, 4002).size() == 1);
 
+        assert(gJournal.stats().backend == EventLog::Backend::Ram);
         // NoStorage retry probe must repeat the SD capacity query instead of
         // restarting forever every 60 s on a card that mounts but fails capacity.
         const int queriesBeforeRetry = SD.capacityQueries;
@@ -248,7 +356,10 @@ int main() {
         loop();
         assert(g_restarts == 0 && gDegraded.waitMs() == 120000);
         assert(SD.capacityQueries == queriesBeforeRetry + 1);
-        assert(!gSdMounted && !gFlashMounted);
+        assert(!gSdMounted && !gFlashMounted && !PMU.bldo1 && SD.ends == 2);
+        assert(settleCount == 2 && PMU.bldo1OffMs - SD.endedAtMs == SD_POWER_OFF_SETTLE_MS);
+        assert(g_watchdog.config.timeout_ms == LOOP_WDT_TIMEOUT_MS);
+        assert(gStartupWatchdogRecord.stage == uint32_t(startup_watchdog::Stage::None));
         // Second retry with the same fault still backs off without restarting.
         g_millis += gDegraded.waitMs();
         loop();
@@ -260,6 +371,8 @@ int main() {
         bool restarted = false;
         try { loop(); } catch (const Restarted&) { restarted = true; }
         assert(restarted && g_restarts == 1);
+        assert(settleCount == 4 && !gSdMounted && !PMU.bldo1);
+        g_taskDelayHook = nullptr;
         g_sdDisk.onMount = nullptr;
     }
     // Boot-time SD capacity failure with LittleFS mounted leaves SD mounted with
@@ -359,4 +472,18 @@ int main() {
         assert(gSdUnavailable && !gSdMounted);
     }
     std::puts("SD runtime: boot capacity failure, no-storage probe, single boot query, cancelled shutdown (#812) passed");
+
+    sdWorld();
+    PMU.vbusIn = false;
+    g_disk.onUnmount = [] { PMU.vbusIn = true; SD.corruptFat = true; };
+    g_taskDelayHook = [](uint32_t ms) {
+        if (ms == 20) serviceJournal();
+        if (ms == SD_POWER_OFF_SETTLE_MS)
+            assert(gNetHold && g_lockDepth > 0 && !g_sdDisk.mounted && PMU.bldo1);
+    };
+    bool restarted = false;
+    try { powerOffForVbus("idle_battery"); } catch (const Restarted&) { restarted = true; }
+    assert(restarted && PMU.shutdownCalls == 0 && SD.begins == 2 && SD.ends == 2);
+    assert(!PMU.bldo1 && PMU.bldo1OffMs - SD.endedAtMs == SD_POWER_OFF_SETTLE_MS);
+    std::puts("SD runtime: rejected cancelled-shutdown remount settles with filesystem locked and network held");
 }

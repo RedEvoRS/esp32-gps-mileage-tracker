@@ -21,8 +21,10 @@ static void world(bool sd, bool flash, EventLog::Config config = EventLog::Confi
     g_disk.mounted = flash; g_sdDisk.mounted = sd;
     SD.cardPresent = sd;
     gSdMounted = sd; gFlashMounted = flash;
+    gFlashTripsReady = flash;
     gTripFS = sd ? static_cast<fs::FS*>(&SD) : static_cast<fs::FS*>(&LittleFS);
     SD.dirs.clear(); LittleFS.dirs.clear();
+    if (flash) LittleFS.dirs.insert(TRIP_DIR);
     g_lockDepth = 0; gFsDemand = 0; gNetHold = gNetBusy = gNetAbort = false;
     gJournalSealRequested = gJournalSealDone = gJournalSealOk = false;
     gJournalSealStalls = 0;

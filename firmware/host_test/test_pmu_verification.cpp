@@ -19,6 +19,361 @@ static unsigned calls(const char* operation) {
 static void chargeTick() { g_millis += CHG_CHECK_MS; serviceChargeTemp(); }
 
 int main() {
+    auto bootRows = []() { FS_LOCK(); auto rows = take(); FS_UNLOCK(); return rows; };
+    // A failed voltage write and a failed ADC read recover on the next attempt.
+    pmuWorld();
+    PMU.failAldo4VoltageWrites = 1;
+    PMU.adcChannels = 0x01;
+    std::vector<uint32_t> gpsAttempts, adcAttempts;
+    PMU.onRegisterRead = [&](uint8_t reg) {
+        if (reg == XPOWERS_AXP2101_LDO_VOL3_CTRL) gpsAttempts.push_back(millis());
+        if (reg == XPOWERS_AXP2101_ADC_CHANNEL_CTRL && calls("enableTemperatureMeasure")) {
+            if (adcAttempts.empty()) PMU.failRegisterReadAt[reg] = PMU.registerReadCalls[reg];
+            adcAttempts.push_back(millis());
+        }
+    };
+    g_delayHook = [](uint32_t ms) { g_millis += ms; };
+    setup();
+    PMU.onRegisterRead = nullptr;
+    g_delayHook = nullptr;
+    assert(gpsAttempts.size() == 3 && gpsAttempts[1] - gpsAttempts[0] == PMU_PERIPHERAL_RETRY_MS);
+    assert(gpsAttempts[2] == gpsAttempts[1]);
+    assert(adcAttempts.size() == 2 && adcAttempts[1] - adcAttempts[0] == PMU_PERIPHERAL_RETRY_MS);
+    assert(calls("setALDO4Voltage") == 2 && calls("enableALDO4") == 1 && PMU.aldo4 && PMU.aldo4Mv == 3300);
+    assert(calls("enableTemperatureMeasure") == 2 && calls("enableVbusVoltageMeasure") == 2 &&
+           calls("enableSystemVoltageMeasure") == 2 && PMU.adcChannels == 0x1D);
+    assert(codeRows(bootRows(), 2010).empty() && !logCount("setup unconfirmed after "));
+    ++cases;
+
+    // Redundant writes can fail while the requested settings are retained.
+    pmuWorld();
+    PMU.aldo4Mv = 3300;
+    PMU.failAldo4VoltageWrites = PMU_PERIPHERAL_ATTEMPTS;
+    setup();
+    assert(calls("setALDO4Voltage") == 1 && calls("enableALDO4") == 1);
+    assert(PMU.aldo4 && logCount("GPS rail (ALDO4) verified on at 3.3 V") == 1);
+    assert(codeRows(bootRows(), 2010).empty());
+    ++cases;
+
+    pmuWorld();
+    PMU.failPeripheralAdcWrites = true;
+    setup();
+    assert(calls("enableTemperatureMeasure") == 1 && calls("enableVbusVoltageMeasure") == 1 &&
+           calls("enableSystemVoltageMeasure") == 1 && PMU.adcChannels == 0x1D);
+    assert(!logCount("measurement setup unconfirmed") && codeRows(bootRows(), 2010).empty());
+    ++cases;
+
+    // Reject a cleared enable, wrong voltage, unreadable register, or any
+    // single missing ADC bit, even when the methods claim the writes succeeded.
+    for (auto [reg, value] : std::initializer_list<std::pair<uint8_t, int>>{
+            {XPOWERS_AXP2101_LDO_ONOFF_CTRL0, 0x01},
+            {XPOWERS_AXP2101_LDO_VOL3_CTRL, 27},
+            {XPOWERS_AXP2101_LDO_VOL3_CTRL, -1},
+            {XPOWERS_AXP2101_ADC_CHANNEL_CTRL, 0x0D},
+            {XPOWERS_AXP2101_ADC_CHANNEL_CTRL, 0x15},
+            {XPOWERS_AXP2101_ADC_CHANNEL_CTRL, 0x19},
+            {XPOWERS_AXP2101_ADC_CHANNEL_CTRL, -1}}) {
+        pmuWorld();
+        if (reg == XPOWERS_AXP2101_LDO_ONOFF_CTRL0) {
+            // Only the GPS read-back loses its enable bit. The shared control
+            // register must still report BLDO1 enabled when SD is checked.
+            PMU.onRegisterRead = [&](uint8_t readReg) {
+                if (readReg != reg) return;
+                if (PMU.aldo4 && !PMU.bldo1) PMU.registerReadOverride[reg] = value;
+                else PMU.registerReadOverride.erase(reg);
+            };
+        } else {
+            PMU.registerReadOverride[reg] = value;
+        }
+        setup();
+        PMU.onRegisterRead = nullptr;
+        const bool adc = reg == XPOWERS_AXP2101_ADC_CHANNEL_CTRL;
+        assert(calls("setALDO4Voltage") == (adc ? 1u : PMU_PERIPHERAL_ATTEMPTS));
+        if (reg == XPOWERS_AXP2101_LDO_VOL3_CTRL)
+            assert(calls("enableALDO4") == 0 && !PMU.aldo4);
+        assert(calls("enableTemperatureMeasure") == (adc ? PMU_PERIPHERAL_ATTEMPTS : 1u));
+        assert(logCount(adc ? "measurement setup unconfirmed after " :
+                              "ALDO4) 3.3 V/on setup unconfirmed after ") == 1);
+        assert(gDegraded.mode() == startup::Mode::Normal && tripStoreAvailable(SD));
+        auto rows = bootRows();
+        auto warning = codeRows(rows, 2010);
+        assert(warning.size() == 1 && codeRows(rows, 2001).empty());
+        has(warning[0], "\"transition\":\"raise\"");
+        ++cases;
+    }
+
+    for (int raw = 0; raw <= 0xFF; ++raw) {
+        assert(pmu_read::batteryDetectionEnabled(raw) == bool(raw & 1));
+        assert(pmu_read::batteryVoltageMeasureEnabled(raw) == bool(raw & 1));
+    }
+    assert(!pmu_read::batteryDetectionEnabled(-1));
+    assert(!pmu_read::batteryVoltageMeasureEnabled(-1));
+    ++cases;
+
+    enum class BatterySetupFault { TransientWrite, PersistentWrite, Unreadable };
+    for (bool detection : {true, false}) {
+        const auto reg = detection ? XPOWERS_AXP2101_BAT_DET_CTRL : XPOWERS_AXP2101_ADC_CHANNEL_CTRL;
+        const auto operation = detection ? "enableBattDetection" : "enableBattVoltageMeasure";
+        const auto warning = detection ? "PMU battery detection enable unconfirmed" :
+                                         "PMU battery voltage measurement enable unconfirmed";
+        for (auto [fault, attempts] : {std::pair{BatterySetupFault::TransientWrite, 2u},
+                                       std::pair{BatterySetupFault::PersistentWrite, PMU_PERIPHERAL_ATTEMPTS},
+                                       std::pair{BatterySetupFault::Unreadable, PMU_PERIPHERAL_ATTEMPTS}}) {
+            pmuWorld();
+            PMU.batteryDetection = false;
+            PMU.adcChannels &= ~0x01;
+            auto& failedWrites = detection ? PMU.failBatteryDetectionWrites : PMU.failBatteryVoltageWrites;
+            failedWrites = fault == BatterySetupFault::TransientWrite ? 1 :
+                           fault == BatterySetupFault::PersistentWrite ? attempts : 0;
+            std::vector<uint32_t> readTimes;
+            PMU.onRegisterRead = [&](uint8_t readReg) {
+                if (readReg != reg || readTimes.size() >= calls(operation)) return;
+                readTimes.push_back(millis());
+                if (fault == BatterySetupFault::Unreadable)
+                    PMU.failRegisterReadAt[reg] = PMU.registerReadCalls[reg];
+            };
+            g_delayHook = [](uint32_t ms) { g_millis += ms; };
+            setup();
+            PMU.onRegisterRead = nullptr;
+            g_delayHook = nullptr;
+            assert(calls(operation) == attempts && readTimes.size() == attempts);
+            assert(calls(detection ? "enableBattVoltageMeasure" : "enableBattDetection") == 1);
+            for (unsigned i = 1; i < attempts; ++i)
+                assert(readTimes[i] - readTimes[i - 1] == PMU_PERIPHERAL_RETRY_MS);
+            assert((detection ? PMU.batteryDetection : bool(PMU.adcChannels & 1)) ==
+                   (fault != BatterySetupFault::PersistentWrite));
+            const bool confirmed = fault == BatterySetupFault::TransientWrite;
+            assert(logCount(warning) == int(!confirmed));
+            assert(gDegraded.mode() == startup::Mode::Normal && tripStoreAvailable(SD));
+            auto warnings = codeRows(bootRows(), 2010);
+            assert(warnings.size() == unsigned(!confirmed));
+            if (!confirmed) has(warnings[0], R"("transition":"raise")");
+            ++cases;
+        }
+    }
+
+    constexpr auto tsReg = XPOWERS_AXP2101_TS_PIN_CTRL;
+    constexpr auto adcReg = XPOWERS_AXP2101_ADC_CHANNEL_CTRL;
+    for (int raw = 0; raw <= 0xFF; ++raw) {
+        assert(pmu_read::tsFixedInputReady(raw, 0x1D) == ((raw & 0x1F) == 0x10));
+        assert(pmu_read::tsFixedInputReady(0xF0, raw) == ((raw & 0x02) == 0));
+    }
+    assert(!pmu_read::tsFixedInputReady(-1, 0x1D));
+    assert(!pmu_read::tsFixedInputReady(0x10, -1));
+    ++cases;
+
+    enum class TsFault { TransientWrite, PersistentWrite, Unreadable };
+    for (auto reg : {tsReg, adcReg}) {
+        for (auto [fault, writes] : {std::pair{TsFault::TransientWrite, 2u},
+                                     std::pair{TsFault::PersistentWrite, PMU_PERIPHERAL_ATTEMPTS},
+                                     std::pair{TsFault::Unreadable, 0u}}) {
+            pmuWorld();
+            // Fail one library TS write. begin() still reports success.
+            PMU.tsControl = 0xB5;
+            PMU.adcChannels = 0x9F;
+            PMU.failRegisterWriteAt[reg] = 1;
+            std::vector<uint32_t> writeTimes;
+            PMU.onRegisterWrite = [&](uint8_t writeReg, uint8_t value) {
+                if (writeReg != tsReg && writeReg != adcReg) return;
+                assert(value == (writeReg == tsReg ? 0xB0 : 0x9D));
+                if (PMU.registerWriteCalls[writeReg] == 1) {
+                    assert(PMU.chargeEnabled && calls("disableCellbatteryCharge") == 0);
+                    return;
+                }
+                assert(!PMU.chargeEnabled && gEarlyChargeDisabled);
+                if (writeReg != reg) return;
+                writeTimes.push_back(millis());
+                if (fault == TsFault::PersistentWrite || writeTimes.size() == 1)
+                    PMU.failRegisterWriteAt[reg] = PMU.registerWriteCalls[reg];
+            };
+            if (fault == TsFault::Unreadable) {
+                PMU.onRegisterRead = [&](uint8_t readReg) {
+                    if (readReg == reg && PMU.registerReadCalls[tsReg] > 1 && !calls("enableTemperatureMeasure"))
+                        PMU.failRegisterReadAt[reg] = PMU.registerReadCalls[reg];
+                };
+            }
+            g_delayHook = [](uint32_t ms) { g_millis += ms; };
+            setup();
+            g_delayHook = nullptr;
+            PMU.onRegisterRead = nullptr;
+            PMU.onRegisterWrite = nullptr;
+            assert(writeTimes.size() == writes && PMU.registerWriteCalls[reg] == writes + 1);
+            for (unsigned i = 1; i < writes; ++i)
+                assert(writeTimes[i] - writeTimes[i - 1] == PMU_PERIPHERAL_RETRY_MS);
+            if (fault == TsFault::Unreadable) {
+                assert(PMU.registerReadCalls[tsReg] == 1 + PMU_PERIPHERAL_ATTEMPTS);
+                assert(PMU.registerWriteCalls[tsReg] == 1 && PMU.registerWriteCalls[adcReg] == 1);
+            }
+            const bool confirmed = fault == TsFault::TransientWrite;
+            assert(pmu_read::tsFixedInputReady(PMU.tsControl, PMU.adcChannels) == confirmed);
+            assert(logCount("TS fixed-input setup unconfirmed after ") == int(!confirmed));
+            assert(gDegraded.mode() == startup::Mode::Normal && tripStoreAvailable(SD));
+            auto rows = bootRows();
+            auto warnings = codeRows(rows, 2010);
+            assert(warnings.size() == unsigned(!confirmed) && codeRows(rows, 2008).empty());
+            if (!confirmed) has(warnings[0], R"("transition":"raise")");
+            ++cases;
+        }
+    }
+
+    assert(pmu_read::bldo1Off(0x00) && pmu_read::bldo1Off(0x09));
+    assert(!pmu_read::bldo1Off(0x10) && !pmu_read::bldo1Off(0x19));
+    assert(!pmu_read::bldo1Off(-1));
+
+    for (int control = 0; control <= 0xFF; ++control)
+        assert(pmu_read::vbackupOff(control) == ((control & 0x04) == 0));
+    assert(!pmu_read::vbackupOff(-1));
+    ++cases;
+
+    // Boot reports VBACKUP only after USB serial has had time to come up.
+    enum class VbackupFault { TransientWrite, PersistentWrite, Unreadable };
+    constexpr auto chargeReg = XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL;
+    for (auto [fault, attempts] : {std::pair{VbackupFault::TransientWrite, 2u},
+                                   std::pair{VbackupFault::PersistentWrite, PMU_PERIPHERAL_ATTEMPTS},
+                                   std::pair{VbackupFault::Unreadable, PMU_PERIPHERAL_ATTEMPTS}}) {
+        pmuWorld();
+        PMU.failVbackupDisableWrites = fault == VbackupFault::TransientWrite ? 1 :
+                                       fault == VbackupFault::PersistentWrite ? PMU_PERIPHERAL_ATTEMPTS : 0;
+        std::vector<uint32_t> readTimes;
+        PMU.onRegisterRead = [&](uint8_t reg) {
+            if (reg != chargeReg || readTimes.size() == calls("disableButtonBatteryCharge")) return;
+            readTimes.push_back(millis());
+            if (fault == VbackupFault::Unreadable)
+                PMU.failRegisterReadAt[reg] = PMU.registerReadCalls[reg];
+        };
+        g_delayHook = [](uint32_t ms) { g_millis += ms; };
+        setup();
+        g_delayHook = nullptr;
+        PMU.onRegisterRead = nullptr;
+        assert(calls("disableButtonBatteryCharge") == attempts && readTimes.size() == attempts);
+        for (unsigned i = 1; i < attempts; ++i)
+            assert(readTimes[i] - readTimes[i - 1] == PMU_PERIPHERAL_RETRY_MS);
+        assert(PMU.vbackup == (fault == VbackupFault::PersistentWrite));
+        const bool confirmed = fault == VbackupFault::TransientWrite;
+        assert(logCount("VBACKUP verified off") == int(confirmed));
+        assert(logCount("VBACKUP off unconfirmed") == int(!confirmed));
+        for (unsigned i = 0; i < Serial.log.size(); ++i) {
+            if (Serial.log[i].find("VBACKUP") == std::string::npos) continue;
+            assert(Serial.logMs[i] - Serial.beginMs >= 1000);
+            assert((Serial.log[i].find("WARNING: ") == 0) == !confirmed);
+        }
+        assert(gDegraded.mode() == startup::Mode::Normal && tripStoreAvailable(SD));
+        ++cases;
+    }
+
+    // A transient voltage or enable write failure must not cost this boot its card.
+    for (bool voltageFault : {true, false}) {
+        pmuWorld();
+        PMU.failSdVoltage = voltageFault;
+        PMU.failSdEnable = !voltageFault;
+        g_delayHook = [](uint32_t ms) {
+            if (ms == PMU_PERIPHERAL_RETRY_MS && calls("setBLDO1Voltage") == 1) {
+                assert(!PMU.bldo1 && SD.begins == 0);
+                assert(calls("enableBLDO1") == (PMU.failSdVoltage ? 0u : 1u));
+                PMU.failSdVoltage = PMU.failSdEnable = false;
+            }
+            g_millis += ms;
+        };
+        setup();
+        g_delayHook = nullptr;
+        assert(calls("setBLDO1Voltage") == 2);
+        assert(calls("enableBLDO1") == (voltageFault ? 1u : 2u));
+        assert(SD.begins == 1 && PMU.bldo1 && gTripFS == &SD);
+        assert(!logCount("microSD card power rail (BLDO1) could not be verified"));
+        assert(codeRows(bootRows(), 4001).empty());
+        ++cases;
+    }
+
+    // The disable command can fail while the final settings are verifiable.
+    pmuWorld();
+    PMU.failSdDisable = true;
+    setup();
+    assert(calls("setBLDO1Voltage") == 1 && calls("enableBLDO1") == 1);
+    assert(SD.begins == 1 && PMU.bldo1 && gTripFS == &SD);
+    assert(codeRows(bootRows(), 4001).empty());
+    ++cases;
+
+    // Post-enable mismatch or failed read repeats the power sequence.
+    // SPI starts only once the rail is verified.
+    for (int badRead : {-1, 27}) for (bool persistent : {false, true}) {
+        pmuWorld();
+        constexpr auto sdVoltageReg = XPOWERS_AXP2101_LDO_VOL4_CTRL;
+        std::vector<uint32_t> readTimes;
+        PMU.onRegisterRead = [&](uint8_t readReg) {
+            if (readReg != sdVoltageReg || !calls("setBLDO1Voltage")) return;
+            if (!PMU.bldo1) {
+                PMU.registerReadOverride.erase(readReg);
+                return;
+            }
+            assert(SD.begins == 0);
+            if (persistent || readTimes.empty()) PMU.registerReadOverride[readReg] = badRead;
+            else PMU.registerReadOverride.erase(readReg);
+            readTimes.push_back(millis());
+        };
+        g_delayHook = [](uint32_t ms) { g_millis += ms; };
+        setup();
+        g_delayHook = nullptr;
+        PMU.onRegisterRead = nullptr;
+        const unsigned attempts = persistent ? PMU_PERIPHERAL_ATTEMPTS : 2;
+        assert(readTimes.size() == attempts);
+        for (unsigned i = 1; i < attempts; ++i)
+            assert(readTimes[i] - readTimes[i - 1] == PMU_PERIPHERAL_RETRY_MS);
+        assert(calls("setBLDO1Voltage") == attempts && calls("enableBLDO1") == attempts);
+        assert(SD.begins == (persistent ? 0 : 1) && PMU.bldo1 == !persistent);
+        assert(gTripFS == (persistent ? static_cast<fs::FS*>(&LittleFS) : static_cast<fs::FS*>(&SD)));
+        assert(logCount("microSD card power rail (BLDO1) could not be verified") == int(persistent));
+        assert(codeRows(bootRows(), 4001).size() == unsigned(persistent));
+        ++cases;
+    }
+
+    // Exercise real degraded SD cleanup with consecutive PMU faults.
+    enum class SdOffFault { None, TransientWrite, PersistentWrite, Unreadable };
+    constexpr auto reg = XPOWERS_AXP2101_LDO_ONOFF_CTRL0;
+    for (auto [fault, attempts] : {std::pair{SdOffFault::None, 1u},
+                                   std::pair{SdOffFault::TransientWrite, 2u},
+                                   std::pair{SdOffFault::PersistentWrite, PMU_PERIPHERAL_ATTEMPTS},
+                                   std::pair{SdOffFault::Unreadable, PMU_PERIPHERAL_ATTEMPTS}}) {
+        pmuWorld(); // mounted SD with BLDO1 enabled
+        PMU.bldo1Mv = 3300;
+        const auto reads = PMU.registerReadCalls[reg];
+        const auto disables = calls("disableBLDO1");
+        PMU.failSdDisable = fault == SdOffFault::TransientWrite || fault == SdOffFault::PersistentWrite;
+        if (fault == SdOffFault::TransientWrite) {
+            PMU.onRegisterRead = [](uint8_t readReg) {
+                if (readReg == reg && PMU.bldo1) PMU.failSdDisable = false;
+            };
+        }
+        if (fault == SdOffFault::Unreadable) PMU.registerReadOverride[reg] = -1;
+        g_delayHook = [](uint32_t ms) { g_millis += ms; };
+        const auto start = millis();
+        unmountDegradedSd();
+        g_delayHook = nullptr;
+        assert(!gSdMounted && !g_sdDisk.mounted);
+        assert(PMU.bldo1 == (fault == SdOffFault::PersistentWrite));
+        assert(calls("disableBLDO1") == disables + attempts);
+        assert(PMU.registerReadCalls[reg] == reads + attempts);
+        assert(millis() - start == SD_POWER_OFF_SETTLE_MS + (attempts - 1) * PMU_PERIPHERAL_RETRY_MS);
+        assert(logCount("microSD card power rail (BLDO1) off unconfirmed after ") ==
+               (attempts == PMU_PERIPHERAL_ATTEMPTS ? 1 : 0));
+        ++cases;
+    }
+
+    // With neither store mounted, the E2010 raise joins the storage faults in RAM.
+    pmuWorld();
+    SD.cardPresent = false;
+    g_disk.failMount = true;
+    PMU.registerReadOverride[XPOWERS_AXP2101_LDO_VOL3_CTRL] = -1;
+    setup();
+    assert(gDegraded.mode() == startup::Mode::NoStorage && !gSdMounted && !gFlashMounted);
+    assert(gJournal.stats().backend == EventLog::Backend::Ram);
+    auto noStorageRows = bootRows();
+    for (int code : {2010, 4001, 4002, 4003}) {
+        auto warning = codeRows(noStorageRows, code);
+        assert(warning.size() == 1);
+        has(warning[0], R"("transition":"raise")");
+    }
+    ++cases;
+
     for (float value : {NAN, INFINITY, -INFINITY, -40.01f, 125.01f, 385.7f})
         assert(!charge_temperature::plausible(value));
     for (float value : {-40.0f, 30.0f, 60.0f, 125.0f})
@@ -27,7 +382,6 @@ int main() {
     // conversion never becomes a hot/cold observation or a debug measurement.
     for (bool degraded : {false, true}) {
         pmuWorld(); PMU.dieC = 385.7f;
-        auto bootRows = []() { FS_LOCK(); auto rows = take(); FS_UNLOCK(); return rows; };
         if (degraded) enterDegraded(startup::Mode::NoStorage);
         else setup();
         assert(!PMU.chargeEnabled && gChargeState == ChargeState::Paused);
@@ -378,6 +732,8 @@ int main() {
     {
         pmuWorld(); PMU.chargeEnabled = true; PMU.failChargeDisable = true;
         static uint32_t startMs; startMs = g_millis;
+        PMU.tsControl = 0x05;
+        PMU.failRegisterWriteAt[tsReg] = 1;
         static bool mountedAfterRecovery; mountedAfterRecovery = false;
         PMU.onRegisterRead = [](uint8_t reg) {
             if (reg == XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL &&
@@ -385,7 +741,8 @@ int main() {
         };
         g_sdDisk.onMount = [] {
             mountedAfterRecovery = true;
-            assert(!PMU.chargeEnabled);
+            assert(!PMU.chargeEnabled && PMU.tsControl == 0x10);
+            assert(PMU.registerWriteCalls[XPOWERS_AXP2101_TS_PIN_CTRL] == 2);
             assert(uint32_t(g_millis - startMs) >= 500 && uint32_t(g_millis - startMs) < 5000);
         };
         setup();
@@ -401,10 +758,15 @@ int main() {
     {
         pmuWorld(); PMU.chargeEnabled = true; PMU.failChargeDisable = true;
         static uint32_t startMs; startMs = g_millis;
+        PMU.tsControl = 0x05;
+        PMU.failRegisterWriteAt[tsReg] = 1;
         static bool checkedAtMount; checkedAtMount = false;
         g_sdDisk.onMount = [] {
             checkedAtMount = true;
             assert(PMU.failChargeDisable); // fault stays active through mount
+            assert(PMU.tsControl == 0x05);
+            assert(PMU.registerWriteCalls[XPOWERS_AXP2101_TS_PIN_CTRL] == 1 &&
+                   PMU.registerWriteCalls[XPOWERS_AXP2101_ADC_CHANNEL_CTRL] == 1);
             assert(uint32_t(g_millis - startMs) >= 5000);
             assert(calls("disableCellbatteryCharge") >= 50);
             assert(g_watchdog.feeds >= 10);
@@ -416,6 +778,9 @@ int main() {
         assert(logCount("early charger disable unconfirmed") == 1 &&
                logCount("charger disable still unconfirmed") == 1);
         FS_LOCK(); auto ev = take(); FS_UNLOCK();
+        assert(logCount("TS fixed-input setup skipped because charger pause is unconfirmed") == 1);
+        auto tsWarnings = codeRows(ev, 2010);
+        assert(tsWarnings.size() == 1); has(tsWarnings[0], R"("transition":"raise")");
         auto ctrl = codeRows(ev, 2008);
         assert(ctrl.size() == 1); has(ctrl[0], "\"transition\":\"raise\"");
         // Recovering charger disable clears E2008 on the next guard tick.

@@ -13,6 +13,12 @@ inline ChargeState chargeState(int control) {
     return (control & (1 << 1)) ? ChargeState::Charging : ChargeState::Paused;
 }
 
+inline bool vbackupOff(int control) {
+    // XPowersLib 0.3.3 disableButtonBatteryCharge() and isEnableButtonBatteryCharge()
+    // use CHARGE_GAUGE_WDT_CTRL (0x18) bit 2.
+    return control >= 0 && (control & (1 << 2)) == 0;
+}
+
 inline bool chargeTargetMatches(int cvReg, uint8_t target) {
     if (cvReg < 0) return false;
     return (cvReg & 0x07) == (target & 0x07);
@@ -88,6 +94,61 @@ inline bool aldo1Ready(int control, int voltage) {
     // XPowersLib 0.3.3: 0x90 bit 0 enables ALDO1; 0x92 bits 0..4
     // select 500 mV + 100 mV/step. Check raw reads, not its masked getter.
     return (control & 1) && 500 + (voltage & 0x1F) * 100 == 3300;
+}
+
+inline bool aldo4VoltageReady(int voltage) {
+    // XPowersLib 0.3.3: 0x95 bits 0..4 select 500 mV + 100 mV/step.
+    return voltage >= 0 && 500 + (voltage & 0x1F) * 100 == 3300;
+}
+
+inline bool aldo4Ready(int control, int voltage) {
+    // LDO_ONOFF_CTRL0 (0x90) bit 3 enables ALDO4.
+    return control >= 0 && (control & (1 << 3)) && aldo4VoltageReady(voltage);
+}
+
+inline bool bldo1Off(int control) {
+    // LDO_ONOFF_CTRL0 (0x90) bit 4 enables BLDO1.
+    return control >= 0 && (control & (1 << 4)) == 0;
+}
+
+inline bool bldo1VoltageReady(int voltage) {
+    // XPowersLib 0.3.3: LDO_VOL4_CTRL (0x96) bits 0..4 select 500 mV + 100 mV/step.
+    return voltage >= 0 && 500 + (voltage & 0x1F) * 100 == 3300;
+}
+
+inline bool bldo1Ready(int control, int voltage) {
+    // LDO_ONOFF_CTRL0 (0x90) bit 4 enables BLDO1.
+    return control >= 0 && (control & (1 << 4)) && bldo1VoltageReady(voltage);
+}
+
+inline bool batteryDetectionEnabled(int detectionCtrl) {
+    // XPowersLib 0.3.3 enableBattDetection(): BAT_DET_CTRL (0x68) bit 0.
+    return detectionCtrl >= 0 && (detectionCtrl & 1) != 0;
+}
+
+inline bool batteryVoltageMeasureEnabled(int adcCtrl) {
+    // XPowersLib 0.3.3 enableBattVoltageMeasure(): ADC_CHANNEL_CTRL (0x30) bit 0.
+    return adcCtrl >= 0 && (adcCtrl & 1) != 0;
+}
+
+// XPowersLib 0.3.3 disableTSPinMeasure(): TS_PIN_CTRL (0x50) applies
+// "value &= 0xF0" then writes "value | 0x10" (bits 3:0 clear, bit 4 set).
+// It also clears ADC_CHANNEL_CTRL (0x30) bit 1.
+constexpr int tsModeMask = 0x1F;
+constexpr int tsFixedInput = 0x10;
+constexpr int tsAdcEnable = 1 << 1;
+
+inline bool tsFixedInputReady(int tsCtrl, int adcCtrl) {
+    return tsCtrl >= 0 && adcCtrl >= 0 &&
+           (tsCtrl & tsModeMask) == tsFixedInput && (adcCtrl & tsAdcEnable) == 0;
+}
+
+inline bool pmuMeasurementsReady(int adcCtrl) {
+    if (adcCtrl < 0) return false;
+    // XPowersLib 0.3.3: 0x30 bits 4, 3 and 2 enable die temperature,
+    // system voltage and VBUS voltage measurements respectively.
+    constexpr int channels = 0x1C;
+    return (adcCtrl & channels) == channels;
 }
 
 inline VbusState vbusState(int status1, int status2) {
