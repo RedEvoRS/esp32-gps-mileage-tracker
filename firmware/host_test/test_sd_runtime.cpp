@@ -211,7 +211,8 @@ int main() {
     std::puts("SD runtime: E4001 uploaded through LittleFS, cached SD authority gated, NVS SD stale bit persisted passed");
 
     // Issue #812: boot-time SD capacity failure with LittleFS unavailable must enter
-    // NoStorage degraded mode, raise E4003 (not clear it), and skip fsck on SD.
+    // NoStorage degraded mode, leave SD mounted/powered with gSdUnavailable latched
+    // (no immediate BLDO1 cut without settle), raise E4003, and skip fsck on SD.
     {
         resetWorld();
         gSdUnavailable = false;
@@ -223,20 +224,42 @@ int main() {
         g_millis = 1000; SD.cardPresent = true; g_disk.failMount = true;
         const std::string torn = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n<trkpt";
         g_sdDisk.files["/trips/torn.gpx"] = torn;
+        g_sdDisk.onMount = [] { g_sdDisk.readsFail = false; };
         SD.onCapacity = [] { g_sdDisk.readsFail = true; };
         setup();
-        SD.onCapacity = nullptr;
         assert(gDegraded.mode() == startup::Mode::NoStorage);
-        assert(!gSdMounted && !gFlashMounted && !PMU.bldo1 && gSdUnavailable);
+        assert(gSdMounted && !gFlashMounted && PMU.bldo1 && SD.ends == 0 && gSdUnavailable);
         assert(g_sdDisk.files["/trips/torn.gpx"] == torn); // fsck did not touch failed SD
         for (unsigned i = 0; i < kEventQueueSize && gJournal.stats().queued; ++i) serviceJournal();
         auto rows = events();
         auto e4003 = codeRows(rows, 4003);
         assert(e4003.size() == 1 && e4003[0].find("\"transition\":\"raise\"") != std::string::npos);
         assert(codeRows(rows, 4001).size() == 1 && codeRows(rows, 4002).size() == 1);
+
+        // NoStorage retry probe must repeat the SD capacity query instead of
+        // restarting forever every 60 s on a card that mounts but fails capacity.
+        const int queriesBeforeRetry = SD.capacityQueries;
+        g_millis += gDegraded.waitMs();
+        loop();
+        assert(g_restarts == 0 && gDegraded.waitMs() == 120000);
+        assert(SD.capacityQueries == queriesBeforeRetry + 1);
+        assert(!gSdMounted && !gFlashMounted);
+        // Second retry with the same fault still backs off without restarting.
+        g_millis += gDegraded.waitMs();
+        loop();
+        assert(g_restarts == 0 && gDegraded.waitMs() == 240000);
+        assert(SD.capacityQueries == queriesBeforeRetry + 2);
+        // Once the card's capacity query succeeds, the next retry restarts cleanly.
+        SD.onCapacity = nullptr;
+        g_millis += gDegraded.waitMs();
+        bool restarted = false;
+        try { loop(); } catch (const Restarted&) { restarted = true; }
+        assert(restarted && g_restarts == 1);
+        g_sdDisk.onMount = nullptr;
     }
-    // Boot-time SD capacity failure with LittleFS mounted falls back cleanly to
-    // LittleFS, skips fsck on failed SD, repairs LittleFS, raises E4001, clears E4003.
+    // Boot-time SD capacity failure with LittleFS mounted leaves SD mounted with
+    // gSdUnavailable latched, falls back to LittleFS, skips fsck on SD, repairs
+    // LittleFS, raises E4001, and clears E4003.
     {
         resetWorld();
         gSdUnavailable = false;
@@ -253,7 +276,7 @@ int main() {
         setup();
         SD.onCapacity = nullptr;
         assert(gDegraded.mode() == startup::Mode::Normal);
-        assert(!gSdMounted && gFlashMounted && gTripFS == &LittleFS && !PMU.bldo1 && gSdUnavailable);
+        assert(gSdMounted && gFlashMounted && gTripFS == &LittleFS && PMU.bldo1 && SD.ends == 0 && gSdUnavailable);
         assert(g_sdDisk.files["/trips/torn.gpx"] == torn); // fsck skipped failed SD
         assert(g_disk.files["/trips/flash_torn.gpx"] ==
                std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n" + GPX_EPILOGUE); // flash still repaired
@@ -268,5 +291,27 @@ int main() {
         });
         assert(noStorageObs != obs + count && noStorageObs->observed && !noStorageObs->episode);
     }
-    std::puts("SD runtime: boot capacity failure enters NoStorage or falls back to LittleFS (#812) passed");
+    // Issue #812: setup() uses one authoritative startup capacity query rather
+    // than re-querying after the mode decision (which could latch gSdUnavailable
+    // and raise E4003 while remaining in Normal mode with no usable store).
+    {
+        resetWorld();
+        gSdUnavailable = false;
+        SD.capacityQueries = 0;
+        Preferences::durable64.clear();
+        for (auto& s : gLoopConditions) { auto code = s.code; s = {}; s.code = code; }
+        gLoopFaults.~RuntimeFaults();
+        new (&gLoopFaults) RuntimeFaults(gJournal, gLoopConditions, sizeof(gLoopConditions)/sizeof(gLoopConditions[0]));
+        g_millis = 1000; SD.cardPresent = true; g_disk.failMount = true;
+        SD.onCapacity = [] { if (SD.capacityQueries >= 2) g_sdDisk.readsFail = true; };
+        setup();
+        assert(SD.capacityQueries == 1);
+        assert(gDegraded.mode() == startup::Mode::Normal);
+        assert(tripStoreAvailable(*gTripFS) && !gSdUnavailable);
+        for (unsigned i = 0; i < kEventQueueSize && gJournal.stats().queued; ++i) serviceJournal();
+        auto rows = events();
+        assert(codeRows(rows, 4003).empty());
+        SD.onCapacity = nullptr;
+    }
+    std::puts("SD runtime: boot capacity failure, no-storage probe, single boot query (#812) passed");
 }

@@ -22,7 +22,7 @@ static void world() {
     gJournalReady = gJournalStarted = gJournalSealing = gJournalBootReported = false;
     gJournalSealRequested = gJournalSealDone = gJournalSealOk = false;
     gEventIoBudget = false; g_taskDelayHook = nullptr;
-    gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeTargetVerified = false;
+    gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeTargetVerified = false; gEarlyChargeDisabled = true;
     gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0;
     gChargeFirstResolved = false; gChargeFirstMs = 0;
     gBatteryDiagChecked = false;
@@ -30,6 +30,7 @@ static void world() {
     gPmuIrqFlag = false;
     gVbusRetry = VbusRetry::None; gVbusRetryMs = gVbusOffReadMs = 0;
     gPmuIrqRetry = false; gPmuIrqReadMs = 0; gBatteryThresholds = -1;
+    gPmuIrqEnableRetry = false; gPmuIrqEnableMs = 0; memset(gPmuIrqHandled, 0, sizeof(gPmuIrqHandled));
     for (auto& slot : gLoopConditions) { auto code = slot.code; slot = {}; slot.code = code; }
     gLoopFaults.~RuntimeFaults();
     new (&gLoopFaults) RuntimeFaults(gJournal, gLoopConditions, sizeof(gLoopConditions)/sizeof(gLoopConditions[0]));
