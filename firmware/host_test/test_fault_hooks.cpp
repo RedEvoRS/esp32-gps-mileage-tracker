@@ -22,7 +22,8 @@ static void faultWorld() {
     gLoopFaults.~RuntimeFaults(); new (&gLoopFaults) RuntimeFaults(gJournal, gLoopConditions, sizeof(gLoopConditions)/sizeof(gLoopConditions[0]));
     gNetFaults.~RuntimeFaults(); new (&gNetFaults) RuntimeFaults(gJournal, gNetConditions, sizeof(gNetConditions)/sizeof(gNetConditions[0]));
     gBatteryDiagChecked = false; gStorageDiagMs = g_millis;
-    gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeTargetVerified = false; gEarlyChargeDisabled = true;
+    gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeTargetVerified = false;
+    gEarlyChargeDisabled = true; gEarlyChargeTimeoutPending = false;
     gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0; gChargeCheckT0 = 0;
     gChargeFirstResolved = false; gChargeFirstMs = 0;
     gJoinFailures = gTransportFailures = 0;

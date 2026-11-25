@@ -563,11 +563,12 @@ static void startupStage(startup_watchdog::Stage stage) {
     gStartupWatchdog.stage(stage);
     saveStartupWatchdog();
 }
-static void finishStartupWatchdog() {
+static void finishStartupWatchdog(bool clearHangs = true) {
     // Switch to the loop limit. If the early arm failed, this is one more
     // try; a second failure prints an error and logging carries on unwatched.
     armLoopWatchdog();
-    gStartupWatchdog.complete();
+    if (clearHangs) gStartupWatchdog.complete();
+    else gStartupWatchdog.stage(startup_watchdog::Stage::None);
     saveStartupWatchdog();
 }
 static void printStartupWatchdog() {
@@ -1860,12 +1861,14 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
     // shutdown the uploader may still own an open file, so leave both
     // stores mounted with the lock held through power-off or restart.
     FS_LOCK();
+    const bool sdWasUsable = tripStoreAvailable(SD);
     if (cleanShutdown) {
         if (gSdMounted) SD.end();
         if (gFlashMounted) LittleFS.end();
         feedLoopWatchdogProgress(); // unmount returned; no feed while acquiring lock
         if (gSdMounted) {
-            // Keep the card powered and the bus idle after the last SPI command.
+            // Give the powered card controller time after the last SPI command.
+            // The filesystem lock keeps the bus idle while BLDO1 stays enabled.
             vTaskDelay(pdMS_TO_TICKS(SD_POWER_OFF_SETTLE_MS));
             feedLoopWatchdogProgress();
         }
@@ -1915,9 +1918,17 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
         return;
     }
     // Resume without formatting or changing the trip counter. The network
-    // stays held until storage is mounted again.
+    // stays held until storage is mounted again. Only require SD remount
+    // when SD was usable before unmount; keep a quarantined card out
+    // (gSdUnavailable stays latched) so healthy LittleFS does not reboot.
     bool remounted = true;
-    if (gSdMounted) remounted = mountSdStorage();
+    if (sdWasUsable) {
+        remounted = mountSdStorage();
+    } else if (gSdMounted) {
+        gSdSpi.end();
+        PMU.disableBLDO1();
+        gSdMounted = false;
+    }
     if (gFlashMounted) remounted = LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL) && remounted;
     if (!remounted) {
         Serial.println("ERROR: storage remount after cancelled/failed power-off failed; restarting.");
@@ -2048,6 +2059,7 @@ static constexpr uint32_t CHG_FIRST_GRACE_MS = 10000;
 static pmu_read::ChargeState gChargeState = pmu_read::ChargeState::Unconfirmed;
 static bool     gChargeTargetVerified = false;
 static bool     gEarlyChargeDisabled = true;
+static bool     gEarlyChargeTimeoutPending = false;
 static bool     gChargeChecked = false;
 static bool     gChargeFirstResolved = false; // plausible read OR grace exhausted; never reopens on rollover
 static uint32_t gChargeFirstMs = 0;
@@ -2188,8 +2200,12 @@ static void serviceChargeTemp() {
         }
         if (!firstGrace) gLoopFaults.event(diagnostics::Code::CHARGE_TEMP_UNREADABLE, now).condition(decision.unreadable);
         const bool controlConfirmed = targetOk && gChargeState != pmu_read::ChargeState::Unconfirmed;
-        if (controlConfirmed || gChargeFailures >= CHG_FAILURE_LIMIT)
+        if (gEarlyChargeTimeoutPending) {
+            gLoopFaults.event(diagnostics::Code::CHARGE_CONTROL_FAILED, now).condition(true);
+            gEarlyChargeTimeoutPending = false;
+        } else if (controlConfirmed || gChargeFailures >= CHG_FAILURE_LIMIT) {
             gLoopFaults.event(diagnostics::Code::CHARGE_CONTROL_FAILED, now).condition(gChargeFailures >= CHG_FAILURE_LIMIT);
+        }
     }
     // Charging was already commanded off during the retries, so the state
     // block above prints nothing when the window ends without a reading.
@@ -3137,7 +3153,10 @@ static bool mountTripStorage(bool allowProvision = true, bool reportFreeSpace = 
     // so a card that mounts but fails its capacity query cannot restart-loop
     // every 60 s instead of backing off.
     if (!reportFreeSpace) {
-        if (gSdMounted && !gFlashMounted) (void)storageFreeBytes(SD);
+        if (gSdMounted && !gFlashMounted) {
+            startupStage(startup_watchdog::Stage::CardSpace);
+            (void)storageFreeBytes(SD);
+        }
         return tripStoreAvailable(SD) || gFlashMounted;
     }
     uint64_t selectedFree = 0;
@@ -3473,7 +3492,7 @@ static void enterDegraded(startup::Mode mode) {
             "DEGRADED: power chip not responding -- not recording; no charge or rail control. Retrying in 60 s." :
             "DEGRADED: power chip state untrusted -- not recording; no further charge or rail control. Retrying in 60 s.");
     }
-    finishStartupWatchdog(); // degraded boots have a loop task too
+    finishStartupWatchdog(mode != startup::Mode::NoStorage); // degraded boots have a loop task too
     Serial.setTxTimeoutMs(0); // all runtime output is best-effort on both cores
 }
 
@@ -3500,6 +3519,13 @@ static void degradedLoop() {
     if (!(mode == Mode::NoStorage && gStartupWatchdog.noStorage()) && gDegraded.retryDue(millis())) {
         bool recovered = false;
         if (mode == Mode::NoStorage) {
+            // Run the mount + capacity probe under the same 120 s per-stage
+            // startup watchdog limit and RTC stage tracking as setup(), so a
+            // slow FAT scan ends in backoff rather than a 60 s loop reset,
+            // while a genuine hang still counts toward SkipCard/NoStorage.
+            if (gLoopWatchdogArmed) armLoopWatchdog(startup_watchdog::STARTUP_WDT_TIMEOUT_MS, false);
+            gStartupWatchdog.stage(startup_watchdog::Stage::CardMount);
+            saveStartupWatchdog();
             if (gSdMounted) {
                 SD.end();
                 gSdSpi.end();
@@ -3508,9 +3534,16 @@ static void degradedLoop() {
             }
             // No format, fsck, trip activity or journal migration on this probe.
             recovered = mountTripStorage(false, false);
-            if (gSdMounted) { SD.end(); gSdSpi.end(); }
+            if (gSdMounted) {
+                startupStage(startup_watchdog::Stage::CardMount);
+                SD.end();
+                gSdSpi.end();
+            }
             if (gFlashMounted) LittleFS.end();
             gSdMounted = gFlashMounted = false;
+            gStartupWatchdog.stage(startup_watchdog::Stage::None);
+            saveStartupWatchdog();
+            if (gLoopWatchdogArmed) armLoopWatchdog(LOOP_WDT_TIMEOUT_MS, false);
         } else {
             PmuStartupResult retry;
             // Release Wire1 before GPIO bus recovery on a later cycle.
@@ -3548,6 +3581,7 @@ void setup() {
     armLoopWatchdog(startup_watchdog::STARTUP_WDT_TIMEOUT_MS, false);
     bool aldo1Warning = false;
     gEarlyChargeDisabled = true;
+    gEarlyChargeTimeoutPending = false;
     gBootBattery = diagnostics::BatterySample();
     if (radioOff) {
         // Stop retained charging before display/USB/storage waits. Only trusted
@@ -3630,6 +3664,7 @@ void setup() {
         Serial.println("WARNING: early charger disable unconfirmed; retrying up to 5 s before storage.");
         gEarlyChargeDisabled = disableChargeBounded(CHG_DISABLE_WAIT_MS, CHG_DISABLE_RETRY_MS);
         if (!gEarlyChargeDisabled) {
+            gEarlyChargeTimeoutPending = true;
             gChargeFailures = CHG_FAILURE_LIMIT;
             Serial.println("WARNING: charger disable still unconfirmed after 5 s; continuing startup and reporting E2008.");
         }

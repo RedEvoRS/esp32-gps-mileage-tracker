@@ -22,7 +22,8 @@ static void world() {
     gJournalReady = gJournalStarted = gJournalSealing = gJournalBootReported = false;
     gJournalSealRequested = gJournalSealDone = gJournalSealOk = false;
     gEventIoBudget = false; g_taskDelayHook = nullptr;
-    gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeTargetVerified = false; gEarlyChargeDisabled = true;
+    gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeTargetVerified = false;
+    gEarlyChargeDisabled = true; gEarlyChargeTimeoutPending = false;
     gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0;
     gChargeFirstResolved = false; gChargeFirstMs = 0;
     gBatteryDiagChecked = false;

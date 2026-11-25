@@ -128,7 +128,14 @@ take longer than 120 seconds in total. Driver calls without visible progress,
 including the first FAT free-space query, must return within that limit.
 
 At the end of normal or degraded startup, the limit becomes
-`LOOP_WDT_TIMEOUT_MS` (60 seconds). ESP-IDF 5.5.5's
+`LOOP_WDT_TIMEOUT_MS` (60 seconds). `NoStorage` degraded retry probes
+temporarily re-arm the 120-second `STARTUP_WDT_TIMEOUT_MS` limit and track
+`CardMount`/`FlashMount`/`CardSpace` stages around the probe's mount and
+capacity query (restoring 60 seconds and clearing the active stage afterward),
+and `NoStorage` startup preserves the startup hang streak across incomplete
+storage boots, so a slow FAT scan ends in backoff rather than a 60-second loop
+reset while genuine repeated hangs still count toward `SkipCard`/`NoStorage`.
+ESP-IDF 5.5.5's
 `esp_task_wdt_reconfigure()` retains subscriptions and restarts its timer under
 a spinlock. The sketch feeds around this change and never removes the loop
 task. It preserves the idle-task mask. A failed arm or reconfiguration prints
