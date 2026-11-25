@@ -1639,8 +1639,12 @@ unchanged; degraded probes explicitly disable that provisioning.
   on restart or power-off. Storage retries use
   the BLDO1-off / 3.3 V / enable ordering for SD, verify both settings
   before mounting, and never format.
-  A newly mounted store is unmounted after the probe. Shutdown safely handles
-  degraded startup: the loop services the bounded
+  If startup cannot use a mounted card and enters this mode, it unmounts
+  the card, waits 500 ms, then turns BLDO1 off. The same sequence applies to
+  any card unmounted before or after a retry probe. If the card never mounts,
+  the tracker cuts SD power immediately. Flash mounted by
+  the probe is unmounted afterward, while an existing journal mount is kept.
+  During shutdown the degraded loop services the bounded
   journal seal itself, reports undurable RAM if necessary, then holds FS_LOCK
   through the final VBUS check and PMU shutdown. A returning/failed shutdown
   restores degraded service without claiming recording or remounting an absent

@@ -3471,6 +3471,17 @@ static bool createFsMutex() {
     return false;
 }
 
+// No core-0 worker is running when entering NoStorage or probing a retry.
+static void unmountDegradedSd() {
+    if (!gSdMounted) return;
+    startupStage(startup_watchdog::Stage::CardMount);
+    SD.end();
+    gSdSpi.end();
+    gSdMounted = false;
+    vTaskDelay(pdMS_TO_TICKS(SD_POWER_OFF_SETTLE_MS));
+    PMU.disableBLDO1();
+}
+
 static void enterDegraded(startup::Mode mode) {
     gDegraded.begin(mode, millis());
     // Setup initialized this independent Wire adapter asleep, even if the
@@ -3543,26 +3554,17 @@ static void degradedLoop() {
             if (gLoopWatchdogArmed) armLoopWatchdog(startup_watchdog::STARTUP_WDT_TIMEOUT_MS, false);
             gStartupWatchdog.stage(startup_watchdog::Stage::CardMount);
             saveStartupWatchdog();
-            if (gSdMounted) {
-                SD.end();
-                gSdSpi.end();
-                gSdMounted = false;
-                vTaskDelay(pdMS_TO_TICKS(SD_POWER_OFF_SETTLE_MS));
-            }
+            unmountDegradedSd();
             // Keep an existing diagnostic mount across the trip-store probe.
             const bool keepFlashMounted = gFlashMounted;
             // No format, fsck, trip activity or journal migration on this probe.
             recovered = mountTripStorage(false, false);
-            if (gSdMounted) {
-                startupStage(startup_watchdog::Stage::CardMount);
-                SD.end();
-                gSdSpi.end();
-            }
+            unmountDegradedSd();
             if (gFlashMounted && !keepFlashMounted) {
                 LittleFS.end();
                 gFlashMounted = false;
             }
-            gSdMounted = gFlashTripsReady = false;
+            gFlashTripsReady = false;
             gStartupWatchdog.stage(startup_watchdog::Stage::None);
             saveStartupWatchdog();
             if (gLoopWatchdogArmed) armLoopWatchdog(LOOP_WDT_TIMEOUT_MS, false);
@@ -3763,6 +3765,8 @@ void setup() {
     // it takes the same degraded path, with the same PMU setup, as a failure.
     uint64_t bootFreeBytes = 0;
     if (!mountTripStorage(true, true, &bootFreeBytes)) {
+        // A card that failed its capacity query is already excluded from the journal.
+        unmountDegradedSd();
         enterDegraded(startup::Mode::NoStorage);
         gLoopFaults.event(diagnostics::Code::PMU_PERIPHERAL_SETUP_FAILED, millis()).condition(pmuPeripheralWarning);
         return;

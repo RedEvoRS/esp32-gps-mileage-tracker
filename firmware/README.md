@@ -432,7 +432,8 @@ a card. Stage 4 has since recorded two real drives on the card.
   timer; untrusted PMU startup does not run this power-off path.
   During shutdown the tracker leaves a mounted card powered for 500 ms after
   unmounting it. The same wait applies when a mounted card fails the
-  filesystem or trip-directory check. At startup the tracker also deselects
+  filesystem or trip-directory check, or is unmounted on entry to no-storage
+  degraded mode or during a storage retry. At startup the tracker also deselects
   the card and waits before cutting power if the card may still be finishing
   a write after a reset.
 - **The firmware never formats the card.** After mounting, the tracker

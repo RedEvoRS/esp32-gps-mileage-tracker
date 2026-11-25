@@ -249,9 +249,12 @@ int main() {
     sdWorld(true, false, true, false);
     assert(gDegraded.mode() == startup::Mode::NoStorage && !tripStoreAvailable(LittleFS));
     assert(gJournal.stats().backend == EventLog::Backend::LittleFs);
+    const int absentEnds = SD.ends;
     g_millis += gDegraded.waitMs();
     loop();
     assert(g_restarts == 0 && gDegraded.waitMs() == 120000);
+    assert(SD.ends == absentEnds + 1 && !gSdMounted && !gSdSpi.started && !PMU.bldo1);
+    assert(PMU.bldo1OffMs == SD.endedAtMs); // failed mount has no power-off settle
     assert(gFlashMounted && g_disk.mounted && !tripStoreAvailable(LittleFS));
     assert(g_disk.files.at(TRIP_DIR) == "preserved flash file");
     std::puts("SD runtime: degraded trip-store retry preserves a diagnostic-only flash mount");
@@ -299,9 +302,9 @@ int main() {
     assert(gJournal.stats().queued == 0 && g_sdDisk.files == journalSd && g_lockDepth == 0);
     std::puts("SD runtime: E4001 uploaded through LittleFS, cached SD authority gated, NVS SD stale bit persisted passed");
 
-    // Issue #812: boot-time SD capacity failure with LittleFS unavailable must enter
-    // NoStorage degraded mode, leave SD mounted/powered with gSdUnavailable latched
-    // (no immediate BLDO1 cut without settle), raise E4003, and skip fsck on SD.
+    // A boot-time SD capacity failure with LittleFS unavailable enters NoStorage
+    // with SD unmounted and powered off after settling. The journal is RAM-only
+    // and reports the storage failures while leaving the SD trip untouched.
     {
         resetWorld();
         gSdUnavailable = false;
@@ -315,9 +318,19 @@ int main() {
         g_sdDisk.files["/trips/torn.gpx"] = torn;
         g_sdDisk.onMount = [] { g_sdDisk.readsFail = false; };
         SD.onCapacity = [] { g_sdDisk.readsFail = true; };
+        static unsigned settleCount = 0;
+        g_taskDelayHook = [](uint32_t ms) {
+            if (ms != SD_POWER_OFF_SETTLE_MS) return;
+            ++settleCount;
+            assert(!g_sdDisk.mounted && !gSdSpi.started && PMU.bldo1);
+            assert(g_watchdog.config.timeout_ms == startup_watchdog::STARTUP_WDT_TIMEOUT_MS);
+            assert(gStartupWatchdogRecord.stage == uint32_t(startup_watchdog::Stage::CardMount));
+        };
         setup();
         assert(gDegraded.mode() == startup::Mode::NoStorage);
-        assert(gSdMounted && !gFlashMounted && PMU.bldo1 && SD.ends == 0 && gSdUnavailable);
+        assert(!gSdMounted && !gFlashMounted && !PMU.bldo1 && SD.ends == 1 && gSdUnavailable);
+        assert(settleCount == 1 && PMU.bldo1OffMs - SD.endedAtMs == SD_POWER_OFF_SETTLE_MS);
+        assert(g_watchdog.config.timeout_ms == LOOP_WDT_TIMEOUT_MS);
         assert(g_sdDisk.files["/trips/torn.gpx"] == torn); // fsck did not touch failed SD
         for (unsigned i = 0; i < kEventQueueSize && gJournal.stats().queued; ++i) serviceJournal();
         auto rows = events();
@@ -325,6 +338,7 @@ int main() {
         assert(e4003.size() == 1 && e4003[0].find("\"transition\":\"raise\"") != std::string::npos);
         assert(codeRows(rows, 4001).size() == 1 && codeRows(rows, 4002).size() == 1);
 
+        assert(gJournal.stats().backend == EventLog::Backend::Ram);
         // NoStorage retry probe must repeat the SD capacity query instead of
         // restarting forever every 60 s on a card that mounts but fails capacity.
         const int queriesBeforeRetry = SD.capacityQueries;
@@ -332,7 +346,10 @@ int main() {
         loop();
         assert(g_restarts == 0 && gDegraded.waitMs() == 120000);
         assert(SD.capacityQueries == queriesBeforeRetry + 1);
-        assert(!gSdMounted && !gFlashMounted);
+        assert(!gSdMounted && !gFlashMounted && !PMU.bldo1 && SD.ends == 2);
+        assert(settleCount == 2 && PMU.bldo1OffMs - SD.endedAtMs == SD_POWER_OFF_SETTLE_MS);
+        assert(g_watchdog.config.timeout_ms == LOOP_WDT_TIMEOUT_MS);
+        assert(gStartupWatchdogRecord.stage == uint32_t(startup_watchdog::Stage::None));
         // Second retry with the same fault still backs off without restarting.
         g_millis += gDegraded.waitMs();
         loop();
@@ -344,6 +361,8 @@ int main() {
         bool restarted = false;
         try { loop(); } catch (const Restarted&) { restarted = true; }
         assert(restarted && g_restarts == 1);
+        assert(settleCount == 4 && !gSdMounted && !PMU.bldo1);
+        g_taskDelayHook = nullptr;
         g_sdDisk.onMount = nullptr;
     }
     // Boot-time SD capacity failure with LittleFS mounted leaves SD mounted with

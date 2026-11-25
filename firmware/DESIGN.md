@@ -131,10 +131,13 @@ At the end of normal or degraded startup, the limit becomes
 `LOOP_WDT_TIMEOUT_MS` (60 seconds). `NoStorage` degraded retry probes
 temporarily re-arm the 120-second `STARTUP_WDT_TIMEOUT_MS` limit and track
 `CardMount`/`FlashMount`/`CardSpace` stages around the probe's mount and
-capacity query (restoring 60 seconds and clearing the active stage afterward),
-and `NoStorage` startup preserves the startup hang streak across incomplete
-storage boots, so a slow FAT scan ends in backoff rather than a 60-second loop
-reset while genuine repeated hangs still count toward `SkipCard`/`NoStorage`.
+capacity query. The 120-second limit and CardMount stage cover SD unmount,
+the 500 ms settle and BLDO1 power-off, both before entering NoStorage and when
+cleaning up a mounted card before or after a retry. The probe clears the active
+stage and restores 60 seconds after cleanup.
+`NoStorage` startup preserves the startup hang streak across incomplete
+storage boots. The longer limit gives slow FAT scans time to finish, while
+repeated hangs still count toward `SkipCard`/`NoStorage`.
 ESP-IDF 5.5.5's
 `esp_task_wdt_reconfigure()` retains subscriptions and restarts its timer under
 a spinlock. The sketch feeds around this change and never removes the loop
