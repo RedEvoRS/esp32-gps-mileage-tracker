@@ -70,6 +70,7 @@ for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resol
         sys.path.insert(0, str(import_root))
 
 from common.version import server_version
+from common.trip_publication import trip_publication_lock
 from common.trip_summary import (
     parse_gpx, summarize, MAX_UPLOAD_TEXT,
 )
@@ -666,7 +667,6 @@ def upload_trip():
         "trip_id": trip_id,
         "device_id": device_id,
         "gpx_file": f"{safe_id}.gpx",
-        "_received_at": datetime.now(timezone.utc).isoformat(),
         "_received_from": request.remote_addr,
     }
     record.update(summary)
@@ -701,6 +701,7 @@ def upload_trip():
             # immutable source (including sanitized-ID/device collisions).
             if gpx_file.exists() and gpx_file.read_bytes() != raw:
                 return jsonify({"error": "trip ID already contains different GPX data"}), 409
+            existing = None
             if json_file.exists():
                 existing = _stored_summary(json_file)
                 if existing is None:
@@ -714,14 +715,19 @@ def upload_trip():
                 elif existing["trip_id"] != trip_id or existing["device_id"] != device_id:
                     return jsonify({"error": "trip ID belongs to another trip or device"}), 409
                 else:
-                    # Keep the original receipt metadata on harmless retries.
-                    record["_received_at"] = existing.get("_received_at", record["_received_at"])
+                    # Keep the original receipt metadata, including unknown
+                    # receipt times on summaries written by older versions.
+                    if "_received_at" in existing:
+                        record["_received_at"] = existing["_received_at"]
                     record["_received_from"] = existing.get("_received_from", record["_received_from"])
             # GPX first: failed summary writes can be repaired by a retry.
             # Each write is durable before a 200 lets firmware delete its copy.
-            if not gpx_file.exists():
-                _atomic_write_bytes(gpx_file, raw)
-            _atomic_write_json(json_file, record)
+            with trip_publication_lock(root):
+                if not gpx_file.exists():
+                    _atomic_write_bytes(gpx_file, raw)
+                if existing is None:
+                    record["_received_at"] = datetime.now(timezone.utc).isoformat()
+                _atomic_write_json(json_file, record)
     except UnwritableMonthError as e:
         message = (f"month folder {e} cannot be written to; new trips for this month are refused "
                    "until its owner and permissions are fixed")

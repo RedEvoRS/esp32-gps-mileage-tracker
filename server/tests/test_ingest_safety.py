@@ -474,6 +474,16 @@ class UploadSafety(unittest.TestCase):
         self.assertEqual(self.upload().status_code, 200)
         self.assertEqual((gpx.read_bytes(), summary.read_bytes()), before)
 
+    def test_identical_retry_preserves_a_missing_receipt_time(self):
+        payload = body(lat='0', lon='0')
+        _, summary = self.saved_pair(self.upload(payload))
+        saved = json.loads(summary.read_bytes())
+        del saved['_received_at']
+        summary.write_text(json.dumps(saved), encoding='utf-8')
+
+        self.assertEqual(self.upload(payload).status_code, 200)
+        self.assertNotIn('_received_at', json.loads(summary.read_bytes()))
+
     def test_different_payload_cannot_overwrite_existing_trip(self):
         gpx, summary = self.saved_pair(self.upload())
         before = (gpx.read_bytes(), summary.read_bytes())

@@ -779,14 +779,16 @@ including straight-line estimates across GPS gaps; a step crossing midnight
 is divided by time. The old-year share is rounded to three decimals and the
 new-year share is the remainder, rounded to three decimals. This preserves
 the saved total even for older summaries and merged drives. Nothing is written
-to the trip files or database. A stationary cooldown past midnight does not
-split a drive whose movement ended before midnight.
+to the trip files or database. A step from the last moving fix to a stopped fix
+can add mileage after midnight. A stationary cooldown with no counted distance
+after midnight leaves the drive in its start year.
 
 Splitting requires complete timing, a readable valid GPX and exactly one year
 end. Otherwise the drive stays whole in its start year (or the first recorded
 year for partial timing), with a short note explaining why it could not be
-split. If one share rounds to zero, the drive is not split and the year with
-the miles counts all of it. That can be the new year: a drive that starts
+split. For older summaries without `recorded_until`, the viewer uses the saved
+end time to check whether the drive crosses midnight. If one share rounds to
+zero, the year with the miles counts all of it. That can be the new year: a drive that starts
 just before midnight with no counted miles until after it shows its December
 31 date but counts, and locks, only in the new year, with a note saying so.
 Its `trip_distance_miles` stays blank because it is not split. This applies only to trips the
@@ -1031,9 +1033,10 @@ one old month must match one unambiguous counted folder. A surviving alias
 must reach that folder; after its link is removed, the saved file stamps
 are the remaining evidence (the database stores no historical folder identity).
 A deleted real folder, partial matches, changed files or unreadable parts
-remain damaged merges: they count as missing mileage, appear in year review
-and close snapshots, block uncertain merge suggestions, and cannot be undone
-through **Undo saved merge**. Ordinary **Undo merge (split back)** is also
+remain damaged merges. They count as missing mileage in the year review and
+close snapshot of each year spanned by the saved recording. They block
+uncertain merge suggestions and cannot be undone through **Undo saved merge**.
+Ordinary **Undo merge (split back)** is also
 refused for damage, for both roles. The admin can use **Discard damaged merge**
 after confirming that parts with readable summaries return separately with
 annotations saved under their names; parts without readable summaries do not.
@@ -1124,8 +1127,8 @@ category and recovery advice. Miles stay blank in CSV and XLSX numeric cells;
 saved miles appear only in the note. XLSX shows the notice in **Unreadable
 trips**, outside **Mileage** and **Totals**. The year review lists each merge
 in **Saved merges under unused month names**, with its saved miles, purpose
-and month name; its parts count separately. Closing its saved-summary year
-or any year containing one of its parts is refused until the name is restored
+and month name; its parts count separately. Closing its saved-summary year or
+any year with counted mileage from a replacement part waits until the name is restored
 or the admin uses **Undo saved merge**.
 If the saved year is unknown, every year is blocked. Reopening stays possible.
 Saved removals under an unused name are not applied, like annotations under
@@ -1195,8 +1198,10 @@ nothing is hidden, but it is not silent either:
 - The year review has a **Received after this year was closed** section listing
   each such trip (when the server received it, its distance, its category) with
   a link. A trip counts as late when ingest stored it after the moment the year
-  was closed. A trip whose summary has no received time (stored by an older
-  ingest) is never listed as late.
+  was closed. Closing takes a snapshot between uploads, and receipt time is
+  set when ingest publishes the trip summary. Retrying the same upload keeps
+  the original receipt time. A trip whose summary has no received time (stored
+  by an older ingest) is never listed as late.
 - The CSV and XLSX exports have a column, `received_after_close`, set to
   `yes` for those trips and blank for the rest. In the CSV it comes after
   `row_type`; `trip_distance_miles` follows it. With a year selected, the flag

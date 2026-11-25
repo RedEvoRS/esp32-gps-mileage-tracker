@@ -8,7 +8,7 @@ import re
 import sqlite3
 import tempfile
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -648,6 +648,38 @@ class YearReviewTests(YearTestBase):
         with self.at(self.CLOSE):
             self.close_year(2026)
         return first, second
+
+    def test_upload_waiting_to_publish_is_late_and_retry_preserves_receipt(self):
+        from test_ingest_safety import HEADERS, body, load_ingest
+
+        ingest = load_ingest(self.data)
+        origin = '0'  # Synthetic coordinate origin.
+        payload = body(lat=origin, lon=origin)
+        client = ingest.app.test_client()
+        acquire_upload_lock = ingest._upload_lock
+        clock = datetime.fromisoformat(self.BEFORE)
+
+        @contextmanager
+        def close_before_ingest_acquires_lock():
+            nonlocal clock
+            with patch.object(self.viewer.trip_log, 'now_utc', return_value=self.CLOSE):
+                self.close_year(2026)
+            clock = datetime.fromisoformat(self.AFTER)
+            with acquire_upload_lock():
+                yield
+
+        with patch.object(ingest, 'datetime', wraps=datetime) as ingest_clock:
+            ingest_clock.now.side_effect = lambda tz: clock
+            with patch.object(ingest, '_upload_lock', close_before_ingest_acquires_lock):
+                self.assertEqual(client.post('/upload', data=payload, headers=HEADERS).status_code, 200)
+            clock += timedelta(days=1)
+            self.assertEqual(client.post('/upload', data=payload, headers=HEADERS).status_code, 200)
+
+        self.assertEqual(self.saved()['trip_keys'], [])
+        row, = [row for row in self.csv_rows('?year=2026') if row['row_type'] == 'trip']
+        self.assertEqual(row['received_after_close'], 'yes')
+        trip, = self.viewer.load_trips()[0]
+        self.assertEqual(trip['received_at'], datetime.fromisoformat(self.AFTER).isoformat())
 
     def sheet_values(self, path):
         workbook = load_workbook(io.BytesIO(self.admin.get(path).data))
