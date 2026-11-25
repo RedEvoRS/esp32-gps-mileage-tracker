@@ -127,7 +127,7 @@ int main() {
                            fault == BatterySetupFault::PersistentWrite ? attempts : 0;
             std::vector<uint32_t> readTimes;
             PMU.onRegisterRead = [&](uint8_t readReg) {
-                if (readReg != reg || readTimes.size() == calls(operation)) return;
+                if (readReg != reg || readTimes.size() >= calls(operation)) return;
                 readTimes.push_back(millis());
                 if (fault == BatterySetupFault::Unreadable)
                     PMU.failRegisterReadAt[reg] = PMU.registerReadCalls[reg];
@@ -168,14 +168,19 @@ int main() {
                                      std::pair{TsFault::PersistentWrite, 3u},
                                      std::pair{TsFault::Unreadable, 0u}}) {
             pmuWorld();
-            // begin() reports success despite the previously retained TS settings.
+            // Fail one library TS write. begin() still reports success.
             PMU.tsControl = 0xB5;
             PMU.adcChannels = 0x9F;
+            PMU.failRegisterWriteAt[reg] = 1;
             std::vector<uint32_t> writeTimes;
             PMU.onRegisterWrite = [&](uint8_t writeReg, uint8_t value) {
                 if (writeReg != tsReg && writeReg != adcReg) return;
-                assert(!PMU.chargeEnabled && gEarlyChargeDisabled);
                 assert(value == (writeReg == tsReg ? 0xB0 : 0x9D));
+                if (PMU.registerWriteCalls[writeReg] == 1) {
+                    assert(PMU.chargeEnabled && calls("disableCellbatteryCharge") == 0);
+                    return;
+                }
+                assert(!PMU.chargeEnabled && gEarlyChargeDisabled);
                 if (writeReg != reg) return;
                 writeTimes.push_back(millis());
                 if (fault == TsFault::PersistentWrite || writeTimes.size() == 1)
@@ -183,7 +188,7 @@ int main() {
             };
             if (fault == TsFault::Unreadable) {
                 PMU.onRegisterRead = [&](uint8_t readReg) {
-                    if (readReg == reg && PMU.registerReadCalls[tsReg] && !calls("enableTemperatureMeasure"))
+                    if (readReg == reg && PMU.registerReadCalls[tsReg] > 1 && !calls("enableTemperatureMeasure"))
                         PMU.failRegisterReadAt[reg] = PMU.registerReadCalls[reg];
                 };
             }
@@ -192,12 +197,12 @@ int main() {
             g_delayHook = nullptr;
             PMU.onRegisterRead = nullptr;
             PMU.onRegisterWrite = nullptr;
-            assert(writeTimes.size() == writes && PMU.registerWriteCalls[reg] == writes);
+            assert(writeTimes.size() == writes && PMU.registerWriteCalls[reg] == writes + 1);
             for (unsigned i = 1; i < writes; ++i)
                 assert(writeTimes[i] - writeTimes[i - 1] == PMU_PERIPHERAL_RETRY_MS);
             if (fault == TsFault::Unreadable) {
-                assert(PMU.registerReadCalls[tsReg] == PMU_PERIPHERAL_ATTEMPTS);
-                assert(PMU.registerWriteCalls[tsReg] == 0 && PMU.registerWriteCalls[adcReg] == 0);
+                assert(PMU.registerReadCalls[tsReg] == 1 + PMU_PERIPHERAL_ATTEMPTS);
+                assert(PMU.registerWriteCalls[tsReg] == 1 && PMU.registerWriteCalls[adcReg] == 1);
             }
             const bool confirmed = fault == TsFault::TransientWrite;
             assert(pmu_read::tsFixedInputReady(PMU.tsControl, PMU.adcChannels) == confirmed);
@@ -663,6 +668,7 @@ int main() {
         pmuWorld(); PMU.chargeEnabled = true; PMU.failChargeDisable = true;
         static uint32_t startMs; startMs = g_millis;
         PMU.tsControl = 0x05;
+        PMU.failRegisterWriteAt[tsReg] = 1;
         static bool mountedAfterRecovery; mountedAfterRecovery = false;
         PMU.onRegisterRead = [](uint8_t reg) {
             if (reg == XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL &&
@@ -671,6 +677,7 @@ int main() {
         g_sdDisk.onMount = [] {
             mountedAfterRecovery = true;
             assert(!PMU.chargeEnabled && PMU.tsControl == 0x10);
+            assert(PMU.registerWriteCalls[XPOWERS_AXP2101_TS_PIN_CTRL] == 2);
             assert(uint32_t(g_millis - startMs) >= 500 && uint32_t(g_millis - startMs) < 5000);
         };
         setup();
@@ -687,11 +694,14 @@ int main() {
         pmuWorld(); PMU.chargeEnabled = true; PMU.failChargeDisable = true;
         static uint32_t startMs; startMs = g_millis;
         PMU.tsControl = 0x05;
+        PMU.failRegisterWriteAt[tsReg] = 1;
         static bool checkedAtMount; checkedAtMount = false;
         g_sdDisk.onMount = [] {
             checkedAtMount = true;
             assert(PMU.failChargeDisable); // fault stays active through mount
-            assert(PMU.tsControl == 0x05 && PMU.registerWriteCalls[XPOWERS_AXP2101_TS_PIN_CTRL] == 0);
+            assert(PMU.tsControl == 0x05);
+            assert(PMU.registerWriteCalls[XPOWERS_AXP2101_TS_PIN_CTRL] == 1 &&
+                   PMU.registerWriteCalls[XPOWERS_AXP2101_ADC_CHANNEL_CTRL] == 1);
             assert(uint32_t(g_millis - startMs) >= 5000);
             assert(calls("disableCellbatteryCharge") >= 50);
             assert(g_watchdog.feeds >= 10);

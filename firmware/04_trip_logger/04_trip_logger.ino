@@ -3799,9 +3799,11 @@ void setup() {
             Serial.println("WARNING: charger disable still unconfirmed after 5 s; continuing startup and reporting E2008.");
         }
     }
-    // Changing TS to a fixed input can remove a hardware charger hold.
-    // Wait for confirmed charger pause, including the bounded recovery above,
-    // so the die-temperature guard controls when charging can resume.
+    // XPowersLib's existing PMU.begin() sets TS to fixed input a few I2C
+    // transactions before the early charger pause. Verify and repair that
+    // setup only after confirming the pause, including bounded recovery above.
+    // The runtime debug TS probe keeps 0x50 bit 4 set, so TS stays a fixed
+    // input and the probe does not give TS control of charging.
     const bool tsReady = gEarlyChargeDisabled && configureTsFixedInput();
     if (!tsReady) {
         Serial.println(gEarlyChargeDisabled

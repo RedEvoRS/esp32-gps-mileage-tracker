@@ -1648,7 +1648,9 @@ during a fix loss on the next drive. These checks still need the board.
 
 If startup cannot verify battery detection, battery voltage measurement or
 the PMU's TS pin setup, it names the setting in a serial warning and reports
-E2010. TS setup waits for confirmation that charging is paused.
+E2010. XPowersLib's existing `PMU.begin()` sets TS to fixed input with its ADC
+off a few I2C transactions before the charger pause. The firmware verifies
+and repairs that setting only after confirming the pause.
 
 Illustrative; free space, attempt count and timing vary:
 

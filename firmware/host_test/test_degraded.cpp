@@ -62,7 +62,10 @@ static RuntimeFaults::Observation observation(unsigned code) {
 }
 static void noTrips() {
     assert(!gDebugTempEnabled);
-    for (const auto& w : PMU.registerWrites) assert(w.first != 0x50 && w.first != 0x30);
+    const auto tsWrites = std::count_if(PMU.registerWrites.begin(), PMU.registerWrites.end(), [](const auto& w) {
+        return w.first == XPOWERS_AXP2101_TS_PIN_CTRL || w.first == XPOWERS_AXP2101_ADC_CHANNEL_CTRL;
+    });
+    assert(size_t(tsWrites) == PMU.beginRegisterWriteCount);
     assert(gState == IDLE && !gTripPath[0] && gArmCount == 0 && gPendCount == 0);
     for (auto* disk : {&g_disk, &g_sdDisk}) for (const auto& file : disk->files)
         assert(file.first.rfind("/trips/", 0) != 0);
@@ -143,7 +146,8 @@ int main() {
         Wire.onBegin = [&] {
             displayBegan = true;
             const std::vector<std::string> expected = {
-                "begin", "disableALDO3", "readRegister", "disableCellbatteryCharge", "readRegister",
+                "begin", "readRegister", "writeRegister", "readRegister", "writeRegister",
+                "disableALDO3", "readRegister", "disableCellbatteryCharge", "readRegister",
                 "enableBattDetection", "readRegister", "enableBattVoltageMeasure", "readRegister",
                 "readRegister", "readRegister",
                 "setALDO1Voltage", "enableALDO1", "readRegister", "readRegister"
@@ -271,11 +275,13 @@ int main() {
     setup();
     bootMessagesAfterUsbWait();
     assert(!PMU.aldo3 && gDegraded.mode() == Mode::PmuUntrusted);
-    onlyPmuCalls({"begin", "disableALDO3", "disableCellbatteryCharge", "readRegister"});
+    onlyPmuCalls({"begin", "disableALDO3", "disableCellbatteryCharge", "readRegister", "writeRegister"});
     assert(PMU.aldo1 && PMU.aldo1Mv == 1800);
     assert(!logCount("LoRa rail (ALDO3) verified off"));
-    assert(PMU.operations[0] == "begin" && PMU.operations[1] == "disableALDO3" &&
-           PMU.operations[2] == "readRegister");
+    const std::vector<std::string> firstOperations = {
+        "begin", "readRegister", "writeRegister", "readRegister", "writeRegister", "disableALDO3", "readRegister",
+    };
+    assert(std::equal(firstOperations.begin(), firstOperations.end(), PMU.operations.begin()));
     failNextRead(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
     g_millis += 60000; loop();
     assert(g_restarts == 0 && gDegraded.mode() == Mode::PmuUntrusted && gDegraded.waitMs() == 120000);
@@ -453,14 +459,14 @@ int main() {
         PMU.failBegins = 0; g_millis += 120000; restartOnLoop();
         assert(gProductionDisplayReady && gProductionOled.sleeps >= 1 && !gProductionHaveOutput);
 
-        onlyPmuCalls({"begin"}); noTrips(); ++cases;
+        onlyPmuCalls({"begin", "readRegister", "writeRegister"}); noTrips(); ++cases;
     }
     for (bool writeFails : {false, true}) for (unsigned chargeResult = 0; chargeResult < 3; ++chargeResult) {
         world(); PMU.failRadioDisable = writeFails; PMU.radioStuckOn = !writeFails;
         PMU.failChargeDisable = chargeResult == 1; PMU.failChargeRead = chargeResult == 2;
         setup(); assert(gDegraded.mode() == Mode::PmuUntrusted);
         bootMessagesAfterUsbWait();
-        assert(std::count(PMU.operations.begin(), PMU.operations.end(), "readRegister") == (writeFails ? 1 : 2));
+        assert(std::count(PMU.operations.begin(), PMU.operations.end(), "readRegister") == (writeFails ? 3 : 4));
         const char* expected = chargeResult == 0 ? "read-back shows charging disabled" :
             chargeResult == 1 ? "read-back still shows charging enabled" : "charger read-back failed, state unknown";
         bool printed = false;
@@ -468,7 +474,7 @@ int main() {
         assert(printed);
         for (unsigned i = 0; i < 5; ++i) loop();
         assert(std::count(PMU.operations.begin(), PMU.operations.end(), "disableCellbatteryCharge") == 1);
-        onlyPmuCalls({"begin", "disableALDO3", "isEnableALDO3", "disableCellbatteryCharge", "readRegister"});
+        onlyPmuCalls({"begin", "disableALDO3", "isEnableALDO3", "disableCellbatteryCharge", "readRegister", "writeRegister"});
         assert(PMU.aldo1 && PMU.aldo1Mv == 1800);
         assert(contains(rows(), 2001)); noTrips();
         g_millis += 60000; loop(); assert(gDegraded.waitMs() == 120000);
@@ -476,7 +482,7 @@ int main() {
         assert(std::count(PMU.operations.begin(), PMU.operations.end(), "disableCellbatteryCharge") == 1);
         PMU.failRadioDisable = PMU.radioStuckOn = false;
         g_millis += 120000; restartOnLoop();
-        onlyPmuCalls({"begin", "disableALDO3", "isEnableALDO3", "disableCellbatteryCharge", "readRegister"});
+        onlyPmuCalls({"begin", "disableALDO3", "isEnableALDO3", "disableCellbatteryCharge", "readRegister", "writeRegister"});
         noTrips(); ++cases;
     }
     // Leave a failed-PMU boot on flash, then simulate a normal reboot with SD.

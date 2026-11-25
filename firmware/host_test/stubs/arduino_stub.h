@@ -655,11 +655,19 @@ struct XPowersAXP2101 {
     TwoWire* bus = nullptr;
     std::vector<std::string> operations;
     int beginCalls = 0, failBegins = 0;
+    size_t beginRegisterWriteCount = 0;
     std::function<void()> onBegin;
     bool begin(TwoWire& wire, int, int, int) {
         bus = &wire; operations.push_back("begin"); beginCalls++;
         if (onBegin) onBegin();
         if (failBegins) { failBegins--; return false; }
+        // XPowersLib 0.3.3 initImpl() ignores the TS setup result.
+        const size_t writesBefore = registerWrites.size();
+        const uint8_t ts = readRegister(XPOWERS_AXP2101_TS_PIN_CTRL);
+        writeRegister(XPOWERS_AXP2101_TS_PIN_CTRL, (ts & 0xF0) | 0x10);
+        const int adc = readRegister(XPOWERS_AXP2101_ADC_CHANNEL_CTRL);
+        if (adc >= 0) writeRegister(XPOWERS_AXP2101_ADC_CHANNEL_CTRL, adc & ~0x02);
+        beginRegisterWriteCount += registerWrites.size() - writesBefore;
         return true;
     }
     bool disableALDO3() {
