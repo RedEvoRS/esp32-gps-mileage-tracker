@@ -118,7 +118,11 @@ int main() {
             assert(pmu_read::vbusState(raw, second) ==
                    (!(second & 8) && (raw & 32) ? VbusState::Present : VbusState::Absent));
             assert(pmu_read::aldo1Ready(raw, second) == bool((raw & 1) && (second & 31) == 28));
+            assert(pmu_read::aldo4Ready(raw, second) == bool((raw & 8) && (second & 31) == 28));
         }
+        assert(!pmu_read::aldo4Ready(-1, raw));
+        assert(!pmu_read::aldo4Ready(raw, -1));
+        assert(pmu_read::pmuMeasurementsReady(raw) == ((raw & 0x1C) == 0x1C));
         assert(!pmu_read::aldo1Ready(-1, raw));
         assert(!pmu_read::aldo1Ready(raw, -1));
         assert(pmu_read::vbusState(-1, raw) == VbusState::Unknown);
@@ -127,6 +131,8 @@ int main() {
     assert(pmu_read::aldo3State(-1) == Aldo3State::Unknown);
     assert(pmu_read::vbusState(-1, -1) == VbusState::Unknown);
     assert(!pmu_read::aldo1Ready(-1, -1));
+    assert(!pmu_read::aldo4Ready(-1, -1));
+    assert(!pmu_read::pmuMeasurementsReady(-1));
 
     // Cold boot changes 1.8 V to 3.3 V; a warm boot already at 3.3 V/on
     // needs no settle delay. The first display bus operation sees all PMU

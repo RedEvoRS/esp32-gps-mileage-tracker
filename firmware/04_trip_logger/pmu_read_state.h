@@ -90,6 +90,21 @@ inline bool aldo1Ready(int control, int voltage) {
     return (control & 1) && 500 + (voltage & 0x1F) * 100 == 3300;
 }
 
+inline bool aldo4Ready(int control, int voltage) {
+    if (control < 0 || voltage < 0) return false;
+    // XPowersLib 0.3.3: 0x90 bit 3 enables ALDO4; 0x95 bits 0..4
+    // select 500 mV + 100 mV/step.
+    return (control & (1 << 3)) && 500 + (voltage & 0x1F) * 100 == 3300;
+}
+
+inline bool pmuMeasurementsReady(int adcCtrl) {
+    if (adcCtrl < 0) return false;
+    // XPowersLib 0.3.3: 0x30 bits 4, 3 and 2 enable die temperature,
+    // system voltage and VBUS voltage measurements respectively.
+    constexpr int channels = 0x1C;
+    return (adcCtrl & channels) == channels;
+}
+
 inline VbusState vbusState(int status1, int status2) {
     if (status1 < 0 || status2 < 0) return VbusState::Unknown;
     // XPowersLib 0.3.3 isVbusIn(): STATUS2 bit 3 clear AND STATUS1 bit 5 set.

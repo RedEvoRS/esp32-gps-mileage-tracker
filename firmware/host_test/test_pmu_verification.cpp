@@ -25,7 +25,17 @@ int main() {
     PMU.failAldo4VoltageWrites = 1;
     PMU.adcChannels = 0x01;
     failRead(XPOWERS_AXP2101_ADC_CHANNEL_CTRL);
+    std::vector<uint32_t> gpsAttempts, adcAttempts;
+    PMU.onRegisterRead = [&](uint8_t reg) {
+        if (reg == XPOWERS_AXP2101_LDO_VOL3_CTRL) gpsAttempts.push_back(millis());
+        if (reg == XPOWERS_AXP2101_ADC_CHANNEL_CTRL) adcAttempts.push_back(millis());
+    };
+    g_delayHook = [](uint32_t ms) { g_millis += ms; };
     setup();
+    PMU.onRegisterRead = nullptr;
+    g_delayHook = nullptr;
+    assert(gpsAttempts.size() == 2 && gpsAttempts[1] - gpsAttempts[0] == 10);
+    assert(adcAttempts.size() == 2 && adcAttempts[1] - adcAttempts[0] == 10);
     assert(calls("setALDO4Voltage") == 2 && calls("enableALDO4") == 1 && PMU.aldo4 && PMU.aldo4Mv == 3300);
     assert(calls("enableTemperatureMeasure") == 2 && calls("enableVbusVoltageMeasure") == 2 &&
            calls("enableSystemVoltageMeasure") == 2 && PMU.adcChannels == 0x1D);
@@ -57,6 +67,22 @@ int main() {
         has(warning[0], "\"transition\":\"raise\"");
         ++cases;
     }
+
+    // With neither store mounted, the E2010 raise joins the storage faults in RAM.
+    pmuWorld();
+    SD.cardPresent = false;
+    g_disk.failMount = true;
+    PMU.registerReadOverride[XPOWERS_AXP2101_LDO_VOL3_CTRL] = -1;
+    setup();
+    assert(gDegraded.mode() == startup::Mode::NoStorage && !gSdMounted && !gFlashMounted);
+    assert(gJournal.stats().backend == EventLog::Backend::Ram);
+    auto noStorageRows = bootRows();
+    for (int code : {2010, 4001, 4002, 4003}) {
+        auto warning = codeRows(noStorageRows, code);
+        assert(warning.size() == 1);
+        has(warning[0], ""transition":"raise"");
+    }
+    ++cases;
 
     for (float value : {NAN, INFINITY, -INFINITY, -40.01f, 125.01f, 385.7f})
         assert(!charge_temperature::plausible(value));

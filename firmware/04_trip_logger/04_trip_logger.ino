@@ -3579,31 +3579,31 @@ static void degradedLoop() {
     delay(20); // yield even without UART, display or network activity
 }
 
+static constexpr unsigned PMU_PERIPHERAL_ATTEMPTS = 3;
+// An estimated pause to ride out transient I2C failures, not a measured timing requirement.
+static constexpr uint32_t PMU_PERIPHERAL_RETRY_MS = 10;
+
 static bool configureGpsRail() {
-    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+    for (unsigned attempt = 0; attempt < PMU_PERIPHERAL_ATTEMPTS; ++attempt) {
+        if (attempt) delay(PMU_PERIPHERAL_RETRY_MS);
         bool voltageSet = PMU.setALDO4Voltage(3300);
         bool enabled = voltageSet && PMU.enableALDO4();
         const int control = PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
         const int voltage = PMU.readRegister(XPOWERS_AXP2101_LDO_VOL3_CTRL);
-        // XPowersLib 0.3.3: 0x90 bit 3 enables ALDO4; 0x95 encodes
-        // 500 mV + 100 mV per step. Raw reads preserve the I2C error sentinel.
-        if (enabled && control >= 0 && (control & (1 << 3)) &&
-            voltage >= 0 && 500 + (voltage & 0x1F) * 100 == 3300) return true;
+        if (enabled && pmu_read::aldo4Ready(control, voltage)) return true;
     }
     Serial.println("WARNING: GPS rail (ALDO4) 3.3 V/on setup unconfirmed after 3 attempts.");
     return false;
 }
 
 static bool configurePmuMeasurements() {
-    // XPowersLib 0.3.3: ADC channel control (0x30) bits 4, 3 and 2
-    // enable die temperature, system voltage and VBUS voltage respectively.
-    constexpr int channels = 0x1C;
-    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+    for (unsigned attempt = 0; attempt < PMU_PERIPHERAL_ATTEMPTS; ++attempt) {
+        if (attempt) delay(PMU_PERIPHERAL_RETRY_MS);
         bool temperature = PMU.enableTemperatureMeasure();
         bool vbus = PMU.enableVbusVoltageMeasure();
         bool system = PMU.enableSystemVoltageMeasure();
         const int adc = PMU.readRegister(XPOWERS_AXP2101_ADC_CHANNEL_CTRL);
-        if (temperature && vbus && system && adc >= 0 && (adc & channels) == channels) return true;
+        if (temperature && vbus && system && pmu_read::pmuMeasurementsReady(adc)) return true;
     }
     Serial.println("WARNING: PMU temperature/VBUS/system voltage measurement setup unconfirmed after 3 attempts.");
     return false;
@@ -3757,8 +3757,7 @@ void setup() {
     uint64_t bootFreeBytes = 0;
     if (!mountTripStorage(true, true, &bootFreeBytes)) {
         enterDegraded(startup::Mode::NoStorage);
-        if (gJournalReady)
-            gLoopFaults.event(diagnostics::Code::PMU_PERIPHERAL_SETUP_FAILED, millis()).condition(pmuPeripheralWarning);
+        gLoopFaults.event(diagnostics::Code::PMU_PERIPHERAL_SETUP_FAILED, millis()).condition(pmuPeripheralWarning);
         return;
     }
     startupStage(startup_watchdog::Stage::Services);
