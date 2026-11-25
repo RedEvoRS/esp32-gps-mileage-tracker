@@ -493,11 +493,35 @@ int main(int argc, char** argv) {
     collect(); cardRemovalAndReturn(); collect();
     mountedStoreFailures(); collect();
     readOnlyAckFallback(); collect();
-    // Refusal is actionable even when the flash copy cannot be read on a PC.
+    // Refusal is actionable even when the flash copy cannot be read on a PC,
+    // and does not consume the one-use ID when no store save succeeds (#805).
     uploadWorld(); Preferences::durable64["enroll"] = 0;
     assert(enrollAt(321)); drainEvents();
     assert(logLines("local minimum high-water 321") == 1);
+    assert(Preferences::durable64["enroll"] == 0);
+
+    // Issue #805: core-1 FS_LOCK demand arriving mid-enrollment cannot cancel
+    // the bounded commit or leave diagnostics suspended; total store write
+    // failure leaves the one-use ID unconsumed for retry after storage recovers.
+    uploadWorld(false); records(1);
+    g_sdDisk.onRead = [] { gFsDemand.store(1); };
+    g_disk.onRead = [] { gFsDemand.store(1); };
+    drainEvents();
+    g_sdDisk.onRead = nullptr; g_disk.onRead = nullptr; gFsDemand.store(0);
     assert(Preferences::durable64["enroll"] == 1);
+    assert(!(Preferences::durable64["revstate"] & 1));
+    gEventRetry = {}; drainEvents();
+    assert(g_httpRequests >= 1 && backlog().records == 0);
+
+    uploadWorld(false); records(1);
+    g_sdDisk.writesFail = g_disk.writesFail = true;
+    drainEvents();
+    assert(Preferences::durable64["enroll"] == 0 && g_httpRequests == 0);
+    g_sdDisk.writesFail = g_disk.writesFail = false;
+    gEnrollmentChecked = false; gEventRetry = {};
+    drainEvents();
+    assert(Preferences::durable64["enroll"] == 1 && g_httpRequests >= 1 && backlog().records == 0);
+    std::puts("Event upload #805: enrollment resists cooperative cancellation and only consumes ID after a store save passed");
     collect();
     if (debugMode()) {
         assert(gEventHeapReported && logLines("Heap:") == 0); // no repeated post-attempt reports

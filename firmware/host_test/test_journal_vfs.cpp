@@ -15,7 +15,23 @@
 #include <io.h>
 #include <direct.h>
 #endif
+#include <vector>
+#include <string>
 static bool failSync = false, failClose = false, failList = false, failOpen = false, failTruncate = false;
+static size_t openDirCount = 0, closeDirCount = 0, statCount = 0;
+static DIR* checkedOpenDir(const char* path) {
+    DIR* d = ::opendir(path);
+    if (d) ++openDirCount;
+    return d;
+}
+static int checkedCloseDir(DIR* dir) {
+    ++closeDirCount;
+    return ::closedir(dir);
+}
+static int checkedStat(const char* path, struct stat* info) {
+    ++statCount;
+    return ::stat(path, info);
+}
 static int checkedTruncate(int fd, off_t size) {
     if (failTruncate) { errno = EIO; return -1; }
 #ifdef _WIN32
@@ -58,7 +74,10 @@ static int checkedOpen(const char* path, int flags, int mode = 0) {
 }
 #define fsync checkedSync
 #define close checkedClose
+#define opendir checkedOpenDir
+#define closedir checkedCloseDir
 #define readdir checkedReadDir
+#define stat(path, info) checkedStat(path, info)
 #define mkdir checkedMkdir
 #define open checkedOpen
 #include "journal_vfs.h"
@@ -69,10 +88,17 @@ static int checkedOpen(const char* path, int flags, int mode = 0) {
 #undef ftruncate
 #undef fsync
 #undef close
+#undef opendir
+#undef closedir
 #undef readdir
+#undef stat
 #undef mkdir
 #undef open
 #include "journal_fs.h"
+
+static bool gAllowList = true;
+static size_t gAllowLimit = SIZE_MAX, gAllowVisited = 0;
+static bool allowList() { return gAllowList && gAllowVisited < gAllowLimit; }
 
 int main(int argc, char** argv) {
     assert(argc == 2);
@@ -81,12 +107,19 @@ int main(int argc, char** argv) {
     std::string mount = root.generic_string();
     diagnostics::JournalVfs io(mount.c_str());
     bool mounted = true;
-    diagnostics::MountedJournalFs<diagnostics::JournalVfs> adapter(io, mounted, nullptr);
+    diagnostics::MountedJournalFs<diagnostics::JournalVfs> adapter(io, mounted, allowList);
     using Result = diagnostics::EventLogFs::Result;
     using Operation = diagnostics::EventLogFs::Operation;
+    auto listAll = [&](size_t skip, std::vector<diagnostics::EventLogFs::Entry>& out) {
+        return adapter.list(skip, [](void* ctx, const diagnostics::EventLogFs::Entry& entry) {
+            ++gAllowVisited;
+            static_cast<std::vector<diagnostics::EventLogFs::Entry>*>(ctx)->push_back(entry);
+            return true;
+        }, &out);
+    };
     assert(adapter.begin());
-    diagnostics::EventLogFs::Entry entry;
-    assert(adapter.list(0, entry) == Result::End);
+    std::vector<diagnostics::EventLogFs::Entry> entries;
+    assert(listAll(0, entries) == Result::Ok && entries.empty());
     const char bytes[] = "one\ntwo\n";
     assert(adapter.write("/diag/seg-00000001.open", bytes, sizeof(bytes)-1, false));
     assert(adapter.write("/diag/seg-00000001.open", "tail", 4, true));
@@ -94,8 +127,9 @@ int main(int argc, char** argv) {
     assert(adapter.read("/diag/seg-00000001.open", 4, buffer, 4));
     assert(!std::memcmp(buffer, "two\n", 4));
     assert(!adapter.read("/diag/seg-00000001.open", 0, buffer, 16));
-    assert(adapter.list(0, entry) == Result::Ok && entry.size == sizeof(bytes)-1+4);
-    assert(!std::strcmp(entry.name, "seg-00000001.open"));
+    entries.clear();
+    assert(listAll(0, entries) == Result::Ok && entries.size() == 1);
+    assert(entries[0].size == sizeof(bytes)-1+4 && !std::strcmp(entries[0].name, "seg-00000001.open"));
     assert(adapter.rename("/diag/seg-00000001.open", "/diag/seg-00000001.ready"));
     assert(adapter.write("/diag/seg-00000002.open", "keep", 4, false));
     assert(!adapter.rename("/diag/seg-00000002.open", "/diag/seg-00000001.ready"));
@@ -113,7 +147,8 @@ int main(int argc, char** argv) {
     assert(adapter.writeFailure() == Operation::Close);
     assert(!adapter.read("/diag/ack-0", 0, buffer, 4));
     failClose = false; failList = true;
-    assert(adapter.list(0, entry) == Result::Error);
+    entries.clear();
+    assert(listAll(0, entries) == Result::Error);
     failList = false;
     assert(!adapter.write("/trips/unuploaded.gpx", "bad", 3, false));
     assert(!adapter.remove("/diag/../trip"));
@@ -122,9 +157,35 @@ int main(int argc, char** argv) {
     for (const char* name : {"seg-00000001.ready", "seg-00000002.open", "ack-0"}) {
         std::string path = std::string("/diag/") + name; assert(adapter.remove(path.c_str()));
     }
-    assert(adapter.list(0, entry) == Result::End);
+    entries.clear();
+    assert(listAll(0, entries) == Result::Ok && entries.empty());
+    // Issue #797: single-pass O(N) enumeration (1 opendir, 1 stat per entry),
+    // clean handle close on cooperative deferral, and zero re-stats on resume.
+    for (unsigned i = 1; i <= 100; ++i) {
+        char path[40];
+        std::snprintf(path, sizeof(path), "/diag/seg-%08u.ready", i);
+        assert(adapter.write(path, "data", 4, false));
+    }
+    openDirCount = closeDirCount = statCount = gAllowVisited = 0; gAllowLimit = SIZE_MAX;
+    entries.clear();
+    assert(listAll(0, entries) == Result::Ok && entries.size() == 100);
+    assert(openDirCount == 1 && closeDirCount == 1 && statCount == 100);
+    // Interrupt after 30 entries, then resume from skip=30 without re-statting.
+    openDirCount = closeDirCount = statCount = gAllowVisited = 0; gAllowLimit = 30;
+    entries.clear();
+    assert(listAll(0, entries) == Result::Deferred && adapter.deferred());
+    assert(entries.size() == 30 && openDirCount == 1 && closeDirCount == 1 && statCount == 30);
+    gAllowLimit = SIZE_MAX;
+    assert(listAll(entries.size(), entries) == Result::Ok && entries.size() == 100);
+    assert(openDirCount == 2 && closeDirCount == 2 && statCount == 100);
+    for (unsigned i = 1; i <= 100; ++i) {
+        char path[40];
+        std::snprintf(path, sizeof(path), "/diag/seg-%08u.ready", i);
+        assert(adapter.remove(path));
+    }
     std::filesystem::create_directory(root / "diag" / "unexpected");
-    assert(adapter.list(0, entry) == Result::Error);
+    entries.clear();
+    assert(listAll(0, entries) == Result::Error);
     std::filesystem::remove(root / "diag" / "unexpected");
     std::filesystem::remove(root / "diag");
     const std::string prefix = "retained point</trkpt>";

@@ -62,15 +62,14 @@ including both loaded copies and any revision reserved this boot. Use at least
 that value and a fresh server read before trying a higher enrollment ID. If
 that minimum was already met, check journal/NVS errors rather than raising it.
 
-Enrollment is one-use: core 0 saves and verifies the ID in `diag/enroll` in
-**NVS (non-volatile storage, the ESP32's settings memory)** before calling
-`restoreStatusSequence(highWater)` under the journal lock. Enrollment attempts
-every loaded journal and needs at least one verified save plus the separate
-NVS recovery marker. Failed/absent stores are marked stale before it succeeds.
-A restore below either loaded stored revision
-is refused **after the ID has been consumed**. Raising only the ID while keeping
-that too-low value repeats the failure and consumes another ID. Fix the lower
-bound or storage problem first; only then retry with a higher ID and reboot.
+Enrollment is one-use: core 0 runs `restoreStatusSequence(highWater)` under the
+journal lock with cooperative cancellation suppressed for this bounded commit,
+and saves and verifies the ID in `diag/enroll` in **NVS (non-volatile storage,
+the ESP32's settings memory)** only after at least one journal store save and
+the separate NVS recovery marker succeed. Failed/absent stores are marked stale
+before it succeeds. A restore below either loaded stored revision, or when no
+journal store can save, is refused without consuming the ID. Fix the lower
+bound or storage problem first, then retry enrollment and reboot.
 
 1. Read the server high-water for the exact `DEVICE_ID`. With the tracker
    powered off, inspect the card's revision using the read-only procedure below
@@ -382,7 +381,7 @@ second metric reference.
 | No Device health entry | A successful GPX upload with a valid `X-Device-Id`, or an accepted diagnostics request, creates contact. Verify the configured identity, server reachability and upload result. Legacy GPX uploads without identity are not assigned to a guessed device. |
 | Contact exists, but no current snapshot | GPX contact does not establish diagnostics health. Check for a current enrolled SD or LittleFS copy, NVS suspension/stale state, and the one-time upload-workspace allocation warning. An upgrade while the card was absent needs it once or explicit enrollment. |
 | Diagnostics stay local while trips upload | Eligible completed GPX files always take priority, even after a failed trip attempt. Diagnostics use the next eligible awake network opportunity and independent retry backoff. Check at least one current enrolled journal can persist revisions, NVS is working, and the serial warning `diagnostics upload disabled: PSRAM allocation failed`; PSRAM is the board's external working memory. |
-| Enrollment/recovery is refused or never produces a current snapshot | Check the server high-water, SD stored revision and serial `local minimum high-water` (includes internal flash) before consuming another ID. Failed attempts consume IDs. A snapshot conflict needs explicit recovery and reboot; do not clear server state to hide it. |
+| Enrollment/recovery is refused or never produces a current snapshot | Check the server high-water, SD stored revision and serial `local minimum high-water` (includes internal flash) before retrying enrollment. A failed attempt does not consume the enrollment ID, while a snapshot conflict needs explicit recovery with a higher ID and reboot; do not clear server state to hide it. |
 | History arrives but current health stays old | Lower-but-valid revisions can deliver history/contact without replacing current health. Compare revision bounds and use the recovery procedure above. An identical retry also does not refresh snapshot age. |
 | An old fault is in history, or a condition says unknown | History is not current health. A reboot or omitted/unobserved condition is unknown, not measured recovery. Use the current snapshot and receipt age. |
 | The screen is dark | Production normally sleeps between cards. Try POWER while running. E6001 means display failure disabled both display paths for this boot; missing pixels alone cannot diagnose the cause. |
@@ -949,7 +948,7 @@ remounting media; do not reuse cached state for a different card.
   is not event-time order. The default 30 KiB events-array budget leaves room
   for the current check-in; the worker also enforces the full 32 KiB request.
   Re-reads preserve exact JSON, including original timestamps and identity.
-  On the Windows host ABI, `sizeof(EventLog)` is **25,184 bytes** and
+  On the Windows host ABI, `sizeof(EventLog)` is **25,200 bytes** and
   `sizeof(EventLog::Batch)` is **35,288 bytes**; the host test prints both.
   ABI/alignment can differ on the ESP32-S3. #124 must place both objects in
   **static DRAM or PSRAM**, never on a task stack. Only one batch ticket is
@@ -1052,7 +1051,8 @@ The work under one `service()` lock hold is bounded as follows:
   512 removals and 513 metadata saves including filename reservation. With a
   normal full-size journal this is usually one eviction at a quota-driven roll;
   tiny recovered segments can require more.
-- Each uncached load uses one `begin`, at most **1025 list calls**, and two
+- Each uncached load uses one `begin`, one single-pass directory listing (at most
+  **1024 entries**, keeping progress across cooperative yields), and two
   metadata reads. The next append validates at most **512 open segments**, each
   at most **64 KiB**, sealing at most 512 files. A failed operation may require
   this recovery again on a later attempt, even within the same service call.
