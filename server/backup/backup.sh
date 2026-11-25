@@ -70,10 +70,8 @@ esac
 
 [[ -d $COMPOSE_DIR/data ]] || die "no trip data directory at $COMPOSE_DIR/data"
 
+lock_backup_dir
 mkdir -p "$SNAPSHOTS"
-exec 9> "$BACKUP_DIR/.lock"
-# 75 lets the scheduled catch-up distinguish contention from a failed backup.
-flock -n 9 || { log "another backup is already running"; exit 75; }
 read_verify_state
 
 # A failed/interrupted deep check retries the same snapshots before retention

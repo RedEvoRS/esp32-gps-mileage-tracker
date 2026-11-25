@@ -110,6 +110,21 @@ guard_backup_mounts() {
     fi
 }
 
+# Share the lock between backup and restore. The shell keeps it through
+# exit cleanup, including a restore's attempt to restart services.
+lock_backup_dir() {
+    local status
+    mkdir -p "$BACKUP_DIR"
+    exec 9>> "$BACKUP_DIR/.lock"
+    flock -n -E 75 9 || {
+        status=$?
+        # Scheduled catch-up distinguishes contention from a failed backup.
+        (( status == 75 )) || die "could not lock $BACKUP_DIR"
+        log "another backup or restore is already running; try again when it finishes"
+        exit 75
+    }
+}
+
 # Publish a new lock only after it belongs to the data owner. A concurrent
 # ingest may create it first; link never replaces that inode. Open read-only
 # afterwards, so root cannot accidentally create a root-owned upload lock.
@@ -244,7 +259,7 @@ salvage_raw_db() {
     count=$(count_files "$dir")
     [[ $count -gt 0 ]] || die "$path can't be read as a database, and no raw file was found to save; nothing more was restored"
     log "WARNING: the current $path can't be read as a database (it is damaged)."
-    log "WARNING: its raw files ($count) are saved in $dir. The restore replaces it."
+    log "WARNING: its raw files ($count) are saved in $dir."
 }
 
 # Delete a database file and its sidecars (inside the container's volume)

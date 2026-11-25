@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from unittest import mock
 
@@ -56,6 +57,9 @@ FAKE_COMPOSE = textwrap.dedent("""\
     elif args[0] == "stop":
         for service in args[1:]:
             open(state + "/" + service, "w").close()
+    elif args[0] == "up" and "FAKE_RESTART_READY" in os.environ:
+        open(os.environ["FAKE_RESTART_READY"], "w").close()
+        sys.stdin.readline()
     if args[0] == "run":
         service = args[args.index("python") - 1]
         args = args[args.index("python"):]
@@ -2208,7 +2212,7 @@ fi
                                     env=self.env, capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(state.read_text(), previous)
-            self.assertIn("another backup is already running",
+            self.assertIn("another backup or restore is already running",
                           (scripts / "logs/backup.log").read_text())
             self.assertFalse(self.compose_log.exists())
         finally:
@@ -2478,6 +2482,71 @@ fi
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--yes", result.stderr)
         self.assertNotIn("stop", self.compose_log.read_text())
+
+    def test_restore_corrects_and_saves_corrupted_trip_with_unchanged_size_and_mtime(self):
+        self.run_script("backup.sh")
+        relative = Path("2026-10/2026-10-01T15-00-00.gpx")
+        trip = self.data / relative
+        original = trip.read_bytes()
+        original_stat = trip.stat()
+        self.silently_corrupt(trip)
+        damaged = trip.read_bytes()
+        self.assertNotEqual(damaged, original)
+        self.assertEqual(trip.stat().st_size, original_stat.st_size)
+        self.assertEqual(trip.stat().st_mtime_ns, original_stat.st_mtime_ns)
+
+        self.run_script("restore.sh", "restore", "latest", "--yes")
+
+        self.assertEqual(trip.read_bytes(), original)
+        [pre] = self.backups.glob("pre-restore-*")
+        self.assertEqual((pre / "data" / relative).read_bytes(), damaged)
+
+    def test_restore_excludes_backup_and_restore_until_services_restart(self):
+        self.run_script("backup.sh")
+        ready = self.tmp / "restart-ready"
+        restore_args = ("restore", "latest", "--yes")
+        with subprocess.Popen(
+            ["bash", str(BACKUP / "restore.sh"), *restore_args],
+            env=dict(self.env, FAKE_RESTART_READY=str(ready)),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ) as restore:
+            try:
+                deadline = time.monotonic() + 15
+                while not ready.exists() and restore.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(ready.exists(), "restore did not reach service restart")
+                calls = self.compose_log.read_bytes()
+                for script, args in (("restore.sh", restore_args), ("backup.sh", ())):
+                    with self.subTest(script=script):
+                        busy = self.run_script(script, *args, check=False)
+                        self.assertEqual(busy.returncode, 75, busy.stderr)
+                        self.assertIn("another backup or restore is already running", busy.stderr)
+                self.assertEqual(self.compose_log.read_bytes(), calls)
+                self.assertEqual(len(list(self.backups.glob("pre-restore-*"))), 1)
+            finally:
+                try:
+                    _, stderr = restore.communicate(input="release\n", timeout=10)
+                except subprocess.TimeoutExpired:
+                    restore.kill()
+                    restore.communicate()
+                    raise
+            self.assertEqual(restore.returncode, 0, stderr)
+        self.run_script("backup.sh")
+
+    def test_restores_in_the_same_second_keep_separate_safety_copies(self):
+        self.run_script("backup.sh")
+        date = shutil.which("date")
+        self.shim("date", 'if [[ $* == "-u +%Y-%m-%dT%H%M%SZ" ]]; then\n'
+                          '    echo 2026-10-07T060000Z; exit 0\n'
+                          f'fi\nexec "{date}" "$@"\n')
+        stem = "2026-10/2026-10-01T15-00-00"
+        for contents in ("first live", "second live"):
+            self.add_trip(stem, contents)
+            self.run_script("restore.sh", "restore", "latest", "--yes")
+
+        safety_copies = self.backups.glob("pre-restore-*")
+        self.assertCountEqual([(pre / "data" / f"{stem}.gpx").read_text() for pre in safety_copies],
+                              ["first live.gpx", "second live.gpx"])
 
     def test_retention_setting_round_trips_in_annotations_without_settings_volume(self):
         path = self.db_dir / 'annotations.db'
@@ -2983,6 +3052,26 @@ fi
                 self.assertEqual(conn.execute("SELECT * FROM gelf_cursor").fetchall(), [(9,)])
             conn.close()
         self.assert_restore_replaces_a_damaged_database(monitor, self.damage_random, verify)
+
+    def test_restore_only_reports_replacement_for_damaged_databases_in_snapshot(self):
+        self.run_script("backup.sh")
+        events = self.add_events()
+        monitor = self.add_monitor()
+        for path in (self.db_dir / "annotations.db", events, monitor):
+            self.damage_random(path)
+        before = {path: path.read_bytes() for path in (events, monitor)}
+
+        result = self.run_script("restore.sh", "restore", "latest", "--yes")
+
+        self.assertIn("1 damaged database(s) were replaced: /db/annotations.db", result.stderr)
+        self.verify_annotations()
+        [pre] = self.backups.glob("pre-restore-*")
+        for path, content in before.items():
+            with self.subTest(database=path.name):
+                self.assertIn(f"No {path.name} in this snapshot", result.stderr)
+                self.assertNotIn(f"/{path.name} can't be read as a database", result.stderr)
+                self.assertEqual(path.read_bytes(), content)
+                self.assertFalse((pre / f"{path.name}-unreadable").exists())
 
     def test_restore_still_stops_when_a_database_just_can_not_be_opened(self):
         # Not being able to open the file (permissions, a mount problem) says

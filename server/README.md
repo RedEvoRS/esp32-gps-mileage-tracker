@@ -1904,8 +1904,11 @@ history and does not verify every snapshot.
 file and database, and reports annotation/event counts and monitor state tables
 without changing live data. `backup/restore.sh restore` runs those checks,
 requires `RESTORE` confirmation (or `--yes`), stops ingest, viewer and any
-installed monitor, and saves current databases and replaced trip files under
-`pre-restore-<time>/` before restoring. Database writes use the owning service's
+installed monitor, and saves the databases and trip files it will replace in
+its own `pre-restore-<time>-<suffix>/` folder under `BACKUP_DIR`. Restore
+compares trip file contents, including when size and timestamp match. If a
+backup or restore is already running, wait for it to finish before retrying.
+Database writes use the owning service's
 throwaway container; an already running monitor is restarted afterward. On a
 replacement server, a saved monitor DB can populate its volume without enabling
 the monitor. Older snapshots still restore trips and annotations: missing new
