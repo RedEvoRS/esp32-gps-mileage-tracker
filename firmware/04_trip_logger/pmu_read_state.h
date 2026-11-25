@@ -96,11 +96,14 @@ inline bool aldo1Ready(int control, int voltage) {
     return (control & 1) && 500 + (voltage & 0x1F) * 100 == 3300;
 }
 
+inline bool aldo4VoltageReady(int voltage) {
+    // XPowersLib 0.3.3: 0x95 bits 0..4 select 500 mV + 100 mV/step.
+    return voltage >= 0 && 500 + (voltage & 0x1F) * 100 == 3300;
+}
+
 inline bool aldo4Ready(int control, int voltage) {
-    if (control < 0 || voltage < 0) return false;
-    // XPowersLib 0.3.3: 0x90 bit 3 enables ALDO4; 0x95 bits 0..4
-    // select 500 mV + 100 mV/step.
-    return (control & (1 << 3)) && 500 + (voltage & 0x1F) * 100 == 3300;
+    // LDO_ONOFF_CTRL0 (0x90) bit 3 enables ALDO4.
+    return control >= 0 && (control & (1 << 3)) && aldo4VoltageReady(voltage);
 }
 
 inline bool bldo1Off(int control) {

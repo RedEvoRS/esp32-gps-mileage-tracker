@@ -3608,11 +3608,14 @@ static void degradedLoop() {
 static bool configureGpsRail() {
     for (unsigned attempt = 0; attempt < PMU_PERIPHERAL_ATTEMPTS; ++attempt) {
         if (attempt) delay(PMU_PERIPHERAL_RETRY_MS);
-        bool voltageSet = PMU.setALDO4Voltage(3300);
-        bool enabled = voltageSet && PMU.enableALDO4();
+        PMU.setALDO4Voltage(3300);
+        // Verify the voltage before enabling, even when the write failed.
+        if (!pmu_read::aldo4VoltageReady(PMU.readRegister(XPOWERS_AXP2101_LDO_VOL3_CTRL)))
+            continue;
+        PMU.enableALDO4();
         const int control = PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
         const int voltage = PMU.readRegister(XPOWERS_AXP2101_LDO_VOL3_CTRL);
-        if (enabled && pmu_read::aldo4Ready(control, voltage)) return true;
+        if (pmu_read::aldo4Ready(control, voltage)) return true;
     }
     Serial.println("WARNING: GPS rail (ALDO4) 3.3 V/on setup unconfirmed after 3 attempts.");
     return false;
@@ -3621,11 +3624,11 @@ static bool configureGpsRail() {
 static bool configurePmuMeasurements() {
     for (unsigned attempt = 0; attempt < PMU_PERIPHERAL_ATTEMPTS; ++attempt) {
         if (attempt) delay(PMU_PERIPHERAL_RETRY_MS);
-        bool temperature = PMU.enableTemperatureMeasure();
-        bool vbus = PMU.enableVbusVoltageMeasure();
-        bool system = PMU.enableSystemVoltageMeasure();
+        PMU.enableTemperatureMeasure();
+        PMU.enableVbusVoltageMeasure();
+        PMU.enableSystemVoltageMeasure();
         const int adc = PMU.readRegister(XPOWERS_AXP2101_ADC_CHANNEL_CTRL);
-        if (temperature && vbus && system && pmu_read::pmuMeasurementsReady(adc)) return true;
+        if (pmu_read::pmuMeasurementsReady(adc)) return true;
     }
     Serial.println("WARNING: PMU temperature/VBUS/system voltage measurement setup unconfirmed after 3 attempts.");
     return false;

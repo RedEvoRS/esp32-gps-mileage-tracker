@@ -36,12 +36,31 @@ int main() {
     setup();
     PMU.onRegisterRead = nullptr;
     g_delayHook = nullptr;
-    assert(gpsAttempts.size() == 2 && gpsAttempts[1] - gpsAttempts[0] == 10);
+    assert(gpsAttempts.size() == 3 && gpsAttempts[1] - gpsAttempts[0] == PMU_PERIPHERAL_RETRY_MS);
+    assert(gpsAttempts[2] == gpsAttempts[1]);
     assert(adcAttempts.size() == 2 && adcAttempts[1] - adcAttempts[0] == 10);
     assert(calls("setALDO4Voltage") == 2 && calls("enableALDO4") == 1 && PMU.aldo4 && PMU.aldo4Mv == 3300);
     assert(calls("enableTemperatureMeasure") == 2 && calls("enableVbusVoltageMeasure") == 2 &&
            calls("enableSystemVoltageMeasure") == 2 && PMU.adcChannels == 0x1D);
     assert(codeRows(bootRows(), 2010).empty() && !logCount("setup unconfirmed after 3 attempts"));
+    ++cases;
+
+    // Redundant writes can fail while the requested settings are retained.
+    pmuWorld();
+    PMU.aldo4Mv = 3300;
+    PMU.failAldo4VoltageWrites = PMU_PERIPHERAL_ATTEMPTS;
+    setup();
+    assert(calls("setALDO4Voltage") == 1 && calls("enableALDO4") == 1);
+    assert(PMU.aldo4 && logCount("GPS rail (ALDO4) verified on at 3.3 V") == 1);
+    assert(codeRows(bootRows(), 2010).empty());
+    ++cases;
+
+    pmuWorld();
+    PMU.failPeripheralAdcWrites = true;
+    setup();
+    assert(calls("enableTemperatureMeasure") == 1 && calls("enableVbusVoltageMeasure") == 1 &&
+           calls("enableSystemVoltageMeasure") == 1 && PMU.adcChannels == 0x1D);
+    assert(!logCount("measurement setup unconfirmed") && codeRows(bootRows(), 2010).empty());
     ++cases;
 
     // Reject a cleared enable, wrong voltage, unreadable register, or any
@@ -70,6 +89,8 @@ int main() {
         PMU.onRegisterRead = nullptr;
         const bool adc = reg == XPOWERS_AXP2101_ADC_CHANNEL_CTRL;
         assert(calls("setALDO4Voltage") == (adc ? 1 : 3));
+        if (reg == XPOWERS_AXP2101_LDO_VOL3_CTRL)
+            assert(calls("enableALDO4") == 0 && !PMU.aldo4);
         assert(calls("enableTemperatureMeasure") == (adc ? 3 : 1));
         assert(logCount(adc ? "measurement setup unconfirmed after 3 attempts" :
                               "ALDO4) 3.3 V/on setup unconfirmed after 3 attempts") == 1);

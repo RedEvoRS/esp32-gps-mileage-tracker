@@ -645,6 +645,7 @@ struct XPowersAXP2101 {
     bool failRadioDisable = false, radioStuckOn = false;
     int aldo4Mv = 1800, bldo1Mv = 1800;
     unsigned failAldo4VoltageWrites = 0;
+    bool failPeripheralAdcWrites = false;
     uint8_t adcChannels = 0x1d; // existing non-TS ADC channels
     uint8_t tsControl = 0x10; // normal XPowersLib init: external TS, bias off
     bool batteryDetection = true;
@@ -725,7 +726,12 @@ struct XPowersAXP2101 {
     }
     uint8_t getChargeTargetVoltage() { operations.push_back("getChargeTargetVoltage"); return chgVol; }
     float dieC = 30.0f; bool chargeEnabled = true;   // tests set dieC
-    bool enableTemperatureMeasure() { operations.push_back("enableTemperatureMeasure"); adcChannels |= 0x10; return true; }
+    bool enableTemperatureMeasure() {
+        operations.push_back("enableTemperatureMeasure");
+        if (failPeripheralAdcWrites) return false;
+        adcChannels |= 0x10;
+        return true;
+    }
     float getTemperature(uint16_t* = nullptr) { operations.push_back("getTemperature"); return dieC; }
     void enableCellbatteryCharge() { operations.push_back("enableCellbatteryCharge"); if (!failChargeEnable) chargeEnabled = true; }
     void disableCellbatteryCharge() { operations.push_back("disableCellbatteryCharge"); if (!failChargeDisable) chargeEnabled = false; }
@@ -747,8 +753,18 @@ struct XPowersAXP2101 {
         adcChannels |= 0x01;
         return true;
     }
-    bool enableVbusVoltageMeasure() { operations.push_back("enableVbusVoltageMeasure"); adcChannels |= 0x04; return true; }
-    bool enableSystemVoltageMeasure() { operations.push_back("enableSystemVoltageMeasure"); adcChannels |= 0x08; return true; }
+    bool enableVbusVoltageMeasure() {
+        operations.push_back("enableVbusVoltageMeasure");
+        if (failPeripheralAdcWrites) return false;
+        adcChannels |= 0x04;
+        return true;
+    }
+    bool enableSystemVoltageMeasure() {
+        operations.push_back("enableSystemVoltageMeasure");
+        if (failPeripheralAdcWrites) return false;
+        adcChannels |= 0x08;
+        return true;
+    }
     uint32_t enabledIrqs = 0;
     bool disableIRQ(uint32_t) { operations.push_back("disableIRQ"); return true; }
     bool enableIRQ(uint32_t mask) {
