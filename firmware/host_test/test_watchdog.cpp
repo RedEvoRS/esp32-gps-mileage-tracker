@@ -12,6 +12,7 @@ static void watchdogWorld() {
     TwoWire::transaction = nullptr; TwoWire::request = nullptr;
     g_taskDelayHook = nullptr; g_semaphoreTakeHook = nullptr;
     gSdMounted = gFlashMounted = false;
+    gFlashTripsReady = false;
     gJournalReady = gJournalStarted = false;
     gJournalSealing = false;
     gJournalSealRequested = gJournalSealDone = gJournalSealOk = false;

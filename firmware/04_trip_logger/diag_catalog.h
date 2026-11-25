@@ -5,8 +5,8 @@
 #include <cstdint>
 
 namespace diagnostics {
-constexpr std::uint16_t kCatalogVersion = 7;
-constexpr char kCatalogDigest[] = "c53e213710d8854284be41a623ebe9f460c492f39ccfb7e910d48969add2921a";
+constexpr std::uint16_t kCatalogVersion = 8;
+constexpr char kCatalogDigest[] = "d5ea0151204a7145a4d452828c817a6269b616c504989cb388564e29726b7201";
 enum class Severity : std::uint8_t { Info, Warning, Error, Critical };
 enum class Journal : std::uint8_t { PerOccurrence, Transitions, Counter };
 enum class Code : std::uint16_t {
@@ -27,6 +27,7 @@ enum class Code : std::uint16_t {
     PMU_STARTUP_RECOVERY = 2007,
     CHARGE_CONTROL_FAILED = 2008,
     BATTERY_POWER_OFF = 2009,
+    PMU_PERIPHERAL_SETUP_FAILED = 2010,
     GPS_NO_DATA = 3001,
     GPS_NO_FIX = 3002,
     GPS_CONFIG_NACK = 3003,
@@ -88,6 +89,7 @@ constexpr CatalogEntry kCatalog[] = {
     {Code::PMU_STARTUP_RECOVERY, "PMU_STARTUP_RECOVERY", Severity::Warning, {"PMU startup recovery", "", ""}, 1, "PMU startup needed recovery or retries", false, Journal::PerOccurrence},
     {Code::CHARGE_CONTROL_FAILED, "CHARGE_CONTROL_FAILED", Severity::Error, {"Charge control fail", "", ""}, 1, "Charger command could not be confirmed", true, Journal::Transitions},
     {Code::BATTERY_POWER_OFF, "BATTERY_POWER_OFF", Severity::Info, {"Battery at power-off", "", ""}, 1, "Battery sampled before power-off", false, Journal::PerOccurrence},
+    {Code::PMU_PERIPHERAL_SETUP_FAILED, "PMU_PERIPHERAL_SETUP_FAILED", Severity::Warning, {"PMU setup unverified", "", ""}, 1, "GPS power or PMU measurements unverified", true, Journal::Transitions},
     {Code::GPS_NO_DATA, "GPS_NO_DATA", Severity::Error, {"GPS data missing", "", ""}, 1, "No GPS serial data", true, Journal::Transitions},
     {Code::GPS_NO_FIX, "GPS_NO_FIX", Severity::Warning, {"Waiting for GPS fix", "", ""}, 1, "GPS has no position fix", false, Journal::Transitions},
     {Code::GPS_CONFIG_NACK, "GPS_CONFIG_NACK", Severity::Warning, {"GPS config rejected", "", ""}, 1, "GPS rejected configuration", true, Journal::PerOccurrence},

@@ -337,6 +337,7 @@ exists, not that every occurrence is guaranteed durable or already road-tested.
 | E2007 | `PMU_STARTUP_RECOVERY` | warning | `per_occurrence` | Yes |
 | E2008 | `CHARGE_CONTROL_FAILED` | error | `transitions` | Yes |
 | E2009 | `BATTERY_POWER_OFF` | info | `per_occurrence` | Yes |
+| E2010 | `PMU_PERIPHERAL_SETUP_FAILED` | warning | `transitions` | Yes |
 | E3001 | `GPS_NO_DATA` | error | `transitions` | Yes |
 | E3002 | `GPS_NO_FIX` | warning | `transitions` | Yes |
 | E3003 | `GPS_CONFIG_NACK` | warning | `per_occurrence` | Yes |
@@ -675,6 +676,11 @@ A server with an older catalog rejects the `reason` context on E4011.
 Rejected batches can enter the firmware's bounded isolation path,
 so affected records may be lost. The upgrade requires no database
 migration or new service dependency.
+
+Catalog v8 adds **2010 PMU_PERIPHERAL_SETUP_FAILED**, a warning when the
+GPS rail or PMU measurement settings cannot be verified at startup. Deploy
+server **v1.25** before firmware **v1.10** so ingest, viewer and monitor
+recognize E2010. Protocol/schema v1 is unchanged.
 
 ### Protocol v1 (#117 contract, #118 and #125 integration)
 
@@ -1426,6 +1432,7 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E2005 | Plausible die requires a cold pause (die <=9 C); keeps requesting it below 14 C | Plausible die >=14 C or another measured pause reason; describes required pause even if control is unconfirmed | `temperature_mc` = measured PMU die |
 | E2006 | Non-finite or implausible die sample; first ten seconds of first-reading retries are silent | Plausible sample; hot/cold conditions are not cleared by an unreadable sample | none |
 | E2008 | Three consecutive runtime charger command/read-back failures (30 s apart), startup charger disable still unconfirmed after its 5 s bounded retry window, or an unconfirmed 4.1 V charge target (blocking charging) | Checked 0x64 4.1 V target and 0x18 bit 1 read match the intended charger state (once startup charger disable is confirmed) | none |
+| E2010 | Startup cannot confirm the GPS rail is on at 3.3 V or that temperature, USB voltage and system voltage measurements are enabled after three attempts for the affected settings | A later startup verifies the GPS rail and all three measurement enables | none |
 | E3001 | No checksum-valid NMEA for 10 s, starting at GPS configuration start | Next checksum-valid NMEA; noise/UBX/bad checksum do not recover it | `elapsed_ms` |
 | E3002 | No trusted fix (one meeting the NAV-PVT start accuracy limits, or any valid fix in RMC-only fallback) for 120 s while idle | Trusted fix; acquisition grace starts again after leaving a trip | `elapsed_ms`, `satellites` when measured |
 | E3003 | Matching checksum-checked VALSET NAK | One notice per rejected attempt, no active condition | `message_class=6`, `message_id=138` |
@@ -1436,7 +1443,7 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E3008 | Readable RTC has STOP/VL, invalid BCD/calendar, unsupported year, or a later read/write/verification failure | Verified RTC setting from GPS/SNTP clears the condition; normal transition/repeat policy | `reason=stopped\|invalid_date\|out_of_range\|read_failed` on failure |
 | E3009 | At 30 s MON-RF boundaries, valid AGC >=70% and fresh GSV (a complete group within 15 s) with zero satellites >=30 dBHz, continuously for >=120 s from the first suspect sample | One valid AGC <=50% sample **or** fresh GSV with at least one satellite >=30 dBHz; missing/stale/intermediate evidence resets the hold and retains an active warning | `agc_pct` (0-100) when MON-RF valid; `max_cno` (0-99) when GSV fresh |
 | E4001 | SD did not mount, the selected SD trip store returns zero total capacity at runtime (failed filesystem query), or two trip pieces in a row fail to write on SD (create, write, sync or close) | Successful SD mount on a later boot; runtime failure stays latched until reboot. After write failures, new trips record on flash while readable trips already queued on the card still upload, so an E4001 can appear next to a successful SD upload | none |
-| E4002 | LittleFS unavailable during no-storage degraded startup | RAM-only raise/repeat; retained as failed until restart discards the queue | none |
+| E4002 | LittleFS unavailable for trips during no-storage degraded startup | Remains active until restart. When LittleFS mounts but its trip directory is unusable, it can still retain journal events | none |
 | E4003 | Neither trip store is usable at startup (including a boot SD capacity failure with flash unavailable), or the selected trip store becomes unavailable at runtime with no fallback | Only a normal boot with an available trip store (or switching to an available fallback store) observes healthy; successful degraded retry restarts without clearing | none |
 | E4004 | Available selected trip store has guarded free space <64 KiB start reserve | >=64 KiB on the selected store, or condition no longer applies because that store is unavailable | `backend`, `free_bytes` only when available |
 | E4005 | Available selected trip store has guarded free space <24 KiB stop reserve | >=24 KiB on the selected store, or condition no longer applies because that store is unavailable | `backend`, `free_bytes` only when available |
@@ -1625,13 +1632,14 @@ unchanged; degraded probes explicitly disable that provisioning.
 - **No usable trip storage (D), PMU healthy:** power/charge service remains
   active: IRQ/VBUS confirmation, power key, low-battery level-2 shutdown,
   temperature guard and the ten-minute battery idle power-off. GPS rail setup
-  remains as at boot, but GPS UART and processing never start. The journal has
-  no backends: BOOT, E4001/E4002 backend failures and E4003
-  `NO_RECORDING_STORAGE` use the bounded RAM queue. They cannot be uploaded
-  during this boot and are lost on restart or power-off. Storage retries use
+  remains as at boot, but GPS UART and processing never start. BOOT,
+  E4001/E4002 backend failures and E4003 `NO_RECORDING_STORAGE` go to the
+  journal. LittleFS can retain them if it mounts with an unusable trip
+  directory. Without a journal backend the bounded RAM queue loses them
+  on restart or power-off. Storage retries use
   the existing BLDO1-off / 3.3 V / enable ordering for SD and never format.
-  A successful mount is unmounted before restart. Shutdown safely handles no
-  trip, no network task and no mounted media: the loop services the bounded
+  A newly mounted store is unmounted after the probe. Shutdown safely handles
+  degraded startup: the loop services the bounded
   journal seal itself, reports undurable RAM if necessary, then holds FS_LOCK
   through the final VBUS check and PMU shutdown. A returning/failed shutdown
   restores degraded service without claiming recording or remounting an absent

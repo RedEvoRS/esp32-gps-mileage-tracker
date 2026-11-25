@@ -16,6 +16,7 @@ static void world() {
     PMU = XPowersAXP2101(); Wire = TwoWire(); Wire1 = TwoWire();
     g_pinModes.clear(); g_pinLevels.clear(); g_partition = PartitionStub();
     gSdMounted = gFlashMounted = g_disk.mounted = false;
+    gFlashTripsReady = false;
     g_taskCreates = g_restarts = g_lockDepth = 0; gFsDemand = 0;
     g_failMutexCreate = false; gFsMutex = nullptr;
     gNetHold = gNetBusy = gNetAbort = false;

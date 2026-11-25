@@ -30,6 +30,7 @@ PUBLISHED_CATALOGS = {
     5: "061911d5a8a96724f2ef5aa9dd9938cc7419812145eadc9bf293d089434cca5c",
     6: "5f442ea44577763d8852e48e185a25564e98ae1b3a578ab5292fc1296874b4f0",
     7: "c53e213710d8854284be41a623ebe9f460c492f39ccfb7e910d48969add2921a",
+    8: "d5ea0151204a7145a4d452828c817a6269b616c504989cb388564e29726b7201",
 }
 
 
@@ -55,7 +56,7 @@ class CatalogTests(unittest.TestCase):
 
     def test_catalog_unique_codes_and_symbols(self):
         rows = self.catalog["codes"]
-        self.assertEqual(len(rows), 49)
+        self.assertEqual(len(rows), 50)
         self.assertEqual(len({r["code"] for r in rows}), len(rows))
         self.assertEqual(len({r["symbol"] for r in rows}), len(rows))
 
@@ -122,7 +123,6 @@ class CatalogTests(unittest.TestCase):
 
     def test_charge_control_failure_and_pause_wording(self):
         rows = {row["code"]: row for row in self.catalog["codes"]}
-        self.assertEqual(self.catalog["catalog_version"], 7)
         self.assertEqual(rows[2008]["symbol"], "CHARGE_CONTROL_FAILED")
         self.assertEqual(rows[2008]["severity"], "error")
         self.assertTrue(rows[2008]["notify"])

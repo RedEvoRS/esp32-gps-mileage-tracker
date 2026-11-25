@@ -267,6 +267,7 @@ fs::FS*           gTripFS = &LittleFS;
 // Mount membership stays fixed for shutdown. Core 1 selects the mounted flash
 // queue only between recordings. Capacity loss also disables SD reads.
 bool              gSdMounted = false, gFlashMounted = false;
+bool              gFlashTripsReady = false; // LittleFS can still hold the journal
 static bool gSdFatChecked = false;
 static diagnostics::SdFatCheck gSdFatCheck = diagnostics::SdFatCheck::Passed;
 static std::atomic<bool> gSdUnavailable{false};
@@ -380,6 +381,7 @@ static bool gJournalBootReported = false;
 // Single writer per array/builder. Only EventLog's try-lock crosses cores.
 static diagnostics::RuntimeFaults::Condition gLoopConditions[] = {
     {diagnostics::Code::PMU_INIT_FAILED},
+    {diagnostics::Code::PMU_PERIPHERAL_SETUP_FAILED},
     {diagnostics::Code::BATTERY_LOW},
     {diagnostics::Code::BATTERY_CRITICAL},
     {diagnostics::Code::CHARGE_HOT},
@@ -591,7 +593,7 @@ static const char* tripBackend(fs::FS& storage) { return &storage == &SD ? "sd" 
 static const char* tripMount(fs::FS& storage) { return &storage == &SD ? "/sd" : "/littlefs"; }
 
 static bool tripStoreAvailable(fs::FS& storage) {
-    return &storage == &SD ? gSdMounted && !gSdUnavailable.load() : gFlashMounted;
+    return &storage == &SD ? gSdMounted && !gSdUnavailable.load() : gFlashMounted && gFlashTripsReady;
 }
 
 static bool sdRecordingUnavailable() {
@@ -1020,7 +1022,7 @@ static uint64_t storageFreeBytes(fs::FS& storage) {
 static uint64_t fsFreeBytes() {
     FS_LOCK();
     uint64_t free = tripRecordingAvailable(*gTripFS) ? storageFreeBytes(*gTripFS) : 0;
-    if (gTripFS == &SD && sdRecordingUnavailable() && !gTripPath[0] && gFlashMounted) {
+    if (gTripFS == &SD && sdRecordingUnavailable() && !gTripPath[0] && tripStoreAvailable(LittleFS)) {
         gTripFS = &LittleFS;
         free = storageFreeBytes(LittleFS);
         Serial.println("SD unavailable -- new trips use the internal flash queue until reboot.");
@@ -2585,12 +2587,13 @@ static bool uploadPending() {
     // filesystem identity, and only the recording store has an active file.
     bool uploaded = false;
     if (gSdMounted && !gSdUnavailable.load()) uploaded = uploadPending(SD);
-    if (gFlashMounted) uploaded = uploadPending(LittleFS) || uploaded;
+    if (tripStoreAvailable(LittleFS)) uploaded = uploadPending(LittleFS) || uploaded;
     return uploaded;
 }
 
 static bool hasPending() {
-    return (gSdMounted && !gSdUnavailable.load() && hasPending(SD)) || (gFlashMounted && hasPending(LittleFS));
+    return (tripStoreAvailable(SD) && hasPending(SD)) ||
+           (tripStoreAvailable(LittleFS) && hasPending(LittleFS));
 }
 
 #include "diag_worker.h"
@@ -2629,7 +2632,7 @@ static unsigned debugPendingCount(fs::FS& storage) {
 static void refreshDebugPending() {
     unsigned count = 0;
     if (gSdMounted && !gSdUnavailable.load()) count += debugPendingCount(SD);
-    if (gFlashMounted) count += debugPendingCount(LittleFS);
+    if (tripStoreAvailable(LittleFS)) count += debugPendingCount(LittleFS);
     if (!debugMode() || gNetHold.load() || gNetAbort.load()) return; // partial count is unknown
     portENTER_CRITICAL(&gDebugNetMux);
     gDebugNet.pending = (int)count;
@@ -3086,6 +3089,14 @@ static bool mountFlashStorage(bool allowProvision = true) {
     return false;
 }
 
+static bool prepareTripDirectory(fs::FS& storage) {
+    if (!storage.exists(TRIP_DIR) && !storage.mkdir(TRIP_DIR)) return false;
+    File dir = storage.open(TRIP_DIR);
+    bool ready = dir && dir.isDirectory();
+    dir.close();
+    return ready;
+}
+
 static bool mountSdStorage() {
     if (gStartupWatchdog.skipCard()) return false;
     // Also used for cancelled/failed shutdown recovery, under FS_LOCK and
@@ -3101,7 +3112,8 @@ static bool mountSdStorage() {
     digitalWrite(SD_CS, HIGH);
     delay(SD_SETTLE_MS);
     bool busReady = gSdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-    if (busReady && SD.begin(SD_CS, gSdSpi, SD_SPI_HZ, "/sd", 10, false) && SD.cardType() != CARD_NONE) {
+    const bool mounted = busReady && SD.begin(SD_CS, gSdSpi, SD_SPI_HZ, "/sd", 10, false);
+    if (mounted && SD.cardType() != CARD_NONE) {
         gSdFatCheck = diagnostics::checkSdFat(
             SD, []() -> uint32_t { return millis(); }, SD_FAT_CHECK_BUDGET_MS);
         gSdFatChecked = true;
@@ -3110,12 +3122,7 @@ static bool mountSdStorage() {
                           "Check it on a PC and copy any needed files before reformatting as FAT32. "
                           "The tracker never formats it.\n", diagnostics::sdFatReason(gSdFatCheck));
         } else {
-            if (SD.exists(TRIP_DIR) || SD.mkdir(TRIP_DIR)) {
-                File dir = SD.open(TRIP_DIR);
-                bool ready = dir && dir.isDirectory();
-                dir.close();
-                if (ready) return true;
-            }
+            if (prepareTripDirectory(SD)) return true;
             Serial.println("WARNING: microSD trip directory unavailable; card preserved.");
         }
     } else {
@@ -3125,6 +3132,7 @@ static bool mountSdStorage() {
     }
     SD.end();
     gSdSpi.end();
+    if (mounted) vTaskDelay(pdMS_TO_TICKS(SD_POWER_OFF_SETTLE_MS));
     PMU.disableBLDO1();
     return false;
 }
@@ -3147,20 +3155,19 @@ static bool mountTripStorage(bool allowProvision = true, bool reportFreeSpace = 
     // for recovery; degraded service handles both stores being unavailable.
     startupStage(startup_watchdog::Stage::FlashMount);
     gFlashMounted = mountFlashStorage(allowProvision);
-    if (gFlashMounted && !LittleFS.exists(TRIP_DIR)) {
-        gFlashMounted = LittleFS.mkdir(TRIP_DIR);
-        if (!gFlashMounted) LittleFS.end();
-    }
+    gFlashTripsReady = gFlashMounted && prepareTripDirectory(LittleFS);
+    if (gFlashMounted && !gFlashTripsReady)
+        Serial.println("WARNING: internal flash trip directory unavailable; keeping LittleFS mounted for diagnostics.");
     gTripFS = gSdMounted ? static_cast<fs::FS*>(&SD) : static_cast<fs::FS*>(&LittleFS);
     // Degraded retry also checks SD capacity when SD is the only mounted store,
     // so a card that mounts but fails its capacity query cannot restart-loop
     // every 60 s instead of backing off.
     if (!reportFreeSpace) {
-        if (gSdMounted && !gFlashMounted) {
+        if (gSdMounted && !gFlashTripsReady) {
             startupStage(startup_watchdog::Stage::CardSpace);
             (void)storageFreeBytes(SD);
         }
-        return tripStoreAvailable(SD) || gFlashMounted;
+        return tripStoreAvailable(SD) || gFlashTripsReady;
     }
     uint64_t selectedFree = 0;
     if (gSdMounted) {
@@ -3170,8 +3177,8 @@ static bool mountTripStorage(bool allowProvision = true, bool reportFreeSpace = 
             selectedFree = sdFree;
             Serial.printf("Trip storage: microSD (%.2f GiB free); internal flash queue %s.\n",
                           sdFree / (1024.0 * 1024 * 1024),
-                          gFlashMounted ? "mounted" : "unavailable -- preserved for recovery");
-        } else if (gFlashMounted) {
+                          gFlashTripsReady ? "ready" : "unavailable -- preserved for recovery");
+        } else if (gFlashTripsReady) {
             gTripFS = &LittleFS;
             startupStage(startup_watchdog::Stage::FlashSpace);
             selectedFree = storageFreeBytes(LittleFS);
@@ -3180,7 +3187,7 @@ static bool mountTripStorage(bool allowProvision = true, bool reportFreeSpace = 
         } else {
             Serial.println("ERROR: no usable trip storage; trips cannot be recorded.");
         }
-    } else if (gFlashMounted) {
+    } else if (gFlashTripsReady) {
         startupStage(startup_watchdog::Stage::FlashSpace);
         selectedFree = storageFreeBytes(LittleFS);
         Serial.printf("WARNING: microSD unavailable -- using internal flash (%.2f MiB free).\n",
@@ -3189,7 +3196,7 @@ static bool mountTripStorage(bool allowProvision = true, bool reportFreeSpace = 
         Serial.println("ERROR: no usable trip storage; trips cannot be recorded.");
     }
     if (freeBytesOut) *freeBytesOut = selectedFree;
-    return tripStoreAvailable(SD) || gFlashMounted;
+    return tripStoreAvailable(SD) || gFlashTripsReady;
 }
 
 static int debugSatellitesUsed() {
@@ -3463,7 +3470,7 @@ static void enterDegraded(startup::Mode mode) {
     // PMU or storage failed. No display service runs in the degraded loop.
     productionDisplayPowerSave(true);
     if (mode == startup::Mode::NoStorage) {
-        // No mounted store: boot and faults stay in the bounded RAM queue.
+        // Keep mounted LittleFS for the journal even if it cannot record trips.
         beginJournal();
         gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, millis()).condition(true);
         gLoopFaults.event(diagnostics::Code::LITTLEFS_UNAVAILABLE, millis()).condition(true);
@@ -3535,6 +3542,8 @@ static void degradedLoop() {
                 gSdMounted = false;
                 vTaskDelay(pdMS_TO_TICKS(SD_POWER_OFF_SETTLE_MS));
             }
+            // Keep an existing diagnostic mount across the trip-store probe.
+            const bool keepFlashMounted = gFlashMounted;
             // No format, fsck, trip activity or journal migration on this probe.
             recovered = mountTripStorage(false, false);
             if (gSdMounted) {
@@ -3542,8 +3551,11 @@ static void degradedLoop() {
                 SD.end();
                 gSdSpi.end();
             }
-            if (gFlashMounted) LittleFS.end();
-            gSdMounted = gFlashMounted = false;
+            if (gFlashMounted && !keepFlashMounted) {
+                LittleFS.end();
+                gFlashMounted = false;
+            }
+            gSdMounted = gFlashTripsReady = false;
             gStartupWatchdog.stage(startup_watchdog::Stage::None);
             saveStartupWatchdog();
             if (gLoopWatchdogArmed) armLoopWatchdog(LOOP_WDT_TIMEOUT_MS, false);
@@ -3565,6 +3577,36 @@ static void degradedLoop() {
                       startup::modeText(mode), (unsigned long)(gDegraded.waitMs() / 1000));
     }
     delay(20); // yield even without UART, display or network activity
+}
+
+static bool configureGpsRail() {
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        bool voltageSet = PMU.setALDO4Voltage(3300);
+        bool enabled = voltageSet && PMU.enableALDO4();
+        const int control = PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
+        const int voltage = PMU.readRegister(XPOWERS_AXP2101_LDO_VOL3_CTRL);
+        // XPowersLib 0.3.3: 0x90 bit 3 enables ALDO4; 0x95 encodes
+        // 500 mV + 100 mV per step. Raw reads preserve the I2C error sentinel.
+        if (enabled && control >= 0 && (control & (1 << 3)) &&
+            voltage >= 0 && 500 + (voltage & 0x1F) * 100 == 3300) return true;
+    }
+    Serial.println("WARNING: GPS rail (ALDO4) 3.3 V/on setup unconfirmed after 3 attempts.");
+    return false;
+}
+
+static bool configurePmuMeasurements() {
+    // XPowersLib 0.3.3: ADC channel control (0x30) bits 4, 3 and 2
+    // enable die temperature, system voltage and VBUS voltage respectively.
+    constexpr int channels = 0x1C;
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        bool temperature = PMU.enableTemperatureMeasure();
+        bool vbus = PMU.enableVbusVoltageMeasure();
+        bool system = PMU.enableSystemVoltageMeasure();
+        const int adc = PMU.readRegister(XPOWERS_AXP2101_ADC_CHANNEL_CTRL);
+        if (temperature && vbus && system && adc >= 0 && (adc & channels) == channels) return true;
+    }
+    Serial.println("WARNING: PMU temperature/VBUS/system voltage measurement setup unconfirmed after 3 attempts.");
+    return false;
 }
 
 void setup() {
@@ -3682,8 +3724,7 @@ void setup() {
     // --- Supreme GPS: ALDO4 at 3.3 V, GPS_EN HIGH as in LilyGO's setup ---
     pinMode(GPS_EN_PIN, OUTPUT);
     digitalWrite(GPS_EN_PIN, HIGH);
-    PMU.setALDO4Voltage(3300);
-    PMU.enableALDO4();
+    const bool gpsRailReady = configureGpsRail();
     // Full-charge voltage 4.1 V instead of the 4.2 V default: ~10% less
     // capacity, much less stress on a cell that lives in a hot car (the
     // charge temperature guard, below, covers charging when it's too hot).
@@ -3695,15 +3736,15 @@ void setup() {
     // can halt or crash before that check runs.
     // Enable the measurements the battery/VBUS predicates and the charge
     // temperature guard rely on.
-    PMU.enableTemperatureMeasure();
-    PMU.enableVbusVoltageMeasure();
-    PMU.enableSystemVoltageMeasure();
+    const bool measurementsReady = configurePmuMeasurements();
+    const bool pmuPeripheralWarning = !gpsRailReady || !measurementsReady;
     setupPmuIrq();
     // Seed VBUS state from hardware: a battery-only boot (e.g. wake via
     // power key away from the car) must still hit the idle power-off timer.
     seedVbusState();
     gIdleSince = millis();
-    Serial.printf("PMU ready, MAX-M10S GPS rail (ALDO4) on at 3.3 V, charge to %s. VBUS %s.\n",
+    Serial.printf("PMU ready, MAX-M10S GPS rail (ALDO4) %s, charge to %s. VBUS %s.\n",
+                  gpsRailReady ? "verified on at 3.3 V" : "unconfirmed",
                   gChargeTargetVerified ? "4.1 V" : "NOT 4.1 V",
                   gVbusRetry == VbusRetry::Seed ? "unknown (assuming USB present)" :
                   gVbusLost ? "absent (on battery)" : "present");
@@ -3716,6 +3757,8 @@ void setup() {
     uint64_t bootFreeBytes = 0;
     if (!mountTripStorage(true, true, &bootFreeBytes)) {
         enterDegraded(startup::Mode::NoStorage);
+        if (gJournalReady)
+            gLoopFaults.event(diagnostics::Code::PMU_PERIPHERAL_SETUP_FAILED, millis()).condition(pmuPeripheralWarning);
         return;
     }
     startupStage(startup_watchdog::Stage::Services);
@@ -3731,10 +3774,11 @@ void setup() {
         // Explicit healthy observations resolve prior degraded-boot alerts.
         // Reuse mountTripStorage()'s single authoritative startup capacity result.
         gLoopFaults.event(diagnostics::Code::PMU_INIT_FAILED, millis()).condition(false);
+        gLoopFaults.event(diagnostics::Code::PMU_PERIPHERAL_SETUP_FAILED, millis()).condition(pmuPeripheralWarning);
         storageConditions(bootFreeBytes, millis());
     }
     if (tripStoreAvailable(SD)) { startupStage(startup_watchdog::Stage::CardRepair); fsckAllTrips(SD); }
-    if (gFlashMounted) { startupStage(startup_watchdog::Stage::FlashRepair); fsckAllTrips(LittleFS); }
+    if (tripStoreAvailable(LittleFS)) { startupStage(startup_watchdog::Stage::FlashRepair); fsckAllTrips(LittleFS); }
     startupStage(startup_watchdog::Stage::Services);
 
     // Start a bounded readiness wait; loop() receives NMEA and configures

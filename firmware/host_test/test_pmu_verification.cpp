@@ -19,6 +19,45 @@ static unsigned calls(const char* operation) {
 static void chargeTick() { g_millis += CHG_CHECK_MS; serviceChargeTemp(); }
 
 int main() {
+    auto bootRows = []() { FS_LOCK(); auto rows = take(); FS_UNLOCK(); return rows; };
+    // A failed voltage write and a failed ADC read recover on the next attempt.
+    pmuWorld();
+    PMU.failAldo4VoltageWrites = 1;
+    PMU.adcChannels = 0x01;
+    failRead(XPOWERS_AXP2101_ADC_CHANNEL_CTRL);
+    setup();
+    assert(calls("setALDO4Voltage") == 2 && calls("enableALDO4") == 1 && PMU.aldo4 && PMU.aldo4Mv == 3300);
+    assert(calls("enableTemperatureMeasure") == 2 && calls("enableVbusVoltageMeasure") == 2 &&
+           calls("enableSystemVoltageMeasure") == 2 && PMU.adcChannels == 0x1D);
+    assert(codeRows(bootRows(), 2010).empty() && !logCount("setup unconfirmed after 3 attempts"));
+    ++cases;
+
+    // Reject a cleared enable, wrong voltage, unreadable register, or any
+    // single missing ADC bit, even when the methods claim the writes succeeded.
+    for (auto [reg, value] : std::initializer_list<std::pair<uint8_t, int>>{
+            {XPOWERS_AXP2101_LDO_ONOFF_CTRL0, 0x01},
+            {XPOWERS_AXP2101_LDO_VOL3_CTRL, 27},
+            {XPOWERS_AXP2101_LDO_VOL3_CTRL, -1},
+            {XPOWERS_AXP2101_ADC_CHANNEL_CTRL, 0x0D},
+            {XPOWERS_AXP2101_ADC_CHANNEL_CTRL, 0x15},
+            {XPOWERS_AXP2101_ADC_CHANNEL_CTRL, 0x19},
+            {XPOWERS_AXP2101_ADC_CHANNEL_CTRL, -1}}) {
+        pmuWorld();
+        PMU.registerReadOverride[reg] = value;
+        setup();
+        const bool adc = reg == XPOWERS_AXP2101_ADC_CHANNEL_CTRL;
+        assert(calls("setALDO4Voltage") == (adc ? 1 : 3));
+        assert(calls("enableTemperatureMeasure") == (adc ? 3 : 1));
+        assert(logCount(adc ? "measurement setup unconfirmed after 3 attempts" :
+                              "ALDO4) 3.3 V/on setup unconfirmed after 3 attempts") == 1);
+        assert(gDegraded.mode() == startup::Mode::Normal && tripStoreAvailable(SD));
+        auto rows = bootRows();
+        auto warning = codeRows(rows, 2010);
+        assert(warning.size() == 1 && codeRows(rows, 2001).empty());
+        has(warning[0], "\"transition\":\"raise\"");
+        ++cases;
+    }
+
     for (float value : {NAN, INFINITY, -INFINITY, -40.01f, 125.01f, 385.7f})
         assert(!charge_temperature::plausible(value));
     for (float value : {-40.0f, 30.0f, 60.0f, 125.0f})
@@ -27,7 +66,6 @@ int main() {
     // conversion never becomes a hot/cold observation or a debug measurement.
     for (bool degraded : {false, true}) {
         pmuWorld(); PMU.dieC = 385.7f;
-        auto bootRows = []() { FS_LOCK(); auto rows = take(); FS_UNLOCK(); return rows; };
         if (degraded) enterDegraded(startup::Mode::NoStorage);
         else setup();
         assert(!PMU.chargeEnabled && gChargeState == ChargeState::Paused);

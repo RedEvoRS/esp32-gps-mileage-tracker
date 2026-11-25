@@ -119,6 +119,7 @@ static void resetWorld() {
     g_sdDisk = FakeDisk(); g_sdDisk.mounted = false; g_sdDisk.renameOverwrites = false;
     SD.dirs.clear(); SD.cardPresent = false; SD.begins = SD.ends = 0;
     gTripFS = &LittleFS; gSdMounted = false; gFlashMounted = true;
+    gFlashTripsReady = true;
     gSdUnavailable = false; gSdWriteFailures = 0;
     gSdUploadOffset = gFlashUploadOffset = 0;
     gTripUploadFileClosed = true;

@@ -428,9 +428,10 @@ a card. Stage 4 has since recorded two real drives on the card.
   startup with no storage, confirmed USB absence still starts the 10-minute
   timer; untrusted PMU startup does not run this power-off path.
   During shutdown the tracker leaves a mounted card powered for 500 ms after
-  unmounting it. At startup it deselects the card and waits the same amount
-  before cutting card power if the card may still be finishing a write after
-  a reset.
+  unmounting it. The same wait applies when a mounted card fails the
+  filesystem or trip-directory check. At startup the tracker also deselects
+  the card and waits before cutting power if the card may still be finishing
+  a write after a reset.
 - **The firmware never formats the card.** After mounting, the tracker
   reads key FAT32 structures before it creates directories or writes files.
   Within a fixed read and time budget, it checks the file allocation table
@@ -1646,8 +1647,8 @@ Illustrative; free space, attempt count and timing vary:
 === Stage 4: Trip Logger ===
 LoRa rail (ALDO3) verified off; SD rail (BLDO1) off; VBACKUP off.
 PMU power-on source 0x04, power-off source 0x02.
-PMU ready, MAX-M10S GPS rail (ALDO4) on at 3.3 V, charge to 4.1 V. VBUS present.
-Trip storage: microSD (29.72 GiB free); internal flash queue mounted.
+PMU ready, MAX-M10S GPS rail (ALDO4) verified on at 3.3 V, charge to 4.1 V. VBUS present.
+Trip storage: microSD (29.72 GiB free); internal flash queue ready.
 GPS: waiting for checksum-valid NMEA (up to 3 s).
 Setup complete. Logging trips.
 GPS ready: checksum-valid NMEA received.

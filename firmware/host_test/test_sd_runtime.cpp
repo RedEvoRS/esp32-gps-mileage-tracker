@@ -6,7 +6,8 @@
 using namespace diagnostics;
 static EventLog::Batch sdRuntimeBatch;
 
-static void sdWorld(bool flash = true, bool corruptFat = false) {
+static void sdWorld(bool flash = true, bool corruptFat = false, bool flashTripsFile = false,
+                    bool cardPresent = true) {
     resetWorld();
     gSdUnavailable = false;
     SD.capacityQueries = 0;
@@ -20,12 +21,16 @@ static void sdWorld(bool flash = true, bool corruptFat = false) {
     gEventRetry = {}; gEventRevisionBlocked = gHaveEventSnapshot = false;
     gEnrollmentChecked = false;
     gContactTick = 0; gContactUptime = gLastContact = 0; gContactKnown = false;
-    g_millis = 1000; SD.cardPresent = true;
+    g_millis = 1000; SD.cardPresent = cardPresent;
     g_disk.failMount = !flash;
+    if (flashTripsFile) {
+        LittleFS.dirs.erase(TRIP_DIR);
+        g_disk.files[TRIP_DIR] = "preserved flash file";
+    }
     SD.corruptFat = corruptFat;
     setup();
-    assert(gFlashMounted == flash && gSdMounted == !corruptFat);
-    assert(gTripFS == (corruptFat ? static_cast<fs::FS*>(&LittleFS) : static_cast<fs::FS*>(&SD)));
+    assert(gFlashMounted == flash && gSdMounted == (cardPresent && !corruptFat));
+    assert(gTripFS == (gSdMounted ? static_cast<fs::FS*>(&SD) : static_cast<fs::FS*>(&LittleFS)));
     serviceJournal();
 }
 
@@ -53,6 +58,27 @@ static void checkStorage() {
 }
 
 int main() {
+    // A successful begin requires a powered settle after end, even when
+    // rejecting FAT or a directory the card reports missing after mkdir.
+    for (int scenario = 0; scenario < 3; ++scenario) {
+        resetWorld();
+        SD.cardPresent = scenario != 0;
+        SD.corruptFat = scenario == 1;
+        if (scenario == 2) g_sdDisk.failOpenPath = TRIP_DIR;
+        g_delayHook = [](uint32_t ms) { g_millis += ms; };
+        g_taskDelayHook = [](uint32_t ms) {
+            assert(ms == SD_POWER_OFF_SETTLE_MS);
+            assert(SD.ends == 1 && !g_sdDisk.mounted && PMU.bldo1);
+        };
+        const uint32_t startedAt = millis();
+        assert(!mountSdStorage());
+        assert(SD.ends == 1 && !PMU.bldo1);
+        assert(SD.endedAtMs == startedAt + SD_SETTLE_MS);
+        assert(PMU.bldo1OffMs - SD.endedAtMs == (scenario == 0 ? 0 : SD_POWER_OFF_SETTLE_MS));
+        assert(g_sdDisk.mkdirCalls == (scenario == 2 ? 1 : 0));
+    }
+    std::puts("SD runtime: mounted FAT and directory rejections settle 500 ms; never-mounted cut stays immediate");
+
     sdWorld(true, true);
     for (unsigned i = 0; i < kEventQueueSize && gJournal.stats().queued; ++i) serviceJournal();
     assert(!gJournal.stats().queued);
@@ -171,6 +197,41 @@ int main() {
     auto flashRows = events();
     noSpaceFaults(flashRows); assert(codeRows(flashRows, 4003).empty());
     std::puts("SD runtime: active SD trip kept on SD, E4006 finalization, next trip on flash, no E4003 passed");
+
+    sdWorld(true, false, true);
+    assert(gFlashMounted && !tripStoreAvailable(LittleFS));
+    assert(!hasPending(LittleFS) && !uploadPending(LittleFS));
+    events(); drive(15, 40); events();
+    assert(gState == ACTIVE && gTripFS == &SD);
+    SD.cardPresent = false;
+    checkStorage();
+    auto blocked = events();
+    auto sdLost = std::find_if(blocked.begin(), blocked.end(), [](const std::string& row) {
+        return row.find("\"code\":4001,") != std::string::npos;
+    });
+    auto noRecording = std::find_if(sdLost, blocked.end(), [](const std::string& row) {
+        return row.find("\"code\":4003,") != std::string::npos;
+    });
+    assert(sdLost != blocked.end() && noRecording != blocked.end());
+    assert(noRecording->find("\"transition\":\"raise\"") != std::string::npos);
+    gClockSet = false; drive(15, 1);
+    assert(gState == IDLE && !gTripPath[0] && gTripFS == &SD);
+    assert(!roomForNewTrip(millis()) && gTripFS == &SD);
+    serviceJournal();
+    assert(gFlashMounted && gJournal.stats().backend == EventLog::Backend::LittleFs);
+    assert(g_disk.files.at(TRIP_DIR) == "preserved flash file" && !LittleFS.dirs.count(TRIP_DIR));
+    for (const auto& file : g_disk.files) assert(file.first.rfind("/trips/", 0) != 0);
+    std::puts("SD runtime: flash /trips file preserved, E4001 then E4003 mid-trip, diagnostics remain on flash");
+
+    sdWorld(true, false, true, false);
+    assert(gDegraded.mode() == startup::Mode::NoStorage && !tripStoreAvailable(LittleFS));
+    assert(gJournal.stats().backend == EventLog::Backend::LittleFs);
+    g_millis += gDegraded.waitMs();
+    loop();
+    assert(g_restarts == 0 && gDegraded.waitMs() == 120000);
+    assert(gFlashMounted && g_disk.mounted && !tripStoreAvailable(LittleFS));
+    assert(g_disk.files.at(TRIP_DIR) == "preserved flash file");
+    std::puts("SD runtime: degraded trip-store retry preserves a diagnostic-only flash mount");
 
     sdWorld(); events(); drive(15, 12); events();
     activePath = gTripPath;
@@ -359,4 +420,18 @@ int main() {
         assert(gSdUnavailable && !gSdMounted);
     }
     std::puts("SD runtime: boot capacity failure, no-storage probe, single boot query, cancelled shutdown (#812) passed");
+
+    sdWorld();
+    PMU.vbusIn = false;
+    g_disk.onUnmount = [] { PMU.vbusIn = true; SD.corruptFat = true; };
+    g_taskDelayHook = [](uint32_t ms) {
+        if (ms == 20) serviceJournal();
+        if (ms == SD_POWER_OFF_SETTLE_MS)
+            assert(gNetHold && g_lockDepth > 0 && !g_sdDisk.mounted && PMU.bldo1);
+    };
+    bool restarted = false;
+    try { powerOffForVbus("idle_battery"); } catch (const Restarted&) { restarted = true; }
+    assert(restarted && PMU.shutdownCalls == 0 && SD.begins == 2 && SD.ends == 2);
+    assert(!PMU.bldo1 && PMU.bldo1OffMs - SD.endedAtMs == SD_POWER_OFF_SETTLE_MS);
+    std::puts("SD runtime: rejected cancelled-shutdown remount settles with filesystem locked and network held");
 }

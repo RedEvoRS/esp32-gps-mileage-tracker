@@ -5,9 +5,11 @@
 #include <iostream>
 
 using namespace diagnostics;
-static_assert(kCatalogVersion == 7, "review the host fixture on catalog version changes");
+static_assert(kCatalogVersion == 8, "review the host fixture on catalog version changes");
 static_assert(find(2009)->severity == Severity::Info && !find(2009)->notify, "battery history only");
 static_assert(find(2009)->journal == Journal::PerOccurrence, "power-off is a notice");
+static_assert(find(2010)->severity == Severity::Warning && find(2010)->notify, "peripheral setup warning eligible");
+static_assert(find(2010)->journal == Journal::Transitions, "verified setup clears the warning");
 static_assert(static_cast<std::uint16_t>(Code::STORAGE_FULL) == 4005, "stable code");
 static_assert(find(4005)->severity == Severity::Critical, "constexpr lookup");
 static_assert(find(5001)->journal == Journal::Counter, "no event for each absent scan");
@@ -23,7 +25,7 @@ static_assert(find(3009)->journal == Journal::Transitions, "antenna condition");
 static_assert(find(7999) == nullptr, "unknown codes need a display fallback");
 
 int main() {
-    assert(kCatalogSize == 49);
+    assert(kCatalogSize == 50);
     for (std::size_t i = 0; i < kCatalogSize; ++i) {
         const auto& entry = kCatalog[i];
         assert(entry.oled_line_count >= 1 && entry.oled_line_count <= 3);
