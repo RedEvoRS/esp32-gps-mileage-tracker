@@ -165,6 +165,7 @@ static void resetWorld() {
     gClockSet = false; gVbusLost = false;
     gVbusRetry = VbusRetry::None; gVbusRetryMs = gVbusOffReadMs = 0;
     gPmuIrqRetry = false; gPmuIrqReadMs = 0; gBatteryThresholds = -1;
+    gChargeTargetVerified = false;
     gDiagnosticClock.~DiagnosticClock(); new (&gDiagnosticClock) diagnostics::DiagnosticClock;
     gRtc = diagnostics::RtcRuntime();
     gGpsClockSet = false; gLastGpsSyncMs = 0;

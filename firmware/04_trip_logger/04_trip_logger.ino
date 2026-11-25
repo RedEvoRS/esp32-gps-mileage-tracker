@@ -631,6 +631,7 @@ static void storageConditions(uint64_t freeB, uint32_t now) {
     if (!gJournalReady) return;
     gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, now).condition(!gSdMounted || sdRecordingUnavailable());
     bool available = tripRecordingAvailable(*gTripFS);
+    gLoopFaults.event(diagnostics::Code::NO_RECORDING_STORAGE, now).condition(!available);
     gLoopFaults.event(diagnostics::Code::STORAGE_LOW, now).enumeration("backend", tripBackend(*gTripFS));
     if (available) gLoopFaults.integer("free_bytes", freeB);
     gLoopFaults.condition(available && freeB < FS_START_FREE);
@@ -1680,6 +1681,9 @@ static constexpr uint32_t PMU_ENABLED_IRQS =
     XPOWERS_AXP2101_PKEY_SHORT_IRQ |
     XPOWERS_AXP2101_PKEY_LONG_IRQ | XPOWERS_AXP2101_WARNING_LEVEL1_IRQ |
     XPOWERS_AXP2101_WARNING_LEVEL2_IRQ;
+static constexpr uint8_t PMU_INTSTS_REGS[3] = {
+    XPOWERS_AXP2101_INTSTS1, XPOWERS_AXP2101_INTSTS2, XPOWERS_AXP2101_INTSTS3
+};
 static constexpr uint32_t PMU_IRQ_RETRY_MS = 100;
 static bool gPmuIrqRetry = false;
 static uint32_t gPmuIrqReadMs = 0;
@@ -1688,8 +1692,13 @@ static void setupPmuIrq() {
     pinMode(PMU_IRQ_PIN, INPUT);
     attachInterrupt(digitalPinToInterrupt(PMU_IRQ_PIN), onPmuIrq, FALLING);
     PMU.disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
-    PMU.clearIrqStatus();
-    PMU.enableIRQ(PMU_ENABLED_IRQS);
+    static constexpr uint8_t kClearAll[3] = {0xFF, 0xFF, 0xFF};
+    bool cleared = pmu_read::clearIrqBytes(PMU, PMU_INTSTS_REGS, kClearAll);
+    bool enabled = PMU.enableIRQ(PMU_ENABLED_IRQS);
+    if (!cleared || !enabled) {
+        gPmuIrqRetry = true;
+        gPmuIrqReadMs = millis();
+    }
 }
 
 // Stop the network task before storage is unmounted (issue #3). It starts
@@ -1737,6 +1746,7 @@ static pmu_read::VbusState vbusState() {
 }
 
 static constexpr uint32_t VBUS_RETRY_MS = 1000;
+static constexpr uint32_t VBUS_POLL_MS = 15UL * 1000;
 enum class VbusRetry { None, Seed, Change };
 static VbusRetry gVbusRetry = VbusRetry::None;
 static uint32_t gVbusRetryMs = 0;
@@ -1765,7 +1775,8 @@ static void observeVbusChange(pmu_read::VbusState state) {
 }
 
 static void serviceVbusRecheck() {
-    if (gVbusRetry == VbusRetry::None || uint32_t(millis() - gVbusRetryMs) < VBUS_RETRY_MS) return;
+    const uint32_t interval = gVbusRetry == VbusRetry::None ? VBUS_POLL_MS : VBUS_RETRY_MS;
+    if (uint32_t(millis() - gVbusRetryMs) < interval) return;
     if (gVbusRetry == VbusRetry::Seed) seedVbusState();
     else observeVbusChange(vbusState());
 }
@@ -1932,21 +1943,28 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
 }
 
 static void pollPmu() {
-    gBootButton.sample(millis(), digitalRead(DEBUG_BOOT_PIN) == LOW);
-    if (!gPmuIrqFlag && !gPmuIrqRetry) return;
     uint32_t now = millis();
-    if (gPmuIrqRetry && uint32_t(now - gPmuIrqReadMs) < PMU_IRQ_RETRY_MS) return;
+    gBootButton.sample(now, digitalRead(DEBUG_BOOT_PIN) == LOW);
+    const bool irqPinLow = digitalRead(PMU_IRQ_PIN) == LOW;
+    if (!pmu_read::shouldPollIrq(gPmuIrqFlag, gPmuIrqRetry, irqPinLow,
+                                 now, gPmuIrqReadMs, PMU_IRQ_RETRY_MS)) return;
     // Consume only the pending edge before reading; an ISR during the reads
-    // can set it again. Failed batches retain a separate pending retry even
-    // though an asserted IRQ line cannot produce another falling edge.
+    // can set it again. Failed reads or clears retain a separate pending retry
+    // even though an asserted IRQ line cannot produce another falling edge.
     gPmuIrqFlag = false;
     gPmuIrqReadMs = now;
     int first = PMU.readRegister(XPOWERS_AXP2101_INTSTS1);
     int second = PMU.readRegister(XPOWERS_AXP2101_INTSTS2);
     int third = PMU.readRegister(XPOWERS_AXP2101_INTSTS3);
     const auto irq = pmu_read::irqBatch(first, second, third, PMU_ENABLED_IRQS);
-    gPmuIrqRetry = !irq.known;
-    if (!irq.known) return; // no actions or clears: real flags stay latched
+    if (!irq.known) {
+        gPmuIrqRetry = true;
+        return; // no actions or clears: real flags stay latched
+    }
+    // Clear only the bits read in this batch with checked register writes,
+    // BEFORE calling powerOffForVbus() so a cancelled shutdown cannot wipe
+    // flags latched during shutdown preparation.
+    gPmuIrqRetry = !pmu_read::clearIrqBytes(PMU, PMU_INTSTS_REGS, irq.raw);
 
     // Treat either VBUS interrupt as "power changed" and read the actual
     // level: a short dip can latch REMOVE and INSERT in the same batch,
@@ -1970,8 +1988,6 @@ static void pollPmu() {
             batteryCondition(diagnostics::Code::BATTERY_CRITICAL, true, millis());
     }
     if (irq.has(XPOWERS_AXP2101_WARNING_LEVEL2_IRQ)) powerOffForVbus("battery_critical");
-
-    PMU.clearIrqStatus();   // write-1-to-clear, or the line never re-fires
 }
 
 // Stage 4 never writes LOW_BAT_WARN_SET. Cache only a successful read.
@@ -2018,13 +2034,45 @@ static constexpr uint32_t CHG_FIRST_GRACE_MS = 10000;
 // The first temperature check must command/verify explicitly: the charger
 // keeps its state across ESP32 resets. Only matching read-back confirms it.
 static pmu_read::ChargeState gChargeState = pmu_read::ChargeState::Unconfirmed;
+static bool     gChargeTargetVerified = false;
 static bool     gChargeChecked = false;
 static bool     gChargeFirstResolved = false; // plausible read OR grace exhausted; never reopens on rollover
 static uint32_t gChargeFirstMs = 0;
-static bool     gChargePauseRequested = false; // hysteresis follows intent, even on failure
+static bool     gChargePauseRequested = false; // hysteresis follows finite temperature decisions only
 static uint8_t  gChargeFailures = 0;
 static constexpr uint8_t CHG_FAILURE_LIMIT = 3;
+static constexpr uint8_t CHG_STARTUP_ATTEMPTS = 3;
 static uint32_t gChargeCheckT0 = 0;
+
+static bool disableChargeVerified(unsigned attempts) {
+    for (unsigned i = 0; i < attempts; ++i) {
+        PMU.disableCellbatteryCharge();
+        if (pmu_read::chargeState(PMU.readRegister(XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL)) ==
+            pmu_read::ChargeState::Paused) return true;
+        if (i + 1 < attempts) delay(10);
+    }
+    return false;
+}
+
+static bool verifyChargeTarget4V1(unsigned attempts, bool forceWrite = false) {
+    if (!forceWrite &&
+        pmu_read::chargeTargetMatches(PMU.readRegister(XPOWERS_AXP2101_CV_CHG_VOL_SET),
+                                      XPOWERS_AXP2101_CHG_VOL_4V1)) {
+        gChargeTargetVerified = true;
+        return true;
+    }
+    for (unsigned i = 0; i < attempts; ++i) {
+        if (PMU.setChargeTargetVoltage(XPOWERS_AXP2101_CHG_VOL_4V1) &&
+            pmu_read::chargeTargetMatches(PMU.readRegister(XPOWERS_AXP2101_CV_CHG_VOL_SET),
+                                          XPOWERS_AXP2101_CHG_VOL_4V1)) {
+            gChargeTargetVerified = true;
+            return true;
+        }
+        if (i + 1 < attempts) delay(10);
+    }
+    gChargeTargetVerified = false;
+    return false;
+}
 
 static void serviceChargeTemp() {
     uint32_t now = millis();
@@ -2046,31 +2094,32 @@ static void serviceChargeTemp() {
     // Reuse this exact sample, including NAN on failure. No second PMU read.
     gDebugTempDie = die;
     gDebugTempDieMs = now;
-    bool pause;
-    const char* why = "";
-    if (!std::isfinite(die)) {
-        pause = true;                        // can't tell: fail safe
-        why = "temperature unreadable";
-    } else if (gChargePauseRequested) {
-        pause = !(die <= CHG_HOT_RESUME_C && die >= CHG_COLD_RESUME_C);
-        why = die > CHG_HOT_RESUME_C ? "too hot" : "too cold";
-    } else {
-        pause = die >= CHG_HOT_PAUSE_C || die <= CHG_COLD_PAUSE_C;
-        why = die >= CHG_HOT_PAUSE_C ? "too hot" : "too cold";
-    }
-    if (!firstGrace) gChargePauseRequested = pause;
+    const auto decision = charge_temperature::evaluate(
+        die, gChargePauseRequested,
+        CHG_HOT_PAUSE_C, CHG_HOT_RESUME_C, CHG_COLD_PAUSE_C, CHG_COLD_RESUME_C);
+    const bool pause = decision.pause;
+    const char* why = decision.why;
+    // Only finite, plausible readings update hysteresis history; unreadable
+    // samples pause charging fail-safe without creating hot/cold history.
+    gChargePauseRequested = decision.nextPauseRequested;
 
-    const auto intended = pause ? pmu_read::ChargeState::Paused : pmu_read::ChargeState::Charging;
+    // Require a verified 4.1 V target before enabling charging, and re-verify
+    // whenever unverified or temperature permits charging.
+    if (!gChargeTargetVerified || !pause) verifyChargeTarget4V1(1);
+    const bool targetOk = gChargeTargetVerified;
+    const auto intended = (pause || !targetOk) ? pmu_read::ChargeState::Paused : pmu_read::ChargeState::Charging;
     if (gChargeState != intended) {
-        if (pause) PMU.disableCellbatteryCharge();
+        if (intended == pmu_read::ChargeState::Paused) PMU.disableCellbatteryCharge();
         else PMU.enableCellbatteryCharge();
         // The void XPowersLib commands discard their write result. A readable
         // matching bit is the only evidence that the intended state took effect.
         auto actual = pmu_read::chargeState(PMU.readRegister(XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL));
         gChargeState = actual == intended ? intended : pmu_read::ChargeState::Unconfirmed;
-        if (gChargeState == pmu_read::ChargeState::Unconfirmed) {
+        if (gChargeState == pmu_read::ChargeState::Unconfirmed || !targetOk) {
             if (gChargeFailures < CHG_FAILURE_LIMIT) ++gChargeFailures;
-            Serial.printf("Charge control unconfirmed; retrying in %lu s.\n",
+            Serial.printf(gChargeState == pmu_read::ChargeState::Unconfirmed ?
+                "Charge control unconfirmed; retrying in %lu s.\n" :
+                "Charge target 4.1 V unconfirmed; keeping charging off, retrying in %lu s.\n",
                 (unsigned long)((firstGrace ? CHG_FIRST_RETRY_MS : CHG_CHECK_MS) / 1000));
         } else {
             gChargeFailures = 0;
@@ -2083,6 +2132,12 @@ static void serviceChargeTemp() {
                               die, die - DIE_OFFSET_C);
             }
         }
+    } else if (!targetOk) {
+        if (gChargeFailures < CHG_FAILURE_LIMIT) ++gChargeFailures;
+        Serial.printf("Charge target 4.1 V unconfirmed; keeping charging off, retrying in %lu s.\n",
+            (unsigned long)((firstGrace ? CHG_FIRST_RETRY_MS : CHG_CHECK_MS) / 1000));
+    } else {
+        gChargeFailures = 0;
     }
 
     if (gJournalReady) {
@@ -2090,21 +2145,21 @@ static void serviceChargeTemp() {
         // Follow intent/hysteresis even if control is unconfirmed. Context is
         // measured die temperature, not an invented cell measurement.
         // Unreadable samples carry no temperature.
-        bool unreadable = !std::isfinite(die);
-        if (!unreadable) {
+        if (!decision.unreadable) {
             for (auto code : {diagnostics::Code::CHARGE_HOT, diagnostics::Code::CHARGE_COLD}) {
                 gLoopFaults.event(code, now);
                 if (die >= -50 && die <= 150) gLoopFaults.integer("temperature_mc", int(die * 1000));
                 gLoopFaults.condition(pause && (code == diagnostics::Code::CHARGE_HOT ? die > CHG_HOT_RESUME_C : die < CHG_COLD_RESUME_C));
             }
         }
-        if (!firstGrace) gLoopFaults.event(diagnostics::Code::CHARGE_TEMP_UNREADABLE, now).condition(unreadable);
-        if (gChargeState != pmu_read::ChargeState::Unconfirmed || gChargeFailures >= CHG_FAILURE_LIMIT)
+        if (!firstGrace) gLoopFaults.event(diagnostics::Code::CHARGE_TEMP_UNREADABLE, now).condition(decision.unreadable);
+        const bool controlConfirmed = targetOk && gChargeState != pmu_read::ChargeState::Unconfirmed;
+        if (controlConfirmed || gChargeFailures >= CHG_FAILURE_LIMIT)
             gLoopFaults.event(diagnostics::Code::CHARGE_CONTROL_FAILED, now).condition(gChargeFailures >= CHG_FAILURE_LIMIT);
     }
     // Charging was already commanded off during the retries, so the state
     // block above prints nothing when the window ends without a reading.
-    if (first && !firstGrace && !std::isfinite(die))
+    if (first && !firstGrace && decision.unreadable)
         Serial.printf("Charge guard: no plausible temperature in the first %lu s; charging stays off.\n",
                       (unsigned long)(CHG_FIRST_GRACE_MS / 1000));
 }
@@ -3047,9 +3102,25 @@ static bool mountTripStorage(bool allowProvision = true, bool reportFreeSpace = 
     if (!reportFreeSpace) return gSdMounted || gFlashMounted;
     if (gSdMounted) {
         startupStage(startup_watchdog::Stage::CardSpace);
-        Serial.printf("Trip storage: microSD (%.2f GiB free); internal flash queue %s.\n",
-                      storageFreeBytes(SD) / (1024.0 * 1024 * 1024),
-                      gFlashMounted ? "mounted" : "unavailable -- preserved for recovery");
+        uint64_t sdFree = storageFreeBytes(SD);
+        if (tripStoreAvailable(SD)) {
+            Serial.printf("Trip storage: microSD (%.2f GiB free); internal flash queue %s.\n",
+                          sdFree / (1024.0 * 1024 * 1024),
+                          gFlashMounted ? "mounted" : "unavailable -- preserved for recovery");
+        } else {
+            SD.end();
+            gSdSpi.end();
+            PMU.disableBLDO1();
+            gSdMounted = false;
+            if (gFlashMounted) {
+                gTripFS = &LittleFS;
+                startupStage(startup_watchdog::Stage::FlashSpace);
+                Serial.printf("WARNING: microSD unavailable -- using internal flash (%.2f MiB free).\n",
+                              storageFreeBytes(LittleFS) / (1024.0 * 1024));
+            } else {
+                Serial.println("ERROR: no usable trip storage; trips cannot be recorded.");
+            }
+        }
     } else if (gFlashMounted) {
         startupStage(startup_watchdog::Stage::FlashSpace);
         Serial.printf("WARNING: microSD unavailable -- using internal flash (%.2f MiB free).\n",
@@ -3057,7 +3128,7 @@ static bool mountTripStorage(bool allowProvision = true, bool reportFreeSpace = 
     } else {
         Serial.println("ERROR: no usable trip storage; trips cannot be recorded.");
     }
-    return gSdMounted || gFlashMounted;
+    return tripStoreAvailable(SD) || gFlashMounted;
 }
 
 static int debugSatellitesUsed() {
@@ -3431,11 +3502,12 @@ void setup() {
     saveStartupWatchdog();
     armLoopWatchdog(startup_watchdog::STARTUP_WDT_TIMEOUT_MS, false);
     bool aldo1Warning = false;
+    bool earlyChargeDisabled = false;
     gBootBattery = diagnostics::BatterySample();
     if (radioOff) {
         // Stop retained charging before display/USB/storage waits. Only trusted
         // PMU startup may do this; degraded power modes retain their policy.
-        PMU.disableCellbatteryCharge();
+        earlyChargeDisabled = disableChargeVerified(CHG_STARTUP_ATTEMPTS);
         PMU.enableBattDetection();
         PMU.enableBattVoltageMeasure();
         // ALDO1 supplies the OLED/BME280/magnetometer and Wire pull-ups.
@@ -3509,6 +3581,12 @@ void setup() {
     printPmuStartup(gPmuStartup);
     if (aldo1Warning)
         Serial.println("WARNING: ALDO1 3.3 V/on setup unconfirmed; OLED/BME280/magnetometer may be unavailable.");
+    if (!earlyChargeDisabled) {
+        Serial.println("WARNING: early charger disable unconfirmed; retrying before storage.");
+        earlyChargeDisabled = disableChargeVerified(CHG_STARTUP_ATTEMPTS);
+        if (!earlyChargeDisabled)
+            Serial.println("WARNING: charger disable still unconfirmed before storage setup.");
+    }
     gRtc.printBootStatus();
     Serial.println("LoRa rail (ALDO3) verified off; SD rail (BLDO1) off; VBACKUP off.");
     Serial.printf("PMU power-on source 0x%02X, power-off source 0x%02X.\n",
@@ -3524,7 +3602,9 @@ void setup() {
     // Full-charge voltage 4.1 V instead of the 4.2 V default: ~10% less
     // capacity, much less stress on a cell that lives in a hot car (the
     // charge temperature guard, below, covers charging when it's too hot).
-    PMU.setChargeTargetVoltage(XPOWERS_AXP2101_CHG_VOL_4V1);
+    gChargeTargetVerified = false;
+    verifyChargeTarget4V1(CHG_STARTUP_ATTEMPTS, /*forceWrite=*/true);
+    if (!gChargeTargetVerified) gChargeFailures = CHG_FAILURE_LIMIT;
     // No charging until the temperature guard's first check. The PMU keeps
     // the charger on across ESP32 resets, and storage setup (mount, fsck)
     // can halt or crash before that check runs.
@@ -3539,9 +3619,11 @@ void setup() {
     seedVbusState();
     gIdleSince = millis();
     Serial.printf("PMU ready, MAX-M10S GPS rail (ALDO4) on at 3.3 V, charge to %s. VBUS %s.\n",
-                  PMU.getChargeTargetVoltage() == XPOWERS_AXP2101_CHG_VOL_4V1 ? "4.1 V" : "NOT 4.1 V",
+                  gChargeTargetVerified ? "4.1 V" : "NOT 4.1 V",
                   gVbusRetry == VbusRetry::Seed ? "unknown (assuming USB present)" :
                   gVbusLost ? "absent (on battery)" : "present");
+    if (!gChargeTargetVerified)
+        Serial.println("WARNING: 4.1 V charge target unconfirmed; charging blocked until verified.");
 
     // --- Storage + boot-time repair ---
     // A latched no-storage fallback returns false here before any mount, so
@@ -3562,12 +3644,12 @@ void setup() {
     if (gJournalReady) {
         // Explicit healthy observations resolve prior degraded-boot alerts.
         gLoopFaults.event(diagnostics::Code::PMU_INIT_FAILED, millis()).condition(false);
-        gLoopFaults.event(diagnostics::Code::NO_RECORDING_STORAGE, millis()).condition(false);
-        gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, millis()).condition(!gSdMounted);
-        startupStage(gSdMounted ? startup_watchdog::Stage::CardSpace : startup_watchdog::Stage::FlashSpace);
+        gLoopFaults.event(diagnostics::Code::NO_RECORDING_STORAGE, millis()).condition(!tripStoreAvailable(*gTripFS));
+        gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, millis()).condition(!tripStoreAvailable(SD));
+        startupStage(tripStoreAvailable(SD) ? startup_watchdog::Stage::CardSpace : startup_watchdog::Stage::FlashSpace);
         storageConditions(storageFreeBytes(*gTripFS), millis());
     }
-    if (gSdMounted) { startupStage(startup_watchdog::Stage::CardRepair); fsckAllTrips(SD); }
+    if (tripStoreAvailable(SD)) { startupStage(startup_watchdog::Stage::CardRepair); fsckAllTrips(SD); }
     if (gFlashMounted) { startupStage(startup_watchdog::Stage::FlashRepair); fsckAllTrips(LittleFS); }
     startupStage(startup_watchdog::Stage::Services);
 

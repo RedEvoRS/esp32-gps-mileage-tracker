@@ -544,16 +544,48 @@ constexpr uint8_t XPOWERS_AXP2101_INTSTS1 = 0x48;
 constexpr uint8_t XPOWERS_AXP2101_INTSTS2 = 0x49;
 constexpr uint8_t XPOWERS_AXP2101_INTSTS3 = 0x4A;
 constexpr uint8_t XPOWERS_AXP2101_LOW_BAT_WARN_SET = 0x1A;
+constexpr uint8_t XPOWERS_AXP2101_CV_CHG_VOL_SET = 0x64;
 struct XPowersAXP2101 {
     // Per-register one-based call injection, independent of other PMU reads.
     std::map<uint8_t, unsigned> registerReadCalls;
     std::map<uint8_t, unsigned> failRegisterReadAt;
     std::map<uint8_t, int> registerReadOverride;
     std::function<void(uint8_t)> onRegisterRead;
+    std::map<uint8_t, unsigned> registerWriteCalls;
+    std::map<uint8_t, unsigned> failRegisterWriteAt;
+    std::vector<std::pair<uint8_t, uint8_t>> registerWrites;
+    std::function<void(uint8_t, uint8_t)> onRegisterWrite;
     bool vbusNotIn = false; // STATUS2 bit 3, independently test library semantics
     bool failChargeDisable = false, failChargeEnable = false, failChargeRead = false;
+    bool failChargeTargetWrite = false, chargeTargetStuck = false, failChargeTargetRead = false;
+    bool failEnableIrq = false;
     int writeRegister(uint8_t reg, uint8_t value) {
         operations.push_back("writeRegister");
+        unsigned call = ++registerWriteCalls[reg];
+        registerWrites.push_back({reg, value});
+        if (onRegisterWrite) onRegisterWrite(reg, value);
+        if (failRegisterWriteAt.count(reg) && failRegisterWriteAt[reg] == call) return -1;
+        if (reg == XPOWERS_AXP2101_INTSTS1) {
+            if (registerReadOverride.count(reg) && registerReadOverride[reg] >= 0)
+                registerReadOverride[reg] &= ~value;
+            if (value & 0x40) lowIrq = false;
+            if (value & 0x80) criticalIrq = false;
+            return 0;
+        }
+        if (reg == XPOWERS_AXP2101_INTSTS2) {
+            if (registerReadOverride.count(reg) && registerReadOverride[reg] >= 0)
+                registerReadOverride[reg] &= ~value;
+            if (value & 0x40) removeIrq = false;
+            if (value & 0x80) insertIrq = false;
+            if (value & 0x04) longPressIrq = false;
+            if (value & 0x08) shortPressIrq = false;
+            return 0;
+        }
+        if (reg == XPOWERS_AXP2101_INTSTS3) {
+            if (registerReadOverride.count(reg) && registerReadOverride[reg] >= 0)
+                registerReadOverride[reg] &= ~value;
+            return 0;
+        }
         assert(reg == 0x50 || reg == 0x30); // debug TS setup only
         registerReadOverride[reg] = value;
         return 0;
@@ -582,6 +614,7 @@ struct XPowersAXP2101 {
             (longPressIrq ? 0x04 : 0) | (shortPressIrq ? 0x08 : 0);
         if (reg == XPOWERS_AXP2101_INTSTS3) return 0;
         if (reg == XPOWERS_AXP2101_LOW_BAT_WARN_SET) return (lowWarnNibble << 4) | criticalPercent;
+        if (reg == XPOWERS_AXP2101_CV_CHG_VOL_SET) return failChargeTargetRead ? -1 : chgVol;
         assert(reg == XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL);
         return failChargeRead ? -1 : chargeEnabled ? 0x02 : 0;
     }
@@ -650,7 +683,12 @@ struct XPowersAXP2101 {
     uint8_t getPowerOnSource() { operations.push_back("getPowerOnSource"); return 0x04; }
     uint8_t getPowerOffSource() { operations.push_back("getPowerOffSource"); return 0x02; }
     uint8_t chgVol = 3;
-    bool setChargeTargetVoltage(uint8_t v) { operations.push_back("setChargeTargetVoltage"); chgVol = v; return true; }
+    bool setChargeTargetVoltage(uint8_t v) {
+        operations.push_back("setChargeTargetVoltage");
+        if (failChargeTargetWrite) return false;
+        if (!chargeTargetStuck) chgVol = v;
+        return true;
+    }
     uint8_t getChargeTargetVoltage() { operations.push_back("getChargeTargetVoltage"); return chgVol; }
     float dieC = 30.0f; bool chargeEnabled = true;   // tests set dieC
     void enableTemperatureMeasure() { operations.push_back("enableTemperatureMeasure");}
@@ -660,7 +698,13 @@ struct XPowersAXP2101 {
     void enableBattDetection() { operations.push_back("enableBattDetection");} void enableBattVoltageMeasure() { operations.push_back("enableBattVoltageMeasure");}
     void enableVbusVoltageMeasure() { operations.push_back("enableVbusVoltageMeasure");} void enableSystemVoltageMeasure() { operations.push_back("enableSystemVoltageMeasure");}
     uint32_t enabledIrqs = 0;
-    void disableIRQ(uint32_t) { operations.push_back("disableIRQ");} void enableIRQ(uint32_t mask) { enabledIrqs |= mask; operations.push_back("enableIRQ");}
+    bool disableIRQ(uint32_t) { operations.push_back("disableIRQ"); return true; }
+    bool enableIRQ(uint32_t mask) {
+        operations.push_back("enableIRQ");
+        if (failEnableIrq) return false;
+        enabledIrqs |= mask;
+        return true;
+    }
     void clearIrqStatus() { operations.push_back("clearIrqStatus"); removeIrq = insertIrq = shortPressIrq = longPressIrq = criticalIrq = lowIrq = false; }
     uint32_t getIrqStatus() { operations.push_back("getIrqStatus"); return 0; }
     bool isVbusRemoveIrq() { operations.push_back("isVbusRemoveIrq"); return removeIrq; } bool isVbusInsertIrq() { operations.push_back("isVbusInsertIrq"); return insertIrq; }

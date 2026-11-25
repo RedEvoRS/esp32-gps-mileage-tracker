@@ -22,7 +22,8 @@ static void world() {
     gJournalReady = gJournalStarted = gJournalSealing = gJournalBootReported = false;
     gJournalSealRequested = gJournalSealDone = gJournalSealOk = false;
     gEventIoBudget = false; g_taskDelayHook = nullptr;
-    gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0;
+    gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeTargetVerified = false;
+    gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0;
     gChargeFirstResolved = false; gChargeFirstMs = 0;
     gBatteryDiagChecked = false;
     gVbusOffPending = false;
@@ -58,7 +59,7 @@ static RuntimeFaults::Observation observation(unsigned code) {
 }
 static void noTrips() {
     assert(!gDebugTempEnabled);
-    assert(std::find(PMU.operations.begin(), PMU.operations.end(), "writeRegister") == PMU.operations.end());
+    for (const auto& w : PMU.registerWrites) assert(w.first != 0x50 && w.first != 0x30);
     assert(gState == IDLE && !gTripPath[0] && gArmCount == 0 && gPendCount == 0);
     for (auto* disk : {&g_disk, &g_sdDisk}) for (const auto& file : disk->files)
         assert(file.first.rfind("/trips/", 0) != 0);
@@ -133,7 +134,7 @@ int main() {
         Wire.onBegin = [&] {
             displayBegan = true;
             const std::vector<std::string> expected = {
-                "begin", "disableALDO3", "readRegister", "disableCellbatteryCharge",
+                "begin", "disableALDO3", "readRegister", "disableCellbatteryCharge", "readRegister",
                 "enableBattDetection", "enableBattVoltageMeasure", "readRegister", "readRegister",
                 "setALDO1Voltage", "enableALDO1", "readRegister", "readRegister"
             };

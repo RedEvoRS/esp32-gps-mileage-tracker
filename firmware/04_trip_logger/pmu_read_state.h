@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 
 // Raw XPowersLib register results retain -1 on I2C failure. Never interpret
 // that sentinel as a cleared bit in a rail or power-source decision.
@@ -12,18 +13,45 @@ inline ChargeState chargeState(int control) {
     return (control & (1 << 1)) ? ChargeState::Charging : ChargeState::Paused;
 }
 
+inline bool chargeTargetMatches(int cvReg, uint8_t target) {
+    if (cvReg < 0) return false;
+    return (cvReg & 0x07) == (target & 0x07);
+}
+
 // XPowersParams.hpp masks put INTSTS1 in bits 0..7, INTSTS2 in 8..15,
 // INTSTS3 in 16..23 (unlike getIrqStatus()'s return-value byte order).
 struct IrqBatch {
     bool known;
     unsigned flags;
+    uint8_t raw[3];
     bool has(unsigned mask) const { return known && (flags & mask) != 0; }
 };
 
 inline IrqBatch irqBatch(int first, int second, int third, unsigned enabled) {
-    if (first < 0 || second < 0 || third < 0) return {false, 0};
+    if (first < 0 || second < 0 || third < 0) return {false, 0, {0, 0, 0}};
     return {true, (unsigned(first) | (unsigned(second) << 8) |
-                   (unsigned(third) << 16)) & enabled};
+                   (unsigned(third) << 16)) & enabled,
+            {uint8_t(first), uint8_t(second), uint8_t(third)}};
+}
+
+// Write-1-to-clear only the bits read in this batch (or 0xFF at init).
+// Returns true only when every nonzero write succeeds (XPowersLib returns 0).
+template <typename Pmu>
+inline bool clearIrqBytes(Pmu& pmu, const uint8_t regs[3], const uint8_t masks[3]) {
+    bool ok = true;
+    for (int i = 0; i < 3; ++i) {
+        if (masks[i] != 0 && pmu.writeRegister(regs[i], masks[i]) != 0) ok = false;
+    }
+    return ok;
+}
+
+// Fresh falling edges run immediately when not backing off from a failed
+// read/clear. Failed batches and a steady active-low IRQ line retry at retryMs.
+inline bool shouldPollIrq(bool edgeFlag, bool retry, bool pinLow,
+                          uint32_t now, uint32_t lastReadMs, uint32_t retryMs) {
+    if (!edgeFlag && !retry && !pinLow) return false;
+    if ((retry || (!edgeFlag && pinLow)) && uint32_t(now - lastReadMs) < retryMs) return false;
+    return true;
 }
 
 inline Aldo3State aldo3State(int control) {
