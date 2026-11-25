@@ -93,6 +93,7 @@ for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resol
 
 from common.version import server_version
 from common.settings import boolean, map_tiles, trusted_proxies, viewer_cookie_secure
+from common.trip_publication import trip_publication_lock
 from common.trip_summary import distance_sides
 
 from common.diagnostics import CatalogError, load_catalog
@@ -510,7 +511,7 @@ def _record_failure(ip, username=""):
         )
 
 
-def _clear_failures(ip, username):
+def _clear_failures(ip, username, *, conn=None):
     """Forget this IP's failures against `username` only.
 
     Anyone who holds one valid login could otherwise reset the count between
@@ -519,32 +520,35 @@ def _clear_failures(ip, username):
 
     Returns False, clearing nothing, if the IP is locked: the lock can appear
     while a login's slow password hash is running, and that login must not
-    still get a session. This check shares the clearing transaction, so no
-    lock can slip in between it and the session being issued.
+    still get a session. Password changes pass their writer transaction so
+    that the lock check, clearing and password update happen together.
     """
+    if conn is None:
+        with closing(sqlite3.connect(DB_PATH, timeout=30)) as writer, writer:
+            writer.execute("BEGIN IMMEDIATE")
+            return _clear_failures(ip, username, conn=writer)
+
     name = _failure_name(username)
-    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT fails, locked_until FROM login_attempts WHERE ip = ?", (ip,)
-        ).fetchone()
-        if not row:
-            conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
-            return True
-        if row[1] and datetime.fromisoformat(row[1]) > datetime.now(timezone.utc):
-            return False  # a lock set by a concurrent request stands
-        own = conn.execute(
-            "SELECT fails FROM login_attempt_names WHERE ip = ? AND name = ?", (ip, name)
-        ).fetchone()
-        if not own:
-            return True
-        conn.execute("DELETE FROM login_attempt_names WHERE ip = ? AND name = ?", (ip, name))
-        fails = max(0, row[0] - own[0])
-        if fails:
-            conn.execute("UPDATE login_attempts SET fails = ? WHERE ip = ?", (fails, ip))
-        else:
-            conn.execute("DELETE FROM login_attempts WHERE ip = ?", (ip,))
-            conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
+    row = conn.execute(
+        "SELECT fails, locked_until FROM login_attempts WHERE ip = ?", (ip,)
+    ).fetchone()
+    if not row:
+        conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
+        return True
+    if row[1] and datetime.fromisoformat(row[1]) > datetime.now(timezone.utc):
+        return False  # a lock set by a concurrent request stands
+    own = conn.execute(
+        "SELECT fails FROM login_attempt_names WHERE ip = ? AND name = ?", (ip, name)
+    ).fetchone()
+    if not own:
+        return True
+    conn.execute("DELETE FROM login_attempt_names WHERE ip = ? AND name = ?", (ip, name))
+    fails = max(0, row[0] - own[0])
+    if fails:
+        conn.execute("UPDATE login_attempts SET fails = ? WHERE ip = ?", (fails, ip))
+    else:
+        conn.execute("DELETE FROM login_attempts WHERE ip = ?", (ip,))
+        conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
     return True
 
 
@@ -2103,7 +2107,7 @@ _year_distance_cache_lock = Lock()
 
 def _crossing_years(trip):
     start = _trip_local_year(trip)
-    until = _to_local(_parse(trip.get("recorded_until")))
+    until = _to_local(_parse(trip.get("recorded_until")) or _parse(trip.get("end_time")))
     return (start, until.year) if start and until and start != until.year else None
 
 
@@ -2157,9 +2161,6 @@ def _year_allocation(trip):
     if new_year != old_year + 1:
         return whole("the recording spans more than one year end")
     cut = datetime(new_year, 1, 1, tzinfo=DISPLAY_TZ).astimezone(timezone.utc)
-    end = _to_local(_parse(trip.get("end_time")))
-    if end and end < cut:
-        return {}  # Movement ended before midnight; only cooldown crossed.
     keys = trip.get("parts") or [trip["trip_key"]]
     try:
         before, after = _year_distances(keys, cut)
@@ -2207,15 +2208,27 @@ def year_members(trips, unreadable, year):
             members.append(trip)
     return (members,
             [t for t in unreadable if (_moved_saved_in_year(t, year) if t.get("moved_saved") else
-                                      _unused_merge_in_year(t, year) if t.get("unused_merge") or t.get("damaged_merge") else
+                                      _saved_merge_in_year(t, year) if t.get("unused_merge") or t.get("damaged_merge") else
                                       any(_may_start_in(ym, year)
                                           for ym in (t.get("saved_months") or [t["ym"]])))])
 
 
-def _unused_merge_in_year(trip, year):
-    saved_year = _trip_local_year(trip.get("saved_summary", {}))
-    return (saved_year is None or saved_year == year
-            or any(_trip_local_year(part) == year for part in trip.get('counted_parts', ())))
+def _saved_merge_years(trip):
+    """Known years affected by a damaged or unused-name merge."""
+    summary = trip.get("saved_summary", {})
+    saved_year = _trip_local_year(summary)
+    if trip.get("damaged_merge"):
+        crossing = _crossing_years(summary)
+        if crossing:
+            return set(range(min(crossing), max(crossing) + 1))
+    years = {saved_year} if saved_year is not None else set()
+    for part in trip.get("counted_parts", ()):
+        years |= _mileage_years({**part, **_year_allocation(part)})
+    return years
+
+
+def _saved_merge_in_year(trip, year):
+    return _trip_local_year(trip.get("saved_summary", {})) is None or year in _saved_merge_years(trip)
 
 
 def _moved_saved_in_year(entry, year):
@@ -2279,8 +2292,8 @@ def selected_trips(include_history=False, loaded=None, include_merge_history=Fal
     trips, unreadable = load_trips() if loaded is None else loaded
     _flag_trips_inside_merges(trips)
     years = {y for t in trips for y in _mileage_years(t)}
-    years |= {y for t in unreadable if t.get('unused_merge')
-              if (y := _trip_local_year(t.get('saved_summary', {}))) is not None}
+    years |= {y for t in unreadable if t.get('unused_merge') or t.get('damaged_merge')
+              for y in _saved_merge_years(t)}
     selected = trips
     if year:
         years.add(year)
@@ -2395,7 +2408,7 @@ def locked_years(trip, closed):
     """Closed years blocking an edit, including a saved merge's existing locks."""
     hit = trip_years(trip) & closed.keys()
     if trip.get("unused_merge") or trip.get("damaged_merge"):
-        hit |= {y for y in closed if _unused_merge_in_year(trip, y)}
+        hit |= {y for y in closed if _saved_merge_in_year(trip, y)}
     return hit
 
 
@@ -3710,8 +3723,11 @@ def _year_list():
         closed = trip_log.closed_years(conn)
     years = {y for t in trips for y in _mileage_years(t)} | closed.keys()
     for trip in unreadable:
-        saved_year = _trip_local_year(trip.get('saved_summary', {})) if trip.get('unused_merge') or trip.get('damaged_merge') else None
-        years |= {saved_year} if saved_year else _folder_years(trip["ym"])
+        if trip.get('unused_merge') or trip.get('damaged_merge'):
+            years |= _saved_merge_years(trip)
+            if _trip_local_year(trip.get('saved_summary', {})) is not None:
+                continue
+        years |= _folder_years(trip["ym"])
     with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn:
         for row in _merge_history_rows(conn, trips=trips):
             if row['saved_year']:
@@ -4317,15 +4333,16 @@ def _change_year(raw_year, closing_it):
         if closing_it:
             # Save the totals as they stand, so a later change can't go unseen.
             # The history row carries the figures; the key list stays in tax_years.
-            all_trips, all_unreadable = _load_trips(conn)
-            if any(t.get("unused_merge") and _unused_merge_in_year(t, year) for t in all_unreadable):
-                abort(409, description=UNUSED_MERGE_CLOSE_REFUSAL)
-            if any(t.get("moved_saved") and _moved_saved_in_year(t, year) for t in all_unreadable):
-                abort(409, description=MOVED_SAVED_CLOSE_REFUSAL)
-            if any(t.get("folder_reason") == "saved_keys" and not t.get("moved_saved") for t in all_unreadable):
-                abort(409, description="Several month names for one folder have saved trip data. Resolve the folder warning on the trip list before closing a year.")
-            snapshot = year_figures(*year_members(all_trips, all_unreadable, year))
-            trip_log.close_year(conn, year, g.user, snapshot)
+            with trip_publication_lock(DATA_ROOT):
+                all_trips, all_unreadable = _load_trips(conn)
+                if any(t.get("unused_merge") and _saved_merge_in_year(t, year) for t in all_unreadable):
+                    abort(409, description=UNUSED_MERGE_CLOSE_REFUSAL)
+                if any(t.get("moved_saved") and _moved_saved_in_year(t, year) for t in all_unreadable):
+                    abort(409, description=MOVED_SAVED_CLOSE_REFUSAL)
+                if any(t.get("folder_reason") == "saved_keys" and not t.get("moved_saved") for t in all_unreadable):
+                    abort(409, description="Several month names for one folder have saved trip data. Resolve the folder warning on the trip list before closing a year.")
+                snapshot = year_figures(*year_members(all_trips, all_unreadable, year))
+                trip_log.close_year(conn, year, g.user, snapshot)
             details = {"snapshot": {k: v for k, v in snapshot.items() if k != "trip_keys"}}
         else:
             discarded = closed[year]["snapshot"]
@@ -4439,13 +4456,17 @@ def restore_moved_removal(year, ym, saved_id):
     return redirect(url_for('admin_year', year=year))
 
 
+class PasswordChangeLocked(Exception):
+    pass
+
+
 @app.route("/account/password", methods=["GET", "POST"])
 def account_password():
     if request.method == "POST" and g.role == "editor":
         ip = _client_ip()
+        lockout_message = "Too many failed attempts. Try again later."
         if _lock_seconds_remaining(ip):
-            return render_template_string(ACCOUNT_HTML, title="Change password",
-                                          message="Too many failed attempts. Try again later."), 429
+            return render_template_string(ACCOUNT_HTML, title="Change password", message=lockout_message), 429
         user = users.get_user(DB_PATH, g.user)
         # A concurrent removal still takes one hash check and fails closed.
         valid = check_password_hash(user["password_hash"] if user else DUMMY_PASSWORD_HASH,
@@ -4454,13 +4475,19 @@ def account_password():
             _record_failure(ip, g.user)
             session["account_message"] = "Incorrect current password."
         else:
+            def check_lockout(conn):
+                if not _clear_failures(ip, g.user, conn=conn):
+                    raise PasswordChangeLocked
+
             try:
                 password = _confirmed_password()
                 updated = users.change_user(DB_PATH, "reset-password", g.user, password, VIEWER_USERNAME,
-                                             expected_tag=session["pw_tag"], secret_key=VIEWER_SECRET_KEY)
+                                             expected_tag=session["pw_tag"], secret_key=VIEWER_SECRET_KEY,
+                                             before_update=check_lockout)
                 session["pw_tag"] = users.session_tag(VIEWER_SECRET_KEY, updated)
-                _clear_failures(ip, g.user)
                 session["account_message"] = "Password changed. Other sessions for this login have ended."
+            except PasswordChangeLocked:
+                return render_template_string(ACCOUNT_HTML, title="Change password", message=lockout_message), 429
             except users.UserError as exc:
                 session["account_message"] = str(exc)
         return redirect(url_for("account_password"))

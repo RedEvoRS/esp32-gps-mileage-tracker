@@ -2,6 +2,7 @@
 
 import importlib.util
 import errno
+import hashlib
 import json
 import multiprocessing
 import os
@@ -473,6 +474,53 @@ class UploadSafety(unittest.TestCase):
         before = (gpx.read_bytes(), summary.read_bytes())
         self.assertEqual(self.upload().status_code, 200)
         self.assertEqual((gpx.read_bytes(), summary.read_bytes()), before)
+
+    def test_identical_retry_preserves_a_missing_receipt_time(self):
+        payload = body(lat='0', lon='0')
+        _, summary = self.saved_pair(self.upload(payload))
+        saved = json.loads(summary.read_bytes())
+        del saved['_received_at']
+        summary.write_text(json.dumps(saved), encoding='utf-8')
+
+        self.assertEqual(self.upload(payload).status_code, 200)
+        self.assertNotIn('_received_at', json.loads(summary.read_bytes()))
+
+    def test_summary_only_recovery_requires_the_original_gpx(self):
+        original = body(lat="0", lon="0")
+        gpx, summary = self.saved_pair(self.upload(original))
+        before = summary.read_bytes()
+        gpx.unlink()
+
+        changed_track = b'lon="0.0001"'.join(original.rsplit(b'lon="0"', 1))
+        self.assertEqual(self.upload(changed_track).status_code, 409)
+        self.assertEqual(self.upload(original + b"\n").status_code, 409)
+        self.assertFalse(gpx.exists())
+        self.assertEqual(summary.read_bytes(), before)
+
+        retry = self.upload(original)
+        self.assertEqual(retry.status_code, 200)
+        self.assertEqual(self.saved_pair(retry), (gpx, summary))
+        self.assertEqual(gpx.read_bytes(), original)
+        self.assertEqual(summary.read_bytes(), before)
+        self.assertEqual(json.loads(before)["gpx_sha256"], hashlib.sha256(original).hexdigest())
+
+    def test_legacy_summary_without_gpx_requires_a_backup_copy(self):
+        gpx, summary = self.saved_pair(self.upload())
+        record = json.loads(summary.read_bytes())
+        record.pop("gpx_sha256", None)
+        summary.write_text(json.dumps(record), encoding="utf-8")
+        before = summary.read_bytes()
+        gpx.unlink()
+
+        retry = self.upload()
+        self.assertEqual(retry.status_code, 409)
+        self.assertIn("no GPX digest", retry.json["error"])
+        self.assertFalse(gpx.exists())
+        self.assertEqual(summary.read_bytes(), before)
+
+        gpx.write_bytes(body())
+        self.assertEqual(self.upload().status_code, 200)
+        self.assertIn("gpx_sha256", json.loads(summary.read_bytes()))
 
     def test_different_payload_cannot_overwrite_existing_trip(self):
         gpx, summary = self.saved_pair(self.upload())

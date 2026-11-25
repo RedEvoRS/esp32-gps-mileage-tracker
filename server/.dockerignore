@@ -51,6 +51,7 @@ common/**
 !common/version.py
 !common/settings.py
 !common/retention.py
+!common/trip_publication.py
 !common/trip_summary.py
 !common/diagnostics/
 common/diagnostics/**

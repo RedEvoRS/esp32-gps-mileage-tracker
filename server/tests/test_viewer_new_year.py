@@ -169,7 +169,6 @@ class NewYearTests(YearTestBase):
             ('multiple year ends', None, {'recorded_until': '2028-01-01T09:00:00+00:00'}, None),
             ('missing GPX', None, {}, 'missing'),
             ('unreadable GPX', None, {}, 'unreadable'),
-            ('cooldown only', None, {'end_time': (self.CUT - timedelta(seconds=5)).isoformat()}, None),
             ('stationary after midnight', [[(-30, 0, 10, 1), (-10, 400, 10, 1),
                                             (10, 400, 0, 1), (30, 400, 0, 1)]], {}, None),
             ('incomplete timing', None, {'timing_status': 'partial', 'start_time': None}, None),
@@ -361,12 +360,12 @@ class NewYearTests(YearTestBase):
         after = self.recording("after", [[(10, 0, 10, 1), (40, 300, 10, 1)]])
         cooldown = self.recording("cooldown", [[(-90, 0, 10, 1), (-60, 300, 10, 1),
                                                  (-30, 300, 0, 1), (30, 301, 0, 1)]])
-        # Even the first stopped fix after midnight cannot extend movement.
-        sparse = self.recording("sparse", [[(-30, 0, 10, 1), (-10, 200, 10, 1), (290, 201, 0, 1)]])
+        # The first stopped fix can be after midnight without adding distance.
+        sparse = self.recording("sparse", [[(-30, 0, 10, 1), (-10, 200, 10, 1), (290, 200, 0, 1)]])
         crossing = self.recording()
         with patch.object(self.viewer.trip_merges, "parsed_parts", wraps=self.viewer.trip_merges.parsed_parts) as read:
             trips, _ = self.viewer.load_trips()
-        self.assertEqual(read.call_count, 1)
+        self.assertEqual(read.call_count, 3)
         for trip in trips:
             if trip["trip_key"] != crossing:
                 self.assertNotIn("year_shares", trip)
@@ -375,6 +374,23 @@ class NewYearTests(YearTestBase):
         self.assertEqual({t["trip_key"] for t in self.viewer.year_members(trips, [], 2026)[0]},
                          {before, cooldown, sparse, crossing})
         self.assertEqual({t["trip_key"] for t in self.viewer.year_members(trips, [], 2027)[0]}, {after, crossing})
+
+    def test_step_from_last_moving_fix_to_stopped_fix_splits_at_midnight(self):
+        key = self.recording("last-step", [[(-20, 0, 10, 1), (-10, 100, 10, 1),
+                                           (10, 160, 0, 1), (30, 161, 0, 1)]], miles=0.099)
+        trip = self.trip(key)
+        self.assertEqual(datetime.fromisoformat(trip['end_time']), self.CUT - timedelta(seconds=10))
+        self.assertEqual(trip.get('year_shares'), {2026: 0.080, 2027: 0.019})
+        self.close_year(2027)
+        self.assertEqual(self.annotate(key, category='business').status_code, 409)
+
+    def test_legacy_summary_uses_end_time_for_crossing_year_review(self):
+        key = self.recording("legacy", timing_status=None, recorded_until=None)
+        self.assertIn('kept whole in 2026', self.trip(key).get('year_split_note', ''))
+        for year in (2026, 2027):
+            self.assertIn('Drives crossing New Year (1)', self.review(year))
+        self.assertEqual(self.figures(2026)['trip_keys'], [key])
+        self.assertEqual(self.figures(2027)['trip_keys'], [])
 
     def test_timezone_changes_the_cut_without_stale_shares(self):
         key = self.recording()
@@ -712,6 +728,48 @@ class NewYearTests(YearTestBase):
         self.assertEqual(trip["parts"], [first, second])
         self.assertEqual(set(trip["year_shares"]), {2026, 2027})
         self.assertEqual(sum(Decimal(str(s)) for s in trip["year_shares"].values()), Decimal(str(trip["distance_miles"])))
+
+    def test_damaged_merge_counts_as_unreadable_in_every_recorded_year(self):
+        first = self.recording('december', [[(-40, 0, 10, 1), (-20, 200, 10, 1)]])
+        (self.data / '2027-01').rename(self.data / '2026-12')
+        first = first.replace('2027-01', '2026-12')
+        second = self.recording('january', [[(20, 600, 10, 1), (40, 800, 10, 1)]])
+        response = self.post(f'/trip/{first}/merge', next_trip=second)
+        self.assertEqual(response.status_code, 302)
+        merged = response.headers['Location'].split('/trip/')[1].split('?')[0]
+        for suffix in ('.gpx', '.json'):
+            (self.data / (second + suffix)).unlink()
+
+        self.assertEqual([row['year'] for row in self.viewer._year_list()], [2027, 2026])
+        for year in (2026, 2027):
+            self.assertIn(merged, self.review(year))
+            rows = self.csv_rows(f'?year={year}')
+            self.assertEqual([row['row_type'] for row in rows if row['row_type'] != 'total'], ['unreadable'])
+            self.close_year(year)
+        with closing(sqlite3.connect(self.db)) as conn:
+            snapshots = self.viewer.trip_log.closed_years(conn)
+            self.assertEqual([snapshots[year]['snapshot']['unreadable'] for year in (2026, 2027)], [1, 1])
+        self.reopen_year(2026)
+        self.assertEqual(self.post(f'/admin/damaged-merge/{merged}/discard', confirm='yes').status_code, 409)
+
+    def test_unused_merge_blocks_close_and_undo_in_split_parts_new_year(self):
+        first = self.recording('first', [[(-100, 0, 10, 1), (-80, 200, 10, 1)]])
+        crossing = self.recording('crossing')
+        (self.data / '2027-01').rename(self.data / '2026-12')
+        first = first.replace('2027-01', '2026-12')
+        crossing = crossing.replace('2027-01', '2026-12')
+        response = self.post(f'/trip/{first}/merge', next_trip=crossing)
+        self.assertEqual(response.status_code, 302)
+        merged = response.headers['Location'].split('/trip/')[1].split('?')[0]
+        (self.data / '2026-12').rename(self.data / '2026-11')
+
+        for year in (2026, 2027):
+            self.assertEqual(self.post(f'/admin/year/{year}/close', confirm='yes').status_code, 409)
+            self.assertIn('Saved merges under unused month names (1)', self.review(year))
+        # An already-closed year must also lock the saved merge's undo.
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            self.viewer.trip_log.close_year(conn, 2027, 'driver')
+        self.assertEqual(self.post(f'/admin/unused-merge/{merged}/undo', confirm='yes').status_code, 409)
 
     def test_exports_keep_column_positions_and_append_full_miles_in_every_selection(self):
         self.recording()

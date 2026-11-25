@@ -422,6 +422,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   uploads may use a custom ID outside that namespace (installer test uploads are
   untimed copies of `sample.gpx`). Every upload looks for its ID in all month
   folders under the upload lock, so a `DISPLAY_TZ` change can't duplicate a trip.
+  Summaries store the raw GPX's SHA-256 digest. A retry with only the summary
+  left must match its digest. A legacy summary without a digest stays intact
+  and returns 409 until the original GPX is restored from backup.
   Internal aliases count once; an outside or looping month link refuses all
   GPX uploads with 503 naming the folder until repaired, and a new trip whose
   month folder links to a differently named folder gets the same 503 (it would
@@ -475,6 +478,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   a trip in that DB; it never touches `./data`. At local New Year in `DISPLAY_TZ`,
   a fully timed drive's saved miles are divided by counted GPX distance between
   the two years; All years keeps one full trip, and closing either year locks it.
+  The counted step into a stopped fix can cross midnight. Older summaries
+  without `recorded_until` use `end_time` to check for a crossing.
   A drive that cannot be split stays whole with a reason; one whose counted miles
   are all after midnight counts and locks only in the new year. Exports append a split drive's
   full miles as `trip_distance_miles` after `received_after_close`.
@@ -506,18 +511,21 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   notices excluded from miles and missing counts, with admin undo, only when
   every part is counted under another name and both files match saved stamps.
   A missing folder alone remains damage; direct trip loads and undo agree.
-  Unused-name merges block closing their saved-summary year and each part's
-  year (every year if the saved year is unknown). Notice miles stay in text,
-  outside numeric totals. Admin discard of damage and unused-name undo keep
-  the full summary in history before deletion in the same transaction; year
+  Unused-name merges block closing their saved-summary year and every year
+  with counted mileage from a replacement part (every year if the saved year
+  is unknown). Damaged merges count as unreadable in each year spanned by the
+  saved recording. Notice miles stay in text, outside numeric totals.
+  Admin discard of damage and unused-name undo keep the full summary in
+  history before deletion in the same transaction; year
   review and exports say which parts are currently counted again.
   A file occupying a month name, or a folder whose owner/mode denies ingest
   writing, is a notice with no missing count or merge block. Write notices
   reuse scanned metadata, never W_OK on the viewer's read-only mount.
-  Closing a year
-  saves its totals
-  in `tax_years.snapshot`; the year review compares saved and current totals,
-  and lists trips received after the close (ingest `_received_at` later than
+  Closing a year saves its totals in `tax_years.snapshot`. The close scan and
+  ingest publication share a lock on the data directory.
+  Ingest stamps `_received_at` when publishing the summary and preserves it on
+  verified retries. The year review compares saved and current totals and
+  lists trips received after the close (ingest `_received_at` later than
   `closed_at`), undated trips and trips inside a merge. Exports mark late trips
   in `received_after_close`; late trips still count and stay
   un-annotatable (409) until the year is reopened. Every response sends
@@ -629,7 +637,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   Outside links under `data/` are reported and counted in `INFO` as
   `links_not_backed_up`; their contents are absent. Copy and deep check still
   run and `last-success` advances, but the run exits non-zero without a
-  heartbeat. A failed coverage check records `unknown` ("not checked"); missing
+  heartbeat. If a backup run by the installer just completed with only linked
+  items missing, install warns and continues. `install.sh --check` still reports
+  the failed status. A failed coverage check records `unknown` ("not checked"); missing
   or unreadable backup information is `unavailable`, not a failed link check.
   Absolute internal aliases get warning-only restore advice; their real targets
   may be saved at their own paths. Failure of advice only warns in backup, check
@@ -664,8 +674,10 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   `REMOTE_PRUNE=yes` uses rsync deletion limited to selected snapshot names,
   never the remote root, and refuses with a warning when the remote has snapshots
   newer than or missing from the local set. rsync has a
-  600 s I/O timeout, the unit 6 h. Restore saves a corrupt live DB's raw files
-  in the pre-restore folder and continues; its scratch is under `$BACKUP_DIR`.
+  600 s I/O timeout, the unit 6 h. Each restore gets its own pre-restore folder
+  and saves only the live DBs and trip files the snapshot replaces; a corrupt
+  live DB it replaces keeps its raw files there. A DB missing from the snapshot
+  is left unchanged and reported. Scratch is under `$BACKUP_DIR`.
 - Port binding: `BIND_ADDR` in `.env` sets the host IP published ports bind
   on (unset = all interfaces). Optional `VIEWER_BIND_ADDR` overrides only
   viewer port 8091 (empty falls back to BIND_ADDR, then all interfaces);
@@ -686,7 +698,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   `manage_users.py` manages everyday accounts. CSRF on POSTs; 5 failures lock
   an IP for 15 min via shared SQLite `login_attempts`. Failures count until a
   15-minute pause without one; the next failure starts a fresh count. A success
-  clears only its own username's failures. App fail-fasts if auth config is
+  clears only its own username's failures. Everyday password changes recheck
+  the IP lock and clear failures in the same transaction as the password update.
+  App fail-fasts if auth config is
   missing or the admin hash lost its `$` chars.
   Optional `.env` `VIEWER_TRUSTED_PROXIES` accepts comma-separated IPv4/IPv6
   IPs/CIDRs: only trusted peers may supply X-Forwarded-For; use the rightmost

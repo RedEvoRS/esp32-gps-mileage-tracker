@@ -66,12 +66,14 @@ def session_tag(secret_key, user):
     return hmac.new(secret_key.encode("utf-8"), payload.encode("utf-8"), "sha256").hexdigest()[:32]
 
 
-def change_user(db_path, action, username, password=None, admin_username="", expected_tag=None, secret_key=None):
+def change_user(db_path, action, username, password=None, admin_username="", expected_tag=None, secret_key=None,
+                *, before_update=None):
     """Serialize mutations with session revocation and optional stale-session check.
 
     Hash before reserving the writer, so slow scrypt does not block requests.
     The own-password form supplies its session tag: a concurrent reset must
     never be overwritten by a request authenticated under the old password.
+    Its before_update callback checks the IP lockout in this transaction.
     """
     if action not in {"add", "reset-password", "disable", "enable", "remove"}:
         raise UserError("Unknown command.", 2)
@@ -102,6 +104,8 @@ def change_user(db_path, action, username, password=None, admin_username="", exp
                 conn.execute("UPDATE users SET session_version=session_version+1 WHERE username=?", (username,))
                 conn.execute("DELETE FROM users WHERE username=?", (username,))
             elif action == "reset-password":
+                if before_update is not None:
+                    before_update(conn)
                 conn.execute("UPDATE users SET password_hash=?, session_version=session_version+1, updated_at=? WHERE username=?",
                              (password_hash, now, username))
             else:

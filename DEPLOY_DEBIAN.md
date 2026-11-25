@@ -298,7 +298,9 @@ Setup verifies the bundle against that release's `SHA256SUMS`, shows the
 old/new versions and asks before copying. Server files go directly into
 `~/mileage-tracker/`; firmware sources and the version-stamping tool go in
 `firmware-src/`. Use `bash setup.sh --dir "$HOME/mileage-tracker"` to choose
-a different destination. The flash helpers accept only simple paths, so setup
+a different destination. Setup checks both destination trees for conflicting
+paths, such as a symlink where a release file belongs, before it copies any
+release files. The flash helpers accept only simple paths, so setup
 refuses a destination that contains anything but letters, digits, `_`, `.`, `-`
 and `/` (a space, for example) and installs nothing. They also need an SSH
 hostname or IPv4 address.
@@ -859,8 +861,10 @@ recording's final timestamp (`recorded_until`). Older summaries fall back to
 `end_time` (last movement), never upload time. Both GPX files and reliable
 start/device information are required. An unreadable summary blocks merging
 only if its device is unknown or it could be an intervening trip from this
-device; repair that summary first. A folder warning also blocks suggestions
-until the folder is fixed. The trip page explains the block.
+device; repair that summary first. A folder problem that leaves trips
+unreadable also blocks suggestions until the folder is fixed. When two saved
+month names point to the same folder, healthy trips under the name in use can
+still have suggestions. The trip page explains any block.
 You can repeat the action to build a chain. The merged trip replaces its parts
 in the list, map, CSV/XLSX exports and totals. Old part links lead to it.
 Export records remain traceable: `trip_id` is the first source trip ID and
@@ -1886,9 +1890,13 @@ bash ~/mileage-tracker/backup/restore.sh restore latest
 `latest` means the newest snapshot on the off-host copy that holds trips. You
 can also name one (`2026-10-06T103000Z`) or give a path. It runs the same checks as
 `restore.sh check`, asks you to type `RESTORE`, and stops ingest, viewer and
-any installed monitor. It saves all current databases before replacing any,
-and saves trip files it would overwrite under
-`~/mileage-backups/pre-restore-<time>/`. It restores databases through SQLite's
+any installed monitor. Backup and restore share a lock in `BACKUP_DIR`, and
+restore holds it until services have restarted. If either is already running,
+wait for it to finish before retrying. Each restore creates its own
+`~/mileage-backups/pre-restore-<time>-<suffix>/` and saves the current copies
+of the databases and trip files it will replace. It compares trip file contents
+so it can replace and save a damaged file even if its size and timestamp match.
+It restores databases through SQLite's
 backup API with their writers stopped: the ingest helper writes events.db;
 the viewer and monitor helpers write their own databases. It starts the default
 services again and restarts the monitor if it was running. A saved monitor DB
@@ -2051,11 +2059,10 @@ questions do. Metrics has no question of its own: its token is generated and
 kept in `monitor.env`, never printed.
 
 The questions and the monitor use the same settings rules. The installer
-checks them with host Python, or one disposable Python container on Unraid;
-it reuses that checker across questions and sends secrets on standard input.
-The checker starts only when settings need reading or an output is chosen.
-A check with no selected monitor file, or a fresh install choosing `none`,
-does not start it. An existing monitor's heartbeat is still checked.
+starts the checker when it reads the Address lookup settings in install
+and check mode. It uses host Python when available or one disposable Python
+container on Unraid, reuses the checker for Notifications, and sends secrets
+on standard input. An existing monitor's heartbeat is still checked.
 Topic names and bundled phone usernames use 1–64 letters, digits, `_` or `-`.
 The phone password needs at least eight characters and is stored by ntfy,
 not in `monitor.env`. Silence accepts at least one second (`1/86400` days)
@@ -2755,6 +2762,11 @@ If the warning says there's no GPX either, put the GPX back from a backup
 snapshot first (Step 10), then send it as above. Without it, ingest answers
 409 (`trip ID has a damaged summary and no GPX to match`).
 
+When the summary is readable and only the GPX is missing, ingest can restore
+the GPX directly from an upload if its SHA-256 digest matches the saved digest.
+For older summaries with no digest, ingest returns 409 and keeps the summary
+as saved. Use the same backup steps to put the original GPX back in place.
+
 ```bash
 ls ~/mileage-backups/snapshots/*/data/$TRIP.gpx      # the snapshots that have it
 sudo cp -p ~/mileage-backups/snapshots/<time>/data/$TRIP.gpx data/$TRIP.gpx
@@ -2906,8 +2918,10 @@ merge's name is back in use.
 
 The year review lists each unused-name merge separately, with its saved miles,
 purpose and month name. These are excluded from totals; its parts count separately.
-Closing its saved-summary year and every year containing a part is refused
-until the name is restored or the admin uses **Undo saved merge**. An unknown saved year blocks every year;
+Closing its saved-summary year, or any year with counted mileage from a
+replacement part, is refused until the name is restored or the admin uses
+**Undo saved merge**. A part that crosses New Year blocks each year it has
+counted mileage in, which can be both. An unknown saved year blocks every year;
 reopening stays possible. It adds no unreadable-file count.
 Saved removals under an unused name are not applied, like annotations under
 that name, so the parts of a formerly removed merge count again. Its saved

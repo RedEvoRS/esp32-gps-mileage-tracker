@@ -98,7 +98,12 @@ so they can never be left partially written:
   of truth that any map tool can open directly)
 - `/data/YYYY-MM/<id>.json` — a derived summary (distance, duration,
   speeds, bounding box) so other tools can list and total trips without
-  re-parsing every track
+  re-parsing every track. It also stores a SHA-256 digest of the original GPX.
+
+If only the summary remains, re-uploading the trip restores the GPX only
+if its digest matches. A legacy summary without a digest yields HTTP 409
+and keeps its saved totals. Restore the original GPX from a backup to recover
+the track. A byte-for-byte retry with that GPX in place adds the digest.
 
 Ingest refuses trip and diagnostics folders or files that resolve outside its data folder.
 
@@ -281,10 +286,11 @@ escaping backslashes as `\\`, double quotes as `\"`, and dollars as `$$`.
 Keep one setting per line and use literal values rather than `$OTHER` or
 `${OTHER}` references: the installer reports those as ambiguous rather than
 guessing Compose's interpolation context. Full examples and error behavior
-are in DEPLOY_DEBIAN.md Step 11b. On Unraid, one disposable Python checker
-serves all Notifications questions; secrets travel on stdin, never argv.
-The checker stays off when `--check` has no selected monitor file and when a
-fresh install chooses no outputs. Existing monitor heartbeat checks still run.
+are in DEPLOY_DEBIAN.md Step 11b. On Unraid without host Python, the installer
+starts one disposable Python checker when it reads the Address lookup settings
+and reuses it for Notifications. Address lookup runs during install and
+`--check` even when lookup is off and no Notifications outputs are configured.
+Secrets travel on stdin, never argv. Existing monitor heartbeat checks still run.
 
 Optionally, the monitor also sends diagnostics as GELF (Graylog Extended Log
 Format) to a Graylog you run elsewhere (`GRAYLOG_*` in `monitor.env`, off by
@@ -779,14 +785,16 @@ including straight-line estimates across GPS gaps; a step crossing midnight
 is divided by time. The old-year share is rounded to three decimals and the
 new-year share is the remainder, rounded to three decimals. This preserves
 the saved total even for older summaries and merged drives. Nothing is written
-to the trip files or database. A stationary cooldown past midnight does not
-split a drive whose movement ended before midnight.
+to the trip files or database. A step from the last moving fix to a stopped fix
+can add mileage after midnight. A stationary cooldown with no counted distance
+after midnight leaves the drive in its start year.
 
 Splitting requires complete timing, a readable valid GPX and exactly one year
 end. Otherwise the drive stays whole in its start year (or the first recorded
 year for partial timing), with a short note explaining why it could not be
-split. If one share rounds to zero, the drive is not split and the year with
-the miles counts all of it. That can be the new year: a drive that starts
+split. For older summaries without `recorded_until`, the viewer uses the saved
+end time to check whether the drive crosses midnight. If one share rounds to
+zero, the year with the miles counts all of it. That can be the new year: a drive that starts
 just before midnight with no counted miles until after it shows its December
 31 date but counts, and locks, only in the new year, with a note saying so.
 Its `trip_distance_miles` stays blank because it is not split. This applies only to trips the
@@ -1031,9 +1039,10 @@ one old month must match one unambiguous counted folder. A surviving alias
 must reach that folder; after its link is removed, the saved file stamps
 are the remaining evidence (the database stores no historical folder identity).
 A deleted real folder, partial matches, changed files or unreadable parts
-remain damaged merges: they count as missing mileage, appear in year review
-and close snapshots, block uncertain merge suggestions, and cannot be undone
-through **Undo saved merge**. Ordinary **Undo merge (split back)** is also
+remain damaged merges. They count as missing mileage in the year review and
+close snapshot of each year spanned by the saved recording. They block
+uncertain merge suggestions and cannot be undone through **Undo saved merge**.
+Ordinary **Undo merge (split back)** is also
 refused for damage, for both roles. The admin can use **Discard damaged merge**
 after confirming that parts with readable summaries return separately with
 annotations saved under their names; parts without readable summaries do not.
@@ -1124,8 +1133,8 @@ category and recovery advice. Miles stay blank in CSV and XLSX numeric cells;
 saved miles appear only in the note. XLSX shows the notice in **Unreadable
 trips**, outside **Mileage** and **Totals**. The year review lists each merge
 in **Saved merges under unused month names**, with its saved miles, purpose
-and month name; its parts count separately. Closing its saved-summary year
-or any year containing one of its parts is refused until the name is restored
+and month name; its parts count separately. Closing its saved-summary year or
+any year with counted mileage from a replacement part waits until the name is restored
 or the admin uses **Undo saved merge**.
 If the saved year is unknown, every year is blocked. Reopening stays possible.
 Saved removals under an unused name are not applied, like annotations under
@@ -1195,8 +1204,10 @@ nothing is hidden, but it is not silent either:
 - The year review has a **Received after this year was closed** section listing
   each such trip (when the server received it, its distance, its category) with
   a link. A trip counts as late when ingest stored it after the moment the year
-  was closed. A trip whose summary has no received time (stored by an older
-  ingest) is never listed as late.
+  was closed. Closing takes a snapshot between uploads, and receipt time is
+  set when ingest publishes the trip summary. Retrying the same upload keeps
+  the original receipt time. A trip whose summary has no received time (stored
+  by an older ingest) is never listed as late.
 - The CSV and XLSX exports have a column, `received_after_close`, set to
   `yes` for those trips and blank for the rest. In the CSV it comes after
   `row_type`; `trip_distance_miles` follows it. With a year selected, the flag
@@ -1269,9 +1280,10 @@ The limit is the named `MERGE_MAX_GAP` constant in `trip_merges.py`. Older
 summaries without that timestamp use `end_time`, the last moving point, as
 a conservative fallback. Upload/receipt times are never used. Overlapping
 recordings, unknown device identities or unknown start times cannot be merged.
-A folder problem that leaves trips unreadable, or a conflict between saved
-month names, blocks merge suggestions with a
-folder-specific message until the folder is fixed. An unreadable summary blocks merging when its device is
+A folder problem that leaves trips unreadable blocks merge suggestions with a
+folder-specific message until the folder is fixed. When two saved month names
+point to the same folder, healthy trips under the name in use can still have
+merge suggestions. An unreadable summary blocks merging when its device is
 unknown, or when it
 belongs to this device and could fall between these recordings. Usable start
 times or UTC timestamp trip IDs can rule out damage outside that interval;
@@ -1904,8 +1916,11 @@ history and does not verify every snapshot.
 file and database, and reports annotation/event counts and monitor state tables
 without changing live data. `backup/restore.sh restore` runs those checks,
 requires `RESTORE` confirmation (or `--yes`), stops ingest, viewer and any
-installed monitor, and saves current databases and replaced trip files under
-`pre-restore-<time>/` before restoring. Database writes use the owning service's
+installed monitor, and saves the databases and trip files it will replace in
+its own `pre-restore-<time>-<suffix>/` folder under `BACKUP_DIR`. Restore
+compares trip file contents, including when size and timestamp match. If a
+backup or restore is already running, wait for it to finish before retrying.
+Database writes use the owning service's
 throwaway container; an already running monitor is restarted afterward. On a
 replacement server, a saved monitor DB can populate its volume without enabling
 the monitor. Older snapshots still restore trips and annotations: missing new

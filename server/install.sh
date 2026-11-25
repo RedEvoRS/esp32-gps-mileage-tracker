@@ -531,7 +531,7 @@ preflight() {
 
     # COMMIT is optional: archives supply it, but hand copies can use VERSION alone.
     local f missing=()
-    for f in VERSION stamp_version.py common/version.py common/settings.py common/retention.py common/trip_summary.py docker-compose.yml .dockerignore .env.example viewer.env.example monitor.env.example sample.gpx \
+    for f in VERSION stamp_version.py common/version.py common/settings.py common/retention.py common/trip_publication.py common/trip_summary.py docker-compose.yml .dockerignore .env.example viewer.env.example monitor.env.example sample.gpx \
         common/__init__.py common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json} \
         mileage-ingest/{Dockerfile,app.py,diag_store.py,reset_high_water.py,requirements.txt} \
         mileage-viewer/{Dockerfile,app.py,geocoding.py,trip_merges.py,trip_log.py,users.py,manage_users.py,diagnostics_settings.py,requirements.txt} \
@@ -2440,6 +2440,7 @@ unraid_backup_log() {
 
 verify_unraid_backups() {
     local status key value last='' attempt='' dir recorded
+    local coverage_only=${1:-no}
     local backup_info_problem_reported=no
     if unraid_cron_current; then
         ok "Persistent backup cron file matches this install and both entries are loaded"
@@ -2467,6 +2468,8 @@ verify_unraid_backups() {
     done <<< "$status"
     if [[ $attempt == running ]]; then
         warn "A scheduled backup is running; its final status is not verified yet"
+    elif [[ $MODE == install && $coverage_only == yes && $attempt == 1 ]]; then
+        warn "The scheduled backup finished with incomplete link coverage"
     elif [[ $attempt != 0 ]]; then
         unraid_backup_log
         problem "The last scheduled backup failed or has never run (status: ${attempt:-missing})" "Run: bash $SCRIPT_DIR/backup/scheduled.sh"
@@ -2488,7 +2491,7 @@ verify_unraid_backups() {
 }
 
 setup_unraid_backups() {
-    local first=no refresh=no began
+    local first=no refresh=no began coverage_only=no
     [[ $SCRIPT_DIR =~ ^/[-a-zA-Z0-9_./]+$ && $SCRIPT_DIR != *'/../'* ]] \
         || die "The install path must be a simple absolute path for the persistent cron entries."
     if [[ $MODE == check ]]; then
@@ -2512,12 +2515,13 @@ setup_unraid_backups() {
         if ! bash "$SCRIPT_DIR/backup/scheduled.sh" < /dev/null; then
             unraid_backup_log
             show_backup_deep_check "$began" || die "The scheduled backup failed. Fix the destination or backup.conf and rerun."
+            coverage_only=yes
         fi
         FIRST_BACKUP=yes
         restore_test
         install_unraid_cron
     fi
-    verify_unraid_backups
+    verify_unraid_backups "$coverage_only"
 }
 
 # Where the backup units go, and where their template expects the files.
@@ -2787,8 +2791,11 @@ install_backup_timer() {
         as_root journalctl -u "$unit.service" -n 20 --no-pager 2>&1 | indent || true
         show_backup_deep_check "$began" || die "The backup failed when systemd ran it (log above)." \
             "journalctl -u $unit.service has the whole log."
+        # Scoped to this setup_backups call, which next verifies the unit.
+        coverage_only=yes
+    else
+        ok "The backup works when systemd runs it"
     fi
-    ok "The backup works when systemd runs it"
 }
 
 show_backup_deep_check() {
@@ -2833,6 +2840,7 @@ show_backup_deep_check() {
 
 verify_backups() {
     local unit backup_dir last age next
+    local coverage_only=${1:-no}
     local backup_info_problem_reported=no
     unit=$(backup_unit)
     if ! timer_ok; then
@@ -2857,8 +2865,12 @@ verify_backups() {
         backup_info_problem_reported=yes
     fi
     if systemctl is-failed --quiet "$unit.service" 2> /dev/null; then
-        problem "The last backup failed" "To see why: journalctl -u $unit.service -n 30"
-        backup_info_problem_reported=yes
+        if [[ $MODE == install && $coverage_only == yes ]]; then
+            warn "The systemd backup finished with incomplete link coverage"
+        else
+            problem "The last backup failed" "To see why: journalctl -u $unit.service -n 30"
+            backup_info_problem_reported=yes
+        fi
     fi
     backup_dir=$(conf_get BACKUP_DIR)
     backup_dir=${backup_dir:-$HOME/mileage-backups}
@@ -2891,6 +2903,7 @@ ask_backups() {
 }
 
 setup_backups() {
+    local coverage_only=no
     section "Backups"
     if [[ $MILEAGE_PLATFORM == unraid ]]; then setup_unraid_backups; return; fi
     if [[ $(id -u) != "$CONTAINER_UID" ]]; then
@@ -2932,7 +2945,7 @@ setup_backups() {
             restore_test
         fi
     fi
-    verify_backups
+    verify_backups "$coverage_only"
 }
 
 # --- Notifications -----------------------------------------------------

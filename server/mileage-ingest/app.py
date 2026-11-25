@@ -30,7 +30,7 @@ reuse their original directory even if the month or DISPLAY_TZ has changed:
     <id>.json   { trip_id, device_id, start_time, end_time, recorded_until,
                   duration_seconds, distance_miles, max_speed_mph,
                   avg_speed_mph, timing_status, timed_from, num_points, bbox{...}, gpx_file,
-                  summary_version, _received_at, _received_from }
+                  summary_version, gpx_sha256, _received_at, _received_from }
 
 Distance is the haversine sum over consecutive fixes, with three rules
 (see summarize()): steps where the vehicle wasn't moving are GPS jitter
@@ -70,6 +70,7 @@ for import_root in (Path(__file__).resolve().parent.parent, Path(__file__).resol
         sys.path.insert(0, str(import_root))
 
 from common.version import server_version
+from common.trip_publication import trip_publication_lock
 from common.trip_summary import (
     parse_gpx, summarize, MAX_UPLOAD_TEXT,
 )
@@ -623,6 +624,7 @@ def upload_trip():
     device_id = request.headers.get("X-Device-Id") or (parsed["creator"] or "unknown")
 
     anchor = identity_dt or parsed["metadata_time"]
+    gpx_sha256 = hashlib.sha256(raw).hexdigest()
     trip_id = None if anchor else request.headers.get("X-Trip-Id")
     if not trip_id:
         # Fall back to the earliest recorded point time, then metadata time. This is
@@ -637,11 +639,9 @@ def upload_trip():
             # body content rather than the wall clock, so a retried
             # upload of the same file is idempotent instead of creating
             # a duplicate under a new received-at name.
-            trip_id = "untimed-" + hashlib.sha256(raw).hexdigest()[:12]
+            trip_id = "untimed-" + gpx_sha256[:12]
 
-    safe_id = _safe_id(trip_id) or (
-        "untimed-" + hashlib.sha256(raw).hexdigest()[:12]
-    )
+    safe_id = _safe_id(trip_id) or ("untimed-" + gpx_sha256[:12])
     if anchor is None and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}Z", safe_id):
         return jsonify(error="untimed X-Trip-Id cannot use the timestamp trip ID namespace"), 400
 
@@ -666,7 +666,7 @@ def upload_trip():
         "trip_id": trip_id,
         "device_id": device_id,
         "gpx_file": f"{safe_id}.gpx",
-        "_received_at": datetime.now(timezone.utc).isoformat(),
+        "gpx_sha256": gpx_sha256,
         "_received_from": request.remote_addr,
     }
     record.update(summary)
@@ -701,6 +701,7 @@ def upload_trip():
             # immutable source (including sanitized-ID/device collisions).
             if gpx_file.exists() and gpx_file.read_bytes() != raw:
                 return jsonify({"error": "trip ID already contains different GPX data"}), 409
+            existing = None
             if json_file.exists():
                 existing = _stored_summary(json_file)
                 if existing is None:
@@ -714,14 +715,25 @@ def upload_trip():
                 elif existing["trip_id"] != trip_id or existing["device_id"] != device_id:
                     return jsonify({"error": "trip ID belongs to another trip or device"}), 409
                 else:
-                    # Keep the original receipt metadata on harmless retries.
-                    record["_received_at"] = existing.get("_received_at", record["_received_at"])
+                    if not gpx_file.exists():
+                        stored_digest = existing.get("gpx_sha256")
+                        if stored_digest is None:
+                            return jsonify(error="trip ID has no GPX digest; restore the original GPX from backup"), 409
+                        if stored_digest != gpx_sha256:
+                            return jsonify(error="trip ID's saved GPX digest does not match the upload"), 409
+                    # Keep the original receipt metadata, including unknown
+                    # receipt times on summaries written by older versions.
+                    if "_received_at" in existing:
+                        record["_received_at"] = existing["_received_at"]
                     record["_received_from"] = existing.get("_received_from", record["_received_from"])
             # GPX first: failed summary writes can be repaired by a retry.
             # Each write is durable before a 200 lets firmware delete its copy.
-            if not gpx_file.exists():
-                _atomic_write_bytes(gpx_file, raw)
-            _atomic_write_json(json_file, record)
+            with trip_publication_lock(root):
+                if not gpx_file.exists():
+                    _atomic_write_bytes(gpx_file, raw)
+                if existing is None:
+                    record["_received_at"] = datetime.now(timezone.utc).isoformat()
+                _atomic_write_json(json_file, record)
     except UnwritableMonthError as e:
         message = (f"month folder {e} cannot be written to; new trips for this month are refused "
                    "until its owner and permissions are fixed")

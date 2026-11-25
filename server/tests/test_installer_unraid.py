@@ -324,6 +324,50 @@ class InstallerUnraid(unittest.TestCase):
                                            ("2", "passed", "2000-01-01T00:00:00Z")):
                     self.run_step(common + route, ok=False, LINKS=links, DEEP=deep, STAMP=stamp)
 
+    def test_install_verification_allows_just_run_link_coverage_failure(self):
+        (self.work / "backup/scheduled.sh").write_text(
+            'if [[ ${1:-} == --status ]]; then cat "$WORK/status"; else bash "$WORK/backup/backup.sh"; fi\n')
+        (self.work / "backup/backup.sh").write_text(
+            'if [[ ${1:-} == --check-target ]]; then exit 0; fi\n'
+            'stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)\n'
+            'echo "$stamp" > "$WORK/backup/last-success"\n'
+            'printf "last_attempt_status=1\\nlast_success=%s\\nlast_backup_links_not_backed_up=2\\n'
+            'last_deep_check_result=passed\\n" "$stamp" > "$WORK/status"\nexit 1\n')
+        common = r'''
+            restore_test() { :; }
+            ensure_backup_target() { :; }
+            CONTAINER_UID=$(id -u)
+            install_backup_units() { :; }
+            as_root() { "$@"; }
+            systemctl() {
+                if [[ $1 == start ]]; then bash "$WORK/backup/backup.sh"
+                else return 0
+                fi
+            }
+            journalctl() { :; }
+            timer_ok() { [[ -f $WORK/status ]]; }
+            timer_current() { :; }
+            backup_units_current() { :; }
+        '''
+        for platform, failure in (("unraid", "The last scheduled backup failed"),
+                                  ("debian", "The last backup failed")):
+            with self.subTest(platform=platform):
+                if platform == "unraid":
+                    self.conf()
+                else:
+                    self.conf(backup=str(self.work / "backup"))
+                (self.work / "status").unlink(missing_ok=True)
+                self.loaded.write_text("")
+                out = self.run_step(common + "setup_backups; echo continued", MILEAGE_PLATFORM=platform)
+                self.assertIn("2 linked item(s) are not in this backup", out)
+                self.assertIn("continued\n", out)
+                self.assertIn("FAILURES=0", out)
+                out = self.run_step(common + "MODE=check; setup_backups", MILEAGE_PLATFORM=platform)
+                self.assertIn(failure, out)
+                self.assertIn("FAILURES=1", out)
+                out = self.run_step(common + "setup_backups", ok=False, MILEAGE_PLATFORM=platform)
+                self.assertIn(failure, out)
+
     def test_unknown_link_coverage_warns_in_check_mode(self):
         self.conf()
         self.scheduled(status="1")

@@ -2448,7 +2448,7 @@ Preserve catalog-version compatibility when restoring.
 
 `restore.sh` checks manifests and saved databases, stops ingest/viewer and any
 discovered monitor writer, saves safety snapshots of the current databases
-before replacing any, and restores with the owning service's helpers. It then
+that the snapshot will replace before replacing any, and restores with the owning service's helpers. It then
 restarts the default services and a monitor only if previously running. Unknown
 monitor discovery skips monitor replacement and monitor service actions; manual
 recovery is in [DEPLOY_DEBIAN.md Step 10](DEPLOY_DEBIAN.md#step-10--backups).
