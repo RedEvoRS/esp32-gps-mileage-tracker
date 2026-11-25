@@ -1646,8 +1646,9 @@ during a fix loss on the next drive. These checks still need the board.
 
 #### Expected boot log
 
-If startup cannot verify battery detection or battery voltage measurement,
-it names the setting in a serial warning and reports E2010.
+If startup cannot verify battery detection, battery voltage measurement or
+the PMU's TS pin setup, it names the setting in a serial warning and reports
+E2010. TS setup waits for confirmation that charging is paused.
 
 Illustrative; free space, attempt count and timing vary:
 

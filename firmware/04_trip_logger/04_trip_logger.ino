@@ -3655,6 +3655,28 @@ static BatterySetup configureBatteryMeasurements() {
     return ready;
 }
 
+static bool configureTsFixedInput() {
+    constexpr auto tsReg = XPOWERS_AXP2101_TS_PIN_CTRL;
+    constexpr auto adcReg = XPOWERS_AXP2101_ADC_CHANNEL_CTRL;
+    for (unsigned attempt = 0; attempt < PMU_PERIPHERAL_ATTEMPTS; ++attempt) {
+        if (attempt) delay(PMU_PERIPHERAL_RETRY_MS);
+        // XPowersLib begin() ignores the TS setup result. Keep the signed raw
+        // reads so a failed read cannot turn into a write back from 0xFF.
+        const int ts = PMU.readRegister(tsReg);
+        const int adc = PMU.readRegister(adcReg);
+        if (ts < 0 || adc < 0) continue;
+        if (pmu_read::tsFixedInputReady(ts, adc)) return true;
+        if ((ts & pmu_read::tsModeMask) != pmu_read::tsFixedInput)
+            PMU.writeRegister(tsReg, uint8_t((ts & ~pmu_read::tsModeMask) | pmu_read::tsFixedInput));
+        if (adc & pmu_read::tsAdcEnable)
+            PMU.writeRegister(adcReg, uint8_t(adc & ~pmu_read::tsAdcEnable));
+        const int tsReadback = PMU.readRegister(tsReg);
+        const int adcReadback = PMU.readRegister(adcReg);
+        if (pmu_read::tsFixedInputReady(tsReadback, adcReadback)) return true;
+    }
+    return false;
+}
+
 void setup() {
     // VBUS-insert power-on brings the Supreme's LoRa rail up ON. Disable
     // and verify it as the first PMU operation after bounded bus recovery
@@ -3771,6 +3793,15 @@ void setup() {
             Serial.println("WARNING: charger disable still unconfirmed after 5 s; continuing startup and reporting E2008.");
         }
     }
+    // Changing TS to a fixed input can remove a hardware charger hold.
+    // Wait for confirmed charger pause, including the bounded recovery above,
+    // so the die-temperature guard controls when charging can resume.
+    const bool tsReady = gEarlyChargeDisabled && configureTsFixedInput();
+    if (!tsReady) {
+        Serial.println(gEarlyChargeDisabled
+            ? "WARNING: PMU TS fixed-input setup unconfirmed after 3 attempts."
+            : "WARNING: PMU TS fixed-input setup skipped because charger pause is unconfirmed.");
+    }
     gRtc.printBootStatus();
     Serial.printf("%sLoRa rail (ALDO3) verified off; SD rail (BLDO1) %s; VBACKUP %s.\n",
                   sdRailOff && vbackupOff ? "" : "WARNING: ",
@@ -3797,7 +3828,7 @@ void setup() {
     // Enable the measurements the battery/VBUS predicates and the charge
     // temperature guard rely on.
     const bool measurementsReady = configurePmuMeasurements();
-    const bool pmuPeripheralWarning = !gpsRailReady || !measurementsReady ||
+    const bool pmuPeripheralWarning = !gpsRailReady || !measurementsReady || !tsReady ||
                                       !batterySetup.detection || !batterySetup.voltage;
     setupPmuIrq();
     // Seed VBUS state from hardware: a battery-only boot (e.g. wake via

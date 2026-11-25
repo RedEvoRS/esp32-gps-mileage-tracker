@@ -540,6 +540,7 @@ constexpr uint8_t XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL = 0x18;
 constexpr uint8_t XPOWERS_AXP2101_STATUS1 = 0x00;
 constexpr uint8_t XPOWERS_AXP2101_STATUS2 = 0x01;
 constexpr uint8_t XPOWERS_AXP2101_ADC_CHANNEL_CTRL = 0x30;
+constexpr uint8_t XPOWERS_AXP2101_TS_PIN_CTRL = 0x50;
 constexpr uint8_t XPOWERS_AXP2101_BAT_DET_CTRL = 0x68;
 constexpr uint8_t XPOWERS_AXP2101_LDO_ONOFF_CTRL0 = 0x90;
 constexpr uint8_t XPOWERS_AXP2101_LDO_VOL0_CTRL = 0x92;
@@ -591,8 +592,9 @@ struct XPowersAXP2101 {
                 registerReadOverride[reg] &= ~value;
             return 0;
         }
-        assert(reg == 0x50 || reg == 0x30); // debug TS setup only
-        registerReadOverride[reg] = value;
+        assert(reg == XPOWERS_AXP2101_TS_PIN_CTRL || reg == XPOWERS_AXP2101_ADC_CHANNEL_CTRL);
+        if (reg == XPOWERS_AXP2101_TS_PIN_CTRL) tsControl = value;
+        else adcChannels = value;
         return 0;
     }
     int readRegister(uint8_t reg) {
@@ -601,7 +603,7 @@ struct XPowersAXP2101 {
         if (onRegisterRead) onRegisterRead(reg);
         if (failRegisterReadAt.count(reg) && failRegisterReadAt[reg] == call) return -1;
         if (registerReadOverride.count(reg)) return registerReadOverride[reg];
-        if (reg == 0x50) return 0x10; // XPowersLib init: external TS, bias off
+        if (reg == XPOWERS_AXP2101_TS_PIN_CTRL) return tsControl;
         if (reg == XPOWERS_AXP2101_ADC_CHANNEL_CTRL) return adcChannels;
         if (reg == XPOWERS_AXP2101_BAT_DET_CTRL) return batteryDetection;
         if (reg == 0x36) return 0x04;
@@ -644,6 +646,7 @@ struct XPowersAXP2101 {
     int aldo4Mv = 1800, bldo1Mv = 1800;
     unsigned failAldo4VoltageWrites = 0;
     uint8_t adcChannels = 0x1d; // existing non-TS ADC channels
+    uint8_t tsControl = 0x10; // normal XPowersLib init: external TS, bias off
     bool batteryDetection = true;
     unsigned failBatteryDetectionWrites = 0, failBatteryVoltageWrites = 0;
     bool failSdVoltage = false, failSdEnable = false, failSdDisable = false;

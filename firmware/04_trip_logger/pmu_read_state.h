@@ -125,6 +125,18 @@ inline bool batteryVoltageMeasureEnabled(int adcCtrl) {
     return adcCtrl >= 0 && (adcCtrl & 1) != 0;
 }
 
+// XPowersLib 0.3.3 disableTSPinMeasure(): TS_PIN_CTRL (0x50) applies
+// "value &= 0xF0" then writes "value | 0x10" (bits 3:0 clear, bit 4 set).
+// It also clears ADC_CHANNEL_CTRL (0x30) bit 1.
+constexpr int tsModeMask = 0x1F;
+constexpr int tsFixedInput = 0x10;
+constexpr int tsAdcEnable = 1 << 1;
+
+inline bool tsFixedInputReady(int tsCtrl, int adcCtrl) {
+    return tsCtrl >= 0 && adcCtrl >= 0 &&
+           (tsCtrl & tsModeMask) == tsFixedInput && (adcCtrl & tsAdcEnable) == 0;
+}
+
 inline bool pmuMeasurementsReady(int adcCtrl) {
     if (adcCtrl < 0) return false;
     // XPowersLib 0.3.3: 0x30 bits 4, 3 and 2 enable die temperature,

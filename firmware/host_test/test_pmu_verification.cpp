@@ -131,6 +131,65 @@ int main() {
         }
     }
 
+    constexpr auto tsReg = XPOWERS_AXP2101_TS_PIN_CTRL;
+    constexpr auto adcReg = XPOWERS_AXP2101_ADC_CHANNEL_CTRL;
+    for (int raw = 0; raw <= 0xFF; ++raw) {
+        assert(pmu_read::tsFixedInputReady(raw, 0x1D) == ((raw & 0x1F) == 0x10));
+        assert(pmu_read::tsFixedInputReady(0xF0, raw) == ((raw & 0x02) == 0));
+    }
+    assert(!pmu_read::tsFixedInputReady(-1, 0x1D));
+    assert(!pmu_read::tsFixedInputReady(0x10, -1));
+    ++cases;
+
+    enum class TsFault { TransientWrite, PersistentWrite, Unreadable };
+    for (auto reg : {tsReg, adcReg}) {
+        for (auto [fault, writes] : {std::pair{TsFault::TransientWrite, 2u},
+                                     std::pair{TsFault::PersistentWrite, 3u},
+                                     std::pair{TsFault::Unreadable, 0u}}) {
+            pmuWorld();
+            // begin() reports success despite the previously retained TS settings.
+            PMU.tsControl = 0xB5;
+            PMU.adcChannels = 0x9F;
+            std::vector<uint32_t> writeTimes;
+            PMU.onRegisterWrite = [&](uint8_t writeReg, uint8_t value) {
+                if (writeReg != tsReg && writeReg != adcReg) return;
+                assert(!PMU.chargeEnabled && gEarlyChargeDisabled);
+                assert(value == (writeReg == tsReg ? 0xB0 : 0x9D));
+                if (writeReg != reg) return;
+                writeTimes.push_back(millis());
+                if (fault == TsFault::PersistentWrite || writeTimes.size() == 1)
+                    PMU.failRegisterWriteAt[reg] = PMU.registerWriteCalls[reg];
+            };
+            if (fault == TsFault::Unreadable) {
+                PMU.onRegisterRead = [&](uint8_t readReg) {
+                    if (readReg == reg && PMU.registerReadCalls[tsReg] && !calls("enableTemperatureMeasure"))
+                        PMU.failRegisterReadAt[reg] = PMU.registerReadCalls[reg];
+                };
+            }
+            g_delayHook = [](uint32_t ms) { g_millis += ms; };
+            setup();
+            g_delayHook = nullptr;
+            PMU.onRegisterRead = nullptr;
+            PMU.onRegisterWrite = nullptr;
+            assert(writeTimes.size() == writes && PMU.registerWriteCalls[reg] == writes);
+            for (unsigned i = 1; i < writes; ++i)
+                assert(writeTimes[i] - writeTimes[i - 1] == PMU_PERIPHERAL_RETRY_MS);
+            if (fault == TsFault::Unreadable) {
+                assert(PMU.registerReadCalls[tsReg] == PMU_PERIPHERAL_ATTEMPTS);
+                assert(PMU.registerWriteCalls[tsReg] == 0 && PMU.registerWriteCalls[adcReg] == 0);
+            }
+            const bool confirmed = fault == TsFault::TransientWrite;
+            assert(pmu_read::tsFixedInputReady(PMU.tsControl, PMU.adcChannels) == confirmed);
+            assert(logCount("TS fixed-input setup unconfirmed after 3 attempts") == int(!confirmed));
+            assert(gDegraded.mode() == startup::Mode::Normal && tripStoreAvailable(SD));
+            auto rows = bootRows();
+            auto warnings = codeRows(rows, 2010);
+            assert(warnings.size() == unsigned(!confirmed) && codeRows(rows, 2008).empty());
+            if (!confirmed) has(warnings[0], R"("transition":"raise")");
+            ++cases;
+        }
+    }
+
     assert(pmu_read::bldo1Off(0x00) && pmu_read::bldo1Off(0x09));
     assert(!pmu_read::bldo1Off(0x10) && !pmu_read::bldo1Off(0x19));
     assert(!pmu_read::bldo1Off(-1));
@@ -582,6 +641,7 @@ int main() {
     {
         pmuWorld(); PMU.chargeEnabled = true; PMU.failChargeDisable = true;
         static uint32_t startMs; startMs = g_millis;
+        PMU.tsControl = 0x05;
         static bool mountedAfterRecovery; mountedAfterRecovery = false;
         PMU.onRegisterRead = [](uint8_t reg) {
             if (reg == XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL &&
@@ -589,7 +649,7 @@ int main() {
         };
         g_sdDisk.onMount = [] {
             mountedAfterRecovery = true;
-            assert(!PMU.chargeEnabled);
+            assert(!PMU.chargeEnabled && PMU.tsControl == 0x10);
             assert(uint32_t(g_millis - startMs) >= 500 && uint32_t(g_millis - startMs) < 5000);
         };
         setup();
@@ -605,10 +665,12 @@ int main() {
     {
         pmuWorld(); PMU.chargeEnabled = true; PMU.failChargeDisable = true;
         static uint32_t startMs; startMs = g_millis;
+        PMU.tsControl = 0x05;
         static bool checkedAtMount; checkedAtMount = false;
         g_sdDisk.onMount = [] {
             checkedAtMount = true;
             assert(PMU.failChargeDisable); // fault stays active through mount
+            assert(PMU.tsControl == 0x05 && PMU.registerWriteCalls[XPOWERS_AXP2101_TS_PIN_CTRL] == 0);
             assert(uint32_t(g_millis - startMs) >= 5000);
             assert(calls("disableCellbatteryCharge") >= 50);
             assert(g_watchdog.feeds >= 10);
@@ -620,6 +682,9 @@ int main() {
         assert(logCount("early charger disable unconfirmed") == 1 &&
                logCount("charger disable still unconfirmed") == 1);
         FS_LOCK(); auto ev = take(); FS_UNLOCK();
+        assert(logCount("TS fixed-input setup skipped because charger pause is unconfirmed") == 1);
+        auto tsWarnings = codeRows(ev, 2010);
+        assert(tsWarnings.size() == 1); has(tsWarnings[0], R"("transition":"raise")");
         auto ctrl = codeRows(ev, 2008);
         assert(ctrl.size() == 1); has(ctrl[0], "\"transition\":\"raise\"");
         // Recovering charger disable clears E2008 on the next guard tick.

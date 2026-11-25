@@ -210,8 +210,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   power-on**, so firmware switches it off first thing after `PMU.begin()`
 - Stage 4 checks ALDO4 enable and 3.3 V selection, battery detection, and the
   battery voltage, temperature, VBUS voltage and system voltage measurement
-  enables. It tries each setting up to three times, reports E2010 for
-  unverified settings and continues startup.
+  enables. Once the charger pause is confirmed, it checks that the TS pin
+  is a fixed input with its ADC off. It tries each setting up to three times,
+  reports E2010 for unverified settings and continues startup.
 - PMU (0x34) and PCF8563 RTC (0x51) share `Wire1`, SDA 42 / SCL 41. OLED and
   BME280 are on `Wire`, SDA 17 / SCL 18
 - RTC: read at boot to anchor diagnostic timestamps only, never GPX;
