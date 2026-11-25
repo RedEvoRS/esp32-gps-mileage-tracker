@@ -1478,9 +1478,12 @@ to disable the charger early and read back `CHARGE_GAUGE_WDT_CTRL` (0x18), and
 if still unconfirmed retries every 100 ms for a bounded 5 s window (feeding the
 startup watchdog) before storage setup. If the PMU still cannot confirm
 charging off after 5 s, firmware cannot guarantee the charger is off during
-storage mount and repair: it sets `gChargeFailures` to the failure limit so the
-first guard run raises E2008 (`CHARGE_CONTROL_FAILED`), and continues startup
-so an uncontrollable PMU does not block trip logging forever. Startup also
+storage mount and repair: it latches a startup disable timeout flag (in
+addition to setting `gChargeFailures` to the failure limit) so the first guard
+pass after the journal is ready always raises E2008 (`CHARGE_CONTROL_FAILED`)
+at least once—even if control recovers during storage mount—and a later
+confirmed pass clears it, while continuing startup so an uncontrollable PMU
+does not block trip logging forever. Startup also
 verifies the 4.1 V charge target in CV_CHG_VOL_SET (0x64). Each enable/disable
 command in the normal temperature guard is followed by a checked
 CHARGE_GAUGE_WDT_CTRL (0x18) bit-1 read, and charging is never enabled without

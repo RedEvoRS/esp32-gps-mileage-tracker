@@ -69,7 +69,8 @@ static void resetWorld() {
     g_httpBodies.clear();
     g_httpConnectMs = g_httpWriteMs = g_httpHeaderMs = g_httpByteMs = 0;
     g_httpConnectTimeouts.clear(); g_httpReadTimeouts.clear();
-    gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeTargetVerified = false; gEarlyChargeDisabled = true;
+    gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeTargetVerified = false;
+    gEarlyChargeDisabled = true; gEarlyChargeTimeoutPending = false;
     gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0; gChargeCheckT0 = 0;
     gChargeFirstResolved = false; gChargeFirstMs = 0;
     gNetBusy = false; gNetHold = false; gNetAbort = false;

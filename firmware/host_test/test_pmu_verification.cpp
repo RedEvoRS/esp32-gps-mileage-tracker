@@ -427,6 +427,40 @@ int main() {
         assert(cleared.size() == 1); has(cleared[0], "\"transition\":\"clear\"");
         ++cases;
     }
+    // Issue #792: if early charger disable times out for the full 5 s window
+    // and then recovers during storage mount, the first guard pass after the
+    // journal is ready must still raise E2008 once (independent of gChargeFailures),
+    // followed by a single clear on the next confirmed guard pass.
+    {
+        pmuWorld(); PMU.chargeEnabled = true; PMU.failChargeDisable = true;
+        static uint32_t startMs; startMs = g_millis;
+        static bool recoveredAtMount; recoveredAtMount = false;
+        g_sdDisk.onMount = [] {
+            recoveredAtMount = true;
+            assert(PMU.failChargeDisable);
+            assert(uint32_t(g_millis - startMs) >= 5000);
+            PMU.failChargeDisable = false; // recovers during storage setup
+        };
+        setup();
+        g_sdDisk.onMount = nullptr;
+        assert(recoveredAtMount && gDegraded.mode() == startup::Mode::Normal);
+        assert(gEarlyChargeDisabled && !gEarlyChargeTimeoutPending);
+        assert(gChargeState == ChargeState::Charging && PMU.chargeEnabled && gChargeFailures == 0);
+        FS_LOCK(); auto bootEv = take(); FS_UNLOCK();
+        auto raised = codeRows(bootEv, 2008);
+        assert(raised.size() == 1); has(raised[0], "\"transition\":\"raise\"");
+        // Next confirmed guard pass clears that exact E2008 episode once.
+        chargeTick();
+        FS_LOCK(); auto rec = take(); FS_UNLOCK();
+        auto cleared = codeRows(rec, 2008);
+        assert(cleared.size() == 1); has(cleared[0], "\"transition\":\"clear\"");
+        assert(episode(raised[0]) == episode(cleared[0]));
+        // Subsequent confirmed passes stay silent.
+        chargeTick();
+        FS_LOCK(); auto quiet = take(); FS_UNLOCK();
+        assert(codeRows(quiet, 2008).empty());
+        ++cases;
+    }
     // Unverified 4.1 V charge target (write error, stuck at 4.2 V, or read error)
     // blocks charging even at safe temperature and raises E2008; later recovery clears E2008.
     for (unsigned mode = 0; mode < 3; ++mode) {

@@ -313,5 +313,45 @@ int main() {
         assert(codeRows(rows, 4003).empty());
         SD.onCapacity = nullptr;
     }
-    std::puts("SD runtime: boot capacity failure, no-storage probe, single boot query (#812) passed");
+    // Issue #812: quarantined SD card (boot capacity failure) + healthy LittleFS +
+    // cancelled shutdown must NOT reboot the tracker, must keep SD out (never
+    // silently re-enabled even if the card starts responding), and must continue
+    // recording trips on LittleFS.
+    for (bool cardRecovers : {false, true}) {
+        resetWorld();
+        gSdUnavailable = false;
+        SD.capacityQueries = 0;
+        g_restarts = 0;
+        Preferences::durable64.clear();
+        for (auto& s : gLoopConditions) { auto code = s.code; s = {}; s.code = code; }
+        gLoopFaults.~RuntimeFaults();
+        new (&gLoopFaults) RuntimeFaults(gJournal, gLoopConditions, sizeof(gLoopConditions)/sizeof(gLoopConditions[0]));
+        g_millis = 1000; SD.cardPresent = true; g_disk.failMount = false;
+        SD.onCapacity = [] { g_sdDisk.readsFail = true; };
+        setup();
+        SD.onCapacity = nullptr;
+        assert(gDegraded.mode() == startup::Mode::Normal);
+        assert(gSdMounted && gFlashMounted && gTripFS == &LittleFS && gSdUnavailable);
+        events();
+        const int sdBeginsBefore = SD.begins;
+        if (cardRecovers) g_sdDisk.readsFail = false; // card would mount if retried
+        else SD.cardPresent = false;                  // remount would fail if retried
+        PMU.vbusIn = false;
+        g_disk.onUnmount = [] { PMU.vbusIn = true; }; // cancel shutdown after unmount
+        powerOffForVbus("idle_battery");
+        g_disk.onUnmount = nullptr;
+        assert(g_restarts == 0 && PMU.shutdownCalls == 0);
+        assert(!gSdMounted && gSdUnavailable && !tripStoreAvailable(SD) && !PMU.bldo1);
+        assert(SD.begins == sdBeginsBefore); // quarantined card never remounted
+        assert(gFlashMounted && gTripFS == &LittleFS && tripStoreAvailable(LittleFS));
+        assert(g_lockDepth == 0 && !gNetHold && !gNetAbort);
+        assert(roomForNewTrip(millis()));
+        drive(15, 40);
+        assert(gState == ACTIVE && gTripFS == &LittleFS);
+        std::string path = gTripPath;
+        endTrip(false);
+        assert(gState == IDLE && wellFormedShape(g_disk.files.at(path)));
+        assert(gSdUnavailable && !gSdMounted);
+    }
+    std::puts("SD runtime: boot capacity failure, no-storage probe, single boot query, cancelled shutdown (#812) passed");
 }
