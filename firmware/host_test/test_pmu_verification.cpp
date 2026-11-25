@@ -53,8 +53,19 @@ int main() {
             {XPOWERS_AXP2101_ADC_CHANNEL_CTRL, 0x19},
             {XPOWERS_AXP2101_ADC_CHANNEL_CTRL, -1}}) {
         pmuWorld();
-        PMU.registerReadOverride[reg] = value;
+        if (reg == XPOWERS_AXP2101_LDO_ONOFF_CTRL0) {
+            // Only the GPS read-back loses its enable bit. The shared control
+            // register must still report BLDO1 enabled when SD is checked.
+            PMU.onRegisterRead = [&](uint8_t readReg) {
+                if (readReg != reg) return;
+                if (PMU.aldo4 && !PMU.bldo1) PMU.registerReadOverride[reg] = value;
+                else PMU.registerReadOverride.erase(reg);
+            };
+        } else {
+            PMU.registerReadOverride[reg] = value;
+        }
         setup();
+        PMU.onRegisterRead = nullptr;
         const bool adc = reg == XPOWERS_AXP2101_ADC_CHANNEL_CTRL;
         assert(calls("setALDO4Voltage") == (adc ? 1 : 3));
         assert(calls("enableTemperatureMeasure") == (adc ? 3 : 1));

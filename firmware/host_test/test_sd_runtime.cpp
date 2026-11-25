@@ -58,6 +58,29 @@ static void checkStorage() {
 }
 
 int main() {
+    // Command success alone cannot justify starting the card's SPI bus.
+    for (auto [reg, value] : std::initializer_list<std::pair<uint8_t, int>>{
+            {XPOWERS_AXP2101_LDO_ONOFF_CTRL0, 0x09},
+            {XPOWERS_AXP2101_LDO_VOL4_CTRL, 13},
+            {XPOWERS_AXP2101_LDO_ONOFF_CTRL0, -1},
+            {XPOWERS_AXP2101_LDO_VOL4_CTRL, -1}}) {
+        resetWorld();
+        SD.cardPresent = true;
+        PMU.registerReadOverride[reg] = value;
+        assert(!mountSdStorage());
+        assert(SD.begins == 0 && !gSdSpi.started && !PMU.bldo1);
+        assert(g_powerEvents == (std::vector<std::string>{
+            "BLDO1.off", "BLDO1.voltage", "BLDO1.on", "BLDO1.off"
+        }));
+        assert(logHas("microSD card power rail (BLDO1) could not be verified"));
+    }
+    resetWorld();
+    SD.cardPresent = true;
+    assert(mountSdStorage() && SD.begins == 1 && PMU.bldo1 && PMU.bldo1Mv == 3300);
+    SD.end();
+    gSdSpi.end();
+    std::puts("PASS BLDO1 read-back: four bad reads prevent mounting; healthy card mounts");
+
     // A successful begin requires a powered settle after end, even when
     // rejecting FAT or a directory the card reports missing after mkdir.
     for (int scenario = 0; scenario < 3; ++scenario) {

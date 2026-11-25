@@ -1442,7 +1442,7 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E3007 | RTC has no ACK, or its initial boot register read fails | Verified RTC setting after trusted GPS/SNTP time; at most three attempts per boot, at least a minute apart after failures | none |
 | E3008 | Readable RTC has STOP/VL, invalid BCD/calendar, unsupported year, or a later read/write/verification failure | Verified RTC setting from GPS/SNTP clears the condition; normal transition/repeat policy | `reason=stopped\|invalid_date\|out_of_range\|read_failed` on failure |
 | E3009 | At 30 s MON-RF boundaries, valid AGC >=70% and fresh GSV (a complete group within 15 s) with zero satellites >=30 dBHz, continuously for >=120 s from the first suspect sample | One valid AGC <=50% sample **or** fresh GSV with at least one satellite >=30 dBHz; missing/stale/intermediate evidence resets the hold and retains an active warning | `agc_pct` (0-100) when MON-RF valid; `max_cno` (0-99) when GSV fresh |
-| E4001 | SD did not mount, the selected SD trip store returns zero total capacity at runtime (failed filesystem query), or two trip pieces in a row fail to write on SD (create, write, sync or close) | Successful SD mount on a later boot; runtime failure stays latched until reboot. After write failures, new trips record on flash while readable trips already queued on the card still upload, so an E4001 can appear next to a successful SD upload | none |
+| E4001 | BLDO1 card power setup or read-back failed, SD did not mount, the selected SD trip store returns zero total capacity at runtime (failed filesystem query), or two trip pieces in a row fail to write on SD (create, write, sync or close) | Successful SD mount on a later boot; runtime failure stays latched until reboot. After write failures, new trips record on flash while readable trips already queued on the card still upload, so an E4001 can appear next to a successful SD upload | none |
 | E4002 | LittleFS unavailable for trips during no-storage degraded startup | Remains active until restart. When LittleFS mounts but its trip directory is unusable, it can still retain journal events | none |
 | E4003 | Neither trip store is usable at startup (including a boot SD capacity failure with flash unavailable), or the selected trip store becomes unavailable at runtime with no fallback | Only a normal boot with an available trip store (or switching to an available fallback store) observes healthy; successful degraded retry restarts without clearing | none |
 | E4004 | Available selected trip store has guarded free space <64 KiB start reserve | >=64 KiB on the selected store, or condition no longer applies because that store is unavailable | `backend`, `free_bytes` only when available |
@@ -1637,7 +1637,8 @@ unchanged; degraded probes explicitly disable that provisioning.
   journal. LittleFS can retain them if it mounts with an unusable trip
   directory. Without a journal backend the bounded RAM queue loses them
   on restart or power-off. Storage retries use
-  the existing BLDO1-off / 3.3 V / enable ordering for SD and never format.
+  the BLDO1-off / 3.3 V / enable ordering for SD, verify both settings
+  before mounting, and never format.
   A newly mounted store is unmounted after the probe. Shutdown safely handles
   degraded startup: the loop services the bounded
   journal seal itself, reports undurable RAM if necessary, then holds FS_LOCK

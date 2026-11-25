@@ -97,6 +97,13 @@ inline bool aldo4Ready(int control, int voltage) {
     return (control & (1 << 3)) && 500 + (voltage & 0x1F) * 100 == 3300;
 }
 
+inline bool bldo1Ready(int control, int voltage) {
+    if (control < 0 || voltage < 0) return false;
+    // XPowersLib 0.3.3: LDO_ONOFF_CTRL0 (0x90) bit 4 enables BLDO1;
+    // LDO_VOL4_CTRL (0x96) bits 0..4 select 500 mV + 100 mV/step.
+    return (control & (1 << 4)) && 500 + (voltage & 0x1F) * 100 == 3300;
+}
+
 inline bool pmuMeasurementsReady(int adcCtrl) {
     if (adcCtrl < 0) return false;
     // XPowersLib 0.3.3: 0x30 bits 4, 3 and 2 enable die temperature,

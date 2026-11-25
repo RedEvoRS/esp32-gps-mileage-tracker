@@ -239,8 +239,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   recorded real drives on the card): FAT32 only (exFAT unsupported),
   powered from BLDO1, SPI MOSI 35 / SCK 36 / MISO 37, CS 47, IMU CS 34
   held high. BLDO1 powers up
-  ON at 1.8 V: switch it off, set 3.3 V, then enable. Stage 4 picks its
-  trip store at boot, never formats the card, and falls back to LittleFS
+  ON at 1.8 V. Stage 4 switches it off, sets 3.3 V, enables it, and reads
+  back both settings before mounting. Stage 4 picks its trip store at boot,
+  never formats the card, and falls back to LittleFS
   for new trips after a failed capacity query or two failed GPX pieces
   without a clean close between them. E4001 reports the fallback, and
   E4006 reports GPX write failures. A card that still answers capacity

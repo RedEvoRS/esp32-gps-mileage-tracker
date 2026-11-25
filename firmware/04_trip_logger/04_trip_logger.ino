@@ -3106,6 +3106,13 @@ static bool mountSdStorage() {
         PMU.disableBLDO1();
         return false;
     }
+    const int control = PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
+    const int voltage = PMU.readRegister(XPOWERS_AXP2101_LDO_VOL4_CTRL);
+    if (!pmu_read::bldo1Ready(control, voltage)) {
+        PMU.disableBLDO1();
+        Serial.println("WARNING: microSD card power rail (BLDO1) could not be verified on at 3.3 V; skipping mount.");
+        return false;
+    }
     pinMode(IMU_CS, OUTPUT);
     digitalWrite(IMU_CS, HIGH);
     pinMode(SD_CS, OUTPUT);
