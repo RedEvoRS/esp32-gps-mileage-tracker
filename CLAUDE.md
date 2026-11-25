@@ -422,6 +422,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   uploads may use a custom ID outside that namespace (installer test uploads are
   untimed copies of `sample.gpx`). Every upload looks for its ID in all month
   folders under the upload lock, so a `DISPLAY_TZ` change can't duplicate a trip.
+  Summaries store the raw GPX's SHA-256 digest. A retry with only the summary
+  left must match its digest. A legacy summary without a digest stays intact
+  and returns 409 until the original GPX is restored from backup.
   Internal aliases count once; an outside or looping month link refuses all
   GPX uploads with 503 naming the folder until repaired, and a new trip whose
   month folder links to a differently named folder gets the same 503 (it would
@@ -634,7 +637,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   Outside links under `data/` are reported and counted in `INFO` as
   `links_not_backed_up`; their contents are absent. Copy and deep check still
   run and `last-success` advances, but the run exits non-zero without a
-  heartbeat. A failed coverage check records `unknown` ("not checked"); missing
+  heartbeat. If a backup run by the installer just completed with only linked
+  items missing, install warns and continues. `install.sh --check` still reports
+  the failed status. A failed coverage check records `unknown` ("not checked"); missing
   or unreadable backup information is `unavailable`, not a failed link check.
   Absolute internal aliases get warning-only restore advice; their real targets
   may be saved at their own paths. Failure of advice only warns in backup, check
@@ -691,7 +696,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   `manage_users.py` manages everyday accounts. CSRF on POSTs; 5 failures lock
   an IP for 15 min via shared SQLite `login_attempts`. Failures count until a
   15-minute pause without one; the next failure starts a fresh count. A success
-  clears only its own username's failures. App fail-fasts if auth config is
+  clears only its own username's failures. Everyday password changes recheck
+  the IP lock and clear failures in the same transaction as the password update.
+  App fail-fasts if auth config is
   missing or the admin hash lost its `$` chars.
   Optional `.env` `VIEWER_TRUSTED_PROXIES` accepts comma-separated IPv4/IPv6
   IPs/CIDRs: only trusted peers may supply X-Forwarded-For; use the rightmost

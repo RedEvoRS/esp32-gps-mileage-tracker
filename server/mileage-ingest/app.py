@@ -30,7 +30,7 @@ reuse their original directory even if the month or DISPLAY_TZ has changed:
     <id>.json   { trip_id, device_id, start_time, end_time, recorded_until,
                   duration_seconds, distance_miles, max_speed_mph,
                   avg_speed_mph, timing_status, timed_from, num_points, bbox{...}, gpx_file,
-                  summary_version, _received_at, _received_from }
+                  summary_version, gpx_sha256, _received_at, _received_from }
 
 Distance is the haversine sum over consecutive fixes, with three rules
 (see summarize()): steps where the vehicle wasn't moving are GPS jitter
@@ -624,6 +624,7 @@ def upload_trip():
     device_id = request.headers.get("X-Device-Id") or (parsed["creator"] or "unknown")
 
     anchor = identity_dt or parsed["metadata_time"]
+    gpx_sha256 = hashlib.sha256(raw).hexdigest()
     trip_id = None if anchor else request.headers.get("X-Trip-Id")
     if not trip_id:
         # Fall back to the earliest recorded point time, then metadata time. This is
@@ -638,11 +639,9 @@ def upload_trip():
             # body content rather than the wall clock, so a retried
             # upload of the same file is idempotent instead of creating
             # a duplicate under a new received-at name.
-            trip_id = "untimed-" + hashlib.sha256(raw).hexdigest()[:12]
+            trip_id = "untimed-" + gpx_sha256[:12]
 
-    safe_id = _safe_id(trip_id) or (
-        "untimed-" + hashlib.sha256(raw).hexdigest()[:12]
-    )
+    safe_id = _safe_id(trip_id) or ("untimed-" + gpx_sha256[:12])
     if anchor is None and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}Z", safe_id):
         return jsonify(error="untimed X-Trip-Id cannot use the timestamp trip ID namespace"), 400
 
@@ -667,6 +666,7 @@ def upload_trip():
         "trip_id": trip_id,
         "device_id": device_id,
         "gpx_file": f"{safe_id}.gpx",
+        "gpx_sha256": gpx_sha256,
         "_received_from": request.remote_addr,
     }
     record.update(summary)
@@ -715,6 +715,12 @@ def upload_trip():
                 elif existing["trip_id"] != trip_id or existing["device_id"] != device_id:
                     return jsonify({"error": "trip ID belongs to another trip or device"}), 409
                 else:
+                    if not gpx_file.exists():
+                        stored_digest = existing.get("gpx_sha256")
+                        if stored_digest is None:
+                            return jsonify(error="trip ID has no GPX digest; restore the original GPX from backup"), 409
+                        if stored_digest != gpx_sha256:
+                            return jsonify(error="trip ID's saved GPX digest does not match the upload"), 409
                     # Keep the original receipt metadata, including unknown
                     # receipt times on summaries written by older versions.
                     if "_received_at" in existing:

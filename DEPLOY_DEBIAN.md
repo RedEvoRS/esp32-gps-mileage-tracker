@@ -298,7 +298,9 @@ Setup verifies the bundle against that release's `SHA256SUMS`, shows the
 old/new versions and asks before copying. Server files go directly into
 `~/mileage-tracker/`; firmware sources and the version-stamping tool go in
 `firmware-src/`. Use `bash setup.sh --dir "$HOME/mileage-tracker"` to choose
-a different destination. The flash helpers accept only simple paths, so setup
+a different destination. Setup checks both destination trees for conflicting
+paths, such as a symlink where a release file belongs, before it copies any
+release files. The flash helpers accept only simple paths, so setup
 refuses a destination that contains anything but letters, digits, `_`, `.`, `-`
 and `/` (a space, for example) and installs nothing. They also need an SSH
 hostname or IPv4 address.
@@ -2055,11 +2057,10 @@ questions do. Metrics has no question of its own: its token is generated and
 kept in `monitor.env`, never printed.
 
 The questions and the monitor use the same settings rules. The installer
-checks them with host Python, or one disposable Python container on Unraid;
-it reuses that checker across questions and sends secrets on standard input.
-The checker starts only when settings need reading or an output is chosen.
-A check with no selected monitor file, or a fresh install choosing `none`,
-does not start it. An existing monitor's heartbeat is still checked.
+starts the checker when it reads the Address lookup settings in install
+and check mode. It uses host Python when available or one disposable Python
+container on Unraid, reuses the checker for Notifications, and sends secrets
+on standard input. An existing monitor's heartbeat is still checked.
 Topic names and bundled phone usernames use 1–64 letters, digits, `_` or `-`.
 The phone password needs at least eight characters and is stored by ntfy,
 not in `monitor.env`. Silence accepts at least one second (`1/86400` days)
@@ -2758,6 +2759,11 @@ since that's what proves it's the same trip.
 If the warning says there's no GPX either, put the GPX back from a backup
 snapshot first (Step 10), then send it as above. Without it, ingest answers
 409 (`trip ID has a damaged summary and no GPX to match`).
+
+When the summary is readable and only the GPX is missing, ingest can restore
+the GPX directly from an upload if its SHA-256 digest matches the saved digest.
+For older summaries with no digest, ingest returns 409 and keeps the summary
+as saved. Use the same backup steps to put the original GPX back in place.
 
 ```bash
 ls ~/mileage-backups/snapshots/*/data/$TRIP.gpx      # the snapshots that have it

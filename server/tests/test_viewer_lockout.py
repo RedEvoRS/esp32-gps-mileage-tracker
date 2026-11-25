@@ -178,6 +178,30 @@ class ViewerLockoutTests(unittest.TestCase):
         self.assertFalse(self.viewer._clear_failures('127.0.0.1', 'driver'))
         self.assertGreater(self.viewer._lock_seconds_remaining('127.0.0.1'), 0)
 
+    def test_password_change_in_flight_is_rejected_if_the_ip_locks(self):
+        self.signed_in('editor')
+        before = self.viewer.users.get_user(self.db, 'helper')
+        for module, hash_step in ((self.viewer, 'check_password_hash'),
+                                  (self.viewer.users, 'generate_password_hash')):
+            with self.subTest(hash_step=hash_step):
+                real_hash = getattr(module, hash_step)
+
+                def hash_then_lock(*args, real_hash=real_hash):
+                    result = real_hash(*args)
+                    for _ in range(self.viewer.MAX_FAILS):
+                        self.viewer._record_failure('127.0.0.1', 'helper')
+                    return result
+
+                with patch.object(module, hash_step, side_effect=hash_then_lock):
+                    response = self.password_post()
+                self.assertEqual(response.status_code, 429)
+                self.assertIn(b'Too many failed attempts', response.data)
+                self.assertEqual(self.viewer.users.get_user(self.db, 'helper'), before)
+                self.assertGreater(self.viewer._lock_seconds_remaining('127.0.0.1'), 0)
+                with closing(sqlite3.connect(self.db)) as conn, conn:
+                    conn.execute('DELETE FROM login_attempts')
+                    conn.execute('DELETE FROM login_attempt_names')
+
     def test_failures_of_one_ip_do_not_touch_another(self):
         self.viewer._record_failure('192.0.2.1', 'driver')
         self.viewer._record_failure('192.0.2.2', 'helper')

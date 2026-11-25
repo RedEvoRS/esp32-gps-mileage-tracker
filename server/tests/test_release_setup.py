@@ -256,6 +256,37 @@ class ReleaseSetup(unittest.TestCase):
         self.assertIn("v0.10+aaaaaaaaaa -> v0.11+bbbbbbbbbb", result.stdout)
         self.assertIn("Files deleted upstream are not removed", result.stdout)
 
+    def test_destination_conflicts_leave_both_release_trees_unchanged(self):
+        self.assert_ok(self.run_setup("--bundle", str(self.bundle())))
+        updated = self.bundle("v1.01", "v0.11", "b" * 40, extra={
+            "server/.env.example": "BIND_ADDR=127.0.0.1\n",
+            "firmware/VERSION": "v0.11\n",
+        })
+        marker = self.destination / "installer-ran"
+        marker.unlink()
+        blocked_paths = ("docker-compose.yml", "firmware-src/tools/stamp_firmware_version.py")
+        for name in blocked_paths:
+            with self.subTest(path=name):
+                blocked = self.destination / name
+                original = blocked.read_bytes()
+                blocked.unlink()
+                if name == "docker-compose.yml":
+                    blocked.symlink_to(self.root / "missing")
+                else:
+                    blocked.mkdir()
+                before = {p: p.read_bytes() for p in self.destination.rglob("*") if p.is_file()}
+                result = self.run_setup("--bundle", str(updated))
+                after = {p: p.read_bytes() for p in self.destination.rglob("*") if p.is_file()}
+                if blocked.is_symlink():
+                    blocked.unlink()
+                else:
+                    blocked.rmdir()
+                blocked.write_bytes(original)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(Path(name).name, result.stderr)
+                self.assertEqual(after, before)
+                self.assertFalse(marker.exists())
+
     def test_private_backup_paths_are_excluded_on_first_install_too(self):
         private = ("backup/ssh/id_ed25519", "backup/ssh/known_hosts",
                    "backup/state/last-attempt", "backup/logs/backup.log")
