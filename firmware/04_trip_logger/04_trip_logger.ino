@@ -353,8 +353,10 @@ static std::atomic<bool> gJournalSealRequested{false}, gJournalSealDone{false}, 
 // Core 0 drains a queue slot, submits it once, then seals. Static task storage.
 static diagnostics::EventInput gPowerOffEvent;
 static std::atomic<bool> gPowerOffEventPending{false};
+static std::atomic<bool> gPowerOffEventDropped{false};
 static diagnostics::BatterySample gBootBattery;
 static bool gJournalSealing = false; // core-0 only, while holding the mutex
+static bool gJournalEnrolling = false; // core-0 only, while holding FS_LOCK for one-time enrollment
 static bool gEventIoBudget = false; // core-0 only, cooperative VFS deadline
 static uint32_t gEventIoStarted = 0;
 static bool journalMayRun();
@@ -618,6 +620,7 @@ static void storageConditions(uint64_t freeB, uint32_t now) {
 }
 
 static bool journalMayRun() {
+    if (gJournalEnrolling) return true;
     return gFsDemand.load() == 0 && (gJournalSealing || !gNetHold.load()) &&
            (!gEventIoBudget || (!gNetAbort.load() && uint32_t(millis() - gEventIoStarted) < diagnostics::kDrainMs));
 }
@@ -669,20 +672,25 @@ static void serviceJournal() {
     }
     if (sealing && gPowerOffEventPending.load()) {
         auto result = gJournal.submit(gPowerOffEvent);
-        if (result == diagnostics::EventLog::Submit::Accepted) gPowerOffEventPending.store(false);
-        // Full/busy stays pending for the next service tick, within the same
-        // bounded shutdown deadline. Never submit a second accepted notice.
+        if (result != diagnostics::EventLog::Submit::Busy) {
+            gPowerOffEventPending.store(false);
+            if (result != diagnostics::EventLog::Submit::Accepted) gPowerOffEventDropped.store(true);
+        }
+        // Only try-lock contention retries; a queue still full after the drain
+        // step above counts one drop and proceeds to seal() instead of stalling
+        // shutdown for the full 15 s (#803). Never submit a second accepted notice.
     }
     if (sealing && !gPowerOffEventPending.load()) {
         bool sealed = gJournal.seal();
         journalStorageFaults();
-        gJournalSealOk.store(sealed && gJournal.stats().queued == 0);
-        gJournalSealDone.store(true);
+        bool hasStore = tripStoreAvailable(SD) || gFlashMounted;
+        size_t queued = gJournal.stats().queued;
+        bool complete = sealed && queued == 0;
+        gJournalSealOk.store(complete && !gPowerOffEventDropped.load());
+        // Leave the seal pending while records remain queued on mounted media
+        // so transient write failures can retry inside the 15 s deadline (#811).
+        if (complete || !hasStore || queued == 0) gJournalSealDone.store(true);
     }
-    // A cancelled metadata read must not remain cached as "missing metadata".
-    // EventLog's bool read API also uses false for an absent/torn slot. Reload
-    // both stores after any cooperative cancellation before later appends.
-    if (!journalMayRun()) gJournal.invalidateStorage();
     gJournalSealing = false;
     xSemaphoreGive(gFsMutex);
 }
@@ -1730,6 +1738,7 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
         gPowerOffEvent.context[gPowerOffEvent.contextCount++] =
             diagnostics::EventContext::enumeration("reason", reason);
         gPowerOffEventPending.store(true);
+        gPowerOffEventDropped.store(false);
         gJournalSealDone.store(false);
         gJournalSealRequested.store(true);
         uint32_t journalWait = millis();
@@ -1830,6 +1839,7 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
     gJournal.invalidateStorage(); // same boot/queue, reload metadata after remount
     gJournalStarted = false; // recheck FAT allocation geometry on core 0
     gPowerOffEventPending.store(false); // consumer excluded by FS_LOCK
+    gPowerOffEventDropped.store(false);
     gJournalSealRequested.store(false);
     gJournalSealDone.store(false);
     FS_UNLOCK();
