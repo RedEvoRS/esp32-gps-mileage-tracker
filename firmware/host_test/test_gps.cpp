@@ -119,6 +119,9 @@ static void resetWorld() {
     g_sdDisk = FakeDisk(); g_sdDisk.mounted = false; g_sdDisk.renameOverwrites = false;
     SD.dirs.clear(); SD.cardPresent = false; SD.begins = SD.ends = 0;
     gTripFS = &LittleFS; gSdMounted = false; gFlashMounted = true;
+    gSdUnavailable = false; gSdWriteFailures = 0;
+    gSdUploadOffset = gFlashUploadOffset = 0;
+    gTripUploadFileClosed = true;
     g_powerEvents.clear();
     LittleFS.dirs.clear();
     LittleFS.mkdir(TRIP_DIR);
@@ -1217,6 +1220,20 @@ int main(int argc, char** argv) {
             exact &= field(pts[i], "time") == (i == 20 ? "2026-04-14T14:30:20.500Z" : "");
         CHECK(exact, "both timed-fix flush and trip-end flush preserve missing times and point order");
         dump((std::string("G35_") + talker).c_str());
+    }
+
+    printf("RMC calendar and the 2038 epoch boundary (#813)\n");
+    {
+        resetWorld(); run(15, 12);
+        for (const char* date : {"310426", "290227", "300228"}) {
+            g_millis += 1000; GPSSerial.rx += rmc("031405.00", date); loop();
+            CHECK(!gLastFix.hasUtc, "an impossible calendar date leaves the point untimed");
+        }
+        g_millis += 1000; GPSSerial.rx += rmc("031408.25", "190138"); loop();
+        CHECK(gLastFix.hasUtc && gLastFix.utcMs == 2147483648250ULL,
+              "RMC retains centiseconds beyond signed 32-bit Unix time");
+        g_millis += 1000; GPSSerial.rx += rmc("000000.00", "290240"); loop();
+        CHECK(gLastFix.hasUtc && gLastFix.utcMs == 2214086400000ULL, "leap day is accepted");
     }
 
     printf("G36 a 190-second red light stays one trip; a five-minute park ends it\n");
