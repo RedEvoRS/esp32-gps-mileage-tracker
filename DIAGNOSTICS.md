@@ -305,7 +305,7 @@ are separate from history: an old event does not prove a fault is still active.
 The page gives catalog explanations and recovery hints; unknown codes have no
 invented severity. See the developer runtime-hook table for exact triggers.
 
-This complete index is generated from catalog v6's **48 definitions**, with
+This complete index is generated from catalog v8's **50 definitions**, with
 each producer checked against Stage 4. A catalog entry alone does not prove
 firmware emits it. Symbols use subsystem abbreviations: **PMU** is the power
 management unit, **GPS** the satellite positioning receiver, **RTC** the real-time
