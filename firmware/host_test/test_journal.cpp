@@ -25,6 +25,7 @@ static void world(bool sd, bool flash, EventLog::Config config = EventLog::Confi
     SD.dirs.clear(); LittleFS.dirs.clear();
     g_lockDepth = 0; gFsDemand = 0; gNetHold = gNetBusy = gNetAbort = false;
     gJournalSealRequested = gJournalSealDone = gJournalSealOk = false;
+    gJournalSealStalls = 0;
     gPowerOffEventPending = gPowerOffEventDropped = false;
     gJournalStarted = gJournalSealing = gJournalEnrolling = gJournalBootReported = false;
     gDegraded = startup::DegradedPolicy();
@@ -311,8 +312,9 @@ int main() {
     assert(gJournalSealDone && !gJournalSealOk && !gPowerOffEventPending);
     assert(gJournal.stats().dropped == dropsBefore + 1);
 
-    // Issue #803 (failing LittleFS): full RAM queue counts one drop and still
-    // calls seal() so an existing .open segment is renamed to .ready.
+    // Issue #803/#811 (failing LittleFS): full RAM queue counts one drop,
+    // seals an existing .open segment to .ready, and stops retrying after
+    // JOURNAL_SEAL_MAX_STALLS consecutive stalled ticks instead of waiting 15 s.
     world(false, true);
     for (auto& s : gEventConditions) { auto code = s.code; s = {}; s.code = code; }
     submit(); serviceJournal();
@@ -320,17 +322,26 @@ int main() {
     g_disk.writesFail = true;
     submit(kEventQueueSize);
     dropsBefore = gJournal.stats().dropped;
+    static unsigned failTicks = 0;
+    failTicks = 0;
+    shutStart = millis();
     PMU.vbusIn = false;
-    g_taskDelayHook = [](uint32_t) { if (!g_lockDepth) serviceJournal(); };
+    g_taskDelayHook = [](uint32_t) {
+        if (g_lockDepth) return;
+        ++failTicks;
+        serviceJournal();
+    };
     g_disk.onUnmount = [] {
-        assert(!gPowerOffEventPending && !gJournalSealOk);
+        assert(failTicks == JOURNAL_SEAL_MAX_STALLS);
+        assert(gJournalSealDone && !gPowerOffEventPending && !gJournalSealOk);
         assert(g_disk.files.count("/diag/seg-00000001.ready") && !g_disk.files.count("/diag/seg-00000001.open"));
     };
     try { powerOffForVbus("battery_critical"); assert(false); } catch (const PoweredOff&) {}
+    assert(uint32_t(millis() - shutStart) < 1000);
     // Exactly two drops across the whole shutdown wait: one from the rate-limited
     // E4008 raise after the first failed write, and one from the power-off notice.
     assert(gJournal.stats().dropped == dropsBefore + 2);
-    std::puts("Journal #803: full RAM queue at shutdown counts one drop, seals open segment and avoids NoStorage stall passed");
+    std::puts("Journal #803: full RAM queue at shutdown counts one drop, seals open segment and finishes promptly on failing LittleFS passed");
 
     // Issue #811: transient write failure during shutdown seal keeps the seal
     // pending while records remain queued, then drains and seals on retry.

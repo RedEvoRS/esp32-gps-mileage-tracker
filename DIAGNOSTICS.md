@@ -62,14 +62,22 @@ including both loaded copies and any revision reserved this boot. Use at least
 that value and a fresh server read before trying a higher enrollment ID. If
 that minimum was already met, check journal/NVS errors rather than raising it.
 
-Enrollment is one-use: core 0 runs `restoreStatusSequence(highWater)` under the
-journal lock with cooperative cancellation suppressed for this bounded commit,
-and saves and verifies the ID in `diag/enroll` in **NVS (non-volatile storage,
-the ESP32's settings memory)** only after at least one journal store save and
-the separate NVS recovery marker succeed. Failed/absent stores are marked stale
-before it succeeds. A restore below either loaded stored revision, or when no
-journal store can save, is refused without consuming the ID. Fix the lower
-bound or storage problem first, then retry enrollment and reboot.
+Enrollment is one-use: core 0 first preloads every mounted journal store under
+the journal lock with normal cooperative cancellation (deferring enrollment
+without consuming the ID if trip storage interrupts a load, and skipping
+enrollment while shutdown abort is active). It then suppresses cooperative
+cancellation only around the bounded metadata commit of
+`restoreStatusSequence(highWater)`, and saves and verifies the ID in
+`diag/enroll` in **NVS (non-volatile storage, the ESP32's settings memory)**
+only after at least one journal store save and the separate NVS recovery marker
+succeed. Failed/absent stores are marked stale before it succeeds. If journal
+enrollment succeeds but writing `diag/enroll` to NVS fails, serial warns you to
+remove `DIAGNOSTICS_ENROLLMENT_ID` and `DIAGNOSTICS_STATUS_HIGH_WATER` from
+`secrets.h` and reflash with erase disabled so later boots do not retry
+enrollment (which would be refused once revisions advance). A restore below
+either loaded stored revision, or when no journal store can save, is refused
+without consuming the ID. Fix the lower bound or storage problem first, then
+retry enrollment and reboot.
 
 1. Read the server high-water for the exact `DEVICE_ID`. With the tracker
    powered off, inspect the card's revision using the read-only procedure below
@@ -1261,7 +1269,11 @@ Immediately before requesting that seal, core 1 captures one E2009 battery
 sample with the existing UTC/confidence provider and the known shutdown reason.
 Core 0 drains a queue slot, submits the retained notice exactly once, then drains
 and seals it with the earlier events. A full writable queue therefore does not
-lose the sample. PMU reads stay on core 1; filesystem writes stay with the
+lose the sample. If the queue stays full after that drain attempt, the notice
+counts one drop and sealing still proceeds. On mounted media, failed seals retry
+while draining makes progress and stop after three consecutive stalled attempts
+inside the 15-second shutdown window so persistently failing or full storage
+cannot stall power-off. PMU reads stay on core 1; filesystem writes stay with the
 existing consumer (the sole degraded-loop consumer handles no-storage mode).
 There is no journal write after sealing/unmounting or between the final VBUS
 check and `PMU.shutdown()`. Successful closed writes and sealing provide the

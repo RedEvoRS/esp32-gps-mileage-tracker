@@ -445,10 +445,11 @@ struct Preferences {
     void putUInt(const char* k, uint32_t v) { kv[k] = v; }
     inline static std::map<std::string, uint64_t> durable64;
     inline static bool failWrite64 = false, failRead64 = false, failBegin = false;
+    inline static std::string failWrite64Key;
     bool isKey(const char* k) { return durable64.count(k) || kv.count(k); }
     uint64_t getULong64(const char* k, uint64_t d) { return !failRead64 && durable64.count(k) ? durable64[k] : d; }
     size_t putULong64(const char* k, uint64_t v) {
-        if (failWrite64) return 0;
+        if (failWrite64 || (!failWrite64Key.empty() && failWrite64Key == k)) return 0;
         durable64[k] = v; return sizeof(v);
     }
     void end() {}

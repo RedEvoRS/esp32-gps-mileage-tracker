@@ -500,16 +500,45 @@ int main(int argc, char** argv) {
     assert(logLines("local minimum high-water 321") == 1);
     assert(Preferences::durable64["enroll"] == 0);
 
-    // Issue #805: core-1 FS_LOCK demand arriving mid-enrollment cannot cancel
-    // the bounded commit or leave diagnostics suspended; total store write
-    // failure leaves the one-use ID unconsumed for retry after storage recovers.
+    // Issue #805: preloading stores during enrollment still yields to core-1
+    // FS_LOCK demand without consuming the ID or setting gEnrollmentChecked,
+    // so the next snapshot retries and succeeds once demand clears.
+    uploadWorld(false); records(2);
+    gJournal.invalidateStorage();
+    gSdJournalIo.onListEntry = [] { gFsDemand.store(1); };
+    drainEvents();
+    gSdJournalIo.onListEntry = nullptr; gFsDemand.store(0);
+    assert(!gEnrollmentChecked && Preferences::durable64["enroll"] == 0);
+    assert(!Preferences::durable64.count("revstate") && g_httpRequests == 0);
+    gEventRetry = {}; drainEvents();
+    assert(gEnrollmentChecked && Preferences::durable64["enroll"] == 1);
+    assert(!(Preferences::durable64["revstate"] & 7) && g_httpRequests >= 1 && backlog().records == 0);
+
+    // Issue #805: shutdown abort skips enrollment without setting
+    // gEnrollmentChecked or touching NVS; enrollment runs once abort clears.
+    uploadWorld(false); records(1);
+    gNetAbort.store(true);
+    assert(xSemaphoreTake(gFsMutex, 0) == pdPASS);
+    enrollEventRevision();
+    xSemaphoreGive(gFsMutex);
+    assert(!gEnrollmentChecked && Preferences::durable64["enroll"] == 0);
+    assert(!Preferences::durable64.count("revstate"));
+    gNetAbort.store(false);
+    drainEvents();
+    assert(gEnrollmentChecked && Preferences::durable64["enroll"] == 1);
+    assert(!(Preferences::durable64["revstate"] & 7) && g_httpRequests >= 1 && backlog().records == 0);
+
+    // Issue #805: once stores are loaded, core-1 FS_LOCK demand arriving
+    // during the bounded metadata commit cannot cancel either store save or
+    // leave diagnostics suspended; total store write failure leaves the ID
+    // unconsumed for retry after storage recovers.
     uploadWorld(false); records(1);
     g_sdDisk.onRead = [] { gFsDemand.store(1); };
     g_disk.onRead = [] { gFsDemand.store(1); };
     drainEvents();
     g_sdDisk.onRead = nullptr; g_disk.onRead = nullptr; gFsDemand.store(0);
     assert(Preferences::durable64["enroll"] == 1);
-    assert(!(Preferences::durable64["revstate"] & 1));
+    assert(!(Preferences::durable64["revstate"] & 7));
     gEventRetry = {}; drainEvents();
     assert(g_httpRequests >= 1 && backlog().records == 0);
 
@@ -521,7 +550,18 @@ int main(int argc, char** argv) {
     gEnrollmentChecked = false; gEventRetry = {};
     drainEvents();
     assert(Preferences::durable64["enroll"] == 1 && g_httpRequests >= 1 && backlog().records == 0);
-    std::puts("Event upload #805: enrollment resists cooperative cancellation and only consumes ID after a store save passed");
+
+    // When journal enrollment succeeds but recording diag/enroll in NVS fails,
+    // warn the operator to remove the enrollment defines and reflash so later
+    // boots do not retry enrollment against advanced revisions.
+    uploadWorld(false); records(1);
+    Preferences::failWrite64Key = "enroll";
+    drainEvents();
+    Preferences::failWrite64Key.clear();
+    assert(Preferences::durable64["enroll"] == 0 && !(Preferences::durable64["revstate"] & 7));
+    assert(g_httpRequests >= 1 && backlog().records == 0);
+    assert(logLines("Remove DIAGNOSTICS_ENROLLMENT_ID and DIAGNOSTICS_STATUS_HIGH_WATER from secrets.h and reflash") == 1);
+    std::puts("Event upload #805: enrollment defers preload, skips gNetAbort, protects bounded commit, consumes ID on save and warns on NVS failure passed");
     collect();
     if (debugMode()) {
         assert(gEventHeapReported && logLines("Heap:") == 0); // no repeated post-attempt reports

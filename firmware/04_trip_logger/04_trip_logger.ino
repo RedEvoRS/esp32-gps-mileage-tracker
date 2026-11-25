@@ -348,7 +348,9 @@ static std::atomic<uint32_t> gFsDemand{0};
 #define FS_LOCK()   do { gFsDemand.fetch_add(1); xSemaphoreTake(gFsMutex, portMAX_DELAY); } while (0)
 #define FS_UNLOCK() do { xSemaphoreGive(gFsMutex); gFsDemand.fetch_sub(1); } while (0)
 
+static constexpr uint8_t JOURNAL_SEAL_MAX_STALLS = 3;
 static std::atomic<bool> gJournalSealRequested{false}, gJournalSealDone{false}, gJournalSealOk{false};
+static std::atomic<uint8_t> gJournalSealStalls{0};
 // Core 1 fills the immutable shutdown notice before publishing the seal request.
 // Core 0 drains a queue slot, submits it once, then seals. Static task storage.
 static diagnostics::EventInput gPowerOffEvent;
@@ -654,8 +656,10 @@ static void serviceJournal() {
         gJournal.setSdAllocationUnit(cluster);
         gJournalStarted = true;
     }
+    size_t queuedBeforeService = sealing ? gJournal.stats().queued : 0;
     // Boot recovery and later maintenance each service exactly one record.
     gJournal.service(1);
+    size_t queuedAfterService = sealing ? gJournal.stats().queued : 0;
     journalStorageFaults();
     if (debugMode() && !gJournalBootReported) {
         auto backlog = gJournal.backlog();
@@ -681,15 +685,30 @@ static void serviceJournal() {
         // shutdown for the full 15 s (#803). Never submit a second accepted notice.
     }
     if (sealing && !gPowerOffEventPending.load()) {
+        size_t queuedBeforeSeal = gJournal.stats().queued;
         bool sealed = gJournal.seal();
+        size_t queuedAfterSeal = gJournal.stats().queued;
         journalStorageFaults();
         bool hasStore = tripStoreAvailable(SD) || gFlashMounted;
         size_t queued = gJournal.stats().queued;
         bool complete = sealed && queued == 0;
+        bool progress = sealed || queuedAfterService < queuedBeforeService ||
+                        queuedAfterSeal < queuedBeforeSeal;
         gJournalSealOk.store(complete && !gPowerOffEventDropped.load());
-        // Leave the seal pending while records remain queued on mounted media
-        // so transient write failures can retry inside the 15 s deadline (#811).
-        if (complete || !hasStore || queued == 0) gJournalSealDone.store(true);
+        // Retry transient failures while mounted media makes progress, stopping
+        // after JOURNAL_SEAL_MAX_STALLS consecutive stalled attempts so full or
+        // persistently broken media cannot stall shutdown for 15 s (#803/#811).
+        if (complete || !hasStore) {
+            gJournalSealStalls.store(0);
+            gJournalSealDone.store(true);
+        } else if (progress) {
+            gJournalSealStalls.store(0);
+        } else {
+            uint8_t stalls = gJournalSealStalls.load();
+            if (stalls < JOURNAL_SEAL_MAX_STALLS) ++stalls;
+            gJournalSealStalls.store(stalls);
+            if (stalls >= JOURNAL_SEAL_MAX_STALLS) gJournalSealDone.store(true);
+        }
     }
     gJournalSealing = false;
     xSemaphoreGive(gFsMutex);
@@ -1739,6 +1758,7 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
             diagnostics::EventContext::enumeration("reason", reason);
         gPowerOffEventPending.store(true);
         gPowerOffEventDropped.store(false);
+        gJournalSealStalls.store(0);
         gJournalSealDone.store(false);
         gJournalSealRequested.store(true);
         uint32_t journalWait = millis();
@@ -1840,6 +1860,7 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
     gJournalStarted = false; // recheck FAT allocation geometry on core 0
     gPowerOffEventPending.store(false); // consumer excluded by FS_LOCK
     gPowerOffEventDropped.store(false);
+    gJournalSealStalls.store(0);
     gJournalSealRequested.store(false);
     gJournalSealDone.store(false);
     FS_UNLOCK();
