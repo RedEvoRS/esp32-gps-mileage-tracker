@@ -1795,7 +1795,7 @@ static void serviceVbusRecheck() {
 static const char* const VBUS_UNREADABLE =
     "VBUS state unreadable -- staying awake instead of powering off.";
 
-static void powerOffSdRail();
+static bool powerOffSdRail(bool warnOnFailure = true);
 static bool mountSdStorage();
 
 static void powerOffForVbus(const char* reason = "idle_battery") {
@@ -3102,14 +3102,16 @@ static constexpr unsigned PMU_PERIPHERAL_ATTEMPTS = 3;
 // An estimated pause to ride out transient I2C failures, not a measured timing requirement.
 static constexpr uint32_t PMU_PERIPHERAL_RETRY_MS = 10;
 
-static void powerOffSdRail() {
+static bool powerOffSdRail(bool warnOnFailure) {
     for (unsigned attempt = 0; attempt < PMU_PERIPHERAL_ATTEMPTS; ++attempt) {
         if (attempt) delay(PMU_PERIPHERAL_RETRY_MS);
         PMU.disableBLDO1();
         // Read-back is authoritative even if the command reported failure.
-        if (pmu_read::bldo1Off(PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0))) return;
+        if (pmu_read::bldo1Off(PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0))) return true;
     }
-    Serial.println("WARNING: microSD card power rail (BLDO1) off unconfirmed after 3 attempts.");
+    if (warnOnFailure)
+        Serial.println("WARNING: microSD card power rail (BLDO1) off unconfirmed after 3 attempts.");
+    return false;
 }
 
 static bool mountSdStorage() {
@@ -3703,7 +3705,8 @@ void setup() {
         if (sdRailControl < 0 || voltage < 0 || 500 + (voltage & 0x1f) * 100 != 1800)
             delay(SD_POWER_OFF_SETTLE_MS);
     }
-    PMU.disableBLDO1();
+    // Report the result below, after the USB serial connection has had time to start.
+    const bool sdRailOff = powerOffSdRail(/*warnOnFailure=*/false);
     // Supreme GPS backup RAM comes straight from the 18650. LilyGO also
     // disables VBACKUP; a 60 s ALDO4-off test hot-started in 2.0 s with it off.
     PMU.disableButtonBatteryCharge();
@@ -3735,7 +3738,8 @@ void setup() {
         }
     }
     gRtc.printBootStatus();
-    Serial.println("LoRa rail (ALDO3) verified off; SD rail (BLDO1) off; VBACKUP off.");
+    Serial.printf("%sLoRa rail (ALDO3) verified off; SD rail (BLDO1) %s; VBACKUP off.\n",
+                  sdRailOff ? "" : "WARNING: ", sdRailOff ? "verified off" : "off unconfirmed");
     Serial.printf("PMU power-on source 0x%02X, power-off source 0x%02X.\n",
                   (unsigned)PMU.getPowerOnSource(), (unsigned)PMU.getPowerOffSource());
 

@@ -197,6 +197,45 @@ int main() {
         ++cases;
     }
 
+    // A latched card skip bypasses mountSdStorage's power sequence entirely.
+    for (bool recovers : {true, false}) {
+        world();
+        startup_watchdog::Record saved{startup_watchdog::kMagic, 0, 0,
+            uint32_t(startup_watchdog::Fallback::SkipCard), 0};
+        saved.checksum = startup_watchdog::checksum(saved);
+        gStartupWatchdog.boot(saved, false, false);
+        gStartupWatchdog.complete();
+        saveStartupWatchdog();
+        g_resetReason = ESP_RST_SW;
+        PMU.bldo1 = true;
+        PMU.bldo1Mv = 3300;
+        PMU.failSdDisable = true;
+        if (recovers) {
+            g_delayHook = [](uint32_t ms) {
+                if (ms == PMU_PERIPHERAL_RETRY_MS && PMU.failSdDisable &&
+                    !g_powerEvents.empty() && g_powerEvents.back() == "BLDO1.off") {
+                    assert(PMU.bldo1 && !gFsMutex);
+                    PMU.failSdDisable = false;
+                }
+                g_millis += ms;
+            };
+        }
+
+        setup();
+        assert(gStartupWatchdog.skipCard() && SD.begins == 0);
+        assert(gDegraded.mode() == Mode::Normal && gFlashMounted && gTripFS == &LittleFS);
+        assert(g_taskCreates == 1 && !gStartupWatchdog.active());
+        assert(PMU.bldo1 == !recovers);
+        assert(std::count(PMU.operations.begin(), PMU.operations.end(), "disableBLDO1") ==
+               (recovers ? 2 : PMU_PERIPHERAL_ATTEMPTS));
+        assert(logCount("SD rail (BLDO1) verified off;") == int(recovers));
+        assert(logCount("WARNING: LoRa rail (ALDO3) verified off; SD rail (BLDO1) off unconfirmed;") ==
+               int(!recovers));
+        assert(!logCount("SD rail (BLDO1) off;"));
+        bootMessagesAfterUsbWait();
+        ++cases;
+    }
+
     // Failed writes, lying writes and either unreadable verification must
     // warn once after USB is ready, but still start the display and logger.
     for (unsigned failure = 0; failure < 6; ++failure) {
