@@ -122,7 +122,7 @@ class InstallerBackupTimer(unittest.TestCase):
                    FAKE_USER=USER)
         env.update({"INSTALL_SAME_DISK": "y", **(extra_env or {})})
         proc = subprocess.run(["bash", "-c", HARNESS], env=env, text=True,
-                              capture_output=True, timeout=60)
+                              capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
         out = proc.stdout + proc.stderr
         lines = log.read_text().splitlines() if log.exists() else []
         return proc.returncode, out, lines
