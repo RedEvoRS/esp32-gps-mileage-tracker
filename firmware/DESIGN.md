@@ -287,10 +287,12 @@ idle on battery, `loop()` holds new network work and lets an upload drain
 within a deadline. `powerOffForVbus()` closes the trip and can cancel both
 the upload body and the response-header wait. When the network task is
 idle and the upload file is closed, it requests journal sealing, locks and
-unmounts storage. If the abort deadline expires, it leaves the filesystems
-mounted and skips the journal handoff. Both paths recheck VBUS before
-requesting PMU shutdown. If forced shutdown is cancelled or returns, the
-tracker restarts. USB insertion powers it on again after shutdown.
+unmounts storage. If the abort deadline expires, it skips the journal
+handoff and locks storage while leaving both filesystems mounted. Both
+paths hold the filesystem lock through PMU shutdown and recheck VBUS
+immediately before the shutdown request. If forced shutdown is cancelled or
+returns, the tracker keeps the lock held through restart. USB insertion
+powers it on again after shutdown.
 
 A user long press calls `powerOffForVbus("user_long_press")` from
 `pollPmu()` on core 1. Confirmed VBUS refuses shutdown and sets a display
@@ -300,7 +302,8 @@ screen mode for the normal card interval. Automatic idle/critical-battery
 requests and unknown VBUS readings do not request it. Debug mode changes
 dismiss it with the other old cards. For an accepted user shutdown, core 1
 synchronously draws the single-line `Switching off` card after trip closure
-and core-0 journal sealing, then holds it for one second before unmounting.
+and any core-0 journal sealing, then holds it for one second before locking
+storage.
 The adapter's 10 ms bus timeout and first-error latch bound failed drawing;
 there is no display acknowledgment wait. A failed display, degraded startup
 or an automatic shutdown reason skips the card and hold. The final VBUS

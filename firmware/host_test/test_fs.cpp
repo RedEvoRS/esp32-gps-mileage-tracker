@@ -885,10 +885,14 @@ int main(int argc, char** argv) {
         gVbusLost = true; gNetBusy = true;           // and it never finishes
         loopFor(IDLE_BATT_SLEEP_MS + NET_DRAIN_MS - 1000);
         CHECK(PMU.shutdownCalls == 0 && !gNetAbort, "waits out the drain limit");
+        PMU.onShutdown = [] {
+            CHECK(xPortGetCoreID() == 1 && g_lockDepth == 1 && g_disk.mounted,
+                  "core 1 holds the filesystem lock at PMU shutdown with storage still mounted");
+        };
         loopFor(2000 + NET_ABORT_MS);
         CHECK(PMU.shutdownCalls == 1 && gNetAbort, "then cuts the upload off and powers off");
-        CHECK(logHas("forcing power-off without unmounting storage") && g_disk.mounted,
-              "forced power-off leaves the busy filesystem mounted");
+        CHECK(logHas("forcing power-off without unmounting storage") && g_disk.mounted && g_lockDepth == 1,
+              "forced power-off leaves storage mounted and locked");
 
         resetWorld();                                // critical battery / power key
         PMU.vbusIn = false;
@@ -899,8 +903,8 @@ int main(int argc, char** argv) {
         CHECK(gNetAbort && g_millis - t0 <= NET_ABORT_MS + 100, "upload cut off without waiting for it");
         auto v = tripFiles();
         CHECK(v.size() == 1 && wellFormedShape(g_disk.files[v[0]]), "trip finalized first");
-        CHECK(PMU.shutdownCalls == 1 && g_disk.mounted && g_lockDepth == 0,
-              "forced power-off does not take the filesystem lock");
+        CHECK(PMU.shutdownCalls == 1 && g_disk.mounted && g_lockDepth == 1,
+              "forced power-off retains the filesystem lock");
     }
 
     printf("T32 network task: stops between files, ends a cut-off body, starts nothing when held (#3)\n");
@@ -1584,9 +1588,9 @@ int main(int argc, char** argv) {
             if (!failedShutdown) g_taskDelayHook = [](uint32_t) { PMU.vbusIn = true; };
             try { powerOffForVbus(); } catch (const Restarted&) {}
             CHECK(g_restarts == 1 && gNetHold && gNetAbort && logHas("forced power-off returned or was cancelled") &&
-                  g_disk.mounted && g_lockDepth == 0 && g_disk.mountAttempts == 0 &&
+                  g_disk.mounted && g_lockDepth == 1 && g_disk.mountAttempts == 0 &&
                   PMU.shutdownCalls == (failedShutdown ? 1 : 0),
-                  "a stuck upload restarts without unmounting or remounting under its old file handle");
+                  "forced shutdown restarts with storage mounted and the lock held");
         }
 
         resetWorld(); drive(15, 40); PMU.vbusIn = false;
@@ -2270,7 +2274,7 @@ int main(int argc, char** argv) {
         CHECK(g_disk.files[path] == spaced && hasPending(), "XML whitespace across a block boundary remains valid");
     }
 
-    printf("T75 abort interrupts response trickle and forced shutdown skips a live upload handle (#810)\n");
+    printf("T75 abort interrupts response trickle and forced shutdown locks out late upload cleanup (#810)\n");
     {
         resetWorld(); drive(15, 40); endTrip(false);
         auto path = tripFiles().front();
@@ -2283,20 +2287,44 @@ int main(int argc, char** argv) {
               "an abort during the response line promptly closes and preserves the trip");
     }
     for (bool busy : {false, true}) {
-        resetWorld(); drive(15, 40); endTrip(false);
-        const auto path = tripFiles().front();
+        resetWorld(); SD.cardPresent = true; setup(); drive(15, 40);
+        const std::string path = gTripPath;
+        endTrip(false);
         PMU.vbusIn = false;
         gNetBusy = busy;
-        g_disk.onUnmount = [] {
-            CHECK(g_disk.openHandles == 0, "unmount never overlaps a live upload handle");
+        PMU.onShutdown = [] {
+            CHECK(xPortGetCoreID() == 1 && g_lockDepth == 1 && g_sdDisk.mounted &&
+                  g_disk.mounted && SD.ends == 0 && g_sdDisk.openHandles == 1,
+                  "core 1 holds the lock at PMU shutdown with both stores mounted and the upload file open");
         };
-        g_httpTripReplyByteHook = [] {
-            CHECK(g_disk.openHandles == 1, "response wait holds a real file handle");
-            powerOffForVbus();
+        struct UploadBlocked {};
+        bool blocked = false;
+        g_httpTripReplyByteHook = [&] {
+            CHECK(g_sdDisk.openHandles == 1 && g_lockDepth == 0,
+                  "a real upload file stays open without holding the lock during the response wait");
+            g_currentCore = 1;
+            // Suspend core 1 at PMU shutdown and let core 0 finish the response.
+            try { powerOffForVbus(); } catch (const PoweredOff&) {}
+            g_currentCore = 0;
+            g_semaphoreTakeHook = [&](uint32_t wait) {
+                if (wait == portMAX_DELAY && g_lockDepth == 1) {
+                    CHECK(xPortGetCoreID() == 0 && !gTripUploadFileClosed.load() &&
+                          g_sdDisk.openHandles == 1 && g_sdDisk.files.count(path),
+                          "late upload cleanup reaches the held mutex before closing or changing the file");
+                    // Model the blocking take without hanging the host harness.
+                    throw UploadBlocked{};
+                }
+            };
         };
         const uint32_t started = millis();
-        try { uploadFile(LittleFS, path.c_str()); } catch (const PoweredOff&) {}
-        CHECK(g_disk.mounted && PMU.shutdownCalls == 1 && g_disk.files.count(path) &&
+        g_currentCore = 0;
+        try { uploadFile(SD, path.c_str()); } catch (const UploadBlocked&) { blocked = true; }
+        g_currentCore = 1;
+        g_semaphoreTakeHook = nullptr;
+        g_httpTripReplyByteHook = nullptr;
+        CHECK(blocked && !gTripUploadFileClosed.load() && g_sdDisk.files.count(path),
+              "late upload completion cannot reach the filesystem");
+        CHECK(g_sdDisk.mounted && g_disk.mounted && PMU.shutdownCalls == 1 &&
               millis() - started >= NET_ABORT_MS,
               "without the file-closed acknowledgement, shutdown waits then skips unmount");
     }

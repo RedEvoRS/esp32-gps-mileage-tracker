@@ -404,10 +404,10 @@ a card. Stage 4 has since recorded two real drives on the card.
      power off without closing files.
   3. Watch for `Switching off`, then a dark screen. Wait a few seconds for
      shutdown to finish before touching the card. The message appears for
-     about one second after trip closure and journal sealing, before storage
-     is unmounted. If SD was mounted, it stays powered for another half
-     second after unmount before power is cut. A failed display or degraded startup
-     skips the message. A dark screen by itself does not mean off: the
+     about one second after trip closure and any journal sealing. On a clean
+     shutdown, storage is then unmounted. If SD was mounted, it stays powered
+     for another half second after unmount before power is cut. A failed
+     display or degraded startup skips the message. A dark screen by itself does not mean off: the
      running board normally sleeps its screen between cards.
   4. Pull the card **without pressing anything**. Any POWER press, even a
      tap, switches an off board on. Pressing it to check can leave the board
@@ -420,7 +420,9 @@ a card. Stage 4 has since recorded two real drives on the card.
   gets up to 16 additional minutes to finish; shutdown then allows up to
   15 s for network abort and up to 15 s for journal sealing before unmounting.
   If the uploader cannot close its file in time, the tracker forces power-off
-  with storage still mounted. Allow those waits too before removing the card.
+  with storage still mounted and locked. If that power-off is cancelled or
+  fails, the tracker holds the lock through restart. Allow those waits too
+  before removing the card.
   Unknown USB state refuses
   shutdown, so this fallback requires working power control. In degraded
   startup with no storage, confirmed USB absence still starts the 10-minute
@@ -1176,8 +1178,10 @@ How it behaves once flashed:
   storage and calls `PMU.shutdown()` to switch the board off completely.
   It does not deep-sleep. The next USB power insert switches it on again.
   An upload still running at 10 minutes gets up to **16 more minutes** to
-  finish; a file cut off then remains queued. This is the opportunity to
-  upload at home; check your installed power setup as described under
+  finish; a file cut off then remains queued. If the uploader does not close
+  the file by the abort deadline, the tracker keeps storage mounted and locked
+  through power-off. This is the opportunity to upload at home; check your
+  installed power setup as described under
   [Put it in the car](#put-it-in-the-car). Without an 18650,
   the board loses power with the car and has no battery upload window or
   clean shutdown. A car USB port that stays powered never triggers this

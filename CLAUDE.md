@@ -243,7 +243,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   E4006 reports GPX write failures. A card that still answers capacity
   queries can keep uploading queued trips. Clean shutdown unmounts both
   stores after the uploader closes its file. An expired abort deadline
-  forces power-off with the stores still mounted.
+  leaves the stores mounted and holds the filesystem lock through power-off
+  or restart.
   A read-only FAT32 check before the first write rejects damaged cards with
   E4011 and keeps trips and diagnostics on LittleFS if available.
   SD uploads were verified on 2026-10-21 (UTC), LittleFS uploads on 2026-11-03 (UTC)
