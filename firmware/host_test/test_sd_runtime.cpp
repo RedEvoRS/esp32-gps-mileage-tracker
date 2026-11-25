@@ -69,10 +69,12 @@ int main() {
         PMU.registerReadOverride[reg] = value;
         assert(!mountSdStorage());
         assert(SD.begins == 0 && !gSdSpi.started && !PMU.bldo1);
-        assert(g_powerEvents == (std::vector<std::string>{
-            "BLDO1.off", "BLDO1.voltage", "BLDO1.on", "BLDO1.off"
-        }));
+        std::vector<std::string> expectedPowerEvents = {"BLDO1.off", "BLDO1.voltage", "BLDO1.on"};
+        const bool unreadableControl = reg == XPOWERS_AXP2101_LDO_ONOFF_CTRL0 && value < 0;
+        expectedPowerEvents.insert(expectedPowerEvents.end(), unreadableControl ? 3 : 1, "BLDO1.off");
+        assert(g_powerEvents == expectedPowerEvents);
         assert(logHas("microSD card power rail (BLDO1) could not be verified"));
+        assert(logHas("BLDO1) off unconfirmed after 3 attempts") == unreadableControl);
     }
     resetWorld();
     SD.cardPresent = true;
