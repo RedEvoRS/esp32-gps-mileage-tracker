@@ -683,8 +683,9 @@ mode cannot be verified at startup. XPowersLib's existing `PMU.begin()` sets
 TS to fixed input with its ADC off a few I2C transactions before the charger
 pause. The firmware verifies that setup and makes any repairs after confirming
 the pause. It skips that check and repair if the pause remains unconfirmed.
-Deploy server **v1.25** before firmware **v1.10** so ingest, viewer and monitor
-recognize E2010. Protocol/schema v1 is unchanged.
+Older servers accept E2010 and store it as an unknown code. Deploy server
+**v1.25** so Device health shows its severity and description and the monitor
+can send alerts for it. Protocol/schema v1 is unchanged.
 
 ### Protocol v1 (#117 contract, #118 and #125 integration)
 
