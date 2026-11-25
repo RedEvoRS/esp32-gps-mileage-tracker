@@ -510,7 +510,7 @@ def _record_failure(ip, username=""):
         )
 
 
-def _clear_failures(ip, username):
+def _clear_failures(ip, username, *, conn=None):
     """Forget this IP's failures against `username` only.
 
     Anyone who holds one valid login could otherwise reset the count between
@@ -519,32 +519,35 @@ def _clear_failures(ip, username):
 
     Returns False, clearing nothing, if the IP is locked: the lock can appear
     while a login's slow password hash is running, and that login must not
-    still get a session. This check shares the clearing transaction, so no
-    lock can slip in between it and the session being issued.
+    still get a session. Password changes pass their writer transaction so
+    that the lock check, clearing and password update happen together.
     """
+    if conn is None:
+        with closing(sqlite3.connect(DB_PATH, timeout=30)) as writer, writer:
+            writer.execute("BEGIN IMMEDIATE")
+            return _clear_failures(ip, username, conn=writer)
+
     name = _failure_name(username)
-    with closing(sqlite3.connect(DB_PATH, timeout=30)) as conn, conn:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT fails, locked_until FROM login_attempts WHERE ip = ?", (ip,)
-        ).fetchone()
-        if not row:
-            conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
-            return True
-        if row[1] and datetime.fromisoformat(row[1]) > datetime.now(timezone.utc):
-            return False  # a lock set by a concurrent request stands
-        own = conn.execute(
-            "SELECT fails FROM login_attempt_names WHERE ip = ? AND name = ?", (ip, name)
-        ).fetchone()
-        if not own:
-            return True
-        conn.execute("DELETE FROM login_attempt_names WHERE ip = ? AND name = ?", (ip, name))
-        fails = max(0, row[0] - own[0])
-        if fails:
-            conn.execute("UPDATE login_attempts SET fails = ? WHERE ip = ?", (fails, ip))
-        else:
-            conn.execute("DELETE FROM login_attempts WHERE ip = ?", (ip,))
-            conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
+    row = conn.execute(
+        "SELECT fails, locked_until FROM login_attempts WHERE ip = ?", (ip,)
+    ).fetchone()
+    if not row:
+        conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
+        return True
+    if row[1] and datetime.fromisoformat(row[1]) > datetime.now(timezone.utc):
+        return False  # a lock set by a concurrent request stands
+    own = conn.execute(
+        "SELECT fails FROM login_attempt_names WHERE ip = ? AND name = ?", (ip, name)
+    ).fetchone()
+    if not own:
+        return True
+    conn.execute("DELETE FROM login_attempt_names WHERE ip = ? AND name = ?", (ip, name))
+    fails = max(0, row[0] - own[0])
+    if fails:
+        conn.execute("UPDATE login_attempts SET fails = ? WHERE ip = ?", (fails, ip))
+    else:
+        conn.execute("DELETE FROM login_attempts WHERE ip = ?", (ip,))
+        conn.execute("DELETE FROM login_attempt_names WHERE ip = ?", (ip,))
     return True
 
 
@@ -4439,13 +4442,17 @@ def restore_moved_removal(year, ym, saved_id):
     return redirect(url_for('admin_year', year=year))
 
 
+class PasswordChangeLocked(Exception):
+    pass
+
+
 @app.route("/account/password", methods=["GET", "POST"])
 def account_password():
     if request.method == "POST" and g.role == "editor":
         ip = _client_ip()
+        lockout_message = "Too many failed attempts. Try again later."
         if _lock_seconds_remaining(ip):
-            return render_template_string(ACCOUNT_HTML, title="Change password",
-                                          message="Too many failed attempts. Try again later."), 429
+            return render_template_string(ACCOUNT_HTML, title="Change password", message=lockout_message), 429
         user = users.get_user(DB_PATH, g.user)
         # A concurrent removal still takes one hash check and fails closed.
         valid = check_password_hash(user["password_hash"] if user else DUMMY_PASSWORD_HASH,
@@ -4454,13 +4461,19 @@ def account_password():
             _record_failure(ip, g.user)
             session["account_message"] = "Incorrect current password."
         else:
+            def check_lockout(conn):
+                if not _clear_failures(ip, g.user, conn=conn):
+                    raise PasswordChangeLocked
+
             try:
                 password = _confirmed_password()
                 updated = users.change_user(DB_PATH, "reset-password", g.user, password, VIEWER_USERNAME,
-                                             expected_tag=session["pw_tag"], secret_key=VIEWER_SECRET_KEY)
+                                             expected_tag=session["pw_tag"], secret_key=VIEWER_SECRET_KEY,
+                                             before_update=check_lockout)
                 session["pw_tag"] = users.session_tag(VIEWER_SECRET_KEY, updated)
-                _clear_failures(ip, g.user)
                 session["account_message"] = "Password changed. Other sessions for this login have ended."
+            except PasswordChangeLocked:
+                return render_template_string(ACCOUNT_HTML, title="Change password", message=lockout_message), 429
             except users.UserError as exc:
                 session["account_message"] = str(exc)
         return redirect(url_for("account_password"))

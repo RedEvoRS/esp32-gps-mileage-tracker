@@ -70,13 +70,12 @@ HELP
         fi
         printf '%s' "$value"
     }
-    # Copy regular release files only; exclude private paths even on first use.
-    # Reject destination symlinks rather than following them outside the install.
-    copy_tree() {
-        local from=$1 to=$2 scope=$3 prefix=$4 item name relative target
+    # Preflight and copy use the same exclusions and path checks.
+    release_tree() {
+        local from=$1 to=$2 scope=$3 prefix=$4 action=$5 item name relative target
         [[ ! -L $to && ( ! -e $to || -d $to ) ]] \
             || fail "Source directory conflicts with an existing path: $to"
-        mkdir -p -- "$to"
+        if [[ $action == copy ]]; then mkdir -p -- "$to"; fi
         for item in "$from"/* "$from"/.[!.]* "$from"/..?*; do
             [[ -e $item || -L $item ]] || continue
             name=${item##*/}
@@ -92,9 +91,9 @@ HELP
             target=$to/$name
             [[ ! -L $target ]] || fail "Source file conflicts with an existing symlink: $target"
             if [[ -d $item ]]; then
-                copy_tree "$item" "$target" "$scope" "$relative/"
-            elif [[ -f $item && ! -d $target ]]; then
-                cp -p -- "$item" "$target"
+                release_tree "$item" "$target" "$scope" "$relative/" "$action"
+            elif [[ -f $item && ( ! -e $target || -f $target ) ]]; then
+                if [[ $action == copy ]]; then cp -p -- "$item" "$target"; fi
             else
                 fail "Unsupported source or destination path: $relative"
             fi
@@ -345,11 +344,13 @@ HELP
     if [[ $yes == no ]]; then
         confirm 'Copy this release and run the server installer?' || { printf 'Cancelled.\n'; return 0; }
     fi
-    copy_tree "$source/server" "$install_dir" server ''
     mkdir -p "$temp_dir/firmware-src/tools"
     mv "$source/firmware" "$temp_dir/firmware-src/firmware"
     cp -p "$source/tools/stamp_firmware_version.py" "$temp_dir/firmware-src/tools/"
-    copy_tree "$temp_dir/firmware-src" "$install_dir/firmware-src" firmware ''
+    release_tree "$source/server" "$install_dir" server '' preflight
+    release_tree "$temp_dir/firmware-src" "$install_dir/firmware-src" firmware '' preflight
+    release_tree "$source/server" "$install_dir" server '' copy
+    release_tree "$temp_dir/firmware-src" "$install_dir/firmware-src" firmware '' copy
     install_dir=$(cd -- "$install_dir" && pwd -P)
     chmod u+x "$install_dir/install.sh"
     printf 'Running install.sh to configure, rebuild and verify the server.\n'

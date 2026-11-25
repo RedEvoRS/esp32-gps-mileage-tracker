@@ -98,7 +98,12 @@ so they can never be left partially written:
   of truth that any map tool can open directly)
 - `/data/YYYY-MM/<id>.json` — a derived summary (distance, duration,
   speeds, bounding box) so other tools can list and total trips without
-  re-parsing every track
+  re-parsing every track. It also stores a SHA-256 digest of the original GPX.
+
+If only the summary remains, re-uploading the trip restores the GPX only
+if its digest matches. A legacy summary without a digest yields HTTP 409
+and keeps its saved totals. Restore the original GPX from a backup to recover
+the track. A byte-for-byte retry with that GPX in place adds the digest.
 
 Ingest refuses trip and diagnostics folders or files that resolve outside its data folder.
 
@@ -281,10 +286,11 @@ escaping backslashes as `\\`, double quotes as `\"`, and dollars as `$$`.
 Keep one setting per line and use literal values rather than `$OTHER` or
 `${OTHER}` references: the installer reports those as ambiguous rather than
 guessing Compose's interpolation context. Full examples and error behavior
-are in DEPLOY_DEBIAN.md Step 11b. On Unraid, one disposable Python checker
-serves all Notifications questions; secrets travel on stdin, never argv.
-The checker stays off when `--check` has no selected monitor file and when a
-fresh install chooses no outputs. Existing monitor heartbeat checks still run.
+are in DEPLOY_DEBIAN.md Step 11b. On Unraid without host Python, the installer
+starts one disposable Python checker when it reads the Address lookup settings
+and reuses it for Notifications. Address lookup runs during install and
+`--check` even when lookup is off and no Notifications outputs are configured.
+Secrets travel on stdin, never argv. Existing monitor heartbeat checks still run.
 
 Optionally, the monitor also sends diagnostics as GELF (Graylog Extended Log
 Format) to a Graylog you run elsewhere (`GRAYLOG_*` in `monitor.env`, off by
@@ -1269,9 +1275,10 @@ The limit is the named `MERGE_MAX_GAP` constant in `trip_merges.py`. Older
 summaries without that timestamp use `end_time`, the last moving point, as
 a conservative fallback. Upload/receipt times are never used. Overlapping
 recordings, unknown device identities or unknown start times cannot be merged.
-A folder problem that leaves trips unreadable, or a conflict between saved
-month names, blocks merge suggestions with a
-folder-specific message until the folder is fixed. An unreadable summary blocks merging when its device is
+A folder problem that leaves trips unreadable blocks merge suggestions with a
+folder-specific message until the folder is fixed. When two saved month names
+point to the same folder, healthy trips under the name in use can still have
+merge suggestions. An unreadable summary blocks merging when its device is
 unknown, or when it
 belongs to this device and could fall between these recordings. Usable start
 times or UTC timestamp trip IDs can rule out damage outside that interval;
