@@ -25,8 +25,11 @@ static void world(bool sd, bool flash, EventLog::Config config = EventLog::Confi
     SD.dirs.clear(); LittleFS.dirs.clear();
     g_lockDepth = 0; gFsDemand = 0; gNetHold = gNetBusy = gNetAbort = false;
     gJournalSealRequested = gJournalSealDone = gJournalSealOk = false;
-    gPowerOffEventPending = false;
-    gJournalStarted = gJournalSealing = gJournalBootReported = false;
+    gJournalSealStalls = 0;
+    gPowerOffEventPending = gPowerOffEventDropped = false;
+    gJournalStarted = gJournalSealing = gJournalEnrolling = gJournalBootReported = false;
+    gDegraded = startup::DegradedPolicy();
+    gSdJournalIo.onListEntry = nullptr; gFlashJournalIo.onListEntry = nullptr;
     gJournal.~EventLog(); new (&gJournal) EventLog(sd ? &gSdJournalFs : nullptr, flash ? &gFlashJournalFs : nullptr, config);
     gJournalBoot = newJournalBoot();
     gJournalReady = gJournal.begin(gJournalBoot.id, gJournalBoot.counter, "test-1");
@@ -266,5 +269,109 @@ int main() {
     }
 
     std::puts("Journal failed power-off remount reloads caches, preserves identity and reports boot once passed");
+
+    // Issue #797 Stage 4 integration: interrupted directory listing keeps
+    // progress across serviceJournal() slices when core 1 demands FS_LOCK.
+    world(true, false);
+    for (unsigned i = 0; i < 80; ++i) {
+        submit(); serviceJournal();
+        xSemaphoreTake(gFsMutex, 0); assert(gJournal.seal()); xSemaphoreGive(gFsMutex);
+    }
+    gJournal.invalidateStorage();
+    size_t expectedEntries = 0;
+    for (const auto& kv : g_sdDisk.files)
+        if (!kv.first.rfind("/diag/", 0)) ++expectedEntries;
+    assert(expectedEntries == 82); // 80 segments + ack-0 + ack-1
+    size_t sliceEntries = 0, totalEntries = 0;
+    gSdJournalIo.onListEntry = [&]() {
+        ++totalEntries;
+        if (++sliceEntries == 20) gFsDemand.store(1);
+    };
+    submit();
+    unsigned slices = 0;
+    while (gJournal.stats().queued > 0 && slices < 10) {
+        sliceEntries = 0; gFsDemand.store(0);
+        serviceJournal();
+        ++slices;
+    }
+    gSdJournalIo.onListEntry = nullptr; gFsDemand.store(0);
+    assert(gJournal.stats().queued == 0 && slices == 5 && totalEntries == expectedEntries);
+    assert(!gJournal.storageFault().active);
+    std::puts("Journal #797: interrupted Stage 4 SD inventory resumes across serviceJournal slices passed");
+
+    // Issue #803 (NoStorage): full RAM queue counts one drop and finishes
+    // shutdown promptly instead of spinning for the full 15 s deadline.
+    world(false, false);
+    gDegraded.begin(startup::Mode::NoStorage, millis());
+    submit(kEventQueueSize);
+    uint64_t dropsBefore = gJournal.stats().dropped;
+    uint32_t shutStart = millis();
+    PMU.vbusIn = false;
+    try { powerOffForVbus("battery_critical"); assert(false); } catch (const PoweredOff&) {}
+    assert(uint32_t(millis() - shutStart) < 1000);
+    assert(gJournalSealDone && !gJournalSealOk && !gPowerOffEventPending);
+    assert(gJournal.stats().dropped == dropsBefore + 1);
+
+    // Issue #803/#811 (failing LittleFS): full RAM queue counts one drop,
+    // seals an existing .open segment to .ready, and stops retrying after
+    // JOURNAL_SEAL_MAX_STALLS consecutive stalled ticks instead of waiting 15 s.
+    world(false, true);
+    for (auto& s : gEventConditions) { auto code = s.code; s = {}; s.code = code; }
+    submit(); serviceJournal();
+    assert(g_disk.files.count("/diag/seg-00000001.open"));
+    g_disk.writesFail = true;
+    submit(kEventQueueSize);
+    dropsBefore = gJournal.stats().dropped;
+    static unsigned failTicks = 0;
+    failTicks = 0;
+    shutStart = millis();
+    PMU.vbusIn = false;
+    g_taskDelayHook = [](uint32_t) {
+        if (g_lockDepth) return;
+        ++failTicks;
+        serviceJournal();
+    };
+    g_disk.onUnmount = [] {
+        assert(failTicks == JOURNAL_SEAL_MAX_STALLS);
+        assert(gJournalSealDone && !gPowerOffEventPending && !gJournalSealOk);
+        assert(g_disk.files.count("/diag/seg-00000001.ready") && !g_disk.files.count("/diag/seg-00000001.open"));
+    };
+    try { powerOffForVbus("battery_critical"); assert(false); } catch (const PoweredOff&) {}
+    assert(uint32_t(millis() - shutStart) < 1000);
+    // Exactly two drops across the whole shutdown wait: one from the rate-limited
+    // E4008 raise after the first failed write, and one from the power-off notice.
+    assert(gJournal.stats().dropped == dropsBefore + 2);
+    std::puts("Journal #803: full RAM queue at shutdown counts one drop, seals open segment and finishes promptly on failing LittleFS passed");
+
+    // Issue #811: transient write failure during shutdown seal keeps the seal
+    // pending while records remain queued, then drains and seals on retry.
+    world(false, true);
+    submit(3);
+    g_disk.writesFail = true;
+    PMU.vbusIn = false;
+    static unsigned retryTicks = 0;
+    retryTicks = 0;
+    shutStart = millis();
+    g_taskDelayHook = [](uint32_t) {
+        if (g_lockDepth) return;
+        ++retryTicks;
+        if (retryTicks == 3) g_disk.writesFail = false;
+        serviceJournal();
+        if (retryTicks < 3) assert(!gJournalSealDone && gJournal.stats().queued > 0);
+    };
+    g_disk.onUnmount = [] {
+        assert(retryTicks == 3 && gJournalSealDone && gJournalSealOk && gJournal.stats().queued == 0);
+        for (const auto& file : g_disk.files)
+            if (!file.first.rfind("/diag/", 0)) assert(file.first.find(".open") == std::string::npos);
+    };
+    try { powerOffForVbus("idle_battery"); assert(false); } catch (const PoweredOff&) {}
+    assert(uint32_t(millis() - shutStart) < NET_ABORT_MS);
+    g_lockDepth = 0; gFsDemand = 0; gNetHold = gNetAbort = false; g_disk.mounted = true;
+    xSemaphoreTake(gFsMutex, 0);
+    gJournal.invalidateStorage();
+    assert(gJournal.nextBatch(batch) && batch.count == 4);
+    assert(std::strstr(batch.events[3], "\"code\":2009,"));
+    xSemaphoreGive(gFsMutex);
+    std::puts("Journal #811: failed shutdown seal retries until queued records drain and seal passed");
     return 0;
 }

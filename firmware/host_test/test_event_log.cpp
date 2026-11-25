@@ -29,22 +29,34 @@ struct MemoryFs : EventLogFs {
     std::map<std::string, std::string> files;
     bool mounted = true, readOnly = false, failOpen = false, failRename = false;
     bool failRemove = false, failRead = false, failList = false, failNotice = false, failClose = false;
-    size_t capacity = SIZE_MAX, tear = SIZE_MAX;
+    bool failMetaReadBack = false, deferredFlag = false;
+    size_t capacity = SIZE_MAX, tear = SIZE_MAX, deferListAfter = SIZE_MAX;
     std::string tearPath, failReadPath;
     uint32_t failReadAfter = 0;
-    size_t writes = 0, calls = 0, lists = 0, reads = 0;
+    size_t writes = 0, calls = 0, lists = 0, listEntriesVisited = 0, reads = 0;
     size_t allocationUnit = 1, peakAllocated = 0;
-    bool begin() override { ++calls; return mounted; }
-    Result list(size_t index, Entry& entry) override {
-        ++calls; ++lists;
-        if (!mounted || failList) return Result::Error;
-        if (index >= files.size()) return Result::End;
-        auto it = files.begin(); std::advance(it, index);
-        std::snprintf(entry.name, sizeof(entry.name), "%s", it->first.c_str() + 6);
-        entry.size = static_cast<uint32_t>(it->second.size()); return Result::Ok;
+    bool begin() override { ++calls; deferredFlag = false; return mounted; }
+    bool deferred() const override { return deferredFlag; }
+    Result list(size_t skip, ListVisitor visitor, void* context) override {
+        ++calls; ++lists; deferredFlag = false;
+        if (!visitor || !mounted || failList) return Result::Error;
+        size_t index = 0, visited = 0;
+        for (const auto& file : files) {
+            if (index++ < skip) continue;
+            if (visited >= deferListAfter) { deferredFlag = true; return Result::Deferred; }
+            Entry entry{};
+            std::snprintf(entry.name, sizeof(entry.name), "%s", file.first.c_str() + 6);
+            entry.size = static_cast<uint32_t>(file.second.size());
+            ++visited; ++listEntriesVisited;
+            if (!visitor(context, entry)) return Result::Error;
+        }
+        return index < skip ? Result::Error : Result::Ok;
     }
     bool read(const char* path, uint32_t offset, void* data, size_t size) override {
-        ++calls; ++reads;
+        ++calls; ++reads; deferredFlag = false;
+        if (failMetaReadBack && std::strstr(path, "/diag/ack-")) {
+            failMetaReadBack = false; deferredFlag = true; return false;
+        }
         auto it = files.find(path);
         if (!mounted || failRead || (path == failReadPath && offset >= failReadAfter) ||
             it == files.end() || offset + size > it->second.size()) return false;
@@ -804,6 +816,105 @@ static void validationAndConcurrency() {
     assert(accepted == kEventQueueSize && concurrent->stats().dropped == 3000 - kEventQueueSize);
     assert(read(*concurrent) == kEventQueueSize); ack(*concurrent); assert(read(*concurrent) == 0);
 }
+static void lossCounterReadBackNoUnderflow() {
+    // Issue #801: a cancelled/failed metadata read-back after writing the
+    // loss-clear slot commits pending=0 on disk while save() returns false.
+    // Reloading must clear the cached loss notice so fewer new drops never
+    // underflow pending or corrupt both ack slots.
+    MemoryFs sd; auto log = logger(&sd);
+    sd.readOnly = true;
+    for (size_t i = 0; i < kEventQueueSize; ++i) assert(log->submit(notice()) == EventLog::Submit::Accepted);
+    for (size_t i = 0; i < 7; ++i) assert(log->submit(notice()) == EventLog::Submit::Full);
+    sd.readOnly = false; sd.failNotice = true;
+    log->service(kEventQueueSize);
+    assert(log->stats().queued == 0 && log->stats().dropped == 7 && log->stats().pendingLoss == 7);
+    // Append of the cached 7-drop notice succeeds, but read-back of the
+    // pending=0 metadata slot is cancelled after the write already landed.
+    sd.failNotice = false; sd.failMetaReadBack = true;
+    log->service(1);
+    assert(!sd.failMetaReadBack); // consumed by the cancelled read-back
+    // Now add only 2 new drops (fewer than the old cached lossReported_=7).
+    sd.readOnly = true;
+    for (size_t i = 0; i < kEventQueueSize; ++i) assert(log->submit(notice()) == EventLog::Submit::Accepted);
+    for (size_t i = 0; i < 2; ++i) assert(log->submit(notice()) == EventLog::Submit::Full);
+    sd.readOnly = false;
+    log->service(kEventQueueSize);
+    log->service(1);
+    assert(log->stats().queued == 0 && log->stats().dropped == 9 && log->stats().pendingLoss == 0);
+    std::vector<std::string> notices;
+    while (read(*log)) {
+        for (size_t i = 0; i < batch.count; ++i)
+            if (std::strstr(batch.events[i], "\"code\":4009,")) notices.emplace_back(batch.events[i]);
+        ack(*log);
+    }
+    assert(notices.size() == 2);
+    assert(notices[0].find("\"count\":7") != std::string::npos);
+    assert(notices[1].find("\"count\":2") != std::string::npos);
+    auto reopened = logger(&sd, nullptr, boot2);
+    assert(read(*reopened) == 0);
+    assert(reopened->stats().dropped == 9 && reopened->stats().pendingLoss == 0);
+    std::cout << "EventLog #801: cancelled loss-clear read-back reloads cleanly without underflow passed\n";
+}
+static void segmentLimitEviction() {
+    // Issue #796: 512 small sealed segments on a small-cluster card stay far
+    // below the 16 MiB byte quota, so makeRoom() must also evict when a new
+    // segment slot is required.
+    MemoryFs sd; sd.allocationUnit = 4096;
+    EventLog::Config config; config.sdQuota = kSdJournalQuota; config.sdCluster = 4096;
+    config.revisionState = &revisionState;
+    EventLog log(&sd, nullptr, config);
+    assert(log.begin(boot1, 1, "test-1"));
+    for (size_t i = 0; i < 512; ++i) {
+        add(log);
+        assert(log.seal());
+    }
+    assert(sd.segments().size() == 512);
+    assert(sd.allocated() < kSdJournalQuota / 4);
+    for (size_t i = 0; i < 5; ++i) {
+        add(log);
+        assert(log.seal());
+    }
+    assert(log.stats().queued == 0 && log.stats().backend == EventLog::Backend::Sd);
+    assert(!log.storageFault().active);
+    assert(sd.segments().size() == 512);
+    assert(log.stats().dropped == 5);
+    assert(!sd.files.count("/diag/seg-00000001.ready") && !sd.files.count("/diag/seg-00000005.ready"));
+    assert(sd.files.count("/diag/seg-00000006.ready") && sd.files.count("/diag/seg-00000517.ready"));
+    // Reclaiming an acknowledged segment frees a slot with zero extra loss.
+    assert(read(log, 1) == 1); ack(log);
+    add(log); assert(log.seal());
+    assert(log.stats().dropped == 5 && sd.segments().size() == 512);
+    assert(!sd.files.count("/diag/seg-00000006.ready") && sd.files.count("/diag/seg-00000518.ready"));
+    std::cout << "EventLog #796: 512-segment limit evicts oldest segment instead of wedging SD passed\n";
+}
+static void resumableSinglePassInventory() {
+    // Issue #797: inventory() enumerates /diag in one pass and keeps progress
+    // across cooperative Deferred interruptions instead of restarting from 0.
+    MemoryFs sd; auto seed = logger(&sd);
+    for (size_t i = 0; i < 120; ++i) { add(*seed); assert(seed->seal()); }
+    const size_t totalFiles = sd.files.size();
+    assert(totalFiles >= 122); // 120 segments + ack-0 + ack-1
+    auto reopened = logger(&sd, nullptr, boot2);
+    sd.lists = 0; sd.listEntriesVisited = 0;
+    sd.deferListAfter = 25;
+    size_t attempts = 0;
+    while (attempts < 20) {
+        ++attempts;
+        reopened->service(0);
+        if (reopened->stats().dropped == 0 && sd.listEntriesVisited == totalFiles &&
+            !sd.deferredFlag) break;
+    }
+    const size_t expectedPasses = (totalFiles + 24) / 25;
+    assert(sd.lists == expectedPasses);
+    assert(sd.listEntriesVisited == totalFiles);
+    assert(!reopened->storageFault().observed);
+    sd.deferListAfter = SIZE_MAX;
+    size_t count = 0;
+    while (read(*reopened)) { count += batch.count; ack(*reopened); }
+    assert(count == 120);
+    std::cout << "EventLog #797: single-pass resumable inventory completed " << totalFiles
+              << " entries across " << sd.lists << " deferred slices passed\n";
+}
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--protocol") { protocolInputs(); return 0; }
     invalidAccounting();
@@ -818,6 +929,9 @@ int main(int argc, char** argv) {
     std::cerr << "counters\n"; countersAndRevisions();
     mirroredRevisions(); revisionFailures(); refusalPreservesAuthority(); missingWitnessRecovery(); unreadableBatchFallback();
     ackFailureBatchFallback();
+    lossCounterReadBackNoUnderflow();
+    segmentLimitEviction();
+    resumableSinglePassInventory();
     std::cerr << "validation\n"; validationAndConcurrency();
     std::cout << "EventLog: identity, recovery, faults, quota, fallback, protocol and concurrency passed\n";
     return 0;

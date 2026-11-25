@@ -217,43 +217,52 @@ EventLog::StorageFault EventLog::storageFault() const {
     return result;
 }
 
+void EventLog::invalidateStore(Store& store) {
+    store.loaded = false;
+    store.inventoryReady = false;
+    store.inventoryInProgress = false;
+    store.inventorySeen = 0;
+}
 uint64_t EventLog::allocated(const Store& store, uint32_t bytes) const {
     return ((static_cast<uint64_t>(bytes) + store.unit - 1) / store.unit) * store.unit;
 }
 bool EventLog::inventory(Store& store) {
-    store.count = 0;
-    uint64_t reserved = 2 * allocated(store, kMetaBytes);
-    if (config_.reserveRejected) reserved += allocated(store, kFrameBytes);
-    if (reserved > UINT32_MAX) return false;
-    store.used = static_cast<uint32_t>(reserved); // reserve both slots even when absent
-    store.metaSizes[0] = store.metaSizes[1] = kMetaBytes;
-    for (size_t i = 0; i <= 1024; ++i) {
-        EventLogFs::Entry entry{};
-        auto result = store.fs->list(i, entry);
-        if (result == EventLogFs::Result::End) {
-            std::sort(store.segments, store.segments + store.count,
-                      [](const Segment& a, const Segment& b) { return a.id < b.id; });
-            for (size_t j = 1; j < store.count; ++j)
-                if (store.segments[j].id == store.segments[j - 1].id) return false;
-            return true;
+    if (store.inventoryReady) return true;
+    if (!store.inventoryInProgress) {
+        store.count = 0;
+        store.inventorySeen = 0;
+        uint64_t reserved = 2 * allocated(store, kMetaBytes);
+        if (config_.reserveRejected) reserved += allocated(store, kFrameBytes);
+        if (reserved > UINT32_MAX) return false;
+        store.used = static_cast<uint32_t>(reserved); // reserve both slots even when absent
+        store.metaSizes[0] = store.metaSizes[1] = kMetaBytes;
+        store.inventoryInProgress = true;
+    }
+    struct Context { EventLog* self; Store* store; bool ok; };
+    Context ctx{this, &store, true};
+    auto result = store.fs->list(store.inventorySeen, [](void* raw, const EventLogFs::Entry& entry) {
+        auto& c = *static_cast<Context*>(raw);
+        Store& s = *c.store;
+        if (s.inventorySeen >= 1024 || !terminated(entry.name, sizeof(entry.name))) {
+            c.ok = false; return false;
         }
-        if (result == EventLogFs::Result::Error || i == 1024 || !terminated(entry.name, sizeof(entry.name))) return false;
+        ++s.inventorySeen;
         if (!std::strcmp(entry.name, "ack-0") || !std::strcmp(entry.name, "ack-1")) {
             unsigned slot = entry.name[4] - '0';
-            store.metaSizes[slot] = std::max<uint32_t>(entry.size, kMetaBytes);
-            uint64_t extra = allocated(store, store.metaSizes[slot]) - allocated(store, kMetaBytes);
-            if (extra > UINT32_MAX - store.used) return false;
-            store.used += static_cast<uint32_t>(extra);
-            continue;
+            s.metaSizes[slot] = std::max<uint32_t>(entry.size, kMetaBytes);
+            uint64_t extra = c.self->allocated(s, s.metaSizes[slot]) - c.self->allocated(s, kMetaBytes);
+            if (extra > UINT32_MAX - s.used) { c.ok = false; return false; }
+            s.used += static_cast<uint32_t>(extra);
+            return true;
         }
-        uint64_t bytes = allocated(store, entry.size);
-        if (config_.reserveRejected && !std::strcmp(entry.name, "rejected"))
-            bytes -= std::min(bytes, allocated(store, kFrameBytes));
-        if (bytes > UINT32_MAX - store.used) return false;
-        store.used += static_cast<uint32_t>(bytes);
+        uint64_t bytes = c.self->allocated(s, entry.size);
+        if (c.self->config_.reserveRejected && !std::strcmp(entry.name, "rejected"))
+            bytes -= std::min(bytes, c.self->allocated(s, kFrameBytes));
+        if (bytes > UINT32_MAX - s.used) { c.ok = false; return false; }
+        s.used += static_cast<uint32_t>(bytes);
         size_t length = std::strlen(entry.name);
-        if (length != 17 && length != 18) continue;
-        if (std::strncmp(entry.name, "seg-", 4)) continue;
+        if (length != 17 && length != 18) return true;
+        if (std::strncmp(entry.name, "seg-", 4)) return true;
         uint32_t id = 0;
         bool digits = true;
         for (size_t j = 4; j < 12; ++j) {
@@ -261,11 +270,27 @@ bool EventLog::inventory(Store& store) {
             id = id * 10 + entry.name[j] - '0';
         }
         bool ready = !std::strcmp(entry.name + 12, ".ready");
-        if (!digits || !id || (!ready && std::strcmp(entry.name + 12, ".open"))) continue;
-        if (store.count == kMaxSegments || entry.size > kJournalSegmentBytes) return false;
-        store.segments[store.count++] = {id, entry.size, ready};
+        if (!digits || !id || (!ready && std::strcmp(entry.name + 12, ".open"))) return true;
+        if (s.count == kMaxSegments || entry.size > kJournalSegmentBytes) { c.ok = false; return false; }
+        s.segments[s.count++] = {id, entry.size, ready};
+        return true;
+    }, &ctx);
+    if (result == EventLogFs::Result::Deferred) return false; // retain progress for next slice
+    if (result != EventLogFs::Result::Ok || !ctx.ok) {
+        store.inventoryInProgress = false; store.inventorySeen = 0; store.count = 0;
+        return false;
     }
-    return false;
+    store.inventoryInProgress = false; store.inventorySeen = 0;
+    std::sort(store.segments, store.segments + store.count,
+              [](const Segment& a, const Segment& b) { return a.id < b.id; });
+    for (size_t j = 1; j < store.count; ++j) {
+        if (store.segments[j].id == store.segments[j - 1].id) {
+            store.count = 0;
+            return false;
+        }
+    }
+    store.inventoryReady = true;
+    return true;
 }
 bool EventLog::load(Store& store) {
     if (store.loaded) return true;
@@ -274,8 +299,11 @@ bool EventLog::load(Store& store) {
     Meta best;
     for (unsigned slot = 0; slot < 2; ++slot) {
         uint8_t data[kMetaBytes];
-        if (!store.fs->read(metaPath(slot), 0, data, sizeof(data)) ||
-            (std::memcmp(data, "ELG1", 4) && std::memcmp(data, "ELG2", 4)) ||
+        if (!store.fs->read(metaPath(slot), 0, data, sizeof(data))) {
+            if (store.fs->deferred()) return false;
+            continue;
+        }
+        if ((std::memcmp(data, "ELG1", 4) && std::memcmp(data, "ELG2", 4)) ||
             crc32(data, 76) != get32(data + 76)) continue;
         Meta m;
         m.generation = get64(data + 8); m.ack = {get32(data + 16), get32(data + 20)};
@@ -297,14 +325,26 @@ bool EventLog::load(Store& store) {
             m.dropped > kMaxEventInteger || m.pending > m.dropped || m.discarded > 99999999 || data[60] > 1) continue;
         if (m.generation > best.generation) best = m;
     }
+    size_t index = static_cast<size_t>(&store - stores_);
+    // A committed metadata slot whose read-back failed advances generation/pending
+    // on disk; clear any cached loss notice so reload cannot underflow or replay it.
+    if (best.generation != store.meta.generation || best.pending != store.meta.pending ||
+        best.pending < lossReported_[index]) {
+        lossReported_[index] = 0;
+    }
     store.meta = best;
     if (store.count) store.meta.next = std::max(store.meta.next, store.segments[store.count - 1].id + 1);
-    store.loaded = true; return true;
+    store.loaded = true; store.inventoryReady = false; return true;
 }
 bool EventLog::save(Store& store, Meta next) {
     if (!load(store)) return false;
     store.operation = EventLogFs::Operation::Ack;
-    if (store.meta.generation == kMaxEventInteger || store.quota < 2 * allocated(store, kMetaBytes)) return false;
+    if (store.meta.generation == kMaxEventInteger || store.quota < 2 * allocated(store, kMetaBytes) ||
+        next.ack.segment > 99999999 || next.ack.offset > kJournalSegmentBytes ||
+        !next.next || next.next > 100000000 || next.revision > kMaxEventInteger ||
+        next.dropped > kMaxEventInteger || next.pending > next.dropped ||
+        next.discarded > 99999999 || (next.revisionReady && next.revisionSuspended) ||
+        next.revisionEpoch > kMaxEventInteger || (next.revisionEpoch & 7)) return false;
     next.generation = store.meta.generation + 1;
     uint8_t data[kMetaBytes] = {}, check[kMetaBytes];
     std::memcpy(data, "ELG2", 4); put64(data + 8, next.generation);
@@ -315,7 +355,7 @@ bool EventLog::save(Store& store, Meta next) {
     put32(data + 76, crc32(data, 76));
     if (!store.fs->write(metaPath(next.generation), data, sizeof(data), false) ||
         !store.fs->read(metaPath(next.generation), 0, check, sizeof(check)) || std::memcmp(data, check, sizeof(data))) {
-        store.loaded = false; return false;
+        invalidateStore(store); return false;
     }
     unsigned slot = next.generation % 2;
     store.used -= static_cast<uint32_t>(allocated(store, store.metaSizes[slot]) - allocated(store, kMetaBytes));
@@ -341,7 +381,7 @@ bool EventLog::readFrame(Store& store, const Segment& segment, uint32_t& offset,
     while (offset < segment.size) {
         char block[kFrameBytes];
         size_t n = std::min<size_t>(sizeof(block), segment.size - offset);
-        if (!store.fs->read(path, offset, block, n)) { store.loaded = false; return false; }
+        if (!store.fs->read(path, offset, block, n)) { invalidateStore(store); return false; }
         size_t take = 0;
         for (; take < n; ++take) {
             char c = block[take];
@@ -373,7 +413,7 @@ uint64_t EventLog::lostIn(Store& store, const Segment& segment) {
     }
     return lost;
 }
-bool EventLog::makeRoom(Store& store, size_t bytes) {
+bool EventLog::makeRoom(Store& store, size_t bytes, bool needSegment) {
     store.operation = EventLogFs::Operation::Write;
     if (bytes + 2 * allocated(store, kMetaBytes) > store.quota) return false;
     // Reclaim only sealed, acknowledged data normally. A discarded segment was
@@ -382,7 +422,9 @@ bool EventLog::makeRoom(Store& store, size_t bytes) {
         const auto& s = store.segments[i];
         bool discarded = s.id <= store.meta.discarded;
         bool reclaim = s.ready && acknowledged(store, s);
-        if (!discarded && !reclaim && static_cast<uint64_t>(store.used) + bytes <= store.quota) { ++i; continue; }
+        bool needSlot = needSegment && store.count >= kMaxSegments;
+        if (!discarded && !reclaim && !needSlot &&
+            static_cast<uint64_t>(store.used) + bytes <= store.quota) { ++i; continue; }
         if (!discarded && !reclaim) {
             // Never evict an actively appended .open file. Seal it first.
             if (!s.ready) return false;
@@ -394,13 +436,14 @@ bool EventLog::makeRoom(Store& store, size_t bytes) {
         }
         char path[40]; segmentPath(path, s.id, s.ready);
         store.operation = EventLogFs::Operation::Write;
-        if (!store.fs->remove(path)) { store.loaded = false; return false; }
+        if (!store.fs->remove(path)) { invalidateStore(store); return false; }
         issued_ = 0; // a batch referencing removed storage must be read again
         store.used -= static_cast<uint32_t>(allocated(store, s.size));
         std::move(store.segments + i + 1, store.segments + store.count, store.segments + i);
         --store.count;
     }
-    return static_cast<uint64_t>(store.used) + bytes <= store.quota;
+    return static_cast<uint64_t>(store.used) + bytes <= store.quota &&
+           (!needSegment || store.count < kMaxSegments);
 }
 bool EventLog::append(Store& store, const Frame& frame) {
     if (!load(store)) return false;
@@ -423,7 +466,7 @@ bool EventLog::append(Store& store, const Frame& frame) {
         if (keep) { open = &segment; continue; }
         char from[40], to[40]; segmentPath(from, segment.id, false); segmentPath(to, segment.id, true);
         store.operation = EventLogFs::Operation::Rename;
-        if (!store.fs->rename(from, to)) { store.loaded = false; return false; }
+        if (!store.fs->rename(from, to)) { invalidateStore(store); return false; }
         segment.ready = true;
     }
     // Under the 64 KiB flash quota the segment itself must leave room for both
@@ -433,12 +476,12 @@ bool EventLog::append(Store& store, const Frame& frame) {
     if (open && (static_cast<uint64_t>(store.used) + growth > store.quota)) {
         char from[40], to[40]; segmentPath(from, open->id, false); segmentPath(to, open->id, true);
         store.operation = EventLogFs::Operation::Rename;
-        if (!store.fs->rename(from, to)) { store.loaded = false; return false; }
+        if (!store.fs->rename(from, to)) { invalidateStore(store); return false; }
         open->ready = true; open = nullptr;
         oldSize = 0; growth = allocated(store, frame.size);
     }
     uint32_t openId = open ? open->id : 0;
-    if (!makeRoom(store, static_cast<size_t>(growth))) return false;
+    if (!makeRoom(store, static_cast<size_t>(growth), !openId)) return false;
     if (!openId) {
         if (store.meta.next > 99999999 || store.count == kMaxSegments) return false;
         openId = store.meta.next;
@@ -451,7 +494,7 @@ bool EventLog::append(Store& store, const Frame& frame) {
     store.operation = EventLogFs::Operation::Write;
     if (!store.fs->write(path, frame.data, frame.size, true)) {
         store.operation = store.fs->writeFailure();
-        store.loaded = false; return false;
+        invalidateStore(store); return false;
     }
     store.used += static_cast<uint32_t>(growth);
     if (!open) store.segments[store.count++] = {openId, frame.size, false, true};
@@ -517,7 +560,8 @@ void EventLog::service(size_t maxRecords) {
             if (!encoded) { fail(); break; }
         }
         if (!append(store, lossNotice_[i])) { fail(store); break; }
-        Meta next = store.meta; next.pending -= lossReported_[i];
+        Meta next = store.meta;
+        next.pending = next.pending > lossReported_[i] ? next.pending - lossReported_[i] : 0;
         if (!save(store, next)) fail(store);
         else lossReported_[i] = 0;
         backend_ = static_cast<Backend>(i);
@@ -652,12 +696,12 @@ bool EventLog::isolateRejected(const Batch& batch) {
         if (uint64_t(store.used) + (config_.reserveRejected ? 0 : allocated(store, frame.size)) > store.quota) continue;
         if (!store.fs->write("/diag/rejected", frame.data, frame.size, false)) {
             store.operation = store.fs->writeFailure(); fail(store);
-            store.loaded = false; continue;
+            invalidateStore(store); continue;
         }
         Frame verify;
         retained = store.fs->read("/diag/rejected", 0, verify.data, frame.size) &&
                    !std::memcmp(frame.data, verify.data, frame.size);
-        store.loaded = false;
+        invalidateStore(store);
         if (retained) break;
     }
     if (!retained) return false; // never discard without checked inspection copy
@@ -715,14 +759,14 @@ bool EventLog::seal() {
             char from[40], to[40];
             segmentPath(from, segment.id, false); segmentPath(to, segment.id, true);
             store.operation = EventLogFs::Operation::Rename;
-            if (!store.fs->rename(from, to)) { fail(store); store.loaded = false; ok = false; break; }
+            if (!store.fs->rename(from, to)) { fail(store); invalidateStore(store); ok = false; break; }
             segment.ready = true;
         }
     }
     return ok;
 }
 void EventLog::invalidateStorage() {
-    for (auto& store : stores_) store.loaded = false;
+    for (auto& store : stores_) invalidateStore(store);
     issued_ = 0;
 }
 // Witness layout: bit 0 = suspended, bits 1/2 = SD/LittleFS stale, remaining
@@ -764,12 +808,15 @@ bool EventLog::writeRevisionState(uint64_t state) {
     }
     return true;
 }
-bool EventLog::revisionStores(uint8_t& mounted, uint64_t& highest) {
+bool EventLog::revisionStores(uint8_t& mounted, uint64_t& highest, bool loadedOnly) {
     mounted = 0; highest = revisionFloor_;
     for (unsigned i = 0; i < 2; ++i) {
         auto& store = stores_[i];
         if (!store.fs) continue; // mounted stores are fixed before consumers start
-        if (!load(store)) { fail(store); continue; }
+        if (loadedOnly ? !store.loaded : !load(store)) {
+            if (!loadedOnly) fail(store);
+            continue;
+        }
         mounted |= 2u << i;
         highest = std::max(highest, store.meta.revision);
         revisionEpochFloor_ = std::max(revisionEpochFloor_, store.meta.revisionEpoch);
@@ -780,9 +827,21 @@ uint64_t EventLog::minimumStatusSequence() {
     uint8_t mounted; uint64_t highest;
     revisionStores(mounted, highest); return highest;
 }
-bool EventLog::restoreStatusSequence(uint64_t highWater) {
+bool EventLog::prepareStatusSequence() {
+    if (!begun_) return false;
+    bool deferred = false;
+    for (auto& store : stores_) {
+        if (!store.fs || store.loaded) continue;
+        if (!load(store)) {
+            if (store.fs->deferred()) deferred = true;
+            else fail(store);
+        }
+    }
+    return !deferred;
+}
+bool EventLog::restoreStatusSequence(uint64_t highWater, bool loadedOnly) {
     uint8_t mounted; uint64_t highest, state;
-    if (!begun_ || highWater > kMaxEventInteger || !revisionStores(mounted, highest) ||
+    if (!begun_ || highWater > kMaxEventInteger || !revisionStores(mounted, highest, loadedOnly) ||
         highWater < highest || !readRevisionState(state, mounted, false)) return false;
     uint64_t epoch = std::max(state & ~uint64_t(7), revisionEpochFloor_);
     if (epoch > kMaxEventInteger - 8) return false;

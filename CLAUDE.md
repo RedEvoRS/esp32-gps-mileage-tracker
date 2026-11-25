@@ -237,10 +237,14 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   powered from BLDO1, SPI MOSI 35 / SCK 36 / MISO 37, CS 47, IMU CS 34
   held high. BLDO1 powers up
   ON at 1.8 V: switch it off, set 3.3 V, then enable. Stage 4 picks its
-  trip store at boot (a card that fails its capacity query at runtime raises
-  E4001 and is latched out until reboot; new trips then go to LittleFS, never
-  mid-trip), never formats the card, falls back to LittleFS,
-  attempts uploads from both stores, and unmounts both before `PMU.shutdown()`.
+  trip store at boot, never formats the card, and falls back to LittleFS
+  for new trips after a failed capacity query or two failed GPX pieces
+  without a clean close between them. E4001 reports the fallback, and
+  E4006 reports GPX write failures. A card that still answers capacity
+  queries can keep uploading queued trips. Clean shutdown unmounts both
+  stores after the uploader closes its file. An expired abort deadline
+  leaves the stores mounted and holds the filesystem lock through power-off
+  or restart.
   A read-only FAT32 check before the first write rejects damaged cards with
   E4011 and keeps trips and diagnostics on LittleFS if available.
   SD uploads were verified on 2026-10-21 (UTC), LittleFS uploads on 2026-11-03 (UTC)

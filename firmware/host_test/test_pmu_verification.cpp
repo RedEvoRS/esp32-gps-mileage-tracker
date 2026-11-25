@@ -120,8 +120,11 @@ int main() {
         PMU.longPressIrq = PMU.criticalIrq = false;
         gPmuIrqFlag = false; g_millis += PMU_IRQ_RETRY_MS; pollPmu();
         one(2002, "raise");
-        assert(gVbusOffPending && !gPmuIrqRetry && calls("clearIrqStatus") == 1);
-        pollPmu(); assert(take().empty() && calls("clearIrqStatus") == 1); ++cases;
+        assert(gVbusOffPending && !gPmuIrqRetry && calls("clearIrqStatus") == 0);
+        assert(PMU.registerWriteCalls[XPOWERS_AXP2101_INTSTS1] == 1 &&
+               PMU.registerWriteCalls[XPOWERS_AXP2101_INTSTS2] == 1 &&
+               PMU.registerWriteCalls[XPOWERS_AXP2101_INTSTS3] == 0);
+        pollPmu(); assert(take().empty() && PMU.registerWriteCalls[XPOWERS_AXP2101_INTSTS1] == 1); ++cases;
 
         // Real long key/critical IRQ survives each possible failed byte and
         // still reaches the battery-only shutdown path on a successful retry.
@@ -138,17 +141,19 @@ int main() {
             ++cases;
         }
     }
-    pmuWorld(); g_millis = UINT32_MAX - 49; gPmuIrqFlag = true;
+    pmuWorld(); g_millis = UINT32_MAX - 49; PMU.shortPressIrq = true; gPmuIrqFlag = true;
     failRead(XPOWERS_AXP2101_INTSTS2); pollPmu();
     auto reads = PMU.registerReadCalls;
     g_millis += 99; pollPmu(); assert(PMU.registerReadCalls == reads);
-    ++g_millis; pollPmu(); assert(!gPmuIrqRetry && calls("clearIrqStatus") == 1); ++cases;
+    ++g_millis; pollPmu();
+    assert(!gPmuIrqRetry && calls("clearIrqStatus") == 0 && PMU.registerWriteCalls[XPOWERS_AXP2101_INTSTS2] == 1); ++cases;
 
     // An edge arriving during a read must survive consumption of the old edge.
-    pmuWorld(); gPmuIrqFlag = true;
+    pmuWorld(); PMU.shortPressIrq = true; gPmuIrqFlag = true;
     PMU.onRegisterRead = [](uint8_t reg) { if (reg == XPOWERS_AXP2101_INTSTS2) onPmuIrq(); };
-    pollPmu(); assert(gPmuIrqFlag);
-    PMU.onRegisterRead = nullptr; pollPmu(); assert(!gPmuIrqFlag && calls("clearIrqStatus") == 2); ++cases;
+    pollPmu(); assert(gPmuIrqFlag && PMU.registerWriteCalls[XPOWERS_AXP2101_INTSTS2] == 1);
+    PMU.onRegisterRead = nullptr; PMU.shortPressIrq = true; pollPmu();
+    assert(!gPmuIrqFlag && PMU.registerWriteCalls[XPOWERS_AXP2101_INTSTS2] == 2); ++cases;
 
     // No false raise or false clear while the threshold register is unreadable.
     for (bool active : {false, true}) {
@@ -223,5 +228,317 @@ int main() {
     pmuWorld(); g_millis = UINT32_MAX - 100; PMU.failChargeRead = true; serviceChargeTemp();
     g_millis += CHG_CHECK_MS - 1; serviceChargeTemp(); assert(calls("enableCellbatteryCharge") == 1);
     ++g_millis; serviceChargeTemp(); assert(calls("enableCellbatteryCharge") == 2); ++cases;
+
+    // --- Issue #790 regressions: checked bit-selective IRQ clear, pin-LOW retry, periodic VBUS ---
+    for (int raw = 0; raw <= 255; ++raw)
+        assert(pmu_read::chargeTargetMatches(raw, XPOWERS_AXP2101_CHG_VOL_4V1) == ((raw & 7) == 2));
+    assert(!pmu_read::chargeTargetMatches(-1, XPOWERS_AXP2101_CHG_VOL_4V1));
+
+    // A failed INTSTS clear write sets gPmuIrqRetry so recovery runs without a new falling edge.
+    for (uint8_t reg : {XPOWERS_AXP2101_INTSTS1, XPOWERS_AXP2101_INTSTS2, XPOWERS_AXP2101_INTSTS3}) {
+        pmuWorld();
+        PMU.registerReadOverride[reg] = (reg == XPOWERS_AXP2101_INTSTS1) ? 0x40 :
+                                        (reg == XPOWERS_AXP2101_INTSTS2) ? 0x08 : 0x01;
+        PMU.failRegisterWriteAt[reg] = 1;
+        gPmuIrqFlag = true; pollPmu();
+        assert(calls("clearIrqStatus") == 0 && gPmuIrqRetry);
+        assert(PMU.registerReadOverride[reg] != 0); // bit stayed latched after failed clear
+        auto writes = PMU.registerWriteCalls[reg];
+        g_millis += PMU_IRQ_RETRY_MS - 1; pollPmu();
+        assert(PMU.registerWriteCalls[reg] == writes); // rate-limited retry
+        ++g_millis; pollPmu();
+        assert(!gPmuIrqRetry && PMU.registerReadOverride[reg] == 0);
+        assert(PMU.registerWriteCalls[reg] == writes + 1); ++cases;
+    }
+    // setupPmuIrq() uses checked writes and sets gPmuIrqRetry if clearing fails.
+    pmuWorld(); PMU.failRegisterWriteAt[XPOWERS_AXP2101_INTSTS2] = 1;
+    setupPmuIrq();
+    assert(calls("clearIrqStatus") == 0 && gPmuIrqRetry); ++cases;
+
+    // Issue #790: failed IRQ clear must not replay the already-handled action on retry,
+    // while still dispatching any newly latched bits on that same retry.
+    {
+        pmuWorld(); gDebugMode.store(false);
+        g_digitalReadHook = [](int pin) { return pin == DEBUG_BOOT_PIN ? LOW : HIGH; };
+        gBootButton = runtime_debug::BootButton();
+        gBootButton.sample(g_millis, true);
+        g_millis += runtime_debug::BootButton::kDebounceMs;
+        gBootButton.sample(g_millis, true);
+        assert(gBootButton.held(g_millis));
+        PMU.shortPressIrq = true;
+        PMU.failRegisterWriteAt[XPOWERS_AXP2101_INTSTS2] = 1;
+        gPmuIrqFlag = true; pollPmu();
+        assert(debugMode() && gPmuIrqRetry && PMU.shortPressIrq);
+        // Retry clears the stuck PKEY_SHORT bit without toggling debug back off,
+        // while dispatching a newly latched VBUS_REMOVE bit in the same register.
+        PMU.vbusIn = false; PMU.removeIrq = true;
+        g_millis += PMU_IRQ_RETRY_MS; pollPmu();
+        assert(debugMode() && !gPmuIrqRetry && !PMU.shortPressIrq && !PMU.removeIrq);
+        assert(gVbusOffPending);
+        // A genuine second tap after clear succeeded toggles debug back off.
+        PMU.shortPressIrq = true; gPmuIrqFlag = true; pollPmu();
+        assert(!debugMode() && !PMU.shortPressIrq);
+        g_digitalReadHook = nullptr; ++cases;
+    }
+    // Issue #790: failed INTSTS2 clear on a long-press does not re-run shutdown prep on retry.
+    {
+        pmuWorld(); PMU.vbusIn = true; PMU.longPressIrq = true;
+        PMU.failRegisterWriteAt[XPOWERS_AXP2101_INTSTS2] = 1;
+        gPmuIrqFlag = true; pollPmu();
+        assert(gDisplayUsbPowerRequest && gPmuIrqRetry && PMU.longPressIrq);
+        gDisplayUsbPowerRequest = false;
+        g_millis += PMU_IRQ_RETRY_MS; pollPmu();
+        assert(!gDisplayUsbPowerRequest && !gPmuIrqRetry && !PMU.longPressIrq); ++cases;
+    }
+    // Issue #790: failed enableIRQ() in setupPmuIrq() is retried rate-limited until it succeeds.
+    {
+        pmuWorld(); PMU.failEnableIrq = true; PMU.enabledIrqs = 0;
+        setupPmuIrq();
+        assert(PMU.enabledIrqs == 0 && calls("enableIRQ") == 1);
+        g_millis += PMU_IRQ_RETRY_MS - 1; pollPmu();
+        assert(calls("enableIRQ") == 1); // rate-limited
+        ++g_millis; pollPmu();
+        assert(calls("enableIRQ") == 2 && PMU.enabledIrqs == 0); // retried while fault still active
+        g_millis += PMU_IRQ_RETRY_MS - 1; pollPmu();
+        assert(calls("enableIRQ") == 2);
+        PMU.failEnableIrq = false;
+        ++g_millis; pollPmu();
+        assert(calls("enableIRQ") == 3 && PMU.enabledIrqs == PMU_ENABLED_IRQS);
+        g_millis += PMU_IRQ_RETRY_MS; pollPmu();
+        assert(calls("enableIRQ") == 3); // stops retrying once enabled
+        ++cases;
+    }
+
+    // Clear only the read bits BEFORE powerOffForVbus() so flags latching during
+    // a cancelled shutdown survive instead of being wiped by an all-ones clear.
+    pmuWorld(); PMU.vbusIn = false; PMU.longPressIrq = true;
+    g_sdDisk.onUnmount = [] {
+        // USB returns (cancelling shutdown) while critical & remove flags latch mid-prep.
+        PMU.vbusIn = true;
+        PMU.criticalIrq = true;
+        PMU.removeIrq = true;
+    };
+    gPmuIrqFlag = true; pollPmu();
+    g_sdDisk.onUnmount = nullptr;
+    assert(calls("clearIrqStatus") == 0 && !gPmuIrqRetry);
+    assert(!PMU.longPressIrq); // original batch bit cleared before shutdown prep
+    assert(PMU.criticalIrq && PMU.removeIrq); // late-latched flags survived cancelled shutdown
+    assert(PMU.registerWrites.size() == 1 &&
+           PMU.registerWrites[0].first == XPOWERS_AXP2101_INTSTS2 &&
+           PMU.registerWrites[0].second == 0x04); ++cases;
+
+    // Steady active-low PMU_IRQ_PIN triggers rate-limited poll without a new falling edge.
+    pmuWorld(); PMU.vbusIn = false; PMU.removeIrq = true;
+    gPmuIrqFlag = false; gPmuIrqRetry = false; gPmuIrqReadMs = g_millis;
+    g_digitalReadHook = [](int pin) { return pin == PMU_IRQ_PIN ? LOW : HIGH; };
+    g_millis += PMU_IRQ_RETRY_MS - 1; pollPmu();
+    assert(!gVbusOffPending && PMU.removeIrq);
+    ++g_millis; pollPmu();
+    assert(gVbusOffPending && !PMU.removeIrq && !gPmuIrqRetry);
+    auto pinReads = PMU.registerReadCalls;
+    for (unsigned i = 0; i < 10; ++i) pollPmu();
+    assert(PMU.registerReadCalls == pinReads); // stuck-low pin stays rate-limited
+    g_digitalReadHook = nullptr; ++cases;
+
+    // Periodic VBUS poll catches a missed VBUS edge (both loss and return).
+    pmuWorld(); PMU.vbusIn = true; seedVbusState();
+    assert(!gVbusLost && !gVbusOffPending);
+    PMU.vbusIn = false; // no IRQ edge or pin low
+    g_millis += VBUS_POLL_MS - 1; serviceVbusRecheck();
+    assert(!gVbusOffPending && !gVbusLost);
+    ++g_millis; serviceVbusRecheck();
+    assert(gVbusOffPending && !gVbusLost);
+    g_millis += VBUS_OFF_CONFIRM_MS; confirmVbusOff();
+    assert(gVbusLost && !gVbusOffPending);
+    PMU.vbusIn = true; // return without IRQ
+    g_millis += VBUS_POLL_MS; serviceVbusRecheck();
+    assert(!gVbusLost && !gVbusOffPending); ++cases;
+
+    // --- Issue #792 regressions: early charger disable retry & verified 4.1 V target ---
+    // Early disable retries on read-back failure and confirms charging off before storage mount.
+    {
+        pmuWorld(); PMU.chargeEnabled = true; PMU.failChargeDisable = true;
+        static bool sawStorageMount; sawStorageMount = false;
+        PMU.onRegisterRead = [](uint8_t reg) {
+            if (reg == XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL &&
+                PMU.registerReadCalls[reg] >= 2) PMU.failChargeDisable = false;
+        };
+        g_sdDisk.onMount = [] {
+            sawStorageMount = true;
+            assert(!PMU.chargeEnabled);
+            assert(calls("disableCellbatteryCharge") == 3);
+        };
+        setup();
+        PMU.onRegisterRead = nullptr; g_sdDisk.onMount = nullptr;
+        assert(sawStorageMount && !logCount("early charger disable unconfirmed"));
+        ++cases;
+    }
+    // Transient disable failure that recovers during the bounded 5 s retry window
+    // confirms charging off before storage mount without raising E2008.
+    {
+        pmuWorld(); PMU.chargeEnabled = true; PMU.failChargeDisable = true;
+        static uint32_t startMs; startMs = g_millis;
+        static bool mountedAfterRecovery; mountedAfterRecovery = false;
+        PMU.onRegisterRead = [](uint8_t reg) {
+            if (reg == XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL &&
+                uint32_t(g_millis - startMs) >= 500) PMU.failChargeDisable = false;
+        };
+        g_sdDisk.onMount = [] {
+            mountedAfterRecovery = true;
+            assert(!PMU.chargeEnabled);
+            assert(uint32_t(g_millis - startMs) >= 500 && uint32_t(g_millis - startMs) < 5000);
+        };
+        setup();
+        PMU.onRegisterRead = nullptr; g_sdDisk.onMount = nullptr;
+        assert(mountedAfterRecovery && PMU.chargeEnabled); // guard enabled charging after mount
+        FS_LOCK(); auto ev = take(); FS_UNLOCK();
+        assert(codeRows(ev, 2008).empty());
+        ++cases;
+    }
+    // Persistent early disable failure retries for a bounded ~5 s window feeding
+    // the startup watchdog before storage mount, keeps fault active through mount,
+    // raises E2008, continues startup, and clears E2008 only when disable recovers.
+    {
+        pmuWorld(); PMU.chargeEnabled = true; PMU.failChargeDisable = true;
+        static uint32_t startMs; startMs = g_millis;
+        static bool checkedAtMount; checkedAtMount = false;
+        g_sdDisk.onMount = [] {
+            checkedAtMount = true;
+            assert(PMU.failChargeDisable); // fault stays active through mount
+            assert(uint32_t(g_millis - startMs) >= 5000);
+            assert(calls("disableCellbatteryCharge") >= 50);
+            assert(g_watchdog.feeds >= 10);
+        };
+        setup();
+        g_sdDisk.onMount = nullptr;
+        assert(checkedAtMount && gDegraded.mode() == startup::Mode::Normal);
+        assert(gChargeState == ChargeState::Unconfirmed);
+        assert(logCount("early charger disable unconfirmed") == 1 &&
+               logCount("charger disable still unconfirmed") == 1);
+        FS_LOCK(); auto ev = take(); FS_UNLOCK();
+        auto ctrl = codeRows(ev, 2008);
+        assert(ctrl.size() == 1); has(ctrl[0], "\"transition\":\"raise\"");
+        // Recovering charger disable clears E2008 on the next guard tick.
+        PMU.failChargeDisable = false;
+        chargeTick();
+        assert(gChargeState == ChargeState::Charging && PMU.chargeEnabled);
+        FS_LOCK(); auto rec = take(); FS_UNLOCK();
+        auto cleared = codeRows(rec, 2008);
+        assert(cleared.size() == 1); has(cleared[0], "\"transition\":\"clear\"");
+        ++cases;
+    }
+    // Issue #792: if early charger disable times out for the full 5 s window
+    // and then recovers during storage mount, the first guard pass after the
+    // journal is ready must still raise E2008 once (independent of gChargeFailures),
+    // followed by a single clear on the next confirmed guard pass.
+    {
+        pmuWorld(); PMU.chargeEnabled = true; PMU.failChargeDisable = true;
+        static uint32_t startMs; startMs = g_millis;
+        static bool recoveredAtMount; recoveredAtMount = false;
+        g_sdDisk.onMount = [] {
+            recoveredAtMount = true;
+            assert(PMU.failChargeDisable);
+            assert(uint32_t(g_millis - startMs) >= 5000);
+            PMU.failChargeDisable = false; // recovers during storage setup
+        };
+        setup();
+        g_sdDisk.onMount = nullptr;
+        assert(recoveredAtMount && gDegraded.mode() == startup::Mode::Normal);
+        assert(gEarlyChargeDisabled && !gEarlyChargeTimeoutPending);
+        assert(gChargeState == ChargeState::Charging && PMU.chargeEnabled && gChargeFailures == 0);
+        FS_LOCK(); auto bootEv = take(); FS_UNLOCK();
+        auto raised = codeRows(bootEv, 2008);
+        assert(raised.size() == 1); has(raised[0], "\"transition\":\"raise\"");
+        // Next confirmed guard pass clears that exact E2008 episode once.
+        chargeTick();
+        FS_LOCK(); auto rec = take(); FS_UNLOCK();
+        auto cleared = codeRows(rec, 2008);
+        assert(cleared.size() == 1); has(cleared[0], "\"transition\":\"clear\"");
+        assert(episode(raised[0]) == episode(cleared[0]));
+        // Subsequent confirmed passes stay silent.
+        chargeTick();
+        FS_LOCK(); auto quiet = take(); FS_UNLOCK();
+        assert(codeRows(quiet, 2008).empty());
+        ++cases;
+    }
+    // Unverified 4.1 V charge target (write error, stuck at 4.2 V, or read error)
+    // blocks charging even at safe temperature and raises E2008; later recovery clears E2008.
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        pmuWorld(); PMU.dieC = 30.0f; PMU.chgVol = 3; // 4.2 V default
+        PMU.failChargeTargetWrite = (mode == 0);
+        PMU.chargeTargetStuck = (mode == 1);
+        PMU.failChargeTargetRead = (mode == 2);
+        setup();
+        assert(!gChargeTargetVerified && !PMU.chargeEnabled);
+        assert(calls("enableCellbatteryCharge") == 0);
+        assert(logCount("NOT 4.1 V") == 1 && logCount("4.1 V charge target unconfirmed") >= 1);
+        FS_LOCK(); auto bootEv = take(); FS_UNLOCK();
+        auto ctrl = codeRows(bootEv, 2008);
+        assert(ctrl.size() == 1); has(ctrl[0], "\"transition\":\"raise\"");
+        chargeTick();
+        assert(!gChargeTargetVerified && !PMU.chargeEnabled && calls("enableCellbatteryCharge") == 0);
+        // Recover 4.1 V setting on next tick: charging enables and E2008 clears.
+        PMU.failChargeTargetWrite = PMU.chargeTargetStuck = PMU.failChargeTargetRead = false;
+        chargeTick();
+        assert(gChargeTargetVerified && PMU.chgVol == XPOWERS_AXP2101_CHG_VOL_4V1);
+        assert(PMU.chargeEnabled && calls("enableCellbatteryCharge") == 1);
+        FS_LOCK(); auto rec = take(); FS_UNLOCK();
+        auto cleared = codeRows(rec, 2008);
+        assert(cleared.size() == 1); has(cleared[0], "\"transition\":\"clear\"");
+        ++cases;
+    }
+    // Runtime target drift away from 4.1 V pauses charging and raises E2008 after 3 failures.
+    pmuWorld(); PMU.dieC = 30.0f; setup();
+    FS_LOCK(); take(); FS_UNLOCK();
+    assert(gChargeTargetVerified && PMU.chargeEnabled);
+    PMU.chgVol = 3; PMU.chargeTargetStuck = true;
+    for (unsigned attempt = 1; attempt <= 3; ++attempt) {
+        chargeTick();
+        assert(!gChargeTargetVerified && !PMU.chargeEnabled);
+        FS_LOCK(); auto ev = take(); FS_UNLOCK();
+        if (attempt < 3) assert(codeRows(ev, 2008).empty());
+        else { auto r = codeRows(ev, 2008); assert(r.size() == 1); has(r[0], "\"transition\":\"raise\""); }
+    }
+    PMU.chargeTargetStuck = false; chargeTick();
+    assert(gChargeTargetVerified && PMU.chargeEnabled);
+    FS_LOCK(); auto driftClear = take(); FS_UNLOCK();
+    assert(codeRows(driftClear, 2008).size() == 1); has(codeRows(driftClear, 2008)[0], "\"transition\":\"clear\""); ++cases;
+
+    // --- Issue #804 regressions: unreadable samples never create hot/cold history ---
+    // (1) After first-reading grace expires, a valid reading in hot or cold deadband
+    //     must resume charging without raising E2004/E2005.
+    for (float deadband : {50.0f, 11.0f}) {
+        pmuWorld(); PMU.dieC = 385.7f; serviceChargeTemp();
+        g_millis += CHG_FIRST_GRACE_MS; serviceChargeTemp();
+        one(2006, "raise");
+        assert(!PMU.chargeEnabled && !gChargePauseRequested);
+        PMU.dieC = deadband; chargeTick();
+        auto rows = take();
+        assert(codeRows(rows, 2006).size() == 1); has(codeRows(rows, 2006)[0], "\"transition\":\"clear\"");
+        assert(codeRows(rows, 2004).empty() && codeRows(rows, 2005).empty());
+        assert(PMU.chargeEnabled && !gChargePauseRequested); ++cases;
+    }
+    // (2) Transient runtime unreadable reading pauses charging fail-safe, then
+    //     a deadband sample resumes without false E2004/E2005.
+    for (float deadband : {50.0f, 11.0f}) {
+        pmuWorld(); PMU.dieC = 30.0f; serviceChargeTemp();
+        assert(PMU.chargeEnabled && !gChargePauseRequested && take().empty());
+        PMU.dieC = NAN; chargeTick(); one(2006, "raise");
+        assert(!PMU.chargeEnabled && !gChargePauseRequested);
+        PMU.dieC = deadband; chargeTick();
+        auto rows = take();
+        assert(codeRows(rows, 2006).size() == 1); has(codeRows(rows, 2006)[0], "\"transition\":\"clear\"");
+        assert(codeRows(rows, 2004).empty() && codeRows(rows, 2005).empty());
+        assert(PMU.chargeEnabled && !gChargePauseRequested); ++cases;
+    }
+    // (3) Existing cold pause history is still preserved across a transient unreadable reading.
+    pmuWorld(); PMU.dieC = CHG_COLD_PAUSE_C; serviceChargeTemp(); one(2005, "raise");
+    PMU.dieC = NAN; chargeTick(); one(2006, "raise");
+    assert(!PMU.chargeEnabled && gChargePauseRequested);
+    PMU.dieC = 11.0f; chargeTick(); // still below CHG_COLD_RESUME_C (14 C)
+    auto coldRows = take();
+    assert(codeRows(coldRows, 2006).size() == 1 && codeRows(coldRows, 2005).empty());
+    assert(!PMU.chargeEnabled && gChargePauseRequested); ++cases;
+
     std::printf("PMU verification: %u scenarios plus exhaustive IRQ/charge/threshold bytes passed (runtime debug=%d).\n", cases, debugMode());
 }

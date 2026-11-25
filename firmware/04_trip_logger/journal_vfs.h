@@ -21,32 +21,34 @@ public:
         if (::stat(path, &info) == 0) return S_ISDIR(info.st_mode);
         return errno == ENOENT && ::mkdir(path, 0700) == 0;
     }
-    EventLogFs::Result list(size_t index, EventLogFs::Entry& entry,
+    EventLogFs::Result list(size_t skip, EventLogFs::ListVisitor visitor, void* context,
                            bool (*allow)() = nullptr, bool = false) {
         using Result = EventLogFs::Result;
+        if (!visitor) return Result::Error;
         char path[96]; if (!full("/diag", path)) return Result::Error;
         DIR* dir = ::opendir(path); if (!dir) return Result::Error;
-        Result result = Result::End;
-        size_t n = 0;
+        Result result = Result::Ok;
+        size_t seen = 0;
         for (;;) {
-            if (allow && !allow()) { result = Result::Error; break; }
+            if (allow && !allow()) { result = Result::Deferred; break; }
             errno = 0;
             dirent* item = ::readdir(dir);
-            if (!item) { if (errno) result = Result::Error; break; }
+            if (!item) { if (errno || seen < skip) result = Result::Error; break; }
             if (!std::strcmp(item->d_name, ".") || !std::strcmp(item->d_name, "..")) continue;
+            if (seen++ < skip) continue;
             // Subdirectories/oversize entries fail closed; do not silently omit
             // unknown allocation from the quota or truncate a filename.
             char relative[64];
             int len = std::snprintf(relative, sizeof(relative), "/diag/%s", item->d_name);
             struct stat info;
+            EventLogFs::Entry entry{};
             if (len < 0 || static_cast<size_t>(len) >= sizeof(relative) ||
                 !full(relative, path) || ::stat(path, &info) || !S_ISREG(info.st_mode) ||
                 info.st_size < 0 || static_cast<uint64_t>(info.st_size) > UINT32_MAX ||
                 std::strlen(item->d_name) >= sizeof(entry.name)) { result = Result::Error; break; }
-            if (n++ == index) {
-                std::strcpy(entry.name, item->d_name); entry.size = info.st_size;
-                result = Result::Ok; break;
-            }
+            std::strcpy(entry.name, item->d_name);
+            entry.size = static_cast<uint32_t>(info.st_size);
+            if (!visitor(context, entry)) { result = Result::Error; break; }
         }
         if (::closedir(dir)) result = Result::Error;
         return result;

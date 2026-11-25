@@ -404,10 +404,10 @@ a card. Stage 4 has since recorded two real drives on the card.
      power off without closing files.
   3. Watch for `Switching off`, then a dark screen. Wait a few seconds for
      shutdown to finish before touching the card. The message appears for
-     about one second after trip closure and journal sealing, before storage
-     is unmounted. If SD was mounted, it stays powered for another half
-     second after unmount before power is cut. A failed display or degraded startup
-     skips the message. A dark screen by itself does not mean off: the
+     about one second after trip closure and any journal sealing. On a clean
+     shutdown, storage is then unmounted. If SD was mounted, it stays powered
+     for another half second after unmount before power is cut. A failed
+     display or degraded startup skips the message. A dark screen by itself does not mean off: the
      running board normally sleeps its screen between cards.
   4. Pull the card **without pressing anything**. Any POWER press, even a
      tap, switches an off board on. Pressing it to check can leave the board
@@ -419,7 +419,11 @@ a card. Stage 4 has since recorded two real drives on the card.
   when USB returns or the trip state leaves IDLE. An upload already running
   gets up to 16 additional minutes to finish; shutdown then allows up to
   15 s for network abort and up to 15 s for journal sealing before unmounting.
-  Allow those waits too before removing the card. Unknown USB state refuses
+  If the uploader cannot close its file in time, the tracker forces power-off
+  with storage still mounted and locked. If that power-off is cancelled or
+  fails, the tracker holds the lock through restart. Allow those waits too
+  before removing the card.
+  Unknown USB state refuses
   shutdown, so this fallback requires working power control. In degraded
   startup with no storage, confirmed USB absence still starts the 10-minute
   timer; untrusted PMU startup does not run this power-off path.
@@ -1174,8 +1178,10 @@ How it behaves once flashed:
   storage and calls `PMU.shutdown()` to switch the board off completely.
   It does not deep-sleep. The next USB power insert switches it on again.
   An upload still running at 10 minutes gets up to **16 more minutes** to
-  finish; a file cut off then remains queued. This is the opportunity to
-  upload at home; check your installed power setup as described under
+  finish; a file cut off then remains queued. If the uploader does not close
+  the file by the abort deadline, the tracker keeps storage mounted and locked
+  through power-off. This is the opportunity to upload at home; check your
+  installed power setup as described under
   [Put it in the car](#put-it-in-the-car). Without an 18650,
   the board loses power with the car and has no battery upload window or
   clean shutdown. A car USB port that stays powered never triggers this
@@ -1247,6 +1253,12 @@ How it behaves once flashed:
   then restart; reinserting it while running does not re-enable SD storage.
   This runtime fallback has host-test coverage but still needs a real-board
   removal-during-recording/upload check.
+- **Card still reads but rejects writes:** two failed GPX recording pieces
+  without a clean close between them trigger E4001 and send new trips to
+  internal flash until reboot. E4006 reports the write failure. The current
+  piece is closed or left for recovery before fallback, and readable,
+  complete trips on the card can still upload. The tracker attempts to
+  recover any complete opening points after a failed first commit.
 
 Watch the Serial Monitor (115200) for state transitions:
 `Trip started` → (drive) → `Trip finalized`, then
@@ -1259,7 +1271,9 @@ failing card, for example), the line instead reads
 `-> HTTP 200, but deleting the local file failed (will re-upload; the server ignores identical copies)`.
 The trip is safely on the server; the copy is uploaded again at the next
 chance, and the server answers identical copies with 200 without storing a
-duplicate.
+duplicate. Each upload batch starts farther into the queue so files that
+keep failing cannot monopolize every batch. GPX files with junk after the
+closing tag stay out of uploads until recovery.
 
 New upload lines keep the same status text and append, for example,
 `; send 2.4 s, reply 0.3 s`. The time beside the byte count is the whole HTTP
@@ -1269,8 +1283,8 @@ Connecting has an explicit 5-second timeout, and the reply wait has a
 10-second timeout. That gives a slower server more time to parse and save a
 large trip while staying below the 15-second shutdown-abort window. A timeout
 keeps the trip queued. Historical log examples above retain their original form.
-The reply setting limits time without incoming data; it is not a deadline
-for the entire response. A server that trickles headers can extend the total wait.
+The reply setting limits time without incoming data. A server that trickles
+headers can extend the total wait, and shutdown can interrupt that wait.
 
 Server-down retry was verified on 2026-10-21 (UTC): the trip stayed queued
 after two `HTTP -1` failures and uploaded with HTTP 200 after ingest

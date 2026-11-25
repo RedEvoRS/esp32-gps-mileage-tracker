@@ -136,7 +136,10 @@ static void usbPowerRegressions() {
 static void toggleRegressions() {
     faultWorld(); gDebugMode = false; beginProductionDisplay();
     gState = ACTIVE;
-    g_digitalReadHook = [](int pin) { assert(pin == DEBUG_BOOT_PIN); return bootLow ? LOW : HIGH; };
+    g_digitalReadHook = [](int pin) {
+        assert(pin == DEBUG_BOOT_PIN || pin == PMU_IRQ_PIN);
+        return pin == DEBUG_BOOT_PIN && bootLow ? LOW : HIGH;
+    };
     // BOOT alone and a bouncing low never toggle. POWER alone is a card.
     bootLow = true; pollPmu(); ++g_millis; bootLow = false; pollPmu();
     bootLow = true; pollPmu(); g_millis += 39; shortTap();
@@ -198,7 +201,7 @@ static void toggleRegressions() {
     // A checked-batch read failure cannot toggle, even with BOOT held.
     for (uint8_t failed : {XPOWERS_AXP2101_INTSTS1, XPOWERS_AXP2101_INTSTS2, XPOWERS_AXP2101_INTSTS3}) {
         faultWorld(); gDebugMode = false;
-        g_digitalReadHook = [](int) { return LOW; };
+        g_digitalReadHook = [](int pin) { return pin == DEBUG_BOOT_PIN ? LOW : HIGH; };
         pollPmu(); g_millis += 40;
         PMU.failRegisterReadAt[failed] = PMU.registerReadCalls[failed] + 1;
         shortTap();
@@ -209,7 +212,7 @@ static void toggleRegressions() {
     // A handoff failure cannot be retried via the other adapter
     // during subsequent toggles. All transfers still belong to core 1/Wire.
     faultWorld(); gDebugMode = false; beginProductionDisplay();
-    g_digitalReadHook = [](int) { return LOW; };
+    g_digitalReadHook = [](int pin) { return pin == DEBUG_BOOT_PIN ? LOW : HIGH; };
     pollPmu(); g_millis += 40; shortTap();
     unsigned attempts = 0;
     TwoWire::transaction = [&](TwoWire& bus, bool) -> uint8_t {
@@ -227,7 +230,7 @@ static void toggleRegressions() {
     // Degraded mode ignores even a fully debounced BOOT+POWER chord.
     for (auto mode : {startup::Mode::PmuMissing, startup::Mode::PmuUntrusted, startup::Mode::NoStorage}) {
         faultWorld(); gDebugMode = false; gDegraded.begin(mode, g_millis);
-        g_digitalReadHook = [](int) { return LOW; };
+        g_digitalReadHook = [](int pin) { return pin == DEBUG_BOOT_PIN ? LOW : HIGH; };
         pollPmu(); g_millis += 40; shortTap();
         assert(!debugMode() && !gModeFeedback && !gDisplayUserRequest);
         g_digitalReadHook = nullptr; gDegraded = startup::DegradedPolicy(); ++cases;
@@ -235,7 +238,7 @@ static void toggleRegressions() {
     // The BOOT modifier never changes a long press, in either runtime mode.
     for (bool debug : {false, true}) for (bool usb : {false, true}) {
         faultWorld(); gDebugMode = debug; PMU.vbusIn = usb;
-        g_digitalReadHook = [](int) { return LOW; };
+        g_digitalReadHook = [](int pin) { return pin == DEBUG_BOOT_PIN ? LOW : HIGH; };
         pollPmu(); g_millis += 40;
         PMU.registerReadOverride[XPOWERS_AXP2101_INTSTS2] = 0x04;
         gPmuIrqFlag = true; bool off = false;
@@ -274,6 +277,7 @@ int main() {
         gPmuIrqFlag = true; pollPmu();
         assert(gPmuIrqRetry && !PMU.shutdownCalls && !gVbusOffPending && !gVbusLost && take().empty());
         assert(std::find(PMU.operations.begin(), PMU.operations.end(), "clearIrqStatus") == PMU.operations.end());
+        assert(std::find(PMU.operations.begin(), PMU.operations.end(), "writeRegister") == PMU.operations.end());
         assert(!gDisplayUserRequest);
         ++cases;
     }

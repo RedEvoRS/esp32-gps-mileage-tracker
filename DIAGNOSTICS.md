@@ -62,15 +62,22 @@ including both loaded copies and any revision reserved this boot. Use at least
 that value and a fresh server read before trying a higher enrollment ID. If
 that minimum was already met, check journal/NVS errors rather than raising it.
 
-Enrollment is one-use: core 0 saves and verifies the ID in `diag/enroll` in
-**NVS (non-volatile storage, the ESP32's settings memory)** before calling
-`restoreStatusSequence(highWater)` under the journal lock. Enrollment attempts
-every loaded journal and needs at least one verified save plus the separate
-NVS recovery marker. Failed/absent stores are marked stale before it succeeds.
-A restore below either loaded stored revision
-is refused **after the ID has been consumed**. Raising only the ID while keeping
-that too-low value repeats the failure and consumes another ID. Fix the lower
-bound or storage problem first; only then retry with a higher ID and reboot.
+Enrollment is one-use: core 0 first preloads every mounted journal store under
+the journal lock with normal cooperative cancellation (deferring enrollment
+without consuming the ID if trip storage interrupts a load, and skipping
+enrollment while shutdown abort is active). It then suppresses cooperative
+cancellation only around the bounded metadata commit of
+`restoreStatusSequence(highWater)`, and saves and verifies the ID in
+`diag/enroll` in **NVS (non-volatile storage, the ESP32's settings memory)**
+only after at least one journal store save and the separate NVS recovery marker
+succeed. Failed/absent stores are marked stale before it succeeds. If journal
+enrollment succeeds but writing `diag/enroll` to NVS fails, serial warns you to
+remove `DIAGNOSTICS_ENROLLMENT_ID` and `DIAGNOSTICS_STATUS_HIGH_WATER` from
+`secrets.h` and reflash with erase disabled so later boots do not retry
+enrollment (which would be refused once revisions advance). A restore below
+either loaded stored revision, or when no journal store can save, is refused
+without consuming the ID. Fix the lower bound or storage problem first, then
+retry enrollment and reboot.
 
 1. Read the server high-water for the exact `DEVICE_ID`. With the tracker
    powered off, inspect the card's revision using the read-only procedure below
@@ -382,7 +389,7 @@ second metric reference.
 | No Device health entry | A successful GPX upload with a valid `X-Device-Id`, or an accepted diagnostics request, creates contact. Verify the configured identity, server reachability and upload result. Legacy GPX uploads without identity are not assigned to a guessed device. |
 | Contact exists, but no current snapshot | GPX contact does not establish diagnostics health. Check for a current enrolled SD or LittleFS copy, NVS suspension/stale state, and the one-time upload-workspace allocation warning. An upgrade while the card was absent needs it once or explicit enrollment. |
 | Diagnostics stay local while trips upload | Eligible completed GPX files always take priority, even after a failed trip attempt. Diagnostics use the next eligible awake network opportunity and independent retry backoff. Check at least one current enrolled journal can persist revisions, NVS is working, and the serial warning `diagnostics upload disabled: PSRAM allocation failed`; PSRAM is the board's external working memory. |
-| Enrollment/recovery is refused or never produces a current snapshot | Check the server high-water, SD stored revision and serial `local minimum high-water` (includes internal flash) before consuming another ID. Failed attempts consume IDs. A snapshot conflict needs explicit recovery and reboot; do not clear server state to hide it. |
+| Enrollment/recovery is refused or never produces a current snapshot | Check the server high-water, SD stored revision and serial `local minimum high-water` (includes internal flash) before retrying enrollment. A failed attempt does not consume the enrollment ID, while a snapshot conflict needs explicit recovery with a higher ID and reboot; do not clear server state to hide it. |
 | History arrives but current health stays old | Lower-but-valid revisions can deliver history/contact without replacing current health. Compare revision bounds and use the recovery procedure above. An identical retry also does not refresh snapshot age. |
 | An old fault is in history, or a condition says unknown | History is not current health. A reboot or omitted/unobserved condition is unknown, not measured recovery. Use the current snapshot and receipt age. |
 | The screen is dark | Production normally sleeps between cards. Try POWER while running. E6001 means display failure disabled both display paths for this boot; missing pixels alone cannot diagnose the cause. |
@@ -949,7 +956,7 @@ remounting media; do not reuse cached state for a different card.
   is not event-time order. The default 30 KiB events-array budget leaves room
   for the current check-in; the worker also enforces the full 32 KiB request.
   Re-reads preserve exact JSON, including original timestamps and identity.
-  On the Windows host ABI, `sizeof(EventLog)` is **25,184 bytes** and
+  On the Windows host ABI, `sizeof(EventLog)` is **25,200 bytes** and
   `sizeof(EventLog::Batch)` is **35,288 bytes**; the host test prints both.
   ABI/alignment can differ on the ESP32-S3. #124 must place both objects in
   **static DRAM or PSRAM**, never on a task stack. Only one batch ticket is
@@ -1052,7 +1059,8 @@ The work under one `service()` lock hold is bounded as follows:
   512 removals and 513 metadata saves including filename reservation. With a
   normal full-size journal this is usually one eviction at a quota-driven roll;
   tiny recovered segments can require more.
-- Each uncached load uses one `begin`, at most **1025 list calls**, and two
+- Each uncached load uses one `begin`, one single-pass directory listing (at most
+  **1024 entries**, keeping progress across cooperative yields), and two
   metadata reads. The next append validates at most **512 open segments**, each
   at most **64 KiB**, sealing at most 512 files. A failed operation may require
   this recovery again on a later attempt, even within the same service call.
@@ -1247,21 +1255,33 @@ across an ESP32 reset), a failed disable may leave charging on, the ADC/gauge
 may be stale, and USB/load/temperature/voltage relaxation affect the reading.
 This is an early sample, not a proven open-circuit voltage or current measurement.
 
-Before PMU shutdown, core 1 ends the trip and stops networking, then asks the
-core-0 consumer to drain the bounded queue and seal open segments. The consumer
-closes each write before returning. Core 1 waits at most 15 seconds for this
-handoff, reports incomplete drain/sealing when necessary, and takes FS_LOCK
-through both unmounts and power-off. No diagnostic I/O can reach unmounted media.
-Cancelled/failed shutdown remounts the same stores and invalidates journal
-caches while retaining the boot identity and RAM queue. RAM-only history is lost
-on reset/power-off. Hardware tests must measure individual VFS operation latency
-and trip-write delay, plus induced failures during sealing and remount.
+Before PMU shutdown, core 1 ends the trip and stops networking. When the network
+task stops within its abort deadline, core 1 asks the core-0 consumer to drain
+the bounded queue and seal open segments. The consumer closes each write before
+returning. Core 1 waits at most 15 seconds for this handoff, reports incomplete
+drain/sealing when necessary, and takes FS_LOCK through both unmounts and
+power-off. If the network task misses the abort deadline (a forced shutdown),
+the uploader may still hold an open file: core 1 skips the journal handoff and
+E2009, takes FS_LOCK and leaves both filesystems mounted, holding the lock
+through power-off. No diagnostic I/O can reach unmounted media. A cancelled or
+failed forced shutdown restarts the tracker instead of resuming. A cancelled or
+failed clean shutdown remounts the stores that were usable before it (a card
+already taken out of use after a failed capacity query stays out, powered off)
+and invalidates journal caches while retaining the boot identity and RAM queue.
+RAM-only history is lost on reset/power-off. Hardware tests must measure
+individual VFS operation latency and trip-write delay, plus induced failures
+during sealing and remount.
 
-Immediately before requesting that seal, core 1 captures one E2009 battery
-sample with the existing UTC/confidence provider and the known shutdown reason.
+On a clean shutdown, immediately before requesting that seal, core 1 captures
+one E2009 battery sample with the existing UTC/confidence provider and the
+known shutdown reason.
 Core 0 drains a queue slot, submits the retained notice exactly once, then drains
 and seals it with the earlier events. A full writable queue therefore does not
-lose the sample. PMU reads stay on core 1; filesystem writes stay with the
+lose the sample. If the queue stays full after that drain attempt, the notice
+counts one drop and sealing still proceeds. On mounted media, failed seals retry
+while draining makes progress and stop after three consecutive stalled attempts
+inside the 15-second shutdown window so persistently failing or full storage
+cannot stall power-off. PMU reads stay on core 1; filesystem writes stay with the
 existing consumer (the sole degraded-loop consumer handles no-storage mode).
 There is no journal write after sealing/unmounting or between the final VBUS
 check and `PMU.shutdown()`. Successful closed writes and sealing provide the
@@ -1405,7 +1425,7 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E2004 | Plausible die requires a hot pause (die >=54 C); keeps requesting it above 47 C | Plausible die <=47 C or another measured pause reason; describes required pause even if control is unconfirmed | `temperature_mc` = measured PMU die |
 | E2005 | Plausible die requires a cold pause (die <=9 C); keeps requesting it below 14 C | Plausible die >=14 C or another measured pause reason; describes required pause even if control is unconfirmed | `temperature_mc` = measured PMU die |
 | E2006 | Non-finite or implausible die sample; first ten seconds of first-reading retries are silent | Plausible sample; hot/cold conditions are not cleared by an unreadable sample | none |
-| E2008 | Three consecutive charger command/read-back failures, 30 s apart | Checked 0x18 bit 1 read matches the intended charger state | none |
+| E2008 | Three consecutive runtime charger command/read-back failures (30 s apart), startup charger disable still unconfirmed after its 5 s bounded retry window, or an unconfirmed 4.1 V charge target (blocking charging) | Checked 0x64 4.1 V target and 0x18 bit 1 read match the intended charger state (once startup charger disable is confirmed) | none |
 | E3001 | No checksum-valid NMEA for 10 s, starting at GPS configuration start | Next checksum-valid NMEA; noise/UBX/bad checksum do not recover it | `elapsed_ms` |
 | E3002 | No trusted fix (one meeting the NAV-PVT start accuracy limits, or any valid fix in RMC-only fallback) for 120 s while idle | Trusted fix; acquisition grace starts again after leaving a trip | `elapsed_ms`, `satellites` when measured |
 | E3003 | Matching checksum-checked VALSET NAK | One notice per rejected attempt, no active condition | `message_class=6`, `message_id=138` |
@@ -1415,9 +1435,9 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E3007 | RTC has no ACK, or its initial boot register read fails | Verified RTC setting after trusted GPS/SNTP time; at most three attempts per boot, at least a minute apart after failures | none |
 | E3008 | Readable RTC has STOP/VL, invalid BCD/calendar, unsupported year, or a later read/write/verification failure | Verified RTC setting from GPS/SNTP clears the condition; normal transition/repeat policy | `reason=stopped\|invalid_date\|out_of_range\|read_failed` on failure |
 | E3009 | At 30 s MON-RF boundaries, valid AGC >=70% and fresh GSV (a complete group within 15 s) with zero satellites >=30 dBHz, continuously for >=120 s from the first suspect sample | One valid AGC <=50% sample **or** fresh GSV with at least one satellite >=30 dBHz; missing/stale/intermediate evidence resets the hold and retains an active warning | `agc_pct` (0-100) when MON-RF valid; `max_cno` (0-99) when GSV fresh |
-| E4001 | SD did not mount, or the selected SD trip store returns zero total capacity at runtime (failed filesystem query) | Successful SD mount on a later boot; runtime failure stays latched until reboot | none |
+| E4001 | SD did not mount, the selected SD trip store returns zero total capacity at runtime (failed filesystem query), or two trip pieces in a row fail to write on SD (create, write, sync or close) | Successful SD mount on a later boot; runtime failure stays latched until reboot. After write failures, new trips record on flash while readable trips already queued on the card still upload, so an E4001 can appear next to a successful SD upload | none |
 | E4002 | LittleFS unavailable during no-storage degraded startup | RAM-only raise/repeat; retained as failed until restart discards the queue | none |
-| E4003 | Neither trip store is usable at startup | Only a normal boot with a mounted trip store observes healthy; successful degraded retry restarts without clearing | none |
+| E4003 | Neither trip store is usable at startup (including a boot SD capacity failure with flash unavailable), or the selected trip store becomes unavailable at runtime with no fallback | Only a normal boot with an available trip store (or switching to an available fallback store) observes healthy; successful degraded retry restarts without clearing | none |
 | E4004 | Available selected trip store has guarded free space <64 KiB start reserve | >=64 KiB on the selected store, or condition no longer applies because that store is unavailable | `backend`, `free_bytes` only when available |
 | E4005 | Available selected trip store has guarded free space <24 KiB stop reserve | >=24 KiB on the selected store, or condition no longer applies because that store is unavailable | `backend`, `free_bytes` only when available |
 | E4006 | Trip create/open, point commit or finalization fails | Next verified trip create/write/finalize or successful repair | `backend`, `operation=open\|write\|close` |
@@ -1448,32 +1468,55 @@ unmeasured and retried at the sampling cadence.
 
 IRQ batches require all three INTSTS1..3 raw reads to succeed. Any failed byte
 makes the entire batch unknown: no flag action (including power-off, battery
-alerts, VBUS handling or a short-press card) and no status clear. The pending
-retry survives without another falling edge and runs at most every 100 ms,
-including if more edges arrive while reads fail. Successful batches use the
-XPowersLib bit positions and the same enabled mask as IRQ setup, then clear as
-before. The production short-press display hook uses this verified batch too.
+alerts, VBUS handling or a short-press card) and no status clear. Successful
+batches clear only the bits read in that batch with checked INTSTS1..3 register
+writes before calling `powerOffForVbus()`, so a cancelled shutdown cannot wipe
+flags latched during shutdown preparation. Any failed clear write sets the
+pending retry flag and remembers which bits were already handled, so retries
+clear those bits without replaying their actions while still dispatching newly
+latched bits. A failed `enableIRQ()` during startup is tracked separately and
+retried at most every 100 ms until it succeeds. An asserted active-low
+`PMU_IRQ_PIN` also triggers a rate-limited retry (at most every 100 ms) without
+another falling edge. A periodic 15 s VBUS check in `serviceVbusRecheck()`
+prevents a missed edge from leaving USB power state stale. The production
+short-press display hook uses this verified batch too.
 
 Plausible means finite and within -40 to 125 C. Before the first usable reading
 each boot, the guard commands/verifies charging off and retries once a second
 for ten seconds. There is no E2006 during that grace window. Expiry pauses
 charging with E2006 and returns to 30-second checks. A plausible hot reading
-still raises E2004 immediately. Invalid readings never drive or clear hot/cold
-conditions, carry temperature context or appear as real debug temperatures.
+still raises E2004 immediately. Invalid readings pause charging fail-safe
+without creating or clearing hot/cold hysteresis history, carrying temperature
+context or appearing as real debug temperatures.
 The first-reading retry has host tests only. Bench boots on 2026-11-10 (UTC)
 were USB resets whose first reading was already usable, so a start from fully
 off remains unchecked.
 
 The charge guard uses its existing die proxy and hysteresis; diagnostic context
-never presents that die reading as a measured cell temperature. Each enable/disable
-command in the normal temperature guard is followed by a checked CHARGE_GAUGE_WDT_CTRL (0x18)
-bit-1 read. State is confirmed paused, confirmed charging or unconfirmed. A
-mismatch or read failure leaves it unconfirmed, retains pause-request hysteresis
-and retries at the temperature cadence (one second during first-reading grace,
-otherwise 30 seconds). Only a matching read-back logs a
-confirmed pause/resume. E2008 stays active until confirmation; the first two
-unconfirmed attempts cannot manufacture recovery. The degraded PMU-untrusted
-mode retains its separate one-time best-effort disable/read-back policy.
+never presents that die reading as a measured cell temperature. Startup tries
+to disable the charger early and read back `CHARGE_GAUGE_WDT_CTRL` (0x18), and
+if still unconfirmed retries every 100 ms for a bounded 5 s window (feeding the
+startup watchdog) before storage setup. If the PMU still cannot confirm
+charging off after 5 s, firmware cannot guarantee the charger is off during
+storage mount and repair: it latches a startup disable timeout flag (in
+addition to setting `gChargeFailures` to the failure limit) so the first guard
+pass after the journal is ready always raises E2008 (`CHARGE_CONTROL_FAILED`)
+at least once—even if control recovers during storage mount—and a later
+confirmed pass clears it, while continuing startup so an uncontrollable PMU
+does not block trip logging forever. Startup also
+verifies the 4.1 V charge target in CV_CHG_VOL_SET (0x64). Each enable/disable
+command in the normal temperature guard is followed by a checked
+CHARGE_GAUGE_WDT_CTRL (0x18) bit-1 read, and charging is never enabled without
+a verified 4.1 V target. A startup disable failure (until later confirmed off),
+target-voltage failure, enable/disable mismatch, or read failure leaves control
+unconfirmed (keeping charging off when 4.1 V is unverified), retains finite
+pause-request hysteresis and retries at the temperature cadence (one second
+during first-reading grace, otherwise 30 seconds). Only a matching read-back
+logs a confirmed pause/resume. E2008 stays active until startup disable, the
+4.1 V target, and intended charger state are all confirmed; the first two
+runtime unconfirmed attempts cannot manufacture recovery. The degraded
+PMU-untrusted mode retains its separate one-time best-effort disable/read-back
+policy.
 
 E3009 checks for a loose or damaged active-antenna cable. On one Supreme/MAX-M10S
 and one antenna (2026-10-19), unplugging raised AGC to about 79% after a minute

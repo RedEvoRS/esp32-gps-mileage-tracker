@@ -8,6 +8,7 @@ class JournalPlatformIo {
     fs::FS& fs_;
     diagnostics::EventLogFs::Operation writeFailure_ = diagnostics::EventLogFs::Operation::Write;
 public:
+    std::function<void()> onListEntry;
     explicit JournalPlatformIo(const char* mount) : fs_(std::strcmp(mount, "/sd") == 0 ?
         static_cast<fs::FS&>(SD) : static_cast<fs::FS&>(LittleFS)) {}
     bool directory(const char* path) {
@@ -16,22 +17,25 @@ public:
         if (fs_.exists(path)) { auto file = fs_.open(path); return file && file.isDirectory(); }
         return fs_.mkdir(path);
     }
-    diagnostics::EventLogFs::Result list(size_t index, diagnostics::EventLogFs::Entry& entry,
+    diagnostics::EventLogFs::Result list(size_t skip, diagnostics::EventLogFs::ListVisitor visitor, void* context,
                                        bool (*allow)() = nullptr, bool accounting = false) {
         if (!accounting) assertLocked();
         using Result = diagnostics::EventLogFs::Result;
-        if (!fs_.g_disk.mounted || fs_.g_disk.failMount || !fs_.exists("/diag")) return Result::Error;
-        size_t i = 0;
+        if (!visitor || !fs_.g_disk.mounted || fs_.g_disk.failMount || !fs_.exists("/diag")) return Result::Error;
+        size_t seen = 0;
         for (const auto& file : fs_.g_disk.files) {
-            if (allow && !allow()) return Result::Error;
+            if (allow && !allow()) return Result::Deferred;
             if (file.first.rfind("/diag/", 0)) continue;
+            if (seen++ < skip) continue;
+            if (onListEntry) onListEntry();
             std::string name = file.first.substr(6);
+            diagnostics::EventLogFs::Entry entry{};
             if (name.size() >= sizeof(entry.name) || name.find('/') != std::string::npos) return Result::Error;
-            if (i++ == index) {
-                std::strcpy(entry.name, name.c_str()); entry.size = file.second.size(); return Result::Ok;
-            }
+            std::strcpy(entry.name, name.c_str());
+            entry.size = static_cast<uint32_t>(file.second.size());
+            if (!visitor(context, entry)) return Result::Error;
         }
-        return Result::End;
+        return seen < skip ? Result::Error : Result::Ok;
     }
     bool read(const char* path, uint32_t offset, void* data, size_t bytes) {
         assertLocked();

@@ -13,19 +13,21 @@ constexpr uint64_t kMaxEventInteger = INT64_MAX;
 
 // Implement on mounted media; never format. A successful write includes a
 // durable close/sync, not just flush(). Failure may leave any written prefix.
-// list() enumerates regular files in /diag (names, not full paths), returning
-// End only after a complete listing. Missing media and I/O errors return Error.
+// list() enumerates regular files in /diag (names, not full paths) in one pass,
+// skipping the first `skip` entries without statting them when resuming after
+// Deferred. Missing media and I/O errors return Error.
 // All methods, including reads and metadata operations, run under FS_LOCK.
 // EventLog exclusively owns /diag while alive. Reconstruct it after a remount
 // or external changes; successful operations update its cached inventory.
 class EventLogFs {
 public:
     enum class Operation : uint8_t { Open, Write, Close, Rename, Ack };
-    enum class Result { Ok, End, Error };
+    enum class Result { Ok, Deferred, Error };
     struct Entry { char name[40]; uint32_t size; };
+    using ListVisitor = bool (*)(void* context, const Entry& entry);
     virtual ~EventLogFs() = default;
     virtual bool begin() = 0;  // ensure /diag exists; no formatting
-    virtual Result list(size_t index, Entry& entry) = 0;
+    virtual Result list(size_t skip, ListVisitor visitor, void* context) = 0;
     virtual bool read(const char* path, uint32_t offset, void* data, size_t size) = 0;
     virtual bool write(const char* path, const void* data, size_t size, bool append) = 0;
     virtual bool rename(const char* from, const char* to) = 0; // never overwrite
@@ -123,7 +125,7 @@ public:
     // A roll adds one rename + one metadata write/read. Each append can reclaim
     // up to 512 segments; each unacked eviction scans <=64 KiB and saves metadata
     // before removal (<=513 saves/append including reservation). Each uncached
-    // load adds one begin, <=1025 list calls, two metadata
+    // load adds one begin, one single-pass list (<=1024 entries), two metadata
     // reads and validation of <=512 open segments (<=64 KiB each). These recovery
     // bounds are work limits, NOT a time guarantee: schedule away from GPS writes
     // and measure adapter latency; do not leave GPS waiting through maintenance.
@@ -172,7 +174,8 @@ public:
     // wear-levelled LittleFS; no revision writes per producer scan/event.
     // Enrollment must supply >= server high-water AND minimumStatusSequence().
     uint64_t minimumStatusSequence(); // read-only, includes every loaded store
-    bool restoreStatusSequence(uint64_t highWater);
+    bool prepareStatusSequence(); // preload mounted stores with normal cancellation; false if deferred
+    bool restoreStatusSequence(uint64_t highWater, bool loadedOnly = false);
     bool allocateStatusSequence(uint64_t& sequence);
     bool suspendStatusSequence(); // explicit recovery required after snapshot conflict
 
@@ -198,8 +201,9 @@ private:
         uint32_t metaSizes[2] = {kMetaBytes, kMetaBytes};
         Segment segments[kMaxSegments];
         size_t count = 0;
+        size_t inventorySeen = 0;
         Meta meta;
-        bool loaded = false;
+        bool loaded = false, inventoryInProgress = false, inventoryReady = false;
         EventLogFs::Operation operation = EventLogFs::Operation::Open;
         EventLogFs::Operation failedOperation = EventLogFs::Operation::Open;
         EventLogFs::Operation recoveryOperation = EventLogFs::Operation::Write;
@@ -237,13 +241,14 @@ private:
     void drop();
     bool load(Store& store);
     bool inventory(Store& store);
+    void invalidateStore(Store& store);
     uint64_t allocated(const Store& store, uint32_t bytes) const;
     bool save(Store& store, Meta next);
-    bool revisionStores(uint8_t& mounted, uint64_t& highest);
+    bool revisionStores(uint8_t& mounted, uint64_t& highest, bool loadedOnly = false);
     bool readRevisionState(uint64_t& state, uint8_t loaded, bool adopt = true);
     bool writeRevisionState(uint64_t state);
     bool append(Store& store, const Frame& frame);
-    bool makeRoom(Store& store, size_t bytes);
+    bool makeRoom(Store& store, size_t bytes, bool needSegment = false);
     bool readFrame(Store& store, const Segment& segment, uint32_t& offset, Frame& frame);
     bool identity(const Frame& frame, EventIdentity& id);
     bool acknowledged(const Store& store, const Segment& segment) const;

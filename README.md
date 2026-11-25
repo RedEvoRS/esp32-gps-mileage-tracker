@@ -41,7 +41,7 @@ contact services outside it:
 
 ## Where it's at
 
-**Current versions:** firmware **v1.08** · server **v1.24**
+**Current versions:** firmware **v1.09** · server **v1.24**
 
 The tracker and server have been in daily use since **v1.00**. The firmware side is mostly completed and most of the work now is going into the server side of things. Later fixes
 are listed on the

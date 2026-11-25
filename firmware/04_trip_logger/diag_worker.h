@@ -59,7 +59,6 @@ static bool eventLock() {
 }
 static void eventUnlock() {
     journalStorageFaults();
-    if (!journalMayRun()) gJournal.invalidateStorage();
     xSemaphoreGive(gFsMutex);
 }
 static void eventHttpFault(int status, const char* ackError = nullptr) {
@@ -96,27 +95,55 @@ static bool appendObservations(const diagnostics::RuntimeFaults& faults, unsigne
     return true;
 }
 
-// Enrollment is an explicit operator action, consumed in NVS BEFORE resetting
-// the mirrored allocator. Reusing a firmware configuration after metadata loss must
-// never silently enroll at zero again. A failed attempt consumes the token too.
+// Enrollment is an explicit one-use operator action. Preload every mounted
+// journal store with normal cooperative cancellation so long /diag listings
+// still yield to core-1 trip writes and shutdown aborts. Suppress cancellation
+// only around the bounded metadata commit, and consume the NVS token only
+// after at least one journal store save succeeds (#805).
 static void enrollEventRevision() {
-    if (gEnrollmentChecked) return;
-    gEnrollmentChecked = true;
+    if (gEnrollmentChecked || gNetAbort.load()) return;
 #if defined(DIAGNOSTICS_ENROLLMENT_ID) && defined(DIAGNOSTICS_STATUS_HIGH_WATER)
     Preferences settings;
-    if (!settings.begin("diag", false)) return;
+    if (!settings.begin("diag", false)) { gEnrollmentChecked = true; return; }
     uint64_t used = settings.isKey("enroll") ? settings.getULong64("enroll", UINT64_MAX) : 0;
     uint64_t token = DIAGNOSTICS_ENROLLMENT_ID;
-    if (token > used && token <= diagnostics::kMaxEventInteger &&
-        settings.putULong64("enroll", token) == sizeof(uint64_t) &&
-        settings.getULong64("enroll", 0) == token) {
-        if (!gJournal.restoreStatusSequence(DIAGNOSTICS_STATUS_HIGH_WATER))
-            Serial.printf("Diagnostics enrollment refused: local minimum high-water %llu; "
-                          "also read server high-water, then use a higher enrollment ID. "
-                          "Check mounted journals and NVS if this minimum was met.\n",
-                          (unsigned long long)gJournal.minimumStatusSequence());
+    if (token <= used || token > diagnostics::kMaxEventInteger) {
+        gEnrollmentChecked = true;
+        settings.end();
+        return;
+    }
+    bool prepared = gJournal.prepareStatusSequence();
+    // Any deferred preload retries at the next snapshot; never enroll a store
+    // that was skipped only because core 1 briefly wanted the FS lock.
+    if (gNetAbort.load() || !prepared) {
+        settings.end();
+        return;
+    }
+    gEnrollmentChecked = true;
+    bool enrolled = false;
+    {
+        struct EnrollmentGuard {
+            EnrollmentGuard() { gJournalEnrolling = true; }
+            ~EnrollmentGuard() { gJournalEnrolling = false; }
+        } guard;
+        enrolled = gJournal.restoreStatusSequence(DIAGNOSTICS_STATUS_HIGH_WATER, /*loadedOnly=*/true);
+    }
+    if (enrolled) {
+        if (settings.putULong64("enroll", token) != sizeof(uint64_t) ||
+            settings.getULong64("enroll", 0) != token) {
+            Serial.println("WARNING: diagnostics enrollment succeeded, but recording the enrollment ID in NVS failed. "
+                           "Remove DIAGNOSTICS_ENROLLMENT_ID and DIAGNOSTICS_STATUS_HIGH_WATER from secrets.h and reflash "
+                           "(erase disabled) so later boots do not retry enrollment.");
+        }
+    } else {
+        Serial.printf("Diagnostics enrollment refused: local minimum high-water %llu; "
+                      "also read server high-water before retrying enrollment. "
+                      "Check mounted journals and NVS if this minimum was met.\n",
+                      (unsigned long long)gJournal.minimumStatusSequence());
     }
     settings.end();
+#else
+    gEnrollmentChecked = true;
 #endif
 }
 

@@ -97,6 +97,8 @@ int main() {
     checkStorage();
     auto removed = events();
     assert(gSdUnavailable && codeRows(removed, 4001).size() == 1);
+    auto noStore = codeRows(removed, 4003);
+    assert(noStore.size() == 1 && noStore[0].find("\"transition\":\"raise\"") != std::string::npos);
     for (unsigned code : {4004, 4005}) {
         auto rows = codeRows(removed, code);
         assert(rows.size() == 1 && rows[0].find("\"transition\":\"clear\"") != std::string::npos);
@@ -111,9 +113,11 @@ int main() {
     auto repeated = events();
     auto sdRepeat = codeRows(repeated, 4001);
     assert(sdRepeat.size() == 1 && sdRepeat[0].find("\"transition\":\"repeat\"") != std::string::npos);
+    auto noStoreRepeat = codeRows(repeated, 4003);
+    assert(noStoreRepeat.size() == 1 && noStoreRepeat[0].find("\"transition\":\"repeat\"") != std::string::npos);
     noSpaceFaults(repeated);
     assert(SD.capacityQueries == queries && gTripFS == &SD);
-    std::puts("SD runtime: full readable card vs failed query, E4001 repeat, no false space faults passed");
+    std::puts("SD runtime: full readable card vs failed query, E4001/E4003 repeat, no false space faults passed");
 
     // Both physical removal and a present but unreadable card switch only to
     // the already-mounted flash queue, without formatting or remounting SD.
@@ -151,17 +155,22 @@ int main() {
     assert(gTripFS == &SD && gState == ACTIVE && activePath == gTripPath);
     auto activeRows = events();
     assert(codeRows(activeRows, 4001).size() == 1); noSpaceFaults(activeRows);
+    // Healthy flash is the fallback for the next trip: no critical E4003.
+    assert(codeRows(activeRows, 4003).empty());
     gClockSet = false; drive(15, 1);
     assert(gState == IDLE && !gTripPath[0] && gTripFS == &SD);
     auto failedWrite = events();
     auto writes = codeRows(failedWrite, 4006);
     assert(writes.size() == 1 && writes[0].find("\"backend\":\"sd\"") != std::string::npos);
     assert(codeRows(failedWrite, 4007).empty() && g_sdDisk.files == savedSd);
+    assert(codeRows(failedWrite, 4003).empty());
     for (const auto& file : g_disk.files) assert(file.first.rfind("/trips/", 0) != 0);
     gClockSet = true; drive(15, 40);
     assert(gState == ACTIVE && gTripFS == &LittleFS);
-    endTrip(false); noSpaceFaults(events());
-    std::puts("SD runtime: active SD trip kept on SD, E4006 finalization, next trip on flash passed");
+    endTrip(false);
+    auto flashRows = events();
+    noSpaceFaults(flashRows); assert(codeRows(flashRows, 4003).empty());
+    std::puts("SD runtime: active SD trip kept on SD, E4006 finalization, next trip on flash, no E4003 passed");
 
     sdWorld(); events(); drive(15, 12); events();
     activePath = gTripPath;
@@ -205,4 +214,149 @@ int main() {
     assert(!(Preferences::durable64["revstate"] & 5));
     assert(gJournal.stats().queued == 0 && g_sdDisk.files == journalSd && g_lockDepth == 0);
     std::puts("SD runtime: E4001 uploaded through LittleFS, cached SD authority gated, NVS SD stale bit persisted passed");
+
+    // Issue #812: boot-time SD capacity failure with LittleFS unavailable must enter
+    // NoStorage degraded mode, leave SD mounted/powered with gSdUnavailable latched
+    // (no immediate BLDO1 cut without settle), raise E4003, and skip fsck on SD.
+    {
+        resetWorld();
+        gSdUnavailable = false;
+        SD.capacityQueries = 0;
+        Preferences::durable64.clear();
+        for (auto& s : gLoopConditions) { auto code = s.code; s = {}; s.code = code; }
+        gLoopFaults.~RuntimeFaults();
+        new (&gLoopFaults) RuntimeFaults(gJournal, gLoopConditions, sizeof(gLoopConditions)/sizeof(gLoopConditions[0]));
+        g_millis = 1000; SD.cardPresent = true; g_disk.failMount = true;
+        const std::string torn = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n<trkpt";
+        g_sdDisk.files["/trips/torn.gpx"] = torn;
+        g_sdDisk.onMount = [] { g_sdDisk.readsFail = false; };
+        SD.onCapacity = [] { g_sdDisk.readsFail = true; };
+        setup();
+        assert(gDegraded.mode() == startup::Mode::NoStorage);
+        assert(gSdMounted && !gFlashMounted && PMU.bldo1 && SD.ends == 0 && gSdUnavailable);
+        assert(g_sdDisk.files["/trips/torn.gpx"] == torn); // fsck did not touch failed SD
+        for (unsigned i = 0; i < kEventQueueSize && gJournal.stats().queued; ++i) serviceJournal();
+        auto rows = events();
+        auto e4003 = codeRows(rows, 4003);
+        assert(e4003.size() == 1 && e4003[0].find("\"transition\":\"raise\"") != std::string::npos);
+        assert(codeRows(rows, 4001).size() == 1 && codeRows(rows, 4002).size() == 1);
+
+        // NoStorage retry probe must repeat the SD capacity query instead of
+        // restarting forever every 60 s on a card that mounts but fails capacity.
+        const int queriesBeforeRetry = SD.capacityQueries;
+        g_millis += gDegraded.waitMs();
+        loop();
+        assert(g_restarts == 0 && gDegraded.waitMs() == 120000);
+        assert(SD.capacityQueries == queriesBeforeRetry + 1);
+        assert(!gSdMounted && !gFlashMounted);
+        // Second retry with the same fault still backs off without restarting.
+        g_millis += gDegraded.waitMs();
+        loop();
+        assert(g_restarts == 0 && gDegraded.waitMs() == 240000);
+        assert(SD.capacityQueries == queriesBeforeRetry + 2);
+        // Once the card's capacity query succeeds, the next retry restarts cleanly.
+        SD.onCapacity = nullptr;
+        g_millis += gDegraded.waitMs();
+        bool restarted = false;
+        try { loop(); } catch (const Restarted&) { restarted = true; }
+        assert(restarted && g_restarts == 1);
+        g_sdDisk.onMount = nullptr;
+    }
+    // Boot-time SD capacity failure with LittleFS mounted leaves SD mounted with
+    // gSdUnavailable latched, falls back to LittleFS, skips fsck on SD, repairs
+    // LittleFS, raises E4001, and clears E4003.
+    {
+        resetWorld();
+        gSdUnavailable = false;
+        SD.capacityQueries = 0;
+        Preferences::durable64.clear();
+        for (auto& s : gLoopConditions) { auto code = s.code; s = {}; s.code = code; }
+        gLoopFaults.~RuntimeFaults();
+        new (&gLoopFaults) RuntimeFaults(gJournal, gLoopConditions, sizeof(gLoopConditions)/sizeof(gLoopConditions[0]));
+        g_millis = 1000; SD.cardPresent = true; g_disk.failMount = false;
+        const std::string torn = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n<trkpt";
+        g_sdDisk.files["/trips/torn.gpx"] = torn;
+        g_disk.files["/trips/flash_torn.gpx"] = torn;
+        SD.onCapacity = [] { g_sdDisk.readsFail = true; };
+        setup();
+        SD.onCapacity = nullptr;
+        assert(gDegraded.mode() == startup::Mode::Normal);
+        assert(gSdMounted && gFlashMounted && gTripFS == &LittleFS && PMU.bldo1 && SD.ends == 0 && gSdUnavailable);
+        assert(g_sdDisk.files["/trips/torn.gpx"] == torn); // fsck skipped failed SD
+        assert(g_disk.files["/trips/flash_torn.gpx"] ==
+               std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n" + GPX_EPILOGUE); // flash still repaired
+        for (unsigned i = 0; i < kEventQueueSize && gJournal.stats().queued; ++i) serviceJournal();
+        auto rows = events();
+        assert(codeRows(rows, 4001).size() == 1);
+        assert(codeRows(rows, 4003).empty());
+        RuntimeFaults::Observation obs[64]; size_t count = 0;
+        assert(gLoopFaults.snapshot(obs, 64, count));
+        const auto* noStorageObs = std::find_if(obs, obs + count, [](const auto& e) {
+            return e.code == static_cast<uint16_t>(Code::NO_RECORDING_STORAGE);
+        });
+        assert(noStorageObs != obs + count && noStorageObs->observed && !noStorageObs->episode);
+    }
+    // Issue #812: setup() uses one authoritative startup capacity query rather
+    // than re-querying after the mode decision (which could latch gSdUnavailable
+    // and raise E4003 while remaining in Normal mode with no usable store).
+    {
+        resetWorld();
+        gSdUnavailable = false;
+        SD.capacityQueries = 0;
+        Preferences::durable64.clear();
+        for (auto& s : gLoopConditions) { auto code = s.code; s = {}; s.code = code; }
+        gLoopFaults.~RuntimeFaults();
+        new (&gLoopFaults) RuntimeFaults(gJournal, gLoopConditions, sizeof(gLoopConditions)/sizeof(gLoopConditions[0]));
+        g_millis = 1000; SD.cardPresent = true; g_disk.failMount = true;
+        SD.onCapacity = [] { if (SD.capacityQueries >= 2) g_sdDisk.readsFail = true; };
+        setup();
+        assert(SD.capacityQueries == 1);
+        assert(gDegraded.mode() == startup::Mode::Normal);
+        assert(tripStoreAvailable(*gTripFS) && !gSdUnavailable);
+        for (unsigned i = 0; i < kEventQueueSize && gJournal.stats().queued; ++i) serviceJournal();
+        auto rows = events();
+        assert(codeRows(rows, 4003).empty());
+        SD.onCapacity = nullptr;
+    }
+    // Issue #812: quarantined SD card (boot capacity failure) + healthy LittleFS +
+    // cancelled shutdown must NOT reboot the tracker, must keep SD out (never
+    // silently re-enabled even if the card starts responding), and must continue
+    // recording trips on LittleFS.
+    for (bool cardRecovers : {false, true}) {
+        resetWorld();
+        gSdUnavailable = false;
+        SD.capacityQueries = 0;
+        g_restarts = 0;
+        Preferences::durable64.clear();
+        for (auto& s : gLoopConditions) { auto code = s.code; s = {}; s.code = code; }
+        gLoopFaults.~RuntimeFaults();
+        new (&gLoopFaults) RuntimeFaults(gJournal, gLoopConditions, sizeof(gLoopConditions)/sizeof(gLoopConditions[0]));
+        g_millis = 1000; SD.cardPresent = true; g_disk.failMount = false;
+        SD.onCapacity = [] { g_sdDisk.readsFail = true; };
+        setup();
+        SD.onCapacity = nullptr;
+        assert(gDegraded.mode() == startup::Mode::Normal);
+        assert(gSdMounted && gFlashMounted && gTripFS == &LittleFS && gSdUnavailable);
+        events();
+        const int sdBeginsBefore = SD.begins;
+        if (cardRecovers) g_sdDisk.readsFail = false; // card would mount if retried
+        else SD.cardPresent = false;                  // remount would fail if retried
+        PMU.vbusIn = false;
+        g_disk.onUnmount = [] { PMU.vbusIn = true; }; // cancel shutdown after unmount
+        powerOffForVbus("idle_battery");
+        g_disk.onUnmount = nullptr;
+        assert(g_restarts == 0 && PMU.shutdownCalls == 0);
+        assert(!gSdMounted && gSdUnavailable && !tripStoreAvailable(SD) && !PMU.bldo1);
+        assert(SD.begins == sdBeginsBefore); // quarantined card never remounted
+        assert(gFlashMounted && gTripFS == &LittleFS && tripStoreAvailable(LittleFS));
+        assert(g_lockDepth == 0 && !gNetHold && !gNetAbort);
+        assert(roomForNewTrip(millis()));
+        drive(15, 40);
+        assert(gState == ACTIVE && gTripFS == &LittleFS);
+        std::string path = gTripPath;
+        endTrip(false);
+        assert(gState == IDLE && wellFormedShape(g_disk.files.at(path)));
+        assert(gSdUnavailable && !gSdMounted);
+    }
+    std::puts("SD runtime: boot capacity failure, no-storage probe, single boot query, cancelled shutdown (#812) passed");
 }
