@@ -383,9 +383,10 @@ on the bench on 2026-10-18, and it's the first check to run when you fit
 a card. Stage 4 has since recorded two real drives on the card.
 
 - **Card power.** Before mounting, Stage 4 turns BLDO1 off, sets it to
-  3.3 V, then enables it and reads back both settings. If either setting
-  is unverified, it skips the mount (E4001) and tries up to three times to
-  switch BLDO1 off, with a serial warning if read-back cannot confirm it.
+  3.3 V and confirms the voltage before enabling it. It then verifies
+  both settings. If any check fails, it retries the sequence up to a total
+  of three attempts. If it still cannot verify the rail, it skips the
+  mount (E4001), tries to switch BLDO1 off and prints a serial warning.
 - **Format: FAT32.** The firmware can't read exFAT, which is what most
   cards of 64 GB and up ship with. Use a microSDHC card of 32 GB or less;
   this project uses a SanDisk 32 GB Max Endurance. These come formatted

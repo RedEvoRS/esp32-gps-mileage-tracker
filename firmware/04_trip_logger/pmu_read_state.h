@@ -111,11 +111,14 @@ inline bool bldo1Off(int control) {
     return control >= 0 && (control & (1 << 4)) == 0;
 }
 
+inline bool bldo1VoltageReady(int voltage) {
+    // XPowersLib 0.3.3: LDO_VOL4_CTRL (0x96) bits 0..4 select 500 mV + 100 mV/step.
+    return voltage >= 0 && 500 + (voltage & 0x1F) * 100 == 3300;
+}
+
 inline bool bldo1Ready(int control, int voltage) {
-    if (control < 0 || voltage < 0) return false;
-    // XPowersLib 0.3.3: LDO_ONOFF_CTRL0 (0x90) bit 4 enables BLDO1;
-    // LDO_VOL4_CTRL (0x96) bits 0..4 select 500 mV + 100 mV/step.
-    return (control & (1 << 4)) && 500 + (voltage & 0x1F) * 100 == 3300;
+    // LDO_ONOFF_CTRL0 (0x90) bit 4 enables BLDO1.
+    return control >= 0 && (control & (1 << 4)) && bldo1VoltageReady(voltage);
 }
 
 inline bool batteryDetectionEnabled(int detectionCtrl) {

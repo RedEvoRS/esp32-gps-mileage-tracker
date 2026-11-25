@@ -417,11 +417,12 @@ Both stores must open `/trips` as a directory before they can record or
 upload trips. An existing regular file at that path is preserved for
 recovery. LittleFS can stay mounted for the diagnostics journal even if
 its trip directory is unusable. E4003 reports when neither store can record.
-Before mounting SD, the firmware disables BLDO1, sets 3.3 V, enables the
-rail and reads back the enable bit and voltage selection. It allows up to
-three checks, 10 ms apart. An unreadable register triggers a re-read and
-a confirmed mismatch repeats the power setup sequence. If the rail still
-cannot be verified, firmware attempts to turn it off and skips the mount.
+Before mounting SD, the firmware disables BLDO1 and sets 3.3 V. It checks
+the voltage selection before enabling the rail, then verifies the enable
+bit and voltage. The register reads determine whether setup succeeded.
+It repeats the sequence up to three times, with a 10 ms pause before
+each retry. If the rail still cannot be verified, firmware attempts to
+turn it off and skips the mount.
 The existing SD-unavailable path reports E4001 at startup.
 A card that mounts and then fails the FAT or trip-directory check stays
 powered for 500 ms after unmount. If the card never mounts, power-off starts

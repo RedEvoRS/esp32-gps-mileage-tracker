@@ -1670,11 +1670,10 @@ int main(int argc, char** argv) {
 
     printf("T52 missing, unmountable or unpowered SD falls back without erasing (#109)\n");
     {
-        for (int fault = 0; fault < 5; ++fault) {
+        for (int fault = 0; fault < 4; ++fault) {
             resetWorld(); SD.cardPresent = fault != 0;
             g_sdDisk.failMount = fault == 1;
             PMU.failSdVoltage = fault == 2; PMU.failSdEnable = fault == 3;
-            PMU.failSdDisable = fault == 4;
             g_sdDisk.files["/keep.txt"] = "card evidence";
             setup();
             CHECK(gTripFS == &LittleFS && !gSdMounted && gFlashMounted &&
@@ -1683,7 +1682,7 @@ int main(int argc, char** argv) {
             CHECK(!g_sdDisk.mounted && !g_sdDisk.formatRequested && !g_sdDisk.formatAttempts &&
                   g_sdDisk.files.at("/keep.txt") == "card evidence",
                   "fallback preserves the card and never formats it");
-            if (fault != 4) CHECK(!PMU.bldo1, "unused card supply is off after fallback");
+            CHECK(!PMU.bldo1, "unused card supply is off after fallback");
             if (fault >= 2) CHECK(SD.begins == 0, "power setup failure prevents any mount attempt");
             drive(15, 40); endTrip(false);
             CHECK(g_disk.files.size() == 1 && wellFormedShape(g_disk.files.begin()->second),

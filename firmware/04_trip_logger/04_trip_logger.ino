@@ -3110,7 +3110,8 @@ static bool powerOffSdRail(bool warnOnFailure) {
         if (pmu_read::bldo1Off(PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0))) return true;
     }
     if (warnOnFailure)
-        Serial.println("WARNING: microSD card power rail (BLDO1) off unconfirmed after 3 attempts.");
+        Serial.printf("WARNING: microSD card power rail (BLDO1) off unconfirmed after %u attempts.\n",
+                      PMU_PERIPHERAL_ATTEMPTS);
     return false;
 }
 
@@ -3118,27 +3119,24 @@ static bool mountSdStorage() {
     if (gStartupWatchdog.skipCard()) return false;
     // Also used for cancelled/failed shutdown recovery, under FS_LOCK and
     // gNetHold, with no live handles. Never provision or format the card.
-    bool powerSetupNeeded = true;
     bool railReady = false;
     for (unsigned attempt = 0; attempt < PMU_PERIPHERAL_ATTEMPTS; ++attempt) {
         if (attempt) delay(PMU_PERIPHERAL_RETRY_MS);
-        if (powerSetupNeeded &&
-            (!PMU.disableBLDO1() || !PMU.setBLDO1Voltage(3300) || !PMU.enableBLDO1())) {
-            Serial.println("WARNING: microSD power setup failed (BLDO1 must be 3.3 V before enable).");
-            powerOffSdRail();
-            return false;
-        }
+        PMU.disableBLDO1();
+        PMU.setBLDO1Voltage(3300);
+        // Verify the voltage before enabling, even when the write failed.
+        if (!pmu_read::bldo1VoltageReady(PMU.readRegister(XPOWERS_AXP2101_LDO_VOL4_CTRL)))
+            continue;
+        PMU.enableBLDO1();
         const int control = PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
         const int voltage = PMU.readRegister(XPOWERS_AXP2101_LDO_VOL4_CTRL);
         railReady = pmu_read::bldo1Ready(control, voltage);
         if (railReady) break;
-        // Unreadable registers can recover with a re-read. A confirmed
-        // mismatch needs the full off, set voltage, and enable sequence.
-        powerSetupNeeded = control >= 0 && voltage >= 0;
     }
     if (!railReady) {
-        powerOffSdRail();
-        Serial.println("WARNING: microSD card power rail (BLDO1) could not be verified on at 3.3 V; skipping mount.");
+        const bool railOff = powerOffSdRail(/*warnOnFailure=*/false);
+        Serial.printf("WARNING: microSD card power rail (BLDO1) could not be verified on at 3.3 V; "
+                      "skipping mount%s.\n", railOff ? "" : "; power-off unconfirmed");
         return false;
     }
     pinMode(IMU_CS, OUTPUT);
@@ -3628,7 +3626,8 @@ static bool configureGpsRail() {
         const int voltage = PMU.readRegister(XPOWERS_AXP2101_LDO_VOL3_CTRL);
         if (pmu_read::aldo4Ready(control, voltage)) return true;
     }
-    Serial.println("WARNING: GPS rail (ALDO4) 3.3 V/on setup unconfirmed after 3 attempts.");
+    Serial.printf("WARNING: GPS rail (ALDO4) 3.3 V/on setup unconfirmed after %u attempts.\n",
+                  PMU_PERIPHERAL_ATTEMPTS);
     return false;
 }
 
@@ -3641,7 +3640,8 @@ static bool configurePmuMeasurements() {
         const int adc = PMU.readRegister(XPOWERS_AXP2101_ADC_CHANNEL_CTRL);
         if (pmu_read::pmuMeasurementsReady(adc)) return true;
     }
-    Serial.println("WARNING: PMU temperature/VBUS/system voltage measurement setup unconfirmed after 3 attempts.");
+    Serial.printf("WARNING: PMU temperature/VBUS/system voltage measurement setup unconfirmed after %u attempts.\n",
+                  PMU_PERIPHERAL_ATTEMPTS);
     return false;
 }
 
@@ -3773,7 +3773,7 @@ void setup() {
     // Supreme GPS backup RAM comes straight from the 18650. LilyGO also
     // disables VBACKUP; a 60 s ALDO4-off test hot-started in 2.0 s with it off.
     bool vbackupOff = false;
-    for (int attempt = 0; attempt < 3; ++attempt) {
+    for (unsigned attempt = 0; attempt < PMU_PERIPHERAL_ATTEMPTS; ++attempt) {
         if (attempt) delay(PMU_PERIPHERAL_RETRY_MS);
         PMU.disableButtonBatteryCharge();
         vbackupOff = pmu_read::vbackupOff(PMU.readRegister(XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL));
@@ -3796,9 +3796,11 @@ void setup() {
     printStartupWatchdog();
     printPmuStartup(gPmuStartup);
     if (!batterySetup.detection)
-        Serial.println("WARNING: PMU battery detection enable unconfirmed after 3 attempts.");
+        Serial.printf("WARNING: PMU battery detection enable unconfirmed after %u attempts.\n",
+                      PMU_PERIPHERAL_ATTEMPTS);
     if (!batterySetup.voltage)
-        Serial.println("WARNING: PMU battery voltage measurement enable unconfirmed after 3 attempts.");
+        Serial.printf("WARNING: PMU battery voltage measurement enable unconfirmed after %u attempts.\n",
+                      PMU_PERIPHERAL_ATTEMPTS);
     if (aldo1Warning)
         Serial.println("WARNING: ALDO1 3.3 V/on setup unconfirmed; OLED/BME280/magnetometer may be unavailable.");
     if (!gEarlyChargeDisabled) {
@@ -3817,9 +3819,11 @@ void setup() {
     // input and the probe does not give TS control of charging.
     const bool tsReady = gEarlyChargeDisabled && configureTsFixedInput();
     if (!tsReady) {
-        Serial.println(gEarlyChargeDisabled
-            ? "WARNING: PMU TS fixed-input setup unconfirmed after 3 attempts."
-            : "WARNING: PMU TS fixed-input setup skipped because charger pause is unconfirmed.");
+        if (gEarlyChargeDisabled)
+            Serial.printf("WARNING: PMU TS fixed-input setup unconfirmed after %u attempts.\n",
+                          PMU_PERIPHERAL_ATTEMPTS);
+        else
+            Serial.println("WARNING: PMU TS fixed-input setup skipped because charger pause is unconfirmed.");
     }
     gRtc.printBootStatus();
     Serial.printf("%sLoRa rail (ALDO3) verified off; SD rail (BLDO1) %s; VBACKUP %s.\n",
