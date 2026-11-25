@@ -861,8 +861,10 @@ recording's final timestamp (`recorded_until`). Older summaries fall back to
 `end_time` (last movement), never upload time. Both GPX files and reliable
 start/device information are required. An unreadable summary blocks merging
 only if its device is unknown or it could be an intervening trip from this
-device; repair that summary first. A folder warning also blocks suggestions
-until the folder is fixed. The trip page explains the block.
+device; repair that summary first. A folder problem that leaves trips
+unreadable also blocks suggestions until the folder is fixed. When two saved
+month names point to the same folder, healthy trips under the name in use can
+still have suggestions. The trip page explains any block.
 You can repeat the action to build a chain. The merged trip replaces its parts
 in the list, map, CSV/XLSX exports and totals. Old part links lead to it.
 Export records remain traceable: `trip_id` is the first source trip ID and
@@ -2916,8 +2918,10 @@ merge's name is back in use.
 
 The year review lists each unused-name merge separately, with its saved miles,
 purpose and month name. These are excluded from totals; its parts count separately.
-Closing its saved-summary year and every year containing a part is refused
-until the name is restored or the admin uses **Undo saved merge**. An unknown saved year blocks every year;
+Closing its saved-summary year, or any year with counted mileage from a
+replacement part, is refused until the name is restored or the admin uses
+**Undo saved merge**. A part that crosses New Year blocks each year it has
+counted mileage in, which can be both. An unknown saved year blocks every year;
 reopening stays possible. It adds no unreadable-file count.
 Saved removals under an unused name are not applied, like annotations under
 that name, so the parts of a formerly removed merge count again. Its saved
