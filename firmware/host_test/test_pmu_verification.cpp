@@ -300,7 +300,7 @@ int main() {
         constexpr auto sdVoltageReg = XPOWERS_AXP2101_LDO_VOL4_CTRL;
         std::vector<uint32_t> readTimes;
         PMU.onRegisterRead = [&](uint8_t readReg) {
-            if (readReg != sdVoltageReg) return;
+            if (readReg != sdVoltageReg || !calls("setBLDO1Voltage")) return;
             if (!PMU.bldo1) {
                 PMU.registerReadOverride.erase(readReg);
                 return;
