@@ -79,6 +79,42 @@ int main() {
         ++cases;
     }
 
+    assert(pmu_read::bldo1Off(0x00) && pmu_read::bldo1Off(0x09));
+    assert(!pmu_read::bldo1Off(0x10) && !pmu_read::bldo1Off(0x19));
+    assert(!pmu_read::bldo1Off(-1));
+
+    // Exercise real degraded SD cleanup with consecutive PMU faults.
+    enum class SdOffFault { None, TransientWrite, PersistentWrite, Unreadable };
+    constexpr auto reg = XPOWERS_AXP2101_LDO_ONOFF_CTRL0;
+    for (auto [fault, attempts] : {std::pair{SdOffFault::None, 1u},
+                                   std::pair{SdOffFault::TransientWrite, 2u},
+                                   std::pair{SdOffFault::PersistentWrite, 3u},
+                                   std::pair{SdOffFault::Unreadable, 3u}}) {
+        pmuWorld(); // mounted SD with BLDO1 enabled
+        PMU.bldo1Mv = 3300;
+        const auto reads = PMU.registerReadCalls[reg];
+        const auto disables = calls("disableBLDO1");
+        PMU.failSdDisable = fault == SdOffFault::TransientWrite || fault == SdOffFault::PersistentWrite;
+        if (fault == SdOffFault::TransientWrite) {
+            PMU.onRegisterRead = [](uint8_t readReg) {
+                if (readReg == reg && PMU.bldo1) PMU.failSdDisable = false;
+            };
+        }
+        if (fault == SdOffFault::Unreadable) PMU.registerReadOverride[reg] = -1;
+        g_delayHook = [](uint32_t ms) { g_millis += ms; };
+        const auto start = millis();
+        unmountDegradedSd();
+        g_delayHook = nullptr;
+        assert(!gSdMounted && !g_sdDisk.mounted);
+        assert(PMU.bldo1 == (fault == SdOffFault::PersistentWrite));
+        assert(calls("disableBLDO1") == disables + attempts);
+        assert(PMU.registerReadCalls[reg] == reads + attempts);
+        assert(millis() - start == SD_POWER_OFF_SETTLE_MS + (attempts - 1) * PMU_PERIPHERAL_RETRY_MS);
+        assert(logCount("microSD card power rail (BLDO1) off unconfirmed after 3 attempts") ==
+               (attempts == 3 ? 1 : 0));
+        ++cases;
+    }
+
     // With neither store mounted, the E2010 raise joins the storage faults in RAM.
     pmuWorld();
     SD.cardPresent = false;

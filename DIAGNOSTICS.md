@@ -1271,9 +1271,10 @@ the uploader may still hold an open file: core 1 skips the journal handoff and
 E2009, takes FS_LOCK and leaves both filesystems mounted, holding the lock
 through power-off. No diagnostic I/O can reach unmounted media. A cancelled or
 failed forced shutdown restarts the tracker instead of resuming. A cancelled or
-failed clean shutdown remounts the stores that were usable before it (a card
-already taken out of use after a failed capacity query stays out, powered off)
-and invalidates journal caches while retaining the boot identity and RAM queue.
+failed clean shutdown remounts the stores that were usable before it and
+invalidates journal caches while retaining the boot identity and RAM queue.
+A card taken out of use after a failed capacity query stays out of use, and
+the tracker attempts to switch its rail off.
 RAM-only history is lost on reset/power-off. Hardware tests must measure
 individual VFS operation latency and trip-write delay, plus induced failures
 during sealing and remount.
@@ -1640,10 +1641,12 @@ unchanged; degraded probes explicitly disable that provisioning.
   the BLDO1-off / 3.3 V / enable ordering for SD, verify both settings
   before mounting, and never format.
   If startup cannot use a mounted card and enters this mode, it unmounts
-  the card, waits 500 ms, then turns BLDO1 off. The same sequence applies to
-  any card unmounted before or after a retry probe. If the card never mounts,
-  the tracker cuts SD power immediately. Flash mounted by
-  the probe is unmounted afterward, while an existing journal mount is kept.
+  the card, waits 500 ms, then attempts to turn BLDO1 off. The same sequence
+  applies to any card unmounted before or after a retry probe. If the card
+  never mounts, power-off starts without the settle delay. The tracker reads
+  back the rail state and prints a serial warning if it cannot confirm power-off
+  after three attempts. The tracker unmounts flash that the probe mounted
+  and keeps any existing journal mount.
   During shutdown the degraded loop services the bounded
   journal seal itself, reports undurable RAM if necessary, then holds FS_LOCK
   through the final VBUS check and PMU shutdown. A returning/failed shutdown

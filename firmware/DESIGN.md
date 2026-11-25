@@ -422,7 +422,9 @@ rail and reads back the enable bit and voltage selection. On a mismatch
 or read failure it attempts to disable BLDO1 and skips the mount. The
 existing SD-unavailable path reports E4001 at startup.
 A card that mounts and then fails the FAT or trip-directory check stays
-powered for 500 ms after unmount. A failed mount cuts card power immediately.
+powered for 500 ms after unmount. If the card never mounts, power-off starts
+without the settle delay. Cleanup reads back BLDO1 after each disable attempt
+and prints a serial warning if power-off remains unconfirmed after three attempts.
 A failed capacity query disables SD recording and uploads until reboot.
 Two failed recording pieces without a clean close between them disable SD
 recording until reboot while leaving readable trips eligible for upload.

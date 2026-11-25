@@ -1795,6 +1795,7 @@ static void serviceVbusRecheck() {
 static const char* const VBUS_UNREADABLE =
     "VBUS state unreadable -- staying awake instead of powering off.";
 
+static void powerOffSdRail();
 static bool mountSdStorage();
 
 static void powerOffForVbus(const char* reason = "idle_battery") {
@@ -1931,7 +1932,7 @@ static void powerOffForVbus(const char* reason = "idle_battery") {
         remounted = mountSdStorage();
     } else if (gSdMounted) {
         gSdSpi.end();
-        PMU.disableBLDO1();
+        powerOffSdRail();
         gSdMounted = false;
     }
     if (gFlashMounted) remounted = LittleFS.begin(false, "/littlefs", 10, TRIP_PARTITION_LABEL) && remounted;
@@ -3097,19 +3098,33 @@ static bool prepareTripDirectory(fs::FS& storage) {
     return ready;
 }
 
+static constexpr unsigned PMU_PERIPHERAL_ATTEMPTS = 3;
+// An estimated pause to ride out transient I2C failures, not a measured timing requirement.
+static constexpr uint32_t PMU_PERIPHERAL_RETRY_MS = 10;
+
+static void powerOffSdRail() {
+    for (unsigned attempt = 0; attempt < PMU_PERIPHERAL_ATTEMPTS; ++attempt) {
+        if (attempt) delay(PMU_PERIPHERAL_RETRY_MS);
+        PMU.disableBLDO1();
+        // Read-back is authoritative even if the command reported failure.
+        if (pmu_read::bldo1Off(PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0))) return;
+    }
+    Serial.println("WARNING: microSD card power rail (BLDO1) off unconfirmed after 3 attempts.");
+}
+
 static bool mountSdStorage() {
     if (gStartupWatchdog.skipCard()) return false;
     // Also used for cancelled/failed shutdown recovery, under FS_LOCK and
     // gNetHold, with no live handles. Never provision or format the card.
     if (!PMU.disableBLDO1() || !PMU.setBLDO1Voltage(3300) || !PMU.enableBLDO1()) {
         Serial.println("WARNING: microSD power setup failed (BLDO1 must be 3.3 V before enable).");
-        PMU.disableBLDO1();
+        powerOffSdRail();
         return false;
     }
     const int control = PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
     const int voltage = PMU.readRegister(XPOWERS_AXP2101_LDO_VOL4_CTRL);
     if (!pmu_read::bldo1Ready(control, voltage)) {
-        PMU.disableBLDO1();
+        powerOffSdRail();
         Serial.println("WARNING: microSD card power rail (BLDO1) could not be verified on at 3.3 V; skipping mount.");
         return false;
     }
@@ -3140,7 +3155,7 @@ static bool mountSdStorage() {
     SD.end();
     gSdSpi.end();
     if (mounted) vTaskDelay(pdMS_TO_TICKS(SD_POWER_OFF_SETTLE_MS));
-    PMU.disableBLDO1();
+    powerOffSdRail();
     return false;
 }
 
@@ -3479,7 +3494,7 @@ static void unmountDegradedSd() {
     gSdSpi.end();
     gSdMounted = false;
     vTaskDelay(pdMS_TO_TICKS(SD_POWER_OFF_SETTLE_MS));
-    PMU.disableBLDO1();
+    powerOffSdRail();
 }
 
 static void enterDegraded(startup::Mode mode) {
@@ -3587,10 +3602,6 @@ static void degradedLoop() {
     }
     delay(20); // yield even without UART, display or network activity
 }
-
-static constexpr unsigned PMU_PERIPHERAL_ATTEMPTS = 3;
-// An estimated pause to ride out transient I2C failures, not a measured timing requirement.
-static constexpr uint32_t PMU_PERIPHERAL_RETRY_MS = 10;
 
 static bool configureGpsRail() {
     for (unsigned attempt = 0; attempt < PMU_PERIPHERAL_ATTEMPTS; ++attempt) {
