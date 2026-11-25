@@ -674,8 +674,10 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   `REMOTE_PRUNE=yes` uses rsync deletion limited to selected snapshot names,
   never the remote root, and refuses with a warning when the remote has snapshots
   newer than or missing from the local set. rsync has a
-  600 s I/O timeout, the unit 6 h. Restore saves a corrupt live DB's raw files
-  in the pre-restore folder and continues; its scratch is under `$BACKUP_DIR`.
+  600 s I/O timeout, the unit 6 h. Each restore gets its own pre-restore folder
+  and saves only the live DBs and trip files the snapshot replaces; a corrupt
+  live DB it replaces keeps its raw files there. A DB missing from the snapshot
+  is left unchanged and reported. Scratch is under `$BACKUP_DIR`.
 - Port binding: `BIND_ADDR` in `.env` sets the host IP published ports bind
   on (unset = all interfaces). Optional `VIEWER_BIND_ADDR` overrides only
   viewer port 8091 (empty falls back to BIND_ADDR, then all interfaces);
