@@ -144,7 +144,8 @@ int main() {
             displayBegan = true;
             const std::vector<std::string> expected = {
                 "begin", "disableALDO3", "readRegister", "disableCellbatteryCharge", "readRegister",
-                "enableBattDetection", "enableBattVoltageMeasure", "readRegister", "readRegister",
+                "enableBattDetection", "readRegister", "enableBattVoltageMeasure", "readRegister",
+                "readRegister", "readRegister",
                 "setALDO1Voltage", "enableALDO1", "readRegister", "readRegister"
             };
             assert(PMU.operations == expected);

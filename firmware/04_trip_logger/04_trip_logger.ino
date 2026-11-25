@@ -3631,6 +3631,30 @@ static bool configurePmuMeasurements() {
     return false;
 }
 
+struct BatterySetup {
+    bool detection = false;
+    bool voltage = false;
+};
+
+static BatterySetup configureBatteryMeasurements() {
+    BatterySetup ready;
+    for (unsigned attempt = 0; attempt < PMU_PERIPHERAL_ATTEMPTS; ++attempt) {
+        if (attempt) delay(PMU_PERIPHERAL_RETRY_MS);
+        if (!ready.detection) {
+            PMU.enableBattDetection();
+            ready.detection = pmu_read::batteryDetectionEnabled(
+                PMU.readRegister(XPOWERS_AXP2101_BAT_DET_CTRL));
+        }
+        if (!ready.voltage) {
+            PMU.enableBattVoltageMeasure();
+            ready.voltage = pmu_read::batteryVoltageMeasureEnabled(
+                PMU.readRegister(XPOWERS_AXP2101_ADC_CHANNEL_CTRL));
+        }
+        if (ready.detection && ready.voltage) break;
+    }
+    return ready;
+}
+
 void setup() {
     // VBUS-insert power-on brings the Supreme's LoRa rail up ON. Disable
     // and verify it as the first PMU operation after bounded bus recovery
@@ -3647,6 +3671,7 @@ void setup() {
     saveStartupWatchdog();
     armLoopWatchdog(startup_watchdog::STARTUP_WDT_TIMEOUT_MS, false);
     bool aldo1Warning = false;
+    BatterySetup batterySetup;
     gEarlyChargeDisabled = true;
     gEarlyChargeTimeoutPending = false;
     gBootBattery = diagnostics::BatterySample();
@@ -3654,8 +3679,7 @@ void setup() {
         // Stop retained charging before display/USB/storage waits. Only trusted
         // PMU startup may do this; degraded power modes retain their policy.
         gEarlyChargeDisabled = disableChargeVerified(CHG_STARTUP_ATTEMPTS);
-        PMU.enableBattDetection();
-        PMU.enableBattVoltageMeasure();
+        batterySetup = configureBatteryMeasurements();
         // ALDO1 supplies the OLED/BME280/magnetometer and Wire pull-ups.
         int aldo1Control = PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
         int aldo1Voltage = PMU.readRegister(XPOWERS_AXP2101_LDO_VOL0_CTRL);
@@ -3732,6 +3756,10 @@ void setup() {
     Serial.printf("Firmware: %s\n", firmware::kVersion);
     printStartupWatchdog();
     printPmuStartup(gPmuStartup);
+    if (!batterySetup.detection)
+        Serial.println("WARNING: PMU battery detection enable unconfirmed after 3 attempts.");
+    if (!batterySetup.voltage)
+        Serial.println("WARNING: PMU battery voltage measurement enable unconfirmed after 3 attempts.");
     if (aldo1Warning)
         Serial.println("WARNING: ALDO1 3.3 V/on setup unconfirmed; OLED/BME280/magnetometer may be unavailable.");
     if (!gEarlyChargeDisabled) {
@@ -3769,7 +3797,8 @@ void setup() {
     // Enable the measurements the battery/VBUS predicates and the charge
     // temperature guard rely on.
     const bool measurementsReady = configurePmuMeasurements();
-    const bool pmuPeripheralWarning = !gpsRailReady || !measurementsReady;
+    const bool pmuPeripheralWarning = !gpsRailReady || !measurementsReady ||
+                                      !batterySetup.detection || !batterySetup.voltage;
     setupPmuIrq();
     // Seed VBUS state from hardware: a battery-only boot (e.g. wake via
     // power key away from the car) must still hit the idle power-off timer.

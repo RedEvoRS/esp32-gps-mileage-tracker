@@ -346,8 +346,8 @@
       "oled": [
         "PMU setup unverified"
       ],
-      "title": "GPS power or PMU measurements unverified",
-      "explanation": "At startup, the power chip did not confirm the GPS rail or its temperature, USB voltage, and system voltage measurement settings. The tracker continues starting up.",
+      "title": "GPS power or PMU settings unverified",
+      "explanation": "At startup, the power chip did not confirm the GPS rail, battery detection, or its battery voltage, temperature, USB voltage, and system voltage measurement settings. The tracker continues starting up.",
       "recovery": "Restart the tracker and check its serial startup messages. If the warning returns, inspect the power chip and its I2C connection.",
       "context": {},
       "notify": true,

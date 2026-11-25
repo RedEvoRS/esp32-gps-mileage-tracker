@@ -208,9 +208,10 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   ALDO1 = OLED/BME280/magnetometer (Stage 4 sets 3.3 V). Never
   run V1.2 rail code on the Supreme. **ALDO3 comes up ON after a USB-power
   power-on**, so firmware switches it off first thing after `PMU.begin()`
-- Stage 4 checks ALDO4 enable and 3.3 V selection plus the temperature, VBUS
-  voltage and system voltage measurement enables. It tries each group up to
-  three times, then reports E2010 and continues startup if either is unverified.
+- Stage 4 checks ALDO4 enable and 3.3 V selection, battery detection, and the
+  battery voltage, temperature, VBUS voltage and system voltage measurement
+  enables. It tries each setting up to three times, reports E2010 for
+  unverified settings and continues startup.
 - PMU (0x34) and PCF8563 RTC (0x51) share `Wire1`, SDA 42 / SCL 41. OLED and
   BME280 are on `Wire`, SDA 17 / SCL 18
 - RTC: read at boot to anchor diagnostic timestamps only, never GPX;

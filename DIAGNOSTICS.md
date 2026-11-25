@@ -678,8 +678,8 @@ so affected records may be lost. The upgrade requires no database
 migration or new service dependency.
 
 Catalog v8 adds **2010 PMU_PERIPHERAL_SETUP_FAILED**, a warning when the
-GPS rail or PMU measurement settings cannot be verified at startup. Deploy
-server **v1.25** before firmware **v1.10** so ingest, viewer and monitor
+GPS rail, battery detection, or PMU measurement settings cannot be verified
+at startup. Deploy server **v1.25** before firmware **v1.10** so ingest, viewer and monitor
 recognize E2010. Protocol/schema v1 is unchanged.
 
 ### Protocol v1 (#117 contract, #118 and #125 integration)
@@ -1433,7 +1433,7 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E2005 | Plausible die requires a cold pause (die <=9 C); keeps requesting it below 14 C | Plausible die >=14 C or another measured pause reason; describes required pause even if control is unconfirmed | `temperature_mc` = measured PMU die |
 | E2006 | Non-finite or implausible die sample; first ten seconds of first-reading retries are silent | Plausible sample; hot/cold conditions are not cleared by an unreadable sample | none |
 | E2008 | Three consecutive runtime charger command/read-back failures (30 s apart), startup charger disable still unconfirmed after its 5 s bounded retry window, or an unconfirmed 4.1 V charge target (blocking charging) | Checked 0x64 4.1 V target and 0x18 bit 1 read match the intended charger state (once startup charger disable is confirmed) | none |
-| E2010 | Startup cannot confirm the GPS rail is on at 3.3 V or that temperature, USB voltage and system voltage measurements are enabled after three attempts for the affected settings | A later startup verifies the GPS rail and all three measurement enables | none |
+| E2010 | Startup cannot confirm the GPS rail is on at 3.3 V, battery detection is enabled, or battery voltage, temperature, USB voltage and system voltage measurements are enabled after three attempts for the affected settings | A later startup verifies the GPS rail, battery detection and all four measurement enables | none |
 | E3001 | No checksum-valid NMEA for 10 s, starting at GPS configuration start | Next checksum-valid NMEA; noise/UBX/bad checksum do not recover it | `elapsed_ms` |
 | E3002 | No trusted fix (one meeting the NAV-PVT start accuracy limits, or any valid fix in RMC-only fallback) for 120 s while idle | Trusted fix; acquisition grace starts again after leaving a trip | `elapsed_ms`, `satellites` when measured |
 | E3003 | Matching checksum-checked VALSET NAK | One notice per rejected attempt, no active condition | `message_class=6`, `message_id=138` |

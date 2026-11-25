@@ -1646,6 +1646,9 @@ during a fix loss on the next drive. These checks still need the board.
 
 #### Expected boot log
 
+If startup cannot verify battery detection or battery voltage measurement,
+it names the setting in a serial warning and reports E2010.
+
 Illustrative; free space, attempt count and timing vary:
 
 ```text

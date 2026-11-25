@@ -540,6 +540,7 @@ constexpr uint8_t XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL = 0x18;
 constexpr uint8_t XPOWERS_AXP2101_STATUS1 = 0x00;
 constexpr uint8_t XPOWERS_AXP2101_STATUS2 = 0x01;
 constexpr uint8_t XPOWERS_AXP2101_ADC_CHANNEL_CTRL = 0x30;
+constexpr uint8_t XPOWERS_AXP2101_BAT_DET_CTRL = 0x68;
 constexpr uint8_t XPOWERS_AXP2101_LDO_ONOFF_CTRL0 = 0x90;
 constexpr uint8_t XPOWERS_AXP2101_LDO_VOL0_CTRL = 0x92;
 constexpr uint8_t XPOWERS_AXP2101_LDO_VOL3_CTRL = 0x95;
@@ -602,6 +603,7 @@ struct XPowersAXP2101 {
         if (registerReadOverride.count(reg)) return registerReadOverride[reg];
         if (reg == 0x50) return 0x10; // XPowersLib init: external TS, bias off
         if (reg == XPOWERS_AXP2101_ADC_CHANNEL_CTRL) return adcChannels;
+        if (reg == XPOWERS_AXP2101_BAT_DET_CTRL) return batteryDetection;
         if (reg == 0x36) return 0x04;
         if (reg == 0x37) return 0x00;
         if (reg == 0xa4) return batteryPercent;
@@ -642,6 +644,8 @@ struct XPowersAXP2101 {
     int aldo4Mv = 1800, bldo1Mv = 1800;
     unsigned failAldo4VoltageWrites = 0;
     uint8_t adcChannels = 0x1d; // existing non-TS ADC channels
+    bool batteryDetection = true;
+    unsigned failBatteryDetectionWrites = 0, failBatteryVoltageWrites = 0;
     bool failSdVoltage = false, failSdEnable = false, failSdDisable = false;
     uint32_t bldo1OffMs = 0;
     TwoWire* bus = nullptr;
@@ -722,7 +726,24 @@ struct XPowersAXP2101 {
     float getTemperature(uint16_t* = nullptr) { operations.push_back("getTemperature"); return dieC; }
     void enableCellbatteryCharge() { operations.push_back("enableCellbatteryCharge"); if (!failChargeEnable) chargeEnabled = true; }
     void disableCellbatteryCharge() { operations.push_back("disableCellbatteryCharge"); if (!failChargeDisable) chargeEnabled = false; }
-    void enableBattDetection() { operations.push_back("enableBattDetection");} void enableBattVoltageMeasure() { operations.push_back("enableBattVoltageMeasure");}
+    bool enableBattDetection() {
+        operations.push_back("enableBattDetection");
+        if (failBatteryDetectionWrites) {
+            --failBatteryDetectionWrites;
+            return false;
+        }
+        batteryDetection = true;
+        return true;
+    }
+    bool enableBattVoltageMeasure() {
+        operations.push_back("enableBattVoltageMeasure");
+        if (failBatteryVoltageWrites) {
+            --failBatteryVoltageWrites;
+            return false;
+        }
+        adcChannels |= 0x01;
+        return true;
+    }
     bool enableVbusVoltageMeasure() { operations.push_back("enableVbusVoltageMeasure"); adcChannels |= 0x04; return true; }
     bool enableSystemVoltageMeasure() { operations.push_back("enableSystemVoltageMeasure"); adcChannels |= 0x08; return true; }
     uint32_t enabledIrqs = 0;

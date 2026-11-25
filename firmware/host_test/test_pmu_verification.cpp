@@ -24,11 +24,13 @@ int main() {
     pmuWorld();
     PMU.failAldo4VoltageWrites = 1;
     PMU.adcChannels = 0x01;
-    failRead(XPOWERS_AXP2101_ADC_CHANNEL_CTRL);
     std::vector<uint32_t> gpsAttempts, adcAttempts;
     PMU.onRegisterRead = [&](uint8_t reg) {
         if (reg == XPOWERS_AXP2101_LDO_VOL3_CTRL) gpsAttempts.push_back(millis());
-        if (reg == XPOWERS_AXP2101_ADC_CHANNEL_CTRL) adcAttempts.push_back(millis());
+        if (reg == XPOWERS_AXP2101_ADC_CHANNEL_CTRL && calls("enableTemperatureMeasure")) {
+            if (adcAttempts.empty()) PMU.failRegisterReadAt[reg] = PMU.registerReadCalls[reg];
+            adcAttempts.push_back(millis());
+        }
     };
     g_delayHook = [](uint32_t ms) { g_millis += ms; };
     setup();
@@ -77,6 +79,56 @@ int main() {
         assert(warning.size() == 1 && codeRows(rows, 2001).empty());
         has(warning[0], "\"transition\":\"raise\"");
         ++cases;
+    }
+
+    for (int raw = 0; raw <= 0xFF; ++raw) {
+        assert(pmu_read::batteryDetectionEnabled(raw) == bool(raw & 1));
+        assert(pmu_read::batteryVoltageMeasureEnabled(raw) == bool(raw & 1));
+    }
+    assert(!pmu_read::batteryDetectionEnabled(-1));
+    assert(!pmu_read::batteryVoltageMeasureEnabled(-1));
+    ++cases;
+
+    enum class BatterySetupFault { TransientWrite, PersistentWrite, Unreadable };
+    for (bool detection : {true, false}) {
+        const auto reg = detection ? XPOWERS_AXP2101_BAT_DET_CTRL : XPOWERS_AXP2101_ADC_CHANNEL_CTRL;
+        const auto operation = detection ? "enableBattDetection" : "enableBattVoltageMeasure";
+        const auto warning = detection ? "PMU battery detection enable unconfirmed" :
+                                         "PMU battery voltage measurement enable unconfirmed";
+        for (auto [fault, attempts] : {std::pair{BatterySetupFault::TransientWrite, 2u},
+                                       std::pair{BatterySetupFault::PersistentWrite, 3u},
+                                       std::pair{BatterySetupFault::Unreadable, 3u}}) {
+            pmuWorld();
+            PMU.batteryDetection = false;
+            PMU.adcChannels &= ~0x01;
+            auto& failedWrites = detection ? PMU.failBatteryDetectionWrites : PMU.failBatteryVoltageWrites;
+            failedWrites = fault == BatterySetupFault::TransientWrite ? 1 :
+                           fault == BatterySetupFault::PersistentWrite ? attempts : 0;
+            std::vector<uint32_t> readTimes;
+            PMU.onRegisterRead = [&](uint8_t readReg) {
+                if (readReg != reg || readTimes.size() == calls(operation)) return;
+                readTimes.push_back(millis());
+                if (fault == BatterySetupFault::Unreadable)
+                    PMU.failRegisterReadAt[reg] = PMU.registerReadCalls[reg];
+            };
+            g_delayHook = [](uint32_t ms) { g_millis += ms; };
+            setup();
+            PMU.onRegisterRead = nullptr;
+            g_delayHook = nullptr;
+            assert(calls(operation) == attempts && readTimes.size() == attempts);
+            assert(calls(detection ? "enableBattVoltageMeasure" : "enableBattDetection") == 1);
+            for (unsigned i = 1; i < attempts; ++i)
+                assert(readTimes[i] - readTimes[i - 1] == PMU_PERIPHERAL_RETRY_MS);
+            assert((detection ? PMU.batteryDetection : bool(PMU.adcChannels & 1)) ==
+                   (fault != BatterySetupFault::PersistentWrite));
+            const bool confirmed = fault == BatterySetupFault::TransientWrite;
+            assert(logCount(warning) == int(!confirmed));
+            assert(gDegraded.mode() == startup::Mode::Normal && tripStoreAvailable(SD));
+            auto warnings = codeRows(bootRows(), 2010);
+            assert(warnings.size() == unsigned(!confirmed));
+            if (!confirmed) has(warnings[0], R"("transition":"raise")");
+            ++cases;
+        }
     }
 
     assert(pmu_read::bldo1Off(0x00) && pmu_read::bldo1Off(0x09));

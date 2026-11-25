@@ -115,6 +115,16 @@ inline bool bldo1Ready(int control, int voltage) {
     return (control & (1 << 4)) && 500 + (voltage & 0x1F) * 100 == 3300;
 }
 
+inline bool batteryDetectionEnabled(int detectionCtrl) {
+    // XPowersLib 0.3.3 enableBattDetection(): BAT_DET_CTRL (0x68) bit 0.
+    return detectionCtrl >= 0 && (detectionCtrl & 1) != 0;
+}
+
+inline bool batteryVoltageMeasureEnabled(int adcCtrl) {
+    // XPowersLib 0.3.3 enableBattVoltageMeasure(): ADC_CHANNEL_CTRL (0x30) bit 0.
+    return adcCtrl >= 0 && (adcCtrl & 1) != 0;
+}
+
 inline bool pmuMeasurementsReady(int adcCtrl) {
     if (adcCtrl < 0) return false;
     // XPowersLib 0.3.3: 0x30 bits 4, 3 and 2 enable die temperature,
