@@ -113,7 +113,9 @@ static void enrollEventRevision() {
         return;
     }
     bool prepared = gJournal.prepareStatusSequence();
-    if (gNetAbort.load() || (!prepared && !journalMayRun())) {
+    // Any deferred preload retries at the next snapshot; never enroll a store
+    // that was skipped only because core 1 briefly wanted the FS lock.
+    if (gNetAbort.load() || !prepared) {
         settings.end();
         return;
     }
