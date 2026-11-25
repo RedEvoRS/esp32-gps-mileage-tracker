@@ -452,7 +452,7 @@ a card. Stage 4 has since recorded two real drives on the card.
   place to see the reason.
   See [how to recover the card](#if-the-trip-storage-wont-mount-later).
 - **At boot** the log says which storage it chose:
-  - `Trip storage: microSD (29.72 GiB free); internal flash queue mounted.`
+  - `Trip storage: microSD (29.72 GiB free); internal flash queue ready.`
     Trips go to the card.
   - `WARNING: no microSD card or mount failed -- check power/wiring and FAT32 (exFAT unsupported); card never formatted.`
     followed by
@@ -1883,7 +1883,7 @@ Serial Monitor can itself restart the board, so messages may show twice.
 Do this before a test drive, not during a trip.
 
 1. After flashing, look for these lines:
-   - `Trip storage: microSD (... GiB free); internal flash queue mounted.`
+   - `Trip storage: microSD (... GiB free); internal flash queue ready.`
      Trips go to the card (the free-space figure depends on your card). If it says `WARNING: microSD unavailable -- using
      internal flash`, the card didn't mount: unplug USB and switch off using
      the [card precautions](#microsd-card), check it's FAT32 and seated, and
