@@ -621,7 +621,8 @@ struct XPowersAXP2101 {
         if (reg == XPOWERS_AXP2101_LOW_BAT_WARN_SET) return (lowWarnNibble << 4) | criticalPercent;
         if (reg == XPOWERS_AXP2101_CV_CHG_VOL_SET) return failChargeTargetRead ? -1 : chgVol;
         assert(reg == XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL);
-        return failChargeRead ? -1 : chargeEnabled ? 0x02 : 0;
+        if (failChargeRead) return -1;
+        return (chargeEnabled ? 0x02 : 0) | (vbackup ? 0x04 : 0);
     }
     bool vbusIn = true, removeIrq = false, insertIrq = false;
     bool longPressIrq = false, shortPressIrq = false, criticalIrq = false, lowIrq = false;
@@ -633,6 +634,7 @@ struct XPowersAXP2101 {
     int shutdownCalls = 0;
     void (*onShutdown)() = nullptr;
     bool aldo3 = true, aldo4 = false, bldo1 = true, vbackup = true;
+    unsigned failVbackupDisableWrites = 0;
     bool aldo1 = true, failAldo1Voltage = false, failAldo1Enable = false;
     bool aldo1VoltageStuck = false, aldo1EnableStuck = false;
     int aldo1Mv = 1800;
@@ -696,7 +698,15 @@ struct XPowersAXP2101 {
         if (failSdEnable) return false;
         bldo1 = true; return true;
     }
-    void disableButtonBatteryCharge() { operations.push_back("disableButtonBatteryCharge"); vbackup = false; }
+    bool disableButtonBatteryCharge() {
+        operations.push_back("disableButtonBatteryCharge");
+        if (failVbackupDisableWrites) {
+            --failVbackupDisableWrites;
+            return false;
+        }
+        vbackup = false;
+        return true;
+    }
     uint8_t getPowerOnSource() { operations.push_back("getPowerOnSource"); return 0x04; }
     uint8_t getPowerOffSource() { operations.push_back("getPowerOffSource"); return 0x02; }
     uint8_t chgVol = 3;

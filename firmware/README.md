@@ -838,7 +838,7 @@ for all four trips, and stored each as `data/YYYY-MM/<trip>.gpx` plus
 11.40 mi on the board and 11.41 mi on the server.
 
 At boot it uses the [Supreme pins and rails](#supreme-pin-and-power-reference):
-it verifies LoRa power off first, checks SD power-off, switches VBACKUP off,
+it verifies LoRa power off first, checks that SD power and VBACKUP are off,
 and enables the GPS rail. Storage setup then powers and mounts the card. It
 selects SD first and attempts uploads from both mounted stores. If SD later
 stops responding, it can select the mounted internal flash queue between trips;
@@ -1650,7 +1650,7 @@ Illustrative; free space, attempt count and timing vary:
 
 ```text
 === Stage 4: Trip Logger ===
-LoRa rail (ALDO3) verified off; SD rail (BLDO1) verified off; VBACKUP off.
+LoRa rail (ALDO3) verified off; SD rail (BLDO1) verified off; VBACKUP verified off.
 PMU power-on source 0x04, power-off source 0x02.
 PMU ready, MAX-M10S GPS rail (ALDO4) verified on at 3.3 V, charge to 4.1 V. VBUS present.
 Trip storage: microSD (29.72 GiB free); internal flash queue ready.

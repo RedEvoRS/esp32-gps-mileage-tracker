@@ -13,6 +13,12 @@ inline ChargeState chargeState(int control) {
     return (control & (1 << 1)) ? ChargeState::Charging : ChargeState::Paused;
 }
 
+inline bool vbackupOff(int control) {
+    // XPowersLib 0.3.3 disableButtonBatteryCharge() and isEnableButtonBatteryCharge()
+    // use CHARGE_GAUGE_WDT_CTRL (0x18) bit 2.
+    return control >= 0 && (control & (1 << 2)) == 0;
+}
+
 inline bool chargeTargetMatches(int cvReg, uint8_t target) {
     if (cvReg < 0) return false;
     return (cvReg & 0x07) == (target & 0x07);

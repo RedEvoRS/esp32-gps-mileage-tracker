@@ -3709,7 +3709,13 @@ void setup() {
     const bool sdRailOff = powerOffSdRail(/*warnOnFailure=*/false);
     // Supreme GPS backup RAM comes straight from the 18650. LilyGO also
     // disables VBACKUP; a 60 s ALDO4-off test hot-started in 2.0 s with it off.
-    PMU.disableButtonBatteryCharge();
+    bool vbackupOff = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (attempt) delay(PMU_PERIPHERAL_RETRY_MS);
+        PMU.disableButtonBatteryCharge();
+        vbackupOff = pmu_read::vbackupOff(PMU.readRegister(XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL));
+        if (vbackupOff) break;
+    }
     // ALDO1 is set to 3.3 V above. Leave ALDO2 and DCDC4/DCDC5 as found.
     // Peripheral loads and PMU/RTC bus pull-up dependencies need proof
     // before disabling them.
@@ -3738,8 +3744,10 @@ void setup() {
         }
     }
     gRtc.printBootStatus();
-    Serial.printf("%sLoRa rail (ALDO3) verified off; SD rail (BLDO1) %s; VBACKUP off.\n",
-                  sdRailOff ? "" : "WARNING: ", sdRailOff ? "verified off" : "off unconfirmed");
+    Serial.printf("%sLoRa rail (ALDO3) verified off; SD rail (BLDO1) %s; VBACKUP %s.\n",
+                  sdRailOff && vbackupOff ? "" : "WARNING: ",
+                  sdRailOff ? "verified off" : "off unconfirmed",
+                  vbackupOff ? "verified off" : "off unconfirmed");
     Serial.printf("PMU power-on source 0x%02X, power-off source 0x%02X.\n",
                   (unsigned)PMU.getPowerOnSource(), (unsigned)PMU.getPowerOffSource());
 

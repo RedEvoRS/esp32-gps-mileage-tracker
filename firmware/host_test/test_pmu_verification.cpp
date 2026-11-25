@@ -83,6 +83,47 @@ int main() {
     assert(!pmu_read::bldo1Off(0x10) && !pmu_read::bldo1Off(0x19));
     assert(!pmu_read::bldo1Off(-1));
 
+    for (int control = 0; control <= 0xFF; ++control)
+        assert(pmu_read::vbackupOff(control) == ((control & 0x04) == 0));
+    assert(!pmu_read::vbackupOff(-1));
+    ++cases;
+
+    // Boot reports VBACKUP only after USB serial has had time to come up.
+    enum class VbackupFault { TransientWrite, PersistentWrite, Unreadable };
+    constexpr auto chargeReg = XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL;
+    for (auto [fault, attempts] : {std::pair{VbackupFault::TransientWrite, 2u},
+                                   std::pair{VbackupFault::PersistentWrite, 3u},
+                                   std::pair{VbackupFault::Unreadable, 3u}}) {
+        pmuWorld();
+        PMU.failVbackupDisableWrites = fault == VbackupFault::TransientWrite ? 1 :
+                                       fault == VbackupFault::PersistentWrite ? 3 : 0;
+        std::vector<uint32_t> readTimes;
+        PMU.onRegisterRead = [&](uint8_t reg) {
+            if (reg != chargeReg || readTimes.size() == calls("disableButtonBatteryCharge")) return;
+            readTimes.push_back(millis());
+            if (fault == VbackupFault::Unreadable)
+                PMU.failRegisterReadAt[reg] = PMU.registerReadCalls[reg];
+        };
+        g_delayHook = [](uint32_t ms) { g_millis += ms; };
+        setup();
+        g_delayHook = nullptr;
+        PMU.onRegisterRead = nullptr;
+        assert(calls("disableButtonBatteryCharge") == attempts && readTimes.size() == attempts);
+        for (unsigned i = 1; i < attempts; ++i)
+            assert(readTimes[i] - readTimes[i - 1] == PMU_PERIPHERAL_RETRY_MS);
+        assert(PMU.vbackup == (fault == VbackupFault::PersistentWrite));
+        const bool confirmed = fault == VbackupFault::TransientWrite;
+        assert(logCount("VBACKUP verified off") == int(confirmed));
+        assert(logCount("VBACKUP off unconfirmed") == int(!confirmed));
+        for (unsigned i = 0; i < Serial.log.size(); ++i) {
+            if (Serial.log[i].find("VBACKUP") == std::string::npos) continue;
+            assert(Serial.logMs[i] - Serial.beginMs >= 1000);
+            assert((Serial.log[i].find("WARNING: ") == 0) == !confirmed);
+        }
+        assert(gDegraded.mode() == startup::Mode::Normal && tripStoreAvailable(SD));
+        ++cases;
+    }
+
     // Exercise real degraded SD cleanup with consecutive PMU faults.
     enum class SdOffFault { None, TransientWrite, PersistentWrite, Unreadable };
     constexpr auto reg = XPOWERS_AXP2101_LDO_ONOFF_CTRL0;
