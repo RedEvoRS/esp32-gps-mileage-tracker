@@ -3118,14 +3118,25 @@ static bool mountSdStorage() {
     if (gStartupWatchdog.skipCard()) return false;
     // Also used for cancelled/failed shutdown recovery, under FS_LOCK and
     // gNetHold, with no live handles. Never provision or format the card.
-    if (!PMU.disableBLDO1() || !PMU.setBLDO1Voltage(3300) || !PMU.enableBLDO1()) {
-        Serial.println("WARNING: microSD power setup failed (BLDO1 must be 3.3 V before enable).");
-        powerOffSdRail();
-        return false;
+    bool powerSetupNeeded = true;
+    bool railReady = false;
+    for (unsigned attempt = 0; attempt < PMU_PERIPHERAL_ATTEMPTS; ++attempt) {
+        if (attempt) delay(PMU_PERIPHERAL_RETRY_MS);
+        if (powerSetupNeeded &&
+            (!PMU.disableBLDO1() || !PMU.setBLDO1Voltage(3300) || !PMU.enableBLDO1())) {
+            Serial.println("WARNING: microSD power setup failed (BLDO1 must be 3.3 V before enable).");
+            powerOffSdRail();
+            return false;
+        }
+        const int control = PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
+        const int voltage = PMU.readRegister(XPOWERS_AXP2101_LDO_VOL4_CTRL);
+        railReady = pmu_read::bldo1Ready(control, voltage);
+        if (railReady) break;
+        // Unreadable registers can recover with a re-read. A confirmed
+        // mismatch needs the full off, set voltage, and enable sequence.
+        powerSetupNeeded = control >= 0 && voltage >= 0;
     }
-    const int control = PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
-    const int voltage = PMU.readRegister(XPOWERS_AXP2101_LDO_VOL4_CTRL);
-    if (!pmu_read::bldo1Ready(control, voltage)) {
+    if (!railReady) {
         powerOffSdRail();
         Serial.println("WARNING: microSD card power rail (BLDO1) could not be verified on at 3.3 V; skipping mount.");
         return false;

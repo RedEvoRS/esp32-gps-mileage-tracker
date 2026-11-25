@@ -69,7 +69,10 @@ int main() {
         PMU.registerReadOverride[reg] = value;
         assert(!mountSdStorage());
         assert(SD.begins == 0 && !gSdSpi.started && !PMU.bldo1);
-        std::vector<std::string> expectedPowerEvents = {"BLDO1.off", "BLDO1.voltage", "BLDO1.on"};
+        assert(PMU.registerReadCalls[XPOWERS_AXP2101_LDO_VOL4_CTRL] == PMU_PERIPHERAL_ATTEMPTS);
+        std::vector<std::string> expectedPowerEvents;
+        for (unsigned attempt = 0; attempt < (value < 0 ? 1u : PMU_PERIPHERAL_ATTEMPTS); ++attempt)
+            expectedPowerEvents.insert(expectedPowerEvents.end(), {"BLDO1.off", "BLDO1.voltage", "BLDO1.on"});
         const bool unreadableControl = reg == XPOWERS_AXP2101_LDO_ONOFF_CTRL0 && value < 0;
         expectedPowerEvents.insert(expectedPowerEvents.end(), unreadableControl ? 3 : 1, "BLDO1.off");
         assert(g_powerEvents == expectedPowerEvents);
@@ -81,7 +84,7 @@ int main() {
     assert(mountSdStorage() && SD.begins == 1 && PMU.bldo1 && PMU.bldo1Mv == 3300);
     SD.end();
     gSdSpi.end();
-    std::puts("PASS BLDO1 read-back: four bad reads prevent mounting; healthy card mounts");
+    std::puts("PASS BLDO1 read-back: four persistent fault scenarios prevent mounting; healthy card mounts");
 
     // A successful begin requires a powered settle after end, even when
     // rejecting FAT or a directory the card reports missing after mkdir.

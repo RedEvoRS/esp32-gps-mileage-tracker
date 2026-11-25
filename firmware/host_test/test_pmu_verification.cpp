@@ -261,6 +261,35 @@ int main() {
         ++cases;
     }
 
+    // Pre-mount read failures re-read the rail. Confirmed mismatches
+    // repeat the power sequence. SPI starts only once the rail is verified.
+    for (int badRead : {-1, 27}) for (bool persistent : {false, true}) {
+        pmuWorld();
+        constexpr auto sdVoltageReg = XPOWERS_AXP2101_LDO_VOL4_CTRL;
+        std::vector<uint32_t> readTimes;
+        PMU.onRegisterRead = [&](uint8_t readReg) {
+            if (readReg != sdVoltageReg || !PMU.bldo1 || PMU.bldo1Mv != 3300) return;
+            assert(SD.begins == 0);
+            if (persistent || readTimes.empty()) PMU.registerReadOverride[readReg] = badRead;
+            else PMU.registerReadOverride.erase(readReg);
+            readTimes.push_back(millis());
+        };
+        g_delayHook = [](uint32_t ms) { g_millis += ms; };
+        setup();
+        g_delayHook = nullptr;
+        PMU.onRegisterRead = nullptr;
+        const unsigned attempts = persistent ? PMU_PERIPHERAL_ATTEMPTS : 2;
+        assert(readTimes.size() == attempts);
+        for (unsigned i = 1; i < attempts; ++i)
+            assert(readTimes[i] - readTimes[i - 1] == PMU_PERIPHERAL_RETRY_MS);
+        assert(calls("enableBLDO1") == (badRead < 0 ? 1u : attempts));
+        assert(SD.begins == (persistent ? 0 : 1) && PMU.bldo1 == !persistent);
+        assert(gTripFS == (persistent ? static_cast<fs::FS*>(&LittleFS) : static_cast<fs::FS*>(&SD)));
+        assert(logCount("microSD card power rail (BLDO1) could not be verified") == int(persistent));
+        assert(codeRows(bootRows(), 4001).size() == unsigned(persistent));
+        ++cases;
+    }
+
     // Exercise real degraded SD cleanup with consecutive PMU faults.
     enum class SdOffFault { None, TransientWrite, PersistentWrite, Unreadable };
     constexpr auto reg = XPOWERS_AXP2101_LDO_ONOFF_CTRL0;
