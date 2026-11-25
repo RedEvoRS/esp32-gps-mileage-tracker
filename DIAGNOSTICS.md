@@ -1405,7 +1405,7 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E2004 | Plausible die requires a hot pause (die >=54 C); keeps requesting it above 47 C | Plausible die <=47 C or another measured pause reason; describes required pause even if control is unconfirmed | `temperature_mc` = measured PMU die |
 | E2005 | Plausible die requires a cold pause (die <=9 C); keeps requesting it below 14 C | Plausible die >=14 C or another measured pause reason; describes required pause even if control is unconfirmed | `temperature_mc` = measured PMU die |
 | E2006 | Non-finite or implausible die sample; first ten seconds of first-reading retries are silent | Plausible sample; hot/cold conditions are not cleared by an unreadable sample | none |
-| E2008 | Three consecutive charger command/read-back failures, 30 s apart | Checked 0x18 bit 1 read matches the intended charger state | none |
+| E2008 | Three consecutive charger command/read-back failures (30 s apart), or an unconfirmed 4.1 V charge target (blocking charging) | Checked 0x64 4.1 V target and 0x18 bit 1 read match the intended charger state | none |
 | E3001 | No checksum-valid NMEA for 10 s, starting at GPS configuration start | Next checksum-valid NMEA; noise/UBX/bad checksum do not recover it | `elapsed_ms` |
 | E3002 | No trusted fix (one meeting the NAV-PVT start accuracy limits, or any valid fix in RMC-only fallback) for 120 s while idle | Trusted fix; acquisition grace starts again after leaving a trip | `elapsed_ms`, `satellites` when measured |
 | E3003 | Matching checksum-checked VALSET NAK | One notice per rejected attempt, no active condition | `message_class=6`, `message_id=138` |
@@ -1417,7 +1417,7 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E3009 | At 30 s MON-RF boundaries, valid AGC >=70% and fresh GSV (a complete group within 15 s) with zero satellites >=30 dBHz, continuously for >=120 s from the first suspect sample | One valid AGC <=50% sample **or** fresh GSV with at least one satellite >=30 dBHz; missing/stale/intermediate evidence resets the hold and retains an active warning | `agc_pct` (0-100) when MON-RF valid; `max_cno` (0-99) when GSV fresh |
 | E4001 | SD did not mount, or the selected SD trip store returns zero total capacity at runtime (failed filesystem query) | Successful SD mount on a later boot; runtime failure stays latched until reboot | none |
 | E4002 | LittleFS unavailable during no-storage degraded startup | RAM-only raise/repeat; retained as failed until restart discards the queue | none |
-| E4003 | Neither trip store is usable at startup | Only a normal boot with a mounted trip store observes healthy; successful degraded retry restarts without clearing | none |
+| E4003 | Neither trip store is usable at startup (including a boot SD capacity failure with flash unavailable), or the selected trip store becomes unavailable at runtime with no fallback | Only a normal boot with an available trip store (or switching to an available fallback store) observes healthy; successful degraded retry restarts without clearing | none |
 | E4004 | Available selected trip store has guarded free space <64 KiB start reserve | >=64 KiB on the selected store, or condition no longer applies because that store is unavailable | `backend`, `free_bytes` only when available |
 | E4005 | Available selected trip store has guarded free space <24 KiB stop reserve | >=24 KiB on the selected store, or condition no longer applies because that store is unavailable | `backend`, `free_bytes` only when available |
 | E4006 | Trip create/open, point commit or finalization fails | Next verified trip create/write/finalize or successful repair | `backend`, `operation=open\|write\|close` |
@@ -1448,32 +1448,41 @@ unmeasured and retried at the sampling cadence.
 
 IRQ batches require all three INTSTS1..3 raw reads to succeed. Any failed byte
 makes the entire batch unknown: no flag action (including power-off, battery
-alerts, VBUS handling or a short-press card) and no status clear. The pending
-retry survives without another falling edge and runs at most every 100 ms,
-including if more edges arrive while reads fail. Successful batches use the
-XPowersLib bit positions and the same enabled mask as IRQ setup, then clear as
-before. The production short-press display hook uses this verified batch too.
+alerts, VBUS handling or a short-press card) and no status clear. Successful
+batches clear only the bits read in that batch with checked INTSTS1..3 register
+writes before calling `powerOffForVbus()`, so a cancelled shutdown cannot wipe
+flags latched during shutdown preparation. Any failed clear write sets the
+pending retry flag, and an asserted active-low `PMU_IRQ_PIN` also triggers a
+rate-limited retry (at most every 100 ms) without another falling edge. A
+periodic 15 s VBUS check in `serviceVbusRecheck()` prevents a missed edge from
+leaving USB power state stale. The production short-press display hook uses
+this verified batch too.
 
 Plausible means finite and within -40 to 125 C. Before the first usable reading
 each boot, the guard commands/verifies charging off and retries once a second
 for ten seconds. There is no E2006 during that grace window. Expiry pauses
 charging with E2006 and returns to 30-second checks. A plausible hot reading
-still raises E2004 immediately. Invalid readings never drive or clear hot/cold
-conditions, carry temperature context or appear as real debug temperatures.
+still raises E2004 immediately. Invalid readings pause charging fail-safe
+without creating or clearing hot/cold hysteresis history, carrying temperature
+context or appearing as real debug temperatures.
 The first-reading retry has host tests only. Bench boots on 2026-11-10 (UTC)
 were USB resets whose first reading was already usable, so a start from fully
 off remains unchecked.
 
 The charge guard uses its existing die proxy and hysteresis; diagnostic context
-never presents that die reading as a measured cell temperature. Each enable/disable
-command in the normal temperature guard is followed by a checked CHARGE_GAUGE_WDT_CTRL (0x18)
-bit-1 read. State is confirmed paused, confirmed charging or unconfirmed. A
-mismatch or read failure leaves it unconfirmed, retains pause-request hysteresis
-and retries at the temperature cadence (one second during first-reading grace,
-otherwise 30 seconds). Only a matching read-back logs a
-confirmed pause/resume. E2008 stays active until confirmation; the first two
-unconfirmed attempts cannot manufacture recovery. The degraded PMU-untrusted
-mode retains its separate one-time best-effort disable/read-back policy.
+never presents that die reading as a measured cell temperature. Startup retries
+and reads back the early charger disable before storage setup, and verifies the
+4.1 V charge target in CV_CHG_VOL_SET (0x64). Each enable/disable command in
+the normal temperature guard is followed by a checked CHARGE_GAUGE_WDT_CTRL (0x18)
+bit-1 read, and charging is never enabled without a verified 4.1 V target. A
+target-voltage failure, enable/disable mismatch, or read failure leaves control
+unconfirmed (keeping charging off when 4.1 V is unverified), retains finite
+pause-request hysteresis and retries at the temperature cadence (one second
+during first-reading grace, otherwise 30 seconds). Only a matching read-back
+logs a confirmed pause/resume. E2008 stays active until both the 4.1 V target
+and intended charger state are confirmed; the first two runtime unconfirmed
+attempts cannot manufacture recovery. The degraded PMU-untrusted mode retains
+its separate one-time best-effort disable/read-back policy.
 
 E3009 checks for a loose or damaged active-antenna cable. On one Supreme/MAX-M10S
 and one antenna (2026-10-19), unplugging raised AGC to about 79% after a minute

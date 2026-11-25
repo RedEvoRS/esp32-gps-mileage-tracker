@@ -47,7 +47,7 @@ int main() {
 
     // The 40 ms BOOT debounce is time based, with eight 5 ms idle passes.
     idleWorld();
-    g_digitalReadHook = [](int) { return LOW; };
+    g_digitalReadHook = [](int pin) { return pin == DEBUG_BOOT_PIN ? LOW : HIGH; };
     for (unsigned i = 0; i < 7; ++i) loop();
     assert(!gBootButton.held(millis()));
     loop(); assert(gBootButton.held(millis()));

@@ -97,6 +97,8 @@ int main() {
     checkStorage();
     auto removed = events();
     assert(gSdUnavailable && codeRows(removed, 4001).size() == 1);
+    auto noStore = codeRows(removed, 4003);
+    assert(noStore.size() == 1 && noStore[0].find("\"transition\":\"raise\"") != std::string::npos);
     for (unsigned code : {4004, 4005}) {
         auto rows = codeRows(removed, code);
         assert(rows.size() == 1 && rows[0].find("\"transition\":\"clear\"") != std::string::npos);
@@ -111,9 +113,11 @@ int main() {
     auto repeated = events();
     auto sdRepeat = codeRows(repeated, 4001);
     assert(sdRepeat.size() == 1 && sdRepeat[0].find("\"transition\":\"repeat\"") != std::string::npos);
+    auto noStoreRepeat = codeRows(repeated, 4003);
+    assert(noStoreRepeat.size() == 1 && noStoreRepeat[0].find("\"transition\":\"repeat\"") != std::string::npos);
     noSpaceFaults(repeated);
     assert(SD.capacityQueries == queries && gTripFS == &SD);
-    std::puts("SD runtime: full readable card vs failed query, E4001 repeat, no false space faults passed");
+    std::puts("SD runtime: full readable card vs failed query, E4001/E4003 repeat, no false space faults passed");
 
     // Both physical removal and a present but unreadable card switch only to
     // the already-mounted flash queue, without formatting or remounting SD.
@@ -205,4 +209,64 @@ int main() {
     assert(!(Preferences::durable64["revstate"] & 5));
     assert(gJournal.stats().queued == 0 && g_sdDisk.files == journalSd && g_lockDepth == 0);
     std::puts("SD runtime: E4001 uploaded through LittleFS, cached SD authority gated, NVS SD stale bit persisted passed");
+
+    // Issue #812: boot-time SD capacity failure with LittleFS unavailable must enter
+    // NoStorage degraded mode, raise E4003 (not clear it), and skip fsck on SD.
+    {
+        resetWorld();
+        gSdUnavailable = false;
+        SD.capacityQueries = 0;
+        Preferences::durable64.clear();
+        for (auto& s : gLoopConditions) { auto code = s.code; s = {}; s.code = code; }
+        gLoopFaults.~RuntimeFaults();
+        new (&gLoopFaults) RuntimeFaults(gJournal, gLoopConditions, sizeof(gLoopConditions)/sizeof(gLoopConditions[0]));
+        g_millis = 1000; SD.cardPresent = true; g_disk.failMount = true;
+        const std::string torn = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n<trkpt";
+        g_sdDisk.files["/trips/torn.gpx"] = torn;
+        SD.onCapacity = [] { g_sdDisk.readsFail = true; };
+        setup();
+        SD.onCapacity = nullptr;
+        assert(gDegraded.mode() == startup::Mode::NoStorage);
+        assert(!gSdMounted && !gFlashMounted && !PMU.bldo1 && gSdUnavailable);
+        assert(g_sdDisk.files["/trips/torn.gpx"] == torn); // fsck did not touch failed SD
+        for (unsigned i = 0; i < kEventQueueSize && gJournal.stats().queued; ++i) serviceJournal();
+        auto rows = events();
+        auto e4003 = codeRows(rows, 4003);
+        assert(e4003.size() == 1 && e4003[0].find("\"transition\":\"raise\"") != std::string::npos);
+        assert(codeRows(rows, 4001).size() == 1 && codeRows(rows, 4002).size() == 1);
+    }
+    // Boot-time SD capacity failure with LittleFS mounted falls back cleanly to
+    // LittleFS, skips fsck on failed SD, repairs LittleFS, raises E4001, clears E4003.
+    {
+        resetWorld();
+        gSdUnavailable = false;
+        SD.capacityQueries = 0;
+        Preferences::durable64.clear();
+        for (auto& s : gLoopConditions) { auto code = s.code; s = {}; s.code = code; }
+        gLoopFaults.~RuntimeFaults();
+        new (&gLoopFaults) RuntimeFaults(gJournal, gLoopConditions, sizeof(gLoopConditions)/sizeof(gLoopConditions[0]));
+        g_millis = 1000; SD.cardPresent = true; g_disk.failMount = false;
+        const std::string torn = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n<trkpt";
+        g_sdDisk.files["/trips/torn.gpx"] = torn;
+        g_disk.files["/trips/flash_torn.gpx"] = torn;
+        SD.onCapacity = [] { g_sdDisk.readsFail = true; };
+        setup();
+        SD.onCapacity = nullptr;
+        assert(gDegraded.mode() == startup::Mode::Normal);
+        assert(!gSdMounted && gFlashMounted && gTripFS == &LittleFS && !PMU.bldo1 && gSdUnavailable);
+        assert(g_sdDisk.files["/trips/torn.gpx"] == torn); // fsck skipped failed SD
+        assert(g_disk.files["/trips/flash_torn.gpx"] ==
+               std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n" + GPX_EPILOGUE); // flash still repaired
+        for (unsigned i = 0; i < kEventQueueSize && gJournal.stats().queued; ++i) serviceJournal();
+        auto rows = events();
+        assert(codeRows(rows, 4001).size() == 1);
+        assert(codeRows(rows, 4003).empty());
+        RuntimeFaults::Observation obs[64]; size_t count = 0;
+        assert(gLoopFaults.snapshot(obs, 64, count));
+        const auto* noStorageObs = std::find_if(obs, obs + count, [](const auto& e) {
+            return e.code == static_cast<uint16_t>(Code::NO_RECORDING_STORAGE);
+        });
+        assert(noStorageObs != obs + count && noStorageObs->observed && !noStorageObs->episode);
+    }
+    std::puts("SD runtime: boot capacity failure enters NoStorage or falls back to LittleFS (#812) passed");
 }

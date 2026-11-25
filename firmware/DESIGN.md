@@ -278,9 +278,13 @@ checked on each fix; the watchdog starts at the last valid RMC and runs
 even without another fix. Neither requires cooldown to expire first.
 
 The power-management unit (PMU) supplies the USB bus-voltage (VBUS) state.
-`observeVbusChange()` and `confirmVbusOff()` require a ten-second loss and
-a fresh absent reading before ending a trip, preserving short drives and
-ignoring brief dips. Unknown readings never authorize power-off. The board
+`pollPmu()` clears only the INTSTS1..3 bits read in the current batch using
+checked register writes before calling `powerOffForVbus()`, retries failed
+clears or a steady active-low `PMU_IRQ_PIN` at 100 ms, and `serviceVbusRecheck()`
+periodically polls VBUS every 15 seconds so a missed edge cannot leave power
+state stale. `observeVbusChange()` and `confirmVbusOff()` require a ten-second
+loss and a fresh absent reading before ending a trip, preserving short drives
+and ignoring brief dips. Unknown readings never authorize power-off. The board
 then stays awake on battery for upload opportunities. After ten minutes
 idle on battery, `loop()` holds new network work and lets an upload drain
 within a deadline. `powerOffForVbus()` closes the trip, stops/aborts uploads,

@@ -1,4 +1,5 @@
 #include "../04_trip_logger/debug_temperature.h"
+#include "../04_trip_logger/charge_temperature.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -169,5 +170,19 @@ int main() {
         if (reg == 0x00 || reg == 0xa4) REQUIRE(bad.percent == -1);
         if (reg == 0x01) REQUIRE(bad.status2 == -1);
     }
-    std::printf("PASS temperature: %u checks (compensation, bounded I2C, TS setup/read failures)\n", checks);
+    // Issue #804: pure charge-guard decision pauses fail-safe on unreadable
+    // readings without mutating pauseRequested hysteresis history.
+    for (float bad : {NAN, INFINITY, -INFINITY, -40.01f, 125.01f, 385.7f}) {
+        auto d0 = charge_temperature::evaluate(bad, false, 54.0f, 47.0f, 9.0f, 14.0f);
+        REQUIRE(d0.pause && !d0.nextPauseRequested && d0.unreadable);
+        auto d1 = charge_temperature::evaluate(bad, true, 54.0f, 47.0f, 9.0f, 14.0f);
+        REQUIRE(d1.pause && d1.nextPauseRequested && d1.unreadable);
+    }
+    for (float deadband : {50.0f, 11.0f}) {
+        auto fresh = charge_temperature::evaluate(deadband, false, 54.0f, 47.0f, 9.0f, 14.0f);
+        REQUIRE(!fresh.pause && !fresh.nextPauseRequested && !fresh.unreadable);
+        auto latched = charge_temperature::evaluate(deadband, true, 54.0f, 47.0f, 9.0f, 14.0f);
+        REQUIRE(latched.pause && latched.nextPauseRequested && !latched.unreadable);
+    }
+    std::printf("PASS temperature: %u checks (compensation, bounded I2C, TS setup/read failures, charge hysteresis)\n", checks);
 }
