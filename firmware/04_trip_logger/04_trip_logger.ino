@@ -3636,6 +3636,9 @@ struct BatterySetup {
     bool voltage = false;
 };
 
+// Keep Arduino from generating a prototype before BatterySetup is defined.
+static BatterySetup configureBatteryMeasurements();
+
 static BatterySetup configureBatteryMeasurements() {
     BatterySetup ready;
     for (unsigned attempt = 0; attempt < PMU_PERIPHERAL_ATTEMPTS; ++attempt) {
