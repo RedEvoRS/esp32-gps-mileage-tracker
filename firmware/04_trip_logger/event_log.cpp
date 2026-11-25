@@ -808,12 +808,15 @@ bool EventLog::writeRevisionState(uint64_t state) {
     }
     return true;
 }
-bool EventLog::revisionStores(uint8_t& mounted, uint64_t& highest) {
+bool EventLog::revisionStores(uint8_t& mounted, uint64_t& highest, bool loadedOnly) {
     mounted = 0; highest = revisionFloor_;
     for (unsigned i = 0; i < 2; ++i) {
         auto& store = stores_[i];
         if (!store.fs) continue; // mounted stores are fixed before consumers start
-        if (!load(store)) { fail(store); continue; }
+        if (loadedOnly ? !store.loaded : !load(store)) {
+            if (!loadedOnly) fail(store);
+            continue;
+        }
         mounted |= 2u << i;
         highest = std::max(highest, store.meta.revision);
         revisionEpochFloor_ = std::max(revisionEpochFloor_, store.meta.revisionEpoch);
@@ -824,9 +827,21 @@ uint64_t EventLog::minimumStatusSequence() {
     uint8_t mounted; uint64_t highest;
     revisionStores(mounted, highest); return highest;
 }
-bool EventLog::restoreStatusSequence(uint64_t highWater) {
+bool EventLog::prepareStatusSequence() {
+    if (!begun_) return false;
+    bool deferred = false;
+    for (auto& store : stores_) {
+        if (!store.fs || store.loaded) continue;
+        if (!load(store)) {
+            if (store.fs->deferred()) deferred = true;
+            else fail(store);
+        }
+    }
+    return !deferred;
+}
+bool EventLog::restoreStatusSequence(uint64_t highWater, bool loadedOnly) {
     uint8_t mounted; uint64_t highest, state;
-    if (!begun_ || highWater > kMaxEventInteger || !revisionStores(mounted, highest) ||
+    if (!begun_ || highWater > kMaxEventInteger || !revisionStores(mounted, highest, loadedOnly) ||
         highWater < highest || !readRevisionState(state, mounted, false)) return false;
     uint64_t epoch = std::max(state & ~uint64_t(7), revisionEpochFloor_);
     if (epoch > kMaxEventInteger - 8) return false;

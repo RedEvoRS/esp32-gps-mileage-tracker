@@ -174,7 +174,8 @@ public:
     // wear-levelled LittleFS; no revision writes per producer scan/event.
     // Enrollment must supply >= server high-water AND minimumStatusSequence().
     uint64_t minimumStatusSequence(); // read-only, includes every loaded store
-    bool restoreStatusSequence(uint64_t highWater);
+    bool prepareStatusSequence(); // preload mounted stores with normal cancellation; false if deferred
+    bool restoreStatusSequence(uint64_t highWater, bool loadedOnly = false);
     bool allocateStatusSequence(uint64_t& sequence);
     bool suspendStatusSequence(); // explicit recovery required after snapshot conflict
 
@@ -243,7 +244,7 @@ private:
     void invalidateStore(Store& store);
     uint64_t allocated(const Store& store, uint32_t bytes) const;
     bool save(Store& store, Meta next);
-    bool revisionStores(uint8_t& mounted, uint64_t& highest);
+    bool revisionStores(uint8_t& mounted, uint64_t& highest, bool loadedOnly = false);
     bool readRevisionState(uint64_t& state, uint8_t loaded, bool adopt = true);
     bool writeRevisionState(uint64_t state);
     bool append(Store& store, const Frame& frame);
