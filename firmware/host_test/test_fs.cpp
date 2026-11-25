@@ -1485,9 +1485,13 @@ int main(int argc, char** argv) {
             CHECK(PMU.bus == &Wire1 && Wire1.sda == 42 && Wire1.scl == 41 &&
                   Wire.begins == 1,
                   "PMU uses only Wire1 on SDA 42 / SCL 41");
-            CHECK(std::vector<std::string>(PMU.operations.begin(), PMU.operations.begin() + 3) ==
-                  std::vector<std::string>({"begin", "disableALDO3", "readRegister"}),
-                  "radio disable and readback are the first operations after PMU.begin");
+            const std::vector<std::string> expected = {
+                "begin", "readRegister", "writeRegister", "readRegister", "writeRegister",
+                "disableALDO3", "readRegister",
+            };
+            CHECK(PMU.operations.size() >= expected.size() &&
+                  std::equal(expected.begin(), expected.end(), PMU.operations.begin()),
+                  "radio disable and read-back follow the library TS setup in PMU.begin");
             CHECK(logHas("power-on source 0x04, power-off source 0x02"), "boot logs PMU power sources");
             if (!failMutex) {
                 CHECK(PMU.aldo4 && PMU.aldo4Mv == 3300 &&
