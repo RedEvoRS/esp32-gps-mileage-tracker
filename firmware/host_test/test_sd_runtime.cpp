@@ -155,17 +155,22 @@ int main() {
     assert(gTripFS == &SD && gState == ACTIVE && activePath == gTripPath);
     auto activeRows = events();
     assert(codeRows(activeRows, 4001).size() == 1); noSpaceFaults(activeRows);
+    // Healthy flash is the fallback for the next trip: no critical E4003.
+    assert(codeRows(activeRows, 4003).empty());
     gClockSet = false; drive(15, 1);
     assert(gState == IDLE && !gTripPath[0] && gTripFS == &SD);
     auto failedWrite = events();
     auto writes = codeRows(failedWrite, 4006);
     assert(writes.size() == 1 && writes[0].find("\"backend\":\"sd\"") != std::string::npos);
     assert(codeRows(failedWrite, 4007).empty() && g_sdDisk.files == savedSd);
+    assert(codeRows(failedWrite, 4003).empty());
     for (const auto& file : g_disk.files) assert(file.first.rfind("/trips/", 0) != 0);
     gClockSet = true; drive(15, 40);
     assert(gState == ACTIVE && gTripFS == &LittleFS);
-    endTrip(false); noSpaceFaults(events());
-    std::puts("SD runtime: active SD trip kept on SD, E4006 finalization, next trip on flash passed");
+    endTrip(false);
+    auto flashRows = events();
+    noSpaceFaults(flashRows); assert(codeRows(flashRows, 4003).empty());
+    std::puts("SD runtime: active SD trip kept on SD, E4006 finalization, next trip on flash, no E4003 passed");
 
     sdWorld(); events(); drive(15, 12); events();
     activePath = gTripPath;

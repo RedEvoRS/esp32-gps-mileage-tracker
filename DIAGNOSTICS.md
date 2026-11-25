@@ -1255,18 +1255,26 @@ across an ESP32 reset), a failed disable may leave charging on, the ADC/gauge
 may be stale, and USB/load/temperature/voltage relaxation affect the reading.
 This is an early sample, not a proven open-circuit voltage or current measurement.
 
-Before PMU shutdown, core 1 ends the trip and stops networking, then asks the
-core-0 consumer to drain the bounded queue and seal open segments. The consumer
-closes each write before returning. Core 1 waits at most 15 seconds for this
-handoff, reports incomplete drain/sealing when necessary, and takes FS_LOCK
-through both unmounts and power-off. No diagnostic I/O can reach unmounted media.
-Cancelled/failed shutdown remounts the same stores and invalidates journal
-caches while retaining the boot identity and RAM queue. RAM-only history is lost
-on reset/power-off. Hardware tests must measure individual VFS operation latency
-and trip-write delay, plus induced failures during sealing and remount.
+Before PMU shutdown, core 1 ends the trip and stops networking. When the network
+task stops within its abort deadline, core 1 asks the core-0 consumer to drain
+the bounded queue and seal open segments. The consumer closes each write before
+returning. Core 1 waits at most 15 seconds for this handoff, reports incomplete
+drain/sealing when necessary, and takes FS_LOCK through both unmounts and
+power-off. If the network task misses the abort deadline (a forced shutdown),
+the uploader may still hold an open file: core 1 skips the journal handoff and
+E2009, takes FS_LOCK and leaves both filesystems mounted, holding the lock
+through power-off. No diagnostic I/O can reach unmounted media. A cancelled or
+failed forced shutdown restarts the tracker instead of resuming. A cancelled or
+failed clean shutdown remounts the stores that were usable before it (a card
+already taken out of use after a failed capacity query stays out, powered off)
+and invalidates journal caches while retaining the boot identity and RAM queue.
+RAM-only history is lost on reset/power-off. Hardware tests must measure
+individual VFS operation latency and trip-write delay, plus induced failures
+during sealing and remount.
 
-Immediately before requesting that seal, core 1 captures one E2009 battery
-sample with the existing UTC/confidence provider and the known shutdown reason.
+On a clean shutdown, immediately before requesting that seal, core 1 captures
+one E2009 battery sample with the existing UTC/confidence provider and the
+known shutdown reason.
 Core 0 drains a queue slot, submits the retained notice exactly once, then drains
 and seals it with the earlier events. A full writable queue therefore does not
 lose the sample. If the queue stays full after that drain attempt, the notice

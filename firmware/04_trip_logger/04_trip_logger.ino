@@ -632,7 +632,10 @@ static void storageConditions(uint64_t freeB, uint32_t now) {
     if (!gJournalReady) return;
     gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, now).condition(!gSdMounted || sdRecordingUnavailable());
     bool available = tripRecordingAvailable(*gTripFS);
-    gLoopFaults.event(diagnostics::Code::NO_RECORDING_STORAGE, now).condition(!available);
+    // E4003 means nothing can record. A trip still open on a failed card ends
+    // with E4006, and fsFreeBytes() moves the next trip to healthy flash.
+    bool flashFallback = gTripFS == &SD && tripRecordingAvailable(LittleFS);
+    gLoopFaults.event(diagnostics::Code::NO_RECORDING_STORAGE, now).condition(!available && !flashFallback);
     gLoopFaults.event(diagnostics::Code::STORAGE_LOW, now).enumeration("backend", tripBackend(*gTripFS));
     if (available) gLoopFaults.integer("free_bytes", freeB);
     gLoopFaults.condition(available && freeB < FS_START_FREE);

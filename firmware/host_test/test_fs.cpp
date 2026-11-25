@@ -2243,6 +2243,36 @@ int main(int argc, char** argv) {
               "repeated failures across append and close trigger fallback even when repair succeeds");
     }
 
+    printf("T72b write-failure fallback survives a cancelled power-off (#791 with #812)\n");
+    {
+        resetWorld(); SD.cardPresent = true; setup();
+        const std::string path = "/trips/old.gpx";
+        g_sdDisk.files[path] = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n" + GPX_EPILOGUE;
+        for (int i = 0; i < 2; ++i) {
+            g_sdDisk.tripFailOperation = "write";
+            drive(15, 11);
+            CHECK(gState == IDLE && !gTripPath[0], "failed SD start leaves no active trip");
+        }
+        CHECK(sdRecordingUnavailable() && !gSdUnavailable && tripStoreAvailable(SD),
+              "two failed SD starts stop SD recording but keep the card readable");
+        PMU.vbusIn = false;
+        g_sdDisk.onUnmount = [] { PMU.vbusIn = true; };
+        const int mounts = SD.begins;
+        powerOffForVbus();
+        g_sdDisk.onUnmount = nullptr;
+        CHECK(g_restarts == 0 && PMU.shutdownCalls == 0 && SD.begins == mounts + 1 &&
+              gSdMounted && gFlashMounted && g_lockDepth == 0 && !gNetHold && !gNetAbort,
+              "cancelled power-off remounts the readable card and flash without a restart");
+        CHECK(sdRecordingUnavailable() && g_sdDisk.files.count(path),
+              "the write-failure latch and the SD queue survive the remount");
+        PMU.vbusIn = true; gVbusLost = false;
+        drive(15, 11);
+        CHECK(gState == ACTIVE && gTripFS == &LittleFS && g_disk.files.count(gTripPath),
+              "the next trip records on flash after recovery");
+        CHECK(uploadPending() && !g_sdDisk.files.count(path),
+              "the readable SD queue still uploads after recovery");
+    }
+
     printf("T73 persistent non-200 responses cannot monopolize the upload batch (#802)\n");
     for (bool sd : {false, true}) {
         resetWorld(); SD.cardPresent = true; setup();
