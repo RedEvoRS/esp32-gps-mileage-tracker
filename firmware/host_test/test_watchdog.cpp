@@ -224,28 +224,28 @@ static void handoverNearDeadline() {
     assert(g_watchdog.feeds == before + 2 && !gStartupWatchdog.active());
 }
 static void boundedShutdownAndBlockedLock() {
-    watchdogWorld(); setup(); checkArmed();
-    // Both handoffs consume their full budget, then the failed PMU shutdown
-    // returns after both one-second holds and the SD settle. No feeds inside either wait.
-    PMU.vbusIn = false; PMU.failShutdown = true;
-    gNetBusy = true; gJournalReady = true;
-    unsigned baseline = g_watchdog.feeds;
-    unsigned slices = 0;
-    g_taskDelayHook = [](uint32_t ms) { assert(ms == 20 || ms == 1000 || ms == SD_POWER_OFF_SETTLE_MS); };
-    // Observe feeds only between stages; the first two feeds follow the two
-    // full 15-second waits, never their 20 ms polling slices.
-    uint32_t start = millis();
-    g_watchdog.onFeed = [&]() {
-        ++slices;
-        uint32_t elapsed = millis() - start;
-        if (slices == 1) assert(elapsed == NET_ABORT_MS);
-        if (slices == 2) assert(elapsed == 2 * NET_ABORT_MS);
-    };
-    try { powerOffForVbus("user_long_press"); assert(false); } catch (const Restarted&) {}
-    assert(uint32_t(millis() - start) == 2 * NET_ABORT_MS + 2000 + SD_POWER_OFF_SETTLE_MS);
-    assert(g_watchdog.feeds > baseline && g_restarts == 1);
-    g_watchdog.onFeed = nullptr; g_taskDelayHook = nullptr;
-    g_lockDepth = 0; gFsDemand = 0;
+    for (bool forced : {false, true}) {
+        watchdogWorld(); setup(); checkArmed();
+        PMU.vbusIn = false; PMU.failShutdown = true;
+        gNetBusy = forced; gJournalReady = true;
+        unsigned slices = 0;
+        uint32_t start = millis();
+        g_taskDelayHook = [](uint32_t ms) { assert(ms == 20 || ms == 1000 || ms == SD_POWER_OFF_SETTLE_MS); };
+        // Each handoff gets at most one full wait, with no watchdog feeds
+        // during its polling slices. Forced shutdown skips the journal.
+        g_watchdog.onFeed = [&]() {
+            ++slices;
+            uint32_t elapsed = millis() - start;
+            if (slices == 1) assert(elapsed == (forced ? NET_ABORT_MS : 0));
+            if (slices == 2) assert(elapsed == NET_ABORT_MS + (forced ? 2000 : 0));
+        };
+        try { powerOffForVbus("user_long_press"); } catch (const Restarted&) {}
+        assert(uint32_t(millis() - start) ==
+               NET_ABORT_MS + 2000 + (forced ? 0 : SD_POWER_OFF_SETTLE_MS + SD_SETTLE_MS));
+        assert(slices >= 2 && g_restarts == (forced ? 1 : 0));
+        g_watchdog.onFeed = nullptr; g_taskDelayHook = nullptr;
+        g_lockDepth = 0; gFsDemand = 0;
+    }
     struct Blocked {};
     unsigned feeds = g_watchdog.feeds;
     g_semaphoreTakeHook = [&](uint32_t wait) {

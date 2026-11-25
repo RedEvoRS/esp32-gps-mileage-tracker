@@ -163,6 +163,7 @@ extern SerialStub Serial;
 class Stream {
 public:
     virtual ~Stream() {}
+    void setTimeout(unsigned long) {}
     virtual int available() = 0;
     virtual int read() = 0;
     virtual size_t readBytes(char*, size_t) { return 0; }
@@ -787,6 +788,7 @@ inline std::string g_httpLastBody;
 inline std::vector<std::string> g_httpBodies;
 inline void (*g_httpHook)() = nullptr;
 inline std::function<void()> g_httpResponseHook;
+inline std::function<void()> g_httpTripReplyByteHook;
 inline std::string g_httpResponse;
 inline bool g_httpAutoAck = true;
 inline int g_httpDeclaredSize = -2;
@@ -825,6 +827,20 @@ struct HTTPClient {
         g_httpUrls.push_back(url); g_httpHeaders.push_back(headers);
         if (g_httpLastBody.size() != size) return -3;   // HTTPC_ERROR_SEND_PAYLOAD_FAILED
         if (!events) {
+            if (g_httpTripReplyByteHook) {
+                // Model a header line dripping bytes without an inactivity
+                // timeout. Each iteration represents Stream::timedRead().
+                client->response = "X-Test: slow";
+                client->position = 0;
+                client->nextByte = g_millis;
+                if (client->available() > 0) {
+                    do {
+                        g_httpTripReplyByteHook();
+                        g_millis += g_httpByteMs;
+                    } while (client->read() >= 0);
+                }
+                if (!client->connected()) return -11;
+            }
             g_millis += std::min(g_httpHeaderMs, readTimeout);
             return g_httpHeaderMs > readTimeout ? -11 : g_httpCode;
         }

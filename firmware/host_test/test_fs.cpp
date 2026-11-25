@@ -47,6 +47,8 @@ static void resetWorld() {
     SD.dirs.clear(); SD.cardPresent = false; SD.begins = SD.ends = 0;
     SD.corruptFat = false; gSdFatChecked = false;
     gTripFS = &LittleFS; gSdMounted = false; gFlashMounted = true;
+    gSdUnavailable = false; gSdWriteFailures = 0;
+    gSdUploadOffset = gFlashUploadOffset = 0;
     g_powerEvents.clear();
     g_partition = PartitionStub();
     LittleFS.dirs.clear();
@@ -67,10 +69,12 @@ static void resetWorld() {
     g_httpCode = 200; g_httpRequests = 0; g_httpLastBody.clear(); g_httpHook = nullptr;
     g_httpBodies.clear();
     g_httpConnectMs = g_httpWriteMs = g_httpHeaderMs = g_httpByteMs = 0;
+    g_httpTripReplyByteHook = nullptr;
     g_httpConnectTimeouts.clear(); g_httpReadTimeouts.clear();
     gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0; gChargeCheckT0 = 0;
     gChargeFirstResolved = false; gChargeFirstMs = 0;
     gNetBusy = false; gNetHold = false; gNetAbort = false;
+    gTripUploadFileClosed = true;
     gNetLastAttemptMs = 0; gNetRetryMs = 0; gNetRetryNow = false; WiFi = WiFiStub();
     g_failMutexCreate = false; g_taskCreates = 0; g_restarts = 0;
     gIdleSince = g_millis; g_lockDepth = 0;
@@ -233,13 +237,34 @@ int main(int argc, char** argv) {
         dump("T2");
     }
 
-    printf("T3 prologue batch fails\n");
+    printf("T3 failed opening batch preserves complete points (#794)\n");
     for (const char* fault : {"write", "sync", "close"}) {
         resetWorld();
         g_disk.tripFailOperation = fault;
         drive(15, 11);
         CHECK(gState != ACTIVE && gTripPath[0] == 0, "stays out of ACTIVE");
-        CHECK(tripFiles().empty() && g_disk.openHandles == 0, "failed file removed and descriptor released");
+        if (std::strcmp(fault, "write") == 0) {
+            CHECK(tripFiles().empty(), "verified point-free opening file removed");
+        } else {
+            auto files = tripFiles();
+            CHECK(files.size() == 1 && wellFormedShape(g_disk.files.at(files.front())) &&
+                  count(g_disk.files.at(files.front()), "</trkpt>") == 11,
+                  "all readable opening points survive a failed sync or close");
+        }
+        CHECK(g_disk.openHandles == 0, "opening batch and recovery release all handles");
+    }
+    {
+        resetWorld();
+        const std::string path = "/trips/t000001.gpx";
+        g_disk.failReadPath = path;
+        g_disk.failReadAfter = 0;
+        g_disk.tripFailOperation = "sync";
+        drive(15, 11);
+        CHECK(g_disk.files.count(path) && !gTripPath[0], "an unreadable opening batch is left for boot repair");
+        g_disk.failReadPath.clear();
+        fsckAllTrips(LittleFS);
+        CHECK(g_disk.files.count(path) && wellFormedShape(g_disk.files.at(path)),
+              "boot repair closes the preserved opening batch once reads recover");
     }
 
     printf("T4 flash write error mid-trip (F4)\n");
@@ -853,7 +878,7 @@ int main(int argc, char** argv) {
         CHECK(!gVbusLost && !gNetHold && PMU.shutdownCalls == 0, "car back on: wait cancelled, uploads resume");
     }
 
-    printf("T31 an upload that won't finish is cut off, and storage stays locked (#3)\n");
+    printf("T31 an upload that won't finish forces power-off with storage still mounted (#3, #810)\n");
     {
         resetWorld();
         PMU.vbusIn = false;
@@ -862,7 +887,8 @@ int main(int argc, char** argv) {
         CHECK(PMU.shutdownCalls == 0 && !gNetAbort, "waits out the drain limit");
         loopFor(2000 + NET_ABORT_MS);
         CHECK(PMU.shutdownCalls == 1 && gNetAbort, "then cuts the upload off and powers off");
-        CHECK(logHas("powering off with storage locked") && g_lockDepth == 1, "a stuck task still can't reach storage");
+        CHECK(logHas("forcing power-off without unmounting storage") && g_disk.mounted,
+              "forced power-off leaves the busy filesystem mounted");
 
         resetWorld();                                // critical battery / power key
         PMU.vbusIn = false;
@@ -873,7 +899,8 @@ int main(int argc, char** argv) {
         CHECK(gNetAbort && g_millis - t0 <= NET_ABORT_MS + 100, "upload cut off without waiting for it");
         auto v = tripFiles();
         CHECK(v.size() == 1 && wellFormedShape(g_disk.files[v[0]]), "trip finalized first");
-        CHECK(PMU.shutdownCalls == 1 && g_lockDepth == 1, "powered off with storage locked");
+        CHECK(PMU.shutdownCalls == 1 && g_disk.mounted && g_lockDepth == 0,
+              "forced power-off does not take the filesystem lock");
     }
 
     printf("T32 network task: stops between files, ends a cut-off body, starts nothing when held (#3)\n");
@@ -1554,12 +1581,12 @@ int main(int argc, char** argv) {
         for (bool failedShutdown : {false, true}) {
             resetWorld(); PMU.vbusIn = false; gNetBusy = true;
             PMU.failShutdown = failedShutdown;
-            if (!failedShutdown) g_disk.onUnmount = [] { PMU.vbusIn = true; };
+            if (!failedShutdown) g_taskDelayHook = [](uint32_t) { PMU.vbusIn = true; };
             try { powerOffForVbus(); } catch (const Restarted&) {}
-            CHECK(g_restarts == 1 && gNetHold && gNetAbort && logHas("upload task still busy") &&
-                  !g_disk.mounted && g_lockDepth == 1 && g_disk.mountAttempts == 0 &&
+            CHECK(g_restarts == 1 && gNetHold && gNetAbort && logHas("forced power-off returned or was cancelled") &&
+                  g_disk.mounted && g_lockDepth == 0 && g_disk.mountAttempts == 0 &&
                   PMU.shutdownCalls == (failedShutdown ? 1 : 0),
-                  "a stuck upload restarts with storage locked, without remounting under its old file handle");
+                  "a stuck upload restarts without unmounting or remounting under its old file handle");
         }
 
         resetWorld(); drive(15, 40); PMU.vbusIn = false;
@@ -1876,9 +1903,14 @@ int main(int argc, char** argv) {
             if (fault == 2) { g_sdDisk.tripFailuresToSkip = 2; g_sdDisk.tripFailOperation = "sync"; }
             drive(15, 1);
             CHECK(gState == IDLE && gTripPath[0] == 0 && gPendCount == 0 && gArmCount == 0 &&
-                  g_sdDisk.files.size() == 1 && wellFormedShape(g_sdDisk.files.at(first)) &&
+                  g_sdDisk.files.size() == (fault == 2 ? 2u : 1u) && wellFormedShape(g_sdDisk.files.at(first)) &&
                   g_sdDisk.files.at(first).size() < TRIP_SPLIT_BYTES,
-                  "storage full, open failure or prologue failure leaves only a valid queued old piece");
+                  "failed split start leaves the old piece intact and stops recording");
+            if (fault == 2) {
+                const auto next = g_sdDisk.files.find("/trips/t000002.gpx");
+                CHECK(next != g_sdDisk.files.end() && wellFormedShape(next->second) &&
+                      count(next->second, "</trkpt>") == 1, "failed split sync preserves the readable boundary fix");
+            }
             CHECK(logHas(fault == 0 ? "trip storage full" : "could not create trip file"),
                   "split startup failure uses existing error logging");
         }
@@ -2165,6 +2197,109 @@ int main(int argc, char** argv) {
           "runtime defers legacy full-prefix recovery without reading it");
     fsckAllTrips(LittleFS);
     CHECK(g_disk.files.count("/trips/legacy.gpx") && !g_disk.files.count("/trips/legacy.gpx.fix"), "boot still recovers deferred legacy copies");
+
+    printf("T72 SD that rejects trip writes falls back, while its queue remains readable (#791)\n");
+    for (const char* fault : {"open", "write", "sync", "close"}) {
+        resetWorld(); SD.cardPresent = true; setup();
+        const std::string path = "/trips/old.gpx";
+        g_sdDisk.files[path] = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n" + GPX_EPILOGUE;
+        for (int i = 0; i < 2; ++i) {
+            g_sdDisk.tripFailOperation = fault;
+            drive(15, 11);
+            CHECK(gState == IDLE && !gTripPath[0], "failed SD start leaves no active trip");
+        }
+        drive(15, 11);
+        CHECK(gState == ACTIVE && gTripFS == &LittleFS && g_disk.files.count(gTripPath) &&
+              SD.totalBytes() > 0 && !gSdUnavailable, "new trip records on flash with SD still readable");
+        CHECK(uploadPending() && !g_sdDisk.files.count(path),
+              "the readable SD queue still uploads after recording falls back");
+    }
+    {
+        resetWorld(); SD.cardPresent = true; setup();
+        for (int i = 0; i < 3; ++i) {
+            drive(15, 40);
+            CHECK(gTripFS == &SD && gState == ACTIVE, "healthy close between faults resets the SD failure streak");
+            if (i == 1) {
+                endTrip(false);
+            } else {
+                g_sdDisk.tripFailOperation = "sync";
+                drive(15, 1);
+                CHECK(gTripFS == &SD && gState == IDLE, "append failure ends its piece on SD before fallback");
+            }
+        }
+        drive(15, 40);
+        CHECK(gTripFS == &SD && gState == ACTIVE, "a single failed piece does not switch recording stores");
+        g_sdDisk.tripFailOperation = "close";
+        endTrip(false);
+        drive(15, 11);
+        CHECK(gTripFS == &LittleFS && gState == ACTIVE,
+              "repeated failures across append and close trigger fallback even when repair succeeds");
+    }
+
+    printf("T73 persistent non-200 responses cannot monopolize the upload batch (#802)\n");
+    for (bool sd : {false, true}) {
+        resetWorld(); SD.cardPresent = true; setup();
+        fs::FS& storage = sd ? static_cast<fs::FS&>(SD) : static_cast<fs::FS&>(LittleFS);
+        auto& disk = sd ? g_sdDisk : g_disk;
+        const std::string complete = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n" + GPX_EPILOGUE;
+        for (int i = 10; i < 26; ++i) disk.files["/trips/t" + std::to_string(i) + ".gpx"] = complete;
+        const std::string later = "/trips/t26.gpx";
+        disk.files[later] = complete;
+        g_httpCode = 409;
+        CHECK(!uploadPending(storage) && g_httpRequests == 16 && disk.files.size() == 17,
+              "the first 16 failures stay queued");
+        g_httpCode = 200;
+        CHECK(uploadPending(storage) && g_httpRequests == 17 && disk.files.size() == 16 &&
+              !disk.files.count(later), "the next batch tries and deletes only the later trip");
+    }
+
+    printf("T74 repair and upload share strict GPX tail validation (#806)\n");
+    {
+        resetWorld();
+        const std::string path = "/trips/damaged.gpx";
+        const std::string complete = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n" + GPX_EPILOGUE;
+        for (const std::string& junk : {std::string("X"), std::string("\0", 1), std::string("\v")}) {
+            g_disk.files[path] = complete + junk;
+            CHECK(!hasPending() && !uploadPending() && g_httpRequests == 0, "junk after closing tag is never sent");
+            fsckAllTrips(LittleFS);
+            CHECK(g_disk.files[path] == complete && hasPending(), "boot repair retains points and removes the damaged tail");
+        }
+        const std::string spaced = complete + std::string(252, ' ') + "\t\r\n";
+        g_disk.files[path] = spaced;
+        fsckAllTrips(LittleFS);
+        CHECK(g_disk.files[path] == spaced && hasPending(), "XML whitespace across a block boundary remains valid");
+    }
+
+    printf("T75 abort interrupts response trickle and forced shutdown skips a live upload handle (#810)\n");
+    {
+        resetWorld(); drive(15, 40); endTrip(false);
+        auto path = tripFiles().front();
+        g_httpByteMs = 900;
+        unsigned reads = 0;
+        g_httpTripReplyByteHook = [&] { if (++reads == 2) gNetAbort = true; };
+        uint32_t started = millis();
+        CHECK(!uploadFile(LittleFS, path.c_str()) && g_disk.files.count(path) &&
+              g_disk.openHandles == 0 && millis() - started < 2000,
+              "an abort during the response line promptly closes and preserves the trip");
+    }
+    for (bool busy : {false, true}) {
+        resetWorld(); drive(15, 40); endTrip(false);
+        const auto path = tripFiles().front();
+        PMU.vbusIn = false;
+        gNetBusy = busy;
+        g_disk.onUnmount = [] {
+            CHECK(g_disk.openHandles == 0, "unmount never overlaps a live upload handle");
+        };
+        g_httpTripReplyByteHook = [] {
+            CHECK(g_disk.openHandles == 1, "response wait holds a real file handle");
+            powerOffForVbus();
+        };
+        const uint32_t started = millis();
+        try { uploadFile(LittleFS, path.c_str()); } catch (const PoweredOff&) {}
+        CHECK(g_disk.mounted && PMU.shutdownCalls == 1 && g_disk.files.count(path) &&
+              millis() - started >= NET_ABORT_MS,
+              "without the file-closed acknowledgement, shutdown waits then skips unmount");
+    }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);
     return g_fail ? 1 : 0;

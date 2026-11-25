@@ -72,7 +72,8 @@ The cores have distinct owners and narrow sharing points:
   would defeat the core split by blocking the GPS writer.
 - Atomic flags coordinate upload hold, busy, abort and retry requests
   (`gNetHold`, `gNetBusy`, `gNetAbort`, `gNetRetryNow`). The hold/busy
-  ordering prevents new network work racing storage unmount.
+  ordering prevents new network work racing storage unmount, and the
+  uploader acknowledges file closure through `gTripUploadFileClosed`.
 - `gDebugNetMux` protects scalar network snapshots. Diagnostic producers
   have separate builders per core; `EventLog::submit()` uses a bounded
   try-lock for their shared queue (`event_log.cpp`). Clock publications
@@ -88,8 +89,8 @@ TLS path would need its own stack measurement.
 
 Trip uploads explicitly set a five-second connect timeout and ten-second
 reply timeout. A `static_assert` keeps the latter below the 15-second
-network-abort deadline: `gNetAbort` can interrupt the body stream but cannot
-interrupt HTTPClient's wait for a reply. An 8 MiB trip takes about 0.4 s to
+network-abort deadline. `gNetAbort` can interrupt both the body stream and
+HTTPClient's wait for a reply. An 8 MiB trip takes about 0.4 s to
 parse on a desktop; ten seconds allows slower processors and durable disk
 writes more margin. Existing upload status text is preserved, with send and
 reply seconds appended. In core 3.3.11, HTTPClient asks the body stream for
@@ -100,8 +101,8 @@ An early send failure has no reply wait. Both timings use unsigned elapsed
 milliseconds so timer rollover is safe.
 HTTPClient resets its read timer when response data arrives: this is an
 inactivity limit, so trickling response headers can extend the total wait
-beyond ten seconds. The assertion bounds the configured timeout, not the
-entire HTTP request.
+beyond ten seconds. The upload socket checks for abort both between headers
+and while reading a header line.
 
 ## Startup and main-loop watchdog
 
@@ -283,10 +284,13 @@ a fresh absent reading before ending a trip, preserving short drives and
 ignoring brief dips. Unknown readings never authorize power-off. The board
 then stays awake on battery for upload opportunities. After ten minutes
 idle on battery, `loop()` holds new network work and lets an upload drain
-within a deadline. `powerOffForVbus()` closes the trip, stops/aborts uploads,
-requests journal sealing, locks and unmounts storage, rechecks VBUS and
-requests PMU shutdown. USB insertion powers it on again. These handoffs
-exclude filesystem access while storage is unmounted.
+within a deadline. `powerOffForVbus()` closes the trip and can cancel both
+the upload body and the response-header wait. When the network task is
+idle and the upload file is closed, it requests journal sealing, locks and
+unmounts storage. If the abort deadline expires, it leaves the filesystems
+mounted and skips the journal handoff. Both paths recheck VBUS before
+requesting PMU shutdown. If forced shutdown is cancelled or returns, the
+tracker restarts. USB insertion powers it on again after shutdown.
 
 A user long press calls `powerOffForVbus("user_long_press")` from
 `pollPmu()` on core 1. Confirmed VBUS refuses shutdown and sets a display
@@ -318,10 +322,10 @@ Each point keeps position, optional time, speed and HDOP; elevation,
 course and satellite count are omitted to keep storage use small.
 
 `beginTrip()`, `writeOrBufferTrkpt()` and `endTrip()` write incrementally.
-Each point is formatted as a complete line. `FileWriter::commit()` flushes
-the batch and checks the resulting size; callers also close the file.
-An append failure ends the trip and attempts repair rather than appending
-after a possibly truncated point.
+Each point is formatted as a complete line. `FileWriter::commit()` checks
+the write, sync and close results. A failed opening commit or append goes
+through bounded repair. Complete points are kept, and failed reads or a
+tail beyond the scan budget leave the file for boot repair.
 
 `receiveGpsNmea()` marks a new `<trkseg>` after a gap greater than five
 seconds from the last accepted fix. If both fixes have valid UTC, the gap
@@ -344,8 +348,9 @@ networking starts. `repairTrip()` looks backwards in 256-byte blocks for the
 last complete `</trkpt>`, retaining seven bytes between blocks so a split tag
 is recognized. Zero-filled or garbage tails are skipped the same way. Every
 verified block feeds the watchdog. Files with no complete points are removed;
-read errors never authorize removal. The existing `</gpx>` tail check leaves
-already-complete files alone.
+read errors never authorize removal. Repair and upload use the same tail
+check. A complete file ends with `</gpx>` followed only by optional XML
+whitespace.
 
 New repairs shorten the original file immediately after that point, then add
 a newline and the closing tags. The bytes match the former copy-based repair,
@@ -361,8 +366,7 @@ when the closing bytes were written but sync or close failed.
 
 A reset after the cut leaves every complete point in an incomplete document;
 the next boot adds the same closing tags. A partial append can be cut back
-and retried too. Only a full closing marker passes the existing completeness
-check (`isCompleteFile()`). FAT metadata itself is not power-loss atomic;
+and retried too. FAT metadata itself is not power-loss atomic;
 these checked calls cannot repair a damaged filesystem or guarantee what a
 card has physically persisted. A failed sync/close may leave the complete
 document on disk; it is still reported as failure on that attempt.
@@ -388,9 +392,14 @@ reasons remain specific to this legacy path; new repairs use existing read,
 write and parse reasons. E4006 write-condition and E4007 recovery-failure
 reporting still go through the existing helpers.
 
-`mountTripStorage()` selects SD first and LittleFS fallback for new trips;
-the destination does not change mid-trip. Both mounted stores can upload
-old files. SD is never formatted. LittleFS mounts with format-on-failure
+`mountTripStorage()` selects SD first and LittleFS fallback for new trips.
+A failed capacity query disables SD recording and uploads until reboot.
+Two failed recording pieces without a clean close between them disable SD
+recording until reboot while leaving readable trips eligible for upload.
+The current piece is closed or left for recovery before a new trip can use
+LittleFS. Each store rotates its starting position between upload batches
+so repeated failures leave room for later files. HTTP 200 authorizes
+deletion of the local copy. SD is never formatted. LittleFS mounts with format-on-failure
 disabled: unreadable or non-erased storage is preserved. The sole
 provisioning exception is `mountFlashStorage()`: after
 `tripPartitionIsErased()` reads **every byte** as `0xFF`, it formats that
@@ -399,7 +408,7 @@ empty partition once. A mount failure alone never authorizes erasure.
 `tripShouldSplit()` reserves pending points, another point and closing
 tags to keep each finished piece below 8 MiB. `tripFsmOnFix()` closes the
 old piece and starts the next without re-arming, sharing the boundary fix
-and preserving any cooldown deadline, provided storage startup succeeds.
+and preserving any cooldown deadline, provided the same store can still record.
 
 The host fault tests exercise write failures, repair, interrupted
 replacement, buffering and splitting (`host_test/test_fs.cpp` and
@@ -413,9 +422,10 @@ verified**. Clean battery-backed shutdown remains part of the design.
 
 `receiveGpsNmea()` processes each committed RMC immediately.
 `validRmcClockFields()` and `setClockFromGps()` validate that sentence's
-date/time before `buildFix()` stores its Coordinated Universal Time (UTC)
-epoch. The trackpoint epoch is captured before rate-limited system-clock
-synchronization; receipt age is used only for the system clock.
+date/time, including month lengths and leap days, before `buildFix()` stores
+its 64-bit Coordinated Universal Time (UTC) epoch. The trackpoint epoch is
+captured before rate-limited system-clock synchronization. Receipt age is
+used only for the system clock.
 
 `isoFromEpochMs()` writes whole seconds for zero centiseconds, otherwise
 three fractional digits (`.sssZ`) preserving the RMC's centisecond value.
