@@ -531,7 +531,7 @@ preflight() {
 
     # COMMIT is optional: archives supply it, but hand copies can use VERSION alone.
     local f missing=()
-    for f in VERSION stamp_version.py common/version.py common/settings.py common/retention.py common/trip_summary.py docker-compose.yml .dockerignore .env.example viewer.env.example monitor.env.example sample.gpx \
+    for f in VERSION stamp_version.py common/version.py common/settings.py common/retention.py common/trip_publication.py common/trip_summary.py docker-compose.yml .dockerignore .env.example viewer.env.example monitor.env.example sample.gpx \
         common/__init__.py common/diagnostics/{__init__.py,catalog.py,protocol.py,catalog.json} \
         mileage-ingest/{Dockerfile,app.py,diag_store.py,reset_high_water.py,requirements.txt} \
         mileage-viewer/{Dockerfile,app.py,geocoding.py,trip_merges.py,trip_log.py,users.py,manage_users.py,diagnostics_settings.py,requirements.txt} \

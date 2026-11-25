@@ -475,6 +475,8 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   a trip in that DB; it never touches `./data`. At local New Year in `DISPLAY_TZ`,
   a fully timed drive's saved miles are divided by counted GPX distance between
   the two years; All years keeps one full trip, and closing either year locks it.
+  The counted step into a stopped fix can cross midnight. Older summaries
+  without `recorded_until` use `end_time` to check for a crossing.
   A drive that cannot be split stays whole with a reason; one whose counted miles
   are all after midnight counts and locks only in the new year. Exports append a split drive's
   full miles as `trip_distance_miles` after `received_after_close`.
@@ -506,18 +508,21 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   notices excluded from miles and missing counts, with admin undo, only when
   every part is counted under another name and both files match saved stamps.
   A missing folder alone remains damage; direct trip loads and undo agree.
-  Unused-name merges block closing their saved-summary year and each part's
-  year (every year if the saved year is unknown). Notice miles stay in text,
-  outside numeric totals. Admin discard of damage and unused-name undo keep
-  the full summary in history before deletion in the same transaction; year
+  Unused-name merges block closing their saved-summary year and every year
+  with counted mileage from a replacement part (every year if the saved year
+  is unknown). Damaged merges count as unreadable in each year spanned by the
+  saved recording. Notice miles stay in text, outside numeric totals.
+  Admin discard of damage and unused-name undo keep the full summary in
+  history before deletion in the same transaction; year
   review and exports say which parts are currently counted again.
   A file occupying a month name, or a folder whose owner/mode denies ingest
   writing, is a notice with no missing count or merge block. Write notices
   reuse scanned metadata, never W_OK on the viewer's read-only mount.
-  Closing a year
-  saves its totals
-  in `tax_years.snapshot`; the year review compares saved and current totals,
-  and lists trips received after the close (ingest `_received_at` later than
+  Closing a year saves its totals in `tax_years.snapshot`. The close scan and
+  ingest publication share a lock on the data directory.
+  Ingest stamps `_received_at` when publishing the summary and preserves it on
+  verified retries. The year review compares saved and current totals and
+  lists trips received after the close (ingest `_received_at` later than
   `closed_at`), undated trips and trips inside a merge. Exports mark late trips
   in `received_after_close`; late trips still count and stay
   un-annotatable (409) until the year is reopened. Every response sends
