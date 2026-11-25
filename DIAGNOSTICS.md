@@ -1405,7 +1405,7 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E2004 | Plausible die requires a hot pause (die >=54 C); keeps requesting it above 47 C | Plausible die <=47 C or another measured pause reason; describes required pause even if control is unconfirmed | `temperature_mc` = measured PMU die |
 | E2005 | Plausible die requires a cold pause (die <=9 C); keeps requesting it below 14 C | Plausible die >=14 C or another measured pause reason; describes required pause even if control is unconfirmed | `temperature_mc` = measured PMU die |
 | E2006 | Non-finite or implausible die sample; first ten seconds of first-reading retries are silent | Plausible sample; hot/cold conditions are not cleared by an unreadable sample | none |
-| E2008 | Three consecutive charger command/read-back failures (30 s apart), or an unconfirmed 4.1 V charge target (blocking charging) | Checked 0x64 4.1 V target and 0x18 bit 1 read match the intended charger state | none |
+| E2008 | Three consecutive runtime charger command/read-back failures (30 s apart), startup charger disable still unconfirmed after its 5 s bounded retry window, or an unconfirmed 4.1 V charge target (blocking charging) | Checked 0x64 4.1 V target and 0x18 bit 1 read match the intended charger state (once startup charger disable is confirmed) | none |
 | E3001 | No checksum-valid NMEA for 10 s, starting at GPS configuration start | Next checksum-valid NMEA; noise/UBX/bad checksum do not recover it | `elapsed_ms` |
 | E3002 | No trusted fix (one meeting the NAV-PVT start accuracy limits, or any valid fix in RMC-only fallback) for 120 s while idle | Trusted fix; acquisition grace starts again after leaving a trip | `elapsed_ms`, `satellites` when measured |
 | E3003 | Matching checksum-checked VALSET NAK | One notice per rejected attempt, no active condition | `message_class=6`, `message_id=138` |
@@ -1452,11 +1452,14 @@ alerts, VBUS handling or a short-press card) and no status clear. Successful
 batches clear only the bits read in that batch with checked INTSTS1..3 register
 writes before calling `powerOffForVbus()`, so a cancelled shutdown cannot wipe
 flags latched during shutdown preparation. Any failed clear write sets the
-pending retry flag, and an asserted active-low `PMU_IRQ_PIN` also triggers a
-rate-limited retry (at most every 100 ms) without another falling edge. A
-periodic 15 s VBUS check in `serviceVbusRecheck()` prevents a missed edge from
-leaving USB power state stale. The production short-press display hook uses
-this verified batch too.
+pending retry flag and remembers which bits were already handled, so retries
+clear those bits without replaying their actions while still dispatching newly
+latched bits. A failed `enableIRQ()` during startup is tracked separately and
+retried at most every 100 ms until it succeeds. An asserted active-low
+`PMU_IRQ_PIN` also triggers a rate-limited retry (at most every 100 ms) without
+another falling edge. A periodic 15 s VBUS check in `serviceVbusRecheck()`
+prevents a missed edge from leaving USB power state stale. The production
+short-press display hook uses this verified batch too.
 
 Plausible means finite and within -40 to 125 C. Before the first usable reading
 each boot, the guard commands/verifies charging off and retries once a second
@@ -1470,19 +1473,27 @@ were USB resets whose first reading was already usable, so a start from fully
 off remains unchecked.
 
 The charge guard uses its existing die proxy and hysteresis; diagnostic context
-never presents that die reading as a measured cell temperature. Startup retries
-and reads back the early charger disable before storage setup, and verifies the
-4.1 V charge target in CV_CHG_VOL_SET (0x64). Each enable/disable command in
-the normal temperature guard is followed by a checked CHARGE_GAUGE_WDT_CTRL (0x18)
-bit-1 read, and charging is never enabled without a verified 4.1 V target. A
+never presents that die reading as a measured cell temperature. Startup tries
+to disable the charger early and read back `CHARGE_GAUGE_WDT_CTRL` (0x18), and
+if still unconfirmed retries every 100 ms for a bounded 5 s window (feeding the
+startup watchdog) before storage setup. If the PMU still cannot confirm
+charging off after 5 s, firmware cannot guarantee the charger is off during
+storage mount and repair: it sets `gChargeFailures` to the failure limit so the
+first guard run raises E2008 (`CHARGE_CONTROL_FAILED`), and continues startup
+so an uncontrollable PMU does not block trip logging forever. Startup also
+verifies the 4.1 V charge target in CV_CHG_VOL_SET (0x64). Each enable/disable
+command in the normal temperature guard is followed by a checked
+CHARGE_GAUGE_WDT_CTRL (0x18) bit-1 read, and charging is never enabled without
+a verified 4.1 V target. A startup disable failure (until later confirmed off),
 target-voltage failure, enable/disable mismatch, or read failure leaves control
 unconfirmed (keeping charging off when 4.1 V is unverified), retains finite
 pause-request hysteresis and retries at the temperature cadence (one second
 during first-reading grace, otherwise 30 seconds). Only a matching read-back
-logs a confirmed pause/resume. E2008 stays active until both the 4.1 V target
-and intended charger state are confirmed; the first two runtime unconfirmed
-attempts cannot manufacture recovery. The degraded PMU-untrusted mode retains
-its separate one-time best-effort disable/read-back policy.
+logs a confirmed pause/resume. E2008 stays active until startup disable, the
+4.1 V target, and intended charger state are all confirmed; the first two
+runtime unconfirmed attempts cannot manufacture recovery. The degraded
+PMU-untrusted mode retains its separate one-time best-effort disable/read-back
+policy.
 
 E3009 checks for a loose or damaged active-antenna cable. On one Supreme/MAX-M10S
 and one antenna (2026-10-19), unplugging raised AGC to about 79% after a minute

@@ -255,6 +255,60 @@ int main() {
     setupPmuIrq();
     assert(calls("clearIrqStatus") == 0 && gPmuIrqRetry); ++cases;
 
+    // Issue #790: failed IRQ clear must not replay the already-handled action on retry,
+    // while still dispatching any newly latched bits on that same retry.
+    {
+        pmuWorld(); gDebugMode.store(false);
+        g_digitalReadHook = [](int pin) { return pin == DEBUG_BOOT_PIN ? LOW : HIGH; };
+        gBootButton = runtime_debug::BootButton();
+        gBootButton.sample(g_millis, true);
+        g_millis += runtime_debug::BootButton::kDebounceMs;
+        gBootButton.sample(g_millis, true);
+        assert(gBootButton.held(g_millis));
+        PMU.shortPressIrq = true;
+        PMU.failRegisterWriteAt[XPOWERS_AXP2101_INTSTS2] = 1;
+        gPmuIrqFlag = true; pollPmu();
+        assert(debugMode() && gPmuIrqRetry && PMU.shortPressIrq);
+        // Retry clears the stuck PKEY_SHORT bit without toggling debug back off,
+        // while dispatching a newly latched VBUS_REMOVE bit in the same register.
+        PMU.vbusIn = false; PMU.removeIrq = true;
+        g_millis += PMU_IRQ_RETRY_MS; pollPmu();
+        assert(debugMode() && !gPmuIrqRetry && !PMU.shortPressIrq && !PMU.removeIrq);
+        assert(gVbusOffPending);
+        // A genuine second tap after clear succeeded toggles debug back off.
+        PMU.shortPressIrq = true; gPmuIrqFlag = true; pollPmu();
+        assert(!debugMode() && !PMU.shortPressIrq);
+        g_digitalReadHook = nullptr; ++cases;
+    }
+    // Issue #790: failed INTSTS2 clear on a long-press does not re-run shutdown prep on retry.
+    {
+        pmuWorld(); PMU.vbusIn = true; PMU.longPressIrq = true;
+        PMU.failRegisterWriteAt[XPOWERS_AXP2101_INTSTS2] = 1;
+        gPmuIrqFlag = true; pollPmu();
+        assert(gDisplayUsbPowerRequest && gPmuIrqRetry && PMU.longPressIrq);
+        gDisplayUsbPowerRequest = false;
+        g_millis += PMU_IRQ_RETRY_MS; pollPmu();
+        assert(!gDisplayUsbPowerRequest && !gPmuIrqRetry && !PMU.longPressIrq); ++cases;
+    }
+    // Issue #790: failed enableIRQ() in setupPmuIrq() is retried rate-limited until it succeeds.
+    {
+        pmuWorld(); PMU.failEnableIrq = true; PMU.enabledIrqs = 0;
+        setupPmuIrq();
+        assert(PMU.enabledIrqs == 0 && calls("enableIRQ") == 1);
+        g_millis += PMU_IRQ_RETRY_MS - 1; pollPmu();
+        assert(calls("enableIRQ") == 1); // rate-limited
+        ++g_millis; pollPmu();
+        assert(calls("enableIRQ") == 2 && PMU.enabledIrqs == 0); // retried while fault still active
+        g_millis += PMU_IRQ_RETRY_MS - 1; pollPmu();
+        assert(calls("enableIRQ") == 2);
+        PMU.failEnableIrq = false;
+        ++g_millis; pollPmu();
+        assert(calls("enableIRQ") == 3 && PMU.enabledIrqs == PMU_ENABLED_IRQS);
+        g_millis += PMU_IRQ_RETRY_MS; pollPmu();
+        assert(calls("enableIRQ") == 3); // stops retrying once enabled
+        ++cases;
+    }
+
     // Clear only the read bits BEFORE powerOffForVbus() so flags latching during
     // a cancelled shutdown survive instead of being wiped by an all-ones clear.
     pmuWorld(); PMU.vbusIn = false; PMU.longPressIrq = true;
@@ -319,19 +373,58 @@ int main() {
         assert(sawStorageMount && !logCount("early charger disable unconfirmed"));
         ++cases;
     }
-    // Persistent early disable failure warns and retries before storage setup.
+    // Transient disable failure that recovers during the bounded 5 s retry window
+    // confirms charging off before storage mount without raising E2008.
     {
         pmuWorld(); PMU.chargeEnabled = true; PMU.failChargeDisable = true;
+        static uint32_t startMs; startMs = g_millis;
+        static bool mountedAfterRecovery; mountedAfterRecovery = false;
+        PMU.onRegisterRead = [](uint8_t reg) {
+            if (reg == XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL &&
+                uint32_t(g_millis - startMs) >= 500) PMU.failChargeDisable = false;
+        };
+        g_sdDisk.onMount = [] {
+            mountedAfterRecovery = true;
+            assert(!PMU.chargeEnabled);
+            assert(uint32_t(g_millis - startMs) >= 500 && uint32_t(g_millis - startMs) < 5000);
+        };
+        setup();
+        PMU.onRegisterRead = nullptr; g_sdDisk.onMount = nullptr;
+        assert(mountedAfterRecovery && PMU.chargeEnabled); // guard enabled charging after mount
+        FS_LOCK(); auto ev = take(); FS_UNLOCK();
+        assert(codeRows(ev, 2008).empty());
+        ++cases;
+    }
+    // Persistent early disable failure retries for a bounded ~5 s window feeding
+    // the startup watchdog before storage mount, keeps fault active through mount,
+    // raises E2008, continues startup, and clears E2008 only when disable recovers.
+    {
+        pmuWorld(); PMU.chargeEnabled = true; PMU.failChargeDisable = true;
+        static uint32_t startMs; startMs = g_millis;
         static bool checkedAtMount; checkedAtMount = false;
         g_sdDisk.onMount = [] {
             checkedAtMount = true;
-            assert(calls("disableCellbatteryCharge") == 6);
-            PMU.failChargeDisable = false;
+            assert(PMU.failChargeDisable); // fault stays active through mount
+            assert(uint32_t(g_millis - startMs) >= 5000);
+            assert(calls("disableCellbatteryCharge") >= 50);
+            assert(g_watchdog.feeds >= 10);
         };
         setup();
         g_sdDisk.onMount = nullptr;
-        assert(checkedAtMount && logCount("early charger disable unconfirmed") == 1 &&
-               logCount("charger disable still unconfirmed before storage setup") == 1);
+        assert(checkedAtMount && gDegraded.mode() == startup::Mode::Normal);
+        assert(gChargeState == ChargeState::Unconfirmed);
+        assert(logCount("early charger disable unconfirmed") == 1 &&
+               logCount("charger disable still unconfirmed") == 1);
+        FS_LOCK(); auto ev = take(); FS_UNLOCK();
+        auto ctrl = codeRows(ev, 2008);
+        assert(ctrl.size() == 1); has(ctrl[0], "\"transition\":\"raise\"");
+        // Recovering charger disable clears E2008 on the next guard tick.
+        PMU.failChargeDisable = false;
+        chargeTick();
+        assert(gChargeState == ChargeState::Charging && PMU.chargeEnabled);
+        FS_LOCK(); auto rec = take(); FS_UNLOCK();
+        auto cleared = codeRows(rec, 2008);
+        assert(cleared.size() == 1); has(cleared[0], "\"transition\":\"clear\"");
         ++cases;
     }
     // Unverified 4.1 V charge target (write error, stuck at 4.2 V, or read error)

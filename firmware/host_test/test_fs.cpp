@@ -64,11 +64,12 @@ static void resetWorld() {
     gVbusLost = false; gVbusOffPending = false;
     gVbusRetry = VbusRetry::None; gVbusRetryMs = gVbusOffReadMs = 0;
     gPmuIrqRetry = false; gPmuIrqReadMs = 0; gBatteryThresholds = -1;
+    gPmuIrqEnableRetry = false; gPmuIrqEnableMs = 0; memset(gPmuIrqHandled, 0, sizeof(gPmuIrqHandled));
     g_httpCode = 200; g_httpRequests = 0; g_httpLastBody.clear(); g_httpHook = nullptr;
     g_httpBodies.clear();
     g_httpConnectMs = g_httpWriteMs = g_httpHeaderMs = g_httpByteMs = 0;
     g_httpConnectTimeouts.clear(); g_httpReadTimeouts.clear();
-    gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeTargetVerified = false;
+    gChargeState = pmu_read::ChargeState::Unconfirmed; gChargeTargetVerified = false; gEarlyChargeDisabled = true;
     gChargeChecked = gChargePauseRequested = false; gChargeFailures = 0; gChargeCheckT0 = 0;
     gChargeFirstResolved = false; gChargeFirstMs = 0;
     gNetBusy = false; gNetHold = false; gNetAbort = false;

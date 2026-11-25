@@ -45,6 +45,30 @@ inline bool clearIrqBytes(Pmu& pmu, const uint8_t regs[3], const uint8_t masks[3
     return ok;
 }
 
+// Compute newly latched flags (excluding bits already handled during a prior
+// failed clear), write-1-to-clear all currently latched bits in INTSTS1..3,
+// and retain only bits whose clear write failed in `handled`.
+// Returns true only when every nonzero clear write succeeds.
+template <typename Pmu>
+inline bool clearIrqBatch(Pmu& pmu, const uint8_t regs[3],
+                          const uint8_t raw[3], uint8_t handled[3],
+                          uint8_t freshOut[3]) {
+    bool ok = true;
+    for (int i = 0; i < 3; ++i) {
+        handled[i] &= raw[i];
+        freshOut[i] = uint8_t(raw[i] & ~handled[i]);
+        if (raw[i] != 0) {
+            if (pmu.writeRegister(regs[i], raw[i]) == 0) {
+                handled[i] = 0;
+            } else {
+                handled[i] = raw[i];
+                ok = false;
+            }
+        }
+    }
+    return ok;
+}
+
 // Fresh falling edges run immediately when not backing off from a failed
 // read/clear. Failed batches and a steady active-low IRQ line retry at retryMs.
 inline bool shouldPollIrq(bool edgeFlag, bool retry, bool pinLow,

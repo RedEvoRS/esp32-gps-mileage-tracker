@@ -120,11 +120,22 @@ static void degradedCoverage() {
         arduinoPass(); assert(g_watchdog.feeds == before + 1); // core's feed
         if (mode == startup::Mode::NoStorage) {
             SD.cardPresent = true;
-            SD.onCapacity = []() { assert(false); }; // defer first capacity scan to reboot
+            g_sdDisk.onMount = []() { g_sdDisk.readsFail = false; };
+            SD.onCapacity = []() {
+                assert(gLoopWatchdogArmed && g_watchdog.config.timeout_ms == LOOP_WDT_TIMEOUT_MS);
+                g_sdDisk.readsFail = true;
+            };
+            g_millis += gDegraded.waitMs();
+            arduinoPass(); // capacity failure keeps loop watchdog bound, backs off without restarting
+            assert(g_restarts == 0 && gDegraded.waitMs() == 120000);
+            assert(g_watchdog.enrollments == 1 && g_watchdog.feeds == before + 2);
+            SD.onCapacity = []() {
+                assert(gLoopWatchdogArmed && g_watchdog.config.timeout_ms == LOOP_WDT_TIMEOUT_MS);
+            };
             g_millis += gDegraded.waitMs();
             try { arduinoPass(); assert(false); } catch (const Restarted&) {}
-            assert(g_watchdog.enrollments == 1 && g_watchdog.feeds == before + 2);
-            SD.onCapacity = nullptr;
+            assert(g_watchdog.enrollments == 1 && g_watchdog.feeds == before + 3);
+            SD.onCapacity = nullptr; g_sdDisk.onMount = nullptr;
         }
     }
 }
