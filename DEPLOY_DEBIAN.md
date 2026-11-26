@@ -1292,10 +1292,18 @@ The first time you upload the sketch to a new board it needs **Erase All Flash
 Before Sketch Upload → Enabled** once to clear factory data, then
 **Disabled** for later uploads;
 see [First flash on a new board](firmware/README.md#first-flash-on-a-new-board).
-Later uploads with erase disabled keep trips on the card and in internal
-flash and preserve NVS (the board's settings memory, including trip
-numbering and the diagnostic boot counter). Erase-all wipes NVS and
-internal trips, so back up existing data before using it again.
+Later uploads with erase disabled keep trips on the card, preserve NVS (the
+board's settings memory, including trip numbering and the diagnostic boot
+counter), and keep internal trips on a board that already uses the current
+partition table. **Warning for existing boards on the original layout:** the
+first v1.11 (or later) upload from the Arduino IDE (or `arduino-cli`) writes
+the new partition table and bootloader with no backup and tries to grow
+LittleFS in place; if growing fails, the internal store is preserved as
+unavailable rather than formatted. Upload or back up any internal trips first,
+or use the backed-up first-install procedure in
+[Using the larger internal store](firmware/README.md#using-the-larger-internal-store).
+Erase-all wipes NVS and internal trips, so back up existing data before using
+it again.
 
 ### One-time diagnostics enrollment
 

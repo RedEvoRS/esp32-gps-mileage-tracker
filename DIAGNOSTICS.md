@@ -91,7 +91,11 @@ retry enrollment and reboot.
    previously used on this board**. Both must fit 0..2^63-1 (the ID cannot be 0).
    The example's `0ULL`/`1ULL` is only for verified fresh state. `ULL` means an
    unsigned long long integer in C++. Follow the flashing procedure in the
-   deployment runbook; a used board normally keeps erase **Disabled**.
+   deployment runbook; a used board normally keeps erase **Disabled**. If this
+   is the first v1.11 (or later) IDE upload onto an original-layout board,
+   upload or back up internal trips first because the IDE rewrites the
+   partition table without a backup (see
+   [Using the larger internal store](firmware/README.md#using-the-larger-internal-store)).
 3. Let the normal awake network cycle finish eligible trip uploads, then check
    the viewer's **Device health** page for a newly received current diagnostics
    snapshot from this boot. GPX contact by itself does not prove enrollment succeeded.
