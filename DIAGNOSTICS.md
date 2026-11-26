@@ -1005,6 +1005,13 @@ write/sync/close error. Read-only frame-export errors remain counter-only becaus
 the catalog has no `read` operation. Cooperative cancellation for trip demand,
 network hold/abort or the I/O deadline does not latch a media fault.
 
+For SD, journal writes and directory changes also check whether the SD driver
+reported a failed sector write during the operation. This catches errors the
+file system can hide when it updates the backup file allocation table or its
+free-space hints. The journal handles these failures through E4008, including
+the usual acknowledgment retry path. A later clear means a new journal
+operation succeeded. It does not verify or repair the earlier failed sector.
+
 There is one aggregate condition per boot, with a latch for each store. Any
 failed store keeps E4008 active. While both fail, SD supplies the context; a
 changed operation/backend updates subsequent repeats without starting a new
@@ -1591,7 +1598,9 @@ the same free-space reserves; if it fills, E4004/E4005 name `littlefs`.
 This runtime switch has host-test coverage; removal during a real trip, upload
 timing, and recovery of the removed card still need a board check.
 These hooks do not modify EventLog's revision/failure rules. GPX commits check
-write, sync and close results on both stores. E4006 `close` reports a
+write, sync and close results on both stores. GPX writes and repairs on SD
+also fail if the card driver reports a failed sector write during the operation,
+even when the file system reports success. E4006 `close` reports a
 failure during trip finalization. Appending requires an existing trip file,
 and a missing file keeps E4006 active through finalization. After a failed
 commit, runtime repair rewrites and syncs an intact GPX epilogue at its

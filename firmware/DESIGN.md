@@ -347,6 +347,22 @@ the write, sync and close results. A failed opening commit or append goes
 through bounded repair. Complete points are kept, and failed reads or a
 tail beyond the scan budget leave the file for boot repair.
 
+The SD file system keeps a backup copy of its allocation table and a sector
+with free-space hints. The bundled FatFs can ignore a failed write to either
+one. Stage 4 installs a disk callback after mounting the card and counts every
+failed sector write reported by Arduino's SD driver. GPX writers and repairs
+compare the count across the whole operation, from open through close, while
+holding the filesystem lock. A new failure takes the usual trip write-error
+path even if every file call returned success. The diagnostics journal checks
+the same count for its writes and directory changes. LittleFS uses its own
+file results.
+
+The callback forwards the original write once and adds no card reads or
+writes. It uses the SD callbacks and drive allocation of the pinned Arduino
+core, so an upgrade must review the adapter before it will build. The check
+detects a driver-reported failure during the operation. A later successful
+operation cannot tell us whether the earlier failed sector was repaired.
+
 `receiveGpsNmea()` marks a new `<trkseg>` after a gap greater than five
 seconds from the last accepted fix. If both fixes have valid UTC, the gap
 uses their GPS epochs; otherwise it uses unsigned monotonic elapsed time.
