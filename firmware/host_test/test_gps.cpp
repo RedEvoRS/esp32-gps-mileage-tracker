@@ -168,6 +168,7 @@ static void resetWorld() {
     gPmuIrqRetry = false; gPmuIrqReadMs = 0; gBatteryThresholds = -1;
     gPmuIrqEnableRetry = false; gPmuIrqEnableMs = 0; memset(gPmuIrqHandled, 0, sizeof(gPmuIrqHandled));
     gChargeTargetVerified = false; gEarlyChargeDisabled = true; gEarlyChargeTimeoutPending = false;
+    gPmuPeripheralChecked = gPmuPeripheralWarning = false;
     gDiagnosticClock.~DiagnosticClock(); new (&gDiagnosticClock) diagnostics::DiagnosticClock;
     gRtc = diagnostics::RtcRuntime();
     gGpsClockSet = false; gLastGpsSyncMs = 0;

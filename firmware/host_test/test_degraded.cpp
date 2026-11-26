@@ -380,6 +380,7 @@ int main() {
     auto all = rows();
     assert(contains(all, 1000) && contains(all, 4001) && contains(all, 4002) && contains(all, 4003));
     assert(observation(4003).observed && observation(4003).episode);
+    assert(observation(2010).observed && !observation(2010).episode);
     assert(!observation(2001).observed); // a degraded boot never publishes clear
     auto mounts = g_disk.mountAttempts;
     GPSSerial.rx = navPvt(0, 100);
@@ -450,6 +451,7 @@ int main() {
         assert(PMU.aldo1 && PMU.aldo1Mv == 1800);
         auto all = rows(); assert(contains(all, 1000) && contains(all, 2001) && contains(all, 2007));
         assert(observation(2001).observed && observation(2001).episode && !observation(4003).observed);
+        assert(!observation(2010).observed && !observation(2010).episode);
         assert(gJournal.stats().backend == (flash ? EventLog::Backend::LittleFs : EventLog::Backend::Ram));
         assert(!g_disk.formatAttempts && !SD.begins && !g_disk.files.count("/trips"));
         g_millis += 60000; loop();
@@ -477,6 +479,7 @@ int main() {
         onlyPmuCalls({"begin", "disableALDO3", "isEnableALDO3", "disableCellbatteryCharge", "readRegister", "writeRegister"});
         assert(PMU.aldo1 && PMU.aldo1Mv == 1800);
         assert(contains(rows(), 2001)); noTrips();
+        assert(!observation(2010).observed && !observation(2010).episode);
         g_millis += 60000; loop(); assert(gDegraded.waitMs() == 120000);
         retryMessage("power chip state untrusted");
         assert(std::count(PMU.operations.begin(), PMU.operations.end(), "disableCellbatteryCharge") == 1);
@@ -492,6 +495,7 @@ int main() {
     setup();
     assert(gDegraded.mode() == Mode::Normal && gSdMounted && gFlashMounted && g_taskCreates == 1);
     assert(observation(2001).observed && !observation(2001).episode);
+    assert(observation(2010).observed && !observation(2010).episode);
     assert(observation(4003).observed && !observation(4003).episode);
     xSemaphoreTake(gFsMutex, portMAX_DELAY);
     assert(gJournal.nextBatch(degradedBatch) && degradedBatch.count >= 2);

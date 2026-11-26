@@ -46,6 +46,7 @@ static void resetWorld() {
     g_sdDisk = FakeDisk(); g_sdDisk.mounted = false; g_sdDisk.renameOverwrites = false;
     SD.dirs.clear(); SD.cardPresent = false; SD.begins = SD.ends = 0;
     SD.corruptFat = false; gSdFatChecked = false;
+    gPmuPeripheralChecked = gPmuPeripheralWarning = false;
     gTripFS = &LittleFS; gSdMounted = false; gFlashMounted = true;
     gFlashTripsReady = true;
     gSdUnavailable = false; gSdWriteFailures = 0;
