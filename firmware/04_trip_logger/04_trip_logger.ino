@@ -436,6 +436,8 @@ static bool gContactKnown = false;
 static uint32_t gGpsDiagStartMs = 0, gLastNmeaMs = 0, gIdleFixWaitMs = 0;
 static uint32_t gStorageDiagMs = 0, gBatteryDiagMs = 0;
 static bool gBatteryDiagChecked = false;
+static bool gPmuPeripheralChecked = false;
+static bool gPmuPeripheralWarning = false;
 static uint8_t gJoinFailures = 0, gTransportFailures = 0;
 
 struct TripRecovery {
@@ -628,6 +630,11 @@ static void sdFatCondition(uint32_t now) {
     gLoopFaults.event(diagnostics::Code::SD_FILESYSTEM_DAMAGED, now);
     if (failed) gLoopFaults.enumeration("reason", diagnostics::sdFatReason(gSdFatCheck));
     gLoopFaults.condition(failed);
+}
+
+static void pmuPeripheralCondition(uint32_t now) {
+    if (!gJournalReady || !gPmuPeripheralChecked) return;
+    gLoopFaults.event(diagnostics::Code::PMU_PERIPHERAL_SETUP_FAILED, now).condition(gPmuPeripheralWarning);
 }
 
 static void storageConditions(uint64_t freeB, uint32_t now) {
@@ -2981,6 +2988,7 @@ static void serviceRuntimeDiagnostics() {
     }
     gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, now).condition(!gSdMounted || sdRecordingUnavailable());
     sdFatCondition(now);
+    pmuPeripheralCondition(now);
     // Check idle storage too, so a successful core-0 upload can be observed as
     // recovery on core 1 without sharing producer state across tasks.
     if (uint32_t(now - gStorageDiagMs) >= FS_CHECK_MS) {
@@ -3473,6 +3481,7 @@ static void beginJournal() {
     gJournal.setTimeProvider(stampDiagnosticTime);
     if (gJournalReady) diagnostics::submitJournalBoot(gJournal, esp_reset_reason(), gPmuStartup, millis(), gBootBattery);
     sdFatCondition(millis());
+    pmuPeripheralCondition(millis());
 }
 
 static bool createFsMutex() {
@@ -3546,6 +3555,7 @@ static void degradedLoop() {
         confirmVbusOff();
         serviceChargeTemp();
         serviceBatteryDiagnostics();
+        pmuPeripheralCondition(millis());
         if (!gVbusLost) gIdleSince = millis();
         else if (uint32_t(millis() - gIdleSince) >= IDLE_BATT_SLEEP_MS) powerOffForVbus();
         gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, millis()).condition(true);
@@ -3699,6 +3709,8 @@ void setup() {
     BatterySetup batterySetup;
     gEarlyChargeDisabled = true;
     gEarlyChargeTimeoutPending = false;
+    gPmuPeripheralChecked = false;
+    gPmuPeripheralWarning = false;
     gBootBattery = diagnostics::BatterySample();
     if (radioOff) {
         // Stop retained charging before display/USB/storage waits. Only trusted
@@ -3835,8 +3847,9 @@ void setup() {
     // Enable the measurements the battery/VBUS predicates and the charge
     // temperature guard rely on.
     const bool measurementsReady = configurePmuMeasurements();
-    const bool pmuPeripheralWarning = !gpsRailReady || !measurementsReady || !tsReady ||
-                                      !batterySetup.detection || !batterySetup.voltage;
+    gPmuPeripheralWarning = !gpsRailReady || !measurementsReady || !tsReady ||
+                            !batterySetup.detection || !batterySetup.voltage;
+    gPmuPeripheralChecked = true;
     setupPmuIrq();
     // Seed VBUS state from hardware: a battery-only boot (e.g. wake via
     // power key away from the car) must still hit the idle power-off timer.
@@ -3858,7 +3871,6 @@ void setup() {
         // A card that failed its capacity query is already excluded from the journal.
         unmountDegradedSd();
         enterDegraded(startup::Mode::NoStorage);
-        gLoopFaults.event(diagnostics::Code::PMU_PERIPHERAL_SETUP_FAILED, millis()).condition(pmuPeripheralWarning);
         return;
     }
     startupStage(startup_watchdog::Stage::Services);
@@ -3874,7 +3886,6 @@ void setup() {
         // Explicit healthy observations resolve prior degraded-boot alerts.
         // Reuse mountTripStorage()'s single authoritative startup capacity result.
         gLoopFaults.event(diagnostics::Code::PMU_INIT_FAILED, millis()).condition(false);
-        gLoopFaults.event(diagnostics::Code::PMU_PERIPHERAL_SETUP_FAILED, millis()).condition(pmuPeripheralWarning);
         storageConditions(bootFreeBytes, millis());
     }
     if (tripStoreAvailable(SD)) { startupStage(startup_watchdog::Stage::CardRepair); fsckAllTrips(SD); }
