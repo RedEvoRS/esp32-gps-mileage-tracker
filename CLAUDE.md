@@ -336,6 +336,9 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   to 5–38 C. Missing air falls back to die alone. An unreadable die pauses
   charging, preserves hot/cold history and retries each second for up to
   ten seconds on startup before E2006. Debug reuses both guard samples.
+  Host tests only: a real hot or cold pause on the Supreme, and the
+  first-reading retry from a fully-off start (2026-11-10 bench boots were
+  USB resets with a usable first reading).
 - Diagnostic journal: the network task services one queued record at a time
   using a zero-wait filesystem lock and yields maintenance to trip/upload
   demand. Mounted SD has a 16 MiB journal quota; LittleFS has a 64 KiB reserve

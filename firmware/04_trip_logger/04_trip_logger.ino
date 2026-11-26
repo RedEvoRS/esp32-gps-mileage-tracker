@@ -3787,7 +3787,7 @@ void setup() {
     if (!batterySetup.voltage)
         Serial.printf("WARNING: PMU battery voltage measurement enable unconfirmed after %u attempts.\n",
                       PMU_PERIPHERAL_ATTEMPTS);
-    if (!gChargeAirPowered)
+    if (radioOff && !gChargeAirPowered) // degraded power startup never sets ALDO1
         Serial.println("WARNING: ALDO1 3.3 V/on setup unconfirmed; OLED/BME280/magnetometer may be unavailable.");
     if (!gEarlyChargeDisabled) {
         Serial.println("WARNING: early charger disable unconfirmed; retrying up to 5 s before storage.");

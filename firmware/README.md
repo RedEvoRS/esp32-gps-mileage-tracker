@@ -1226,8 +1226,9 @@ How it behaves once flashed:
   Either reading pauses charging at 0 °C or below or 45 °C or above. All
   available readings must return to 5–38 °C before charging resumes. When
   board air is unavailable for a check, the guard uses the chip alone.
-  These are indirect estimates of cell temperature. Logging continues
-  while charging is paused.
+  These are indirect estimates, not a measurement of the battery cell or a
+  guarantee of safe charging in a hot car. Logging continues while
+  charging is paused.
   A die reading must be finite and between -40 and 125 C to be usable.
   An unreadable first sample keeps charging off and retries each second for
   ten seconds, without blocking startup or raising E2004/E2005/E2006.
