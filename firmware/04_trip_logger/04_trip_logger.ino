@@ -81,6 +81,32 @@
 #include "runtime_faults.h"
 #include "rtc_runtime.h"
 
+#ifdef SD_BENCH_POWER_CUT
+#include "sd_bench_check.h"
+#if SD_BENCH_POWER_CUT == 2
+#include <ff.h>
+#include <diskio.h>
+static_assert(!FF_FS_TINY, "SD bench mode 2 expects the pinned FatFs per-file cache.");
+extern "C" DRESULT __real_ff_disk_write(BYTE drive, const BYTE* data, LBA_t sector, UINT count);
+extern "C" DRESULT __wrap_ff_disk_write(BYTE drive, const BYTE* data, LBA_t sector, UINT count);
+#endif
+#if defined(WATCHDOG_BENCH_STARTUP_HANG) || defined(WATCHDOG_BENCH_HANG)
+#error "Use SD_BENCH_POWER_CUT separately from the watchdog bench flags."
+#endif
+static_assert(SD_BENCH_POWER_CUT == 1 || SD_BENCH_POWER_CUT == 2,
+              "SD_BENCH_POWER_CUT must be 1 (clean) or 2 (during ack sync).");
+#ifndef SD_BENCH_DELAY_MS
+#define SD_BENCH_DELAY_MS 0
+#endif
+#ifndef SD_BENCH_CYCLES
+#define SD_BENCH_CYCLES 50
+#endif
+static_assert(SD_BENCH_DELAY_MS >= 0 && SD_BENCH_DELAY_MS <= 5000,
+              "SD_BENCH_DELAY_MS must be 0 to 5000.");
+static_assert(SD_BENCH_CYCLES >= 1 && SD_BENCH_CYCLES <= 1000000,
+              "SD_BENCH_CYCLES must be 1 to 1000000.");
+#endif
+
 #include "runtime_debug.h"
 // Core 1 is the only writer. Core 0 reads the mode, never the button or OLED.
 static std::atomic<bool> gDebugMode{false};
@@ -3134,6 +3160,29 @@ static bool prepareTripDirectory(fs::FS& storage) {
     return ready;
 }
 
+#ifdef SD_BENCH_POWER_CUT
+static bool sdBenchFatHeadersReady() {
+    using sd_bench::HeaderResult;
+    const auto check = sd_bench::checkFatHeaders(SD);
+    switch (check.result) {
+        case HeaderResult::ReadError:
+            Serial.printf("SD BENCH: raw header read failed (copy %lu, 0 means boot sector).\n",
+                          (unsigned long)check.copy);
+            return false;
+        case HeaderResult::Layout:
+            Serial.println("SD BENCH: refused; the scratch card must have two FAT32 copies.");
+            return false;
+        case HeaderResult::ReservedEntries:
+            Serial.printf("SD BENCH: FAT copy %lu reserved entries failed: FAT[0]=0x%08lx FAT[1]=0x%08lx.\n",
+                          (unsigned long)check.copy, (unsigned long)check.fat0, (unsigned long)check.fat1);
+            return false;
+        case HeaderResult::Passed:
+            return true;
+    }
+    return false;
+}
+#endif
+
 static constexpr unsigned PMU_PERIPHERAL_ATTEMPTS = 3;
 // An estimated pause to ride out transient I2C failures, not a measured timing requirement.
 static constexpr uint32_t PMU_PERIPHERAL_RETRY_MS = 10;
@@ -3190,10 +3239,20 @@ static bool mountSdStorage() {
             Serial.printf("WARNING: microSD filesystem check failed (%s) -- card not used. "
                           "Check it on a PC and copy any needed files before reformatting as FAT32. "
                           "The tracker never formats it.\n", diagnostics::sdFatReason(gSdFatCheck));
-        } else {
+        }
+#ifdef SD_BENCH_POWER_CUT
+        // Run the extra header check even when #783 found damage. Keep the
+        // mount read-only until both checks and the owner marker pass.
+        if (sdBenchFatHeadersReady() && gSdFatCheck == diagnostics::SdFatCheck::Passed) {
+            if (sd_bench::hasMarker(SD)) return true;
+            Serial.println("SD BENCH: refused; root SDBENCH.OK is missing, unreadable or a directory.");
+        }
+#else
+        else {
             if (prepareTripDirectory(SD)) return true;
             Serial.println("WARNING: microSD trip directory unavailable; card preserved.");
         }
+#endif
     } else {
         // SD.begin discards card type on failure; there is no card-detect
         // pin. Be explicit that absence and bus/format faults look alike.
@@ -3691,12 +3750,164 @@ static bool configureTsFixedInput() {
     return false;
 }
 
+#ifdef SD_BENCH_POWER_CUT
+static constexpr const char* SD_BENCH_TRIP_PATH = "/trips/bench.gpx";
+static constexpr uint32_t SD_BENCH_RAIL_OFF_MS = 250;
+[[noreturn]] static void sdBenchStop(unsigned long checked, const char* reason);
+[[noreturn]] static void runSdBench(bool radioOff);
+
+#if SD_BENCH_POWER_CUT == 2
+static TaskHandle_t gSdBenchCutTask = nullptr, gSdBenchWriter = nullptr;
+static bool gSdBenchArmAck = false, gSdBenchTriggered = false; // writer only
+static std::atomic<bool> gSdBenchWriteActive{false};
+static std::atomic<bool> gSdBenchRailOff{false}, gSdBenchWriteOverlap{false};
+
+static void sdBenchCutTask(void*) {
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (SD_BENCH_DELAY_MS) delay(SD_BENCH_DELAY_MS);
+        // Wire1/PMU is independent of the SPI bus and the writer's FatFs lock.
+        gSdBenchRailOff = powerOffSdRail();
+        gSdBenchWriteOverlap = gSdBenchWriteActive.load();
+        xTaskNotifyGive(gSdBenchWriter);
+    }
+}
+
+// Linker wrap for the pinned ESP-IDF FatFs disk dispatcher. The ack save
+// truncates and rewrites an 80-byte ELG2 record, so f_sync writes its
+// per-file cache as one sector. Trigger on that write, inside the real sync.
+extern "C" DRESULT __wrap_ff_disk_write(BYTE drive, const BYTE* data, LBA_t sector, UINT count) {
+    if (!gSdBenchArmAck || count != 1 || std::memcmp(data, "ELG2", 4) != 0)
+        return __real_ff_disk_write(drive, data, sector, count);
+    gSdBenchArmAck = false;
+    gSdBenchTriggered = true;
+    gSdBenchWriteActive.store(true);
+    xTaskNotifyGive(gSdBenchCutTask);
+    const auto result = __real_ff_disk_write(drive, data, sector, count);
+    gSdBenchWriteActive.store(false);
+    return result;
+}
+#endif
+
+[[noreturn]] static void sdBenchStop(unsigned long checked, const char* reason) {
+    Serial.printf("SD BENCH STOP: checked cycles=%lu, %s\n", checked, reason);
+    if (gSdMounted) {
+        SD.end();
+        gSdMounted = false;
+        gSdSpi.end();
+        delay(SD_POWER_OFF_SETTLE_MS);
+        powerOffSdRail();
+    }
+    for (;;) delay(1000); // keep the report available; no automatic restart
+}
+
+static bool sdBenchWriteTrip() {
+    FileWriter writer(tripMount(SD), SD_BENCH_TRIP_PATH, /*create=*/true);
+    if (!writer) return false; // O_EXCL preserves any pre-existing file
+    writer.put(GPX_PROLOGUE);
+    const Fix synthetic{};
+    for (unsigned point = 0; point < 64; ++point) appendTrkpt(writer, synthetic);
+    writer.put(GPX_EPILOGUE);
+    return writer.commit();
+}
+
+[[noreturn]] static void runSdBench(bool radioOff) {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.printf("\nSD BENCH: SCRATCH CARD ONLY. Firmware %s, mode=%d, delay=%d ms, limit=%d cycles.\n",
+                  firmware::kVersion, SD_BENCH_POWER_CUT, SD_BENCH_DELAY_MS, SD_BENCH_CYCLES);
+    if (!radioOff) sdBenchStop(0, "refused; PMU or LoRa rail off could not be verified");
+    if (!disableChargeBounded(CHG_DISABLE_WAIT_MS, CHG_DISABLE_RETRY_MS))
+        sdBenchStop(0, "refused; charger disable could not be verified");
+
+    Serial.println("SD BENCH: send s to start. The card must contain /SDBENCH.OK.");
+    while (Serial.read() != 's') delay(20);
+    // A reset may have left BLDO1 on. Give any previous write time to settle
+    // before the production mount helper cycles the rail.
+    delay(SD_POWER_OFF_SETTLE_MS);
+    gSdMounted = mountSdStorage();
+    if (!gSdMounted) sdBenchStop(0, "initial mount/guard failed; see preceding output");
+    const uint32_t cluster = diagnostics::journalSdCluster(SD);
+    if (!cluster) sdBenchStop(0, "could not read journal allocation geometry");
+
+    // Only the bench writer uses the filesystem; the cutter only talks to
+    // the PMU. Keep the journal and batch out of the task stack.
+    gJournal.~EventLog();
+    new (&gJournal) diagnostics::EventLog(&gSdJournalFs, nullptr);
+    const auto boot = diagnostics::newJournalBoot(/*useNvs=*/false);
+    if (!gJournal.begin(boot.id, boot.counter, firmware::kVersion) || !gJournal.setSdAllocationUnit(cluster))
+        sdBenchStop(0, "journal initialization failed");
+    static diagnostics::EventLog::Batch batch;
+#if SD_BENCH_POWER_CUT == 2
+    gSdBenchWriter = xTaskGetCurrentTaskHandle();
+    if (xTaskCreatePinnedToCore(sdBenchCutTask, "sd-cut", 4096, nullptr, 2,
+                               &gSdBenchCutTask, 0) != pdPASS)
+        sdBenchStop(0, "could not start the independent power-cut task");
+    unsigned long overlaps = 0;
+#endif
+
+    for (unsigned long cycle = 1; cycle <= SD_BENCH_CYCLES; ++cycle) {
+        Serial.printf("SD BENCH: cycle %lu starting.\n", cycle);
+        if (!prepareTripDirectory(SD) || !sdBenchWriteTrip())
+            sdBenchStop(cycle - 1, "scratch GPX write failed; check /trips/bench.gpx and the card");
+        diagnostics::EventInput event;
+        event.code = static_cast<uint16_t>(diagnostics::Code::BOOT);
+        event.uptimeMs = millis();
+        if (gJournal.submit(event) != diagnostics::EventLog::Submit::Accepted)
+            sdBenchStop(cycle - 1, "journal rejected synthetic event");
+        const auto previousFailures = gJournal.stats().storageFailures;
+        gJournal.service();
+        if (gJournal.stats().queued || !gJournal.nextBatch(batch) || !batch.count ||
+            gJournal.stats().storageFailures != previousFailures)
+            sdBenchStop(cycle - 1, "could not write and read back the SD journal batch");
+
+#if SD_BENCH_POWER_CUT == 1
+        if (!gJournal.acknowledge(batch, batch.ids, batch.count) || !gJournal.seal())
+            sdBenchStop(cycle - 1, "clean cycle could not acknowledge and seal the journal");
+        SD.end();
+        gSdMounted = false;
+        if (SD_BENCH_DELAY_MS) delay(SD_BENCH_DELAY_MS);
+        if (!powerOffSdRail()) sdBenchStop(cycle - 1, "card power-off unconfirmed");
+#else
+        gSdBenchTriggered = false;
+        gSdBenchArmAck = true;
+        const bool acked = gJournal.acknowledge(batch, batch.ids, batch.count);
+        gSdBenchArmAck = false;
+        if (!gSdBenchTriggered)
+            sdBenchStop(cycle - 1, "no ack sector write intercepted; check linker flag and preceding errors");
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (gSdBenchRailOff && gSdBenchWriteOverlap) ++overlaps;
+        Serial.printf("SD BENCH: rail-off=%s, ack sector write active at read-back=%s, ack=%s, overlaps=%lu.\n",
+                      gSdBenchRailOff ? "verified" : "unconfirmed", gSdBenchWriteOverlap ? "yes" : "unconfirmed",
+                      acked ? "verified" : "failed", overlaps);
+        if (!gSdBenchRailOff) sdBenchStop(cycle - 1, "card power-off unconfirmed");
+        // The writer has returned from sync and close. Only now dismantle
+        // the VFS/driver, with the rail still off.
+        SD.end();
+        gSdMounted = false;
+#endif
+        gSdSpi.end();
+        delay(SD_BENCH_RAIL_OFF_MS);
+        gSdMounted = mountSdStorage();
+        if (!gSdMounted) sdBenchStop(cycle - 1, "post-cut mount/guard failed; preserve the card");
+        Serial.printf("SD BENCH: cycle %lu remounted; FAT checks passed.\n", cycle);
+        gJournal.invalidateStorage();
+        if (!SD.remove(SD_BENCH_TRIP_PATH))
+            sdBenchStop(cycle, "could not remove the scratch GPX after validation");
+    }
+    sdBenchStop(SD_BENCH_CYCLES, "limit reached; FAT checks passed");
+}
+#endif
+
 void setup() {
     // VBUS-insert power-on brings the Supreme's LoRa rail up ON. Disable
     // and verify it as the first PMU operation after bounded bus recovery
     // and initialization, BEFORE Serial, storage or GPS setup can block.
     bool pmuReady = beginPmuWithRecovery(Wire1, PMU, I2C_SDA, I2C_SCL, gPmuStartup);
     bool radioOff = pmuReady && PMU.disableALDO3() && aldo3State() == Aldo3State::Off;
+#ifdef SD_BENCH_POWER_CUT
+    runSdBench(radioOff);
+#endif
     // Bounded PMU/bus recovery and the radio-off safety command come first.
     // Enroll before display, USB waits, filesystems, NVS or any storage call.
     startup_watchdog::Record saved{gStartupWatchdogRecord.magic, gStartupWatchdogRecord.stage,
