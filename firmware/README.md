@@ -37,8 +37,9 @@ four real trips from microSD to the deployed server, then delivered all 115
 pending diagnostic events and a current snapshot. Uploads with debug mode
 off and server-down retry were also verified on 2026-10-21 (UTC). Wrong-token
 and server-error retries passed bench checks on 2026-11-01 (UTC); see
-[upload checks](#check-recording-and-uploads). Uploads from the internal
-LittleFS fallback and HTTP 413 handling remain untested on the Supreme.
+[upload checks](#check-recording-and-uploads). Without a microSD card, trips
+are recorded on internal LittleFS flash and upload the same way. HTTP 413
+handling remains untested on the Supreme.
 The [top-level README](../README.md#where-its-at)
 has the current status.
 
@@ -477,8 +478,7 @@ a card. Stage 4 has since recorded two real drives on the card.
   both the card and internal flash, including trips left by a boot without
   a card. It deletes each only after an accepted server response. On
   2026-10-21 (UTC), four trips uploaded from the card with HTTP 200 and
-  were deleted locally. Internal LittleFS was mounted but held no trips;
-  uploading from that fallback remains untested on the Supreme.
+  were deleted locally.
 - **Power cuts:** FAT copes with a sudden power loss worse than LittleFS
   does. The 18650 is what lets the logger close its files and unmount the
   card cleanly after the car's USB power goes away, so keep it fitted.
@@ -2033,9 +2033,9 @@ received HTTP 200 and deleted the local file.
   gaps or duplicates after retries. Device health showed no active conditions
   and zero dropped events.
 
-This checks the microSD retry paths and diagnostics deduplication. LittleFS
-uploads and HTTP 413 handling remain untested on the Supreme. Debug was off
-during the large upload, so this session did not check GPS-loop responsiveness.
+This checks the microSD retry paths and diagnostics deduplication. HTTP 413
+handling remains untested on the Supreme. Debug was off during the large
+upload, so this session did not check GPS-loop responsiveness.
 
 If the trip does not appear, first confirm both `Trip started` and
 `Trip finalized`. A trip still in progress cannot upload; a short trip

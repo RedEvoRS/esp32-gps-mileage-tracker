@@ -33,10 +33,9 @@ for the small file; the roughly 3 MB file instead saw a broken send,
 `HTTP -3`, and E5003 ("Upload link failed"). Both stayed queued and uploaded
 after the original token was restored.
 
-Still untested on hardware: uploads from LittleFS (the internal flash
-filesystem) without the SD card, HTTP 413 handling, a trip ending in a parking
-garage (deferred past v1.00), the `flash.ps1` first-install and `-Cleanup`
-paths, and `flash.sh`. Unraid has no real-box verification yet either.
+Still untested on hardware: HTTP 413 handling, a trip ending in a parking
+garage, the `flash.ps1` first-install and `-Cleanup` paths, and `flash.sh`.
+Unraid has no real-box verification yet either.
 
 It runs as two default Docker containers, with two optional services, all
 defined in `docker-compose.yml`:

@@ -1283,11 +1283,11 @@ Runtime debug mode does not change the version. Without the generated header
 it shows `unversioned`; an old header keeps its old version. Road-use version bumps and tags are described
 in [Firmware versions and releases](firmware/README.md#firmware-versions-and-releases).
 
-Fit a **FAT32 microSD card** with the board switched off. The trip logger
-records there when it mounts, otherwise it uses internal LittleFS. Its bundled
-`partitions.csv` overrides the Arduino IDE's Partition Scheme menu.
-Uploads from LittleFS without the SD card remain untested. A trip ending in a
-parking garage also remains unverified and is deferred until after v1.00.
+Fit a **FAT32 microSD card** with the board switched off as the normal trip
+store. The trip logger records there when it mounts; without a card, it records
+trips on internal LittleFS flash and uploads them the same way. Its bundled
+`partitions.csv` overrides the Arduino IDE's Partition Scheme menu. A trip
+ending in a parking garage remains unverified.
 The first time you upload the sketch to a new board it needs **Erase All Flash
 Before Sketch Upload → Enabled** once to clear factory data, then
 **Disabled** for later uploads;
