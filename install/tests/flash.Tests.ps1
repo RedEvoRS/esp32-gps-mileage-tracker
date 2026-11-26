@@ -89,8 +89,11 @@ try {
         Assert-Rejected { Test-FlashManifest $folder $false }
     }
     foreach ($change in @(@('file', '../app.bin'), @('sha256', ('0' * 64)), @('offset', $nvsStart),
-        @('offset', $appEnd), @('offset', ('0x{0:x}' -f ($regions.factory.Offset + 1))), @('offset', '0x1;id'), @('name', 'bootloader'))) {
-        $m = New-Fixture; $m.parts[3][$change[0]] = $change[1]; Save-Fixture $m
+        @('offset', '0x20000'), @('offset', $appEnd),
+        @('offset', ('0x{0:x}' -f ($regions.factory.Offset + 1))), @('offset', '0x1;id'), @('name', 'bootloader'))) {
+        $m = New-Fixture; $m.parts[3][$change[0]] = $change[1]
+        if ($change[0] -ceq 'offset') { $m.app_offset = $change[1] }
+        Save-Fixture $m
         Assert-Rejected { Test-FlashManifest $folder $false }
     }
     $m = New-Fixture; Save-Fixture $m

@@ -72,9 +72,9 @@ function Invoke-TrackerFlash {
                 'bootloader' { $end -le 0x8000 }
                 'partitions' { $start -ge 0x8000 -and $end -le 0x9000 }
                 'boot_app0' { $start -ge 0xe000 -and $end -le 0x10000 }
-                'app' { $start -ge 0x10000 -and $end -le 0x190000 -and $part.offset -ceq $m.app_offset }
+                'app' { $start -eq 0x10000 -and $end -le 0x190000 -and $part.offset -ceq $m.app_offset }
             }
-            if (-not $safe) { throw 'Part crosses a reserved region (NVS or trip storage), or app_offset differs.' }
+            if (-not $safe) { throw 'Part crosses a reserved region (NVS or trip storage), app does not start at the factory slot, or app_offset differs.' }
             $previous = $end
         }
         return $m

@@ -45,13 +45,14 @@ def script_limits(source, powershell=False):
     number = r"(0x[0-9a-fA-F]+|[0-9]+)"
     result = {}
     for name in expected_limits():
+        start_op = "-eq" if name == "app" else "-ge"
         if powershell:
-            start = r"\$start\s+-ge\s+" + number + r"\s+-and\s+"
+            start = rf"\$start\s+{start_op}\s+" + number + r"\s+-and\s+"
             end = r"\$end\s+-le\s+" + number
             extra = r"\s+-and\s+\$part\.offset\s+-ceq\s+\$m\.app_offset" if name == "app" else ""
             pattern = rf"\s*'{name}'\s*\{{\s*" + ("" if name == "bootloader" else start) + end + extra + r"\s*\}\s*"
         else:
-            start = r'\[\s*"\$start"\s+-ge\s+\$\(\(' + number + r"\)\)\s*\]\s*&&\s*"
+            start = rf'\[\s*"\$start"\s+{start_op}\s+\$\(\(' + number + r"\)\)\s*\]\s*&&\s*"
             end = r'\[\s*"\$end"\s+-le\s+\$\(\(' + number + r"\)\)\s*\]"
             pattern = rf"\s*{name}\)\s*" + ("" if name == "bootloader" else start) + end + r"\s*\|\|\s*return\s+1\s*;;\s*"
         matches = [re.fullmatch(pattern, line) for line in source.splitlines()]
@@ -100,6 +101,9 @@ class FlashPartitionLimitsTests(unittest.TestCase):
         for filename in ("flash.sh", "flash.ps1"):
             source = (ROOT / "install" / filename).read_text(encoding="utf-8")
             app_line = next(line for line in source.splitlines() if re.match(r"\s*(?:'app'\s*\{|app\))", line))
-            changed = re.sub(r"0x[0-9a-fA-F]+", "APP_LIMIT", app_line)
-            with self.subTest(script=filename), self.assertRaisesRegex(AssertionError, "recognizable app fence"):
-                script_limits(source.replace(app_line, changed), filename.endswith("ps1"))
+            for variant in (
+                re.sub(r"0x[0-9a-fA-F]+", "APP_LIMIT", app_line),
+                app_line.replace("-eq", "-ge", 1),
+            ):
+                with self.subTest(script=filename, variant=variant.strip()), self.assertRaisesRegex(AssertionError, "recognizable app fence"):
+                    script_limits(source.replace(app_line, variant), filename.endswith("ps1"))
