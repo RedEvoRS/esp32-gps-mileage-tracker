@@ -552,9 +552,9 @@ normal recorded run. Other failures in the same check still need attention.
 ## Step 5 — Build on Unraid, flash from the PC
 
 The Windows helper's first-install and `-Cleanup` flows, and the macOS/Linux
-`flash.sh` helper, still need checks on a real board. Uploads from internal
-LittleFS flash without the SD card also remain untested on the Supreme;
-use the FAT32 microSD card for this route.
+`flash.sh` helper, still need checks on a real board. Use a FAT32 microSD card
+as the normal trip store; without a card, the tracker records trips on internal
+LittleFS flash and uploads them the same way.
 
 Accept the build offered by setup, or run it later:
 

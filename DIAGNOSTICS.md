@@ -488,8 +488,8 @@ on 2026-10-21 (UTC): two `HTTP -1` failures kept the trip queued, then HTTP
 2026-11-01 (UTC), a server error (5xx) kept trips queued with E5008 and they
 uploaded after recovery; a wrong token gave E5004 on a small file and a broken
 send (E5003, `HTTP -3`) on a roughly 3 MB file; retried diagnostics batches
-created no duplicate events. LittleFS uploads and HTTP 413 remain untested on
-the Supreme. Setup steps are in
+created no duplicate events. HTTP 413 remains untested on the Supreme. Setup
+steps are in
 [README.md](README.md) and [DEPLOY_DEBIAN.md](DEPLOY_DEBIAN.md) Step 8.
 
 The tracker normally runs unattended in a car. A serial console cannot explain
