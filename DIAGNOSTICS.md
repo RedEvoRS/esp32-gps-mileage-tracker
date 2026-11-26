@@ -1448,12 +1448,12 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E3007 | RTC has no ACK, or its initial boot register read fails | Verified RTC setting after trusted GPS/SNTP time; at most three attempts per boot, at least a minute apart after failures | none |
 | E3008 | Readable RTC has STOP/VL, invalid BCD/calendar, unsupported year, or a later read/write/verification failure | Verified RTC setting from GPS/SNTP clears the condition; normal transition/repeat policy | `reason=stopped\|invalid_date\|out_of_range\|read_failed` on failure |
 | E3009 | At 30 s MON-RF boundaries, valid AGC >=70% and fresh GSV (a complete group within 15 s) with zero satellites >=30 dBHz, continuously for >=120 s from the first suspect sample | One valid AGC <=50% sample **or** fresh GSV with at least one satellite >=30 dBHz; missing/stale/intermediate evidence resets the hold and retains an active warning | `agc_pct` (0-100) when MON-RF valid; `max_cno` (0-99) when GSV fresh |
-| E4001 | BLDO1 card power setup or read-back failed, SD did not mount, the selected SD trip store returns zero total capacity at runtime (failed filesystem query), or two trip pieces in a row fail to write on SD (create, write, sync or close) | Successful SD mount on a later boot; runtime failure stays latched until reboot. After write failures, new trips record on flash while readable trips already queued on the card still upload, so an E4001 can appear next to a successful SD upload | none |
+| E4001 | BLDO1 card power setup or read-back failed, SD did not mount, the selected SD trip store returns zero total capacity at runtime (failed filesystem query), or two trip pieces in a row fail to write or discard on SD (create, write, sync, close or micro-trip removal) | Successful SD mount on a later boot; runtime failure stays latched until reboot. After write failures, new trips record on flash while readable trips already queued on the card still upload, so an E4001 can appear next to a successful SD upload | none |
 | E4002 | LittleFS unavailable for trips during no-storage degraded startup | Remains active until restart. When LittleFS mounts but its trip directory is unusable, it can still retain journal events | none |
 | E4003 | Neither trip store is usable at startup (including a boot SD capacity failure with flash unavailable), or the selected trip store becomes unavailable at runtime with no fallback | Only a normal boot with an available trip store (or switching to an available fallback store) observes healthy; successful degraded retry restarts without clearing | none |
 | E4004 | Available selected trip store has guarded free space <64 KiB start reserve | >=64 KiB on the selected store, or condition no longer applies because that store is unavailable | `backend`, `free_bytes` only when available |
 | E4005 | Available selected trip store has guarded free space <24 KiB stop reserve | >=24 KiB on the selected store, or condition no longer applies because that store is unavailable | `backend`, `free_bytes` only when available |
-| E4006 | Trip create/open, point commit or finalization fails | Next verified trip create/write/finalize or successful repair | `backend`, `operation=open\|write\|close` |
+| E4006 | Trip create/open, point commit, finalization or micro-trip discard removal fails (including retry read/remove failures for a pending micro-trip discard) | Next verified trip create/write/finalize, successful repair or successful retry removal of a pending micro-trip discard | `backend`, `operation=open\|write\|close` |
 | E4007 | Boot fsck directory/read, ambiguous repair, write or publish fails; also runtime repair failure, including a trip-end tail longer than 4 KiB left for boot repair (`parse`) | Per-occurrence notice; no clear | `backend`, `reason=read\|parse\|write\|rename` (`rename` only for older firmware's `.fix` copies) |
 | E4008 | Journal preparation, event append, sealing or metadata persistence fails | All failed stores must later append an event or durably ack an event batch; 15-minute repeats, no recursive submission | `backend`, `operation=open\|write\|close\|rename\|ack` |
 | E4010 | Actual repaired trip (cut in place since firmware v1.06), published verified repair or recovered orphan | Per-occurrence notice; complete untouched files and garbage cleanup stay silent | `backend`; `points` only when an older firmware's `.fix` copy was recovered (in-place repairs don't count points) |
@@ -1592,7 +1592,11 @@ This runtime switch has host-test coverage; removal during a real trip, upload
 timing, and recovery of the removed card still need a board check.
 These hooks do not modify EventLog's revision/failure rules. GPX commits check
 write, sync and close results on both stores. E4006 `close` reports a
-failure during trip finalization. Appending requires an existing trip file,
+failure during trip finalization, including when a micro-trip cannot be removed
+at trip end or on a later retry. Pending micro-trip discards stay unclosed and
+are tracked in NVS (by store, path, byte count and 64-bit content hash) so boot
+repair skips finalizing them and retries removal without emitting E4007 or
+E4010; successful retry removal clears E4006 with `operation=close`. Appending requires an existing trip file,
 and a missing file keeps E4006 active through finalization. After a failed
 commit, runtime repair rewrites and syncs an intact GPX epilogue at its
 existing offset. A torn tail is cut back to the last complete point before
