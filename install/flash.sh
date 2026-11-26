@@ -50,9 +50,9 @@ tracker_flash() (
             start=$((offset)); size=$(wc -c < "$dir/$file"); end=$((start + size))
             [ "$size" -gt 0 ] && [ $((start % 4096)) -eq 0 ] && [ "$start" -ge "$previous" ] || return 1
             case $name in
-                bootloader) [ "$end" -le $((0x8000)) ] || return 1 ;;
+                bootloader) [ "$start" -eq $((0x0)) ] && [ "$end" -le $((0x8000)) ] || return 1 ;;
                 partitions) [ "$start" -ge $((0x8000)) ] && [ "$end" -le $((0x9000)) ] || return 1 ;;
-                boot_app0) [ "$start" -ge $((0xe000)) ] && [ "$end" -le $((0x10000)) ] || return 1 ;;
+                boot_app0) [ "$start" -eq $((0xe000)) ] && [ "$end" -le $((0x10000)) ] || return 1 ;;
                 app) [ "$start" -eq $((0x10000)) ] && [ "$end" -le $((0x190000)) ] || return 1 ;;
             esac
             previous=$end

@@ -110,6 +110,12 @@ class BashFlashTests(unittest.TestCase):
                     altered["app_offset"] = value
                 self.save(altered)
                 self.run_bash('flash_validate "$1" false', success=False)
+        for part_index, offset in ((0, "0x1000"), (2, "0xf000")):
+            with self.subTest(part=self.manifest["parts"][part_index]["name"], offset=offset):
+                altered = copy.deepcopy(self.manifest)
+                altered["parts"][part_index]["offset"] = offset
+                self.save(altered)
+                self.run_bash('flash_validate "$1" false', success=False)
 
     def test_cleanup_rejects_enrollment(self):
         self.run_bash('flash_validate "$1" true', success=False)

@@ -69,12 +69,12 @@ function Invoke-TrackerFlash {
             # Safety fences from the Supreme sketch partitions.csv. Commands
             # use manifest offsets, never these fence values.
             $safe = switch -CaseSensitive ($part.name) {
-                'bootloader' { $end -le 0x8000 }
+                'bootloader' { $start -eq 0x0 -and $end -le 0x8000 }
                 'partitions' { $start -ge 0x8000 -and $end -le 0x9000 }
-                'boot_app0' { $start -ge 0xe000 -and $end -le 0x10000 }
+                'boot_app0' { $start -eq 0xe000 -and $end -le 0x10000 }
                 'app' { $start -eq 0x10000 -and $end -le 0x190000 -and $part.offset -ceq $m.app_offset }
             }
-            if (-not $safe) { throw 'Part crosses a reserved region (NVS or trip storage), app does not start at the factory slot, or app_offset differs.' }
+            if (-not $safe) { throw 'Part crosses a reserved region (NVS or trip storage), does not start at its required offset, or app_offset differs.' }
             $previous = $end
         }
         return $m

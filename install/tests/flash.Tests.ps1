@@ -107,6 +107,10 @@ try {
     Assert-Rejected { Test-FlashManifest $folder $false }
     $m = New-Fixture; $m.parts[2].offset = $nvsStart; Save-Fixture $m
     Assert-Rejected { Test-FlashManifest $folder $false }
+    $m = New-Fixture; $m.parts[0].offset = '0x1000'; Save-Fixture $m
+    Assert-Rejected { Test-FlashManifest $folder $false }
+    $m = New-Fixture; $m.parts[2].offset = '0xf000'; Save-Fixture $m
+    Assert-Rejected { Test-FlashManifest $folder $false }
     Assert-Equal (Select-FlashPort 'COMx' @() '') 'COMx'
     Assert-Equal (Select-FlashPort '' @('COMx') '') 'COMx'
     Assert-Equal (Select-FlashPort '' @('COMx', 'COMy') '2') 'COMy'
