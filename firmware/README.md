@@ -1432,6 +1432,59 @@ be recorded to flash. There is no fixed total bound for progressing repairs.
 If internal flash also hangs, the next startup hang latches no-storage mode;
 trips cannot be recorded, but charge and battery power management continue.
 
+#### SD power-cut bench check
+
+**Scratch microSD card only. This test deliberately interrupts card power
+and can destroy all data on the card. Remove your trip card before using
+this build.** Use USB power with the battery removed and the LoRa antenna
+attached. Power off before inserting or removing a card.
+
+1. On a PC, verify the scratch drive letter and format that card as FAT32
+   with 32 KiB allocation units. Create an empty file named `SDBENCH.OK`
+   at the root (for example, `New-Item -ItemType File X:\SDBENCH.OK` in
+   PowerShell, with the scratch drive letter in place of `X:`). Check the
+   extension if your file manager hides it. The firmware never formats the
+   card and refuses to write without the marker on every mount.
+2. Run the usual version-stamping step and compile Stage 4 with the usual
+   Supreme board settings. Add one of these to the `arduino-cli compile`
+   command. Use the SD bench flag by itself, without the watchdog bench
+   flags.
+
+   | Test | Extra compile option |
+   | --- | --- |
+   | Clean unmount, immediate card-rail cut (v1.07 delay) | `--build-property "compiler.cpp.extra_flags=-DSD_BENCH_POWER_CUT=1 -DSD_BENCH_DELAY_MS=0"` |
+   | Clean unmount, 500 ms before the cut (v1.08 delay) | `--build-property "compiler.cpp.extra_flags=-DSD_BENCH_POWER_CUT=1 -DSD_BENCH_DELAY_MS=500"` |
+   | Card-rail cut during journal acknowledgement sync | `--build-property "compiler.cpp.extra_flags=-DSD_BENCH_POWER_CUT=2" --build-property "compiler.c.elf.extra_flags=-Wl,--wrap=ff_disk_write"` |
+
+   The delay is in milliseconds and defaults to zero. In mode 2 it starts
+   when FatFs reaches the ack sector write inside `fsync()` and hands the
+   cut request to the other core. The linker option enables that trigger
+   with Arduino-ESP32 3.3.11. The default limit is 50 cycles. Add
+   `-DSD_BENCH_CYCLES=5` inside the same quoted compiler flags for a short
+   first run.
+3. Flash the bench build, connect at 115200 baud, and send `s` after the
+   `SD BENCH` prompt. Keep the serial log. The tracker writes a synthetic
+   GPX file and a journal event and acknowledges it locally each cycle.
+   It skips GPS, WiFi and internal trip storage. After each cut it remounts,
+   runs the read-only mount guard, and checks FAT[0] and FAT[1] in both
+   copies (low 28 bits). Each `remounted; FAT checks passed` line identifies
+   the cycle that passed. In mode 2, `overlaps` counts cuts whose rail-off
+   read-back finished before the ack sector write returned. An ack failure
+   is expected when the cut interrupts sync. A run with zero overlaps gives
+   no confirmed overlap with that write. A scope on the card supply and SPI
+   bus can verify the actual electrical timing. The ESP32 stays up in both
+   modes.
+4. After the five-cycle trial, start with a fresh scratch filesystem and
+   run 20–50 cycles per condition, or until `SD BENCH STOP`. Expect
+   `limit reached; FAT checks passed` on a completed run. A post-cut
+   mount failure or failed guard stops the run before any new write. Save
+   the log, power down, and image the scratch card before running any
+   repair. The original failure signature is both FAT copies wiped or
+   overwritten. A failed remount or one bad entry is evidence to inspect
+   the image, and the quick check can miss damage outside the areas it reads.
+5. Recompile and flash without any SD bench flags before reinstalling the
+   trip card. A reset of the bench build waits for a new `s` command.
+
 #### Startup failures
 
 `DEGRADED:` Serial lines mean trips are **not being
