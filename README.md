@@ -468,6 +468,8 @@ Update the server first, so it understands the new firmware's diagnostics.
    your settings. Your configuration and trips are kept.
 2. Rerun **Step 2 on your PC** and answer **no** to first install. A normal
    update writes only the app and keeps the existing partition layout.
+   Don't use `-FirstInstall` / `--first-install` for routine updates: it
+   erases the board's settings and internal trips.
 
 To get the larger internal store on a board with the original layout,
 upload or back up any trips still on internal flash first. Then use the
