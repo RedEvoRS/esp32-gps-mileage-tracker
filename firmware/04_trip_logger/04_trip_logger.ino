@@ -2184,20 +2184,26 @@ static void serviceChargeTemp() {
         gChargeFirstResolved = true;
     bool firstGrace = !gChargeFirstResolved;
     // Debug reuses this check's samples, including NAN on failure.
+    const bool dieChanged = std::isfinite(die) != std::isfinite(gDebugTempDie);
     gDebugTempDie = die;
     gDebugTempDieMs = now;
     const float air = readChargeAir();
-    if (std::isfinite(air) != std::isfinite(gChargeAirC)) {
-        Serial.println(std::isfinite(air) ? "Charge guard: using both sensors."
-                                         : "Charge guard: using die only.");
+    const bool airAvailable = std::isfinite(air);
+    if (airAvailable != std::isfinite(gChargeAirC) || (airAvailable && dieChanged)) {
+        if (airAvailable) {
+            Serial.println(std::isfinite(die) ? "Charge guard: using both sensors."
+                                             : "Charge guard: board air available, die unreadable.");
+        } else {
+            Serial.println(std::isfinite(die) ? "Charge guard: using die only."
+                                             : "Charge guard: no usable sensor readings.");
+        }
     }
     gChargeAirC = air;
     const auto decision = charge_temperature::evaluate(
         die, air, gChargePauseRequested,
         CHG_HOT_PAUSE_C, CHG_HOT_RESUME_C, CHG_COLD_PAUSE_C, CHG_COLD_RESUME_C, DIE_OFFSET_C);
     const bool pause = decision.pause;
-    // Only finite, plausible readings update hysteresis history; unreadable
-    // samples pause charging fail-safe without creating hot/cold history.
+    // A missing die blocks charging. Only plausible samples create hot/cold history.
     gChargePauseRequested = decision.nextPauseRequested;
 
     if (!gEarlyChargeDisabled) {
@@ -2232,13 +2238,18 @@ static void serviceChargeTemp() {
             char boardAir[24] = "";
             if (std::isfinite(air)) snprintf(boardAir, sizeof boardAir, ", board air %.1f C", air);
             if (pause && !firstGrace) {
-                const char* dieReason = decision.unreadable ? "die unreadable" :
-                    decision.die.hot ? "die estimate too hot" : decision.die.cold ? "die estimate too cold" : "";
                 const char* airReason = decision.air.hot ? "board air too hot" :
                     decision.air.cold ? "board air too cold" : "";
-                Serial.printf("Charging paused: %s%s%s (die %.1f C, battery ~%.0f C%s)\n",
-                              dieReason, *dieReason && *airReason ? ", " : "", airReason,
-                              die, die - DIE_OFFSET_C, boardAir);
+                if (decision.unreadable) {
+                    Serial.printf("Charging paused: die unreadable%s%s%s\n",
+                                  *airReason ? ", " : "", airReason, boardAir);
+                } else {
+                    const char* dieReason = decision.die.hot ? "die estimate too hot" :
+                        decision.die.cold ? "die estimate too cold" : "";
+                    Serial.printf("Charging paused: %s%s%s (die %.1f C, battery ~%.0f C%s)\n",
+                                  dieReason, *dieReason && *airReason ? ", " : "", airReason,
+                                  die, die - DIE_OFFSET_C, boardAir);
+                }
             } else if (!pause) {
                 Serial.printf(first ? "Charge guard: die %.1f C (battery ~%.0f C%s), charging on.\n"
                                     : "Charging resumed (die %.1f C, battery ~%.0f C%s)\n",
@@ -2255,14 +2266,15 @@ static void serviceChargeTemp() {
 
     if (gJournalReady) {
         // E2004/E2005 describe a required pause, not a confirmed charger state.
-        // Follow intent/hysteresis even if control is unconfirmed. Context is
-        // measured die temperature, not an invented cell measurement.
-        // Unreadable samples carry no temperature.
-        if (!decision.unreadable) {
+        // After startup grace, board air can raise a condition on its own.
+        // Clearing requires a usable die reading. Context uses the measured die.
+        if (!firstGrace) {
             for (auto code : {diagnostics::Code::CHARGE_HOT, diagnostics::Code::CHARGE_COLD}) {
+                const bool active = code == diagnostics::Code::CHARGE_HOT ? decision.hot() : decision.cold();
+                if (decision.unreadable && !active) continue;
                 gLoopFaults.event(code, now);
-                gLoopFaults.integer("temperature_mc", int(die * 1000));
-                gLoopFaults.condition(code == diagnostics::Code::CHARGE_HOT ? decision.hot() : decision.cold());
+                if (!decision.unreadable) gLoopFaults.integer("temperature_mc", int(die * 1000));
+                gLoopFaults.condition(active);
             }
         }
         if (!firstGrace) gLoopFaults.event(diagnostics::Code::CHARGE_TEMP_UNREADABLE, now).condition(decision.unreadable);
@@ -2277,7 +2289,7 @@ static void serviceChargeTemp() {
     // Charging was already commanded off during the retries, so the state
     // block above prints nothing when the window ends without a reading.
     if (first && !firstGrace && decision.unreadable)
-        Serial.printf("Charge guard: no plausible temperature in the first %lu s; charging stays off.\n",
+        Serial.printf("Charge guard: no plausible die temperature in the first %lu s; charging stays off.\n",
                       (unsigned long)(CHG_FIRST_GRACE_MS / 1000));
 }
 

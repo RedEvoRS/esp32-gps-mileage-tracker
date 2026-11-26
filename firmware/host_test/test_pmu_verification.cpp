@@ -514,7 +514,7 @@ int main() {
     auto unreadable = one(2006, "raise");
     assert(unreadable.find("temperature_mc") == std::string::npos);
     // The pause was commanded silently during the retries; say so once now.
-    assert(logCount("no plausible temperature in the first 10 s; charging stays off") == 1);
+    assert(logCount("no plausible die temperature in the first 10 s; charging stays off") == 1);
     assert(!logCount("Charging paused") && !logCount("Charge guard: die"));
     auto n = calls("getTemperature");
     g_millis += CHG_CHECK_MS - 1; serviceChargeTemp(); assert(calls("getTemperature") == n);

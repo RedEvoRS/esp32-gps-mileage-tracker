@@ -142,6 +142,83 @@ static void testGuard() {
     REQUIRE(Wire.begins == 1 && Wire.ends == 0);
 }
 
+static void testUnreadableDieWithAir() {
+    for (bool cold : {true, false}) {
+        const int code = cold ? 2005 : 2004;
+        const int otherCode = cold ? 2004 : 2005;
+        const auto paused = pmu_read::ChargeState::Paused;
+        prepare(); beginProductionDisplay(); gChargeAirPowered = true;
+        serviceChargeTemp();
+        REQUIRE(gChargeState == pmu_read::ChargeState::Charging);
+        take();
+
+        PMU.dieC = 385.7f;
+        setAirRaw(cold ? 415148 : 600000);
+        chargeTick();
+        REQUIRE(gChargeState == paused && gChargePauseRequested);
+        const auto rows = take();
+        const auto airFault = codeRows(rows, code);
+        const auto unreadable = codeRows(rows, 2006);
+        REQUIRE(airFault.size() == 1 && unreadable.size() == 1 && codeRows(rows, otherCode).empty());
+        has(airFault.front(), "\"transition\":\"raise\"");
+        has(unreadable.front(), "\"transition\":\"raise\"");
+        REQUIRE(airFault.front().find("temperature_mc") == std::string::npos);
+        REQUIRE(linesContaining("board air available, die unreadable") == 1);
+        REQUIRE(linesContaining(cold ? "Charging paused: die unreadable, board air too cold" :
+                                       "Charging paused: die unreadable, board air too hot") == 1);
+        gDebugMode = true;
+        gDebugTempLogMs = g_millis - 30000;
+        logTick();
+        char temperatures[80];
+        std::snprintf(temperatures, sizeof temperatures,
+                      "die -- C, guard_est -- C, BME280 %.2f C", gChargeAirC);
+        REQUIRE(tempLine().find(temperatures) != std::string::npos);
+
+        setAirRaw(519888); // In-range air cannot clear a pause without a die reading.
+        chargeTick();
+        REQUIRE(gChargeState == paused && gChargePauseRequested && take().empty());
+        bmeMissing = true;
+        chargeTick();
+        REQUIRE(gChargeState == paused && gChargePauseRequested && take().empty());
+        REQUIRE(linesContaining("no usable sensor readings") == 1);
+
+        PMU.dieC = 30;
+        bmeMissing = false;
+        setAirRaw(cold ? 450000 : 575000); // Between pause and resume thresholds.
+        chargeTick();
+        REQUIRE(cold ? (gChargeAirC > 0 && gChargeAirC < 5) : (gChargeAirC > 38 && gChargeAirC < 45));
+        REQUIRE(gChargeState == paused && gChargePauseRequested);
+        one(2006, "clear");
+        REQUIRE(linesContaining("using both sensors") == 2);
+
+        setAirRaw(519888);
+        chargeTick();
+        REQUIRE(gChargeState == pmu_read::ChargeState::Charging && !gChargePauseRequested);
+        has(one(code, "clear"), "\"temperature_mc\":30000");
+    }
+}
+
+static void testUnreadableDieStartupWithAir() {
+    prepare(); beginProductionDisplay(); gChargeAirPowered = true;
+    PMU.dieC = 385.7f;
+    setAirRaw(415148);
+    serviceChargeTemp();
+    REQUIRE(!gChargeFirstResolved && gChargePauseRequested);
+    REQUIRE(gChargeState == pmu_read::ChargeState::Paused && take().empty());
+
+    setAirRaw(450000); // Warmer air still needs the cold resume threshold.
+    g_millis = gChargeCheckT0 + CHG_FIRST_RETRY_MS;
+    serviceChargeTemp();
+    REQUIRE(!gChargeFirstResolved && gChargePauseRequested && take().empty());
+
+    g_millis = gChargeFirstMs + CHG_FIRST_GRACE_MS;
+    serviceChargeTemp();
+    REQUIRE(gChargeFirstResolved && gChargePauseRequested);
+    const auto rows = take();
+    REQUIRE(codeRows(rows, 2005).size() == 1 && codeRows(rows, 2006).size() == 1);
+    REQUIRE(linesContaining("no plausible die temperature") == 1);
+}
+
 static void testDebugLog() {
     prepare();
     beginProductionDisplay(); gChargeAirPowered = true;
@@ -221,6 +298,8 @@ static void testDebugTiming() {
 
 int main() {
     testGuard();
+    testUnreadableDieWithAir();
+    testUnreadableDieStartupWithAir();
     testDebugLog();
     testDebugTiming();
     std::printf("PASS temperature runtime: %u checks (guard ownership, fault transitions, fallback, debug reuse and TS untouched)\n", checks);
