@@ -331,13 +331,11 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   15-minute repeats; WiFi access point (AP) absence is a boot-local counter,
   never a scan event. Per-core static producer builders keep event buffers
   off task stacks. Bounded degraded startup retries restart on recovery.
-  The charge guard accepts finite die readings only from -40 to 125 C.
-  An unreadable first sample keeps charging off and retries each second for
-  ten seconds before E2006; plausible hot/cold samples act immediately.
-  Invalid samples never create hot/cold history or real debug temperatures.
-  The first-reading retry has host tests only: bench boots on 2026-11-10 (UTC)
-  were USB resets with a usable first reading, so a start from fully off is
-  unchecked.
+  The charge guard checks die minus 9 C and fresh BME280 board air. Either
+  can pause charging at <=0 or >=45 C; all available readings must return
+  to 5–38 C. Missing air falls back to die alone. An unreadable die pauses
+  charging, preserves hot/cold history and retries each second for up to
+  ten seconds on startup before E2006. Debug reuses both guard samples.
 - Diagnostic journal: the network task services one queued record at a time
   using a zero-wait filesystem lock and yields maintenance to trip/upload
   demand. Mounted SD has a 16 MiB journal quota; LittleFS has a 64 KiB reserve

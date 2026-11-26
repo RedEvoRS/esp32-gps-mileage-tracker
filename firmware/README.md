@@ -1219,13 +1219,15 @@ How it behaves once flashed:
   running, hold BOOT then tap POWER to toggle debug; it starts off at every
   power-on. BOOT held during power-up still means download mode.
   See [The screen](#the-screen).
-- **Charging:** the firmware pauses charging at high or low temperatures
-  reported by the AXP2101 power-management chip. Its temperature is an
-  indirect estimate using a 9 °C die-temperature offset measured on the
-  retired V1.2; recalibration for the Supreme is still pending. Debug mode
-  logs the readings it needs (the `Temp:` line under [The screen](#the-screen)).
-  This is not a measurement of the battery cell or a guarantee of safe charging in a
-  hot car. Logging continues while charging is paused.
+- **Charging:** the firmware checks the AXP2101 power chip and the BME280
+  board-air sensor every 30 seconds. The guard subtracts 9 °C from the chip
+  temperature to estimate battery temperature. Charging heats the chip, so
+  the board-air reading helps catch cold conditions that the chip can miss.
+  Either reading pauses charging at 0 °C or below or 45 °C or above. All
+  available readings must return to 5–38 °C before charging resumes. When
+  board air is unavailable for a check, the guard uses the chip alone.
+  These are indirect estimates of cell temperature. Logging continues
+  while charging is paused.
   A die reading must be finite and between -40 and 125 C to be usable.
   An unreadable first sample keeps charging off and retries each second for
   ten seconds, without blocking startup or raising E2004/E2005/E2006.
@@ -1233,9 +1235,6 @@ How it behaves once flashed:
   E2006 is raised and retries return to 30 seconds. Runtime garbage after a
   good reading pauses charging and raises E2006 at once. Invalid readings
   never clear hot/cold faults or appear as real debug temperatures.
-  This first-reading retry is covered by host tests only. The 2026-11-10
-  (UTC) bench boots were USB resets whose first reading was already usable,
-  so a start from fully off is still unchecked.
   The guard verifies every charger on/off command with a checked register read
   and retries unconfirmed commands at the sampling cadence; E2008 means three attempts failed
   to confirm the requested state, so charging may still be on or remain off.
@@ -1608,19 +1607,11 @@ Things to know:
   `rf --`, and unknown or stale NMEA values show `--`. Antenna status
   and power may read `DONTKNOW` without an antenna supervisor; that
   alone does not mean the antenna failed.
-- Debug mode also prints a `Temp:` line every 30 s: the guard's PMU die
-  temperature with sample age and its die-minus-9 C estimate (the retired
-  V1.2 calibration; samples older than 35 s show `--`),
-  TS voltage/raw ADC count, BME280 temperature, actual charging/phase,
-  battery voltage/percent and VBUS. Unavailable values show `--`. Compare
-  TS voltage across temperatures to identify whether the Supreme's TS
-  resistor is fixed (flat) or a thermistor (temperature-dependent); TS stays
-  independent of the charger, with a 50 uA measurement bias. BME280 uses
-  temperature-only forced mode on the OLED's core/bus; its ALDO1 supply
-  (also OLED/magnetometer) is set to 3.3 V and enabled at trusted PMU startup.
-  If that setup cannot be confirmed, boot continues with a serial warning;
-  the display or sensors may be unavailable. These readings do not change
-  the guard's offset or thresholds. The line and probes are debug-only.
+- Debug mode prints a `Temp:` line every 30 s. It reuses the charge guard's
+  latest PMU die temperature, die-minus-9 °C estimate and BME280 board-air
+  temperature. It also shows sample age next to the die reading, actual
+  charging state and phase, battery voltage and percent, and USB power
+  (VBUS). Unavailable values and guard samples older than 35 s show `--`.
 - The screen can't stop logging. If it is missing or an I2C write fails,
   the affected display stays off until the next boot. The debug display
   prints `WARNING: debug OLED I2C failed` once. A production-display failure

@@ -9,27 +9,40 @@ inline bool plausible(float dieC) {
     return std::isfinite(dieC) && dieC >= kMinDieC && dieC <= kMaxDieC;
 }
 
+inline bool plausibleAir(float airC) {
+    return airC >= -40.0f && airC <= 85.0f;
+}
+
+struct Limits {
+    bool hot;
+    bool cold;
+};
+
 struct Decision {
     bool pause;
     bool nextPauseRequested;
     bool unreadable;
-    const char* why;
+    Limits die;
+    Limits air;
+    bool hot() const { return die.hot || air.hot; }
+    bool cold() const { return die.cold || air.cold; }
 };
 
-// Pure hysteresis decision for the charge temperature guard.
-// Unreadable or implausible readings pause charging fail-safe without creating
-// or clearing hot/cold hysteresis history.
-inline Decision evaluate(float dieC, bool pauseRequested,
+// Thresholds are in battery terms. Pass NAN when this check has no fresh air
+// sample. The die reading is required and an invalid die preserves hysteresis.
+inline Decision evaluate(float dieC, float airC, bool pauseRequested,
                          float hotPauseC, float hotResumeC,
-                         float coldPauseC, float coldResumeC) {
+                         float coldPauseC, float coldResumeC, float dieOffsetC) {
     if (!plausible(dieC)) {
-        return {true, pauseRequested, true, "temperature unreadable"};
+        return {true, pauseRequested, true, {}, {}};
     }
-    if (pauseRequested) {
-        const bool pause = !(dieC <= hotResumeC && dieC >= coldResumeC);
-        return {pause, pause, false, dieC > hotResumeC ? "too hot" : "too cold"};
-    }
-    const bool pause = dieC >= hotPauseC || dieC <= coldPauseC;
-    return {pause, pause, false, dieC >= hotPauseC ? "too hot" : "too cold"};
+    const auto limits = [&](float c) -> Limits {
+        if (pauseRequested) return {c > hotResumeC, c < coldResumeC};
+        return {c >= hotPauseC, c <= coldPauseC};
+    };
+    const Limits die = limits(dieC - dieOffsetC);
+    const Limits air = plausibleAir(airC) ? limits(airC) : Limits{};
+    const bool pause = die.hot || die.cold || air.hot || air.cold;
+    return {pause, pause, false, die, air};
 }
 }

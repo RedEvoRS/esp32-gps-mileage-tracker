@@ -61,7 +61,7 @@ static RuntimeFaults::Observation observation(unsigned code) {
     assert(false); return {};
 }
 static void noTrips() {
-    assert(!gDebugTempEnabled);
+    assert(!debugMode());
     const auto tsWrites = std::count_if(PMU.registerWrites.begin(), PMU.registerWrites.end(), [](const auto& w) {
         return w.first == XPOWERS_AXP2101_TS_PIN_CTRL || w.first == XPOWERS_AXP2101_ADC_CHANNEL_CTRL;
     });

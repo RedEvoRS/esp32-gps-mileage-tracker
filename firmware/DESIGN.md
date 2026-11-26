@@ -31,8 +31,7 @@ At the end of a normal pass, `loop()` checks the UART again and calls
 power work suppress that pause. At 9,600 baud, about five bytes can arrive
 during 5 ms, compared with the 4,096-byte buffer. This lets core 1 idle
 between bursts. The 40 ms BOOT debounce and latched PMU IRQ still run each
-pass; the debug page keeps its one-second redraw, and the BME280 conversion
-can finish on a later pass after its 5 ms wait. The RTC still waits for the
+pass and the debug page keeps its one-second redraw. The RTC still waits for the
 first 100 ms of a second, GPS configuration keeps its two-second ACK window,
 and NAV-PVT keeps its 1,500 ms freshness limit. Host regressions exercise
 these with time advancing through the pause. The degraded loop keeps its
@@ -204,7 +203,24 @@ The watchdog reset was bench-checked on 2026-11-10 (UTC); the results and
 what remains unchecked are in the same README section. Host control-flow
 tests and real board builds do not prove SD durability.
 
-## First charge-temperature reading
+## Charge-temperature guard
+
+The Supreme has no battery thermistor. Every 30 seconds, the guard compares
+the power chip's die temperature minus 9 °C and the BME280 board-air
+temperature to the same limits. Charging heats the die and can hide a cold
+cell from the die estimate. Board air changes much less during charging and
+helps catch a cold start after the device has sat in a cold cabin. Either
+reading requests a pause at or below 0 °C or at or above 45 °C. To resume,
+every available reading must be within 5–38 °C, inclusive.
+
+Core 1 triggers a fresh temperature-only conversion on the OLED's `Wire`
+bus. It yields for 6 ms to allow the conversion and tick rounding, then
+reads the result in the same guard check. The driver stops on the first
+failed transaction, which can cost one 10 ms bus timeout. If the bus is
+uninitialized, the ALDO1 supply was unconfirmed, or the sample fails or
+falls outside -40 to 85 °C, the guard uses the die estimate alone for that
+check. Debug logging reuses this pair of samples even though its print
+interval is independent. It makes no additional temperature reads.
 
 `charge_temperature.h` accepts only finite die readings from -40 to 125 C.
 These are plausibility bounds, not battery charging limits. XPowersLib 0.3.3
@@ -215,8 +231,8 @@ The first normal or no-storage check commands and verifies charging off if
 the reading is implausible. The loop retries every `CHG_FIRST_RETRY_MS`
 (one second) for `CHG_FIRST_GRACE_MS` (ten seconds), without a setup wait.
 During this grace period there is no hot/cold event or E2006. A plausible
-reading immediately uses the existing thresholds and charger read-back rules;
-a plausible hot reading still raises E2004 at once. Grace expiry raises
+die reading lets the guard apply the temperature limits and charger read-back
+rules immediately. Grace expiry raises
 E2006, prints one serial line saying charging stays off, and returns to
 30-second sampling. Later plausible recovery clears it.
 Any implausible sample after the first good one immediately follows the normal

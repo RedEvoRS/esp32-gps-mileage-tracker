@@ -542,8 +542,8 @@ int main() {
     // E2008; a later matching read-back clears that same episode.
     for (unsigned failure = 0; failure < 4; ++failure) {
         pmuWorld(); bool resume = failure == 3;
-        if (resume) { PMU.dieC = CHG_HOT_PAUSE_C; serviceChargeTemp(); one(2004, "raise"); }
-        PMU.dieC = resume ? 30 : CHG_HOT_PAUSE_C;
+        if (resume) { PMU.dieC = 54.0f; serviceChargeTemp(); one(2004, "raise"); }
+        PMU.dieC = resume ? 30.0f : 54.0f;
         PMU.failChargeDisable = failure == 0;
         PMU.failChargeRead = failure == 1;
         if (failure == 2) PMU.registerReadOverride[XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL] = 2;
@@ -571,9 +571,9 @@ int main() {
     }
     // Failed pause retains hysteresis; a cooler-but-not-yet-safe reading must
     // retry disable, never enable. Unreadable temperature does the same.
-    pmuWorld(); PMU.dieC = CHG_HOT_PAUSE_C; PMU.failChargeDisable = true;
+    pmuWorld(); PMU.dieC = 54.0f; PMU.failChargeDisable = true;
     serviceChargeTemp(); one(2004, "raise");
-    PMU.dieC = CHG_HOT_RESUME_C + 1; chargeTick();
+    PMU.dieC = 48.0f; chargeTick();
     assert(calls("disableCellbatteryCharge") == 2 && calls("enableCellbatteryCharge") == 0);
     PMU.dieC = INFINITY; chargeTick(); auto rows = take();
     assert(codeRows(rows, 2006).size() == 1 && codeRows(rows, 2008).size() == 1);
@@ -897,10 +897,10 @@ int main() {
         assert(PMU.chargeEnabled && !gChargePauseRequested); ++cases;
     }
     // (3) Existing cold pause history is still preserved across a transient unreadable reading.
-    pmuWorld(); PMU.dieC = CHG_COLD_PAUSE_C; serviceChargeTemp(); one(2005, "raise");
+    pmuWorld(); PMU.dieC = 9.0f; serviceChargeTemp(); one(2005, "raise");
     PMU.dieC = NAN; chargeTick(); one(2006, "raise");
     assert(!PMU.chargeEnabled && gChargePauseRequested);
-    PMU.dieC = 11.0f; chargeTick(); // still below CHG_COLD_RESUME_C (14 C)
+    PMU.dieC = 11.0f; chargeTick(); // still below the 14 C die resume threshold
     auto coldRows = take();
     assert(codeRows(coldRows, 2006).size() == 1 && codeRows(coldRows, 2005).empty());
     assert(!PMU.chargeEnabled && gChargePauseRequested); ++cases;

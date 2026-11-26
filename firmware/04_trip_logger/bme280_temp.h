@@ -52,7 +52,7 @@ class Sensor {
     }
     bool failed() { ready_ = pending_ = false; return false; }
 public:
-    // Only called once per logging interval, including retries after absence.
+    // Called once per guard check, including retries after absence.
     template<class Bus> bool trigger(Bus& bus, uint32_t now) {
         pending_ = false;
         uint8_t status;

@@ -480,7 +480,7 @@ int main(int argc, char** argv) {
             if (resumedAt < 0 && PMU.chargeEnabled) resumedAt = c;
         }
         printf("  (resumed at die %.1f C ~ battery %.1f C)\n", resumedAt, resumedAt - DIE_OFFSET_C);
-        CHECK(resumedAt <= CHG_HOT_RESUME_C && resumedAt > CHG_HOT_RESUME_C - 1, "resumed on its own near 47 C");
+        CHECK(resumedAt <= 47.0f && resumedAt > 46.0f, "resumed on its own near 47 C");
         CHECK(PMU.chargeEnabled, "charging at the end");
     }
 

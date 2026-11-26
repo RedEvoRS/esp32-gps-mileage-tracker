@@ -1,5 +1,6 @@
 #include "../04_trip_logger/debug_temperature.h"
 #include "../04_trip_logger/charge_temperature.h"
+#include "../04_trip_logger/bme280_temp.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -49,18 +50,55 @@ static Bus sensorBus() {
     return bus;
 }
 struct Pmu {
-    std::map<uint8_t,int> regs{{0x50,0x10},{0x30,0x1d},{0x00,0x28},{0x01,0x22},
+    std::map<uint8_t,int> regs{{0x00,0x28},{0x01,0x22},
                                {0xA4,85},{0x34,0x0f},{0x35,0xb4}};
-    std::vector<std::pair<uint8_t,uint8_t>> writes;
-    unsigned reads = 0, failRead = 0, failWrite = 0, ignoredWrite = 0;
-    int readRegister(uint8_t reg) { return ++reads == failRead ? -1 : regs[reg]; }
-    int writeRegister(uint8_t reg, uint8_t val) {
-        writes.emplace_back(reg,val);
-        if (writes.size() == failWrite) return -1;
-        if (writes.size() != ignoredWrite) regs[reg] = val;
-        return 0;
-    }
+    int readRegister(uint8_t reg) { return regs[reg]; }
 };
+
+static void testChargeDecision() {
+    auto evaluate = [](float die, float air, bool paused = false) {
+        return charge_temperature::evaluate(die, air, paused, 45.0f, 38.0f, 0.0f, 5.0f, 9.0f);
+    };
+    auto dieHot = evaluate(54, 20), dieCold = evaluate(9, 20);
+    auto airHot = evaluate(30, 45), airCold = evaluate(30, 0);
+    REQUIRE(dieHot.pause && dieHot.hot() && dieHot.die.hot && !dieHot.air.hot && !dieHot.cold());
+    REQUIRE(dieCold.pause && dieCold.cold() && dieCold.die.cold && !dieCold.air.cold && !dieCold.hot());
+    REQUIRE(airHot.pause && airHot.hot() && airHot.air.hot && !airHot.die.hot && !airHot.cold());
+    REQUIRE(airCold.pause && airCold.cold() && airCold.air.cold && !airCold.die.cold && !airCold.hot());
+    auto split = evaluate(54, 0);
+    REQUIRE(split.pause && split.hot() && split.cold() && split.die.hot && split.air.cold);
+    REQUIRE(evaluate(30, -40).air.cold && evaluate(30, 85).air.hot);
+    REQUIRE(!evaluate(53.99f, 44.99f).pause && !evaluate(9.01f, 0.01f).pause);
+
+    for (float die : {14.0f, 47.0f}) for (float air : {5.0f, 38.0f}) {
+        auto resumed = evaluate(die, air, true);
+        REQUIRE(!resumed.pause && !resumed.nextPauseRequested && !resumed.hot() && !resumed.cold());
+    }
+    REQUIRE(evaluate(47.01f, 20, true).die.hot && evaluate(13.99f, 20, true).die.cold);
+    REQUIRE(evaluate(30, 38.01f, true).air.hot && evaluate(30, 4.99f, true).air.cold);
+
+    // NAN represents an absent, failed or stale sample. Compare fallbacks
+    // with the original die-only thresholds, including each exact boundary.
+    for (float air : {NAN, INFINITY, -INFINITY, -40.01f, 85.01f}) {
+        for (float die : {-40.0f, 9.0f, 9.01f, 13.99f, 14.0f, 30.0f, 47.0f, 47.01f, 53.99f, 54.0f, 125.0f}) {
+            for (bool paused : {false, true}) {
+                bool hot = paused ? die > 47 : die >= 54;
+                bool cold = paused ? die < 14 : die <= 9;
+                auto result = evaluate(die, air, paused);
+                REQUIRE(result.pause == (hot || cold) && result.nextPauseRequested == result.pause);
+                REQUIRE(!result.unreadable && result.hot() == hot && result.cold() == cold);
+                REQUIRE(!result.air.hot && !result.air.cold);
+            }
+        }
+    }
+    for (float die : {NAN, INFINITY, -INFINITY, -40.01f, 125.01f, 385.7f}) {
+        for (float air : {NAN, -5.0f, 20.0f, 50.0f}) for (bool paused : {false, true}) {
+            auto result = evaluate(die, air, paused);
+            REQUIRE(result.pause && result.nextPauseRequested == paused && result.unreadable);
+            REQUIRE(!result.hot() && !result.cold());
+        }
+    }
+}
 int main() {
     const bme280_temp::Calibration calibrations[] = {
         {27504,26435,-1000}, {27504,-26435,1000}, {32000,19000,-12000}, {24000,-19000,-12000}
@@ -118,31 +156,6 @@ int main() {
         centi = -9999;
         REQUIRE(!s.finish(broken,5,centi) && centi == -9999);
     }
-    for (unsigned old = 0; old < 256; ++old) {
-        Pmu p; p.regs[0x30] = old;
-        auto result = debug_temperature::setupTs(p);
-        REQUIRE(result.ready && result.control == 0x16 && result.adc == int(old | 2));
-        REQUIRE(p.writes.size() == 2 && p.writes[0].first == 0x50 && p.writes[1].first == 0x30);
-        REQUIRE((p.writes[0].second & 0x10) != 0);
-    }
-    for (unsigned fail=1;fail<=4;++fail) {
-        Pmu p; p.failRead=fail;
-        REQUIRE(!debug_temperature::setupTs(p).ready);
-        REQUIRE(p.writes.size() == (fail==1 ? 0u : fail==4 ? 2u : 1u));
-    }
-    for (unsigned fail=1;fail<=2;++fail) {
-        Pmu p; p.failWrite=fail; REQUIRE(!debug_temperature::setupTs(p).ready);
-        Pmu q; q.ignoredWrite=fail; REQUIRE(!debug_temperature::setupTs(q).ready);
-    }
-    REQUIRE(debug_temperature::tsRaw(0x84,0) == 1024); // non-data high bits masked
-    REQUIRE(std::abs(debug_temperature::tsVolts(1024) - 0.512) < 0.000001);
-    REQUIRE(debug_temperature::tsVolts(0) == 0);
-    REQUIRE(std::abs(debug_temperature::tsVolts(8191) - 4.0955) < 0.000001);
-    REQUIRE(debug_temperature::tsRaw(-1,0) == -1 && debug_temperature::tsRaw(0,-1) == -1);
-    REQUIRE(debug_temperature::tsRaw(0x20,0) == -1 && debug_temperature::tsRaw(0x3f,0xff) == -1);
-    REQUIRE(debug_temperature::tsRaw(0xc4,0) == 1024); // both REG36 control bits excluded
-    REQUIRE(debug_temperature::tsRaw(0xa0,0) == -1); // sentinel survives control-bit masking
-    REQUIRE(std::isnan(debug_temperature::tsVolts(-1)) && std::isnan(debug_temperature::tsVolts(8192)));
     Pmu p;
     auto power = debug_temperature::samplePower(p,42);
     REQUIRE(power.sampled && power.sampledMs == 42 && power.millivolts == 4020 && power.percent == 85);
@@ -170,19 +183,6 @@ int main() {
         if (reg == 0x00 || reg == 0xa4) REQUIRE(bad.percent == -1);
         if (reg == 0x01) REQUIRE(bad.status2 == -1);
     }
-    // Issue #804: pure charge-guard decision pauses fail-safe on unreadable
-    // readings without mutating pauseRequested hysteresis history.
-    for (float bad : {NAN, INFINITY, -INFINITY, -40.01f, 125.01f, 385.7f}) {
-        auto d0 = charge_temperature::evaluate(bad, false, 54.0f, 47.0f, 9.0f, 14.0f);
-        REQUIRE(d0.pause && !d0.nextPauseRequested && d0.unreadable);
-        auto d1 = charge_temperature::evaluate(bad, true, 54.0f, 47.0f, 9.0f, 14.0f);
-        REQUIRE(d1.pause && d1.nextPauseRequested && d1.unreadable);
-    }
-    for (float deadband : {50.0f, 11.0f}) {
-        auto fresh = charge_temperature::evaluate(deadband, false, 54.0f, 47.0f, 9.0f, 14.0f);
-        REQUIRE(!fresh.pause && !fresh.nextPauseRequested && !fresh.unreadable);
-        auto latched = charge_temperature::evaluate(deadband, true, 54.0f, 47.0f, 9.0f, 14.0f);
-        REQUIRE(latched.pause && latched.nextPauseRequested && !latched.unreadable);
-    }
-    std::printf("PASS temperature: %u checks (compensation, bounded I2C, TS setup/read failures, charge hysteresis)\n", checks);
+    testChargeDecision();
+    std::printf("PASS temperature: %u checks (compensation, bounded I2C, power reads, two-sensor hysteresis)\n", checks);
 }

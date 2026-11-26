@@ -102,11 +102,11 @@ static constexpr uint32_t DEBUG_FEEDBACK_MS = 2000;
 #include "debug_display.h"
 static uint32_t gDebugDrawMs = 0; // loop-owned redraw cadence, not renderer state
 #include "debug_temperature.h"
-static float gDebugTempDie = NAN;
+#include "bme280_temp.h"
+static float gDebugTempDie = NAN, gChargeAirC = NAN;
 static uint32_t gDebugTempDieMs = 0, gDebugTempLogMs = 0;
-static bool gDebugTempEnabled = false, gDebugTempPending = false;
-static debug_temperature::TsSetup gDebugTempTs;
-static bme280_temp::Sensor gDebugTempBme;
+static bool gChargeAirPowered = false;
+static bme280_temp::Sensor gChargeAirSensor;
 #include "production_display.h"
 static display::DisplayModel gDisplayModel;
 static bool gDisplayTripFinalized = false, gDisplayUserRequest = false;
@@ -2043,20 +2043,22 @@ static void serviceBatteryDiagnostics() {
 // Battery charge temperature guard (audit N4)
 // -----------------------------------------------------------------
 // Li-ion must only be charged at roughly 0-45 C cell temperature, and a
-// parked car's cabin passes 60 C in summer. TS is excluded from charging
-// (the Supreme's Rt is unidentified), so the AXP2101's own die temperature
-// stands in. Measured on the retired V1.2 2026-10-05: the die idles
-// ~9 C above a 25.6 C room with nothing charging, and charge current heats
-// it a few degrees more within seconds. Hence the offset, and a 7 C gap
-// between pausing and resuming so the charger's own heat can't make it
-// toggle. Pausing charging never affects logging: on USB the PMU powers
-// the board directly; the battery just isn't topped up until it cools.
-// Supreme debug-only Temp: logs collect recalibration evidence; no tuning yet.
+// parked car's cabin can pass 60 C. The Supreme has no usable cell thermistor.
+// On the Supreme the die ran 8.9-10.7 C above the BME280 without charging
+// (88 USB desk samples). At 93% battery in CV, that gap grew from 11.5
+// to 16.8 C over six minutes (15 samples), while board air rose only 0.7 C.
+// The 9 C offset comes from the retired V1.2's idle die measurements.
+// Die self-heating can pause charging early in heat and mask freezing in cold.
+// The BME280 measures board air. After a long cold soak, the cell and board
+// air track the cabin. While charging, the cell warms and board air changes
+// little, so the air reading can err toward pausing early on the cold side.
+// Either reading can pause charging; both must permit resumption. Fall back
+// to die alone if board air is unavailable. USB still powers the logger.
 static constexpr float    DIE_OFFSET_C      = 9.0f;
-static constexpr float    CHG_HOT_PAUSE_C   = 45.0f + DIE_OFFSET_C;   // battery ~45 C
-static constexpr float    CHG_HOT_RESUME_C  = 38.0f + DIE_OFFSET_C;   // battery ~38 C
-static constexpr float    CHG_COLD_PAUSE_C  =  0.0f + DIE_OFFSET_C;   // battery ~0 C
-static constexpr float    CHG_COLD_RESUME_C =  5.0f + DIE_OFFSET_C;   // battery ~5 C
+static constexpr float    CHG_HOT_PAUSE_C   = 45.0f; // all thresholds in battery terms
+static constexpr float    CHG_HOT_RESUME_C  = 38.0f;
+static constexpr float    CHG_COLD_PAUSE_C  =  0.0f;
+static constexpr float    CHG_COLD_RESUME_C =  5.0f;
 static constexpr uint32_t CHG_CHECK_MS      = 30UL * 1000;
 static constexpr uint32_t CHG_FIRST_RETRY_MS = 1000;
 static constexpr uint32_t CHG_FIRST_GRACE_MS = 10000;
@@ -2117,6 +2119,20 @@ static bool verifyChargeTarget4V1(unsigned attempts, bool forceWrite = false) {
     return false;
 }
 
+static float readChargeAir() {
+    // Production Wire readiness is independent of OLED communication.
+    if (!gChargeAirPowered || !gProductionWireReady ||
+        !gChargeAirSensor.trigger(Wire, millis())) return NAN;
+    // Yield for the 5 ms forced conversion, plus one tick of rounding margin.
+    // At 9600 baud this wait fits well within the 4096-byte GPS RX buffer.
+    // Sensor aborts on its first I2C error (Wire's timeout is 10 ms).
+    delay(6);
+    int32_t centiC;
+    if (!gChargeAirSensor.finish(Wire, millis(), centiC)) return NAN;
+    const float air = centiC / 100.0f;
+    return charge_temperature::plausibleAir(air) ? air : NAN;
+}
+
 static void serviceChargeTemp() {
     uint32_t now = millis();
     if (gChargeChecked && uint32_t(now - gChargeCheckT0) <
@@ -2134,14 +2150,19 @@ static void serviceChargeTemp() {
     if (std::isfinite(die) || uint32_t(now - gChargeFirstMs) >= CHG_FIRST_GRACE_MS)
         gChargeFirstResolved = true;
     bool firstGrace = !gChargeFirstResolved;
-    // Reuse this exact sample, including NAN on failure. No second PMU read.
+    // Debug reuses this check's samples, including NAN on failure.
     gDebugTempDie = die;
     gDebugTempDieMs = now;
+    const float air = readChargeAir();
+    if (std::isfinite(air) != std::isfinite(gChargeAirC)) {
+        Serial.println(std::isfinite(air) ? "Charge guard: using both sensors."
+                                         : "Charge guard: using die only.");
+    }
+    gChargeAirC = air;
     const auto decision = charge_temperature::evaluate(
-        die, gChargePauseRequested,
-        CHG_HOT_PAUSE_C, CHG_HOT_RESUME_C, CHG_COLD_PAUSE_C, CHG_COLD_RESUME_C);
+        die, air, gChargePauseRequested,
+        CHG_HOT_PAUSE_C, CHG_HOT_RESUME_C, CHG_COLD_PAUSE_C, CHG_COLD_RESUME_C, DIE_OFFSET_C);
     const bool pause = decision.pause;
-    const char* why = decision.why;
     // Only finite, plausible readings update hysteresis history; unreadable
     // samples pause charging fail-safe without creating hot/cold history.
     gChargePauseRequested = decision.nextPauseRequested;
@@ -2175,13 +2196,20 @@ static void serviceChargeTemp() {
                 (unsigned long)((firstGrace ? CHG_FIRST_RETRY_MS : CHG_CHECK_MS) / 1000));
         } else {
             gChargeFailures = 0;
+            char boardAir[24] = "";
+            if (std::isfinite(air)) snprintf(boardAir, sizeof boardAir, ", board air %.1f C", air);
             if (pause && !firstGrace) {
-                Serial.printf("Charging paused: %s (die %.1f C, battery ~%.0f C)\n",
-                              why, die, die - DIE_OFFSET_C);
+                const char* dieReason = decision.unreadable ? "die unreadable" :
+                    decision.die.hot ? "die estimate too hot" : decision.die.cold ? "die estimate too cold" : "";
+                const char* airReason = decision.air.hot ? "board air too hot" :
+                    decision.air.cold ? "board air too cold" : "";
+                Serial.printf("Charging paused: %s%s%s (die %.1f C, battery ~%.0f C%s)\n",
+                              dieReason, *dieReason && *airReason ? ", " : "", airReason,
+                              die, die - DIE_OFFSET_C, boardAir);
             } else if (!pause) {
-                Serial.printf(first ? "Charge guard: die %.1f C (battery ~%.0f C), charging on.\n"
-                                    : "Charging resumed (die %.1f C, battery ~%.0f C)\n",
-                              die, die - DIE_OFFSET_C);
+                Serial.printf(first ? "Charge guard: die %.1f C (battery ~%.0f C%s), charging on.\n"
+                                    : "Charging resumed (die %.1f C, battery ~%.0f C%s)\n",
+                              die, die - DIE_OFFSET_C, boardAir);
             }
         }
     } else if (!targetOk) {
@@ -2200,8 +2228,8 @@ static void serviceChargeTemp() {
         if (!decision.unreadable) {
             for (auto code : {diagnostics::Code::CHARGE_HOT, diagnostics::Code::CHARGE_COLD}) {
                 gLoopFaults.event(code, now);
-                if (die >= -50 && die <= 150) gLoopFaults.integer("temperature_mc", int(die * 1000));
-                gLoopFaults.condition(pause && (code == diagnostics::Code::CHARGE_HOT ? die > CHG_HOT_RESUME_C : die < CHG_COLD_RESUME_C));
+                gLoopFaults.integer("temperature_mc", int(die * 1000));
+                gLoopFaults.condition(code == diagnostics::Code::CHARGE_HOT ? decision.hot() : decision.cold());
             }
         }
         if (!firstGrace) gLoopFaults.event(diagnostics::Code::CHARGE_TEMP_UNREADABLE, now).condition(decision.unreadable);
@@ -3272,67 +3300,31 @@ static void serviceDebugRf() {
     ubxSend(0x0A, 0x38, nullptr, 0);
 }
 
-static void beginDebugTemperature() {
-    // Only runtime debug entry reaches here, after LoRa-off verification, storage,
-    // and the first guard check. PMU/Wire1 accesses (including RTC and IRQ
-    // batches) all run serially on core 1; the ISR only sets a flag. There is
-    // no PMU access from the networking task and no PMU mutex to acquire.
-    gDebugTempTs = debug_temperature::setupTs(PMU);
-    char control[11] = "--", adc[11] = "--"; // room for the API's full int range
-    if (gDebugTempTs.control >= 0) snprintf(control, sizeof control, "0x%02X", gDebugTempTs.control);
-    if (gDebugTempTs.adc >= 0) snprintf(adc, sizeof adc, "0x%02X", gDebugTempTs.adc);
-    Serial.printf("Temp setup: TS %s, REG50 %s, REG30 %s (target external input, 50 uA).\n",
-                  gDebugTempTs.ready ? "verified" : "unavailable", control, adc);
-    // ALDO1 supplies BME280 + OLED + magnetometer. Do not change any rail:
-    // Trusted startup sets ALDO1 to 3.3 V; an unpowered/missing sensor shows --.
-    gDebugTempEnabled = true;
-    gDebugTempPending = false;
-    gDebugTempLogMs = millis();
-}
-
 static void serviceDebugTemperature() {
-    if (!debugMode() || !gDebugTempEnabled || gDegraded.mode() != startup::Mode::Normal) return;
+    if (!debugMode() || gDegraded.mode() != startup::Mode::Normal) return;
     uint32_t now = millis();
-    if (!gDebugTempPending) {
-        // Same rollover-safe 30 s scheduling pattern as serviceDebugRf().
-        if (uint32_t(now - gDebugTempLogMs) < 30000) return;
-        gDebugTempLogMs = now;
-        gDebugTempPending = true;
-        if (gDebugWireReady && gDebugTempBme.trigger(Wire, now)) return;
-    }
-    if (gDebugTempBme.waiting(now)) return;
-    int32_t centiC = 0;
-    bool bmeOk = gDebugWireReady && gDebugTempBme.finish(Wire, now, centiC);
-    gDebugTempPending = false;
-
-    int raw = -1;
-    if (gDebugTempTs.ready) {
-        int high = PMU.readRegister(0x36); // high first latches low (datasheet)
-        int low = PMU.readRegister(0x37);
-        raw = debug_temperature::tsRaw(high, low);
-    }
+    if (uint32_t(now - gDebugTempLogMs) < 30000) return;
+    gDebugTempLogMs = now;
     const auto p = debug_temperature::samplePower(PMU, now);
-    char die[40] = "-- C", estimate[16] = "--", ts[16] = "--", tsRaw[8] = "--";
+    char die[40] = "-- C", estimate[16] = "--";
     char bme[16] = "--", volts[16] = "--", percent[12] = "--";
     // Independent 30 s schedules can drift. Reuse the latest guard sample
     // through one guard interval plus 5 s, and report its age explicitly.
     uint32_t dieAgeMs = uint32_t(now - gDebugTempDieMs);
-    if (gChargeChecked && dieAgeMs <= CHG_CHECK_MS + 5000 && std::isfinite(gDebugTempDie)) {
-        snprintf(die, sizeof die, "%.1f C (%lu s)", gDebugTempDie, (unsigned long)(dieAgeMs / 1000));
-        snprintf(estimate, sizeof estimate, "%.1f", gDebugTempDie - DIE_OFFSET_C);
+    if (gChargeChecked && dieAgeMs <= CHG_CHECK_MS + 5000) {
+        if (std::isfinite(gDebugTempDie)) {
+            snprintf(die, sizeof die, "%.1f C (%lu s)", gDebugTempDie, (unsigned long)(dieAgeMs / 1000));
+            snprintf(estimate, sizeof estimate, "%.1f", gDebugTempDie - DIE_OFFSET_C);
+        }
+        if (std::isfinite(gChargeAirC)) snprintf(bme, sizeof bme, "%.2f", gChargeAirC);
     }
-    if (raw >= 0) {
-        snprintf(ts, sizeof ts, "%.3f", debug_temperature::tsVolts(raw));
-        snprintf(tsRaw, sizeof tsRaw, "%d", raw);
-    }
-    if (bmeOk) snprintf(bme, sizeof bme, "%.2f", centiC / 100.0);
     if (p.millivolts >= 0) snprintf(volts, sizeof volts, "%.2f", p.millivolts / 1000.0);
     if (p.percent >= 0) snprintf(percent, sizeof percent, "%d", p.percent);
     const char* charging = p.status2 < 0 ? "--" : debug_temperature::isCharging(p.status2) ? "on" : "off";
     auto vbus = pmu_read::vbusState(p.status1, p.status2);
-    Serial.printf("Temp: die %s, guard_est %s C, TS %s V, TS_raw %s, BME280 %s C, "
+    Serial.printf("Temp: die %s, guard_est %s C, BME280 %s C, "
                   "chg %s, phase %s, batt %s V, pct %s, VBUS %s\n",
-                  die, estimate, ts, tsRaw, bme, charging, debug_temperature::phase(p.status2),
+                  die, estimate, bme, charging, debug_temperature::phase(p.status2),
                   volts, percent, vbus == VbusState::Unknown ? "--" : vbus == VbusState::Present ? "1" : "0");
 }
 
@@ -3423,12 +3415,7 @@ static void toggleRuntimeDebug() {
     gDisplayUserRequest = gDisplayTripFinalized = false;
     gDisplayUsbPowerRequest = false;
     gModeFeedback = true; gModeFeedbackMs = millis();
-    // Drop an unfinished BME conversion; the next entry starts a fresh cycle.
-    gDebugTempPending = false;
-    gDebugTempBme = bme280_temp::Sensor();
     if (enabled) {
-        gDebugWireReady = gProductionWireReady;
-        if (!gDebugTempEnabled) beginDebugTemperature();
         gDebugTempLogMs = millis();
         reportEventHeap(); // current heap at debug entry, rather than a boot-time fiction
     }
@@ -3709,7 +3696,6 @@ void setup() {
         reason == ESP_RST_TASK_WDT || reason == ESP_RST_INT_WDT || reason == ESP_RST_WDT);
     saveStartupWatchdog();
     armLoopWatchdog(startup_watchdog::STARTUP_WDT_TIMEOUT_MS, false);
-    bool aldo1Warning = false;
     BatterySetup batterySetup;
     gEarlyChargeDisabled = true;
     gEarlyChargeTimeoutPending = false;
@@ -3727,7 +3713,7 @@ void setup() {
         bool enabled = PMU.enableALDO1();
         aldo1Control = PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
         aldo1Voltage = PMU.readRegister(XPOWERS_AXP2101_LDO_VOL0_CTRL);
-        aldo1Warning = !voltageSet || !enabled || !pmu_read::aldo1Ready(aldo1Control, aldo1Voltage);
+        gChargeAirPowered = voltageSet && enabled && pmu_read::aldo1Ready(aldo1Control, aldo1Voltage);
         // No 250 ms off/on cycle: the reported failures were cold power-ons.
         // 10 ms is a conservative guess for the LDO ramp and local supply
         // capacitors to settle before I2C, not a measured board requirement.
@@ -3801,7 +3787,7 @@ void setup() {
     if (!batterySetup.voltage)
         Serial.printf("WARNING: PMU battery voltage measurement enable unconfirmed after %u attempts.\n",
                       PMU_PERIPHERAL_ATTEMPTS);
-    if (aldo1Warning)
+    if (!gChargeAirPowered)
         Serial.println("WARNING: ALDO1 3.3 V/on setup unconfirmed; OLED/BME280/magnetometer may be unavailable.");
     if (!gEarlyChargeDisabled) {
         Serial.println("WARNING: early charger disable unconfirmed; retrying up to 5 s before storage.");
@@ -3815,8 +3801,6 @@ void setup() {
     // XPowersLib's existing PMU.begin() sets TS to fixed input a few I2C
     // transactions before the early charger pause. Verify and repair that
     // setup only after confirming the pause, including bounded recovery above.
-    // The runtime debug TS probe keeps 0x50 bit 4 set, so TS stays a fixed
-    // input and the probe does not give TS control of charging.
     const bool tsReady = gEarlyChargeDisabled && configureTsFixedInput();
     if (!tsReady) {
         if (gEarlyChargeDisabled)

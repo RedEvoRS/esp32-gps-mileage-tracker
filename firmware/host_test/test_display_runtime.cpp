@@ -154,7 +154,7 @@ static void toggleRegressions() {
     for (size_t i = 1; i < gProductionOled.text.size(); ++i)
         shownVersion += gProductionOled.text[i].value;
     assert(shownVersion == firmware::kVersion);
-    assert(!gDebugDisplayBegun && gDebugTempEnabled);
+    assert(!gDebugDisplayBegun);
     auto productionFrames = gProductionOled.frames;
     g_millis += DEBUG_FEEDBACK_MS - 1; serviceDisplay();
     assert(gDisplayOwner == DisplayOwner::Feedback && !gDebugDisplayBegun);
@@ -249,7 +249,7 @@ static void toggleRegressions() {
     // A new boot discards an enabled mode and initializes GPIO0 only as input.
     faultWorld(); gDebugMode = true; setup();
     assert(!debugMode() && g_pinModes.at(DEBUG_BOOT_PIN) == INPUT_PULLUP);
-    assert(!g_pinLevels.count(DEBUG_BOOT_PIN) && !gDebugDisplayBegun && !gDebugTempEnabled); ++cases;
+    assert(!g_pinLevels.count(DEBUG_BOOT_PIN) && !gDebugDisplayBegun); ++cases;
 }
 int main() {
     assert(!debugMode());

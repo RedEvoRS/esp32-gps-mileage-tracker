@@ -19,7 +19,12 @@ static void rtcWorld(bool valid = true) {
     rtc::encode(fakeEpoch, rtcRegisters + 2);
     if (!valid) rtcRegisters[2] |= 0x80;
     TwoWire::transaction = [](TwoWire& wire, bool stop) -> uint8_t {
-        if (&wire == &Wire && wire.address == 0x3c) return 0; // unrelated debug OLED
+        if (&wire == &Wire) {
+            assert(g_currentCore == 1);
+            if (wire.address == 0x3c) return 0; // OLED
+            assert(wire.address == 0x77);
+            return 2; // BME280 is absent in this RTC fixture
+        }
         assert(&wire == &Wire1 && wire.address == 0x51 && g_currentCore == 1);
         ++transactions;
         if (!present) return 2;

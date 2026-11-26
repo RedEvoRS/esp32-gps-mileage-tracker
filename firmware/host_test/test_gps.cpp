@@ -141,9 +141,9 @@ static void resetWorld() {
     gDebugRf = DebugRf(); gDebugRfPollMs = 0; gDebugRfStarted = false;
     gDebugRmcValid = false;
     gDebugDisplayReady = gDebugDisplayFailed = false;
-    gDebugWireReady = gDebugTempEnabled = gDebugTempPending = false;
-    gDebugTempDie = NAN; gDebugTempDieMs = gDebugTempLogMs = 0;
-    gDebugTempTs = {}; gDebugTempBme = {};
+    gDebugWireReady = gChargeAirPowered = false;
+    gDebugTempDie = gChargeAirC = NAN; gDebugTempDieMs = gDebugTempLogMs = 0;
+    gChargeAirSensor = {};
     gDebugNet = DebugNetwork{};
     gProductionDisplayReady = gProductionDisplayFailed = gProductionDisplayBegun = false;
     gProductionHaveOutput = false;
