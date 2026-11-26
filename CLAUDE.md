@@ -151,8 +151,15 @@ names no issue numbers on purpose, because they go stale; keep it that way.
 
 ## Tests
 
-CI runs all checks on PRs and manual runs; pushes to main run the PII/tools
-job, plus the firmware release workflow when `firmware/VERSION` changes.
+CI runs all checks on ready PRs and manual runs; pushes to main run the
+PII/tools job, plus the firmware release workflow when `firmware/VERSION`
+changes. Draft PRs run only the PII/tools job; the other jobs report skipped
+(which GitHub counts as passing, but a draft can't merge). Marking a draft
+ready for review starts the full run. Build up combined work as one draft
+(merge other branches into its branch), run
+`gh workflow run audit-tests.yml --ref <branch>` for a checkpoint without
+leaving draft, and convert back to draft before pushing more fixes after it's
+marked ready.
 That workflow publishes immediately, before server deployment or board flashing.
 Strict up-to-date required checks mean main receives exactly the files
 tested on the PR. A new push to a PR cancels its older run; main runs are not
