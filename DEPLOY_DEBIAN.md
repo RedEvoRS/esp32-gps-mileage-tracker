@@ -2638,7 +2638,8 @@ in, so update `secrets.h` and reflash (Step 8). The firmware guide's
 output. Trips recorded meanwhile wait on the board, but once its storage
 fills it stops recording. On the microSD card it can hold far more
 than any realistic gap between uploads; without a usable card, internal
-flash fallback holds about 5–6 hours of driving, then recording stops.
+flash fallback holds about 15 hours of driving with the 6.375 MiB layout
+or about 5–6 hours with the original layout, then recording stops.
 
 **Compose says `INGEST_AUTH_TOKEN` is unset** — `.env` must sit next to
 `docker-compose.yml` in `~/mileage-tracker/`, not inside `mileage-ingest/`.

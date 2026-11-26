@@ -23,7 +23,11 @@ Supreme on `main`.
 **Supreme status:** Stages 1–3 and the trip logger (Stage 4) run on the
 Supreme: pins, rails, PMU power-off and USB wake were bench-checked
 2026-10-18. Stage 4 stores trips on the microSD card, with the internal
-2.375 MB LittleFS partition as fallback. The card was bench-checked
+LittleFS partition as fallback (6.375 MiB on the new layout, about 15 h of
+driving; app-only updates keep the installed layout). To enlarge an existing
+board's store, upload or back up internal trips first. First install erases
+internal trips, the trip counter and diagnostics enrollment; see Snapshot
+enrollment below. The card was bench-checked
 2026-10-18, and by 2026-10-20 two real drives were recorded on it and read
 back on a PC. The server was deployed on Debian 13 with `server/install.sh`
 on 2026-10-20; `install.sh --check` passed. The first real uploads from SD

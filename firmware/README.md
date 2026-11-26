@@ -457,9 +457,9 @@ a card. Stage 4 has since recorded two real drives on the card.
     Trips go to the card.
   - `WARNING: no microSD card or mount failed -- check power/wiring and FAT32 (exFAT unsupported); card never formatted.`
     followed by
-    `WARNING: microSD unavailable -- using internal flash (2.30 MiB free).`
-    No usable card: trips go to the internal partition, which holds about
-    5–6 hours of driving.
+    `WARNING: microSD unavailable -- using internal flash (<free> MiB free).`
+    No usable card: trips go to internal flash. The free space shown
+    comes from the mounted filesystem, with room reserved for diagnostics.
   - `WARNING: microSD filesystem check failed (<reason>) -- card not used.`
     The card mounted but failed the read-only check. The rest of the
     message explains how to preserve files before reformatting on a PC.
@@ -642,9 +642,12 @@ card mounts.
 
 Each upload replaces the previous stage's program. Stages 1–3 check
 hardware; they do not record trips. **Leave Stage 4 installed for use in
-the car.** When updating it later, keep its `partitions.csv` and leave
-**Erase All Flash Before Sketch Upload → Disabled** to preserve internal
-trips and settings. Reflashing does not erase trips on the card.
+the car.** For routine Stage 4 updates, use the flash helper's app-only
+mode to preserve internal trips, settings and the installed table. An
+Arduino Upload writes the sketch's partition table even with
+**Erase All Flash Before Sketch Upload → Disabled**. See the
+[larger internal store](#using-the-larger-internal-store) before changing
+the table on an existing board. Reflashing does not erase trips on the card.
 
 #### Firmware versions and releases
 
@@ -868,11 +871,12 @@ Before flashing:
      on the board; use the Serial Monitor and [screen](#the-screen)
      to investigate failures.
 2. **Partitions are handled for you.** The sketch's `partitions.csv` gives
-   a 1.5 MB app partition and 2.375 MB internal LittleFS fallback, with no
+   a 1.5 MiB app partition and 6.375 MiB internal LittleFS fallback, with no
    over-the-air firmware update slot (no OTA). It overrides **Tools →
-   Partition Scheme**. Internal fallback holds roughly 5–6 hours of driving;
-   the [microSD card](#microsd-card) holds far more. A full trip store ends
-   the current trip and prevents another until space is freed.
+   Partition Scheme**. Internal fallback holds about 15 hours of driving
+   with the new table or 5–6 hours with the original table. The
+   [microSD card](#microsd-card) holds far more. A full trip store ends the
+   current trip and prevents another until space is freed.
 
    <a id="stage-4-size-check"></a>
    **The compiler's size limit is lower than the partition.** A source build
@@ -954,6 +958,7 @@ their recovery epoch. A suspended card alone stays blocked. Erasing loses any
 record that a card was stale: it may send history with low revisions while
 Device health stays old, or hit a revision conflict that requires re-enrollment.
 Keep erase disabled for updates and check Device health after any erase.
+
 If `DIAGNOSTICS_ENROLLMENT_ID`
 and `DIAGNOSTICS_STATUS_HIGH_WATER` are still defined in `secrets.h`, the
 next boot can consume that ID again and re-enroll from its possibly stale
@@ -988,10 +993,25 @@ no trips or networking, but power management and the charge guard remain
 active when the PMU is trusted. Follow [storage recovery](#if-the-trip-storage-wont-mount-later);
 do not enable format-on-mount-failure.
 
-Later uploads with erase **Disabled** preserve trips on the card and in
-internal flash, along with NVS and trip numbering. Before changing the
-partition layout or erasing flash, upload or independently back up every
-trip. Erase-all does not erase the removable card, but it does reset NVS.
+#### Using the larger internal store
+
+The flash helper's normal update writes only the app. An existing tracker
+with the original layout still has 2.375 MiB of internal trip storage
+after an app-only update. To get 6.375 MiB, use a new build and follow the
+[first Stage 4 flash procedure](#first-flash-on-a-new-board).
+
+Before reinstalling, **upload or back up any trips still on internal
+flash**. The full erase deletes those trips, resets the trip counter and
+erases the stored diagnostics enrollment record. It leaves the microSD
+card alone. Follow the
+[diagnostics enrollment procedure](../DEPLOY_DEBIAN.md#one-time-diagnostics-enrollment)
+to re-enroll after reprovisioning and check Device health.
+
+With a table-only write, the pinned Arduino core attempts to grow a clean
+LittleFS filesystem in place at mount. If mounting or growing fails,
+Stage 4 preserves non-erased storage. Use the backed-up first-install
+procedure to change layouts. Once LittleFS grows, restoring the old
+partition table would cut off part of the filesystem.
 
 #### If the trip storage won't mount later
 
@@ -1014,7 +1034,8 @@ A FAT32 formatter on another operating system works too. Reinsert the card
 with the tracker switched off, then start it and check that it selects
 microSD again. The tracker never formats the card itself. Until the card
 passes the check, new trips go to internal flash if available. Flash holds
-about 5 to 6 hours of driving, so give it regular opportunities to upload.
+about 15 hours of driving on the new layout or 5–6 hours on the original
+layout, so give it regular opportunities to upload.
 
 For internal flash on a board that's been working, `LittleFS mount failed`
 doesn't mean the trips are gone. Keep format-on-mount-failure disabled. Check that you
@@ -1023,13 +1044,14 @@ worked. Before anything that could erase the partition, copy it to a file
 with esptool (it comes with the ESP32 core, or `pip install esptool`):
 
 ```
-esptool --chip esp32s3 --port <port> read-flash 0x190000 0x260000 trips-backup.bin
+esptool --chip esp32s3 --port <port> read-flash 0x190000 <littlefs-size> trips-backup.bin
 ```
 
 Close Serial Monitor before running esptool. Replace `<port>` with the
-board's port, such as `COMx` or `/dev/ttyACM0`. The offset and size above
-come from this project's `spiffs` line in `partitions.csv`; if a different
-layout was previously installed, use that layout's offset and size instead.
+board's port, such as `COMx` or `/dev/ttyACM0`. For `<littlefs-size>`,
+use `0x660000` for the expanded layout or `0x260000` for the original
+layout. Both start at `0x190000`. Verify the installed layout before
+choosing the size. An app-only update retains the previously installed table.
 Keep the backup outside the repo. Older esptool versions spell the command
 `read_flash`. A backup image preserves the bytes but does not prove they
 are recoverable; keep it before attempting repairs or formatting.
@@ -1042,19 +1064,20 @@ trips, a damaged filesystem, or factory firmware data on a new board.
 For a board that has never logged trips, or when you have independently
 backed up the stored data and deliberately decided to reset trip storage,
 you can erase **only the trip partition** once. This deletes everything
-in that region. First finish the backup above and confirm the board is
-running this sketch's bundled partition layout. If a previous layout put
-trip data elsewhere, preserve that region too before changing layouts.
+in that region. First finish the backup above and confirm the board's
+installed `spiffs` offset and size. If a previous layout put trip data
+elsewhere, preserve that region too before changing layouts.
 Do not use this step to recover trips you still need from the device.
 
 With Serial Monitor closed, run:
 
 ```
-esptool --chip esp32s3 --port <port> erase-region 0x190000 0x260000
+esptool --chip esp32s3 --port <port> erase-region 0x190000 <littlefs-size>
 ```
 
-Older esptool versions spell it `erase_region`. The address and size are
-for this project's bundled `spiffs` partition only. Reset the board (or
+Older esptool versions spell it `erase_region`. Use the exact `spiffs`
+size for the installed table. On an older board the expanded range would
+also erase the original coredump partition. Reset the board (or
 power-cycle it) after a successful erase; the unchanged firmware verifies
 the erased partition, provisions it, and reaches `Setup complete. Logging
 trips.` No second flash or format-on-mount-failure build is needed. If it
@@ -1424,7 +1447,7 @@ bench flag separately.
 This startup hook and the card skip were run on the board on 2026-11-10
 (UTC), as above; no-storage mode was not. The timeout is unmeasured for a
 full 32 GB card, an 8 MiB repair
-or the full 2.375 MB erased-partition scan. Successful scan/comparison progress
+or the full 6.375 MiB erased-partition scan. Successful scan/comparison progress
 feeds the watchdog, so a healthy repair may take longer overall. With a card
 that always hangs, each power-on waits about four minutes (two 120-second
 timeouts), plus reboot and healthy internal-flash startup, before trips can

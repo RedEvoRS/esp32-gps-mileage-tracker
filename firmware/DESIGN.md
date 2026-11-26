@@ -171,7 +171,7 @@ the applied fallback. Watchdog boots still enqueue E1003.
 
 The startup limit is generous and **unmeasured**. Only nearly empty-card boots
 without repair have been observed at 1–2 seconds from banner to completion.
-Full 32 GB card scans, 8 MiB repairs and the 2.375 MB erased-flash scan have
+Full 32 GB card scans, 8 MiB repairs and the 6.375 MiB erased-flash scan have
 not been timed. A card that hangs at every mount costs two 120-second waits
 per power-on, about four minutes plus reboot and healthy flash startup, before
 trips can use internal flash. Progressing flash repair has no fixed total limit.
@@ -455,6 +455,22 @@ disabled: unreadable or non-erased storage is preserved. The sole
 provisioning exception is `mountFlashStorage()`: after
 `tripPartitionIsErased()` reads **every byte** as `0xFF`, it formats that
 empty partition once. A mount failure alone never authorizes erasure.
+
+The Supreme's 8 MiB table keeps the NVS, OTA data and factory app regions in
+place for app-only updates. The `spiffs` partition starts at `0x190000` and
+ends at `0x7F0000`, where the 64 KiB coredump partition starts. App-only
+updates keep the original 2.375 MiB `spiffs` partition on older boards.
+Trip space and boot logging use the mounted filesystem's capacity and usage,
+with any unspent part of the 64 KiB LittleFS diagnostics reserve deducted.
+
+Arduino ESP32 3.3.11 sets `grow_on_mount` in `LittleFS.begin()`. The bundled
+[esp_littlefs 1.22.2](https://github.com/joltwallet/esp_littlefs/blob/v1.22.2/src/esp_littlefs.c)
+reads the block count from the superblock, then grows a mounted filesystem
+to the partition's size if it is larger. A grow failure is reported as a
+mount failure and still has to pass the full erased-partition check before
+firmware can format. The supported upgrade to the larger store is a first
+install with a full erase. See the [firmware guide](README.md#using-the-larger-internal-store)
+for backup and re-enrollment.
 
 `tripShouldSplit()` reserves pending points, another point and closing
 tags to keep each finished piece below 8 MiB. `tripFsmOnFix()` closes the
