@@ -1,7 +1,6 @@
 #pragma once
 #include <cstdio>
 #include <cstring>
-#include "micro_discard.h"
 #include "trip_vfs_io.h"
 
 // One descriptor per GPX batch, opened and closed under FS_LOCK. Direct VFS
@@ -11,12 +10,9 @@ class FileWriter {
 
 public:
     size_t queued = 0;
-    uint64_t hash = micro_discard::kHashOffset;
     bool ok = false;
 
-    FileWriter(const char* mount, const char* relative, bool create,
-               uint64_t initialHash = micro_discard::kHashOffset)
-        : hash(initialHash) {
+    FileWriter(const char* mount, const char* relative, bool create) {
         char path[96];
         int n = std::snprintf(path, sizeof(path), "%s%s", mount, relative);
         if (n <= 0 || static_cast<size_t>(n) >= sizeof(path)) return;
@@ -35,12 +31,8 @@ public:
 
     void put(const char* s, size_t n) {
         if (!ok) return;
-        if (trip_vfs_io::write(fd, s, n) == static_cast<ssize_t>(n)) {
-            queued += n;
-            hash = micro_discard::hashBytes(hash, s, n);
-        } else {
-            ok = false;
-        }
+        if (trip_vfs_io::write(fd, s, n) == static_cast<ssize_t>(n)) queued += n;
+        else ok = false;
     }
     void put(const char* s) { put(s, std::strlen(s)); }
 

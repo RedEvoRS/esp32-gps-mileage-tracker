@@ -162,9 +162,6 @@ static void resetWorld() {
     gNavPvtWaitMs = uint32_t(0 - NAV_PVT_FALLBACK_MS - 1);
     gDistanceContinuous = true;
     gState = IDLE; gResumeFixes = 0; gTripPath[0] = 0; gTripWriteFailed = false;
-    gTripBytes = 0; gTripHash = micro_discard::kHashOffset;
-    gPendingDiscards.clear(); gPendingDiscardsLoaded = false; gPendingDiscardRetryMs = 0;
-    Preferences::durableBytes.clear(); Preferences::failWriteBytes = Preferences::failReadBytes = false;
     gPendCount = gPendHead = 0; armBufReset(); gHaveLastFix = false;
     gClockSet = false; gVbusLost = false;
     gVbusRetry = VbusRetry::None; gVbusRetryMs = gVbusOffReadMs = 0;

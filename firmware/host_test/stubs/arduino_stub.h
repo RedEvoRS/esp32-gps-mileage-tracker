@@ -443,50 +443,17 @@ inline SDStub SD;
 struct Preferences {
     std::map<std::string, uint32_t> kv;
     inline static unsigned begins = 0;
-    std::string ns;
-    bool begin(const char* name, bool) {
-        ++begins;
-        if (failBegin) return false;
-        ns = name ? name : "";
-        return true;
-    }
+    bool begin(const char*, bool) { ++begins; return !failBegin; }
     uint32_t getUInt(const char* k, uint32_t d) { auto it = kv.find(k); return it == kv.end() ? d : it->second; }
     void putUInt(const char* k, uint32_t v) { kv[k] = v; }
     inline static std::map<std::string, uint64_t> durable64;
-    inline static std::map<std::string, std::vector<uint8_t>> durableBytes;
     inline static bool failWrite64 = false, failRead64 = false, failBegin = false;
-    inline static bool failWriteBytes = false, failReadBytes = false;
     inline static std::string failWrite64Key;
-    std::string bytesKey(const char* k) const { return ns + "/" + (k ? k : ""); }
-    bool isKey(const char* k) {
-        return durable64.count(k) || kv.count(k) || durableBytes.count(bytesKey(k));
-    }
+    bool isKey(const char* k) { return durable64.count(k) || kv.count(k); }
     uint64_t getULong64(const char* k, uint64_t d) { return !failRead64 && durable64.count(k) ? durable64[k] : d; }
     size_t putULong64(const char* k, uint64_t v) {
         if (failWrite64 || (!failWrite64Key.empty() && failWrite64Key == k)) return 0;
         durable64[k] = v; return sizeof(v);
-    }
-    size_t getBytesLength(const char* k) {
-        if (failReadBytes) return 0;
-        auto it = durableBytes.find(bytesKey(k));
-        return it == durableBytes.end() ? 0 : it->second.size();
-    }
-    size_t getBytes(const char* k, void* buf, size_t maxLen) {
-        if (failReadBytes) return 0;
-        auto it = durableBytes.find(bytesKey(k));
-        if (it == durableBytes.end() || it->second.size() > maxLen) return 0;
-        if (!it->second.empty()) memcpy(buf, it->second.data(), it->second.size());
-        return it->second.size();
-    }
-    size_t putBytes(const char* k, const void* value, size_t len) {
-        if (failWriteBytes) return 0;
-        const auto* src = static_cast<const uint8_t*>(value);
-        durableBytes[bytesKey(k)].assign(src, src + len);
-        return len;
-    }
-    bool remove(const char* k) {
-        if (failWriteBytes) return false;
-        return durableBytes.erase(bytesKey(k)) > 0;
     }
     void end() {}
 };

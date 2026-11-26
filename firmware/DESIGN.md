@@ -295,26 +295,7 @@ accuracy checks and can accept false movement.
 `endTrip()` normally discards a micro-trip if **either** its duration is
 under 30 seconds **or** its distance is under 160 m. Duration ends at the
 last moving fix, excluding the final parked cooldown. Confirmed Universal
-Serial Bus (USB) loss, write-failure finalizations and size splits keep short
-pieces (including split-trip continuations). When a micro-trip removal fails
-(a storage I/O error or a store lost before removal), `endTrip()` does not
-append closing tags, reports E4006 (`operation=close`), counts the failed piece
-toward SD write-failure fallback and saves the discard intent in a checksummed
-non-volatile storage (NVS) list (`micro_discard.h`, namespace `mdisc`, up to
-eight entries across SD and LittleFS). Each entry records the store, `/trips/`
-path, exact committed byte count and a running 64-bit FNV-1a hash tracked by
-`FileWriter` as bytes commit. `makeTripPath()` skips pending-discard paths, and
-`servicePendingDiscards()` retries removal every 30 seconds and after a later
-clean trip end; `fsckAllTrips()` also retries before repairing files on reboot.
-A retry deletes a file only after reading it and confirming its size, 64-bit
-hash and incomplete GPX tail all match—so a different file at the same path
-(for example on a swapped microSD card) or an unreadable file is never deleted.
-While a matching or unreadable discard entry remains pending, boot repair skips
-finalizing that file so it can never be uploaded as a real drive. If saving the
-NVS list also fails, the firmware keeps the entry in RAM for runtime retries and
-attempts to truncate the file to zero bytes so boot repair removes it as empty
-rather than finalizing it. Successful micro-trip removals write nothing to NVS.
-Separately, `loop()`
+Serial Bus (USB) loss and size splits keep short pieces. Separately, `loop()`
 ends a recording trip after more than five minutes without any valid RMC fix,
 including when no next fix arrives to drive the FSM. Rejected speeds still
 count as received fixes for this watchdog (`gLastFixMonoMs`). Its
@@ -399,10 +380,7 @@ full, the oldest point is committed without a time before accepting more.
 at trip end. The in-memory tail can be lost on reset.
 
 At boot, `setup()` calls `fsckAllTrips()` on both mounted stores before
-networking starts. Before repairing incomplete files, `fsckAllTrips()` retries
-any pending micro-trip discards saved in NVS and skips repair for entries whose
-removal or verification read still fails, so a discarded micro-trip is never
-finalized or uploaded. `repairTrip()` looks backwards in 256-byte blocks for the
+networking starts. `repairTrip()` looks backwards in 256-byte blocks for the
 last complete `</trkpt>`, retaining seven bytes between blocks so a split tag
 is recognized. Zero-filled or garbage tails are skipped the same way. Every
 verified block feeds the watchdog. Files with no complete points are removed;
