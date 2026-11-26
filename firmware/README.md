@@ -1067,10 +1067,9 @@ about 15 hours of driving on the new layout or 5–6 hours on the original
 layout, so give it regular opportunities to upload.
 
 For internal flash on a board that's been working, `LittleFS mount failed`
-doesn't mean the trips are gone. Keep format-on-mount-failure disabled. Check that you
-flashed with this sketch's `partitions.csv`, and try the firmware that last
-worked. Before anything that could erase the partition, copy it to a file
-with esptool (it comes with the ESP32 core, or `pip install esptool`):
+doesn't mean the trips are gone. Keep format-on-mount-failure disabled. Before
+reflashing or making any other change to the board, copy the trip partition to
+a file with esptool (it comes with the ESP32 core, or `pip install esptool`):
 
 ```
 esptool --chip esp32s3 --port <port> read-flash 0x190000 0x660000 trips-backup.bin
@@ -1088,6 +1087,16 @@ layout it covers all of LittleFS (`0x190000`–`0x3F0000`) plus only the old
 Keep the backup outside the repo. Older esptool versions spell the command
 `read_flash`. A backup image preserves the bytes but does not prove they
 are recoverable; keep it before attempting repairs or formatting.
+
+Once the backup is saved, check that the board has the expected
+`partitions.csv` layout, and if you need to go back to the firmware that last
+worked, keep the installed partition table: use the flash helper's app-only
+update, or write only the app binary with esptool at `0x10000` (the `factory`
+app offset). Never use an Arduino IDE (or `arduino-cli`) upload of older
+firmware (v1.10 or earlier) on a board that has the larger internal store. An
+IDE upload writes the older partition table back, which cuts off any trip data
+above `0x3F0000` and puts the old crash-dump area at `0x3F0000` inside the
+trip store, so a single crash can overwrite stored trips.
 
 If the log says the partition is missing or empty, check the flashed
 `partitions.csv` first. A partition read error needs investigation and a
