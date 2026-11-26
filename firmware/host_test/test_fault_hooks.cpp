@@ -578,6 +578,48 @@ int main(int argc, char** argv) {
     assert(uploadPending(SD)); auto happy = take();
     assert(happy.size() == 1); has(happy[0], "\"code\":1000,");
     assert(gJournal.stats().dropped == 0 && g_lockDepth == 0);
+
+    // Failed micro-trip remove raises E4006 (operation=close), never finalizes
+    // or emits E4007/E4010 across reboot repair, and clears E4006 when retry removes it.
+    for (bool sd : {false, true}) {
+        faultWorld();
+        if (!sd) gTripFS = &LittleFS;
+        fs::FS& storage = sd ? static_cast<fs::FS&>(SD) : static_cast<fs::FS&>(LittleFS);
+        FakeDisk& disk = sd ? g_sdDisk : g_disk;
+        const char* backend = sd ? "\"backend\":\"sd\"" : "\"backend\":\"littlefs\"";
+
+        // Successful micro-trip remove produces no fault event.
+        run(3, 12, true, false, 100); run(0, kCooldownSeconds + 5, true, false, 100);
+        assert(gState == IDLE && disk.files.empty() && take().empty());
+
+        // Failed remove raises E4006 close on that backend.
+        disk.failRemoves = 1;
+        run(3, 12, true, false, 100);
+        const std::string microPath = gTripPath;
+        assert(!microPath.empty());
+        run(0, kCooldownSeconds + 5, true, false, 100);
+        assert(gState == IDLE && disk.files.count(microPath) && !isComplete(storage, microPath.c_str()));
+        auto raised = one(4006, "raise");
+        has(raised, backend);
+        has(raised, "\"operation\":\"close\"");
+
+        // Simulated reboot while remove still fails: no E4007, no E4010, file stays unfinalized.
+        gPendingDiscards.clear(); gPendingDiscardsLoaded = false;
+        disk.failRemoves = 1;
+        fsckAllTrips(storage);
+        auto bootRows = take();
+        assert(codeRows(bootRows, 4007).empty() && codeRows(bootRows, 4010).empty());
+        assert(disk.files.count(microPath) && !isComplete(storage, microPath.c_str()) && !hasPending());
+
+        // Once remove recovers, retry deletes the file and clears E4006 in the same episode.
+        g_millis += FS_CHECK_MS;
+        servicePendingDiscards();
+        assert(!disk.files.count(microPath) && Preferences::durableBytes.empty());
+        auto cleared = one(4006, "clear");
+        has(cleared, backend);
+        has(cleared, "\"operation\":\"close\"");
+        assert(episode(cleared) == episode(raised));
+    }
     if (exportJson) for (const auto& row : exported) std::printf("EVENT %s\n", row.c_str());
     std::printf("Runtime hook transitions, fields, counter, overflow and happy drive passed (runtime debug=%d).\n", debugMode());
 }

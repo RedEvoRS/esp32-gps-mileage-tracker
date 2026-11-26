@@ -85,6 +85,11 @@ echo "== test_gps_drain_monitor"
     -I"$here/../04_trip_logger" "$here/test_gps_drain_monitor.cpp" -o "$build/test_gps_drain_monitor.exe"
 "$build/test_gps_drain_monitor.exe" || status=1
 
+echo "== test_micro_discard"
+"${cxx[@]}" "${assert_flags[@]}" -std=c++14 -Wall -Wextra -Werror -pedantic \
+    -I"$here/../04_trip_logger" "$here/test_micro_discard.cpp" -o "$build/test_micro_discard.exe"
+"$build/test_micro_discard.exe" || status=1
+
 echo "== test_debug_display (bus fault injection)"
 "${cxx[@]}" "${flags[@]}" -I"$here/display_stubs" -I"$here/../04_trip_logger" \
     "$here/test_debug_display.cpp" -o "$build/test_debug_display.exe"

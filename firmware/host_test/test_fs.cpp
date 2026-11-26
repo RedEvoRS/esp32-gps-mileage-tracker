@@ -56,11 +56,14 @@ static void resetWorld() {
     LittleFS.dirs.clear();
     LittleFS.mkdir(TRIP_DIR);
     prefs.kv.clear();
+    Preferences::durableBytes.clear();
+    Preferences::failWriteBytes = Preferences::failReadBytes = false;
     Serial.log.clear();
     GPSSerial = HardwareSerial(1);
     gGpsConfig = GpsConfig(); gGpsUbxRx = GpsUbxRx();
     gState = IDLE; gTripPath[0] = 0; gTripWriteFailed = false;
-    gTripBytes = 0;
+    gTripBytes = 0; gTripHash = micro_discard::kHashOffset;
+    gPendingDiscards.clear(); gPendingDiscardsLoaded = false; gPendingDiscardRetryMs = 0;
     gPendCount = gPendHead = 0; armBufReset(); gHaveLastFix = false;
     gClockSet = true;
     PMU = XPowersAXP2101(); gPmuIrqFlag = false;
@@ -2377,6 +2380,175 @@ int main(int argc, char** argv) {
         CHECK(g_sdDisk.mounted && g_disk.mounted && PMU.shutdownCalls == 1 &&
               millis() - started >= NET_ABORT_MS,
               "without the file-closed acknowledgement, shutdown waits then skips unmount");
+    }
+
+    printf("T76 failed micro-trip discard survives reboot, never uploads, and retries cleanly (#845)\n");
+    for (bool sd : {false, true}) {
+        auto initStore = [&]() {
+            resetWorld();
+            if (sd) { SD.cardPresent = true; setup(); }
+        };
+        fs::FS& storage = sd ? static_cast<fs::FS&>(SD) : static_cast<fs::FS&>(LittleFS);
+        FakeDisk& disk = sd ? g_sdDisk : g_disk;
+        const std::string storeName = sd ? "SD" : "LittleFS";
+
+        // 1. Successful micro-trip remove is unchanged and writes no NVS discard state.
+        initStore();
+        drive(3, 12); drive(0, kCooldownSeconds + 5);
+        CHECK(gState == IDLE && disk.files.empty() && logHas("Discarding micro-trip") &&
+              Preferences::durableBytes.empty() && gPendingDiscards.empty(),
+              (storeName + ": successful micro-trip discard unchanged with no NVS state").c_str());
+
+        // 2-4. Failed remove keeps file incomplete, never uploads, persists NVS intent,
+        //      survives reboot while remove still fails, and runtime retry removes it.
+        initStore();
+        disk.failRemoves = 1;
+        drive(3, 12);
+        const std::string discardedPath = gTripPath;
+        drive(0, kCooldownSeconds + 5);
+        CHECK(gState == IDLE && !gTripPath[0] && disk.files.count(discardedPath) &&
+              !wellFormedShape(disk.files.at(discardedPath)) && !isComplete(storage, discardedPath.c_str()),
+              (storeName + ": failed remove leaves micro-trip incomplete").c_str());
+        CHECK(!hasPending() && !uploadPending() && g_httpRequests == 0,
+              (storeName + ": failed-remove micro-trip is never offered for upload").c_str());
+        CHECK(logHas("could not discard micro-trip") && !logHas("Discarding micro-trip"),
+              (storeName + ": failed remove logs an error instead of claiming discard").c_str());
+        CHECK(!Preferences::durableBytes.empty() && disk.openHandles == 0 && g_lockDepth == 0,
+              (storeName + ": discard intent saved in NVS with no leaked handles or locks").c_str());
+
+        const std::string originalMicroBytes = disk.files.at(discardedPath);
+        const std::string realSibling = "/trips/t000099.gpx";
+        const std::string partialReal = std::string(GPX_PROLOGUE) +
+            "<trkpt lat=\"37.000000\" lon=\"-122.000000\"><speed>15.00</speed><hdop>0.9</hdop></trkpt>\npartial";
+        disk.files[realSibling] = partialReal;
+
+        gPendingDiscards.clear(); gPendingDiscardsLoaded = false;
+        disk.failRemoves = 1;
+        fsckAllTrips(storage);
+        CHECK(disk.files.count(discardedPath) && disk.files.at(discardedPath) == originalMicroBytes &&
+              !isComplete(storage, discardedPath.c_str()),
+              (storeName + ": boot repair does not finalize micro-trip when retry remove still fails").c_str());
+        CHECK(disk.files.count(realSibling) && wellFormedShape(disk.files.at(realSibling)),
+              (storeName + ": boot repair still repairs unrelated real incomplete trip").c_str());
+        CHECK(!repairIfNeeded(storage, discardedPath.c_str()) &&
+              disk.files.at(discardedPath) == originalMicroBytes,
+              (storeName + ": direct repair also refuses to finalize pending discard").c_str());
+        CHECK(uploadPending(storage) && g_httpRequests == 1 &&
+              !disk.files.count(realSibling) && disk.files.count(discardedPath),
+              (storeName + ": uploader sends only the real trip, never the discarded micro-trip").c_str());
+
+        g_millis += FS_CHECK_MS;
+        servicePendingDiscards();
+        CHECK(!disk.files.count(discardedPath) && gPendingDiscards.empty() &&
+              Preferences::durableBytes.empty() && disk.openHandles == 0,
+              (storeName + ": runtime retry removes discarded micro-trip and clears NVS").c_str());
+
+        // 5. Simulated reboot after storage recovers: boot repair removes it before repairing.
+        initStore();
+        disk.failRemoves = 1;
+        drive(3, 12);
+        const std::string bootRemovedPath = gTripPath;
+        drive(0, kCooldownSeconds + 5);
+        CHECK(disk.files.count(bootRemovedPath) && !Preferences::durableBytes.empty(),
+              (storeName + ": failed remove persisted before reboot").c_str());
+        gPendingDiscards.clear(); gPendingDiscardsLoaded = false;
+        fsckAllTrips(storage);
+        CHECK(!disk.files.count(bootRemovedPath) && gPendingDiscards.empty() &&
+              Preferences::durableBytes.empty() && !hasPending(),
+              (storeName + ": boot repair removes discarded micro-trip before finalizing").c_str());
+
+        // 6. Read error during boot check neither deletes nor finalizes; retry removes after recovery.
+        initStore();
+        disk.failRemoves = 1;
+        drive(3, 12);
+        const std::string readErrPath = gTripPath;
+        drive(0, kCooldownSeconds + 5);
+        const std::string readErrBytes = disk.files.at(readErrPath);
+        gPendingDiscards.clear(); gPendingDiscardsLoaded = false;
+        disk.failReadPath = readErrPath; disk.failReadAfter = 0;
+        fsckAllTrips(storage);
+        CHECK(disk.files.count(readErrPath) && disk.files.at(readErrPath) == readErrBytes &&
+              !isComplete(storage, readErrPath.c_str()),
+              (storeName + ": read error neither deletes nor finalizes pending discard").c_str());
+        disk.failReadPath.clear();
+        g_millis += FS_CHECK_MS;
+        servicePendingDiscards();
+        CHECK(!disk.files.count(readErrPath) && Preferences::durableBytes.empty(),
+              (storeName + ": retry removes pending discard once reads recover").c_str());
+
+        // 7. Subsequent clean trip end triggers immediate retry of an earlier pending discard.
+        initStore();
+        disk.failRemoves = 1;
+        drive(3, 12);
+        const std::string prevMicroPath = gTripPath;
+        drive(0, kCooldownSeconds + 5);
+        CHECK(disk.files.count(prevMicroPath), (storeName + ": pending discard queued before normal trip").c_str());
+        drive(15, 40);
+        const std::string normalPath = gTripPath;
+        CHECK(normalPath != prevMicroPath, (storeName + ": next trip never reuses pending-discard path").c_str());
+        drive(0, kCooldownSeconds + 5);
+        CHECK(!disk.files.count(prevMicroPath) && disk.files.count(normalPath) &&
+              wellFormedShape(disk.files.at(normalPath)) && Preferences::durableBytes.empty(),
+              (storeName + ": clean normal trip end retries and removes earlier pending micro-trip").c_str());
+
+        // 8. Double fault (remove fails + NVS write fails): fallback truncates file to 0 bytes
+        //    so reboot without NVS still deletes it as empty instead of finalizing and uploading.
+        initStore();
+        disk.failRemoves = 1;
+        Preferences::failWriteBytes = true;
+        drive(3, 12);
+        const std::string nvsFailPath = gTripPath;
+        drive(0, kCooldownSeconds + 5);
+        Preferences::failWriteBytes = false;
+        CHECK(disk.files.count(nvsFailPath) && disk.files.at(nvsFailPath).empty(),
+              (storeName + ": NVS save failure falls back to truncating discarded micro-trip empty").c_str());
+        gPendingDiscards.clear(); gPendingDiscardsLoaded = false; Preferences::durableBytes.clear();
+        fsckAllTrips(storage);
+        CHECK(!disk.files.count(nvsFailPath) && !hasPending(),
+              (storeName + ": empty fallback file removed at boot without finalizing or uploading").c_str());
+    }
+
+    printf("T76b pending discard never deletes a different file at the same path (swapped card)\n");
+    {
+        resetWorld(); SD.cardPresent = true; setup();
+        g_sdDisk.failRemoves = 1;
+        drive(3, 12);
+        const std::string path = gTripPath;
+        drive(0, kCooldownSeconds + 5);
+        const std::string cardAMicro = g_sdDisk.files.at(path);
+
+        // Card B has a different incomplete real trip at the same filename.
+        const std::string cardBIncomplete = std::string(GPX_PROLOGUE) +
+            "<trkpt lat=\"40.000000\" lon=\"-105.000000\"><speed>20.00</speed><hdop>0.8</hdop></trkpt>\n";
+        g_sdDisk.files[path] = cardBIncomplete;
+        gPendingDiscards.clear(); gPendingDiscardsLoaded = false;
+        fsckAllTrips(SD);
+        CHECK(g_sdDisk.files.count(path) && wellFormedShape(g_sdDisk.files.at(path)),
+              "swapped card's different incomplete trip is repaired, not deleted");
+        CHECK(!Preferences::durableBytes.empty(), "card A discard record preserved in NVS across card swap");
+
+        // Card B's now-complete trip is uploaded and never deleted as a micro-trip.
+        g_httpRequests = 0;
+        CHECK(uploadPending(SD) && g_httpRequests == 1 && !g_sdDisk.files.count(path),
+              "swapped card's real trip uploads normally");
+
+        // Card C has a complete trip of the exact same path on another boot: untouched.
+        const std::string cardCComplete = std::string(GPX_PROLOGUE) +
+            "<trkpt lat=\"41.000000\" lon=\"-106.000000\"><speed>18.00</speed><hdop>0.9</hdop></trkpt>\n" +
+            GPX_EPILOGUE;
+        g_sdDisk.files[path] = cardCComplete;
+        gPendingDiscards.clear(); gPendingDiscardsLoaded = false;
+        fsckAllTrips(SD);
+        CHECK(g_sdDisk.files.count(path) && g_sdDisk.files.at(path) == cardCComplete,
+              "complete trip on another card is never deleted");
+
+        // Card A returns on a later boot: its exact micro-trip matches and is deleted.
+        g_sdDisk.files[path] = cardAMicro;
+        gPendingDiscards.clear(); gPendingDiscardsLoaded = false;
+        fsckAllTrips(SD);
+        CHECK(!g_sdDisk.files.count(path) && gPendingDiscards.empty() && Preferences::durableBytes.empty(),
+              "original card's discarded micro-trip is removed when the card returns");
+        CHECK(!g_sdDisk.formatRequested && !g_disk.formatRequested, "no store is ever formatted");
     }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nALL PASS\n", g_fail);

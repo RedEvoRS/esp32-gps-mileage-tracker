@@ -1092,7 +1092,11 @@ How it behaves once flashed:
   10 s and ends after you're below 2 mph for 5 minutes, tolerating
   longer stops in traffic. When the stop timer or lost-GPS watchdog ends a
   trip, it discards trips shorter than ~30 s (not counting the parked wait)
-  or 0.1 mi as noise. Confirmed USB loss when the car switches off, or a
+  or 0.1 mi as noise. If removing a discarded short trip fails, serial prints
+  `ERROR: could not discard micro-trip ... -- will retry.`, E4006 is reported,
+  and the tracker remembers the file in NVS so boot repair skips finalizing it
+  and retries removal until it succeeds (`Removed discarded micro-trip: ...`).
+  Confirmed USB loss when the car switches off, or a
   clean board power-off, keeps even a short trip that has started.
   Speed must also pass the GPS receiver's accuracy check: a checksum-valid
   NAV-PVT (navigation position, velocity and time) message received within
