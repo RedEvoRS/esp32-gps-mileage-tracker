@@ -99,7 +99,8 @@ class BashFlashTests(unittest.TestCase):
                 self.save({**self.manifest, **change})
                 self.run_bash('flash_validate "$1" false', success=False)
         for field, value in (("file", "../app.bin"), ("sha256", "0" * 64),
-                             ("offset", hex(REGIONS["nvs"][0])), ("offset", hex(APP_END)),
+                             ("offset", hex(REGIONS["nvs"][0])), ("offset", "0x20000"),
+                             ("offset", hex(APP_END)),
                              ("offset", hex(APP_START + 1)), ("offset", "0x1;id"),
                              ("name", "bootloader")):
             with self.subTest(field=field, value=value):
