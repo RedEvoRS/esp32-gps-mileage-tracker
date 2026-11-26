@@ -814,9 +814,9 @@ For why it works this way, see [the firmware design](DESIGN.md).
 
 The `04_trip_logger/` sketch detects trips, accumulates mileage and writes
 GPS Exchange Format (GPX) files to the microSD card, with internal LittleFS
-as fallback. The current release is `v1.03`; it uploads trips from
-the card, and the [top-level README](../README.md#where-its-at) has the current status and
-what's still unproven on a real board. Since `v0.06` there is one firmware build: debug
+as fallback. It uploads trips from the card, and the
+[top-level README](../README.md#where-its-at) has the current release version,
+status and what's still unproven on a real board. Since `v0.06` there is one firmware build: debug
 mode starts off at every power-on and can be toggled by holding BOOT and
 tapping POWER.
 
