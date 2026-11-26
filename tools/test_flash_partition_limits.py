@@ -7,9 +7,12 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-# ESP-IDF's ESP32-S3 default (CONFIG_PARTITION_TABLE_OFFSET); the table uses
-# one 4 KiB sector. These are platform defaults, not entries in partitions.csv.
+# ESP-IDF's ESP32-S3 defaults: the ROM loads the second-stage bootloader from
+# 0x0, and CONFIG_PARTITION_TABLE_OFFSET places the one-sector (4 KiB)
+# partition table at 0x8000. These are platform defaults, not entries in
+# partitions.csv.
 # https://docs.espressif.com/projects/esp-idf/en/v5.5.6/esp32s3/api-guides/partition-tables.html
+BOOTLOADER_OFFSET = 0x0
 PARTITION_TABLE_OFFSET = 0x8000
 PARTITION_TABLE_SIZE = 0x1000
 
@@ -33,7 +36,7 @@ def partition_regions():
 def expected_limits():
     regions = partition_regions()
     return {
-        "bootloader": (PARTITION_TABLE_OFFSET,),
+        "bootloader": (BOOTLOADER_OFFSET, PARTITION_TABLE_OFFSET),
         "partitions": (PARTITION_TABLE_OFFSET, PARTITION_TABLE_OFFSET + PARTITION_TABLE_SIZE),
         "boot_app0": regions["otadata"],
         "app": regions["factory"],
@@ -45,16 +48,16 @@ def script_limits(source, powershell=False):
     number = r"(0x[0-9a-fA-F]+|[0-9]+)"
     result = {}
     for name in expected_limits():
-        start_op = "-eq" if name == "app" else "-ge"
+        start_op = "-eq" if name in ("bootloader", "boot_app0", "app") else "-ge"
         if powershell:
             start = rf"\$start\s+{start_op}\s+" + number + r"\s+-and\s+"
             end = r"\$end\s+-le\s+" + number
             extra = r"\s+-and\s+\$part\.offset\s+-ceq\s+\$m\.app_offset" if name == "app" else ""
-            pattern = rf"\s*'{name}'\s*\{{\s*" + ("" if name == "bootloader" else start) + end + extra + r"\s*\}\s*"
+            pattern = rf"\s*'{name}'\s*\{{\s*" + start + end + extra + r"\s*\}\s*"
         else:
             start = rf'\[\s*"\$start"\s+{start_op}\s+\$\(\(' + number + r"\)\)\s*\]\s*&&\s*"
             end = r'\[\s*"\$end"\s+-le\s+\$\(\(' + number + r"\)\)\s*\]"
-            pattern = rf"\s*{name}\)\s*" + ("" if name == "bootloader" else start) + end + r"\s*\|\|\s*return\s+1\s*;;\s*"
+            pattern = rf"\s*{name}\)\s*" + start + end + r"\s*\|\|\s*return\s+1\s*;;\s*"
         matches = [re.fullmatch(pattern, line) for line in source.splitlines()]
         matches = [match for match in matches if match]
         if len(matches) != 1:
@@ -100,10 +103,29 @@ class FlashPartitionLimitsTests(unittest.TestCase):
     def test_unrecognized_or_missing_fence_fails_loudly(self):
         for filename in ("flash.sh", "flash.ps1"):
             source = (ROOT / "install" / filename).read_text(encoding="utf-8")
-            app_line = next(line for line in source.splitlines() if re.match(r"\s*(?:'app'\s*\{|app\))", line))
-            for variant in (
-                re.sub(r"0x[0-9a-fA-F]+", "APP_LIMIT", app_line),
-                app_line.replace("-eq", "-ge", 1),
-            ):
-                with self.subTest(script=filename, variant=variant.strip()), self.assertRaisesRegex(AssertionError, "recognizable app fence"):
-                    script_limits(source.replace(app_line, variant), filename.endswith("ps1"))
+            for name in ("bootloader", "boot_app0", "app"):
+                fence_line = next(
+                    line for line in source.splitlines()
+                    if re.match(rf"\s*(?:'{name}'\s*\{{|{name}\))", line)
+                )
+                variants = [
+                    re.sub(r"0x[0-9a-fA-F]+", "FENCE_LIMIT", fence_line),
+                    fence_line.replace("-eq", "-ge", 1),
+                ]
+                if name == "bootloader":
+                    variants.append(
+                        re.sub(
+                            r"\$start\s+-eq\s+0x0\s+-and\s+" if filename.endswith("ps1")
+                            else r'\[\s*"\$start"\s+-eq\s+\$\(\(0x0\)\)\s*\]\s*&&\s*',
+                            "",
+                            fence_line,
+                            count=1,
+                        )
+                    )
+                for variant in variants:
+                    self.assertNotEqual(variant, fence_line)
+                    with (
+                        self.subTest(script=filename, part=name, variant=variant.strip()),
+                        self.assertRaisesRegex(AssertionError, f"recognizable {name} fence"),
+                    ):
+                        script_limits(source.replace(fence_line, variant), filename.endswith("ps1"))
