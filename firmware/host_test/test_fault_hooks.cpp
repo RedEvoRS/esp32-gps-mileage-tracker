@@ -303,7 +303,8 @@ int main(int argc, char** argv) {
         serviceBatteryDiagnostics();
     }, "\"battery_mv\":3500");
     for (int c : {2004, 2005, 2006}) cycle(c, [c](bool bad) {
-        PMU.dieC = !bad ? 30.0f : c == 2004 ? CHG_HOT_PAUSE_C : c == 2005 ? CHG_COLD_PAUSE_C : NAN;
+        PMU.dieC = !bad ? 30.0f : c == 2004 ? CHG_HOT_PAUSE_C + DIE_OFFSET_C :
+                                  c == 2005 ? CHG_COLD_PAUSE_C + DIE_OFFSET_C : NAN;
         gChargeCheckT0 = g_millis - CHG_CHECK_MS; serviceChargeTemp();
     }, c == 2004 ? "\"temperature_mc\":54000" : c == 2005 ? "\"temperature_mc\":9000" : "\"context\":{}");
     cycle(2008, [](bool bad) {
@@ -315,12 +316,12 @@ int main(int argc, char** argv) {
         }
     });
     // Guard hysteresis and changing reasons without charger resume.
-    faultWorld(); PMU.dieC = CHG_HOT_PAUSE_C; serviceChargeTemp(); one(2004, "raise");
-    PMU.dieC = CHG_HOT_RESUME_C + 1; g_millis += CHG_CHECK_MS; serviceChargeTemp(); assert(take().empty());
+    faultWorld(); PMU.dieC = CHG_HOT_PAUSE_C + DIE_OFFSET_C; serviceChargeTemp(); one(2004, "raise");
+    PMU.dieC = CHG_HOT_RESUME_C + DIE_OFFSET_C + 1; g_millis += CHG_CHECK_MS; serviceChargeTemp(); assert(take().empty());
     PMU.dieC = NAN; g_millis += CHG_CHECK_MS; serviceChargeTemp(); one(2006, "raise");
-    PMU.dieC = CHG_COLD_PAUSE_C; g_millis += CHG_CHECK_MS; serviceChargeTemp();
+    PMU.dieC = CHG_COLD_PAUSE_C + DIE_OFFSET_C; g_millis += CHG_CHECK_MS; serviceChargeTemp();
     auto changed = take(); assert(codeRows(changed, 2004).size() == 1 && codeRows(changed, 2005).size() == 1 && codeRows(changed, 2006).size() == 1);
-    PMU.dieC = CHG_COLD_RESUME_C; g_millis += CHG_CHECK_MS; serviceChargeTemp(); one(2005, "clear");
+    PMU.dieC = CHG_COLD_RESUME_C + DIE_OFFSET_C; g_millis += CHG_CHECK_MS; serviceChargeTemp(); one(2005, "clear");
     assert(PMU.chargeEnabled);
     // Thresholds come from the PMU configuration, not guessed voltage cutoffs.
     faultWorld(); PMU.lowWarnNibble = 15; PMU.criticalPercent = 8;

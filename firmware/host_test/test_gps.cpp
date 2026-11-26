@@ -141,9 +141,9 @@ static void resetWorld() {
     gDebugRf = DebugRf(); gDebugRfPollMs = 0; gDebugRfStarted = false;
     gDebugRmcValid = false;
     gDebugDisplayReady = gDebugDisplayFailed = false;
-    gDebugWireReady = gDebugTempEnabled = gDebugTempPending = false;
-    gDebugTempDie = NAN; gDebugTempDieMs = gDebugTempLogMs = 0;
-    gDebugTempTs = {}; gDebugTempBme = {};
+    gDebugWireReady = gChargeAirPowered = false;
+    gDebugTempDie = gChargeAirC = NAN; gDebugTempDieMs = gDebugTempLogMs = 0;
+    gChargeAirSensor = {};
     gDebugNet = DebugNetwork{};
     gProductionDisplayReady = gProductionDisplayFailed = gProductionDisplayBegun = false;
     gProductionHaveOutput = false;
@@ -168,6 +168,7 @@ static void resetWorld() {
     gPmuIrqRetry = false; gPmuIrqReadMs = 0; gBatteryThresholds = -1;
     gPmuIrqEnableRetry = false; gPmuIrqEnableMs = 0; memset(gPmuIrqHandled, 0, sizeof(gPmuIrqHandled));
     gChargeTargetVerified = false; gEarlyChargeDisabled = true; gEarlyChargeTimeoutPending = false;
+    gPmuPeripheralChecked = gPmuPeripheralWarning = false;
     gDiagnosticClock.~DiagnosticClock(); new (&gDiagnosticClock) diagnostics::DiagnosticClock;
     gRtc = diagnostics::RtcRuntime();
     gGpsClockSet = false; gLastGpsSyncMs = 0;

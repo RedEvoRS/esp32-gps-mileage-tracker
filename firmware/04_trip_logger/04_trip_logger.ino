@@ -30,8 +30,8 @@
 //   SD, SPI, LittleFS, and Preferences ship with the ESP32 Arduino core.
 //   U8g2 2.36.18 (olikraus) drives the optional test-drive OLED page.
 //
-// PARTITIONS: partitions.csv is unchanged (no OTA, 2.375 MB LittleFS
-// fallback, about 5-6 driving hours). SD requires FAT32; never auto-format.
+// PARTITIONS: first installs use 6.375 MiB for LittleFS; app-only updates
+// keep the installed layout. No OTA. SD requires FAT32; never auto-format.
 // New trips use SD when it mounts at boot. Both mounted stores are repaired
 // and drained, SD first, so flash trips from a previous boot are not stranded.
 //
@@ -81,6 +81,32 @@
 #include "runtime_faults.h"
 #include "rtc_runtime.h"
 
+#ifdef SD_BENCH_POWER_CUT
+#include "sd_bench_check.h"
+#if SD_BENCH_POWER_CUT == 2
+#include <ff.h>
+#include <diskio.h>
+static_assert(!FF_FS_TINY, "SD bench mode 2 expects the pinned FatFs per-file cache.");
+extern "C" DRESULT __real_ff_disk_write(BYTE drive, const BYTE* data, LBA_t sector, UINT count);
+extern "C" DRESULT __wrap_ff_disk_write(BYTE drive, const BYTE* data, LBA_t sector, UINT count);
+#endif
+#if defined(WATCHDOG_BENCH_STARTUP_HANG) || defined(WATCHDOG_BENCH_HANG)
+#error "Use SD_BENCH_POWER_CUT separately from the watchdog bench flags."
+#endif
+static_assert(SD_BENCH_POWER_CUT == 1 || SD_BENCH_POWER_CUT == 2,
+              "SD_BENCH_POWER_CUT must be 1 (clean) or 2 (during ack sync).");
+#ifndef SD_BENCH_DELAY_MS
+#define SD_BENCH_DELAY_MS 0
+#endif
+#ifndef SD_BENCH_CYCLES
+#define SD_BENCH_CYCLES 50
+#endif
+static_assert(SD_BENCH_DELAY_MS >= 0 && SD_BENCH_DELAY_MS <= 5000,
+              "SD_BENCH_DELAY_MS must be 0 to 5000.");
+static_assert(SD_BENCH_CYCLES >= 1 && SD_BENCH_CYCLES <= 1000000,
+              "SD_BENCH_CYCLES must be 1 to 1000000.");
+#endif
+
 #include "runtime_debug.h"
 // Core 1 is the only writer. Core 0 reads the mode, never the button or OLED.
 static std::atomic<bool> gDebugMode{false};
@@ -102,11 +128,11 @@ static constexpr uint32_t DEBUG_FEEDBACK_MS = 2000;
 #include "debug_display.h"
 static uint32_t gDebugDrawMs = 0; // loop-owned redraw cadence, not renderer state
 #include "debug_temperature.h"
-static float gDebugTempDie = NAN;
+#include "bme280_temp.h"
+static float gDebugTempDie = NAN, gChargeAirC = NAN;
 static uint32_t gDebugTempDieMs = 0, gDebugTempLogMs = 0;
-static bool gDebugTempEnabled = false, gDebugTempPending = false;
-static debug_temperature::TsSetup gDebugTempTs;
-static bme280_temp::Sensor gDebugTempBme;
+static bool gChargeAirPowered = false;
+static bme280_temp::Sensor gChargeAirSensor;
 #include "production_display.h"
 static display::DisplayModel gDisplayModel;
 static bool gDisplayTripFinalized = false, gDisplayUserRequest = false;
@@ -436,6 +462,8 @@ static bool gContactKnown = false;
 static uint32_t gGpsDiagStartMs = 0, gLastNmeaMs = 0, gIdleFixWaitMs = 0;
 static uint32_t gStorageDiagMs = 0, gBatteryDiagMs = 0;
 static bool gBatteryDiagChecked = false;
+static bool gPmuPeripheralChecked = false;
+static bool gPmuPeripheralWarning = false;
 static uint8_t gJoinFailures = 0, gTransportFailures = 0;
 
 struct TripRecovery {
@@ -628,6 +656,11 @@ static void sdFatCondition(uint32_t now) {
     gLoopFaults.event(diagnostics::Code::SD_FILESYSTEM_DAMAGED, now);
     if (failed) gLoopFaults.enumeration("reason", diagnostics::sdFatReason(gSdFatCheck));
     gLoopFaults.condition(failed);
+}
+
+static void pmuPeripheralCondition(uint32_t now) {
+    if (!gJournalReady || !gPmuPeripheralChecked) return;
+    gLoopFaults.event(diagnostics::Code::PMU_PERIPHERAL_SETUP_FAILED, now).condition(gPmuPeripheralWarning);
 }
 
 static void storageConditions(uint64_t freeB, uint32_t now) {
@@ -2043,20 +2076,22 @@ static void serviceBatteryDiagnostics() {
 // Battery charge temperature guard (audit N4)
 // -----------------------------------------------------------------
 // Li-ion must only be charged at roughly 0-45 C cell temperature, and a
-// parked car's cabin passes 60 C in summer. TS is excluded from charging
-// (the Supreme's Rt is unidentified), so the AXP2101's own die temperature
-// stands in. Measured on the retired V1.2 2026-10-05: the die idles
-// ~9 C above a 25.6 C room with nothing charging, and charge current heats
-// it a few degrees more within seconds. Hence the offset, and a 7 C gap
-// between pausing and resuming so the charger's own heat can't make it
-// toggle. Pausing charging never affects logging: on USB the PMU powers
-// the board directly; the battery just isn't topped up until it cools.
-// Supreme debug-only Temp: logs collect recalibration evidence; no tuning yet.
+// parked car's cabin can pass 60 C. The Supreme has no usable cell thermistor.
+// On the Supreme the die ran 8.9-10.7 C above the BME280 without charging
+// (88 USB desk samples). At 93% battery in CV, that gap grew from 11.5
+// to 16.8 C over six minutes (15 samples), while board air rose only 0.7 C.
+// The 9 C offset comes from the retired V1.2's idle die measurements.
+// Die self-heating can pause charging early in heat and mask freezing in cold.
+// The BME280 measures board air. After a long cold soak, the cell and board
+// air track the cabin. While charging, the cell warms and board air changes
+// little, so the air reading can err toward pausing early on the cold side.
+// Either reading can pause charging; both must permit resumption. Fall back
+// to die alone if board air is unavailable. USB still powers the logger.
 static constexpr float    DIE_OFFSET_C      = 9.0f;
-static constexpr float    CHG_HOT_PAUSE_C   = 45.0f + DIE_OFFSET_C;   // battery ~45 C
-static constexpr float    CHG_HOT_RESUME_C  = 38.0f + DIE_OFFSET_C;   // battery ~38 C
-static constexpr float    CHG_COLD_PAUSE_C  =  0.0f + DIE_OFFSET_C;   // battery ~0 C
-static constexpr float    CHG_COLD_RESUME_C =  5.0f + DIE_OFFSET_C;   // battery ~5 C
+static constexpr float    CHG_HOT_PAUSE_C   = 45.0f; // all thresholds in battery terms
+static constexpr float    CHG_HOT_RESUME_C  = 38.0f;
+static constexpr float    CHG_COLD_PAUSE_C  =  0.0f;
+static constexpr float    CHG_COLD_RESUME_C =  5.0f;
 static constexpr uint32_t CHG_CHECK_MS      = 30UL * 1000;
 static constexpr uint32_t CHG_FIRST_RETRY_MS = 1000;
 static constexpr uint32_t CHG_FIRST_GRACE_MS = 10000;
@@ -2117,6 +2152,20 @@ static bool verifyChargeTarget4V1(unsigned attempts, bool forceWrite = false) {
     return false;
 }
 
+static float readChargeAir() {
+    // Production Wire readiness is independent of OLED communication.
+    if (!gChargeAirPowered || !gProductionWireReady ||
+        !gChargeAirSensor.trigger(Wire, millis())) return NAN;
+    // Yield for the 5 ms forced conversion, plus one tick of rounding margin.
+    // At 9600 baud this wait fits well within the 4096-byte GPS RX buffer.
+    // Sensor aborts on its first I2C error (Wire's timeout is 10 ms).
+    delay(6);
+    int32_t centiC;
+    if (!gChargeAirSensor.finish(Wire, millis(), centiC)) return NAN;
+    const float air = centiC / 100.0f;
+    return charge_temperature::plausibleAir(air) ? air : NAN;
+}
+
 static void serviceChargeTemp() {
     uint32_t now = millis();
     if (gChargeChecked && uint32_t(now - gChargeCheckT0) <
@@ -2134,16 +2183,27 @@ static void serviceChargeTemp() {
     if (std::isfinite(die) || uint32_t(now - gChargeFirstMs) >= CHG_FIRST_GRACE_MS)
         gChargeFirstResolved = true;
     bool firstGrace = !gChargeFirstResolved;
-    // Reuse this exact sample, including NAN on failure. No second PMU read.
+    // Debug reuses this check's samples, including NAN on failure.
+    const bool dieChanged = std::isfinite(die) != std::isfinite(gDebugTempDie);
     gDebugTempDie = die;
     gDebugTempDieMs = now;
+    const float air = readChargeAir();
+    const bool airAvailable = std::isfinite(air);
+    if (airAvailable != std::isfinite(gChargeAirC) || (airAvailable && dieChanged)) {
+        if (airAvailable) {
+            Serial.println(std::isfinite(die) ? "Charge guard: using both sensors."
+                                             : "Charge guard: board air available, die unreadable.");
+        } else {
+            Serial.println(std::isfinite(die) ? "Charge guard: using die only."
+                                             : "Charge guard: no usable sensor readings.");
+        }
+    }
+    gChargeAirC = air;
     const auto decision = charge_temperature::evaluate(
-        die, gChargePauseRequested,
-        CHG_HOT_PAUSE_C, CHG_HOT_RESUME_C, CHG_COLD_PAUSE_C, CHG_COLD_RESUME_C);
+        die, air, gChargePauseRequested,
+        CHG_HOT_PAUSE_C, CHG_HOT_RESUME_C, CHG_COLD_PAUSE_C, CHG_COLD_RESUME_C, DIE_OFFSET_C);
     const bool pause = decision.pause;
-    const char* why = decision.why;
-    // Only finite, plausible readings update hysteresis history; unreadable
-    // samples pause charging fail-safe without creating hot/cold history.
+    // A missing die blocks charging. Only plausible samples create hot/cold history.
     gChargePauseRequested = decision.nextPauseRequested;
 
     if (!gEarlyChargeDisabled) {
@@ -2175,13 +2235,25 @@ static void serviceChargeTemp() {
                 (unsigned long)((firstGrace ? CHG_FIRST_RETRY_MS : CHG_CHECK_MS) / 1000));
         } else {
             gChargeFailures = 0;
+            char boardAir[24] = "";
+            if (std::isfinite(air)) snprintf(boardAir, sizeof boardAir, ", board air %.1f C", air);
             if (pause && !firstGrace) {
-                Serial.printf("Charging paused: %s (die %.1f C, battery ~%.0f C)\n",
-                              why, die, die - DIE_OFFSET_C);
+                const char* airReason = decision.air.hot ? "board air too hot" :
+                    decision.air.cold ? "board air too cold" : "";
+                if (decision.unreadable) {
+                    Serial.printf("Charging paused: die unreadable%s%s%s\n",
+                                  *airReason ? ", " : "", airReason, boardAir);
+                } else {
+                    const char* dieReason = decision.die.hot ? "die estimate too hot" :
+                        decision.die.cold ? "die estimate too cold" : "";
+                    Serial.printf("Charging paused: %s%s%s (die %.1f C, battery ~%.0f C%s)\n",
+                                  dieReason, *dieReason && *airReason ? ", " : "", airReason,
+                                  die, die - DIE_OFFSET_C, boardAir);
+                }
             } else if (!pause) {
-                Serial.printf(first ? "Charge guard: die %.1f C (battery ~%.0f C), charging on.\n"
-                                    : "Charging resumed (die %.1f C, battery ~%.0f C)\n",
-                              die, die - DIE_OFFSET_C);
+                Serial.printf(first ? "Charge guard: die %.1f C (battery ~%.0f C%s), charging on.\n"
+                                    : "Charging resumed (die %.1f C, battery ~%.0f C%s)\n",
+                              die, die - DIE_OFFSET_C, boardAir);
             }
         }
     } else if (!targetOk) {
@@ -2194,14 +2266,15 @@ static void serviceChargeTemp() {
 
     if (gJournalReady) {
         // E2004/E2005 describe a required pause, not a confirmed charger state.
-        // Follow intent/hysteresis even if control is unconfirmed. Context is
-        // measured die temperature, not an invented cell measurement.
-        // Unreadable samples carry no temperature.
-        if (!decision.unreadable) {
+        // After startup grace, board air can raise a condition on its own.
+        // Clearing requires a usable die reading. Context uses the measured die.
+        if (!firstGrace) {
             for (auto code : {diagnostics::Code::CHARGE_HOT, diagnostics::Code::CHARGE_COLD}) {
+                const bool active = code == diagnostics::Code::CHARGE_HOT ? decision.hot() : decision.cold();
+                if (decision.unreadable && !active) continue;
                 gLoopFaults.event(code, now);
-                if (die >= -50 && die <= 150) gLoopFaults.integer("temperature_mc", int(die * 1000));
-                gLoopFaults.condition(pause && (code == diagnostics::Code::CHARGE_HOT ? die > CHG_HOT_RESUME_C : die < CHG_COLD_RESUME_C));
+                if (!decision.unreadable) gLoopFaults.integer("temperature_mc", int(die * 1000));
+                gLoopFaults.condition(active);
             }
         }
         if (!firstGrace) gLoopFaults.event(diagnostics::Code::CHARGE_TEMP_UNREADABLE, now).condition(decision.unreadable);
@@ -2216,7 +2289,7 @@ static void serviceChargeTemp() {
     // Charging was already commanded off during the retries, so the state
     // block above prints nothing when the window ends without a reading.
     if (first && !firstGrace && decision.unreadable)
-        Serial.printf("Charge guard: no plausible temperature in the first %lu s; charging stays off.\n",
+        Serial.printf("Charge guard: no plausible die temperature in the first %lu s; charging stays off.\n",
                       (unsigned long)(CHG_FIRST_GRACE_MS / 1000));
 }
 
@@ -2953,6 +3026,7 @@ static void serviceRuntimeDiagnostics() {
     }
     gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, now).condition(!gSdMounted || sdRecordingUnavailable());
     sdFatCondition(now);
+    pmuPeripheralCondition(now);
     // Check idle storage too, so a successful core-0 upload can be observed as
     // recovery on core 1 without sharing producer state across tasks.
     if (uint32_t(now - gStorageDiagMs) >= FS_CHECK_MS) {
@@ -3098,6 +3172,29 @@ static bool prepareTripDirectory(fs::FS& storage) {
     return ready;
 }
 
+#ifdef SD_BENCH_POWER_CUT
+static bool sdBenchFatHeadersReady() {
+    using sd_bench::HeaderResult;
+    const auto check = sd_bench::checkFatHeaders(SD);
+    switch (check.result) {
+        case HeaderResult::ReadError:
+            Serial.printf("SD BENCH: raw header read failed (copy %lu, 0 means boot sector).\n",
+                          (unsigned long)check.copy);
+            return false;
+        case HeaderResult::Layout:
+            Serial.println("SD BENCH: refused; the scratch card must have two FAT32 copies.");
+            return false;
+        case HeaderResult::ReservedEntries:
+            Serial.printf("SD BENCH: FAT copy %lu reserved entries failed: FAT[0]=0x%08lx FAT[1]=0x%08lx.\n",
+                          (unsigned long)check.copy, (unsigned long)check.fat0, (unsigned long)check.fat1);
+            return false;
+        case HeaderResult::Passed:
+            return true;
+    }
+    return false;
+}
+#endif
+
 static constexpr unsigned PMU_PERIPHERAL_ATTEMPTS = 3;
 // An estimated pause to ride out transient I2C failures, not a measured timing requirement.
 static constexpr uint32_t PMU_PERIPHERAL_RETRY_MS = 10;
@@ -3154,10 +3251,20 @@ static bool mountSdStorage() {
             Serial.printf("WARNING: microSD filesystem check failed (%s) -- card not used. "
                           "Check it on a PC and copy any needed files before reformatting as FAT32. "
                           "The tracker never formats it.\n", diagnostics::sdFatReason(gSdFatCheck));
-        } else {
+        }
+#ifdef SD_BENCH_POWER_CUT
+        // Run the extra header check even when #783 found damage. Keep the
+        // mount read-only until both checks and the owner marker pass.
+        if (sdBenchFatHeadersReady() && gSdFatCheck == diagnostics::SdFatCheck::Passed) {
+            if (sd_bench::hasMarker(SD)) return true;
+            Serial.println("SD BENCH: refused; root SDBENCH.OK is missing, unreadable or a directory.");
+        }
+#else
+        else {
             if (prepareTripDirectory(SD)) return true;
             Serial.println("WARNING: microSD trip directory unavailable; card preserved.");
         }
+#endif
     } else {
         // SD.begin discards card type on failure; there is no card-detect
         // pin. Be explicit that absence and bus/format faults look alike.
@@ -3272,67 +3379,31 @@ static void serviceDebugRf() {
     ubxSend(0x0A, 0x38, nullptr, 0);
 }
 
-static void beginDebugTemperature() {
-    // Only runtime debug entry reaches here, after LoRa-off verification, storage,
-    // and the first guard check. PMU/Wire1 accesses (including RTC and IRQ
-    // batches) all run serially on core 1; the ISR only sets a flag. There is
-    // no PMU access from the networking task and no PMU mutex to acquire.
-    gDebugTempTs = debug_temperature::setupTs(PMU);
-    char control[11] = "--", adc[11] = "--"; // room for the API's full int range
-    if (gDebugTempTs.control >= 0) snprintf(control, sizeof control, "0x%02X", gDebugTempTs.control);
-    if (gDebugTempTs.adc >= 0) snprintf(adc, sizeof adc, "0x%02X", gDebugTempTs.adc);
-    Serial.printf("Temp setup: TS %s, REG50 %s, REG30 %s (target external input, 50 uA).\n",
-                  gDebugTempTs.ready ? "verified" : "unavailable", control, adc);
-    // ALDO1 supplies BME280 + OLED + magnetometer. Do not change any rail:
-    // Trusted startup sets ALDO1 to 3.3 V; an unpowered/missing sensor shows --.
-    gDebugTempEnabled = true;
-    gDebugTempPending = false;
-    gDebugTempLogMs = millis();
-}
-
 static void serviceDebugTemperature() {
-    if (!debugMode() || !gDebugTempEnabled || gDegraded.mode() != startup::Mode::Normal) return;
+    if (!debugMode() || gDegraded.mode() != startup::Mode::Normal) return;
     uint32_t now = millis();
-    if (!gDebugTempPending) {
-        // Same rollover-safe 30 s scheduling pattern as serviceDebugRf().
-        if (uint32_t(now - gDebugTempLogMs) < 30000) return;
-        gDebugTempLogMs = now;
-        gDebugTempPending = true;
-        if (gDebugWireReady && gDebugTempBme.trigger(Wire, now)) return;
-    }
-    if (gDebugTempBme.waiting(now)) return;
-    int32_t centiC = 0;
-    bool bmeOk = gDebugWireReady && gDebugTempBme.finish(Wire, now, centiC);
-    gDebugTempPending = false;
-
-    int raw = -1;
-    if (gDebugTempTs.ready) {
-        int high = PMU.readRegister(0x36); // high first latches low (datasheet)
-        int low = PMU.readRegister(0x37);
-        raw = debug_temperature::tsRaw(high, low);
-    }
+    if (uint32_t(now - gDebugTempLogMs) < 30000) return;
+    gDebugTempLogMs = now;
     const auto p = debug_temperature::samplePower(PMU, now);
-    char die[40] = "-- C", estimate[16] = "--", ts[16] = "--", tsRaw[8] = "--";
+    char die[40] = "-- C", estimate[16] = "--";
     char bme[16] = "--", volts[16] = "--", percent[12] = "--";
     // Independent 30 s schedules can drift. Reuse the latest guard sample
     // through one guard interval plus 5 s, and report its age explicitly.
     uint32_t dieAgeMs = uint32_t(now - gDebugTempDieMs);
-    if (gChargeChecked && dieAgeMs <= CHG_CHECK_MS + 5000 && std::isfinite(gDebugTempDie)) {
-        snprintf(die, sizeof die, "%.1f C (%lu s)", gDebugTempDie, (unsigned long)(dieAgeMs / 1000));
-        snprintf(estimate, sizeof estimate, "%.1f", gDebugTempDie - DIE_OFFSET_C);
+    if (gChargeChecked && dieAgeMs <= CHG_CHECK_MS + 5000) {
+        if (std::isfinite(gDebugTempDie)) {
+            snprintf(die, sizeof die, "%.1f C (%lu s)", gDebugTempDie, (unsigned long)(dieAgeMs / 1000));
+            snprintf(estimate, sizeof estimate, "%.1f", gDebugTempDie - DIE_OFFSET_C);
+        }
+        if (std::isfinite(gChargeAirC)) snprintf(bme, sizeof bme, "%.2f", gChargeAirC);
     }
-    if (raw >= 0) {
-        snprintf(ts, sizeof ts, "%.3f", debug_temperature::tsVolts(raw));
-        snprintf(tsRaw, sizeof tsRaw, "%d", raw);
-    }
-    if (bmeOk) snprintf(bme, sizeof bme, "%.2f", centiC / 100.0);
     if (p.millivolts >= 0) snprintf(volts, sizeof volts, "%.2f", p.millivolts / 1000.0);
     if (p.percent >= 0) snprintf(percent, sizeof percent, "%d", p.percent);
     const char* charging = p.status2 < 0 ? "--" : debug_temperature::isCharging(p.status2) ? "on" : "off";
     auto vbus = pmu_read::vbusState(p.status1, p.status2);
-    Serial.printf("Temp: die %s, guard_est %s C, TS %s V, TS_raw %s, BME280 %s C, "
+    Serial.printf("Temp: die %s, guard_est %s C, BME280 %s C, "
                   "chg %s, phase %s, batt %s V, pct %s, VBUS %s\n",
-                  die, estimate, ts, tsRaw, bme, charging, debug_temperature::phase(p.status2),
+                  die, estimate, bme, charging, debug_temperature::phase(p.status2),
                   volts, percent, vbus == VbusState::Unknown ? "--" : vbus == VbusState::Present ? "1" : "0");
 }
 
@@ -3423,12 +3494,7 @@ static void toggleRuntimeDebug() {
     gDisplayUserRequest = gDisplayTripFinalized = false;
     gDisplayUsbPowerRequest = false;
     gModeFeedback = true; gModeFeedbackMs = millis();
-    // Drop an unfinished BME conversion; the next entry starts a fresh cycle.
-    gDebugTempPending = false;
-    gDebugTempBme = bme280_temp::Sensor();
     if (enabled) {
-        gDebugWireReady = gProductionWireReady;
-        if (!gDebugTempEnabled) beginDebugTemperature();
         gDebugTempLogMs = millis();
         reportEventHeap(); // current heap at debug entry, rather than a boot-time fiction
     }
@@ -3486,6 +3552,7 @@ static void beginJournal() {
     gJournal.setTimeProvider(stampDiagnosticTime);
     if (gJournalReady) diagnostics::submitJournalBoot(gJournal, esp_reset_reason(), gPmuStartup, millis(), gBootBattery);
     sdFatCondition(millis());
+    pmuPeripheralCondition(millis());
 }
 
 static bool createFsMutex() {
@@ -3559,6 +3626,7 @@ static void degradedLoop() {
         confirmVbusOff();
         serviceChargeTemp();
         serviceBatteryDiagnostics();
+        pmuPeripheralCondition(millis());
         if (!gVbusLost) gIdleSince = millis();
         else if (uint32_t(millis() - gIdleSince) >= IDLE_BATT_SLEEP_MS) powerOffForVbus();
         gLoopFaults.event(diagnostics::Code::SD_UNAVAILABLE, millis()).condition(true);
@@ -3694,12 +3762,164 @@ static bool configureTsFixedInput() {
     return false;
 }
 
+#ifdef SD_BENCH_POWER_CUT
+static constexpr const char* SD_BENCH_TRIP_PATH = "/trips/bench.gpx";
+static constexpr uint32_t SD_BENCH_RAIL_OFF_MS = 250;
+[[noreturn]] static void sdBenchStop(unsigned long checked, const char* reason);
+[[noreturn]] static void runSdBench(bool radioOff);
+
+#if SD_BENCH_POWER_CUT == 2
+static TaskHandle_t gSdBenchCutTask = nullptr, gSdBenchWriter = nullptr;
+static bool gSdBenchArmAck = false, gSdBenchTriggered = false; // writer only
+static std::atomic<bool> gSdBenchWriteActive{false};
+static std::atomic<bool> gSdBenchRailOff{false}, gSdBenchWriteOverlap{false};
+
+static void sdBenchCutTask(void*) {
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (SD_BENCH_DELAY_MS) delay(SD_BENCH_DELAY_MS);
+        // Wire1/PMU is independent of the SPI bus and the writer's FatFs lock.
+        gSdBenchRailOff = powerOffSdRail();
+        gSdBenchWriteOverlap = gSdBenchWriteActive.load();
+        xTaskNotifyGive(gSdBenchWriter);
+    }
+}
+
+// Linker wrap for the pinned ESP-IDF FatFs disk dispatcher. The ack save
+// truncates and rewrites an 80-byte ELG2 record, so f_sync writes its
+// per-file cache as one sector. Trigger on that write, inside the real sync.
+extern "C" DRESULT __wrap_ff_disk_write(BYTE drive, const BYTE* data, LBA_t sector, UINT count) {
+    if (!gSdBenchArmAck || count != 1 || std::memcmp(data, "ELG2", 4) != 0)
+        return __real_ff_disk_write(drive, data, sector, count);
+    gSdBenchArmAck = false;
+    gSdBenchTriggered = true;
+    gSdBenchWriteActive.store(true);
+    xTaskNotifyGive(gSdBenchCutTask);
+    const auto result = __real_ff_disk_write(drive, data, sector, count);
+    gSdBenchWriteActive.store(false);
+    return result;
+}
+#endif
+
+[[noreturn]] static void sdBenchStop(unsigned long checked, const char* reason) {
+    Serial.printf("SD BENCH STOP: checked cycles=%lu, %s\n", checked, reason);
+    if (gSdMounted) {
+        SD.end();
+        gSdMounted = false;
+        gSdSpi.end();
+        delay(SD_POWER_OFF_SETTLE_MS);
+        powerOffSdRail();
+    }
+    for (;;) delay(1000); // keep the report available; no automatic restart
+}
+
+static bool sdBenchWriteTrip() {
+    FileWriter writer(tripMount(SD), SD_BENCH_TRIP_PATH, /*create=*/true);
+    if (!writer) return false; // O_EXCL preserves any pre-existing file
+    writer.put(GPX_PROLOGUE);
+    const Fix synthetic{};
+    for (unsigned point = 0; point < 64; ++point) appendTrkpt(writer, synthetic);
+    writer.put(GPX_EPILOGUE);
+    return writer.commit();
+}
+
+[[noreturn]] static void runSdBench(bool radioOff) {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.printf("\nSD BENCH: SCRATCH CARD ONLY. Firmware %s, mode=%d, delay=%d ms, limit=%d cycles.\n",
+                  firmware::kVersion, SD_BENCH_POWER_CUT, SD_BENCH_DELAY_MS, SD_BENCH_CYCLES);
+    if (!radioOff) sdBenchStop(0, "refused; PMU or LoRa rail off could not be verified");
+    if (!disableChargeBounded(CHG_DISABLE_WAIT_MS, CHG_DISABLE_RETRY_MS))
+        sdBenchStop(0, "refused; charger disable could not be verified");
+
+    Serial.println("SD BENCH: send s to start. The card must contain /SDBENCH.OK.");
+    while (Serial.read() != 's') delay(20);
+    // A reset may have left BLDO1 on. Give any previous write time to settle
+    // before the production mount helper cycles the rail.
+    delay(SD_POWER_OFF_SETTLE_MS);
+    gSdMounted = mountSdStorage();
+    if (!gSdMounted) sdBenchStop(0, "initial mount/guard failed; see preceding output");
+    const uint32_t cluster = diagnostics::journalSdCluster(SD);
+    if (!cluster) sdBenchStop(0, "could not read journal allocation geometry");
+
+    // Only the bench writer uses the filesystem; the cutter only talks to
+    // the PMU. Keep the journal and batch out of the task stack.
+    gJournal.~EventLog();
+    new (&gJournal) diagnostics::EventLog(&gSdJournalFs, nullptr);
+    const auto boot = diagnostics::newJournalBoot(/*useNvs=*/false);
+    if (!gJournal.begin(boot.id, boot.counter, firmware::kVersion) || !gJournal.setSdAllocationUnit(cluster))
+        sdBenchStop(0, "journal initialization failed");
+    static diagnostics::EventLog::Batch batch;
+#if SD_BENCH_POWER_CUT == 2
+    gSdBenchWriter = xTaskGetCurrentTaskHandle();
+    if (xTaskCreatePinnedToCore(sdBenchCutTask, "sd-cut", 4096, nullptr, 2,
+                               &gSdBenchCutTask, 0) != pdPASS)
+        sdBenchStop(0, "could not start the independent power-cut task");
+    unsigned long overlaps = 0;
+#endif
+
+    for (unsigned long cycle = 1; cycle <= SD_BENCH_CYCLES; ++cycle) {
+        Serial.printf("SD BENCH: cycle %lu starting.\n", cycle);
+        if (!prepareTripDirectory(SD) || !sdBenchWriteTrip())
+            sdBenchStop(cycle - 1, "scratch GPX write failed; check /trips/bench.gpx and the card");
+        diagnostics::EventInput event;
+        event.code = static_cast<uint16_t>(diagnostics::Code::BOOT);
+        event.uptimeMs = millis();
+        if (gJournal.submit(event) != diagnostics::EventLog::Submit::Accepted)
+            sdBenchStop(cycle - 1, "journal rejected synthetic event");
+        const auto previousFailures = gJournal.stats().storageFailures;
+        gJournal.service();
+        if (gJournal.stats().queued || !gJournal.nextBatch(batch) || !batch.count ||
+            gJournal.stats().storageFailures != previousFailures)
+            sdBenchStop(cycle - 1, "could not write and read back the SD journal batch");
+
+#if SD_BENCH_POWER_CUT == 1
+        if (!gJournal.acknowledge(batch, batch.ids, batch.count) || !gJournal.seal())
+            sdBenchStop(cycle - 1, "clean cycle could not acknowledge and seal the journal");
+        SD.end();
+        gSdMounted = false;
+        if (SD_BENCH_DELAY_MS) delay(SD_BENCH_DELAY_MS);
+        if (!powerOffSdRail()) sdBenchStop(cycle - 1, "card power-off unconfirmed");
+#else
+        gSdBenchTriggered = false;
+        gSdBenchArmAck = true;
+        const bool acked = gJournal.acknowledge(batch, batch.ids, batch.count);
+        gSdBenchArmAck = false;
+        if (!gSdBenchTriggered)
+            sdBenchStop(cycle - 1, "no ack sector write intercepted; check linker flag and preceding errors");
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        if (gSdBenchRailOff && gSdBenchWriteOverlap) ++overlaps;
+        Serial.printf("SD BENCH: rail-off=%s, ack sector write active at read-back=%s, ack=%s, overlaps=%lu.\n",
+                      gSdBenchRailOff ? "verified" : "unconfirmed", gSdBenchWriteOverlap ? "yes" : "unconfirmed",
+                      acked ? "verified" : "failed", overlaps);
+        if (!gSdBenchRailOff) sdBenchStop(cycle - 1, "card power-off unconfirmed");
+        // The writer has returned from sync and close. Only now dismantle
+        // the VFS/driver, with the rail still off.
+        SD.end();
+        gSdMounted = false;
+#endif
+        gSdSpi.end();
+        delay(SD_BENCH_RAIL_OFF_MS);
+        gSdMounted = mountSdStorage();
+        if (!gSdMounted) sdBenchStop(cycle - 1, "post-cut mount/guard failed; preserve the card");
+        Serial.printf("SD BENCH: cycle %lu remounted; FAT checks passed.\n", cycle);
+        gJournal.invalidateStorage();
+        if (!SD.remove(SD_BENCH_TRIP_PATH))
+            sdBenchStop(cycle, "could not remove the scratch GPX after validation");
+    }
+    sdBenchStop(SD_BENCH_CYCLES, "limit reached; FAT checks passed");
+}
+#endif
+
 void setup() {
     // VBUS-insert power-on brings the Supreme's LoRa rail up ON. Disable
     // and verify it as the first PMU operation after bounded bus recovery
     // and initialization, BEFORE Serial, storage or GPS setup can block.
     bool pmuReady = beginPmuWithRecovery(Wire1, PMU, I2C_SDA, I2C_SCL, gPmuStartup);
     bool radioOff = pmuReady && PMU.disableALDO3() && aldo3State() == Aldo3State::Off;
+#ifdef SD_BENCH_POWER_CUT
+    runSdBench(radioOff);
+#endif
     // Bounded PMU/bus recovery and the radio-off safety command come first.
     // Enroll before display, USB waits, filesystems, NVS or any storage call.
     startup_watchdog::Record saved{gStartupWatchdogRecord.magic, gStartupWatchdogRecord.stage,
@@ -3709,10 +3929,11 @@ void setup() {
         reason == ESP_RST_TASK_WDT || reason == ESP_RST_INT_WDT || reason == ESP_RST_WDT);
     saveStartupWatchdog();
     armLoopWatchdog(startup_watchdog::STARTUP_WDT_TIMEOUT_MS, false);
-    bool aldo1Warning = false;
     BatterySetup batterySetup;
     gEarlyChargeDisabled = true;
     gEarlyChargeTimeoutPending = false;
+    gPmuPeripheralChecked = false;
+    gPmuPeripheralWarning = false;
     gBootBattery = diagnostics::BatterySample();
     if (radioOff) {
         // Stop retained charging before display/USB/storage waits. Only trusted
@@ -3727,7 +3948,7 @@ void setup() {
         bool enabled = PMU.enableALDO1();
         aldo1Control = PMU.readRegister(XPOWERS_AXP2101_LDO_ONOFF_CTRL0);
         aldo1Voltage = PMU.readRegister(XPOWERS_AXP2101_LDO_VOL0_CTRL);
-        aldo1Warning = !voltageSet || !enabled || !pmu_read::aldo1Ready(aldo1Control, aldo1Voltage);
+        gChargeAirPowered = voltageSet && enabled && pmu_read::aldo1Ready(aldo1Control, aldo1Voltage);
         // No 250 ms off/on cycle: the reported failures were cold power-ons.
         // 10 ms is a conservative guess for the LDO ramp and local supply
         // capacitors to settle before I2C, not a measured board requirement.
@@ -3801,7 +4022,7 @@ void setup() {
     if (!batterySetup.voltage)
         Serial.printf("WARNING: PMU battery voltage measurement enable unconfirmed after %u attempts.\n",
                       PMU_PERIPHERAL_ATTEMPTS);
-    if (aldo1Warning)
+    if (radioOff && !gChargeAirPowered) // degraded power startup never sets ALDO1
         Serial.println("WARNING: ALDO1 3.3 V/on setup unconfirmed; OLED/BME280/magnetometer may be unavailable.");
     if (!gEarlyChargeDisabled) {
         Serial.println("WARNING: early charger disable unconfirmed; retrying up to 5 s before storage.");
@@ -3815,8 +4036,6 @@ void setup() {
     // XPowersLib's existing PMU.begin() sets TS to fixed input a few I2C
     // transactions before the early charger pause. Verify and repair that
     // setup only after confirming the pause, including bounded recovery above.
-    // The runtime debug TS probe keeps 0x50 bit 4 set, so TS stays a fixed
-    // input and the probe does not give TS control of charging.
     const bool tsReady = gEarlyChargeDisabled && configureTsFixedInput();
     if (!tsReady) {
         if (gEarlyChargeDisabled)
@@ -3851,8 +4070,9 @@ void setup() {
     // Enable the measurements the battery/VBUS predicates and the charge
     // temperature guard rely on.
     const bool measurementsReady = configurePmuMeasurements();
-    const bool pmuPeripheralWarning = !gpsRailReady || !measurementsReady || !tsReady ||
-                                      !batterySetup.detection || !batterySetup.voltage;
+    gPmuPeripheralWarning = !gpsRailReady || !measurementsReady || !tsReady ||
+                            !batterySetup.detection || !batterySetup.voltage;
+    gPmuPeripheralChecked = true;
     setupPmuIrq();
     // Seed VBUS state from hardware: a battery-only boot (e.g. wake via
     // power key away from the car) must still hit the idle power-off timer.
@@ -3874,7 +4094,6 @@ void setup() {
         // A card that failed its capacity query is already excluded from the journal.
         unmountDegradedSd();
         enterDegraded(startup::Mode::NoStorage);
-        gLoopFaults.event(diagnostics::Code::PMU_PERIPHERAL_SETUP_FAILED, millis()).condition(pmuPeripheralWarning);
         return;
     }
     startupStage(startup_watchdog::Stage::Services);
@@ -3890,7 +4109,6 @@ void setup() {
         // Explicit healthy observations resolve prior degraded-boot alerts.
         // Reuse mountTripStorage()'s single authoritative startup capacity result.
         gLoopFaults.event(diagnostics::Code::PMU_INIT_FAILED, millis()).condition(false);
-        gLoopFaults.event(diagnostics::Code::PMU_PERIPHERAL_SETUP_FAILED, millis()).condition(pmuPeripheralWarning);
         storageConditions(bootFreeBytes, millis());
     }
     if (tripStoreAvailable(SD)) { startupStage(startup_watchdog::Stage::CardRepair); fsckAllTrips(SD); }

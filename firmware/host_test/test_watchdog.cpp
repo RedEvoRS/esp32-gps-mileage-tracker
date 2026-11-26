@@ -75,7 +75,7 @@ static void startupAndRecovery() {
     // The erased scan exceeds the startup limit in total; verified block
     // progress feeds it. Tail repair no longer scans/copies the whole trip.
     g_disk.failMount = true;
-    g_partition.partition.size = 0x260000;
+    g_partition.partition.size = 0x660000;
     g_partition.bytes.assign(g_partition.partition.size, 0xff);
     g_sdDisk.capacity = 32 * 1024 * 1024;
     g_sdDisk.files["/trips/interrupted.gpx"] = largeOpenTrip();

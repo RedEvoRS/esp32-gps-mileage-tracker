@@ -374,6 +374,109 @@ int main() {
     }
     ++cases;
 
+    // Issue #838: E2010 keeps its startup verdict and is re-observed from both
+    // the normal and no-storage loops so rejected startup submissions retry,
+    // active warnings repeat every 15 min, and healthy boots stay observed clear.
+    auto loopObservation = [](uint16_t code) {
+        RuntimeFaults::Observation observations[64];
+        size_t count = 0;
+        assert(gLoopFaults.snapshot(observations, 64, count));
+        for (size_t i = 0; i < count; ++i)
+            if (observations[i].code == code) return observations[i];
+        assert(false);
+        return RuntimeFaults::Observation{};
+    };
+    for (bool degraded : {false, true}) {
+        auto tickLoop = [degraded]() {
+            if (degraded) degradedLoop();
+            else { runtimeHealthy(); serviceRuntimeDiagnostics(); }
+        };
+        // Healthy boot: observed clear after setup and stays silent across loop passes.
+        pmuWorld();
+        if (degraded) { SD.cardPresent = false; g_disk.failMount = true; }
+        setup();
+        assert(gDegraded.mode() == (degraded ? startup::Mode::NoStorage : startup::Mode::Normal));
+        assert(gPmuPeripheralChecked && !gPmuPeripheralWarning);
+        assert(codeRows(bootRows(), 2010).empty());
+        auto clearObs = loopObservation(2010);
+        assert(clearObs.observed && !clearObs.episode);
+        tickLoop();
+        const unsigned revAfterFirstTick = gLoopFaults.publicationRevision();
+        for (unsigned i = 0; i < 5; ++i) tickLoop();
+        assert(gLoopFaults.publicationRevision() == revAfterFirstTick);
+        g_millis += RuntimeFaults::kRepeatMs;
+        tickLoop();
+        assert(codeRows(bootRows(), 2010).empty());
+        clearObs = loopObservation(2010);
+        assert(clearObs.observed && !clearObs.episode);
+        ++cases;
+
+        // Warning boot: normal 15-minute repeat, plus recovery if the first
+        // startup submission is rejected (e.g. full event queue).
+        pmuWorld();
+        if (degraded) { SD.cardPresent = false; g_disk.failMount = true; }
+        PMU.registerReadOverride[XPOWERS_AXP2101_LDO_VOL3_CTRL] = -1;
+        setup();
+        assert(gDegraded.mode() == (degraded ? startup::Mode::NoStorage : startup::Mode::Normal));
+        assert(gPmuPeripheralChecked && gPmuPeripheralWarning);
+        auto raisedBoot = codeRows(bootRows(), 2010);
+        assert(raisedBoot.size() == 1);
+        has(raisedBoot[0], R"("transition":"raise")");
+        auto activeObs = loopObservation(2010);
+        assert(activeObs.observed && activeObs.episode);
+        g_millis += RuntimeFaults::kRepeatMs - 1;
+        tickLoop();
+        assert(codeRows(bootRows(), 2010).empty());
+        ++g_millis;
+        tickLoop();
+        auto repeatedBoot = codeRows(bootRows(), 2010);
+        assert(repeatedBoot.size() == 1);
+        has(repeatedBoot[0], R"("transition":"repeat")");
+        assert(episode(repeatedBoot[0]) == episode(raisedBoot[0]));
+
+        // Simulate a rejected startup submission with the event queue full,
+        // keeping the boot verdict stored by setup().
+        for (auto& slot : gLoopConditions) { auto code = slot.code; slot = {}; slot.code = code; }
+        gLoopFaults.~RuntimeFaults();
+        new (&gLoopFaults) RuntimeFaults(gJournal, gLoopConditions, sizeof(gLoopConditions) / sizeof(gLoopConditions[0]));
+        for (unsigned i = 0; i < kEventQueueSize; ++i)
+            assert(gJournal.submit(EventInput()) == EventLog::Submit::Accepted);
+        const auto dropsBefore = gJournal.stats().dropped;
+        pmuPeripheralCondition(millis());
+        assert(gJournal.stats().dropped == dropsBefore + 1);
+        auto missingObs = loopObservation(2010);
+        assert(!missingObs.observed && !missingObs.episode);
+        assert(codeRows(bootRows(), 2010).empty()); // drain filler events; no E2010 yet
+        // Hot-loop passes before kRetryMs stay bounded and do not drop more events.
+        const auto dropsAfterReject = gJournal.stats().dropped;
+        for (unsigned i = 0; i < 5; ++i) tickLoop();
+        g_millis += RuntimeFaults::kRetryMs - 1;
+        tickLoop();
+        assert(gJournal.stats().dropped == dropsAfterReject);
+        assert(codeRows(bootRows(), 2010).empty());
+        assert(!loopObservation(2010).observed);
+        // Once kRetryMs elapses, the runtime loop raises E2010 and publishes it.
+        ++g_millis;
+        tickLoop();
+        auto retried = codeRows(bootRows(), 2010);
+        assert(retried.size() == 1);
+        has(retried[0], R"("transition":"raise")");
+        has(retried[0], R"("context":{})");
+        activeObs = loopObservation(2010);
+        assert(activeObs.observed && activeObs.episode);
+        // Subsequent loop passes follow the normal 15-minute repeat cadence.
+        g_millis += RuntimeFaults::kRepeatMs - 1;
+        tickLoop();
+        assert(codeRows(bootRows(), 2010).empty());
+        ++g_millis;
+        tickLoop();
+        auto retriedRepeat = codeRows(bootRows(), 2010);
+        assert(retriedRepeat.size() == 1);
+        has(retriedRepeat[0], R"("transition":"repeat")");
+        assert(episode(retriedRepeat[0]) == episode(retried[0]));
+        ++cases;
+    }
+
     for (float value : {NAN, INFINITY, -INFINITY, -40.01f, 125.01f, 385.7f})
         assert(!charge_temperature::plausible(value));
     for (float value : {-40.0f, 30.0f, 60.0f, 125.0f})
@@ -411,7 +514,7 @@ int main() {
     auto unreadable = one(2006, "raise");
     assert(unreadable.find("temperature_mc") == std::string::npos);
     // The pause was commanded silently during the retries; say so once now.
-    assert(logCount("no plausible temperature in the first 10 s; charging stays off") == 1);
+    assert(logCount("no plausible die temperature in the first 10 s; charging stays off") == 1);
     assert(!logCount("Charging paused") && !logCount("Charge guard: die"));
     auto n = calls("getTemperature");
     g_millis += CHG_CHECK_MS - 1; serviceChargeTemp(); assert(calls("getTemperature") == n);
@@ -542,8 +645,8 @@ int main() {
     // E2008; a later matching read-back clears that same episode.
     for (unsigned failure = 0; failure < 4; ++failure) {
         pmuWorld(); bool resume = failure == 3;
-        if (resume) { PMU.dieC = CHG_HOT_PAUSE_C; serviceChargeTemp(); one(2004, "raise"); }
-        PMU.dieC = resume ? 30 : CHG_HOT_PAUSE_C;
+        if (resume) { PMU.dieC = 54.0f; serviceChargeTemp(); one(2004, "raise"); }
+        PMU.dieC = resume ? 30.0f : 54.0f;
         PMU.failChargeDisable = failure == 0;
         PMU.failChargeRead = failure == 1;
         if (failure == 2) PMU.registerReadOverride[XPOWERS_AXP2101_CHARGE_GAUGE_WDT_CTRL] = 2;
@@ -571,9 +674,9 @@ int main() {
     }
     // Failed pause retains hysteresis; a cooler-but-not-yet-safe reading must
     // retry disable, never enable. Unreadable temperature does the same.
-    pmuWorld(); PMU.dieC = CHG_HOT_PAUSE_C; PMU.failChargeDisable = true;
+    pmuWorld(); PMU.dieC = 54.0f; PMU.failChargeDisable = true;
     serviceChargeTemp(); one(2004, "raise");
-    PMU.dieC = CHG_HOT_RESUME_C + 1; chargeTick();
+    PMU.dieC = 48.0f; chargeTick();
     assert(calls("disableCellbatteryCharge") == 2 && calls("enableCellbatteryCharge") == 0);
     PMU.dieC = INFINITY; chargeTick(); auto rows = take();
     assert(codeRows(rows, 2006).size() == 1 && codeRows(rows, 2008).size() == 1);
@@ -897,10 +1000,10 @@ int main() {
         assert(PMU.chargeEnabled && !gChargePauseRequested); ++cases;
     }
     // (3) Existing cold pause history is still preserved across a transient unreadable reading.
-    pmuWorld(); PMU.dieC = CHG_COLD_PAUSE_C; serviceChargeTemp(); one(2005, "raise");
+    pmuWorld(); PMU.dieC = 9.0f; serviceChargeTemp(); one(2005, "raise");
     PMU.dieC = NAN; chargeTick(); one(2006, "raise");
     assert(!PMU.chargeEnabled && gChargePauseRequested);
-    PMU.dieC = 11.0f; chargeTick(); // still below CHG_COLD_RESUME_C (14 C)
+    PMU.dieC = 11.0f; chargeTick(); // still below the 14 C die resume threshold
     auto coldRows = take();
     assert(codeRows(coldRows, 2006).size() == 1 && codeRows(coldRows, 2005).empty());
     assert(!PMU.chargeEnabled && gChargePauseRequested); ++cases;

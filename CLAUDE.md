@@ -23,7 +23,14 @@ Supreme on `main`.
 **Supreme status:** Stages 1–3 and the trip logger (Stage 4) run on the
 Supreme: pins, rails, PMU power-off and USB wake were bench-checked
 2026-10-18. Stage 4 stores trips on the microSD card, with the internal
-2.375 MB LittleFS partition as fallback. The card was bench-checked
+LittleFS partition as fallback (6.375 MiB on the new layout, about 15 h of
+driving; app-only updates keep the installed layout). To enlarge an existing
+board's store, upload or back up internal trips first. First install erases
+internal trips, the trip counter and NVS/LittleFS diagnostics metadata; keep
+the enrolled microSD card inserted for the first boot so enrollment restores
+automatically (without it or if Device health stays stuck, re-enroll manually
+via `secrets.h`, as the server builder only builds enrollment ID 1); see
+Snapshot enrollment below. The card was bench-checked
 2026-10-18, and by 2026-10-20 two real drives were recorded on it and read
 back on a PC. The server was deployed on Debian 13 with `server/install.sh`
 on 2026-10-20; `install.sh --check` passed. The first real uploads from SD
@@ -156,10 +163,11 @@ PII/tools job, plus the firmware release workflow when `firmware/VERSION`
 changes. Draft PRs run only the PII/tools job; the other jobs report skipped
 (which GitHub counts as passing, but a draft can't merge). Marking a draft
 ready for review starts the full run. Build up combined work as one draft
-(merge other branches into its branch), run
-`gh workflow run audit-tests.yml --ref <branch>` for a checkpoint without
-leaving draft, and convert back to draft before pushing more fixes after it's
-marked ready (converting cancels an in-flight full run). Open drafts with
+(merge other branches into its branch) and rely on local checks while it's a
+draft. Full CI runs only once the PR is in review (marked ready), unless the
+owner asks for a manual run (`gh workflow run audit-tests.yml --ref <branch>`);
+never start one otherwise. Convert back to draft before pushing more fixes
+after it's marked ready (converting cancels an in-flight full run). Open drafts with
 `gh pr create --draft`: a PR opened ready and then converted starts a full
 run first.
 That workflow publishes immediately, before server deployment or board flashing.
@@ -340,13 +348,15 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   15-minute repeats; WiFi access point (AP) absence is a boot-local counter,
   never a scan event. Per-core static producer builders keep event buffers
   off task stacks. Bounded degraded startup retries restart on recovery.
-  The charge guard accepts finite die readings only from -40 to 125 C.
-  An unreadable first sample keeps charging off and retries each second for
-  ten seconds before E2006; plausible hot/cold samples act immediately.
-  Invalid samples never create hot/cold history or real debug temperatures.
-  The first-reading retry has host tests only: bench boots on 2026-11-10 (UTC)
-  were USB resets with a usable first reading, so a start from fully off is
-  unchecked.
+  The charge guard checks die minus 9 C and fresh BME280 board air. Either
+  can pause charging at <=0 or >=45 C. After a hot/cold pause, the die
+  estimate and any available air reading must return to 5–38 C. An unreadable
+  die blocks charging, keeps any hot/cold pause and still checks valid air.
+  Startup retries each second for up to ten seconds before E2006.
+  Debug reuses both guard samples.
+  Host tests only: a real hot or cold pause on the Supreme, and the
+  first-reading retry from a fully-off start (2026-11-10 bench boots were
+  USB resets with a usable first reading).
 - Diagnostic journal: the network task services one queued record at a time
   using a zero-wait filesystem lock and yields maintenance to trip/upload
   demand. Mounted SD has a 16 MiB journal quota; LittleFS has a 64 KiB reserve

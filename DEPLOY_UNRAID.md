@@ -552,9 +552,9 @@ normal recorded run. Other failures in the same check still need attention.
 ## Step 5 — Build on Unraid, flash from the PC
 
 The Windows helper's first-install and `-Cleanup` flows, and the macOS/Linux
-`flash.sh` helper, still need checks on a real board. Uploads from internal
-LittleFS flash without the SD card also remain untested on the Supreme;
-use the FAT32 microSD card for this route.
+`flash.sh` helper, still need checks on a real board. Use a FAT32 microSD card
+as the normal trip store; without a card, the tracker records trips on internal
+LittleFS flash and uploads them the same way.
 
 Accept the build offered by setup, or run it later:
 
@@ -585,8 +585,11 @@ bash flash.sh --server 'root@<host>' --install-dir /mnt/<pool>/appdata/mileage-t
 ```
 
 Do not use the helpers' default `~/mileage-tracker`; root's home is not the
-Unraid install. For a previously used tracker, follow the update flow and
-preserve its saved settings and trips. Follow [README Step 3](README.md#step-3--first-drive-and-device-health)
+Unraid install. For routine updates on a previously used tracker, follow the
+update flow and preserve its saved settings and trips (to move an existing
+tracker to the larger internal store, see
+[Using the larger internal store](firmware/README.md#using-the-larger-internal-store)).
+Follow [README Step 3](README.md#step-3--first-drive-and-device-health)
 to confirm uploads and a fresh Device health snapshot.
 
 ## Moving an existing Debian install to Unraid

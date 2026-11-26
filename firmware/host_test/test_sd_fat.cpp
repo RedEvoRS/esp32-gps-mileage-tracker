@@ -1,4 +1,5 @@
 #include "../04_trip_logger/sd_fat_check.h"
+#include "../04_trip_logger/sd_bench_check.h"
 #include "stubs/fake_sd_fat.h"
 #include <array>
 #include <cassert>
@@ -47,7 +48,63 @@ static void directory(uint8_t* entry, const char* name, uint32_t cluster, uint8_
     put16(entry + 26, uint16_t(cluster));
 }
 
+static void testBenchGuards() {
+    struct MarkerCard {
+        struct File {
+            bool present, directory;
+            bool& closed;
+            explicit operator bool() const { return present; }
+            bool isDirectory() const { return directory; }
+            void close() { closed = true; }
+        };
+        bool present = false, directory = false, closed = false;
+        File open(const char* path, const char* mode) {
+            assert(std::strcmp(path, "/SDBENCH.OK") == 0 && std::strcmp(mode, "r") == 0);
+            return {present, directory, closed};
+        }
+    };
+    MarkerCard card;
+    assert(!sd_bench::hasMarker(card) && card.closed);
+    card = {true, true, false};
+    assert(!sd_bench::hasMarker(card) && card.closed);
+    card = {true, false, false};
+    assert(sd_bench::hasMarker(card) && card.closed);
+
+    using sd_bench::HeaderResult;
+    Card fresh;
+    assert(sd_bench::checkFatHeaders(fresh).result == HeaderResult::Passed && fresh.reads == 3);
+    Card incident;
+    incidentFat(incident.edit(kFatStart));
+    auto bad = sd_bench::checkFatHeaders(incident);
+    assert(bad.result == HeaderResult::ReservedEntries && bad.copy == 1 &&
+           bad.fat0 == 0 && bad.fat1 == 0x7fffffff);
+    Card second;
+    constexpr auto secondFat = kFatStart + kFatSectors;
+    put32(second.edit(secondFat) + 4, 0x07ffffff);
+    assert(checkSdFat(second) == SdFatCheck::Passed);
+    bad = sd_bench::checkFatHeaders(second);
+    assert(bad.result == HeaderResult::ReservedEntries && bad.copy == 2 &&
+           bad.fat0 == 0x0ffffff8 && bad.fat1 == 0x07ffffff);
+    put32(second.edit(secondFat) + 4, 0xffffffff);
+    assert(sd_bench::checkFatHeaders(second).result == HeaderResult::Passed);
+    second.unreadable = secondFat;
+    bad = sd_bench::checkFatHeaders(second);
+    assert(bad.result == HeaderResult::ReadError && bad.copy == 2);
+    fresh.edit(0)[16] = 1;
+    assert(sd_bench::checkFatHeaders(fresh).result == HeaderResult::Layout);
+
+    Card partitioned;
+    partitioned.partition = 2048;
+    auto* mbr = partitioned.edit(0);
+    mbr[510] = 0x55;
+    mbr[511] = 0xaa;
+    put32(mbr + 454, partitioned.partition);
+    assert(sd_bench::checkFatHeaders(partitioned).result == HeaderResult::Passed &&
+           partitioned.reads == 4);
+}
+
 int main() {
+    testBenchGuards();
     Card fresh;
     assert(checkSdFat(fresh) == SdFatCheck::Passed && fresh.reads == 3);
     for (uint32_t flags : {0u, 0x04000000u, 0x08000000u, 0x0c000000u}) {

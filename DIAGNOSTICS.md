@@ -91,7 +91,11 @@ retry enrollment and reboot.
    previously used on this board**. Both must fit 0..2^63-1 (the ID cannot be 0).
    The example's `0ULL`/`1ULL` is only for verified fresh state. `ULL` means an
    unsigned long long integer in C++. Follow the flashing procedure in the
-   deployment runbook; a used board normally keeps erase **Disabled**.
+   deployment runbook; a used board normally keeps erase **Disabled**. If this
+   is the first v1.11 (or later) IDE upload onto an original-layout board,
+   upload or back up internal trips first because the IDE rewrites the
+   partition table without a backup (see
+   [Using the larger internal store](firmware/README.md#using-the-larger-internal-store)).
 3. Let the normal awake network cycle finish eligible trip uploads, then check
    the viewer's **Device health** page for a newly received current diagnostics
    snapshot from this boot. GPX contact by itself does not prove enrollment succeeded.
@@ -180,7 +184,9 @@ stays blocked, an older epoch cannot authorize allocation after adoption, and
 an NVS read error never counts as a missing key. An intact enrolled card can
 therefore continue without re-enrollment and seed the erased internal flash.
 With no ready copy, disagreeing epochs or suspension in the adopted epoch,
-recover explicitly using the procedure above.
+recover explicitly using the manual `secrets.h` procedure above (the server
+firmware builder only builds enrollment ID 1 for fresh boards and cannot
+build a recovery image).
 
 Erasing NVS loses evidence that an absent card was stale or missed a conflict.
 A stale enrolled card may then issue low revisions: the server accepts history
@@ -486,8 +492,8 @@ on 2026-10-21 (UTC): two `HTTP -1` failures kept the trip queued, then HTTP
 2026-11-01 (UTC), a server error (5xx) kept trips queued with E5008 and they
 uploaded after recovery; a wrong token gave E5004 on a small file and a broken
 send (E5003, `HTTP -3`) on a roughly 3 MB file; retried diagnostics batches
-created no duplicate events. LittleFS uploads and HTTP 413 remain untested on
-the Supreme. Setup steps are in
+created no duplicate events. HTTP 413 remains untested on the Supreme. Setup
+steps are in
 [README.md](README.md) and [DEPLOY_DEBIAN.md](DEPLOY_DEBIAN.md) Step 8.
 
 The tracker normally runs unattended in a car. A serial console cannot explain
@@ -1434,11 +1440,11 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E2001 | PMU initialization failed or LoRa ALDO3 could not be verified off at startup | Only a normal boot after successful PMU initialization and rail verification observes healthy; retry success restarts, never clears in degraded mode | none |
 | E2002 | Verified AXP2101 level-1 IRQ or battery percentage <= successfully read configured low warning | Valid connected battery percentage above that threshold; failed threshold reads neither raise nor clear | `battery_mv`, if in catalog range |
 | E2003 | Verified AXP2101 level-2 IRQ (before existing shutdown), or percentage <= successfully read configured critical level | Valid connected battery percentage above critical; failed threshold reads neither raise nor clear | `battery_mv`, if in range |
-| E2004 | Plausible die requires a hot pause (die >=54 C); keeps requesting it above 47 C | Plausible die <=47 C or another measured pause reason; describes required pause even if control is unconfirmed | `temperature_mc` = measured PMU die |
-| E2005 | Plausible die requires a cold pause (die <=9 C); keeps requesting it below 14 C | Plausible die >=14 C or another measured pause reason; describes required pause even if control is unconfirmed | `temperature_mc` = measured PMU die |
+| E2004 | Die estimate or available board air is 45 C or above, or above 38 C when the guard already requests a temperature pause | Neither reading meets the current hot condition, and the die reading is usable | `temperature_mc` = measured PMU die, omitted while the die is unreadable |
+| E2005 | Die estimate or available board air is 0 C or below, or below 5 C when the guard already requests a temperature pause | Neither reading meets the current cold condition, and the die reading is usable | `temperature_mc` = measured PMU die, omitted while the die is unreadable |
 | E2006 | Non-finite or implausible die sample; first ten seconds of first-reading retries are silent | Plausible sample; hot/cold conditions are not cleared by an unreadable sample | none |
 | E2008 | Three consecutive runtime charger command/read-back failures (30 s apart), startup charger disable still unconfirmed after its 5 s bounded retry window, or an unconfirmed 4.1 V charge target (blocking charging) | Checked 0x64 4.1 V target and 0x18 bit 1 read match the intended charger state (once startup charger disable is confirmed) | none |
-| E2010 | Startup cannot confirm the GPS rail is on at 3.3 V, battery detection and the four PMU measurement channels are enabled, or the TS pin is in fixed-input mode with its ADC off. Each check allows three attempts. XPowersLib sets TS to fixed input in `PMU.begin()` before the charger pause. The firmware skips TS verification and repair if the pause cannot be confirmed (E2008). | A later startup verifies the GPS rail, battery detection, the four measurement enables and TS setup | none |
+| E2010 | Startup cannot confirm the GPS rail is on at 3.3 V, battery detection and the four PMU measurement channels are enabled, or the TS pin is in fixed-input mode with its ADC off. Each check allows three attempts. XPowersLib sets TS to fixed input in `PMU.begin()` before the charger pause. The firmware skips TS verification and repair if the pause cannot be confirmed (E2008). | The startup result is re-observed from the normal and no-storage loops under the normal retry and 15-minute repeat policy (PMU-missing and untrusted boots leave it unobserved); a later startup that verifies the GPS rail, battery detection, the four measurement enables and TS setup observes it clear | none |
 | E3001 | No checksum-valid NMEA for 10 s, starting at GPS configuration start | Next checksum-valid NMEA; noise/UBX/bad checksum do not recover it | `elapsed_ms` |
 | E3002 | No trusted fix (one meeting the NAV-PVT start accuracy limits, or any valid fix in RMC-only fallback) for 120 s while idle | Trusted fix; acquisition grace starts again after leaving a trip | `elapsed_ms`, `satellites` when measured |
 | E3003 | Matching checksum-checked VALSET NAK | One notice per rejected attempt, no active condition | `message_class=6`, `message_id=138` |
@@ -1498,15 +1504,22 @@ Plausible means finite and within -40 to 125 C. Before the first usable reading
 each boot, the guard commands/verifies charging off and retries once a second
 for ten seconds. There is no E2006 during that grace window. Expiry pauses
 charging with E2006 and returns to 30-second checks. A plausible hot reading
-still raises E2004 immediately. Invalid readings pause charging fail-safe
-without creating or clearing hot/cold hysteresis history, carrying temperature
-context or appearing as real debug temperatures.
+still raises E2004 immediately. An invalid die reading always pauses charging.
+It never clears a hot/cold pause, carries temperature context or appears as a
+real debug temperature. A valid board-air reading taken at the same time can
+still request a hot/cold pause and, after the grace window, raise E2004 or
+E2005 without `temperature_mc`. Clearing either needs a usable die reading.
 The first-reading retry has host tests only. Bench boots on 2026-11-10 (UTC)
 were USB resets whose first reading was already usable, so a start from fully
 off remains unchecked.
 
-The charge guard uses its existing die proxy and hysteresis; diagnostic context
-never presents that die reading as a measured cell temperature. Startup tries
+The charge guard uses the PMU die minus 9 C and the BME280 board-air
+temperature from the same check. A missing board-air sample leaves the
+die estimate as the only input. E2004 and E2005 follow the combined hot
+and cold flags, so both can be active when the readings disagree. They
+describe the requested pause even when charger control is unconfirmed.
+Diagnostic context carries the raw PMU die temperature in
+`temperature_mc` whenever the die reading is usable. Startup tries
 to disable the charger early and read back `CHARGE_GAUGE_WDT_CTRL` (0x18), and
 if still unconfirmed retries every 100 ms for a bounded 5 s window (feeding the
 startup watchdog) before storage setup. If the PMU still cannot confirm

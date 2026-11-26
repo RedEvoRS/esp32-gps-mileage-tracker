@@ -466,7 +466,12 @@ again; settings are not saved for reuse by the builder. A successful build
 replaces its output, and a normal build removes stale cleanup images.
 Finish a pending enrollment cleanup before rebuilding. Then run the printed
 flash command on your PC, without `-FirstInstall` / `--first-install`, and
-answer **no** to first install. App-only updates preserve settings and trips.
+answer **no** to first install. App-only updates preserve settings, trips
+and the existing partition layout. To move an existing board from the
+original 2.375 MiB internal store to 6.375 MiB instead, follow
+[Using the larger internal store](firmware/README.md#using-the-larger-internal-store)
+(upload or back up internal trips first, keep the enrolled microSD card in
+for the first boot, then check Device health).
 Always update the server before installing newer firmware.
 
 For a specific release, download that release's `setup.sh` rather than
@@ -1212,19 +1217,26 @@ token and built the server address and WiFi settings into the firmware.
 Exit SSH and use the printed flash command **on the PC connected by USB**;
 see [README Step 2](README.md#step-2--flash-the-tracker) and the
 [full flash guide](firmware/README.md#flash-from-the-server-build).
-First install verifies a factory backup, requires typing `ERASE`, erases
-all internal flash and writes four parts. Updates are app-only; do not
-choose first install for an existing tracker.
+First install verifies a full 8 MB flash backup, requires typing `ERASE`,
+erases all internal flash and writes four parts. Routine updates are
+app-only; never choose first install for a routine update. Use first install
+on an existing tracker only when deliberately moving to the
+[larger internal store](firmware/README.md#using-the-larger-internal-store)
+after uploading or backing up any internal trips, keeping the enrolled
+microSD card inserted for the first boot and checking Device health
+afterward.
 
 For a fresh device/card with no saved server snapshot revision, the builder
 prepares one-use enrollment values and a separate cleanup image. After the
 first newly received **current snapshot** in Device health, run the flash
 script with `-Cleanup` (Windows) / `--cleanup` (macOS/Linux), before another
 server build. This removes enrollment values with an app-only flash. A
-listed device or GPX contact alone is insufficient. Reused cards/boards,
-lost metadata or snapshot conflicts need
-[diagnostics recovery](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery);
-do not answer the builder's new-device questions as if they were fresh.
+listed device or GPX contact alone is insufficient. The server builder only
+builds enrollment ID 1 for fresh boards; reused cards/boards, lost metadata
+or snapshot conflicts need
+[diagnostics recovery](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
+using the manual `secrets.h` route below rather than answering the builder's
+new-device questions as if they were fresh.
 
 ### Advanced: local firmware settings
 
@@ -1271,19 +1283,27 @@ Runtime debug mode does not change the version. Without the generated header
 it shows `unversioned`; an old header keeps its old version. Road-use version bumps and tags are described
 in [Firmware versions and releases](firmware/README.md#firmware-versions-and-releases).
 
-Fit a **FAT32 microSD card** with the board switched off. The trip logger
-records there when it mounts, otherwise it uses internal LittleFS. Its bundled
-`partitions.csv` overrides the Arduino IDE's Partition Scheme menu.
-Uploads from LittleFS without the SD card remain untested. A trip ending in a
-parking garage also remains unverified and is deferred until after v1.00.
+Fit a **FAT32 microSD card** with the board switched off as the normal trip
+store. The trip logger records there when it mounts; without a card, it records
+trips on internal LittleFS flash and uploads them the same way. Its bundled
+`partitions.csv` overrides the Arduino IDE's Partition Scheme menu. A trip
+ending in a parking garage remains unverified.
 The first time you upload the sketch to a new board it needs **Erase All Flash
 Before Sketch Upload → Enabled** once to clear factory data, then
 **Disabled** for later uploads;
 see [First flash on a new board](firmware/README.md#first-flash-on-a-new-board).
-Later uploads with erase disabled keep trips on the card and in internal
-flash and preserve NVS (the board's settings memory, including trip
-numbering and the diagnostic boot counter). Erase-all wipes NVS and
-internal trips, so back up existing data before using it again.
+Later uploads with erase disabled keep trips on the card, preserve NVS (the
+board's settings memory, including trip numbering and the diagnostic boot
+counter), and keep internal trips on a board that already uses the current
+partition table. **Warning for existing boards on the original layout:** the
+first v1.11 (or later) upload from the Arduino IDE (or `arduino-cli`) writes
+the new partition table and bootloader with no backup and tries to grow
+LittleFS in place; if growing fails, the internal store is preserved as
+unavailable rather than formatted. Upload or back up any internal trips first,
+or use the backed-up first-install procedure in
+[Using the larger internal store](firmware/README.md#using-the-larger-internal-store).
+Erase-all wipes NVS and internal trips, so back up existing data before using
+it again.
 
 ### One-time diagnostics enrollment
 
@@ -2638,7 +2658,8 @@ in, so update `secrets.h` and reflash (Step 8). The firmware guide's
 output. Trips recorded meanwhile wait on the board, but once its storage
 fills it stops recording. On the microSD card it can hold far more
 than any realistic gap between uploads; without a usable card, internal
-flash fallback holds about 5–6 hours of driving, then recording stops.
+flash fallback holds about 15 hours of driving with the 6.375 MiB layout
+or about 5–6 hours with the original layout, then recording stops.
 
 **Compose says `INGEST_AUTH_TOKEN` is unset** — `.env` must sit next to
 `docker-compose.yml` in `~/mileage-tracker/`, not inside `mileage-ingest/`.

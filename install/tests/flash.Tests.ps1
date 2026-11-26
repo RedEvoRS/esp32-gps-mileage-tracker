@@ -89,8 +89,11 @@ try {
         Assert-Rejected { Test-FlashManifest $folder $false }
     }
     foreach ($change in @(@('file', '../app.bin'), @('sha256', ('0' * 64)), @('offset', $nvsStart),
-        @('offset', $appEnd), @('offset', ('0x{0:x}' -f ($regions.factory.Offset + 1))), @('offset', '0x1;id'), @('name', 'bootloader'))) {
-        $m = New-Fixture; $m.parts[3][$change[0]] = $change[1]; Save-Fixture $m
+        @('offset', '0x20000'), @('offset', $appEnd),
+        @('offset', ('0x{0:x}' -f ($regions.factory.Offset + 1))), @('offset', '0x1;id'), @('name', 'bootloader'))) {
+        $m = New-Fixture; $m.parts[3][$change[0]] = $change[1]
+        if ($change[0] -ceq 'offset') { $m.app_offset = $change[1] }
+        Save-Fixture $m
         Assert-Rejected { Test-FlashManifest $folder $false }
     }
     $m = New-Fixture; Save-Fixture $m
@@ -103,6 +106,10 @@ try {
     $m.parts[3].sha256 = (Get-FileHash (Join-Path $folder 'app.bin')).Hash; Save-Fixture $m
     Assert-Rejected { Test-FlashManifest $folder $false }
     $m = New-Fixture; $m.parts[2].offset = $nvsStart; Save-Fixture $m
+    Assert-Rejected { Test-FlashManifest $folder $false }
+    $m = New-Fixture; $m.parts[0].offset = '0x1000'; Save-Fixture $m
+    Assert-Rejected { Test-FlashManifest $folder $false }
+    $m = New-Fixture; $m.parts[2].offset = '0xf000'; Save-Fixture $m
     Assert-Rejected { Test-FlashManifest $folder $false }
     Assert-Equal (Select-FlashPort 'COMx' @() '') 'COMx'
     Assert-Equal (Select-FlashPort '' @('COMx') '') 'COMx'
@@ -173,11 +180,19 @@ $global:LASTEXITCODE = 0
                 if ($mode -eq 'first') {
                     Assert-Equal ($commands[-2] -match 'erase-flash') $true
                     Assert-Equal ($commands[-3] -match 'read-flash') $true
+                    Assert-Equal ($commands[-3] -match 'supreme-flash-') $true
+                    Assert-Equal ($transcript.Contains('moving an existing tracker to the larger internal store')) $true
+                    Assert-Equal ($transcript.Contains('Never for a routine update')) $true
+                    Assert-Equal ($transcript.Contains('wrong for a tracker already running this project')) $false
                     Assert-Equal ($transcript.Contains('LittleFS partition is fully erased; provisioning trip storage.')) $true
                     Assert-Equal ($transcript.Contains('Setup complete. Logging trips.')) $true
                 }
                 Assert-Equal (@(Get-ChildItem $folder -Directory -Filter 'tracker-flash-*').Count) 0
             }
+            $helpText = (& $scriptPath -Help 6>&1 | Out-String -Width 32767)
+            Assert-Equal ($helpText.Contains('moving an existing tracker to the larger internal store')) $true
+            Assert-Equal ($helpText.Contains('Never for a routine update.')) $true
+            Assert-Equal ($helpText.Contains('Use only for a new/factory board.')) $false
             # Apply the release builder's global byte replacement to the whole
             # script: the comparison must still identify a stamped release.
             $releaseScript = Join-Path $folder 'release-flash.ps1'

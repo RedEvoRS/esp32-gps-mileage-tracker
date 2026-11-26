@@ -37,8 +37,9 @@ four real trips from microSD to the deployed server, then delivered all 115
 pending diagnostic events and a current snapshot. Uploads with debug mode
 off and server-down retry were also verified on 2026-10-21 (UTC). Wrong-token
 and server-error retries passed bench checks on 2026-11-01 (UTC); see
-[upload checks](#check-recording-and-uploads). Uploads from the internal
-LittleFS fallback and HTTP 413 handling remain untested on the Supreme.
+[upload checks](#check-recording-and-uploads). Without a microSD card, trips
+are recorded on internal LittleFS flash and upload the same way. HTTP 413
+handling remains untested on the Supreme.
 The [top-level README](../README.md#where-its-at)
 has the current status.
 
@@ -146,7 +147,8 @@ your WiFi password and upload token. The PC's temporary firmware copy is
 private and removed on exit; keep any manually copied binaries private too.
 
 Choose first install or update before connecting. **First installs always
-use manual download mode**, because the factory board's state is unknown:
+use manual download mode**, because the board's existing state is unknown
+(such as factory firmware):
 hold BOOT, plug USB in (or tap RESET), wait 2–3 seconds, release BOOT, then
 select the port. See [download mode](#download-mode) for factory-firmware
 and battery details.
@@ -160,23 +162,32 @@ confirmation once without automatic reset and stops if that also fails.
 After writing, it requests a hard reset to run the program; press RESET
 with BOOT released only if the board stays in download mode.
 
-- **First install on a factory board:** use `-FirstInstall` / `--first-install`,
-  or answer yes at the first-install prompt. The script reads all 8 MB of
-  factory flash twice, verifies the sizes and matching hashes/content, and
-  stops before any erase/write if verification fails. Windows retries failed
-  reads in smaller pieces for the native-USB read quirk. The default backup
-  location is `mileage-tracker-backups` under your PC home directory; the
-  script asks for the location and prints the saved path. Keep it outside
-  the repo: it can contain factory device keys. Type **`ERASE`** to confirm
-  the full internal-flash erase, then it writes the bootloader, partition
-  table, boot support image and app. All internal trips and settings in
-  nonvolatile storage (NVS), including counters and enrollment records, are
-  erased. The SD card is untouched. The erase lets Stage 4 provision its
-  internal trip filesystem; see [first-flash behavior](#first-flash-on-a-new-board).
-  On an enrolled board, an intact enrolled card can restore diagnostics without
-  re-enrollment. Erasing also loses stale-card/conflict protection; check
+- **First install (new board, or moving an existing tracker to the larger
+  internal store):** use `-FirstInstall` / `--first-install`, or answer yes
+  at the first-install prompt. The script reads all 8 MB of internal flash
+  twice (saving the factory image on a new board, or the existing flash
+  before changing layouts as `supreme-flash-<timestamp>.bin`), verifies the
+  sizes and matching hashes/content, and stops before any erase/write if
+  verification fails. Windows retries failed reads in smaller pieces for the
+  native-USB read quirk. The default backup location is
+  `mileage-tracker-backups` under your PC home directory; the script asks
+  for the location and prints the saved path. Keep it outside the repo: it
+  can contain factory device keys, WiFi credentials or your upload token.
+  Type **`ERASE`** to confirm the full internal-flash erase, then it writes
+  the bootloader, partition table, boot support image and app. All internal
+  trips and settings in nonvolatile storage (NVS), including the trip
+  counter and internal-flash diagnostics record, are erased. The SD card is
+  untouched. The erase lets Stage 4 provision its internal trip filesystem;
+  see [first-flash behavior](#first-flash-on-a-new-board) and
+  [using the larger internal store](#using-the-larger-internal-store). On an
+  existing enrolled board, keep the intact enrolled microSD card inserted
+  for the first boot so diagnostics can restore without re-enrollment, then
+  check **Device health** for a current snapshot. Without the card, or if
+  diagnostics stay stuck (erasing also loses stale-card/conflict
+  protection), follow
   [revision recovery](../DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
-  before erasing a used board.
+  via the manual `secrets.h` route (the server builder only builds
+  enrollment ID 1).
 - **Update an installed tracker:** update/build on the server first, then
   rerun the script without the first-install flag and answer **no** at that
   prompt. This writes only the app, preserving NVS, internal trips and SD
@@ -210,10 +221,10 @@ bash flash.sh --server '<user>@<host>' --cleanup
 esptool's version command, but never opens the serial device. It prints the
 plan; add the first-install flag to preview backup/erase/all-part writes.
 `-Path` / `--path` can select a local firmware folder instead of SSH;
-for cleanup select the local cleanup folder explicitly. `-SkipBackup` /
-`--skip-backup` requires an explicit first-install flag and is only for
-re-provisioning a board whose factory backup you already hold; it still
-requires `ERASE`. Do not use it to work around a failed first backup.
+for cleanup select the local cleanup folder explicitly. `-SkipBackup` / `--skip-backup` requires an explicit first-install flag and
+is only for re-provisioning a board whose full-flash backup you already
+hold; it still requires `ERASE`. Do not use it to work around a failed first
+backup.
 
 ## Advanced: build from source
 
@@ -457,9 +468,9 @@ a card. Stage 4 has since recorded two real drives on the card.
     Trips go to the card.
   - `WARNING: no microSD card or mount failed -- check power/wiring and FAT32 (exFAT unsupported); card never formatted.`
     followed by
-    `WARNING: microSD unavailable -- using internal flash (2.30 MiB free).`
-    No usable card: trips go to the internal partition, which holds about
-    5–6 hours of driving.
+    `WARNING: microSD unavailable -- using internal flash (<free> MiB free).`
+    No usable card: trips go to internal flash. The free space shown
+    comes from the mounted filesystem, with room reserved for diagnostics.
   - `WARNING: microSD filesystem check failed (<reason>) -- card not used.`
     The card mounted but failed the read-only check. The rest of the
     message explains how to preserve files before reformatting on a PC.
@@ -467,8 +478,7 @@ a card. Stage 4 has since recorded two real drives on the card.
   both the card and internal flash, including trips left by a boot without
   a card. It deletes each only after an accepted server response. On
   2026-10-21 (UTC), four trips uploaded from the card with HTTP 200 and
-  were deleted locally. Internal LittleFS was mounted but held no trips;
-  uploading from that fallback remains untested on the Supreme.
+  were deleted locally.
 - **Power cuts:** FAT copes with a sudden power loss worse than LittleFS
   does. The 18650 is what lets the logger close its files and unmount the
   card cleanly after the car's USB power goes away, so keep it fitted.
@@ -642,9 +652,13 @@ card mounts.
 
 Each upload replaces the previous stage's program. Stages 1–3 check
 hardware; they do not record trips. **Leave Stage 4 installed for use in
-the car.** When updating it later, keep its `partitions.csv` and leave
-**Erase All Flash Before Sketch Upload → Disabled** to preserve internal
-trips and settings. Reflashing does not erase trips on the card.
+the car.** For routine Stage 4 updates, use the flash helper's app-only
+mode to preserve internal trips, settings and the installed table. An
+Arduino IDE (or `arduino-cli`) upload writes the sketch's bootloader and
+new partition table without taking any backup or erasing flash, even with
+**Erase All Flash Before Sketch Upload → Disabled**. See the
+[larger internal store](#using-the-larger-internal-store) before changing
+the table on an existing board. Reflashing does not erase trips on the card.
 
 #### Firmware versions and releases
 
@@ -800,9 +814,9 @@ For why it works this way, see [the firmware design](DESIGN.md).
 
 The `04_trip_logger/` sketch detects trips, accumulates mileage and writes
 GPS Exchange Format (GPX) files to the microSD card, with internal LittleFS
-as fallback. The current release is `v1.03`; it uploads trips from
-the card, and the [top-level README](../README.md#where-its-at) has the current status and
-what's still unproven on a real board. Since `v0.06` there is one firmware build: debug
+as fallback. It uploads trips from the card, and the
+[top-level README](../README.md#where-its-at) has the current release version,
+status and what's still unproven on a real board. Since `v0.06` there is one firmware build: debug
 mode starts off at every power-on and can be toggled by holding BOOT and
 tapping POWER.
 
@@ -868,11 +882,12 @@ Before flashing:
      on the board; use the Serial Monitor and [screen](#the-screen)
      to investigate failures.
 2. **Partitions are handled for you.** The sketch's `partitions.csv` gives
-   a 1.5 MB app partition and 2.375 MB internal LittleFS fallback, with no
+   a 1.5 MiB app partition and 6.375 MiB internal LittleFS fallback, with no
    over-the-air firmware update slot (no OTA). It overrides **Tools →
-   Partition Scheme**. Internal fallback holds roughly 5–6 hours of driving;
-   the [microSD card](#microsd-card) holds far more. A full trip store ends
-   the current trip and prevents another until space is freed.
+   Partition Scheme**. Internal fallback holds about 15 hours of driving
+   with the new table or 5–6 hours with the original table. The
+   [microSD card](#microsd-card) holds far more. A full trip store ends the
+   current trip and prevents another until space is freed.
 
    <a id="stage-4-size-check"></a>
    **The compiler's size limit is lower than the partition.** A source build
@@ -941,9 +956,12 @@ firmware leaves data in the area used for the trip partition, and Stage 4
 will not overwrite non-erased data merely because it cannot mount it.
 
 The standalone `install/flash.ps1 -FirstInstall` / `install/flash.sh --first-install`
-performs the same one-time erase after a verified factory backup and an exact
-`ERASE` confirmation, then writes the four firmware parts. Use the default
-app-only update (or cleanup) for a tracker already running this project.
+performs the same one-time erase after a verified full-flash backup and an
+exact `ERASE` confirmation, then writes the four firmware parts. Use the
+default app-only update (or cleanup) for routine updates on a tracker
+already running this project; use first install on an existing tracker only
+when deliberately moving to the
+[larger internal store](#using-the-larger-internal-store).
 
 **Erase-all also wipes the board's settings memory (NVS):** the trip
 counter (`tripno`), diagnostic journal boot counter and consumed enrollment
@@ -954,6 +972,7 @@ their recovery epoch. A suspended card alone stays blocked. Erasing loses any
 record that a card was stale: it may send history with low revisions while
 Device health stays old, or hit a revision conflict that requires re-enrollment.
 Keep erase disabled for updates and check Device health after any erase.
+
 If `DIAGNOSTICS_ENROLLMENT_ID`
 and `DIAGNOSTICS_STATUS_HIGH_WATER` are still defined in `secrets.h`, the
 next boot can consume that ID again and re-enroll from its possibly stale
@@ -988,10 +1007,40 @@ no trips or networking, but power management and the charge guard remain
 active when the PMU is trusted. Follow [storage recovery](#if-the-trip-storage-wont-mount-later);
 do not enable format-on-mount-failure.
 
-Later uploads with erase **Disabled** preserve trips on the card and in
-internal flash, along with NVS and trip numbering. Before changing the
-partition layout or erasing flash, upload or independently back up every
-trip. Erase-all does not erase the removable card, but it does reset NVS.
+#### Using the larger internal store
+
+The flash helper's normal update writes only the app. An existing tracker
+with the original layout still has 2.375 MiB of internal trip storage
+after an app-only update. To get 6.375 MiB, use a new build and follow the
+[first Stage 4 flash procedure](#first-flash-on-a-new-board) (`-FirstInstall`
+/ `--first-install` in the flash helper).
+
+Before reinstalling, **upload or back up any trips still on internal
+flash**. The full erase deletes those trips, resets the trip counter and
+erases NVS and the internal-flash diagnostics record. It leaves the microSD
+card alone. **Keep the enrolled microSD card inserted for the first boot**
+after the first install: an intact enrolled card restores diagnostics
+enrollment automatically and seeds the freshly provisioned internal flash.
+Once that boot connects, check **Device health** for a newly received
+current snapshot. If you boot without an intact enrolled card, re-enrollment
+is needed; if Device health stays old or stuck (for example from a stale or
+suspended card), follow the
+[diagnostics recovery procedure](../DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery).
+Because the server firmware builder only builds enrollment ID 1 for fresh
+boards and cannot build a recovery image, re-enrollment uses the manual
+`secrets.h` source-build route with a higher enrollment ID and verified
+high-water.
+
+An **Arduino IDE** (or `arduino-cli`) upload writes the new partition table
+(and bootloader) without any backup or erase, even with **Erase All Flash
+Before Sketch Upload → Disabled**. On an old-table board, the pinned Arduino
+core mounts LittleFS with `grow_on_mount` enabled and attempts to grow a
+clean filesystem in place at the next mount. If mounting or growing fails,
+Stage 4 preserves non-erased storage instead of formatting it. Use the
+backed-up first-install procedure to change layouts deliberately, and back
+up internal trips before uploading from Arduino IDE onto an old-table board.
+Once LittleFS grows, restoring the old partition table would cut off part of
+the filesystem.
 
 #### If the trip storage won't mount later
 
@@ -1014,25 +1063,40 @@ A FAT32 formatter on another operating system works too. Reinsert the card
 with the tracker switched off, then start it and check that it selects
 microSD again. The tracker never formats the card itself. Until the card
 passes the check, new trips go to internal flash if available. Flash holds
-about 5 to 6 hours of driving, so give it regular opportunities to upload.
+about 15 hours of driving on the new layout or 5–6 hours on the original
+layout, so give it regular opportunities to upload.
 
 For internal flash on a board that's been working, `LittleFS mount failed`
-doesn't mean the trips are gone. Keep format-on-mount-failure disabled. Check that you
-flashed with this sketch's `partitions.csv`, and try the firmware that last
-worked. Before anything that could erase the partition, copy it to a file
-with esptool (it comes with the ESP32 core, or `pip install esptool`):
+doesn't mean the trips are gone. Keep format-on-mount-failure disabled. Before
+reflashing or making any other change to the board, copy the trip partition to
+a file with esptool (it comes with the ESP32 core, or `pip install esptool`):
 
 ```
-esptool --chip esp32s3 --port <port> read-flash 0x190000 0x260000 trips-backup.bin
+esptool --chip esp32s3 --port <port> read-flash 0x190000 0x660000 trips-backup.bin
 ```
 
 Close Serial Monitor before running esptool. Replace `<port>` with the
-board's port, such as `COMx` or `/dev/ttyACM0`. The offset and size above
-come from this project's `spiffs` line in `partitions.csv`; if a different
-layout was previously installed, use that layout's offset and size instead.
+board's port, such as `COMx` or `/dev/ttyACM0`. Using `0x190000` and size
+`0x660000` works on both the expanded (`0x660000`) and original (`0x260000`)
+Supreme layouts, so you do not need to identify which table is installed
+first: `0x190000 + 0x660000 = 0x7F0000`, which stays inside the 8 MB flash
+(`0x800000`) and leaves the bootloader, partition table, NVS, OTA data, app
+and the final 64 KiB (`0x7F0000`–`0x800000`) untouched. On the original
+layout it covers all of LittleFS (`0x190000`–`0x3F0000`) plus only the old
+64 KiB coredump partition (`0x3F0000`–`0x400000`) and unused flash after it.
 Keep the backup outside the repo. Older esptool versions spell the command
 `read_flash`. A backup image preserves the bytes but does not prove they
 are recoverable; keep it before attempting repairs or formatting.
+
+Once the backup is saved, check that the board has the expected
+`partitions.csv` layout, and if you need to go back to the firmware that last
+worked, keep the installed partition table: use the flash helper's app-only
+update, or write only the app binary with esptool at `0x10000` (the `factory`
+app offset). Never use an Arduino IDE (or `arduino-cli`) upload of older
+firmware (v1.10 or earlier) on a board that has the larger internal store. An
+IDE upload writes the older partition table back, which cuts off any trip data
+above `0x3F0000` and puts the old crash-dump area at `0x3F0000` inside the
+trip store, so a single crash can overwrite stored trips.
 
 If the log says the partition is missing or empty, check the flashed
 `partitions.csv` first. A partition read error needs investigation and a
@@ -1042,24 +1106,27 @@ trips, a damaged filesystem, or factory firmware data on a new board.
 For a board that has never logged trips, or when you have independently
 backed up the stored data and deliberately decided to reset trip storage,
 you can erase **only the trip partition** once. This deletes everything
-in that region. First finish the backup above and confirm the board is
-running this sketch's bundled partition layout. If a previous layout put
-trip data elsewhere, preserve that region too before changing layouts.
+in that region. First finish the backup above. If a custom layout ever put
+trip data outside `0x190000`–`0x7F0000`, preserve that region too before
+changing layouts.
 Do not use this step to recover trips you still need from the device.
 
 With Serial Monitor closed, run:
 
 ```
-esptool --chip esp32s3 --port <port> erase-region 0x190000 0x260000
+esptool --chip esp32s3 --port <port> erase-region 0x190000 0x660000
 ```
 
-Older esptool versions spell it `erase_region`. The address and size are
-for this project's bundled `spiffs` partition only. Reset the board (or
-power-cycle it) after a successful erase; the unchanged firmware verifies
-the erased partition, provisions it, and reaches `Setup complete. Logging
-trips.` No second flash or format-on-mount-failure build is needed. If it
-still enters degraded service, investigate the reported error rather than
-repeating erases.
+Older esptool versions spell it `erase_region`. The same `0x190000` /
+`0x660000` range is safe on both Supreme layouts: on the expanded layout it
+erases only `spiffs`, and on the original layout it erases `spiffs` plus
+only the old coredump partition and unused flash (leaving NVS, the app and
+the partition table intact). Reset the board (or power-cycle it) after a
+successful erase; the unchanged firmware verifies the installed `spiffs`
+partition is erased, provisions it at its table size, and reaches `Setup
+complete. Logging trips.` No second flash or format-on-mount-failure build
+is needed. If it still enters degraded service, investigate the reported
+error rather than repeating erases.
 
 #### Normal operation
 
@@ -1077,9 +1144,9 @@ How it behaves once flashed:
   at most 0.5 m/s plus `hAcc` (horizontal accuracy) at most 5 m when starting,
   or 1.0 m/s plus 10 m during a trip.
   These limits were retained after road-test calibration. A trip ending in a
-  parking garage remains untested and is deferred until after `v1.00`. The
-  arrival window tolerates either message order at 1 Hz, so the latest
-  sample may belong to the previous epoch; it does not change GPX times.
+  parking garage remains unverified. The arrival window tolerates either
+  message order at 1 Hz, so the latest sample may belong to the previous epoch;
+  it does not change GPX times.
   Rejected speeds count as stopped: arming resets, or an active trip enters
   its normal five-minute cooldown. Rejected points enter neither GPX nor
   the distance total, and distance never bridges across them. Leaving
@@ -1219,13 +1286,16 @@ How it behaves once flashed:
   running, hold BOOT then tap POWER to toggle debug; it starts off at every
   power-on. BOOT held during power-up still means download mode.
   See [The screen](#the-screen).
-- **Charging:** the firmware pauses charging at high or low temperatures
-  reported by the AXP2101 power-management chip. Its temperature is an
-  indirect estimate using a 9 °C die-temperature offset measured on the
-  retired V1.2; recalibration for the Supreme is still pending. Debug mode
-  logs the readings it needs (the `Temp:` line under [The screen](#the-screen)).
-  This is not a measurement of the battery cell or a guarantee of safe charging in a
-  hot car. Logging continues while charging is paused.
+- **Charging:** the firmware checks the AXP2101 power chip and the BME280
+  board-air sensor every 30 seconds. The guard subtracts 9 °C from the chip
+  temperature to estimate battery temperature. Charging heats the chip, so
+  the board-air reading helps catch cold conditions that the chip can miss.
+  Either reading pauses charging at 0 °C or below or 45 °C or above. All
+  available readings must return to 5–38 °C before charging resumes. When
+  board air is unavailable for a check, the guard uses the chip alone.
+  These are indirect estimates, not a measurement of the battery cell or a
+  guarantee of safe charging in a hot car. Logging continues while
+  charging is paused.
   A die reading must be finite and between -40 and 125 C to be usable.
   An unreadable first sample keeps charging off and retries each second for
   ten seconds, without blocking startup or raising E2004/E2005/E2006.
@@ -1233,9 +1303,6 @@ How it behaves once flashed:
   E2006 is raised and retries return to 30 seconds. Runtime garbage after a
   good reading pauses charging and raises E2006 at once. Invalid readings
   never clear hot/cold faults or appear as real debug temperatures.
-  This first-reading retry is covered by host tests only. The 2026-11-10
-  (UTC) bench boots were USB resets whose first reading was already usable,
-  so a start from fully off is still unchecked.
   The guard verifies every charger on/off command with a checked register read
   and retries unconfirmed commands at the sampling cadence; E2008 means three attempts failed
   to confirm the requested state, so charging may still be on or remain off.
@@ -1424,13 +1491,66 @@ bench flag separately.
 This startup hook and the card skip were run on the board on 2026-11-10
 (UTC), as above; no-storage mode was not. The timeout is unmeasured for a
 full 32 GB card, an 8 MiB repair
-or the full 2.375 MB erased-partition scan. Successful scan/comparison progress
+or the full 6.375 MiB erased-partition scan. Successful scan/comparison progress
 feeds the watchdog, so a healthy repair may take longer overall. With a card
 that always hangs, each power-on waits about four minutes (two 120-second
 timeouts), plus reboot and healthy internal-flash startup, before trips can
 be recorded to flash. There is no fixed total bound for progressing repairs.
 If internal flash also hangs, the next startup hang latches no-storage mode;
 trips cannot be recorded, but charge and battery power management continue.
+
+#### SD power-cut bench check
+
+**Scratch microSD card only. This test deliberately interrupts card power
+and can destroy all data on the card. Remove your trip card before using
+this build.** Use USB power with the battery removed and the LoRa antenna
+attached. Power off before inserting or removing a card.
+
+1. On a PC, verify the scratch drive letter and format that card as FAT32
+   with 32 KiB allocation units. Create an empty file named `SDBENCH.OK`
+   at the root (for example, `New-Item -ItemType File X:\SDBENCH.OK` in
+   PowerShell, with the scratch drive letter in place of `X:`). Check the
+   extension if your file manager hides it. The firmware never formats the
+   card and refuses to write without the marker on every mount.
+2. Run the usual version-stamping step and compile Stage 4 with the usual
+   Supreme board settings. Add one of these to the `arduino-cli compile`
+   command. Use the SD bench flag by itself, without the watchdog bench
+   flags.
+
+   | Test | Extra compile option |
+   | --- | --- |
+   | Clean unmount, immediate card-rail cut (v1.07 delay) | `--build-property "compiler.cpp.extra_flags=-DSD_BENCH_POWER_CUT=1 -DSD_BENCH_DELAY_MS=0"` |
+   | Clean unmount, 500 ms before the cut (v1.08 delay) | `--build-property "compiler.cpp.extra_flags=-DSD_BENCH_POWER_CUT=1 -DSD_BENCH_DELAY_MS=500"` |
+   | Card-rail cut during journal acknowledgement sync | `--build-property "compiler.cpp.extra_flags=-DSD_BENCH_POWER_CUT=2" --build-property "compiler.c.elf.extra_flags=-Wl,--wrap=ff_disk_write"` |
+
+   The delay is in milliseconds and defaults to zero. In mode 2 it starts
+   when FatFs reaches the ack sector write inside `fsync()` and hands the
+   cut request to the other core. The linker option enables that trigger
+   with Arduino-ESP32 3.3.11. The default limit is 50 cycles. Add
+   `-DSD_BENCH_CYCLES=5` inside the same quoted compiler flags for a short
+   first run.
+3. Flash the bench build, connect at 115200 baud, and send `s` after the
+   `SD BENCH` prompt. Keep the serial log. The tracker writes a synthetic
+   GPX file and a journal event and acknowledges it locally each cycle.
+   It skips GPS, WiFi and internal trip storage. After each cut it remounts,
+   runs the read-only mount guard, and checks FAT[0] and FAT[1] in both
+   copies (low 28 bits). Each `remounted; FAT checks passed` line identifies
+   the cycle that passed. In mode 2, `overlaps` counts cuts whose rail-off
+   read-back finished before the ack sector write returned. An ack failure
+   is expected when the cut interrupts sync. A run with zero overlaps gives
+   no confirmed overlap with that write. A scope on the card supply and SPI
+   bus can verify the actual electrical timing. The ESP32 stays up in both
+   modes.
+4. After the five-cycle trial, start with a fresh scratch filesystem and
+   run 20–50 cycles per condition, or until `SD BENCH STOP`. Expect
+   `limit reached; FAT checks passed` on a completed run. A post-cut
+   mount failure or failed guard stops the run before any new write. Save
+   the log, power down, and image the scratch card before running any
+   repair. The original failure signature is both FAT copies wiped or
+   overwritten. A failed remount or one bad entry is evidence to inspect
+   the image, and the quick check can miss damage outside the areas it reads.
+5. Recompile and flash without any SD bench flags before reinstalling the
+   trip card. A reset of the bench build waits for a new `s` command.
 
 #### Startup failures
 
@@ -1608,19 +1728,11 @@ Things to know:
   `rf --`, and unknown or stale NMEA values show `--`. Antenna status
   and power may read `DONTKNOW` without an antenna supervisor; that
   alone does not mean the antenna failed.
-- Debug mode also prints a `Temp:` line every 30 s: the guard's PMU die
-  temperature with sample age and its die-minus-9 C estimate (the retired
-  V1.2 calibration; samples older than 35 s show `--`),
-  TS voltage/raw ADC count, BME280 temperature, actual charging/phase,
-  battery voltage/percent and VBUS. Unavailable values show `--`. Compare
-  TS voltage across temperatures to identify whether the Supreme's TS
-  resistor is fixed (flat) or a thermistor (temperature-dependent); TS stays
-  independent of the charger, with a 50 uA measurement bias. BME280 uses
-  temperature-only forced mode on the OLED's core/bus; its ALDO1 supply
-  (also OLED/magnetometer) is set to 3.3 V and enabled at trusted PMU startup.
-  If that setup cannot be confirmed, boot continues with a serial warning;
-  the display or sensors may be unavailable. These readings do not change
-  the guard's offset or thresholds. The line and probes are debug-only.
+- Debug mode prints a `Temp:` line every 30 s. It reuses the charge guard's
+  latest PMU die temperature, die-minus-9 °C estimate and BME280 board-air
+  temperature. It also shows sample age next to the die reading, actual
+  charging state and phase, battery voltage and percent, and USB power
+  (VBUS). Unavailable values and guard samples older than 35 s show `--`.
 - The screen can't stop logging. If it is missing or an I2C write fails,
   the affected display stays off until the next boot. The debug display
   prints `WARNING: debug OLED I2C failed` once. A production-display failure
@@ -1930,9 +2042,9 @@ received HTTP 200 and deleted the local file.
   gaps or duplicates after retries. Device health showed no active conditions
   and zero dropped events.
 
-This checks the microSD retry paths and diagnostics deduplication. LittleFS
-uploads and HTTP 413 handling remain untested on the Supreme. Debug was off
-during the large upload, so this session did not check GPS-loop responsiveness.
+This checks the microSD retry paths and diagnostics deduplication. HTTP 413
+handling remains untested on the Supreme. Debug was off during the large
+upload, so this session did not check GPS-loop responsiveness.
 
 If the trip does not appear, first confirm both `Trip started` and
 `Trip finalized`. A trip still in progress cannot upload; a short trip

@@ -31,8 +31,7 @@ At the end of a normal pass, `loop()` checks the UART again and calls
 power work suppress that pause. At 9,600 baud, about five bytes can arrive
 during 5 ms, compared with the 4,096-byte buffer. This lets core 1 idle
 between bursts. The 40 ms BOOT debounce and latched PMU IRQ still run each
-pass; the debug page keeps its one-second redraw, and the BME280 conversion
-can finish on a later pass after its 5 ms wait. The RTC still waits for the
+pass and the debug page keeps its one-second redraw. The RTC still waits for the
 first 100 ms of a second, GPS configuration keeps its two-second ACK window,
 and NAV-PVT keeps its 1,500 ms freshness limit. Host regressions exercise
 these with time advancing through the pause. The degraded loop keeps its
@@ -172,7 +171,7 @@ the applied fallback. Watchdog boots still enqueue E1003.
 
 The startup limit is generous and **unmeasured**. Only nearly empty-card boots
 without repair have been observed at 1–2 seconds from banner to completion.
-Full 32 GB card scans, 8 MiB repairs and the 2.375 MB erased-flash scan have
+Full 32 GB card scans, 8 MiB repairs and the 6.375 MiB erased-flash scan have
 not been timed. A card that hangs at every mount costs two 120-second waits
 per power-on, about four minutes plus reboot and healthy flash startup, before
 trips can use internal flash. Progressing flash repair has no fixed total limit.
@@ -204,7 +203,25 @@ The watchdog reset was bench-checked on 2026-11-10 (UTC); the results and
 what remains unchecked are in the same README section. Host control-flow
 tests and real board builds do not prove SD durability.
 
-## First charge-temperature reading
+## Charge-temperature guard
+
+The Supreme has no battery thermistor. Every 30 seconds, the guard compares
+the power chip's die temperature minus 9 °C and the BME280 board-air
+temperature to the same limits. Charging heats the die and can hide a cold
+cell from the die estimate. Board air changes much less during charging and
+helps catch a cold start after the device has sat in a cold cabin. Either
+reading requests a pause at or below 0 °C or at or above 45 °C. To resume,
+the die estimate and any available board-air reading must be within 5–38 °C,
+inclusive, after a temperature-driven pause.
+
+Core 1 triggers a fresh temperature-only conversion on the OLED's `Wire`
+bus. It yields for 6 ms to allow the conversion and tick rounding, then
+reads the result in the same guard check. The driver stops on the first
+failed transaction, which can cost one 10 ms bus timeout. If the bus is
+uninitialized, the ALDO1 supply was unconfirmed, or the sample fails or
+falls outside -40 to 85 °C, the guard uses the die estimate alone for that
+check. Debug logging reuses this pair of samples even though its print
+interval is independent. It makes no additional temperature reads.
 
 `charge_temperature.h` accepts only finite die readings from -40 to 125 C.
 These are plausibility bounds, not battery charging limits. XPowersLib 0.3.3
@@ -215,14 +232,17 @@ The first normal or no-storage check commands and verifies charging off if
 the reading is implausible. The loop retries every `CHG_FIRST_RETRY_MS`
 (one second) for `CHG_FIRST_GRACE_MS` (ten seconds), without a setup wait.
 During this grace period there is no hot/cold event or E2006. A plausible
-reading immediately uses the existing thresholds and charger read-back rules;
-a plausible hot reading still raises E2004 at once. Grace expiry raises
+die reading lets the guard apply the temperature limits and charger read-back
+rules immediately. Grace expiry raises
 E2006, prints one serial line saying charging stays off, and returns to
 30-second sampling. Later plausible recovery clears it.
-Any implausible sample after the first good one immediately follows the normal
-unreadable path. Invalid readings never clear hot/cold episodes, supply event
-temperature context or appear as real debug temperatures. The retry is covered
-by host tests only. The 2026-11-10 (UTC) bench boots were USB resets whose
+An implausible die reading after the first good one immediately follows the
+unreadable path. Valid board air can still request a temperature pause, so the
+guard applies the resume limits when the die recovers. After the startup grace
+period, valid air can raise E2004 or E2005 while the die is unreadable. Clearing
+either event requires a usable die reading. An unreadable die supplies no event
+temperature context and appears as unavailable in debug output. The retry is
+covered by host tests only. The 2026-11-10 (UTC) bench boots were USB resets whose
 first reading was already usable, so the retry is unchecked on the board.
 
 ## Firmware identity on the debug screen
@@ -439,6 +459,22 @@ disabled: unreadable or non-erased storage is preserved. The sole
 provisioning exception is `mountFlashStorage()`: after
 `tripPartitionIsErased()` reads **every byte** as `0xFF`, it formats that
 empty partition once. A mount failure alone never authorizes erasure.
+
+The Supreme's 8 MiB table keeps the NVS, OTA data and factory app regions in
+place for app-only updates. The `spiffs` partition starts at `0x190000` and
+ends at `0x7F0000`, where the 64 KiB coredump partition starts. App-only
+updates keep the original 2.375 MiB `spiffs` partition on older boards.
+Trip space and boot logging use the mounted filesystem's capacity and usage,
+with any unspent part of the 64 KiB LittleFS diagnostics reserve deducted.
+
+Arduino ESP32 3.3.11 sets `grow_on_mount` in `LittleFS.begin()`. The bundled
+[esp_littlefs 1.22.2](https://github.com/joltwallet/esp_littlefs/blob/v1.22.2/src/esp_littlefs.c)
+reads the block count from the superblock, then grows a mounted filesystem
+to the partition's size if it is larger. A grow failure is reported as a
+mount failure and still has to pass the full erased-partition check before
+firmware can format. The supported upgrade to the larger store is a first
+install with a full erase. See the [firmware guide](README.md#using-the-larger-internal-store)
+for internal-trip backup, card-based enrollment restoration and recovery.
 
 `tripShouldSplit()` reserves pending points, another point and closing
 tags to keep each finished piece below 8 MiB. `tripFsmOnFix()` closes the

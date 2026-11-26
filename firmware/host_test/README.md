@@ -150,8 +150,8 @@ enrollment never reuses a loaded epoch after NVS reset.
 - `test_pmu_verification` **[TinyGPSPlus]**: checked PMU register reads, interrupt decoding, charging thresholds/control read-back, hysteresis and retry timing; plausible-reading boundaries, garbage-first recovery on normal/no-storage startup, grace expiry/recovery, hot first readings, runtime garbage and timer rollover.
 - `test_degraded_policy`: mode selection and bounded retry delays when power control or storage is unavailable/untrusted.
 - `test_degraded` **[TinyGPSPlus]**: real startup/loop behavior with PMU/storage failures, verified supply settings, retry/restart recovery and preserved trips.
-- `test_temperature`: BME280 temperature-sensor compensation, bounded bus operations and checked PMU temperature-input/battery probes.
-- `test_temperature_runtime` **[TinyGPSPlus]**: debug temperature sampling/logging, failed/stale/implausible samples, charge-guard freshness and debug-off behavior.
+- `test_temperature`: BME280 compensation, bounded bus operations, checked battery reads and two-sensor charge hysteresis.
+- `test_temperature_runtime` **[TinyGPSPlus]**: charge-guard sampling, hot/cold diagnostic transitions, die-only fallback and debug logging from the cached samples. Debug entry leaves TS registers alone.
 
 **RTC (real-time clock) and diagnostic time**
 
