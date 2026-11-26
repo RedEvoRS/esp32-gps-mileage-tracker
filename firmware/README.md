@@ -146,7 +146,8 @@ your WiFi password and upload token. The PC's temporary firmware copy is
 private and removed on exit; keep any manually copied binaries private too.
 
 Choose first install or update before connecting. **First installs always
-use manual download mode**, because the factory board's state is unknown:
+use manual download mode**, because the board's existing state is unknown
+(such as factory firmware):
 hold BOOT, plug USB in (or tap RESET), wait 2–3 seconds, release BOOT, then
 select the port. See [download mode](#download-mode) for factory-firmware
 and battery details.
@@ -160,23 +161,32 @@ confirmation once without automatic reset and stops if that also fails.
 After writing, it requests a hard reset to run the program; press RESET
 with BOOT released only if the board stays in download mode.
 
-- **First install on a factory board:** use `-FirstInstall` / `--first-install`,
-  or answer yes at the first-install prompt. The script reads all 8 MB of
-  factory flash twice, verifies the sizes and matching hashes/content, and
-  stops before any erase/write if verification fails. Windows retries failed
-  reads in smaller pieces for the native-USB read quirk. The default backup
-  location is `mileage-tracker-backups` under your PC home directory; the
-  script asks for the location and prints the saved path. Keep it outside
-  the repo: it can contain factory device keys. Type **`ERASE`** to confirm
-  the full internal-flash erase, then it writes the bootloader, partition
-  table, boot support image and app. All internal trips and settings in
-  nonvolatile storage (NVS), including counters and enrollment records, are
-  erased. The SD card is untouched. The erase lets Stage 4 provision its
-  internal trip filesystem; see [first-flash behavior](#first-flash-on-a-new-board).
-  On an enrolled board, an intact enrolled card can restore diagnostics without
-  re-enrollment. Erasing also loses stale-card/conflict protection; check
+- **First install (new board, or moving an existing tracker to the larger
+  internal store):** use `-FirstInstall` / `--first-install`, or answer yes
+  at the first-install prompt. The script reads all 8 MB of internal flash
+  twice (saving the factory image on a new board, or the existing flash
+  before changing layouts as `supreme-flash-<timestamp>.bin`), verifies the
+  sizes and matching hashes/content, and stops before any erase/write if
+  verification fails. Windows retries failed reads in smaller pieces for the
+  native-USB read quirk. The default backup location is
+  `mileage-tracker-backups` under your PC home directory; the script asks
+  for the location and prints the saved path. Keep it outside the repo: it
+  can contain factory device keys, WiFi credentials or your upload token.
+  Type **`ERASE`** to confirm the full internal-flash erase, then it writes
+  the bootloader, partition table, boot support image and app. All internal
+  trips and settings in nonvolatile storage (NVS), including the trip
+  counter and internal-flash diagnostics record, are erased. The SD card is
+  untouched. The erase lets Stage 4 provision its internal trip filesystem;
+  see [first-flash behavior](#first-flash-on-a-new-board) and
+  [using the larger internal store](#using-the-larger-internal-store). On an
+  existing enrolled board, keep the intact enrolled microSD card inserted
+  for the first boot so diagnostics can restore without re-enrollment, then
+  check **Device health** for a current snapshot. Without the card, or if
+  diagnostics stay stuck (erasing also loses stale-card/conflict
+  protection), follow
   [revision recovery](../DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
-  before erasing a used board.
+  via the manual `secrets.h` route (the server builder only builds
+  enrollment ID 1).
 - **Update an installed tracker:** update/build on the server first, then
   rerun the script without the first-install flag and answer **no** at that
   prompt. This writes only the app, preserving NVS, internal trips and SD
@@ -210,10 +220,10 @@ bash flash.sh --server '<user>@<host>' --cleanup
 esptool's version command, but never opens the serial device. It prints the
 plan; add the first-install flag to preview backup/erase/all-part writes.
 `-Path` / `--path` can select a local firmware folder instead of SSH;
-for cleanup select the local cleanup folder explicitly. `-SkipBackup` /
-`--skip-backup` requires an explicit first-install flag and is only for
-re-provisioning a board whose factory backup you already hold; it still
-requires `ERASE`. Do not use it to work around a failed first backup.
+for cleanup select the local cleanup folder explicitly. `-SkipBackup` / `--skip-backup` requires an explicit first-install flag and
+is only for re-provisioning a board whose full-flash backup you already
+hold; it still requires `ERASE`. Do not use it to work around a failed first
+backup.
 
 ## Advanced: build from source
 
@@ -644,7 +654,8 @@ Each upload replaces the previous stage's program. Stages 1–3 check
 hardware; they do not record trips. **Leave Stage 4 installed for use in
 the car.** For routine Stage 4 updates, use the flash helper's app-only
 mode to preserve internal trips, settings and the installed table. An
-Arduino Upload writes the sketch's partition table even with
+Arduino IDE (or `arduino-cli`) upload writes the sketch's bootloader and
+new partition table without taking any backup or erasing flash, even with
 **Erase All Flash Before Sketch Upload → Disabled**. See the
 [larger internal store](#using-the-larger-internal-store) before changing
 the table on an existing board. Reflashing does not erase trips on the card.
@@ -945,9 +956,12 @@ firmware leaves data in the area used for the trip partition, and Stage 4
 will not overwrite non-erased data merely because it cannot mount it.
 
 The standalone `install/flash.ps1 -FirstInstall` / `install/flash.sh --first-install`
-performs the same one-time erase after a verified factory backup and an exact
-`ERASE` confirmation, then writes the four firmware parts. Use the default
-app-only update (or cleanup) for a tracker already running this project.
+performs the same one-time erase after a verified full-flash backup and an
+exact `ERASE` confirmation, then writes the four firmware parts. Use the
+default app-only update (or cleanup) for routine updates on a tracker
+already running this project; use first install on an existing tracker only
+when deliberately moving to the
+[larger internal store](#using-the-larger-internal-store).
 
 **Erase-all also wipes the board's settings memory (NVS):** the trip
 counter (`tripno`), diagnostic journal boot counter and consumed enrollment
@@ -998,20 +1012,35 @@ do not enable format-on-mount-failure.
 The flash helper's normal update writes only the app. An existing tracker
 with the original layout still has 2.375 MiB of internal trip storage
 after an app-only update. To get 6.375 MiB, use a new build and follow the
-[first Stage 4 flash procedure](#first-flash-on-a-new-board).
+[first Stage 4 flash procedure](#first-flash-on-a-new-board) (`-FirstInstall`
+/ `--first-install` in the flash helper).
 
 Before reinstalling, **upload or back up any trips still on internal
 flash**. The full erase deletes those trips, resets the trip counter and
-erases the stored diagnostics enrollment record. It leaves the microSD
-card alone. Follow the
-[diagnostics enrollment procedure](../DEPLOY_DEBIAN.md#one-time-diagnostics-enrollment)
-to re-enroll after reprovisioning and check Device health.
+erases NVS and the internal-flash diagnostics record. It leaves the microSD
+card alone. **Keep the enrolled microSD card inserted for the first boot**
+after the first install: an intact enrolled card restores diagnostics
+enrollment automatically and seeds the freshly provisioned internal flash.
+Once that boot connects, check **Device health** for a newly received
+current snapshot. If you boot without an intact enrolled card, re-enrollment
+is needed; if Device health stays old or stuck (for example from a stale or
+suspended card), follow the
+[diagnostics recovery procedure](../DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery).
+Because the server firmware builder only builds enrollment ID 1 for fresh
+boards and cannot build a recovery image, re-enrollment uses the manual
+`secrets.h` source-build route with a higher enrollment ID and verified
+high-water.
 
-With a table-only write, the pinned Arduino core attempts to grow a clean
-LittleFS filesystem in place at mount. If mounting or growing fails,
-Stage 4 preserves non-erased storage. Use the backed-up first-install
-procedure to change layouts. Once LittleFS grows, restoring the old
-partition table would cut off part of the filesystem.
+An **Arduino IDE** (or `arduino-cli`) upload writes the new partition table
+(and bootloader) without any backup or erase, even with **Erase All Flash
+Before Sketch Upload → Disabled**. On an old-table board, the pinned Arduino
+core mounts LittleFS with `grow_on_mount` enabled and attempts to grow a
+clean filesystem in place at the next mount. If mounting or growing fails,
+Stage 4 preserves non-erased storage instead of formatting it. Use the
+backed-up first-install procedure to change layouts deliberately, and back
+up internal trips before uploading from Arduino IDE onto an old-table board.
+Once LittleFS grows, restoring the old partition table would cut off part of
+the filesystem.
 
 #### If the trip storage won't mount later
 
@@ -1044,14 +1073,18 @@ worked. Before anything that could erase the partition, copy it to a file
 with esptool (it comes with the ESP32 core, or `pip install esptool`):
 
 ```
-esptool --chip esp32s3 --port <port> read-flash 0x190000 <littlefs-size> trips-backup.bin
+esptool --chip esp32s3 --port <port> read-flash 0x190000 0x660000 trips-backup.bin
 ```
 
 Close Serial Monitor before running esptool. Replace `<port>` with the
-board's port, such as `COMx` or `/dev/ttyACM0`. For `<littlefs-size>`,
-use `0x660000` for the expanded layout or `0x260000` for the original
-layout. Both start at `0x190000`. Verify the installed layout before
-choosing the size. An app-only update retains the previously installed table.
+board's port, such as `COMx` or `/dev/ttyACM0`. Using `0x190000` and size
+`0x660000` works on both the expanded (`0x660000`) and original (`0x260000`)
+Supreme layouts, so you do not need to identify which table is installed
+first: `0x190000 + 0x660000 = 0x7F0000`, which stays inside the 8 MB flash
+(`0x800000`) and leaves the bootloader, partition table, NVS, OTA data, app
+and the final 64 KiB (`0x7F0000`–`0x800000`) untouched. On the original
+layout it covers all of LittleFS (`0x190000`–`0x3F0000`) plus only the old
+64 KiB coredump partition (`0x3F0000`–`0x400000`) and unused flash after it.
 Keep the backup outside the repo. Older esptool versions spell the command
 `read_flash`. A backup image preserves the bytes but does not prove they
 are recoverable; keep it before attempting repairs or formatting.
@@ -1064,25 +1097,27 @@ trips, a damaged filesystem, or factory firmware data on a new board.
 For a board that has never logged trips, or when you have independently
 backed up the stored data and deliberately decided to reset trip storage,
 you can erase **only the trip partition** once. This deletes everything
-in that region. First finish the backup above and confirm the board's
-installed `spiffs` offset and size. If a previous layout put trip data
-elsewhere, preserve that region too before changing layouts.
+in that region. First finish the backup above. If a custom layout ever put
+trip data outside `0x190000`–`0x7F0000`, preserve that region too before
+changing layouts.
 Do not use this step to recover trips you still need from the device.
 
 With Serial Monitor closed, run:
 
 ```
-esptool --chip esp32s3 --port <port> erase-region 0x190000 <littlefs-size>
+esptool --chip esp32s3 --port <port> erase-region 0x190000 0x660000
 ```
 
-Older esptool versions spell it `erase_region`. Use the exact `spiffs`
-size for the installed table. On an older board the expanded range would
-also erase the original coredump partition. Reset the board (or
-power-cycle it) after a successful erase; the unchanged firmware verifies
-the erased partition, provisions it, and reaches `Setup complete. Logging
-trips.` No second flash or format-on-mount-failure build is needed. If it
-still enters degraded service, investigate the reported error rather than
-repeating erases.
+Older esptool versions spell it `erase_region`. The same `0x190000` /
+`0x660000` range is safe on both Supreme layouts: on the expanded layout it
+erases only `spiffs`, and on the original layout it erases `spiffs` plus
+only the old coredump partition and unused flash (leaving NVS, the app and
+the partition table intact). Reset the board (or power-cycle it) after a
+successful erase; the unchanged firmware verifies the installed `spiffs`
+partition is erased, provisions it at its table size, and reaches `Setup
+complete. Logging trips.` No second flash or format-on-mount-failure build
+is needed. If it still enters degraded service, investigate the reported
+error rather than repeating erases.
 
 #### Normal operation
 

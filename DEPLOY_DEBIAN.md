@@ -466,7 +466,12 @@ again; settings are not saved for reuse by the builder. A successful build
 replaces its output, and a normal build removes stale cleanup images.
 Finish a pending enrollment cleanup before rebuilding. Then run the printed
 flash command on your PC, without `-FirstInstall` / `--first-install`, and
-answer **no** to first install. App-only updates preserve settings and trips.
+answer **no** to first install. App-only updates preserve settings, trips
+and the existing partition layout. To move an existing board from the
+original 2.375 MiB internal store to 6.375 MiB instead, follow
+[Using the larger internal store](firmware/README.md#using-the-larger-internal-store)
+(upload or back up internal trips first, keep the enrolled microSD card in
+for the first boot, then check Device health).
 Always update the server before installing newer firmware.
 
 For a specific release, download that release's `setup.sh` rather than
@@ -1212,19 +1217,26 @@ token and built the server address and WiFi settings into the firmware.
 Exit SSH and use the printed flash command **on the PC connected by USB**;
 see [README Step 2](README.md#step-2--flash-the-tracker) and the
 [full flash guide](firmware/README.md#flash-from-the-server-build).
-First install verifies a factory backup, requires typing `ERASE`, erases
-all internal flash and writes four parts. Updates are app-only; do not
-choose first install for an existing tracker.
+First install verifies a full 8 MB flash backup, requires typing `ERASE`,
+erases all internal flash and writes four parts. Routine updates are
+app-only; never choose first install for a routine update. Use first install
+on an existing tracker only when deliberately moving to the
+[larger internal store](firmware/README.md#using-the-larger-internal-store)
+after uploading or backing up any internal trips, keeping the enrolled
+microSD card inserted for the first boot and checking Device health
+afterward.
 
 For a fresh device/card with no saved server snapshot revision, the builder
 prepares one-use enrollment values and a separate cleanup image. After the
 first newly received **current snapshot** in Device health, run the flash
 script with `-Cleanup` (Windows) / `--cleanup` (macOS/Linux), before another
 server build. This removes enrollment values with an app-only flash. A
-listed device or GPX contact alone is insufficient. Reused cards/boards,
-lost metadata or snapshot conflicts need
-[diagnostics recovery](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery);
-do not answer the builder's new-device questions as if they were fresh.
+listed device or GPX contact alone is insufficient. The server builder only
+builds enrollment ID 1 for fresh boards; reused cards/boards, lost metadata
+or snapshot conflicts need
+[diagnostics recovery](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
+using the manual `secrets.h` route below rather than answering the builder's
+new-device questions as if they were fresh.
 
 ### Advanced: local firmware settings
 

@@ -67,5 +67,5 @@ assertion failures. Forced termination can leave `flash-tests-*` under the OS
 temporary directory; the script copies are `tracker-flash-*` under `$env:TEMP`
 (Windows) or `tracker-firmware.*` under `${TMPDIR:-/tmp}` (bash). Download folders
 are `tracker-flash-*` under the Windows user profile or `esptool.*` under
-`~/.cache/mileage-tracker`. Factory backups are deliberately retained in the
+`~/.cache/mileage-tracker`. Full-flash backups are deliberately retained in the
 chosen backup directory. Report exact leftover paths after an interrupted run.

@@ -585,8 +585,11 @@ bash flash.sh --server 'root@<host>' --install-dir /mnt/<pool>/appdata/mileage-t
 ```
 
 Do not use the helpers' default `~/mileage-tracker`; root's home is not the
-Unraid install. For a previously used tracker, follow the update flow and
-preserve its saved settings and trips. Follow [README Step 3](README.md#step-3--first-drive-and-device-health)
+Unraid install. For routine updates on a previously used tracker, follow the
+update flow and preserve its saved settings and trips (to move an existing
+tracker to the larger internal store, see
+[Using the larger internal store](firmware/README.md#using-the-larger-internal-store)).
+Follow [README Step 3](README.md#step-3--first-drive-and-device-health)
 to confirm uploads and a fresh Device health snapshot.
 
 ## Moving an existing Debian install to Unraid

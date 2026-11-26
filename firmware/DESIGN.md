@@ -474,7 +474,7 @@ to the partition's size if it is larger. A grow failure is reported as a
 mount failure and still has to pass the full erased-partition check before
 firmware can format. The supported upgrade to the larger store is a first
 install with a full erase. See the [firmware guide](README.md#using-the-larger-internal-store)
-for backup and re-enrollment.
+for internal-trip backup, card-based enrollment restoration and recovery.
 
 `tripShouldSplit()` reserves pending points, another point and closing
 tags to keep each finished piece below 8 MiB. `tripFsmOnFix()` closes the

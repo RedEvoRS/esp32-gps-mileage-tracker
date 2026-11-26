@@ -136,7 +136,9 @@ Default update and --cleanup write only the app and never erase settings or trip
 They try automatic USB download mode first; if it fails, follow the BOOT/RESET prompt.
 --first-install: verified double 8 MB backup, type ERASE, erase all flash, write four parts.
 First installs always use the manual BOOT/RESET download-mode prompt.
-Use only for a new/factory board. Internal settings and trips are wiped; SD is untouched.
+Use for a new board, or moving an existing tracker to the larger internal store
+(erases its settings, internal trips and trip counter; SD is untouched).
+Never for a routine update.
 --first-install --skip-backup: re-provision a board already backed up; still type ERASE.
 Dry run prints the backup/erase/write plan without requesting confirmation.
 The standalone esptool version is pinned independently of the tracker release.
@@ -192,7 +194,7 @@ HELP
     printf 'Tracker flash (%s). Keep the LoRa antenna attached; use a USB data cable.\n' "$(flash_label "$RELEASE_TAG")"
     printf 'Close serial monitors. The port can change in download mode.\n'
     if [ "$first" != true ] && [ "$cleanup" != true ] && [ "$dry" != true ]; then
-        value=$(flash_prompt 'First install on a factory board? Backup, full erase, then write four parts? [y/N]: ')
+        value=$(flash_prompt 'First install (new board, or moving to the larger internal store; never for a routine update)? Backup, full erase, write four parts? [y/N]: ')
         case $value in y|Y|yes|YES) first=true ;; esac
     fi
     if [ "$first" = true ]; then flash_download_mode; fi
@@ -227,20 +229,20 @@ HELP
                 if [ "$dry" != true ]; then value=$(flash_prompt "Backup folder [$backup_dir]: "); backup_dir=${value:-$backup_dir}; fi
             fi
             local backup second
-            backup="$backup_dir/supreme-factory-$(date -u +%Y%m%dT%H%M%SZ)-$$.bin"; second="$backup.verify.bin"
+            backup="$backup_dir/supreme-flash-$(date -u +%Y%m%dT%H%M%SZ)-$$.bin"; second="$backup.verify.bin"
             if [ "$dry" != true ]; then mkdir -p "$backup_dir"; fi
             flash_command "${common[@]}" "$read_flash" 0 0x800000 "$backup"
             flash_command "${common[@]}" "$read_flash" 0 0x800000 "$second"
             if [ "$dry" != true ]; then
-                [ "$(wc -c < "$backup")" -eq 8388608 ] && [ "$(wc -c < "$second")" -eq 8388608 ] || flash_die 'Factory backup is not 8 MB; no flash write performed.'
-                cmp -s "$backup" "$second" || flash_die 'Factory backup reads differ; no flash write performed. Keep both for investigation.'
+                [ "$(wc -c < "$backup")" -eq 8388608 ] && [ "$(wc -c < "$second")" -eq 8388608 ] || flash_die 'Full-flash backup is not 8 MB; no flash write performed.'
+                cmp -s "$backup" "$second" || flash_die 'Full-flash backup reads differ; no flash write performed. Keep both for investigation.'
                 rm -- "$second"
             fi
-            printf 'Keep the factory backup privately outside the repo: %s (may contain device keys).\n' "$backup"
-        else printf 'Skipping factory backup: re-provision only a board you already backed up.\n'; fi
+            printf 'Keep the full-flash backup privately outside the repo: %s (may contain factory device keys, WiFi credentials or upload token).\n' "$backup"
+        else printf 'Skipping full-flash backup: re-provision only a board you already backed up.\n'; fi
         printf 'WARNING: This wipes everything on the board internal flash, including settings (trip counter, diagnostics enrollment record) and any trips on internal flash.\n'
-        printf 'This is right for a brand-new board or one coming from factory firmware. It is wrong for a tracker already running this project; use the default update instead.\n'
-        printf 'Trips on the SD card are not touched.\n'
+        printf 'Use this for a new board, or when moving an existing tracker to the larger internal store after uploading or backing up any internal trips. Never for a routine update; use the default update instead.\n'
+        printf 'Trips on the SD card are not touched. On an existing tracker, keep the enrolled SD card in for the first boot, then check Device health.\n'
         if [ "$dry" = true ]; then
             printf 'DRY RUN: A real first install requires typing ERASE. Backup verification is skipped only with explicit skip-backup.\n'
         else

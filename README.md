@@ -381,17 +381,20 @@ Both scripts copy your private firmware from the server over SSH and check
 its hashes. `--server '<alias>'` works on macOS/Linux too. Each script
 asks whether this is a first install.
 
-**First install on a factory board:** answer **yes**, then:
+**First install (new board, or moving an existing tracker to the larger
+internal store):** answer **yes**, then:
 
 1. When asked, put the board in download mode: hold **BOOT**, plug in USB
    (or tap **RESET**), wait 2–3 seconds, then release BOOT.
 2. Select the port (`COMx` on Windows; it can change in download mode).
-3. The script backs up the full 8 MB factory flash, reading it twice to
-   check the copies match. Keep the backup private and outside the repo: it
-   may contain device keys.
+3. The script backs up the full 8 MB internal flash, reading it twice to
+   check the copies match (saving the factory image on a new board, or the
+   existing flash before changing layouts). Keep the backup private and
+   outside the repo: it may contain factory device keys, WiFi credentials or
+   your upload token.
 4. Type **`ERASE`** to confirm. This wipes all internal flash, including
-   settings and any trips stored there, then writes the firmware. The SD
-   card is not touched.
+   settings, the trip counter and any trips stored there, then writes the
+   firmware. The SD card is not touched.
 
 **Updates:** answer **no** and select the running board's port. Only the app
 is rewritten; settings and trips are kept. The script tries to switch the
@@ -475,8 +478,13 @@ To get the larger internal store on a board with the original layout,
 upload or back up any trips still on internal flash first. Then use the
 [first-install procedure](firmware/README.md#using-the-larger-internal-store)
 with the new build. This erases internal flash, including queued internal
-trips, the trip counter and the diagnostics enrollment record. Re-enroll
-diagnostics afterward.
+trips, the trip counter and the internal-flash diagnostics record. Keep the
+enrolled microSD card inserted for the first boot so diagnostics can restore
+automatically, then check **Device health** for a current snapshot. Without
+an intact enrolled card, or if Device health stays stuck, follow the
+[diagnostics recovery procedure](DIAGNOSTICS.md#snapshot-revision-enrollment-and-recovery)
+(re-enrollment needs the manual `secrets.h` route, because the server
+builder only builds enrollment ID 1 for fresh boards).
 
 See the [update runbook](DEPLOY_DEBIAN.md#updating).
 

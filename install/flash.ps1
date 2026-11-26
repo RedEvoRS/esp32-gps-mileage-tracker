@@ -143,7 +143,7 @@ function Invoke-TrackerFlash {
         if ($readExitCode -eq 0 -and (Test-Path -LiteralPath $Destination) -and
             (Get-Item -LiteralPath $Destination).Length -eq $Length) { return }
         if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Force }
-        if ($Length -le 2048) { throw 'Factory read failed even at 2 KB. No write performed; check USB cable and download mode.' }
+        if ($Length -le 2048) { throw 'Full-flash read failed even at 2 KB. No write performed; check USB cable and download mode.' }
         $half = [int]($Length / 2)
         $left = Join-Path $temp ([guid]::NewGuid().ToString('N') + '.bin')
         $right = Join-Path $temp ([guid]::NewGuid().ToString('N') + '.bin')
@@ -179,7 +179,9 @@ Default update and -Cleanup write only the app and never erase settings or trips
 They try automatic USB download mode first; if it fails, follow the BOOT/RESET prompt.
 -FirstInstall: verified double 8 MB backup, type ERASE, erase all flash, write four parts.
 First installs always use the manual BOOT/RESET download-mode prompt.
-Use only for a new/factory board. Internal settings and trips are wiped; SD is untouched.
+Use for a new board, or moving an existing tracker to the larger internal store
+(erases its settings, internal trips and trip counter; SD is untouched).
+Never for a routine update.
 -FirstInstall -SkipBackup: re-provision a board you already backed up; still type ERASE.
 Dry run prints the backup/erase/write plan without requesting confirmation.
 The standalone esptool version is pinned independently of the tracker release.
@@ -244,7 +246,7 @@ The standalone esptool version is pinned independently of the tracker release.
         Write-Host "Tracker flash ($(Get-FlashLabel $releaseTag)). Keep the LoRa antenna attached; use a USB data cable."
         Write-Host 'Close serial monitors. Native USB needs no Windows driver; COM number can change in download mode.'
         if (-not $FirstInstall -and -not $Cleanup -and -not $DryRun) {
-            $FirstInstall = (Read-Host 'First install on a factory board? Backup, full erase, then write four parts? [y/N]') -match '^(y|yes)$'
+            $FirstInstall = (Read-Host 'First install (new board, or moving to the larger internal store; never for a routine update)? Backup, full erase, write four parts? [y/N]') -match '^(y|yes)$'
         }
         if ($FirstInstall) { Read-DownloadMode }
         $candidates = @()
@@ -291,7 +293,7 @@ The standalone esptool version is pinned independently of the tracker release.
                     [IO.Directory]::CreateDirectory($BackupDir) | Out-Null
                     $BackupDir = New-PrivateFolder $BackupDir
                 }
-                $backup = Join-Path $BackupDir ('supreme-factory-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '.bin')
+                $backup = Join-Path $BackupDir ('supreme-flash-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '.bin')
                 $second = $backup + '.verify.bin'
                 if ($DryRun) {
                     Invoke-FlashCommand ($common + @($readCommand, '0', '0x800000', $backup))
@@ -299,15 +301,15 @@ The standalone esptool version is pinned independently of the tracker release.
                 } else {
                     Read-FactoryRange 0 8388608 $backup
                     Read-FactoryRange 0 8388608 $second
-                    if ((Get-Item -LiteralPath $backup).Length -ne 8388608 -or (Get-Item -LiteralPath $second).Length -ne 8388608) { throw 'Factory backup is not 8 MB; no write performed.' }
-                    if ((Get-FileHash -LiteralPath $backup).Hash -cne (Get-FileHash -LiteralPath $second).Hash) { throw 'Factory backup reads differ; no write performed. Keep both for investigation.' }
+                    if ((Get-Item -LiteralPath $backup).Length -ne 8388608 -or (Get-Item -LiteralPath $second).Length -ne 8388608) { throw 'Full-flash backup is not 8 MB; no write performed.' }
+                    if ((Get-FileHash -LiteralPath $backup).Hash -cne (Get-FileHash -LiteralPath $second).Hash) { throw 'Full-flash backup reads differ; no write performed. Keep both for investigation.' }
                     Remove-Item -LiteralPath $second -Force
                 }
-                Write-Host "Keep the factory backup privately outside the repo: $backup (may contain device keys)."
-            } else { Write-Host 'Skipping factory backup: re-provision only a board you already backed up.' }
+                Write-Host "Keep the full-flash backup privately outside the repo: $backup (may contain factory device keys, WiFi credentials or upload token)."
+            } else { Write-Host 'Skipping full-flash backup: re-provision only a board you already backed up.' }
             Write-Host 'WARNING: This wipes everything on the board internal flash, including settings (trip counter, diagnostics enrollment record) and any trips on internal flash.'
-            Write-Host 'This is right for a brand-new board or one coming from factory firmware. It is wrong for a tracker already running this project; use the default update instead.'
-            Write-Host 'Trips on the SD card are not touched.'
+            Write-Host 'Use this for a new board, or when moving an existing tracker to the larger internal store after uploading or backing up any internal trips. Never for a routine update; use the default update instead.'
+            Write-Host 'Trips on the SD card are not touched. On an existing tracker, keep the enrolled SD card in for the first boot, then check Device health.'
             if ($DryRun) { Write-Host 'DRY RUN: A real first install requires typing ERASE. Backup verification is skipped only with explicit SkipBackup.' }
             elseif ((Read-Host 'Type ERASE to erase the whole internal flash') -cne 'ERASE') { throw 'Erase confirmation refused; nothing erased or written.' }
             Invoke-FlashCommand ($common + @($eraseCommand))
