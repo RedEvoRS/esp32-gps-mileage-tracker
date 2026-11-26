@@ -1135,9 +1135,9 @@ How it behaves once flashed:
   at most 0.5 m/s plus `hAcc` (horizontal accuracy) at most 5 m when starting,
   or 1.0 m/s plus 10 m during a trip.
   These limits were retained after road-test calibration. A trip ending in a
-  parking garage remains untested and is deferred until after `v1.00`. The
-  arrival window tolerates either message order at 1 Hz, so the latest
-  sample may belong to the previous epoch; it does not change GPX times.
+  parking garage remains unverified. The arrival window tolerates either
+  message order at 1 Hz, so the latest sample may belong to the previous epoch;
+  it does not change GPX times.
   Rejected speeds count as stopped: arming resets, or an active trip enters
   its normal five-minute cooldown. Rejected points enter neither GPX nor
   the distance total, and distance never bridges across them. Leaving
