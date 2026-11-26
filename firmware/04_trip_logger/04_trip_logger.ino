@@ -30,8 +30,8 @@
 //   SD, SPI, LittleFS, and Preferences ship with the ESP32 Arduino core.
 //   U8g2 2.36.18 (olikraus) drives the optional test-drive OLED page.
 //
-// PARTITIONS: partitions.csv is unchanged (no OTA, 2.375 MB LittleFS
-// fallback, about 5-6 driving hours). SD requires FAT32; never auto-format.
+// PARTITIONS: first installs use 6.375 MiB for LittleFS; app-only updates
+// keep the installed layout. No OTA. SD requires FAT32; never auto-format.
 // New trips use SD when it mounts at boot. Both mounted stores are repaired
 // and drained, SD first, so flash trips from a previous boot are not stranded.
 //

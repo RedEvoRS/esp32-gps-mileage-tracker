@@ -591,21 +591,33 @@ int main(int argc, char** argv) {
         CHECK(g_partition.finds == 0 && g_disk.formatAttempts == 0,
               "successful mount skips the raw scan and format");
 
-        resetWorld();
-        g_disk.failMount = true;
-        g_partition.partition.size = 0x260000;
-        g_partition.bytes.assign(g_partition.partition.size, 0xFF);
-        setup();
-        CHECK(logHas("Setup complete") && g_taskCreates == 1,
-              "first flash on fully erased storage completes setup and starts worker");
-        CHECK(g_disk.formatAttempts == 1 && g_disk.mountAttempts == 2 && !g_disk.formatRequested,
-              "provisions once then remounts with format-on-failure disabled");
-        CHECK(g_partition.readBytes == g_partition.partition.size && !g_partition.wrongLookup &&
-              g_disk.partitionLabel == "spiffs", "reads every byte of the same labelled data partition");
-        g_disk.files["/trips/queued.gpx"] = "queued trip";
-        CHECK(mountTripStorage() && g_disk.formatAttempts == 1 &&
-              g_disk.files["/trips/queued.gpx"] == "queued trip",
-              "next mount preserves trips without provisioning again");
+        for (size_t capacity : {0x260000U, 0x660000U}) {
+            resetWorld();
+            g_disk.failMount = true;
+            g_disk.capacity = capacity;
+            g_partition.partition.size = capacity;
+            g_partition.bytes.assign(capacity, 0xFF);
+            // Data at the very end, including beyond the old partition's end,
+            // must prevent provisioning after a failed mount.
+            g_partition.bytes.back() = 0xFE;
+            CHECK(!mountFlashStorage() && g_disk.formatAttempts == 0 &&
+                  g_partition.readBytes == capacity && g_partition.bytes.back() == 0xFE,
+                  "failed mount preserves a nonblank installed partition of either size");
+            g_partition.bytes.back() = 0xFF;
+            g_partition.readBytes = 0;
+            g_disk.mountAttempts = 0;
+            setup();
+            CHECK(logHas("Setup complete") && g_taskCreates == 1,
+                  "first flash on fully erased storage completes setup and starts worker");
+            CHECK(g_disk.formatAttempts == 1 && g_disk.mountAttempts == 2 && !g_disk.formatRequested,
+                  "provisions once then remounts with format-on-failure disabled");
+            CHECK(g_partition.readBytes == capacity && !g_partition.wrongLookup &&
+                  g_disk.partitionLabel == "spiffs", "reads the entire installed partition");
+            g_disk.files["/trips/queued.gpx"] = "queued trip";
+            CHECK(mountTripStorage() && g_disk.formatAttempts == 1 &&
+                  g_disk.files["/trips/queued.gpx"] == "queued trip",
+                  "next mount preserves trips without provisioning again");
+        }
 
         // Exercise the first byte, both sides of a read boundary, and the
         // last byte of a short final chunk. Sampling must never suffice.

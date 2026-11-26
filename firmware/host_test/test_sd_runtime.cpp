@@ -278,6 +278,16 @@ int main() {
     assert(codeRows(events(), 4006).size() == 1);
     std::puts("SD runtime: unavailable micro-trip finalization reports E4006 and preserves the SD file passed");
 
+    // A backlog larger than the legacy partition still leaves usable space
+    // on the expanded layout, with the diagnostics reserve deducted.
+    sdWorld(); events();
+    g_disk.capacity = 0x660000;
+    g_disk.files["/trips/queued.gpx"] = std::string(0x260000 + 4096, 'x');
+    SD.cardPresent = false;
+    assert(roomForNewTrip(millis()) && gTripFS == &LittleFS);
+    assert(fsFreeBytes() == g_disk.capacity - g_disk.used() -
+           (kLittleFsJournalReserve - gFlashJournalFs.allocatedBytes(4096)));
+
     // Flash still obeys its original start/stop guards and journal reserve.
     sdWorld(); events();
     g_disk.capacity = g_disk.used() + kLittleFsJournalReserve + FS_STOP_FREE - 1;
