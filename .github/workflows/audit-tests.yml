@@ -2,7 +2,11 @@ name: Audit regression tests
 
 on:
   workflow_dispatch:
+  # ready_for_review starts the full run when a draft is marked ready. While a
+  # PR is a draft, only pii-scan runs; the other jobs report skipped.
+  # converted_to_draft cancels an in-flight full run (same concurrency group).
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   push:
     branches: [main]
 
@@ -47,9 +51,10 @@ jobs:
         run: python tools/check_pii.py ${COMMITS:+--commits "$COMMITS"}
 
   # Strict up-to-date required checks mean main receives exactly the files tested on the PR.
-  # Keep the push run as the PII backstop; the other checks run on PRs and manual runs.
+  # Keep the push run as the PII backstop; the other checks run on ready (non-draft) PRs
+  # and manual runs.
   server:
-    if: github.event_name != 'push'
+    if: github.event_name != 'push' && !github.event.pull_request.draft
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -76,7 +81,7 @@ jobs:
           node server/tests/test_viewer_annotation.js
 
   firmware-host:
-    if: github.event_name != 'push'
+    if: github.event_name != 'push' && !github.event.pull_request.draft
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -102,7 +107,7 @@ jobs:
   firmware-compile:
     # One runner shares the toolchain and core build cache across all sketches.
     # Compilation only; OLED/SD/power behavior still needs hardware validation.
-    if: github.event_name != 'push'
+    if: github.event_name != 'push' && !github.event.pull_request.draft
     runs-on: ubuntu-latest
     timeout-minutes: 25
     outputs:
@@ -234,7 +239,7 @@ jobs:
 
   installer:
     needs: firmware-compile
-    if: github.event_name != 'push'
+    if: github.event_name != 'push' && !github.event.pull_request.draft
     # Runs server/install.sh for real on a fresh VM: Docker builds, the
     # test upload, the viewer login and exports, and backups through
     # systemd. Then reruns it, has it repair a mangled config, restarts
@@ -534,7 +539,7 @@ jobs:
   # Optional check: do not add this job to branch protection's five required checks.
   flash-windows:
     needs: firmware-compile
-    if: github.event_name != 'push' && needs.firmware-compile.outputs.windows == 'true'
+    if: github.event_name != 'push' && !github.event.pull_request.draft && needs.firmware-compile.outputs.windows == 'true'
     runs-on: windows-latest
     timeout-minutes: 5
     steps:
