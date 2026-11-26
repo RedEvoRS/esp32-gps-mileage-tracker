@@ -814,9 +814,9 @@ For why it works this way, see [the firmware design](DESIGN.md).
 
 The `04_trip_logger/` sketch detects trips, accumulates mileage and writes
 GPS Exchange Format (GPX) files to the microSD card, with internal LittleFS
-as fallback. The current release is `v1.03`; it uploads trips from
-the card, and the [top-level README](../README.md#where-its-at) has the current status and
-what's still unproven on a real board. Since `v0.06` there is one firmware build: debug
+as fallback. It uploads trips from the card, and the
+[top-level README](../README.md#where-its-at) has the current release version,
+status and what's still unproven on a real board. Since `v0.06` there is one firmware build: debug
 mode starts off at every power-on and can be toggled by holding BOOT and
 tapping POWER.
 
@@ -1135,9 +1135,9 @@ How it behaves once flashed:
   at most 0.5 m/s plus `hAcc` (horizontal accuracy) at most 5 m when starting,
   or 1.0 m/s plus 10 m during a trip.
   These limits were retained after road-test calibration. A trip ending in a
-  parking garage remains untested and is deferred until after `v1.00`. The
-  arrival window tolerates either message order at 1 Hz, so the latest
-  sample may belong to the previous epoch; it does not change GPX times.
+  parking garage remains unverified. The arrival window tolerates either
+  message order at 1 Hz, so the latest sample may belong to the previous epoch;
+  it does not change GPX times.
   Rejected speeds count as stopped: arming resets, or an active trip enters
   its normal five-minute cooldown. Rejected points enter neither GPX nor
   the distance total, and distance never bridges across them. Leaving
