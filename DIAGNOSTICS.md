@@ -180,7 +180,9 @@ stays blocked, an older epoch cannot authorize allocation after adoption, and
 an NVS read error never counts as a missing key. An intact enrolled card can
 therefore continue without re-enrollment and seed the erased internal flash.
 With no ready copy, disagreeing epochs or suspension in the adopted epoch,
-recover explicitly using the procedure above.
+recover explicitly using the manual `secrets.h` procedure above (the server
+firmware builder only builds enrollment ID 1 for fresh boards and cannot
+build a recovery image).
 
 Erasing NVS loses evidence that an absent card was stale or missed a conflict.
 A stale enrolled card may then issue low revisions: the server accepts history
