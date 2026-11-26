@@ -191,9 +191,19 @@ class BashFlashTests(unittest.TestCase):
                 if first:
                     self.assertIn(erase, commands[-2])
                     self.assertIn("read-flash" if major == 5 else "read_flash", commands[-3])
+                    self.assertIn("supreme-flash-", commands[-3])
+                    self.assertIn("moving an existing tracker to the larger internal store", result.stdout)
+                    self.assertIn("Never for a routine update", result.stdout)
+                    self.assertNotIn("wrong for a tracker already running this project", result.stdout)
                     self.assertIn("LittleFS partition is fully erased; provisioning trip storage.", result.stdout)
                     self.assertIn("Setup complete. Logging trips.", result.stdout)
                 self.assertEqual(list(self.folder.glob("tracker-firmware.*")), [])
+        help_result = subprocess.run(["bash", str(ROOT / "install/flash.sh"), "--help"],
+                                     capture_output=True, text=True)
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("moving an existing tracker to the larger internal store", help_result.stdout)
+        self.assertIn("Never for a routine update.", help_result.stdout)
+        self.assertNotIn("Use only for a new/factory board.", help_result.stdout)
         release_script = self.folder / "release-flash.sh"
         release_script.write_bytes((ROOT / "install/flash.sh").read_bytes().replace(
             b"@" + b"RELEASE_TAG" + b"@", b"v0.00-test"))

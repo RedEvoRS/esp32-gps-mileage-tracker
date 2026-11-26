@@ -180,11 +180,19 @@ $global:LASTEXITCODE = 0
                 if ($mode -eq 'first') {
                     Assert-Equal ($commands[-2] -match 'erase-flash') $true
                     Assert-Equal ($commands[-3] -match 'read-flash') $true
+                    Assert-Equal ($commands[-3] -match 'supreme-flash-') $true
+                    Assert-Equal ($transcript.Contains('moving an existing tracker to the larger internal store')) $true
+                    Assert-Equal ($transcript.Contains('Never for a routine update')) $true
+                    Assert-Equal ($transcript.Contains('wrong for a tracker already running this project')) $false
                     Assert-Equal ($transcript.Contains('LittleFS partition is fully erased; provisioning trip storage.')) $true
                     Assert-Equal ($transcript.Contains('Setup complete. Logging trips.')) $true
                 }
                 Assert-Equal (@(Get-ChildItem $folder -Directory -Filter 'tracker-flash-*').Count) 0
             }
+            $helpText = (& $scriptPath -Help 6>&1 | Out-String -Width 32767)
+            Assert-Equal ($helpText.Contains('moving an existing tracker to the larger internal store')) $true
+            Assert-Equal ($helpText.Contains('Never for a routine update.')) $true
+            Assert-Equal ($helpText.Contains('Use only for a new/factory board.')) $false
             # Apply the release builder's global byte replacement to the whole
             # script: the comparison must still identify a stamped release.
             $releaseScript = Join-Path $folder 'release-flash.ps1'
