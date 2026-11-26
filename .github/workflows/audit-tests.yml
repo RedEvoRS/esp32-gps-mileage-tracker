@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
   # ready_for_review starts the full run when a draft is marked ready. While a
   # PR is a draft, only pii-scan runs; the other jobs report skipped.
+  # converted_to_draft cancels an in-flight full run (same concurrency group).
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   push:
     branches: [main]
 

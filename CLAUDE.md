@@ -159,7 +159,9 @@ ready for review starts the full run. Build up combined work as one draft
 (merge other branches into its branch), run
 `gh workflow run audit-tests.yml --ref <branch>` for a checkpoint without
 leaving draft, and convert back to draft before pushing more fixes after it's
-marked ready.
+marked ready (converting cancels an in-flight full run). Open drafts with
+`gh pr create --draft`: a PR opened ready and then converted starts a full
+run first.
 That workflow publishes immediately, before server deployment or board flashing.
 Strict up-to-date required checks mean main receives exactly the files
 tested on the PR. A new push to a PR cancels its older run; main runs are not
