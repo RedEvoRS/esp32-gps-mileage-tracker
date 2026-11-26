@@ -276,7 +276,32 @@ int main() {
     endTrip(true); // no next point: even a micro-trip cannot claim deletion
     assert(gState == IDLE && g_sdDisk.files.count(activePath));
     assert(codeRows(events(), 4006).size() == 1);
-    std::puts("SD runtime: unavailable micro-trip finalization reports E4006 and preserves the SD file passed");
+    // When the card returns on a later boot, boot repair deletes the discarded
+    // micro-trip instead of finalizing and uploading it.
+    SD.cardPresent = true;
+    gSdUnavailable = false;
+    setup();
+    assert(!g_sdDisk.files.count(activePath) && !hasPending() && Preferences::durableBytes.empty());
+    std::puts("SD runtime: unavailable micro-trip finalization reports E4006, preserves file while unavailable, and boot removes it on return passed");
+
+    // Two consecutive failed micro-trip discards on SD count toward SD write
+    // failure fallback while keeping readable trips eligible for upload.
+    sdWorld(); events();
+    const std::string queuedSd = "/trips/queued_ok.gpx";
+    g_sdDisk.files[queuedSd] = std::string(GPX_PROLOGUE) + "<trkpt></trkpt>\n" + GPX_EPILOGUE;
+    for (int i = 0; i < 2; ++i) {
+        g_sdDisk.failRemoves = 1;
+        drive(3, 12);
+        drive(0, kCooldownSeconds + 5);
+        assert(gState == IDLE && gTripFS == &SD);
+    }
+    assert(sdRecordingUnavailable() && !gSdUnavailable && tripStoreAvailable(SD));
+    drive(15, 11);
+    assert(gState == ACTIVE && gTripFS == &LittleFS && g_disk.files.count(gTripPath));
+    endTrip(false);
+    g_httpRequests = 0;
+    assert(uploadPending(SD) && g_httpRequests == 1 && !g_sdDisk.files.count(queuedSd));
+    std::puts("SD runtime: repeated failed micro-trip discards fall back to LittleFS while keeping SD queue uploadable passed");
 
     // Flash still obeys its original start/stop guards and journal reserve.
     sdWorld(); events();
