@@ -41,3 +41,18 @@ inline bool rewriteTripEpilogue(const char* mount, const char* relative,
     if (trip_vfs_io::close(fd) != 0) ok = false;
     return ok;
 }
+
+// Fallback when both removing a discarded micro-trip and saving its NVS
+// discard record fail: emptying the file ensures boot repair removes it as
+// empty instead of finalizing and uploading it.
+inline bool truncateTripEmpty(const char* mount, const char* relative) {
+    char path[96];
+    int n = std::snprintf(path, sizeof(path), "%s%s", mount, relative);
+    if (n <= 0 || static_cast<size_t>(n) >= sizeof(path)) return false;
+    int fd = trip_vfs_io::open(path, O_WRONLY);
+    if (fd < 0) return false;
+    bool ok = trip_vfs_io::ftruncate(fd, 0) == 0;
+    if (ok) ok = trip_vfs_io::fsync(fd) == 0;
+    if (trip_vfs_io::close(fd) != 0) ok = false;
+    return ok;
+}

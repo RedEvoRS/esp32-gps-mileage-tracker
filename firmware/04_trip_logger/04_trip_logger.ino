@@ -78,6 +78,7 @@
 #include "journal_platform.h"
 #include "trip_repair_vfs.h"
 #include "trip_write_vfs.h"
+#include "micro_discard.h"
 #include "runtime_faults.h"
 #include "rtc_runtime.h"
 
@@ -476,7 +477,14 @@ static bool      gFullWarned = false;
 static uint32_t  gIdleSince = 0;        // last time we were NOT (on battery + IDLE)
 static double    gTripMeters = 0;
 static size_t    gTripBytes = 0;        // committed prologue + trackpoint bytes
+static uint64_t  gTripHash = micro_discard::kHashOffset; // FNV-1a of committed bytes
 static bool      gTripContinuation = false; // piece started by a size split
+// Core 1 only: pending micro-trip discards whose remove() failed, persisted in NVS.
+static constexpr const char* MICRO_DISCARD_NVS_NS = "mdisc";
+static constexpr const char* MICRO_DISCARD_NVS_KEY = "list";
+static micro_discard::PendingList gPendingDiscards;
+static bool      gPendingDiscardsLoaded = false;
+static uint32_t  gPendingDiscardRetryMs = 0;
 
 // Fixes seen while ARMING, so the first ~10 s of a trip isn't lost.
 // One fix per 1 Hz epoch makes a 10 s arm window 10-11 fixes; 16 slots is
@@ -591,6 +599,9 @@ static bool heartbeatDue() {
 
 static const char* tripBackend(fs::FS& storage) { return &storage == &SD ? "sd" : "littlefs"; }
 static const char* tripMount(fs::FS& storage) { return &storage == &SD ? "/sd" : "/littlefs"; }
+static micro_discard::Backend discardBackend(fs::FS& storage) {
+    return &storage == &SD ? micro_discard::Backend::Sd : micro_discard::Backend::LittleFs;
+}
 
 static bool tripStoreAvailable(fs::FS& storage) {
     return &storage == &SD ? gSdMounted && !gSdUnavailable.load() : gFlashMounted && gFlashTripsReady;
@@ -937,7 +948,8 @@ static void makeTripPath(char* out, size_t n) {
         snprintf(out, n, "%s/t%06u.gpx", TRIP_DIR, (unsigned)c);
     } while (storage.exists(out) ||
              storage.exists((String(out) + ".bad").c_str()) ||
-             storage.exists((String(out) + ".fix").c_str()));
+             storage.exists((String(out) + ".fix").c_str()) ||
+             gPendingDiscards.contains(discardBackend(storage), out));
     prefs.putUInt("tripno", c);
 }
 
@@ -1063,14 +1075,19 @@ static bool tripStorageLow(uint32_t now) {
 }
 
 static bool repairIfNeeded(fs::FS& storage, const char* path, bool bounded = false);
+static void ensurePendingDiscardsLoaded();
+static void rememberPendingDiscard(fs::FS& storage, const char* path, size_t bytes, uint64_t hash);
+static void servicePendingDiscards(bool force = false);
 
 // A failed start leaves no active trip. Recover complete opening points, or
 // leave uncertain bytes for boot repair. The caller must then stay IDLE.
 static bool beginTrip(const Fix& fx, bool continuation = false) {
+    ensurePendingDiscardsLoaded();
     gTripContinuation = false;
     fs::FS& storage = *gTripFS;
     gTripMeters = 0;
     gTripBytes = 0;
+    gTripHash = micro_discard::kHashOffset;
     gTripWriteFailed = false;
     gTripT0 = gArmCount ? gArmBuf[gArmHead].monoMs : fx.monoMs;
     gLastMoveMs = fx.monoMs;
@@ -1099,7 +1116,7 @@ static bool beginTrip(const Fix& fx, bool continuation = false) {
             }
         }
         ok = w.commit();
-        if (ok) gTripBytes = w.queued;
+        if (ok) { gTripBytes = w.queued; gTripHash = w.hash; }
     }
     tripWriteResult(storage, ok, operation);
     if (!ok) {
@@ -1152,7 +1169,7 @@ static bool writeOrBufferTrkpt(const Fix& fx) {
     bool ok = false;
     const char* operation = "open";
     if (tripStoreAvailable(storage)) {
-        FileWriter w(tripMount(storage), gTripPath, /*create=*/false);
+        FileWriter w(tripMount(storage), gTripPath, /*create=*/false, gTripHash);
         if (w) {
             operation = "write";
             if (w.ok) {
@@ -1164,7 +1181,7 @@ static bool writeOrBufferTrkpt(const Fix& fx) {
                 }
             }
             ok = w.commit();
-            if (ok) gTripBytes += w.queued;
+            if (ok) { gTripBytes += w.queued; gTripHash = w.hash; }
         }
     }
     FS_UNLOCK();
@@ -1197,14 +1214,30 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
     bool micro = (tripMs < MIN_TRIP_MS) ||
                  (gTripMeters < MIN_TRIP_METERS);
 
+    char failedDiscardPath[sizeof(gTripPath)] = {0};
+    const size_t failedDiscardBytes = gTripBytes;
+    const uint64_t failedDiscardHash = gTripHash;
+    bool recordPendingDiscard = false;
+    bool cleanEnd = false;
+
     FS_LOCK();
     // A successful continuation starts with the shared boundary fix (pending
     // if untimed). Keep even a stopped tail, including a lone boundary point,
     // so per-piece thresholds never discard recorded points from a split trip.
-    if (discardIfMicro && micro && !gTripContinuation && !gTripWriteFailed && tripStoreAvailable(storage)) {
-        Serial.printf("Discarding micro-trip (%.0f m, %lu ms)\n",
-                      gTripMeters, (unsigned long)tripMs);
-        storage.remove(gTripPath);
+    if (discardIfMicro && micro && !gTripContinuation && !gTripWriteFailed) {
+        const bool removed = tripStoreAvailable(storage) && storage.remove(gTripPath);
+        if (removed) {
+            cleanEnd = true;
+            Serial.printf("Discarding micro-trip (%.0f m, %lu ms)\n",
+                          gTripMeters, (unsigned long)tripMs);
+        } else {
+            snprintf(failedDiscardPath, sizeof(failedDiscardPath), "%s", gTripPath);
+            recordPendingDiscard = true;
+            tripWriteResult(storage, false, "close");
+            noteTripPieceWrite(storage, false);
+            Serial.printf("ERROR: could not discard micro-trip %s (%.0f m, %lu ms) -- will retry.\n",
+                          gTripPath, gTripMeters, (unsigned long)tripMs);
+        }
     } else {
         bool ok = false;
         if (!gTripWriteFailed && tripStoreAvailable(storage)) {
@@ -1230,6 +1263,7 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
         }
         if (!tripStoreAvailable(storage)) tripWriteResult(storage, false, "close");
         noteTripPieceWrite(storage, cleanClose);
+        cleanEnd = cleanClose;
 
         if (ok) {
             Serial.printf("Trip finalized: %s (%.2f mi)\n",
@@ -1245,7 +1279,17 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
     gPendCount = gPendHead = 0;
     gTripWriteFailed = false;
     gTripContinuation = false;
+    gTripBytes = 0;
+    gTripHash = micro_discard::kHashOffset;
     gState = nextState;
+
+    if (recordPendingDiscard) {
+        rememberPendingDiscard(storage, failedDiscardPath, failedDiscardBytes, failedDiscardHash);
+        gPendingDiscardRetryMs = millis();
+    } else if (cleanEnd && nextState == IDLE) {
+        servicePendingDiscards(/*force=*/true);
+    }
+
     if (nextState == IDLE) gDisplayTripFinalized = true;
     gNetRetryNow.store(true);   // after the file is closed and no longer active
 }
@@ -1417,6 +1461,175 @@ static GpxTail checkGpxTail(File& f) {
     return GpxTail::Incomplete;
 }
 
+// =================================================================
+// Pending micro-trip discards (Core 1 only; persisted in NVS)
+// =================================================================
+static void ensurePendingDiscardsLoaded() {
+    if (gPendingDiscardsLoaded) return;
+    gPendingDiscardsLoaded = true;
+    Preferences store;
+    if (!store.begin(MICRO_DISCARD_NVS_NS, true)) return;
+    const size_t len = store.getBytesLength(MICRO_DISCARD_NVS_KEY);
+    if (len > 0 && len <= micro_discard::kMaxBlobBytes) {
+        uint8_t buf[micro_discard::kMaxBlobBytes];
+        if (store.getBytes(MICRO_DISCARD_NVS_KEY, buf, len) == len) {
+            micro_discard::PendingList loaded;
+            if (loaded.decode(buf, len)) gPendingDiscards = loaded;
+        }
+    }
+    store.end();
+}
+
+static bool savePendingDiscards() {
+    Preferences store;
+    if (!store.begin(MICRO_DISCARD_NVS_NS, false)) return false;
+    bool ok = false;
+    if (gPendingDiscards.empty()) {
+        ok = !store.isKey(MICRO_DISCARD_NVS_KEY) || store.remove(MICRO_DISCARD_NVS_KEY);
+    } else {
+        uint8_t buf[micro_discard::kMaxBlobBytes];
+        const size_t len = gPendingDiscards.encode(buf, sizeof(buf));
+        if (len > 0 && store.putBytes(MICRO_DISCARD_NVS_KEY, buf, len) == len) {
+            uint8_t verify[micro_discard::kMaxBlobBytes];
+            ok = store.getBytes(MICRO_DISCARD_NVS_KEY, verify, len) == len &&
+                 memcmp(buf, verify, len) == 0;
+        }
+    }
+    store.end();
+    return ok;
+}
+
+static void rememberPendingDiscard(fs::FS& storage, const char* path, size_t bytes, uint64_t hash) {
+    ensurePendingDiscardsLoaded();
+    const auto backend = discardBackend(storage);
+    if (!gPendingDiscards.add(backend, path, static_cast<uint32_t>(bytes), hash)) return;
+    if (!savePendingDiscards()) {
+        Serial.printf("WARNING: could not save pending micro-trip discard %s to NVS.\n", path);
+        FS_LOCK();
+        if (tripStoreAvailable(storage) && truncateTripEmpty(tripMount(storage), path)) {
+            gPendingDiscards.add(backend, path, 0, micro_discard::kHashOffset);
+        }
+        FS_UNLOCK();
+    }
+}
+
+// Caller holds FS_LOCK. Only an exact match of size, 64-bit content hash, and
+// incomplete GPX tail authorizes removal; read errors and mismatches never do.
+static micro_discard::Match checkDiscardMatchLocked(fs::FS& storage, const micro_discard::Entry& entry) {
+    File f = storage.open(entry.path, FILE_READ);
+    if (!f) return micro_discard::Match::ReadError;
+    if (f.isDirectory()) { f.close(); return micro_discard::Match::Mismatch; }
+    const size_t sz = f.size();
+    if (sz != entry.size) { f.close(); return micro_discard::Match::Mismatch; }
+    if (!f.seek(0)) { f.close(); return micro_discard::Match::ReadError; }
+    uint64_t hash = micro_discard::kHashOffset;
+    uint8_t buf[256];
+    size_t remaining = sz;
+    while (remaining > 0) {
+        const size_t want = min(sizeof(buf), remaining);
+        const int n = f.read(buf, want);
+        if (n != (int)want) { f.close(); return micro_discard::Match::ReadError; }
+        hash = micro_discard::hashBytes(hash, buf, want);
+        remaining -= want;
+        feedLoopWatchdogProgress();
+    }
+    if (hash != entry.hash) { f.close(); return micro_discard::Match::Mismatch; }
+    const GpxTail tail = checkGpxTail(f);
+    f.close();
+    if (tail == GpxTail::ReadError) return micro_discard::Match::ReadError;
+    return tail == GpxTail::Incomplete ? micro_discard::Match::Matched : micro_discard::Match::Mismatch;
+}
+
+// Caller holds FS_LOCK. Returns true if gPendingDiscards changed and NVS needs
+// updating after FS_UNLOCK(). When fsckPaths is provided, TRIP_DIR was already
+// opened and enumerated cleanly, and removed paths are erased from *fsckPaths.
+static bool retryPendingDiscardsLocked(fs::FS& storage, std::vector<String>* fsckPaths) {
+    const auto backend = discardBackend(storage);
+    if (!gPendingDiscards.hasActive(backend)) return false;
+    if (!fsckPaths) {
+        File dir = storage.open(TRIP_DIR);
+        const bool dirOk = dir && dir.isDirectory();
+        if (dir) dir.close();
+        if (!dirOk) return false;
+    }
+    bool changed = false;
+    for (size_t i = 0; i < gPendingDiscards.count(); ) {
+        auto& entry = gPendingDiscards.at(i);
+        if (entry.backend != backend || entry.skipThisBoot) { ++i; continue; }
+        if (&storage == gTripFS && gTripPath[0] && strcmp(entry.path, gTripPath) == 0) {
+            ++i; continue;
+        }
+        bool present = false;
+        if (fsckPaths) {
+            for (const String& p : *fsckPaths) {
+                if (p == entry.path) { present = true; break; }
+            }
+            if (!present) present = storage.exists(entry.path);
+        } else {
+            present = storage.exists(entry.path);
+        }
+        if (!present) {
+            if (&storage == &LittleFS) {
+                gPendingDiscards.removeAt(i);
+                changed = true;
+            } else {
+                // SD is removable: another card may be inserted on this boot.
+                entry.skipThisBoot = true;
+                ++i;
+            }
+            continue;
+        }
+        const auto match = checkDiscardMatchLocked(storage, entry);
+        if (match == micro_discard::Match::Mismatch) {
+            // Different file at the same path (e.g. swapped card): never delete.
+            entry.skipThisBoot = true;
+            ++i;
+            continue;
+        }
+        if (match == micro_discard::Match::ReadError) {
+            tripWriteResult(storage, false, "close");
+            ++i;
+            continue;
+        }
+        char removedPath[micro_discard::kPathBytes];
+        snprintf(removedPath, sizeof(removedPath), "%s", entry.path);
+        if (storage.remove(removedPath)) {
+            Serial.printf("Removed discarded micro-trip: %s\n", removedPath);
+            gPendingDiscards.removeAt(i);
+            changed = true;
+            if (fsckPaths) {
+                for (size_t j = 0; j < fsckPaths->size(); ) {
+                    if ((*fsckPaths)[j] == removedPath) fsckPaths->erase(fsckPaths->begin() + j);
+                    else ++j;
+                }
+            }
+            tripWriteResult(storage, true, "close");
+        } else {
+            tripWriteResult(storage, false, "close");
+            if (fsckPaths) {
+                Serial.printf("ERROR: could not remove discarded micro-trip %s -- will retry.\n",
+                              removedPath);
+            }
+            ++i;
+        }
+    }
+    return changed;
+}
+
+static void servicePendingDiscards(bool force) {
+    ensurePendingDiscardsLoaded();
+    if (!gPendingDiscards.hasActive()) return;
+    const uint32_t now = millis();
+    if (!force && uint32_t(now - gPendingDiscardRetryMs) < FS_CHECK_MS) return;
+    gPendingDiscardRetryMs = now;
+    bool changed = false;
+    FS_LOCK();
+    if (tripStoreAvailable(SD)) changed |= retryPendingDiscardsLocked(SD, nullptr);
+    if (tripStoreAvailable(LittleFS)) changed |= retryPendingDiscardsLocked(LittleFS, nullptr);
+    FS_UNLOCK();
+    if (changed) savePendingDiscards();
+}
+
 // Legacy .fix validation still needs the point count and verified prefix.
 static long findLastTrkptEnd(File& f, uint32_t* points = nullptr) {
     if (points) *points = 0;
@@ -1564,6 +1777,15 @@ static bool recoverRepairCopy(fs::FS& storage, const char* path, TripRecovery& r
 // false on any IO error or if bounded runtime work must wait for boot. A
 // failed in-place write can leave a shortened/partially closed recoverable trip.
 static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result, bool bounded = false) {
+    if (!bounded) {
+        if (const auto* pending = gPendingDiscards.findActive(discardBackend(storage), path)) {
+            const auto match = checkDiscardMatchLocked(storage, *pending);
+            if (match != micro_discard::Match::Mismatch) {
+                result.reason = match == micro_discard::Match::ReadError ? "read" : "write";
+                return false;
+            }
+        }
+    }
     // Legacy comparisons may read megabytes. Do them only during boot fsck.
     if (bounded && storage.exists((String(path) + ".fix").c_str())) return false;
     if (!recoverRepairCopy(storage, path, result)) return false;
@@ -1641,6 +1863,8 @@ static String tripEntryPath(const File& entry) {
 }
 
 static void fsckAllTrips(fs::FS& storage) {
+    ensurePendingDiscardsLoaded();
+    bool discardsChanged = false;
     FS_LOCK();
     std::vector<String> paths;
     File dir = storage.open(TRIP_DIR);
@@ -1669,11 +1893,14 @@ static void fsckAllTrips(fs::FS& storage) {
     // LittleFS directory cursors can change when repair creates, removes or
     // renames entries. Finish enumeration and close every handle first.
     dir.close();
+    discardsChanged = retryPendingDiscardsLocked(storage, &paths);
     for (const String& path : paths) {
+        if (gPendingDiscards.hasActivePath(discardBackend(storage), path.c_str())) continue;
         repairIfNeeded(storage, path.c_str());
         feedLoopWatchdogProgress(); // another file checked, even if no repair
     }
     FS_UNLOCK();
+    if (discardsChanged) savePendingDiscards();
 }
 
 // =================================================================
@@ -3893,6 +4120,10 @@ void setup() {
         gLoopFaults.event(diagnostics::Code::PMU_PERIPHERAL_SETUP_FAILED, millis()).condition(pmuPeripheralWarning);
         storageConditions(bootFreeBytes, millis());
     }
+    gPendingDiscards.clear();
+    gPendingDiscardsLoaded = false;
+    ensurePendingDiscardsLoaded();
+    gPendingDiscardRetryMs = millis();
     if (tripStoreAvailable(SD)) { startupStage(startup_watchdog::Stage::CardRepair); fsckAllTrips(SD); }
     if (tripStoreAvailable(LittleFS)) { startupStage(startup_watchdog::Stage::FlashRepair); fsckAllTrips(LittleFS); }
     startupStage(startup_watchdog::Stage::Services);
@@ -3949,6 +4180,7 @@ void loop() {
     }
     serviceGpsConfiguration();
     serviceDebugRf();
+    servicePendingDiscards();
     serviceRuntimeDiagnostics(); // before fix-loss finalization and PMU shutdown
 
     // ARMING must also expire when no next fix arrives to drive the FSM.
