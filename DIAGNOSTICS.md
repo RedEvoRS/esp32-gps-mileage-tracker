@@ -1434,8 +1434,8 @@ raise has not been accepted remains unknown until it has a valid episode ID.
 | E2001 | PMU initialization failed or LoRa ALDO3 could not be verified off at startup | Only a normal boot after successful PMU initialization and rail verification observes healthy; retry success restarts, never clears in degraded mode | none |
 | E2002 | Verified AXP2101 level-1 IRQ or battery percentage <= successfully read configured low warning | Valid connected battery percentage above that threshold; failed threshold reads neither raise nor clear | `battery_mv`, if in catalog range |
 | E2003 | Verified AXP2101 level-2 IRQ (before existing shutdown), or percentage <= successfully read configured critical level | Valid connected battery percentage above critical; failed threshold reads neither raise nor clear | `battery_mv`, if in range |
-| E2004 | Die estimate or available board air is 45 C or above, or above 38 C when the guard already requests a temperature pause | Neither reading meets the current hot condition | `temperature_mc` = measured PMU die |
-| E2005 | Die estimate or available board air is 0 C or below, or below 5 C when the guard already requests a temperature pause | Neither reading meets the current cold condition | `temperature_mc` = measured PMU die |
+| E2004 | Die estimate or available board air is 45 C or above, or above 38 C when the guard already requests a temperature pause | Neither reading meets the current hot condition | `temperature_mc` = measured PMU die, omitted while the die is unreadable |
+| E2005 | Die estimate or available board air is 0 C or below, or below 5 C when the guard already requests a temperature pause | Neither reading meets the current cold condition | `temperature_mc` = measured PMU die, omitted while the die is unreadable |
 | E2006 | Non-finite or implausible die sample; first ten seconds of first-reading retries are silent | Plausible sample; hot/cold conditions are not cleared by an unreadable sample | none |
 | E2008 | Three consecutive runtime charger command/read-back failures (30 s apart), startup charger disable still unconfirmed after its 5 s bounded retry window, or an unconfirmed 4.1 V charge target (blocking charging) | Checked 0x64 4.1 V target and 0x18 bit 1 read match the intended charger state (once startup charger disable is confirmed) | none |
 | E2010 | Startup cannot confirm the GPS rail is on at 3.3 V, battery detection and the four PMU measurement channels are enabled, or the TS pin is in fixed-input mode with its ADC off. Each check allows three attempts. XPowersLib sets TS to fixed input in `PMU.begin()` before the charger pause. The firmware skips TS verification and repair if the pause cannot be confirmed (E2008). | The startup result is re-observed from the normal and no-storage loops under the normal retry and 15-minute repeat policy (PMU-missing and untrusted boots leave it unobserved); a later startup that verifies the GPS rail, battery detection, the four measurement enables and TS setup observes it clear | none |
@@ -1498,9 +1498,11 @@ Plausible means finite and within -40 to 125 C. Before the first usable reading
 each boot, the guard commands/verifies charging off and retries once a second
 for ten seconds. There is no E2006 during that grace window. Expiry pauses
 charging with E2006 and returns to 30-second checks. A plausible hot reading
-still raises E2004 immediately. Invalid readings pause charging fail-safe
-without creating or clearing hot/cold hysteresis history, carrying temperature
-context or appearing as real debug temperatures.
+still raises E2004 immediately. An invalid die reading always pauses charging.
+It never clears a hot/cold pause, carries temperature context or appears as a
+real debug temperature. A valid board-air reading taken at the same time can
+still request a hot/cold pause and, after the grace window, raise E2004 or
+E2005 without `temperature_mc`. Clearing either needs a usable die reading.
 The first-reading retry has host tests only. Bench boots on 2026-11-10 (UTC)
 were USB resets whose first reading was already usable, so a start from fully
 off remains unchecked.
@@ -1510,8 +1512,8 @@ temperature from the same check. A missing board-air sample leaves the
 die estimate as the only input. E2004 and E2005 follow the combined hot
 and cold flags, so both can be active when the readings disagree. They
 describe the requested pause even when charger control is unconfirmed.
-Diagnostic context always carries the raw PMU die temperature in
-`temperature_mc`. Startup tries
+Diagnostic context carries the raw PMU die temperature in
+`temperature_mc` whenever the die reading is usable. Startup tries
 to disable the charger early and read back `CHARGE_GAUGE_WDT_CTRL` (0x18), and
 if still unconfirmed retries every 100 ms for a bounded 5 s window (feeding the
 startup watchdog) before storage setup. If the PMU still cannot confirm
