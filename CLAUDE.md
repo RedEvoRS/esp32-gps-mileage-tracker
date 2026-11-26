@@ -346,10 +346,11 @@ Bench-checked 2026-10-18 with Stages 1–3 unless marked; details in
   never a scan event. Per-core static producer builders keep event buffers
   off task stacks. Bounded degraded startup retries restart on recovery.
   The charge guard checks die minus 9 C and fresh BME280 board air. Either
-  can pause charging at <=0 or >=45 C; all available readings must return
-  to 5–38 C. Missing air falls back to die alone. An unreadable die pauses
-  charging, preserves hot/cold history and retries each second for up to
-  ten seconds on startup before E2006. Debug reuses both guard samples.
+  can pause charging at <=0 or >=45 C. After a hot/cold pause, the die
+  estimate and any available air reading must return to 5–38 C. An unreadable
+  die blocks charging, keeps any hot/cold pause and still checks valid air.
+  Startup retries each second for up to ten seconds before E2006.
+  Debug reuses both guard samples.
   Host tests only: a real hot or cold pause on the Supreme, and the
   first-reading retry from a fully-off start (2026-11-10 bench boots were
   USB resets with a usable first reading).

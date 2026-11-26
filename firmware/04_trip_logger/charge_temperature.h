@@ -29,19 +29,20 @@ struct Decision {
 };
 
 // Thresholds are in battery terms. Pass NAN when this check has no fresh air
-// sample. The die reading is required and an invalid die preserves hysteresis.
+// sample. An invalid die blocks charging and keeps any existing temperature
+// pause. A plausible air reading can also request a pause while the die is invalid.
 inline Decision evaluate(float dieC, float airC, bool pauseRequested,
                          float hotPauseC, float hotResumeC,
                          float coldPauseC, float coldResumeC, float dieOffsetC) {
-    if (!plausible(dieC)) {
-        return {true, pauseRequested, true, {}, {}};
-    }
     const auto limits = [&](float c) -> Limits {
         if (pauseRequested) return {c > hotResumeC, c < coldResumeC};
         return {c >= hotPauseC, c <= coldPauseC};
     };
-    const Limits die = limits(dieC - dieOffsetC);
     const Limits air = plausibleAir(airC) ? limits(airC) : Limits{};
+    if (!plausible(dieC)) {
+        return {true, pauseRequested || air.hot || air.cold, true, {}, air};
+    }
+    const Limits die = limits(dieC - dieOffsetC);
     const bool pause = die.hot || die.cold || air.hot || air.cold;
     return {pause, pause, false, die, air};
 }

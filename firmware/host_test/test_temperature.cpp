@@ -92,11 +92,24 @@ static void testChargeDecision() {
         }
     }
     for (float die : {NAN, INFINITY, -INFINITY, -40.01f, 125.01f, 385.7f}) {
-        for (float air : {NAN, -5.0f, 20.0f, 50.0f}) for (bool paused : {false, true}) {
+        for (float air : {NAN, -40.01f, 20.0f, 85.01f}) for (bool paused : {false, true}) {
             auto result = evaluate(die, air, paused);
             REQUIRE(result.pause && result.nextPauseRequested == paused && result.unreadable);
             REQUIRE(!result.hot() && !result.cold());
         }
+        auto cold = evaluate(die, -2.0f);
+        REQUIRE(cold.pause && cold.unreadable && cold.nextPauseRequested);
+        REQUIRE(cold.air.cold && !cold.air.hot && !cold.die.hot && !cold.die.cold);
+        REQUIRE(evaluate(die, 2.0f, cold.nextPauseRequested).air.cold);
+        REQUIRE(evaluate(30.0f, 2.0f, cold.nextPauseRequested).pause);
+        REQUIRE(!evaluate(30.0f, 5.0f, cold.nextPauseRequested).pause);
+
+        auto hot = evaluate(die, 46.0f);
+        REQUIRE(hot.pause && hot.unreadable && hot.nextPauseRequested);
+        REQUIRE(hot.air.hot && !hot.air.cold && !hot.die.hot && !hot.die.cold);
+        REQUIRE(evaluate(die, 40.0f, hot.nextPauseRequested).air.hot);
+        REQUIRE(evaluate(30.0f, 40.0f, hot.nextPauseRequested).pause);
+        REQUIRE(!evaluate(30.0f, 38.0f, hot.nextPauseRequested).pause);
     }
 }
 int main() {

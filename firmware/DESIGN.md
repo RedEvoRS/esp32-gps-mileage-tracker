@@ -211,7 +211,8 @@ temperature to the same limits. Charging heats the die and can hide a cold
 cell from the die estimate. Board air changes much less during charging and
 helps catch a cold start after the device has sat in a cold cabin. Either
 reading requests a pause at or below 0 °C or at or above 45 °C. To resume,
-every available reading must be within 5–38 °C, inclusive.
+the die estimate and any available board-air reading must be within 5–38 °C,
+inclusive, after a temperature-driven pause.
 
 Core 1 triggers a fresh temperature-only conversion on the OLED's `Wire`
 bus. It yields for 6 ms to allow the conversion and tick rounding, then
@@ -235,10 +236,13 @@ die reading lets the guard apply the temperature limits and charger read-back
 rules immediately. Grace expiry raises
 E2006, prints one serial line saying charging stays off, and returns to
 30-second sampling. Later plausible recovery clears it.
-Any implausible sample after the first good one immediately follows the normal
-unreadable path. Invalid readings never clear hot/cold episodes, supply event
-temperature context or appear as real debug temperatures. The retry is covered
-by host tests only. The 2026-11-10 (UTC) bench boots were USB resets whose
+An implausible die reading after the first good one immediately follows the
+unreadable path. Valid board air can still request a temperature pause, so the
+guard applies the resume limits when the die recovers. After the startup grace
+period, valid air can raise E2004 or E2005 while the die is unreadable. Clearing
+either event requires a usable die reading. An unreadable die supplies no event
+temperature context and appears as unavailable in debug output. The retry is
+covered by host tests only. The 2026-11-10 (UTC) bench boots were USB resets whose
 first reading was already usable, so the retry is unchecked on the board.
 
 ## Firmware identity on the debug screen
