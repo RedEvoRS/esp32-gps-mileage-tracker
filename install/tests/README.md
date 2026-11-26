@@ -32,14 +32,17 @@ Flash safety fences reflect the checked-in Supreme `partitions.csv`: NVS starts
 at `0x9000` and LittleFS at `0x190000`. A future partition-layout change must
 review these fences along with the builder; offsets used in commands always
 come from the manifest. The scripts never use a padded merged image.
+The 8 MiB layout grows LittleFS at the same start address and leaves the
+app and OTA data boundaries intact, so the same fences cover both layouts.
 
 First install performs two full 8 MB reads and verifies their size and contents,
 requires the exact case-sensitive answer `ERASE`, erases the whole internal flash,
 then writes all four parts at manifest offsets. This is required to provision
 LittleFS over the factory firmware, as explained in `firmware/README.md`.
 It wipes internal settings (including trip counter and diagnostics enrollment)
-and internal trips. SD trips are untouched. Use the default update for a tracker
-already running this project. `-FirstInstall -SkipBackup` / `--first-install
+and internal trips. SD trips are untouched. Use the default update for routine
+updates. An existing board gets the larger LittleFS only when first install
+writes the new table. `-FirstInstall -SkipBackup` / `--first-install
 --skip-backup` is only for re-provisioning a board already backed up, and still
 requires `ERASE`. Dry run prints the sequence and confirmation requirement without
 prompting or accessing a device. Update and cleanup never erase. First

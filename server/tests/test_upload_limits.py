@@ -208,10 +208,11 @@ class DeviceTripsFit(unittest.TestCase):
         self.assertLessEqual(trip_split_bytes(), cap // 2,
                              "a trip piece must fit within half the upload cap")
 
-    def test_fallback_partition_is_under_the_default_cap(self):
+    def test_fallback_partition_is_under_the_split_and_default_cap(self):
         with tempfile.TemporaryDirectory() as root:
             cap = load_ingest(root).MAX_UPLOAD_BYTES
-        # Flash fallback still bounds a trip below the server cap.
+        # Even the expanded Supreme filesystem fills before the split limit.
+        self.assertLess(trip_partition_bytes(), trip_split_bytes())
         self.assertLess(trip_partition_bytes(), cap,
                         "a full trip partition would be rejected with a 413")
 

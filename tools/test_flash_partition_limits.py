@@ -63,6 +63,20 @@ def script_limits(source, powershell=False):
 
 
 class FlashPartitionLimitsTests(unittest.TestCase):
+    def test_supreme_layout_fills_flash_and_preserves_update_addresses(self):
+        regions = partition_regions()
+        self.assertEqual(regions["nvs"], (0x9000, 0xE000))
+        self.assertEqual(regions["otadata"], (0xE000, 0x10000))
+        self.assertEqual(regions["factory"], (0x10000, 0x190000))
+        self.assertEqual(regions["spiffs"][0], regions["factory"][1])
+        self.assertEqual(regions["spiffs"][1], regions["coredump"][0])
+        self.assertEqual(regions["coredump"], (0x7F0000, 0x800000))
+        for name, (start, end) in regions.items():
+            with self.subTest(partition=name):
+                self.assertGreater(end, start)
+                self.assertEqual(start % (0x10000 if name == "factory" else 0x1000), 0)
+                self.assertEqual(end % 0x1000, 0)
+
     def test_both_scripts_match_partition_table(self):
         regions = partition_regions()
         self.assertLessEqual(PARTITION_TABLE_OFFSET + PARTITION_TABLE_SIZE, min(start for start, _ in regions.values()))

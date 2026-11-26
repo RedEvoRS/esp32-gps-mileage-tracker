@@ -90,8 +90,10 @@ through a self-hosted ntfy notification service.
 every code.
 
 If no card mounts at boot, the board stores trips in its internal flash
-instead (about 5–6 hours of driving between uploads) and uploads them from
-there. If the board detects that the card has stopped responding while it
+instead and uploads them from there. The 6.375 MiB fallback on a newly
+provisioned Supreme holds about 15 hours of driving between uploads.
+Boards still using the original layout hold about 5–6 hours.
+If the board detects that the card has stopped responding while it
 runs, new trips use internal flash, if available, until restart; the current
 trip stays on the card for recovery.
 Either way, Device health shows the missing card as error E4001.
@@ -464,10 +466,15 @@ Update the server first, so it understands the new firmware's diagnostics.
 
 1. Rerun **Step 1 on the server**, accept the firmware build, and confirm
    your settings. Your configuration and trips are kept.
-2. Rerun **Step 2 on your PC** and answer **no** to first install. Never use
-   `-FirstInstall` / `--first-install` on a tracker that's already set up:
-   it erases the board's settings and internal trips. A normal update
-   writes only the app.
+2. Rerun **Step 2 on your PC** and answer **no** to first install. A normal
+   update writes only the app and keeps the existing partition layout.
+
+To get the larger internal store on a board with the original layout,
+upload or back up any trips still on internal flash first. Then use the
+[first-install procedure](firmware/README.md#using-the-larger-internal-store)
+with the new build. This erases internal flash, including queued internal
+trips, the trip counter and the diagnostics enrollment record. Re-enroll
+diagnostics afterward.
 
 See the [update runbook](DEPLOY_DEBIAN.md#updating).
 
