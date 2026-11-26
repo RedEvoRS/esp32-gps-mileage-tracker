@@ -78,6 +78,7 @@
 #include "journal_platform.h"
 #include "trip_repair_vfs.h"
 #include "trip_write_vfs.h"
+#include "sd_write_check.h"
 #include "runtime_faults.h"
 #include "rtc_runtime.h"
 
@@ -368,7 +369,7 @@ static bool gEventIoBudget = false; // core-0 only, cooperative VFS deadline
 static uint32_t gEventIoStarted = 0;
 static bool journalMayRun();
 static bool sdJournalMayRun();
-static JournalPlatformIo gSdJournalIo("/sd"), gFlashJournalIo("/littlefs");
+static JournalPlatformIo gSdJournalIo("/sd", &sdWriteFailureCount()), gFlashJournalIo("/littlefs");
 static diagnostics::MountedJournalFs<JournalPlatformIo> gSdJournalFs(gSdJournalIo, gSdMounted, sdJournalMayRun);
 static diagnostics::MountedJournalFs<JournalPlatformIo> gFlashJournalFs(gFlashJournalIo, gFlashMounted, journalMayRun);
 // Static storage, never the 12 KiB network task stack.
@@ -591,6 +592,9 @@ static bool heartbeatDue() {
 
 static const char* tripBackend(fs::FS& storage) { return &storage == &SD ? "sd" : "littlefs"; }
 static const char* tripMount(fs::FS& storage) { return &storage == &SD ? "/sd" : "/littlefs"; }
+static const uint32_t* tripSdFailures(fs::FS& storage) {
+    return &storage == &SD ? &sdWriteFailureCount() : nullptr;
+}
 
 static bool tripStoreAvailable(fs::FS& storage) {
     return &storage == &SD ? gSdMounted && !gSdUnavailable.load() : gFlashMounted && gFlashTripsReady;
@@ -1078,7 +1082,7 @@ static bool beginTrip(const Fix& fx, bool continuation = false) {
     FS_LOCK();
     makeTripPath(gTripPath, sizeof(gTripPath));
     bool ok = false;
-    FileWriter w(tripMount(storage), gTripPath, /*create=*/true);
+    FileWriter w(tripMount(storage), gTripPath, /*create=*/true, tripSdFailures(storage));
     const bool created = bool(w);
     const char* operation = created ? "write" : "open";
     if (created) {
@@ -1152,7 +1156,7 @@ static bool writeOrBufferTrkpt(const Fix& fx) {
     bool ok = false;
     const char* operation = "open";
     if (tripStoreAvailable(storage)) {
-        FileWriter w(tripMount(storage), gTripPath, /*create=*/false);
+        FileWriter w(tripMount(storage), gTripPath, /*create=*/false, tripSdFailures(storage));
         if (w) {
             operation = "write";
             if (w.ok) {
@@ -1208,7 +1212,7 @@ static void endTrip(bool discardIfMicro, TripState nextState = IDLE) {
     } else {
         bool ok = false;
         if (!gTripWriteFailed && tripStoreAvailable(storage)) {
-            FileWriter w(tripMount(storage), gTripPath, /*create=*/false);
+            FileWriter w(tripMount(storage), gTripPath, /*create=*/false, tripSdFailures(storage));
             if (w.ok) {
                 // Flush any still-buffered (never-got-UTC) points before
                 // closing, so a trip that never got UTC isn't lost. They're
@@ -1605,10 +1609,12 @@ static bool repairTrip(fs::FS& storage, const char* path, TripRecovery& result, 
     result.reason = "write";
     bool ok;
     if (rewrite) {
-        ok = rewriteTripEpilogue(tripMount(storage), path, end, GPX_EPILOGUE, epilogueSize);
+        ok = rewriteTripEpilogue(tripMount(storage), path, end, GPX_EPILOGUE, epilogueSize,
+                                 tripSdFailures(storage));
     } else {
         const String suffix = String("\n") + GPX_EPILOGUE;
-        ok = repairTripInPlace(tripMount(storage), path, static_cast<size_t>(end), suffix.c_str());
+        ok = repairTripInPlace(tripMount(storage), path, static_cast<size_t>(end), suffix.c_str(),
+                               tripSdFailures(storage));
     }
     if (!ok) {
         Serial.printf("fsck: could not repair %s (write failed)\n", path);
@@ -3091,11 +3097,12 @@ static bool mountFlashStorage(bool allowProvision = true) {
 }
 
 static bool prepareTripDirectory(fs::FS& storage) {
+    const SdWriteCheck check(tripSdFailures(storage));
     if (!storage.exists(TRIP_DIR) && !storage.mkdir(TRIP_DIR)) return false;
     File dir = storage.open(TRIP_DIR);
     bool ready = dir && dir.isDirectory();
     dir.close();
-    return ready;
+    return ready && check.ok();
 }
 
 static constexpr unsigned PMU_PERIPHERAL_ATTEMPTS = 3;
@@ -3114,6 +3121,10 @@ static bool powerOffSdRail(bool warnOnFailure) {
                       PMU_PERIPHERAL_ATTEMPTS);
     return false;
 }
+
+#ifndef JOURNAL_HOST_TEST
+bool beginMonitoredSd(uint8_t pin, SPIClass& spi, uint32_t frequency);
+#endif
 
 static bool mountSdStorage() {
     if (gStartupWatchdog.skipCard()) return false;
@@ -3145,7 +3156,11 @@ static bool mountSdStorage() {
     digitalWrite(SD_CS, HIGH);
     delay(SD_SETTLE_MS);
     bool busReady = gSdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+#ifdef JOURNAL_HOST_TEST
     const bool mounted = busReady && SD.begin(SD_CS, gSdSpi, SD_SPI_HZ, "/sd", 10, false);
+#else
+    const bool mounted = busReady && beginMonitoredSd(SD_CS, gSdSpi, SD_SPI_HZ);
+#endif
     if (mounted && SD.cardType() != CARD_NONE) {
         gSdFatCheck = diagnostics::checkSdFat(
             SD, []() -> uint32_t { return millis(); }, SD_FAT_CHECK_BUDGET_MS);

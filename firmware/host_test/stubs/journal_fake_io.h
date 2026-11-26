@@ -9,7 +9,7 @@ class JournalPlatformIo {
     diagnostics::EventLogFs::Operation writeFailure_ = diagnostics::EventLogFs::Operation::Write;
 public:
     std::function<void()> onListEntry;
-    explicit JournalPlatformIo(const char* mount) : fs_(std::strcmp(mount, "/sd") == 0 ?
+    explicit JournalPlatformIo(const char* mount, const uint32_t* = nullptr) : fs_(std::strcmp(mount, "/sd") == 0 ?
         static_cast<fs::FS&>(SD) : static_cast<fs::FS&>(LittleFS)) {}
     bool directory(const char* path) {
         assertLocked();

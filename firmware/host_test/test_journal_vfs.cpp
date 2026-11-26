@@ -1,6 +1,7 @@
 // Exercise the production mounted VFS implementation, including error returns
 // Arduino File hides. Windows shims only adapt POSIX spelling/binary mode.
 #include "event_log.h"
+#include "sd_write_check.h"
 #include <cassert>
 #include <cerrno>
 #include <cstdio>
@@ -18,6 +19,13 @@
 #include <vector>
 #include <string>
 static bool failSync = false, failClose = false, failList = false, failOpen = false, failTruncate = false;
+enum class HiddenWriteError { None, Open, Sync, Close, Truncate };
+static HiddenWriteError hiddenWriteError = HiddenWriteError::None;
+static void simulateDiskWrite(HiddenWriteError point) {
+    // Model a failed sector write whose error FatFs discards. The POSIX
+    // syscall below still returns its real result, normally success.
+    if (hiddenWriteError == point) ++sdWriteFailureCount();
+}
 static size_t openDirCount = 0, closeDirCount = 0, statCount = 0;
 static DIR* checkedOpenDir(const char* path) {
     DIR* d = ::opendir(path);
@@ -33,6 +41,7 @@ static int checkedStat(const char* path, struct stat* info) {
     return ::stat(path, info);
 }
 static int checkedTruncate(int fd, off_t size) {
+    simulateDiskWrite(HiddenWriteError::Truncate);
     if (failTruncate) { errno = EIO; return -1; }
 #ifdef _WIN32
     return ::_chsize_s(fd, size) == 0 ? 0 : -1;
@@ -41,6 +50,7 @@ static int checkedTruncate(int fd, off_t size) {
 #endif
 }
 static int checkedSync(int fd) {
+    simulateDiskWrite(HiddenWriteError::Sync);
     if (failSync) { errno = EIO; return -1; }
 #ifdef _WIN32
     return ::_commit(fd);
@@ -49,6 +59,7 @@ static int checkedSync(int fd) {
 #endif
 }
 static int checkedClose(int fd) {
+    simulateDiskWrite(HiddenWriteError::Close);
     int result = ::close(fd);
     if (failClose) { errno = EIO; return -1; }
     return result;
@@ -65,6 +76,7 @@ static int checkedMkdir(const char* path, [[maybe_unused]] int mode) {
 #endif
 }
 static int checkedOpen(const char* path, int flags, int mode = 0) {
+    simulateDiskWrite(HiddenWriteError::Open);
     if (failOpen) { errno = EIO; return -1; }
 #ifdef _WIN32
     return ::open(path, flags | _O_BINARY, mode);
@@ -85,6 +97,7 @@ static int checkedOpen(const char* path, int flags, int mode = 0) {
 #undef JOURNAL_HOST_TEST
 #define ftruncate checkedTruncate
 #include "trip_repair_vfs.h"
+#include "trip_write_vfs.h"
 #undef ftruncate
 #undef fsync
 #undef close
@@ -210,8 +223,44 @@ int main(int argc, char** argv) {
     }
     assert(!repairTripInPlace(mount.c_str(), "/missing.gpx", 8, suffix));
     assert(!std::filesystem::exists(root / "missing.gpx"));
+    diagnostics::JournalVfs sdIo(mount.c_str(), &sdWriteFailureCount());
+    assert(sdIo.directory("/diag"));
+    for (auto point : {HiddenWriteError::Open, HiddenWriteError::Sync, HiddenWriteError::Close}) {
+        hiddenWriteError = point;
+        assert(!sdIo.write("/diag/ack-0", "test", 4, false));
+        const auto expected = point == HiddenWriteError::Open ? Operation::Open :
+                              point == HiddenWriteError::Close ? Operation::Close : Operation::Write;
+        assert(sdIo.writeFailure() == expected);
+        assert(io.write("/diag/ack-0", "test", 4, false)); // unmonitored store
+        {
+            FileWriter writer(mount.c_str(), "/trip.gpx", false, &sdWriteFailureCount());
+            assert(writer); // open returned a valid descriptor
+            writer.put(suffix);
+            assert(!writer.commit());
+        }
+        hiddenWriteError = HiddenWriteError::None;
+        assert(sdIo.write("/diag/ack-0", "test", 4, false));
+    }
+    {
+        FileWriter writer(mount.c_str(), "/trip.gpx", false, &sdWriteFailureCount());
+        writer.put(suffix);
+        assert(writer.commit());
+    }
+    { std::ofstream output(trip, std::ios::binary); output << original; }
+    hiddenWriteError = HiddenWriteError::Truncate;
+    assert(!repairTripInPlace(mount.c_str(), "/trip.gpx", prefix.size(), suffix, &sdWriteFailureCount()));
+    assert(readTrip() == prefix); // stop before the append when truncate reports success
+    hiddenWriteError = HiddenWriteError::None;
+    assert(repairTripInPlace(mount.c_str(), "/trip.gpx", prefix.size(), suffix, &sdWriteFailureCount()));
+    hiddenWriteError = HiddenWriteError::Close;
+    assert(!rewriteTripEpilogue(mount.c_str(), "/trip.gpx", prefix.size(),
+                                suffix, std::strlen(suffix), &sdWriteFailureCount()));
+    hiddenWriteError = HiddenWriteError::None;
+    assert(sdIo.remove("/diag/ack-0"));
+    std::filesystem::remove(root / "diag");
     std::filesystem::remove(trip);
     std::filesystem::remove(root);
     std::puts("Journal production VFS round trip, sync/close/list errors and path isolation passed");
     std::puts("Trip production VFS truncate/append, open/truncate/sync/close errors and missing-file safety passed");
+    std::puts("Hidden SD write errors fail the current journal or GPX operation despite VFS success");
 }

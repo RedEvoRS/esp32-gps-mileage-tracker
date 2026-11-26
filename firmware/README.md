@@ -1266,6 +1266,12 @@ How it behaves once flashed:
   piece is closed or left for recovery before fallback, and readable,
   complete trips on the card can still upload. The tracker attempts to
   recover any complete opening points after a failed first commit.
+- **File calls succeed but an SD write failed:** the tracker also checks the
+  card driver's result when saving or repairing a trip or updating the
+  diagnostics journal. This can catch a failed write to the backup file
+  allocation table or free-space hints. Trip writes use the usual E4006
+  failure path, and journal updates use E4008. These checks report the failed
+  operation so it can follow the usual retry or recovery path.
 
 Watch the Serial Monitor (115200) for state transitions:
 `Trip started` → (drive) → `Trip finalized`, then

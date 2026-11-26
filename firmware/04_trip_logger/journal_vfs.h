@@ -1,5 +1,6 @@
 #pragma once
 #include "event_log.h"
+#include "sd_write_check.h"
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -14,12 +15,14 @@ namespace diagnostics {
 // or format here. Paths supplied to EventLog remain relative to the store.
 class JournalVfs {
 public:
-    explicit JournalVfs(const char* mount) : mount_(mount) {}
+    explicit JournalVfs(const char* mount, const uint32_t* sdFailures = nullptr)
+        : mount_(mount), sdFailures_(sdFailures) {}
     bool directory(const char* relative) {
         char path[96]; if (!full(relative, path)) return false;
         struct stat info;
         if (::stat(path, &info) == 0) return S_ISDIR(info.st_mode);
-        return errno == ENOENT && ::mkdir(path, 0700) == 0;
+        const SdWriteCheck check(sdFailures_);
+        return errno == ENOENT && ::mkdir(path, 0700) == 0 && check.ok();
     }
     EventLogFs::Result list(size_t skip, EventLogFs::ListVisitor visitor, void* context,
                            bool (*allow)() = nullptr, bool = false) {
@@ -64,12 +67,18 @@ public:
     bool write(const char* relative, const void* data, size_t size, bool append) {
         writeFailure_ = EventLogFs::Operation::Open;
         char path[96]; if (!full(relative, path)) return false;
+        const SdWriteCheck opened(sdFailures_);
         int fd = ::open(path, O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC), 0600);
         if (fd < 0) return false;
-        writeFailure_ = EventLogFs::Operation::Write;
-        bool ok = ::write(fd, data, size) == static_cast<ssize_t>(size);
+        bool ok = opened.ok();
+        if (ok) {
+            writeFailure_ = EventLogFs::Operation::Write;
+            ok = ::write(fd, data, size) == static_cast<ssize_t>(size);
+        }
         if (::fsync(fd)) ok = false;
-        if (::close(fd)) {
+        ok = ok && opened.ok();
+        const SdWriteCheck closed(sdFailures_);
+        if (::close(fd) || !closed.ok()) {
             if (ok) writeFailure_ = EventLogFs::Operation::Close;
             ok = false;
         }
@@ -81,13 +90,16 @@ public:
         struct stat info;
         if (::stat(b, &info) == 0 || errno != ENOENT) return false;
         // EventLog exclusively owns /diag and FS_LOCK serializes both stores.
-        return ::rename(a, b) == 0;
+        const SdWriteCheck check(sdFailures_);
+        return ::rename(a, b) == 0 && check.ok();
     }
     bool remove(const char* relative) {
-        char path[96]; return full(relative, path) && ::unlink(path) == 0;
+        const SdWriteCheck check(sdFailures_);
+        char path[96]; return full(relative, path) && ::unlink(path) == 0 && check.ok();
     }
 private:
     const char* mount_;
+    const uint32_t* sdFailures_;
     EventLogFs::Operation writeFailure_ = EventLogFs::Operation::Write;
     bool full(const char* relative, char (&path)[96]) {
         int n = std::snprintf(path, sizeof(path), "%s%s", mount_, relative);
